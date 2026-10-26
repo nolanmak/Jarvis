@@ -105,17 +105,76 @@ async fn create_or_reconcile(
     }
 }
 
+#[derive(serde::Serialize,serde::Deserialize)]
+struct PendingPublication {
+    repository:String,worktree:PathBuf,issue:u64,branch:String,head:String,
+    contract:String,environment:String,args:Vec<String>,
+}
+
+/// This lane spends no model calls and runs independently of builder capacity.
+pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
+    if dry_run { return Ok(()); }
+    let repository=workflow::canonical_repository(repo).await?;
+    let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+    for (id,raw) in store.pending_publications(&repository)? {
+        let request:PendingPublication=serde_json::from_str(&raw)?;
+        anyhow::ensure!(request.repository==repository && id==crate::autoship_workflow::workflow_id(&repository,request.issue)?,"publication identity mismatch");
+        let Some(snapshot)=store.snapshot(&id)? else {continue};
+        let now=chrono::Utc::now().timestamp_millis();
+        if snapshot.lease_until_ms>now || snapshot.checkpoint.next.eligible_at_ms>now {continue;}
+        let acquired=workflow::WorkflowGuard::acquire(workflow::Start {
+            repo_root:repo,worktree:&request.worktree,repository:&repository,source_issue:Some(request.issue),pr:snapshot.pr,
+            branch:&request.branch,contract:&request.contract,environment:&request.environment,
+        }).await;
+        let mut guard=match acquired {Ok(Some(guard))=>guard,Ok(None)=>continue,Err(error)=>{
+            warn!(workflow=%id,"pending publication lease/evidence unavailable: {error:#}");continue;
+        }};
+        if guard.binding().head != request.head {
+            guard.forget_publication()?;
+            guard.transition(crate::autoship_workflow::Stage::Reconcile,"pending_publication_candidate_changed","reverify_candidate",now).await?;
+            guard.finish()?;continue;
+        }
+        let result=publish(&guard,&request.worktree,&request.branch,&request.head,request.issue,
+            &request.args.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        match result {
+            Ok(pr)=> {
+                let verdict=store.current_reviews(&id)?.into_iter().filter(|review|review.approved)
+                    .find_map(|review|serde_json::from_str::<RecordedVerdict>(&review.evidence).ok());
+                opened_prs::record(request.issue,pr.number,&request.head,verdict);
+                info!(pr=pr.number,"reconciled pending publication without rebuilding");
+            }
+            Err(error)=> {
+                guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",now+60_000).await?;
+                warn!(workflow=%id,"publication reconciliation deferred: {error:#}");
+            }
+        }
+        guard.finish()?;
+    }
+    Ok(())
+}
+pub(super) async fn pending_issue(repo:&Path,issue:u64)->Result<bool> {
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? else {return Ok(false)};
+    if !store.has_any_pending_publications()? {return Ok(false);}
+    let repository=workflow::canonical_repository(repo).await?;
+    store.has_pending_publication(&crate::autoship_workflow::workflow_id(&repository,issue)?)
+}
+
 pub(super) async fn publish(
     guard: &workflow::WorkflowGuard,
     worktree: &Path,
     branch: &str,
     head: &str,
+    issue:u64,
     args: &[&str],
 ) -> Result<Published> {
     anyhow::ensure!(
         head == guard.binding().head,
         "publication head is not the checkpointed candidate"
     );
+    let (repository,retained,contract,environment)=guard.publication_inputs();
+    anyhow::ensure!(retained==worktree,"publication worktree differs from workflow");
+    guard.save_publication(&serde_json::to_string(&PendingPublication {repository:repository.into(),worktree:worktree.into(),issue,
+        branch:branch.into(),head:head.into(),contract:contract.into(),environment:environment.into(),args:args.iter().map(|v|(*v).into()).collect()})?)?;
     let operation = guard.intent(OperationKind::CreatePr)?;
     guard.validate_binding(guard.binding()).await?;
     let result = if operation.receipt.is_some() {
@@ -132,6 +191,7 @@ pub(super) async fn publish(
         &format!("github-pr:{}", result.number),
         Some(result.number),
     )?;
+    guard.forget_publication()?;
     Ok(result)
 }
 
@@ -528,6 +588,60 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(gh.creates, 1);
     }
+    #[tokio::test]
+    async fn pending_publication_reopens_without_another_build_or_create() {
+        const CHILD:&str="AUTOSHIP_PENDING_PUBLICATION_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh.py");
+            std::fs::write(&gh,r#"#!/usr/bin/env python3
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ['AUTOSHIP_PENDING_PUBLICATION_FIXTURE']);a=sys.argv[1:]
+if a[:2]==['repo','view']: print('owner/repo')
+elif a[:2]==['pr','create']:
+    with (root/'creates').open('a') as f:f.write('create\n')
+    print('https://github.com/owner/repo/pull/12')
+elif a[:2]==['pr','list']:
+    if not (root/'creates').exists(): print('[]')
+    elif not (root/'visible').exists():sys.exit(1)
+    else: print(json.dumps([dict(number=12,url='https://github.com/owner/repo/pull/12',headRefOid=(root/'head').read_text(),headRefName='agent-fix/issue-1',isCrossRepository=False,state='OPEN')]))
+else:sys.exit(2)
+"#).unwrap();
+            std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::publication::tests::pending_publication_reopens_without_another_build_or_create","--nocapture"])
+                .env(CHILD,root.path()).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
+                .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("state/workflow.db"))
+                .output().unwrap();
+            assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+            assert!(root.path().join("executed").exists());return;
+        }
+        let root=PathBuf::from(std::env::var_os(CHILD).unwrap());let repo=root.join("repo");std::fs::create_dir(&repo).unwrap();
+        for args in [vec!["init","-q"],vec!["config","user.name","Fixture"],vec!["config","user.email","fixture@example.invalid"]] {
+            assert!(run("git",&args,&repo).await.unwrap().0);
+        }
+        std::fs::write(repo.join("source"),"candidate").unwrap();
+        assert!(run("git",&["add","source"],&repo).await.unwrap().0);
+        assert!(run("git",&["commit","-qm","candidate"],&repo).await.unwrap().0);
+        let head=run("git",&["rev-parse","HEAD"],&repo).await.unwrap().1.trim().to_owned();
+        assert!(run("git",&["update-ref","refs/remotes/origin/main",&head],&repo).await.unwrap().0);
+        std::fs::write(root.join("head"),&head).unwrap();
+        let mut guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&repo,repository:"owner/repo",source_issue:Some(1),pr:None,branch:"agent-fix/issue-1",contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
+        guard.audit_logger().model_call_admitted("codex").unwrap(); // Simulated already-paid builder admission.
+        assert!(publish(&guard,&repo,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1"]).await.is_err());
+        guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",0).await.unwrap();
+        let id=guard.id().to_owned();guard.finish().unwrap();
+        assert!(pending_issue(&repo,1).await.unwrap());
+        std::fs::write(root.join("visible"),"yes").unwrap();
+        reconcile_pending(&repo,false).await.unwrap();
+        let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().pr,Some(12));
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1);
+        assert!(!store.has_pending_publication(&id).unwrap());
+        assert!(store.pending_operations(&id).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap().lines().count(),1);
+        std::fs::write(root.join("executed"),"ok").unwrap();
+    }
+
     #[tokio::test]
     async fn delayed_visibility_and_transient_lookup_never_duplicate_creation() {
         let mut gh=Fake {replies:VecDeque::from([Ok("[]".into()),Ok("created".into()),

@@ -1021,6 +1021,18 @@ impl WorkflowGuard {
     }
 
     /// Pending intents mean remote outcome unknown, never "safe to repeat".
+    pub(super) fn publication_inputs(&self)->(&str,&Path,&str,&str) {
+        (&self.repository,&self.worktree,&self.contract,&self.environment)
+    }
+    pub(super) fn save_publication(&self,body:&str)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .save_publication(&self.lease,&self.binding,&self.repository,body,millis())
+    }
+    pub(super) fn forget_publication(&self)->Result<()> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.forget_publication(&self.lease,millis())
+    }
+
     pub(super) fn pending_operations(&self) -> Result<Vec<Operation>> {
         self.store
             .lock()

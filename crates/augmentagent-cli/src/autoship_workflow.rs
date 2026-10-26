@@ -229,6 +229,7 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS pending_publication(workflow TEXT PRIMARY KEY REFERENCES workflow(id),repository TEXT NOT NULL,body TEXT NOT NULL,updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS observation_reservation(workflow TEXT NOT NULL,generation INTEGER NOT NULL,reserved INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS observation_charge (
                 workflow TEXT NOT NULL, receipt_id TEXT NOT NULL, day INTEGER NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(workflow,receipt_id));
@@ -1334,6 +1335,32 @@ impl WorkflowStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn save_publication(&mut self,lease:&Lease,binding:&Binding,repository:&str,body:&str,now:i64)->Result<()> {
+        ensure!(body.len()<=256*1024,"publication request exceeds bound");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        tx.execute("INSERT INTO pending_publication VALUES(?1,?2,?3,?4) ON CONFLICT(workflow) DO UPDATE SET body=excluded.body,updated_at=excluded.updated_at",
+            params![lease.workflow,repository,body,now])?;
+        event(&tx,&lease.workflow,lease.generation,"publication_request",body,now)?;tx.commit()?;Ok(())
+    }
+    pub fn forget_publication(&mut self,lease:&Lease,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_lease(&tx,lease,now)?;
+        tx.execute("DELETE FROM pending_publication WHERE workflow=?1",[&lease.workflow])?;tx.commit()?;Ok(())
+    }
+    pub fn pending_publications(&self,repository:&str)->Result<Vec<(String,String)>> {
+        let mut stmt=self.conn.prepare("SELECT workflow,body FROM pending_publication WHERE repository=?1 ORDER BY updated_at,workflow LIMIT 16")?;
+        let rows=stmt.query_map([repository],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let values=rows.collect::<rusqlite::Result<_>>()?;Ok(values)
+    }
+    pub fn has_any_pending_publications(&self)->Result<bool> {
+        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_publication')",[],|r|r.get(0))?;
+        if !exists { return Ok(false); }
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM pending_publication)",[],|r|r.get(0))?)
+    }
+    pub fn has_pending_publication(&self,workflow:&str)->Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM pending_publication WHERE workflow=?1)",[workflow],|r|r.get(0))?)
+    }
+
     pub fn pending_operations(&self, workflow: &str) -> Result<Vec<Operation>> {
         let mut statement = self.conn.prepare("SELECT id,kind,binding FROM operation WHERE workflow=?1 AND receipt IS NULL ORDER BY created_at,id")?;
         let rows = statement.query_map([workflow], |r| {
@@ -1453,6 +1480,27 @@ mod tests {
             .unwrap();
         (store, lease)
     }
+    #[test]
+    fn publication_request_survives_reopen_is_fenced_and_does_not_rebill_models() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let (mut store,old)=setup(&path);
+        store.charge(&old,"paid-build",ResourceCharge {model_calls:3,..Default::default()},25).unwrap();
+        let body=serde_json::json!({"issue":1,"head":"head-a","args":["pr","create"]}).to_string();
+        store.save_publication(&old,&binding(),"owner/repo",&body,30).unwrap();
+        let before=store.snapshot(&old.workflow).unwrap().unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        assert!(store.has_pending_publication(&old.workflow).unwrap());
+        assert_eq!(store.pending_publications("owner/repo").unwrap(),vec![(old.workflow.clone(),body.clone())]);
+        assert!(store.pending_publications("other/repo").unwrap().is_empty());
+        let new=store.claim(&old.workflow,"free-reconciler",1021,1000).unwrap().unwrap();
+        assert!(store.forget_publication(&old,1022).is_err());
+        store.save_publication(&new,&binding(),"owner/repo",&body,1023).unwrap();
+        assert_eq!(store.snapshot(&old.workflow).unwrap().unwrap().model_calls,before.model_calls);
+        store.forget_publication(&new,1024).unwrap();
+        assert!(!store.has_any_pending_publications().unwrap());
+        assert!(store.events(&old.workflow).unwrap().iter().any(|(_,kind,_,_)|kind=="publication_request"));
+    }
+
     #[test]
     fn audit_recovery_is_fenced_durable_and_invalidates_approval() {
         let dir = tempfile::tempdir().unwrap();

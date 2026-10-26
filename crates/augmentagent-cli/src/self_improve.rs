@@ -1024,6 +1024,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
 /// Dedup guard: is there already an open PR whose head branch matches our
 /// per-issue convention?
 async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
+    if publication::pending_issue(repo_root,issue).await? { return Ok(true); }
     let gh = gh_bin();
     let branch = format!("{BRANCH_PREFIX}{issue}");
     let (ok, stdout, _) = run(
@@ -1547,6 +1548,9 @@ async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
 /// justification is that it finishes work already approved, and acting on a
 /// guess would make it something else.
 async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
+    if let Err(error)=publication::reconcile_pending(repo_root,dry_run).await {
+        warn!("pending publication reconciliation unavailable: {error:#}");
+    }
     let gh = gh_bin();
     // Repository connection pagination includes ready and draft PRs. Sort
     // locally only after the complete pool is known, then apply fair windows.
@@ -9253,7 +9257,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // remote head that another actor might push during PR creation.
     let (head_ok, published_head, _) = run("git", &["rev-parse", "HEAD"], &worktree).await?;
     let published_head = if head_ok { published_head.trim() } else { "" };
-    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, &args).await;
+    // Persist the already-earned review before the uncertain remote mutation.
+    if (qa_ok || independent.approved()) && park.is_none() && !repaired_after_review {
+        if let Some(receipt)=independent.recorded_verdict() {
+            workflow_guard.record_review("publication-review",independent.approved(),&serde_json::to_string(&receipt)?)?;
+        }
+    }
+    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args).await;
     let (ok, stdout, e) = match created {
         Ok(created) => (true, created.url, String::new()),
         Err(error) => (false, String::new(), format!("{error:#}")),
@@ -9261,12 +9271,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
     if !ok {
-        // #815 — the branch is pushed but has no PR. Left as an `Err` this
-        // re-picks the same issue next tick and dies at the push above.
-        if park_charged {
-            return Ok(RunReport::built(parked_publish_failed(issue.number, "gh pr create failed", &e)));
-        }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:gh pr create", &detail, &diff, lines) }).await));
+        workflow_guard.transition(crate::autoship_workflow::Stage::Publish,
+            "remote_publication_unconfirmed","await_publication_reconcile",chrono::Utc::now().timestamp_millis()+60_000).await?;
+        workflow_guard.finish()?;
+        // Actual builder/reviewer resource charges remain paid. Remote visibility
+        // uncertainty is not a code failure and does not exhaust repair attempts.
+        return Ok(RunReport::built(format!("Autoship #{} awaiting free publication reconciliation; candidate and intent retained: {}",issue.number,truncate(&e,300))));
     }
     let pr_url = stdout.trim().to_string();
     let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
@@ -19798,7 +19808,7 @@ mod iterate_not_delete_tests {
     #[test]
     fn a_parked_publish_failure_records_no_second_attempt() {
         let body = run_once_src();
-        for what in ["git commit failed", "git push failed", "gh pr create failed"] {
+        for what in ["git commit failed", "git push failed"] {
             let hard = body.find(&format!("record_hard_failure(repo_root, issue.number, \"{what}\"")).expect(what);
             let guard = body[..hard].rfind("if park_charged {").expect("guard");
             assert!(body[guard..hard].contains(&format!("parked_publish_failed(issue.number, \"{what}\"")));
