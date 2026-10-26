@@ -485,6 +485,11 @@ pub fn diff_line_count(diff: &str) -> usize {
         .count()
 }
 
+struct CommandGroup(u32);
+impl Drop for CommandGroup {
+    fn drop(&mut self) { unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) }; }
+}
+
 async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, String)> {
     // All maintenance issue/PR writes flow through this runner. Return a normal
     // failed-command result so callers still clean up their worktree and record
@@ -503,13 +508,12 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
             return Ok((false, String::new(), error));
         }
     }
-    let out = Command::new(cmd)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("spawn {cmd} {args:?}"))?;
+    let mut command = Command::new(cmd);
+    command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
+    let child = command.spawn().with_context(|| format!("spawn {cmd}"))?;
+    let _group = CommandGroup(child.id().context("command has no process id")?);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), child.wait_with_output())
+        .await.context("metadata/publication command timed out; reconcile durable intent before retry")??;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -678,6 +682,11 @@ async fn run_sandboxed(
     cwd: &Path,
     env: &[(String, String)],
 ) -> Result<(bool, String, String)> {
+    run_sandboxed_bounded(cmd, args, cwd, env, augmentagent_channel_core::reasoner::reasoner_timeout() * 2).await
+}
+
+async fn run_sandboxed_bounded(cmd: &str, args: &[&str], cwd: &Path, env: &[(String, String)],
+    budget: std::time::Duration) -> Result<(bool, String, String)> {
     let child = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
@@ -704,7 +713,9 @@ async fn run_sandboxed(
     let target = env_path("CARGO_TARGET_DIR");
     let temp = env_path("TMPDIR");
     let output = async { Ok::<_, anyhow::Error>(child.wait_with_output().await?) };
-    let out = crate::build_storage::watch_reserve_roots(target.as_deref(), temp.as_deref(), output).await?;
+    let out = tokio::time::timeout(budget,
+        crate::build_storage::watch_reserve_roots(target.as_deref(), temp.as_deref(), output))
+        .await.context("verification invocation timed out; preserve candidate and retry stage")??;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -10617,14 +10628,32 @@ struct DailyCounter {
     /// No new run starts before this instant (unix seconds): the spread gate.
     #[serde(default)]
     not_before: Option<i64>,
+    #[serde(default)]
+    history: std::collections::BTreeMap<u64, u32>,
 }
 
 impl DailyCounter {
     fn runs_today(&mut self, day: u64) -> u32 {
-        if day != self.day {
-            *self = Self { day, ..Self::default() };
+        if day > self.day {
+            let mut history = std::mem::take(&mut self.history);
+            history.insert(self.day, self.runs);
+            while history.len() > 32 { if let Some(first) = history.keys().next().copied() { history.remove(&first); } }
+            *self = Self { day, history, ..Self::default() };
         }
-        self.runs
+        if day == self.day { self.runs } else { self.history.get(&day).copied().unwrap_or(0) }
+    }
+
+    fn settle(&mut self, started: u64, completed: u64, billed: bool) {
+        let _ = self.runs_today(completed);
+        if !billed {
+            if started == self.day { self.runs = self.runs.saturating_sub(1); }
+            else if let Some(runs) = self.history.get_mut(&started) { *runs = runs.saturating_sub(1); }
+        } else if completed != started {
+            // A run spanning midnight used both days; retain the old debit and
+            // charge completion rather than resetting the new day's capacity.
+            self.record(completed);
+        }
+        self.not_before = None; // migrate obsolete calendar spacing away
     }
 
     /// #1215 — feed the current Claude latch, if any: `(reset, reason)`.
@@ -10652,7 +10681,8 @@ impl DailyCounter {
 
     fn record(&mut self, day: u64) {
         let _ = self.runs_today(day);
-        self.runs += 1;
+        if day == self.day { self.runs = self.runs.saturating_add(1); }
+        else { let count = self.history.entry(day).or_default(); *count = count.saturating_add(1); }
     }
 
     /// #814 — read the counter back from disk, defaulting to a fresh one.
@@ -10672,21 +10702,31 @@ impl DailyCounter {
             .unwrap_or_default()
     }
 
-    /// Best-effort persist. A write failure must never abort a run — it only
-    /// costs the cap its memory, which is where we already were.
-    fn save(&self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match serde_json::to_vec(self) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, bytes) {
-                    warn!(path = %path.display(), "could not persist auto-PR daily counter: {e}");
-                }
-            }
-            Err(e) => warn!("could not serialize auto-PR daily counter: {e}"),
+    fn load_checked(path: &Path) -> Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("daily accounting corrupt; refuse to reset resource budget"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
         }
     }
+
+    /// Atomic reservation persistence must finish before any paid work starts.
+    fn persist(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+        let dir = path.parent().context("daily counter has no parent")?;
+        std::fs::create_dir_all(dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|error| error.error)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn save(&self, path: &Path) {
+        if let Err(error) = self.persist(path) { warn!(path=%path.display(), "could not persist daily accounting: {error:#}"); }
+    }
+
 }
 
 /// #851 — which issues were already attempted today, so the picker never
@@ -11413,25 +11453,6 @@ fn is_quota_latch(reason: &str) -> bool {
     reason.contains("rate limit")
 }
 
-/// #1215 — how long to wait after an engaged run before starting the next:
-/// the rest of the UTC day split so the remaining runs cover it, never less
-/// than the tick interval. Without this every run started back to back at
-/// 00:00 UTC and the loop idled for the other ~19 hours.
-fn next_tick_delay(
-    now: chrono::DateTime<chrono::Utc>,
-    cap: u32,
-    runs_so_far: u32,
-    interval: std::time::Duration,
-) -> std::time::Duration {
-    let left = cap.saturating_sub(runs_so_far);
-    if left == 0 {
-        return interval;
-    }
-    let secs_into_day = now.timestamp().rem_euclid(86_400) as u64;
-    let remaining = 86_400 - secs_into_day;
-    interval.max(std::time::Duration::from_secs(remaining / (u64::from(left) + 1)))
-}
-
 fn utc_day_of(now: chrono::DateTime<chrono::Utc>) -> u64 {
     now.timestamp().div_euclid(86_400) as u64
 }
@@ -11461,31 +11482,6 @@ impl AutoPrLoop {
     const DEFAULT_DAILY_CAP: u32 = 5;
     /// How many consecutive triage-only refusals one tick may clear.
     const MAX_TRIAGE_PER_TICK: u32 = 5;
-    /// #954 — no tick may outlive this. Generous (a builder legitimately
-    /// compiles for tens of minutes), but 15 h is a wedge, and awaiting one
-    /// forever stops every later tick.
-    const MAX_TICK: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
-
-    /// A tick that outran its budget is dropped — its #816 `RunLock` and any
-    /// half-built worktree go with it — and recorded as an `Infra` harness
-    /// failure: never charged to the model, so the next tick may retry it.
-    fn abandon_wedged_tick(max_tick: std::time::Duration) {
-        let secs = max_tick.as_secs();
-        let issue = CURRENT_ISSUE.swap(0, std::sync::atomic::Ordering::Relaxed);
-        warn!(issue, budget_secs = secs, "auto-PR: tick outran its budget; abandoned (#954)");
-        if issue == 0 {
-            return; // Wedged before committing to an issue; nothing to charge.
-        }
-        let rec = AttemptRecord {
-            kind: FailureKind::Infra,
-            stage: "abandoned-tick".into(),
-            detail: format!("no result in {secs}s; run abandoned so the loop keeps ticking"),
-            wall_secs: secs,
-            ..AttemptRecord::unspecified()
-        };
-        record_reasoner_error(issue, rec);
-    }
-
     /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
     /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
     /// tick does a real `gh issue list`) and `AUGMENTAGENT_AUTOPR_DAILY_CAP`
@@ -11558,23 +11554,46 @@ impl AutoPrLoop {
 
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
-        self.run_with(shutdown, Self::MAX_TICK, move || {
+        let sweep_root = root.clone();
+        self.run_with(shutdown, move || {
             let root = root.clone();
             async move { run_once(&root, dry_run).await }
-        })
-        .await
+        }, move || {
+            let root = sweep_root.clone();
+            async move { merge_sweep(&root, dry_run).await }
+        }).await
     }
 
-    /// The loop body, over an injectable tick + budget (#954's wedge, tested).
-    async fn run_with<F, T>(
-        self,
-        shutdown: tokio_util::sync::CancellationToken,
-        max_tick: std::time::Duration,
-        tick: F,
-    ) -> Result<()>
-    where
-        F: Fn() -> T,
-        T: std::future::Future<Output = Result<RunReport>>,
+    /// Reconciliation runs independently of a builder's lifetime and budget.
+    /// Individual commands/providers own their watchdog and cleanup boundary.
+    async fn run_with<F, T, S, U>(self, shutdown: tokio_util::sync::CancellationToken,
+        tick: F, sweep: S) -> Result<()>
+    where F: Fn() -> T, T: std::future::Future<Output = Result<RunReport>>,
+        S: Fn() -> U, U: std::future::Future<Output = usize>,
+    {
+        let interval = self.interval;
+        let stop = shutdown.clone();
+        let reconciliation = async move {
+            let mut timer = tokio::time::interval(interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = stop.cancelled() => return Ok(()), _ = timer.tick() => {} }
+                let swept = tokio::select! {
+                    _ = stop.cancelled() => return Ok(()),
+                    swept = sweep() => swept,
+                };
+                if swept > 0 { info!(swept, "auto-PR: reconciled approved drafts independently of builder"); }
+            }
+        };
+        tokio::select! {
+            biased;
+            result = self.run_builds(shutdown, tick) => result,
+            result = reconciliation => result,
+        }
+    }
+
+    async fn run_builds<F, T>(self, shutdown: tokio_util::sync::CancellationToken, tick: F) -> Result<()>
+    where F: Fn() -> T, T: std::future::Future<Output = Result<RunReport>>,
     {
         info!(
             interval_secs = self.interval.as_secs(),
@@ -11583,7 +11602,7 @@ impl AutoPrLoop {
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
         let counter_path = self.counter_path.clone();
-        let mut counter = DailyCounter::load(&counter_path);
+        let mut counter = DailyCounter::load_checked(&counter_path)?;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -11592,20 +11611,12 @@ impl AutoPrLoop {
                 }
                 _ = tokio::time::sleep(self.interval) => {}
             }
-            // #1029 — finish already-approved drafts FIRST, and outside the
-            // cap. This spends no reasoner call, so a reasoner budget must not
-            // gate it; gating it is what let approved PRs sit for days.
-            let swept = merge_sweep(&self.repo_root, self.dry_run).await;
-            if swept > 0 {
-                info!(swept, "auto-PR: merged already-approved drafts (unbilled)");
-            }
-
             let now = (self.clock)();
             let today = utc_day_of(now);
             // #1215 — the quota brake: count today's Claude quota latches.
             let latch = self.latch.latched_entry("claude");
             counter.observe_claude_latch(today, latch.as_ref().map(|(t, r)| (*t, r.as_str())));
-            counter.save(&counter_path);
+            counter.persist(&counter_path)?;
             let cap = counter.cap_today(today, self.daily_cap);
             if counter.runs_today(today) >= cap {
                 info!(
@@ -11615,11 +11626,6 @@ impl AutoPrLoop {
                 );
                 continue;
             }
-            // #1215 — the spread gate: the last run set when the next may start.
-            if let Some(at) = counter.not_before.filter(|at| now.timestamp() < *at) {
-                info!(not_before = at, "auto-PR: spreading today's runs; next run later");
-                continue;
-            }
             // Triage-only outcomes are cheap and permanently label the
             // issue out of the pool, so keep going within the SAME tick
             // instead of spending a 30-minute interval on each one. Bounded
@@ -11627,45 +11633,33 @@ impl AutoPrLoop {
             // refusal, so this burst is self-limiting.
             let mut triaged = 0u32;
             loop {
-                // #954 — bounded AND cancellable: the 15 h freeze swallowed
-                // shutdown, and awaiting a wedged run forever stopped every
-                // later tick. Abandoning one costs a single tick.
+                // Reserve before spending so restart/shutdown cannot erase work.
+                let started_day = utc_day_of((self.clock)());
+                counter.record(started_day);
+                counter.persist(&counter_path)?;
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
-                        info!("auto-PR loop stopped mid-tick");
+                        info!("auto-PR loop stopped mid-stage; reservation and checkpoint retained");
                         return Ok(());
                     }
-                    r = tokio::time::timeout(max_tick, tick()) => r,
+                    r = tick() => r,
                 };
-                let Ok(outcome) = outcome else {
-                    Self::abandon_wedged_tick(max_tick);
-                    break;
-                };
+                let completed_day = utc_day_of((self.clock)());
+                let billed = outcome.as_ref().map_or(true, |r| r.billed);
+                counter.settle(started_day, completed_day, billed);
+                counter.persist(&counter_path)?;
                 match outcome {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
-                        counter.record(today);
+                        // The reservation was settled against the actual completion day.
                         // #1532 — the single debt-accounting site, next to the
                         // one that spends the budget: a billed resume owes the
                         // new-issue lane a slot, a billed build settles up.
                         // Persisted, so it survives the post-merge daemon
                         // restart exactly as the run count does (#814).
                         FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
-                        // #1215 — spread the rest of today's runs over the
-                        // rest of the day. This replaces #851's same-tick
-                        // continuation, which spent every run back to back
-                        // at 00:00 UTC; the attempt ledger still guarantees
-                        // the next pick is a different issue.
-                        let delay = next_tick_delay((self.clock)(), cap, counter.runs, self.interval);
-                        counter.not_before = Some((self.clock)().timestamp() + delay.as_secs() as i64);
-                        counter.save(&counter_path);
-                        info!(
-                            runs_today = counter.runs_today(today),
-                            daily_cap = cap,
-                            next_in_secs = delay.as_secs(),
-                            "auto-PR: {r}"
-                        );
+                        info!(runs_today = counter.runs_today(completed_day), daily_cap = cap, "auto-PR: {r}");
                         break;
                     }
                     Ok(r) => {
@@ -12213,28 +12207,13 @@ for tool, arguments in [
         assert_eq!(c.runs_today(day + 1), 0);
     }
 
-    /// C3 — after a run, the next one waits so the remaining runs cover the
-    /// rest of the UTC day, never less than the tick interval.
-    #[test]
-    fn next_run_is_spread_across_the_rest_of_the_utc_day() {
-        let interval = std::time::Duration::from_secs(1800);
-        let at_midnight = next_tick_delay(utc("2026-09-26T00:00:00Z"), 5, 0, interval);
-        assert!(at_midnight >= std::time::Duration::from_secs(4 * 3600), "{at_midnight:?}");
-        assert_eq!(
-            next_tick_delay(utc("2026-09-26T22:00:00Z"), 5, 4, interval),
-            std::time::Duration::from_secs(3600)
-        );
-        assert_eq!(next_tick_delay(utc("2026-09-26T23:45:00Z"), 5, 4, interval), interval, "the floor");
-        assert_eq!(next_tick_delay(utc("2026-09-26T12:00:00Z"), 5, 5, interval), interval, "capped: no spread");
-    }
-
     /// C4 — a scripted UTC day with every candidate green: exactly `cap`
     /// engaged runs, spread over the day, and the next candidate is not
     /// built. Paused tokio time drives a synthetic clock; nothing touches
     /// the owner's state (counter and latch live in a tempdir, and the repo
     /// root does not exist, so the sweep's `gh` fails synchronously).
     #[tokio::test(start_paused = true)]
-    async fn a_scripted_green_day_ships_exactly_the_cap_spread_across_it() {
+    async fn a_scripted_green_day_ships_at_poll_cadence_until_cap() {
         use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
         let state = tempfile::tempdir().unwrap();
         let start = tokio::time::Instant::now();
@@ -12249,7 +12228,7 @@ for tool, arguments in [
         let asked = Arc::new(AtomicU32::new(0));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (seen, stop, runs, now) = (Arc::clone(&built), shutdown.clone(), Arc::clone(&asked), Arc::clone(&clock));
-        let run = lp.run_with(shutdown, AutoPrLoop::MAX_TICK, move || {
+        let run = lp.run_with(shutdown, move || {
             let (seen, stop, runs, now) = (Arc::clone(&seen), stop.clone(), Arc::clone(&runs), Arc::clone(&now));
             async move {
                 let at = now();
@@ -12261,7 +12240,7 @@ for tool, arguments in [
                 seen.lock().unwrap().push(at);
                 Ok(RunReport::built(format!("issue #{nth}: PR auto-merged")))
             }
-        });
+        }, || async { 0 });
         // Past the end of the synthetic day, the loop must have stopped.
         tokio::time::timeout(std::time::Duration::from_secs(26 * 3600), run)
             .await
@@ -12274,9 +12253,9 @@ for tool, arguments in [
         let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
         assert_eq!((counter.day, counter.runs), (utc_day_of(utc("2026-09-27T00:00:00Z")), 0));
         let last = *built.last().unwrap();
-        assert!(last >= utc("2026-09-26T16:00:00Z"), "runs cover the day, not its first hours: {built:?}");
+        assert!(last <= utc("2026-09-26T03:00:00Z"), "no calendar spacing after productive work: {built:?}");
         for pair in built.windows(2) {
-            assert!(pair[1] - pair[0] >= chrono::Duration::hours(2), "spread: {built:?}");
+            assert_eq!(pair[1] - pair[0], chrono::Duration::minutes(30));
         }
     }
 
@@ -12760,39 +12739,69 @@ for tool, arguments in [
         assert_eq!(c.runs_today(101), 1);
     }
 
-    /// #954 verbatim, loop side: on 2026-09-04 a run parked forever on a
-    /// leaked CLI-gate permit (15 h, no email triage, no auto-PR). The loop
-    /// must abandon that run and keep ticking, not await it for good.
-    #[tokio::test]
-    async fn a_wedged_tick_is_abandoned_so_the_loop_keeps_ticking() {
-        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
-        let ms = std::time::Duration::from_millis;
-        assert_eq!(AutoPrLoop::MAX_TICK, std::time::Duration::from_secs(3 * 60 * 60));
-        // Cap `u32::MAX`: the tick that matters is the one AFTER the wedge.
-        let (root, cap) = (PathBuf::from("/nonexistent"), u32::MAX);
+    #[tokio::test(start_paused = true)]
+    async fn productive_seven_hour_tick_keeps_running_while_merge_sweep_advances() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
         let state = tempfile::tempdir().unwrap();
-        let mut lp = AutoPrLoop::for_tests(root, cap, state.path());
-        lp.interval = ms(5);
-        let calls = Arc::new(AtomicU32::new(0));
+        let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path());
+        lp.interval = std::time::Duration::from_secs(1800);
+        let start = tokio::time::Instant::now();
+        let base = utc("2026-09-26T20:00:00Z");
+        lp.clock = Arc::new(move || base + chrono::Duration::from_std(tokio::time::Instant::now()-start).unwrap());
+        let completed = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(false));
+        let sweeps_during_build = Arc::new(AtomicU32::new(0));
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (seen, stop) = (Arc::clone(&calls), shutdown.clone());
-        let run = lp.run_with(shutdown, ms(50), move || {
-            let (nth, stop) = (seen.fetch_add(1, SeqCst), stop.clone());
+        let (done, running) = (completed.clone(), active.clone());
+        let (sweep_done, sweep_active, sweeps, stop) = (completed.clone(), active.clone(), sweeps_during_build.clone(), shutdown.clone());
+        lp.run_with(shutdown, move || {
+            let (done, running) = (done.clone(), running.clone());
             async move {
-                if nth == 0 {
-                    std::future::pending::<()>().await; // The freeze, verbatim.
-                }
-                stop.cancel();
-                Ok(RunReport::idle())
+                running.store(true, SeqCst);
+                for _ in 0..7 { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
+                running.store(false, SeqCst);
+                done.store(true, SeqCst);
+                Ok(RunReport::built("seven productive stages completed".into()))
             }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(10), run)
-            .await
-            .expect("a wedged run must not stop every later tick")
-            .expect("abandoning a tick is not a loop failure");
-        assert_eq!(calls.load(SeqCst), 2);
-        // Abandoned mid-run, the attempt is the harness's, never the model's.
-        assert!(!FailureKind::Infra.counts_toward_max_attempts());
+        }, move || {
+            let (done, active, sweeps, stop) = (sweep_done.clone(), sweep_active.clone(), sweeps.clone(), stop.clone());
+            async move {
+                if active.load(SeqCst) { sweeps.fetch_add(1, SeqCst); }
+                if done.load(SeqCst) { stop.cancel(); }
+                1
+            }
+        }).await.unwrap();
+        assert!(completed.load(SeqCst));
+        assert!(sweeps_during_build.load(SeqCst) >= 12, "ready PR reconciliation cannot wait for builder completion");
+        let mut counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs_today(utc_day_of(base)), 1, "old-day resource reservation retained");
+        assert_eq!(counter.runs_today(utc_day_of(base)+1), 1, "completion charged to actual day");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_active_builder_without_erasing_reservation() {
+        let state = tempfile::tempdir().unwrap();
+        let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path());
+        lp.interval = std::time::Duration::from_secs(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        lp.run_with(shutdown, move || {
+            let stop = stop.clone();
+            async move { stop.cancel(); std::future::pending::<Result<RunReport>>().await }
+        }, || async { 0 }).await.unwrap();
+        assert_eq!(DailyCounter::load(&state.path().join("autopr-daily-runs.json")).runs, 1);
+    }
+
+    #[tokio::test]
+    async fn individual_hung_gate_is_stopped_without_deleting_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("candidate"), "keep work").unwrap();
+        let result = run_sandboxed_bounded("/bin/sh", &["-c", "sleep 0.2; touch late-write"],
+            dir.path(), &[("PATH".into(), "/usr/bin:/bin".into())], std::time::Duration::from_millis(20)).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("verification invocation timed out"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!dir.path().join("late-write").exists(), "timed-out descendant must be terminated");
+        assert_eq!(std::fs::read_to_string(dir.path().join("candidate")).unwrap(), "keep work");
     }
 
     // ---- throughput: cheap triage must not cost a build's budget ----
@@ -17867,11 +17876,10 @@ else:
         let end = start + src[start..].find("\n#[cfg(test)]\n").expect("end of AutoPrLoop");
         let body = &src[start..end];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
-        assert!(body.contains("counter.record(today);"));
-        // #954 — the production tick runs on MAX_TICK, the budget whose
-        // expiry `a_wedged_tick_is_abandoned_so_the_loop_keeps_ticking` drives.
-        assert!(body.contains("self.run_with(shutdown, Self::MAX_TICK, move ||"), "prod budget");
-        assert!(body.contains("r = tokio::time::timeout(max_tick, tick()) => r,"), "bounded tick");
+        assert!(body.contains("counter.settle(started_day, completed_day, billed);"));
+        assert!(body.contains("result = self.run_builds(shutdown, tick) => result"));
+        assert!(body.contains("result = reconciliation => result"));
+        assert!(!body.contains("timeout(max_tick"));
     }
 
     // Structural (codex on #859): a revision-round failure is recorded with
