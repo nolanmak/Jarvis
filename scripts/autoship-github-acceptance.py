@@ -39,6 +39,7 @@ def main():
     binary = args.test_binary.resolve(strict=True)
     root = Path(tempfile.mkdtemp(prefix='autoship-github-acceptance-'))
     repo_root = root / 'repository'
+    print(f'Fixture evidence: {root}', flush=True)
 
     def call(*cmd, cwd=None, env=None, stdin=None):
         result = subprocess.run(cmd, cwd=cwd, env=env, input=stdin, text=True,
@@ -57,6 +58,7 @@ def main():
     repository = f'{owner}/autoship-acceptance-{uuid.uuid4().hex[:16]}'
     (root / 'repository.json').write_text(json.dumps({'repository': repository, 'marker': MARKER}))
     gh('repo', 'create', repository, '--public', '--description', MARKER)
+    print(f'Synthetic repository: {repository}', flush=True)
     call('git', 'clone', f'https://github.com/{repository}.git', str(repo_root))
     git('config', 'user.name', 'Synthetic Autoship Probe')
     git('config', 'user.email', 'probe@example.invalid')
@@ -109,6 +111,7 @@ def main():
         raise RuntimeError('synthetic checks did not complete within five minutes')
 
     def probe(mode, pr, head, **extra):
+        print(f'Checking {mode}: PR #{pr}', flush=True)
         env = dict(os.environ, AUTOSHIP_GITHUB_PROBE_REPOSITORY=repository,
                    AUTOSHIP_GITHUB_PROBE_ROOT=str(repo_root), AUTOSHIP_GITHUB_PROBE_MODE=mode,
                    AUTOSHIP_GITHUB_PROBE_PR=pr, AUTOSHIP_GITHUB_PROBE_HEAD=head, **extra)
