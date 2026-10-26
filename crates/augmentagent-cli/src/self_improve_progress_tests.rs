@@ -234,7 +234,7 @@ fn resumed_reviews_recover_latest_findings_without_minting_approval() {
 async fn approved_ready_pr_survives_pending_checks_failed_merge_and_head_change() {
     const CHILD: &str = "AUTOSHIP_PROGRESS_FIXTURE";
     if std::env::var_os(CHILD).is_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("autoship-sweep-test-").tempdir_in("/tmp").unwrap();
         let root = dir.path();
         let gh = root.join("gh.py");
         std::fs::write(&gh, r#"#!/usr/bin/env python3
