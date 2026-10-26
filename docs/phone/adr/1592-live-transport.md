@@ -96,9 +96,11 @@ outbound-only service. Revisit the choice if measured latency misses #1591.
 * Forward `media` followed by a unique `mark`. A returned mark confirms that
   preceding audio drained, not when its first sample became audible. A `clear`
   releases audio but returned marks for cleared buffers are not playback proof.
-* Buffer at most two seconds (16,000 mu-law bytes) awaiting playback, with a
-  separate bounded outstanding-mark count. Overflow fails the session explicitly;
-  it never queues unlimited delayed speech or silently drops tool results.
+* Buffer at most two seconds (16,000 mu-law bytes) awaiting Twilio playback,
+  with a separate bounded outstanding-mark count. When capacity is exhausted,
+  hold at most one provider frame (16,000 bytes) locally and pause provider reads
+  until marks free capacity. Oversized provider frames fail the session. Never
+  queue unlimited delayed speech or silently drop tool results.
 * A `stop`, socket close or generic terminal call status does not establish an
   owner hangup. Keep provider failure, app stop and ambiguous closure separate.
 * No raw audio/transcripts/provider error bodies enter public diagnostics.
