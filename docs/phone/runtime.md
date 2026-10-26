@@ -728,18 +728,21 @@ the text never reaches history or the model):
 
 ## Terminal and recoverable relay conditions (#1549)
 
-Once a relay socket is authenticated and claimed, only nine conditions end it.
+Authenticated relay termination uses nine fixed diagnostic categories.
 `ingress::EndReason` enumerates them and a wildcard-free test keeps the set
 exact: `peer_closed` (the provider closed the WebSocket, or sent an error code
 Twilio documents as session-terminating: 64104, 64105, 64108), `transport_error`
-(a socket read or write failed), `owner_hangup` (the call left the connected
-state or a stop was requested, including an `end` we sent), `revoked` (call
+(a socket operation or provider call failed), `owner_hangup` (reserved for
+explicit evidence of an owner hangup, which is not currently available), `revoked` (call
 authority can no longer be verified; an unreadable call record fails closed the
 same way), `duration_limit`, `worker_failed` (the agent worker stopped before
 the connection did), `invalid_frame_limit`, `agent_end` (Jarvis said goodbye and
 sent `end` itself, #1557) and `silence` (nobody spoke through both check-ins,
 #1556). The TwiML is `<Connect>` followed
 by `<Hangup/>`, so any other exit would hang up on the owner.
+
+A generic stop request, completed call or canceled call remains `peer_closed`;
+none identifies who ended the call. Failed calls retain `transport_error`.
 
 Everything else is recoverable and the loop continues:
 
