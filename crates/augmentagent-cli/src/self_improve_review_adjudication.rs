@@ -70,6 +70,7 @@ impl Input<'_> {
             // this final conversation has reread the entire candidate.
             let mut evidence=serde_json::json!({
                 "full_evidence_manifest_sha256":aligned::digest(&serde_json::to_vec(&self.evidence)?),
+                "controller_acceptance":self.evidence.get("controller_acceptance"),
                 "completed_review_receipts":self.review.passes.iter().map(|pass|serde_json::json!({"role":pass.role,
                     "receipt_sha256":aligned::digest(&serde_json::to_vec(pass).expect("serialize review receipt"))})).collect::<Vec<_>>(),
                 "reviewed_source":source,

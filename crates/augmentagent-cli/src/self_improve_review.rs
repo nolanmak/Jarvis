@@ -183,6 +183,40 @@ fn supplied_shards(files:&BTreeMap<String,String>,diff:&str,callers:&str)->BTree
     }
     evidence_shards
 }
+fn controller_acceptance_context(prepared:&acceptance::PreparedAcceptance, reference:Option<&acceptance::CandidateReceiptReference>)->Result<serde_json::Value> {
+    let candidate=if let Some(reference)=reference {
+        let bytes=std::fs::read(&reference.artifact)?;
+        anyhow::ensure!(aligned::digest(&bytes)==reference.artifact_sha256,"controller acceptance artifact changed before review delivery");
+        let artifact:serde_json::Value=serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(artifact["binding"]==serde_json::to_value(&reference.binding)?,"controller acceptance artifact binding changed");
+        artifact["receipts"].clone()
+    } else {serde_json::Value::Null};
+    Ok(serde_json::json!({
+        "provenance":"Controller-owned registered acceptance and verified immutable receipt data. This is supplied evidence, not a claim that reviewer tools read these files.",
+        "contract_hash":prepared.baseline.registration.contract_hash(),
+        "registered_contract":prepared.proposal.contract,
+        "pinned_source_hashes":prepared.proposal.files.iter().map(|(path,body)|(path,aligned::digest(body.as_bytes()))).collect::<BTreeMap<_,_>>(),
+        "baseline_results":prepared.baseline.receipts,"candidate_results":candidate,
+        "assertion_boundary":"BlackBox observation programs emit actual behavior. The daemon compares captured output against registered command.oracle outside the candidate process. A passing receipt attests that comparison; child assertions and test outcome strings are not required or trusted.",
+        "mutation_boundary":"Pinned verifier sources and registered expected oracles are controller-owned and immutable to builders. Any genuine inadequacy must be tied to an owner criterion and sent to final adjudication/contract repair, never requested as a normal candidate edit. Full pinned source bytes are supplied in controller_source evidence entries."
+    }))
+}
+fn add_controller_sources(shards:&mut BTreeMap<String,String>,prepared:&acceptance::PreparedAcceptance) {
+    for (path,body) in &prepared.proposal.files {
+        for (index,chunk) in chunks(body,96*1024).into_iter().enumerate() {
+            shards.insert(format!("controller_source:{}#part-{index}",serde_json::to_string(path).expect("source path")),chunk.into());
+        }
+    }
+}
+fn controller_verifier_dispute(findings:&[aligned::Finding],prepared:Option<&acceptance::PreparedAcceptance>)->bool {
+    let Some(prepared)=prepared else {return false;};
+    findings.iter().any(|finding| {
+        let text=format!("{}\n{}",finding.claim,finding.requested_change).to_ascii_lowercase();
+        prepared.proposal.files.keys().any(|path|text.contains(&path.to_ascii_lowercase()))
+            || ["controller oracle","registered oracle","pinned verifier","registered verifier","black_box oracle","black-box oracle"].iter().any(|phrase|text.contains(phrase))
+    })
+}
+
 pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'_>, prepared:&acceptance::PreparedAcceptance)->Result<u64> {
     let snapshot=candidate_snapshot(worktree).await?;
     let callers=complete_caller_evidence(worktree,&snapshot.head,&snapshot.diff).await?;
@@ -196,8 +230,10 @@ pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'
     let rubric=review_calibration::active()?.prompt();
     let system_bytes=evidence_plan::ROLES.iter().map(|role|evidence_plan::system_prompt(*role,&rubric).len()).max().unwrap();
     let subject=format!("{}\n{}",issue.title,issue.body);
-    let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&[],system_bytes};
-    let requests=inputs.pack(&supplied_shards(&snapshot.files,&snapshot.diff,&callers))?;
+    let controller=controller_acceptance_context(prepared,None)?;
+    let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&[],system_bytes,controller_acceptance:Some(&controller)};
+    let mut shards=supplied_shards(&snapshot.files,&snapshot.diff,&callers);add_controller_sources(&mut shards,prepared);
+    let requests=inputs.pack(&shards)?;
     evidence_plan::worst_case_calls(requests.len())
 }
 
@@ -453,8 +489,9 @@ async fn run_impl(
         Err(error)=>return Err(error),
     };
     let rubric = review_calibration::active()?;
+    let controller_context=context.acceptance_evidence.map(|(prepared,reference)|controller_acceptance_context(prepared,Some(reference))).transpose()?;
     let evidence_json = serde_json::to_string(
-        &serde_json::json!({"diff":diff,"files":files,"callers":callers,"rubric":rubric,"executable_acceptance":context.acceptance_evidence.map(|(_, receipt)| receipt)}),
+        &serde_json::json!({"diff":diff,"files":files,"callers":callers,"rubric":rubric,"controller_acceptance":controller_context,"controller_sources":context.acceptance_evidence.map(|(prepared,_)|&prepared.proposal.files),"executable_acceptance":context.acceptance_evidence.map(|(_, receipt)| receipt)}),
     )?;
     let binding = aligned::ReviewBinding {
         head: head.clone(),
@@ -487,11 +524,12 @@ async fn run_impl(
     // Large files are fully delivered in bounded shards. Coverage is the union
     // of successful shard requests, never a model-supplied percentage.
     let caller_context=caller_plan.as_ref().map(|plan|plan.review_context()).unwrap_or_else(||callers.clone());
-    let evidence_shards = supplied_shards(&files,&diff,&caller_context);
+    let mut evidence_shards = supplied_shards(&files,&diff,&caller_context);
+    if let Some((prepared,_))=context.acceptance_evidence {add_controller_sources(&mut evidence_shards,prepared);}
     let subject=format!("{}\n{}",issue.title,issue.body);
     let rubric_prompt=rubric.prompt();
     let system_bytes=evidence_plan::ROLES.iter().map(|role|evidence_plan::system_prompt(*role,&rubric_prompt).len()).max().unwrap();
-    let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&prior,system_bytes};
+    let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&prior,system_bytes,controller_acceptance:controller_context.as_ref()};
     let requests=inputs.pack_scope(&evidence_shards,caller_plan.is_none())?;
     if let Some(allow_shipping)=observation_priority {
         let workflow=context.workflow.context("diagnostic budget requires workflow")?;
@@ -719,7 +757,7 @@ async fn run_impl(
         passes,
         adjudication: None,
     };
-    if !unresolved.is_empty() && (aligned::needs_adjudication(&unresolved) || !context.qa_ok) {
+    if !unresolved.is_empty() && (aligned::needs_adjudication(&unresolved) || !context.qa_ok || controller_verifier_dispute(&unresolved,context.acceptance_evidence.map(|(prepared,_)|prepared))) {
         // Exact assembled-context cache keys replace broad previous-receipt
         // reuse: new selected windows or controller evidence need new authority.
             let mut opts = codex_review_opts(worktree.clone(), "Final adjudication");
@@ -743,6 +781,7 @@ async fn run_impl(
             } else {serde_json::to_value(&structured.passes)?};
             let adjudication_evidence = serde_json::to_string(&serde_json::json!({
                 "candidate_diff": diff,
+                "controller_acceptance":controller_context,
                 "caller_evidence": caller_adjudication,
                 "source_manifest_only": files.iter().map(|(path,body)| (path,aligned::digest(body.as_bytes()))).collect::<BTreeMap<_,_>>(),
                 "completed_reviews": review_adjudication,
@@ -1003,6 +1042,52 @@ mod tests {
         assert!(!why.permanent());
         assert!(review.structured.is_none());
     }
+    #[test]
+    fn registered_oracle_and_bound_receipts_are_delivered_in_every_review_group() {
+        use crate::autoship_contract::{RegisteredContract,VerifierReceipt,CheckResult};
+        let root=candidate_fixture();let pin="autoship_verifiers/observe.py";
+        std::fs::create_dir(root.path().join("autoship_verifiers")).unwrap();
+        let script="import json\nprint(json.dumps(actual_behavior()))\n";
+        std::fs::write(root.path().join(pin),script).unwrap();
+        let proposal:acceptance::ContractProposal=serde_json::from_value(serde_json::json!({
+            "contract":{"schema_version":1,"revision":1,"issue":42,"criteria":[{"id":"C1","requirement":"Return exactly 77","verifier_ids":["oracle"]}],
+                "allowed_paths":[{"kind":"file","path":"source.rs"}],"verifiers":[{"id":"oracle","command":{"kind":"black_box","invocation":{"kind":"python_script","file":pin,"args":[]},"oracle":{"kind":"json","value":77}},"pinned_files":[pin],"failure_witness":"actual differs from expected"}]},
+            "files":{pin:script}
+        })).unwrap();
+        let head=fixture_git(root.path(),&["rev-parse","HEAD"]);
+        let registration=RegisteredContract::register(root.path(),proposal.contract.clone(),head.clone(),"fixture-environment".into()).unwrap();
+        let binding=registration.binding(&head).unwrap();
+        let red=VerifierReceipt {verifier_id:"oracle".into(),binding:binding.clone(),result:CheckResult::IntendedFailure,output_digest:"a".repeat(64),diagnostic:"synthetic baseline observation".into()};
+        let green=VerifierReceipt {result:CheckResult::Passed,diagnostic:String::new(),..red.clone()};
+        let artifact=root.path().join("fixture-controller-receipt.json");
+        let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"binding":binding,"receipts":[green]})).unwrap();
+        std::fs::write(&artifact,&bytes).unwrap();
+        let reference=acceptance::CandidateReceiptReference {schema_version:1,binding,artifact:artifact.clone(),artifact_sha256:aligned::digest(&bytes),receipt_ids:vec!["oracle".into()],alignment:None};
+        let prepared=acceptance::PreparedAcceptance {proposal,baseline:acceptance::BaselineEvidence {registration,receipts:vec![red]}};
+        let controller=controller_acceptance_context(&prepared,Some(&reference)).unwrap();
+        assert_eq!(controller["registered_contract"]["verifiers"][0]["command"]["oracle"]["value"],77);
+        assert_eq!(controller["candidate_results"][0]["result"],"passed");
+        assert_eq!(controller["pinned_source_hashes"][pin],aligned::digest(script.as_bytes()));
+        let review_binding=aligned::ReviewBinding {head,base:"b".repeat(40),contract_hash:reference.binding.contract_hash.clone(),environment_id:"fixture-environment".into(),evidence_hash:aligned::digest(&bytes)};
+        let contract=BTreeMap::from([("C1".into(),"Return exactly 77".into())]);
+        let inputs=evidence_plan::Inputs {binding:&review_binding,issue:"behavior",contract:&contract,prior:&[],system_bytes:1024,controller_acceptance:Some(&controller)};
+        let mut shards=BTreeMap::from([("source:large".into(),"x".repeat(aligned::MAX_PROMPT_BYTES))]);
+        add_controller_sources(&mut shards,&prepared);
+        assert!(shards.values().any(|source|source==script));
+        let requests=inputs.pack(&shards).unwrap();assert!(requests.len()>1);
+        for request in requests {
+            let value:serde_json::Value=serde_json::from_str(&request.prompt).unwrap();
+            assert_eq!(value["controller_acceptance"],controller);
+            assert!(request.prompt.len()+inputs.system_bytes<=aligned::MAX_PROMPT_BYTES);
+        }
+        let mut finding=aligned::Finding {id:"F1".into(),criterion_id:"C1".into(),evidence_hash:"proof".into(),claim:"observer lacks child assertions".into(),requested_change:format!("add assertions to {pin}"),conflicts_with:BTreeSet::new(),repair_rounds:0};
+        assert!(controller_verifier_dispute(&[finding.clone()],Some(&prepared)),"controller disputes go to final authority on their first round");
+        finding.claim="incorrect sum".into();finding.requested_change="fix arithmetic.py".into();
+        assert!(!controller_verifier_dispute(&[finding],Some(&prepared)));
+        std::fs::write(&artifact,b"tampered").unwrap();
+        assert!(controller_acceptance_context(&prepared,Some(&reference)).is_err());
+    }
+
     #[test]
     fn new_supplemental_context_invalidates_old_dismissal_reuse() {
         let previous=BTreeMap::new();
