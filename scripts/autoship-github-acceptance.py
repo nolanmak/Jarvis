@@ -103,7 +103,12 @@ def main():
             raw = gh('pr', 'view', pr, '--repo', repository, '--json', 'statusCheckRollup')
             checks = json.loads(raw)['statusCheckRollup']
             names = {c.get('name') for c in checks if c.get('conclusion') == 'SUCCESS'}
-            if {'privacy', 'node-release'} <= names:
+            # push and pull_request can report the same context twice. One
+            # successful run must not hide another required run still queued.
+            required = [c for c in checks if c.get('name') in {'privacy', 'node-release'}]
+            if {'privacy', 'node-release'} <= names and all(
+                    c.get('status') == 'COMPLETED' and c.get('conclusion') == 'SUCCESS'
+                    for c in required):
                 return
             if any(c.get('conclusion') in {'FAILURE', 'CANCELLED', 'TIMED_OUT'} for c in checks):
                 raise RuntimeError('synthetic checks failed')
