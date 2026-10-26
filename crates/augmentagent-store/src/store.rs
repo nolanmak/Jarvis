@@ -8255,6 +8255,18 @@ impl Store {
         }
     }
 
+    /// Upsert one `config` row — the same table and shape the dashboard's
+    /// `setConfig` writes, so values set from the CLI show up there too.
+    pub fn set_config(&self, key: &str, value: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO config (key, value, updatedAt) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt",
+            params![key, value, now_millis()],
+        )?;
+        Ok(())
+    }
+
     /// Account handles of every registered SocialAPI.ai account, lowercased
     /// and stripped of a leading `@`. This is the set of identities that count
     /// as "us" when deciding whether an inbound-looking DM is really our own
@@ -12379,6 +12391,15 @@ mod tests {
     /// #525 — the dashboard's paste-your-key card writes here; the daemon has
     /// to be able to read it back or the documented primary setup flow leaves
     /// the channel dead.
+    #[test]
+    fn set_config_upserts_and_round_trips() {
+        let (s, _f) = fresh_store();
+        s.set_config("calendar_auto_accept", "on").unwrap();
+        assert_eq!(s.get_config("calendar_auto_accept").unwrap().as_deref(), Some("on"));
+        s.set_config("calendar_auto_accept", "off").unwrap();
+        assert_eq!(s.get_config("calendar_auto_accept").unwrap().as_deref(), Some("off"));
+    }
+
     #[test]
     fn get_config_reads_dashboard_written_keys() {
         let (s, _f) = fresh_store();

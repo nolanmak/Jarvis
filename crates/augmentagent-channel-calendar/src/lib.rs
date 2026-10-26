@@ -13,6 +13,7 @@ pub mod channel;
 pub mod filter;
 pub mod gcal;
 pub mod recurrence;
+pub mod rsvp;
 pub mod trigger;
 pub mod types;
 
@@ -27,10 +28,12 @@ pub use channel::{
 };
 pub use filter::{passes_filter, SkipReason};
 pub use gcal::{
-    CalendarApi, CalendarError, ComposioCalendarClient, CreatedEvent, EventDraft,
+    ensure_organizer_accepted, CalendarApi, CalendarError, ComposioCalendarClient,
+    CreatedEvent, EventDraft, RsvpResponse,
 };
+pub use rsvp::{InviteDecision, RsvpRequest};
 pub use trigger::{CalendarTrigger, HOT_LOOKAHEAD_HOURS, HOT_LOOKBACK_HOURS};
 pub use types::{
-    render_meeting_body, truncate, CalendarEvent, EventTime, MeetingAttendee,
+    render_meeting_body, truncate, CalendarEvent, EventTime, MeetingAttendee, RawAttendee,
     MeetingPayload, GCAL_FIELD_ALLOWLIST,
 };

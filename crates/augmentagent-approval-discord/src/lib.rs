@@ -61,6 +61,7 @@ pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send};
 // #501 — scheduled-notice layout, for brokers/tests outside this crate.
 pub use layout::{scheduled_notice_message, schedule_modal, SCHEDULE_CUSTOM_VALUE};
 pub use layout::reminder_buttons;
+pub use layout::auto_rsvp_notice_message;
 pub use loops::{
     handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
@@ -116,6 +117,13 @@ pub enum ApprovalActionOutcome {
         html_link: Option<String>,
         /// A repeated Approve recovered the saved receipt; no new write/nudge.
         already_existed: bool,
+    },
+    /// #1224 — an RSVP was written to the provider (a `calendar rsvp` card
+    /// approved, or Decline clicked on an auto-accept notice).
+    CalendarResponded {
+        account: String,
+        response: String,
+        summary: String,
     },
     /// A signed PDF was published, or its immutable receipt recovered.
     DocumentSigned { receipt: String, already_existed: bool, output: Option<(std::path::PathBuf, String)> },
@@ -386,6 +394,15 @@ pub trait ApprovalActionHandler: Send + Sync {
         let _ = action_id;
         ApprovalActionOutcome::Failed {
             message: "recompose is not supported by this handler".into(),
+        }
+    }
+
+    /// #1224 — "Decline" on a calendar auto-accept notice: replace the
+    /// automatic answer with a decline. Default: unsupported.
+    async fn calendar_decline(&self, action_id: &str) -> ApprovalActionOutcome {
+        let _ = action_id;
+        ApprovalActionOutcome::Failed {
+            message: "calendar RSVP is not supported by this handler".into(),
         }
     }
 
