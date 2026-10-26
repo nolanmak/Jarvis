@@ -525,6 +525,7 @@ async fn repaired_new_head_does_not_need_previous_upheld_receipt() {
 #[test]
 fn serialized_receipts_cannot_reuse_partial_or_stale_coverage() {
     let receipt = ReviewEvidence {
+            supplemental_source_hashes: Default::default(),
         origin: Default::default(),
         binding: binding(),
         builders: builders(),

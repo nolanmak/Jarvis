@@ -234,7 +234,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     let origin = adoption::origin_for_candidate(&root, Some(&guard)).await?;
     let seed=aligned_review::run_diagnostic_canary(Codex,&[],&aligned_review::ReviewSubject{title:&issue.title,body:&issue.body},root.clone(),&criteria,aligned_review::ReviewContext {
         qa_ok:true,qa_notes:"Arithmetic verifier passed; diagnostic seed is intentionally outside shipping alignment.",repair_round:0,previous:None,environment_id:"disposable-python",adjudication_attempts_already_made:0,workflow:Some(&guard),acceptance_evidence:Some((&prepared,&seeded)),
-    },origin).await?.structured.context("native seeded review incomplete")?;
+    },origin,None).await?.structured.context("native seeded review incomplete")?;
     assert!(
         review_canary::detected_seed(&seed),
         "native reviewer missed seeded boundary: {}",

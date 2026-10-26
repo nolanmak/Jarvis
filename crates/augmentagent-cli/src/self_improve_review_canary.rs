@@ -104,7 +104,7 @@ fn open(path: &Path) -> Result<rusqlite::Connection> {
     Ok(conn)
 }
 #[derive(Debug)]
-struct CanaryDeferred;
+pub(super) struct CanaryDeferred;
 impl std::fmt::Display for CanaryDeferred { fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"canary deferred before any native dispatch")}}
 impl std::error::Error for CanaryDeferred {}
 fn due_and_starved(path:&Path,now:i64)->Result<(bool,bool)> {
@@ -355,11 +355,6 @@ async fn probe_with_priority(id: &str,allow_shipping:bool) -> Result<crate::auto
             &[serde_json::to_string(&reference)?],
         )
         .await?;
-    let bound=aligned_review::diagnostic_call_bound(&root).await?;
-    if !guard.reserve_canary_calls(bound,allow_shipping)? {
-        guard.finish()?;
-        return Err(CanaryDeferred.into());
-    }
     let origin = adoption::origin_for_candidate(&root, Some(&guard)).await?;
     let issue = Issue {
         number: 840,
@@ -390,6 +385,7 @@ async fn probe_with_priority(id: &str,allow_shipping:bool) -> Result<crate::auto
             acceptance_evidence: Some((&prepared, &reference)),
         },
         origin,
+        Some(allow_shipping),
     )
     .await;
     guard.audit_health().await?;
@@ -568,7 +564,8 @@ mod tests {
         let control=dir.path().join("control");
         std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&control).unwrap();
         let (prepared,reference)=prepare_fixture_kind(&root,&control,840,true,&test_resource_audit(&control)).await.unwrap();
-        let call_bound=aligned_review::diagnostic_call_bound(&root).await.unwrap();
+        let call_bound=aligned_review::diagnostic_call_bound(&root,&aligned_review::ReviewSubject {title:"Correct integer addition",body:CRITERION},&prepared).await.unwrap();
+        assert_eq!(call_bound,8,"packed fixture reserves three reviews, one recovery each, and adjudicator plus correction");
         assert!(call_bound<=12,"complete native probe, including adjudicator correction, must fit the default observation budget: {call_bound}");
         assert!(reference.alignment.is_none());
         acceptance::assert_verifier_receipt_current(&root,&prepared,&reference).await.unwrap();

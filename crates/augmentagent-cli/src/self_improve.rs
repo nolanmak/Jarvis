@@ -12061,6 +12061,7 @@ mod tests {
     #[test]
     fn incomplete_structured_receipt_cannot_fall_back_to_true_legacy_flags() {
         let evidence = crate::autoship_review::ReviewEvidence {
+            supplemental_source_hashes: Default::default(),
             origin: Default::default(),
             binding: crate::autoship_review::ReviewBinding { head:"head".into(),base:"base".into(),
                 environment_id:"env".into(),contract_hash:"contract".into(),evidence_hash:"evidence".into() },

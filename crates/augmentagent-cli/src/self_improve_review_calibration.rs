@@ -182,6 +182,27 @@ pub(super) fn collect(
     }
     Ok(())
 }
+/// Preserve outcomes and full supplemental source separately until replay can
+/// model role-specific context. Exclusion from promotion is explicit, not loss
+/// of disagreement/outcome telemetry or an invented original evidence hash.
+pub(super) fn collect_supplemental_outcome(
+    guard:&workflow::WorkflowGuard, evidence:&review::ReviewEvidence,
+    criteria:&BTreeMap<String,String>, supplied:&str, supplemental:&BTreeMap<String,String>,
+)->Result<()> {
+    anyhow::ensure!(guard.binding().head==evidence.binding.head && review::digest(supplied.as_bytes())==evidence.binding.evidence_hash,
+        "supplemental review outcome differs from original evidence");
+    evidence.origin.validate(&evidence.binding.head)?;
+    let body=serde_json::to_string(&serde_json::json!({"version":1,"workflow":guard.id(),"review":evidence,
+        "criteria":criteria,"original_evidence":serde_json::from_str::<serde_json::Value>(supplied)?,
+        "supplemental_immutable_source":supplemental,
+        "promotion_exclusion":"role-specific supplemental source requires a dedicated replay plan; no calibration label inferred"}))?;
+    let id=review::digest(body.as_bytes());
+    let conn=open(&database())?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS supplemental_outcomes(id TEXT PRIMARY KEY,body TEXT NOT NULL,created INTEGER NOT NULL)")?;
+    conn.execute("INSERT OR IGNORE INTO supplemental_outcomes VALUES(?1,?2,?3)",rusqlite::params![id,body,chrono::Utc::now().timestamp_millis()])?;
+    Ok(())
+}
+
 fn cases(conn: &rusqlite::Connection) -> Result<Vec<Case>> {
     let mut stmt = conn.prepare("SELECT body FROM cases ORDER BY created DESC,rowid DESC ")?;
     let bodies = stmt

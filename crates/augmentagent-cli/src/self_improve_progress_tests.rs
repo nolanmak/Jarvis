@@ -74,7 +74,7 @@ pub(super) fn synthetic_aligned_review(head: &str, dismiss: bool) -> Independent
         prompt_hash: "adjudication-prompt".into(), response_hash: "adjudication-response".into() });
     IndependentReview { provider: Some(augmentagent_channel_core::ProviderKind::Codex), model: Some("synthetic".into()),
         available: true, diff_ok: true, system_ok: true, notes: String::new(), why_unavailable: None,
-        structured: Some(ReviewEvidence { origin: Default::default(), binding, builders: vec![actor("claude", "builder")], passes, adjudication }) }
+        structured: Some(ReviewEvidence { supplemental_source_hashes: Default::default(), origin: Default::default(), binding, builders: vec![actor("claude", "builder")], passes, adjudication }) }
 }
 
 #[test]
