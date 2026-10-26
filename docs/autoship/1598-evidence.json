@@ -8,7 +8,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1537",
       "implementation_status": "partial",
       "evidence": [
-        "Owner-authorized branch-independent linked-issue adoption integrated; source-less execution and automatic parent-base reconciliation remain incomplete."
+        "Real issue/PR source types, source-less acceptance/review/recovery, parent-base retarget under leases and free CI reconciliation integrated. Shared convergence controller and native isolation wired. Production end-to-end adoption smoke and autonomous merge attribution still pending."
       ]
     },
     {
@@ -33,7 +33,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1082",
       "implementation_status": "partial",
       "evidence": [
-        "Exact-head approval now excludes policy-held PRs before billed selection; shared policy reread freely, durable health observations distinguish holds. New Rust regressions await managed build admission."
+        "Exact-head approved policy/CI waits now use free reconciliation; actual failed checks/conflicts/main changes reengage repair. Named health observations persisted. Virtual 72-hour five-PR admission/Git/fake-GH soak integrated; full native soak remains pending."
       ]
     },
     {
@@ -60,7 +60,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1476",
       "implementation_status": "partial",
       "evidence": [
-        "Episode reducer foundation tests passed. Production fresh/resume wiring, preserved candidate refs, fresh-session budget and missing-evidence epoch regression integrated; new integration tests not yet run. Thirty-day observation not started."
+        "Fresh-session and rescope actions fenced per epoch; actual provider-native conversations isolated across fallbacks. Best commits and corresponding findings retained. Crash substep recovery still being completed; long-window outcome observation not started."
       ]
     },
     {
@@ -119,8 +119,10 @@
       "issue": 953,
       "title": "Add review-constraint checks to the auto-PR loop, mined from real PR review comments, reported separately from functional tests",
       "source": "https://github.com/nolanmak/Jarvis/issues/953",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Protected literal constraint promotion requires provenance/version and positive/negative replay; comments are proposals only. Historical mining and recurring promotion workflow still incomplete."
+      ]
     },
     {
       "issue": 1522,
@@ -160,8 +162,10 @@
       "issue": 524,
       "title": "self-improve: verify PR\u2194issue alignment before surfacing a draft PR for review",
       "source": "https://github.com/nolanmak/Jarvis/issues/524",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Independent hunk/criterion mappings run before model review; protected exact-head alignment artifacts and promoted constraints rechecked. Typed PR-scoped sources supported. Production canary and rollout acceptance still pending."
+      ]
     },
     {
       "issue": 1184,
@@ -169,7 +173,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1184",
       "implementation_status": "partial",
       "evidence": [
-        "Fresh native session receipt, actual CLI session identity checks, Codex-after-Codex selection and resume preflight integrated. New Rust tests pending; live seeded-defect canary and drift reporting still incomplete."
+        "Isolated native reviewer origins and real session IDs integrated. Daily diagnostic canary scheduler and immutable private evidence store added; diagnostic preflight isolation is being corrected before live execution. No live detection result claimed."
       ]
     },
     {
@@ -178,15 +182,17 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1209",
       "implementation_status": "partial",
       "evidence": [
-        "External audit anchors, persistent pending tickets, controller/provider audit wiring and protected drains integrated. Earlier four audit-chain tests passed; latest runtime audit checks await rerun."
+        "Protected audit storage correctly rejected tests whose control evidence lived in managed writable build scratch. Fixtures separated from worker cache; workflow audit tests passed in latest broad run. Runtime and provider-specific targeted suites still required."
       ]
     },
     {
       "issue": 840,
       "title": "self-improve: codex cannot run any command on this host (bwrap/AppArmor), so the system-interaction review reviews nothing",
       "source": "https://github.com/nolanmak/Jarvis/issues/840",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Production native seeded-defect probe implemented but not run; diagnostic verifier/alignment separation found during audit and being corrected. Legacy historical bwrap incident is not assumed resolved from unit tests."
+      ]
     }
   ],
   "operational_acceptance": {
@@ -202,10 +208,11 @@
       "note": "Before latest episode production wiring and native fresh-session changes."
     },
     "self_improve": {
-      "passed": 329,
-      "failed": 4,
-      "ignored": 6,
-      "note": "Most recent completed broad suite. Fixes for these failures and subsequent changes integrated; rerun pending. Do not treat previous green suite as validation of current HEAD."
+      "passed": 358,
+      "failed": 1,
+      "ignored": 7,
+      "revision": "12e06b4f",
+      "note": "Latest completed broad run. Remaining sweep fixture control-state isolation fixed; rerun active. Subsequent source changes must be retested."
     },
     "kernel_scope": {
       "passed": 6,
@@ -240,6 +247,25 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "Refused build storage busy; production current-baseline workspace test process active. No second Rust build started."
-  }
+    "latest_rust_admission": "Production baseline test finished; managed single-job build/test admission now available. Only one Rust process scheduled at a time.",
+    "github_main_rules": {
+      "observed": "2026-10-26",
+      "rules": [
+        "non_fast_forward",
+        "deletion"
+      ],
+      "coderabbit_required": false,
+      "note": "Legacy branch protection endpoint reports unprotected; branch rules endpoint reports only these rules. This does not prove local autoship code is deployed."
+    }
+  },
+  "remaining_cross_cutting_acceptance": [
+    "Native seeded-defect canary through diagnostic-only authority",
+    "Strategy dispatch crash subcheckpoint recovery",
+    "Unambiguous own-merge attribution versus concurrent manual merge",
+    "Atomic protection against main advancing between validation and merge",
+    "Independent versioned verifier amendment and rebaseline",
+    "Historical constraint mining and recurring replay promotion",
+    "Full native/disposable-repository integrated soak and rollout",
+    "24-hour, seven-day and 30-day operational observations"
+  ]
 }
