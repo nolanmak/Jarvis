@@ -7,7 +7,7 @@ use crate::autoship_workflow::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex,
 };
 
@@ -82,6 +82,7 @@ pub(super) struct WorkflowGuard {
     lease_failure: Arc<Mutex<Option<String>>>,
     started: std::time::Instant,
     accounted_ms: Arc<AtomicU64>,
+    capacity_exhausted: Arc<AtomicBool>,
     released: bool,
     audit: Arc<augmentagent_channel_core::AuditLogger>,
 }
@@ -334,6 +335,7 @@ impl SweepGuard {
             lease_failure: Arc::new(Mutex::new(None)),
             started: std::time::Instant::now(),
             accounted_ms: Arc::new(AtomicU64::new(0)),
+            capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
         };
         inner.install_model_accounting()?;
@@ -589,6 +591,7 @@ impl WorkflowGuard {
             lease_failure: Arc::new(Mutex::new(None)),
             started: std::time::Instant::now(),
             accounted_ms: Arc::new(AtomicU64::new(0)),
+            capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
         };
         guard.install_model_accounting()?;
@@ -644,10 +647,34 @@ impl WorkflowGuard {
         self.audit.clone()
     }
     fn install_model_accounting(&self) -> Result<()> {
+        let capacity_store = self.store.clone();
+        let capacity_lease = self.lease.clone();
+        let capacity_flag = self.capacity_exhausted.clone();
+        self.audit.set_resource_capacity_observer(Arc::new(move |observation| {
+            // Refuse further work even if persistence itself fails. The protected
+            // audit already contains the full independently observed resource event.
+            capacity_flag.store(true, Ordering::SeqCst);
+            let mut store = capacity_store.lock().map_err(|_| anyhow::anyhow!("workflow capacity lock poisoned"))?;
+            let mut checkpoint = store.snapshot(&capacity_lease.workflow)?
+                .context("capacity workflow missing")?.checkpoint;
+            let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(observation)?));
+            checkpoint.evidence.retain(|entry| !entry.starts_with("resource-capacity:"));
+            checkpoint.evidence.push(format!("resource-capacity:{digest}"));
+            checkpoint.next = NextAction {
+                reason: "resource_capacity".into(),
+                action: "await_capacity".into(),
+                eligible_at_ms: millis().saturating_add(300_000),
+            };
+            // Keep the current stage, verified binding, findings and receipts;
+            // capacity exhaustion is not a code defect or a convergence round.
+            store.checkpoint(&capacity_lease, &checkpoint, millis())
+        }))?;
+        let capacity_flag = self.capacity_exhausted.clone();
         let store = self.store.clone();
         let lease = self.lease.clone();
         let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
         self.audit.set_model_call_observer(Arc::new(move |_provider| {
+            anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
             let charge = ResourceCharge { model_calls:1, ..Default::default() };
@@ -680,7 +707,7 @@ impl WorkflowGuard {
         let Some(lease) = store.claim(&id,&format!("observation:{}",uuid::Uuid::new_v4()),now,LEASE_MS)? else { return Ok(None); };
         let audit = workflow_audit(&state,&id,None)?;
         let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
-            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),released:false };
+            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
         guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
         guard.spawn_renewal();
@@ -835,6 +862,8 @@ impl WorkflowGuard {
     }
 
     fn healthy_lease(&self) -> Result<()> {
+        anyhow::ensure!(!self.capacity_exhausted.load(Ordering::SeqCst),
+            "resource_capacity: await_capacity checkpoint retained; reacquire after eligible retry");
         let failure = self
             .lease_failure
             .lock()
@@ -2130,6 +2159,31 @@ mod tests {
         std::os::unix::fs::symlink("code.txt", &new_file).unwrap();
         assert!(git_binding(dir.path(), "C1", "rust-a", &[]).await.is_err());
     }
+    #[tokio::test]
+    async fn capacity_exhaustion_preserves_evidence_and_blocks_paid_or_publication_work() {
+        let dir=repo(); let control=control_dir(); let path=control.path().join("workflow.db");
+        let start = || Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let mut guard=WorkflowGuard::acquire_at(&path,start(),millis()).await.unwrap().unwrap();
+        guard.checkpoint(Stage::Review,"verified","review",0,&["protected-acceptance-receipt".into()]).await.unwrap();
+        let id=guard.id().to_owned();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+        guard.audit_logger().resource_capacity_exhausted(&serde_json::json!({"phase":"completed","exhausted":true,"memory_events":{"oom_kill":1}})).unwrap();
+        assert!(guard.validate_before_side_effect().is_err());
+        assert!(guard.audit_logger().model_call_admitted("codex").is_err());
+        assert!(guard.checkpoint(Stage::Build,"generic_failure","retry_builder",0,&[]).await.is_err());
+        let after=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+        assert_eq!(after.checkpoint.stage,before.checkpoint.stage);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+        assert!(after.checkpoint.evidence.contains(&"protected-acceptance-receipt".to_owned()));
+        assert_eq!(after.checkpoint.next.action,"await_capacity");
+        assert_eq!(after.model_calls,before.model_calls);
+        let eligible=after.checkpoint.next.eligible_at_ms;
+        drop(guard);
+        assert!(WorkflowGuard::acquire_at(&path,start(),eligible-1).await.unwrap().is_none());
+        let resumed=WorkflowGuard::acquire_at(&path,start(),eligible+1).await.unwrap().unwrap();
+        assert!(!resumed.capacity_exhausted.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn acquired_guard_accounts_direct_reviewers_without_builder_binding() {
         let dir=repo(); let control=control_dir(); let path=control.path().join("workflow.db");
