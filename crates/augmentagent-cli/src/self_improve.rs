@@ -10663,6 +10663,8 @@ struct DailyCounter {
     not_before: Option<i64>,
     #[serde(default)]
     history: std::collections::BTreeMap<u64, u32>,
+    #[serde(default)]
+    reservations: std::collections::BTreeMap<String, u64>,
 }
 
 impl DailyCounter {
@@ -10671,7 +10673,8 @@ impl DailyCounter {
             let mut history = std::mem::take(&mut self.history);
             history.insert(self.day, self.runs);
             while history.len() > 32 { if let Some(first) = history.keys().next().copied() { history.remove(&first); } }
-            *self = Self { day, history, ..Self::default() };
+            let reservations = std::mem::take(&mut self.reservations);
+            *self = Self { day, history, reservations, ..Self::default() };
         }
         if day == self.day { self.runs } else { self.history.get(&day).copied().unwrap_or(0) }
     }
@@ -10733,6 +10736,43 @@ impl DailyCounter {
             .ok()
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
             .unwrap_or_default()
+    }
+
+    /// Every lane reloads under a stable sibling-inode flock. Atomic rename
+    /// protects crashes; this lock additionally prevents lost cross-lane updates.
+    fn update<R>(path: &Path, mutation: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = path.parent().context("daily counter has no parent")?;
+        std::fs::create_dir_all(dir)?;
+        let lock = path.with_file_name(format!("{}.lock", path.file_name().context("counter filename")?.to_string_lossy()));
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(lock)?;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 { break; }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted { return Err(error.into()); }
+        }
+        let mut counter = Self::load_checked(path)?;
+        let result = mutation(&mut counter)?;
+        counter.persist(path)?;
+        Ok(result)
+    }
+
+    fn reserve(&mut self, day: u64, cap: u32, latch: Option<(i64, &str)>) -> Option<String> {
+        self.observe_claude_latch(day, latch);
+        let cap = self.cap_today(day, cap);
+        if self.runs_today(day) >= cap { return None; }
+        self.record(day);
+        let id = uuid::Uuid::new_v4().to_string();
+        self.reservations.insert(id.clone(), day);
+        Some(id)
+    }
+
+    fn settle_reservation(&mut self, id: &str, completed: u64, billed: bool) {
+        if let Some(started) = self.reservations.remove(id) {
+            self.settle(started, completed, billed);
+        }
     }
 
     fn load_checked(path: &Path) -> Result<Self> {
@@ -11635,7 +11675,6 @@ impl AutoPrLoop {
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
         let counter_path = self.counter_path.clone();
-        let mut counter = DailyCounter::load_checked(&counter_path)?;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -11643,21 +11682,6 @@ impl AutoPrLoop {
                     return Ok(());
                 }
                 _ = tokio::time::sleep(self.interval) => {}
-            }
-            let now = (self.clock)();
-            let today = utc_day_of(now);
-            // #1215 — the quota brake: count today's Claude quota latches.
-            let latch = self.latch.latched_entry("claude");
-            counter.observe_claude_latch(today, latch.as_ref().map(|(t, r)| (*t, r.as_str())));
-            counter.persist(&counter_path)?;
-            let cap = counter.cap_today(today, self.daily_cap);
-            if counter.runs_today(today) >= cap {
-                info!(
-                    daily_cap = cap,
-                    braked = counter.brake_runs.is_some(),
-                    "auto-PR: daily cap reached; idling until the next UTC day"
-                );
-                continue;
             }
             // Triage-only outcomes are cheap and permanently label the
             // issue out of the pool, so keep going within the SAME tick
@@ -11668,8 +11692,13 @@ impl AutoPrLoop {
             loop {
                 // Reserve before spending so restart/shutdown cannot erase work.
                 let started_day = utc_day_of((self.clock)());
-                counter.record(started_day);
-                counter.persist(&counter_path)?;
+                let latch = self.latch.latched_entry("claude");
+                let reservation = DailyCounter::update(&counter_path, |counter| Ok(counter.reserve(
+                    started_day, self.daily_cap, latch.as_ref().map(|(at, reason)| (*at, reason.as_str())))))?;
+                let Some(reservation) = reservation else {
+                    info!("auto-PR: shared daily resource/quota cap reached");
+                    break;
+                };
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
@@ -11680,8 +11709,10 @@ impl AutoPrLoop {
                 };
                 let completed_day = utc_day_of((self.clock)());
                 let billed = outcome.as_ref().map_or(true, |r| r.billed);
-                counter.settle(started_day, completed_day, billed);
-                counter.persist(&counter_path)?;
+                let runs_today = DailyCounter::update(&counter_path, |counter| {
+                    counter.settle_reservation(&reservation, completed_day, billed);
+                    Ok(counter.runs_today(completed_day))
+                })?;
                 match outcome {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
@@ -11692,7 +11723,7 @@ impl AutoPrLoop {
                         // Persisted, so it survives the post-merge daemon
                         // restart exactly as the run count does (#814).
                         FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
-                        info!(runs_today = counter.runs_today(completed_day), daily_cap = cap, "auto-PR: {r}");
+                        info!(runs_today, daily_cap = self.daily_cap, "auto-PR: {r}");
                         break;
                     }
                     Ok(r) => {
@@ -12770,6 +12801,45 @@ for tool, arguments in [
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    #[test]
+    fn concurrent_lanes_share_one_daily_cap_and_settle_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daily.json");
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let threads: Vec<_> = (0..12).map(|_| {
+            let (path, barrier) = (path.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                DailyCounter::update(&path, |counter| Ok(counter.reserve(100, 5, None))).unwrap()
+            })
+        }).collect();
+        let reservations: Vec<_> = threads.into_iter().filter_map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(reservations.len(), 5);
+        let threads: Vec<_> = reservations.into_iter().map(|id| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2 { DailyCounter::update(&path, |counter| {
+                    counter.settle_reservation(&id, 101, true); Ok(())
+                }).unwrap(); }
+            })
+        }).collect();
+        for thread in threads { thread.join().unwrap(); }
+        let mut counter = DailyCounter::load_checked(&path).unwrap();
+        assert_eq!(counter.runs_today(100), 5);
+        assert_eq!(counter.runs_today(101), 5);
+        assert!(counter.reservations.is_empty());
+        assert!(DailyCounter::update(&path, |counter| Ok(counter.reserve(101, 5, None))).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_daily_accounting_does_not_reset_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daily.json");
+        std::fs::write(&path, "partial").unwrap();
+        assert!(DailyCounter::update(&path, |counter| Ok(counter.reserve(100, 5, None))).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "partial");
     }
 
     #[tokio::test(start_paused = true)]
@@ -17914,7 +17984,7 @@ else:
         let end = start + src[start..].find("\n#[cfg(test)]\n").expect("end of AutoPrLoop");
         let body = &src[start..end];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
-        assert!(body.contains("counter.settle(started_day, completed_day, billed);"));
+        assert!(body.contains("counter.settle_reservation(&reservation, completed_day, billed);"));
         assert!(body.contains("result = self.run_builds(shutdown, tick) => result"));
         assert!(body.contains("result = reconciliation => result"));
         assert!(!body.contains("timeout(max_tick"));
