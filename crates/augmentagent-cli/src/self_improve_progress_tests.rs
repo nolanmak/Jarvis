@@ -299,7 +299,8 @@ else: raise Exception('unexpected call '+repr(a))
     let root = fixture_root.join("repo");
     let initial_control = fixture_root.join("initial-control");
     std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&initial_control).unwrap();
-    let (prepared, _) = review_canary::shipping_fixture(&root, &initial_control, 10).await.unwrap();
+    let (modern, _) = review_canary::shipping_fixture(&root, &initial_control, 10).await.unwrap();
+    let mut prepared = acceptance::historical_fixture(&root,&modern).unwrap();
     let head = run("git", &["rev-parse", "HEAD"], &root).await.unwrap().1.trim().to_owned();
     let base = prepared.baseline.registration.baseline_head().to_owned();
     let remote = fixture_root.join("remote.git");
@@ -313,7 +314,7 @@ else: raise Exception('unexpected call '+repr(a))
             "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha,"base":base
         })).unwrap()).unwrap();
     };
-    let verdict = || {
+    let verdict = |prepared: &acceptance::PreparedAcceptance| {
         let mut review = synthetic_aligned_review(&head,true);
         let evidence = review.structured.as_mut().unwrap();
         evidence.binding.base = base.clone();
@@ -324,7 +325,7 @@ else: raise Exception('unexpected call '+repr(a))
         }
         evidence.adjudication.as_mut().unwrap().binding = evidence.binding.clone();
         assert!(review.approved(), "fixture approval must validate before sweep");
-        review.recorded_verdict()
+        review.recorded_verdict(&prepared)
     };
     let mut workflow = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root:&root, worktree:&root, repository:"fixture-owner/project", source_issue:Some(10),pr:Some(20),
@@ -333,19 +334,39 @@ else: raise Exception('unexpected call '+repr(a))
     let directories = acceptance::control_directories("fixture-owner/project",workflow.id()).unwrap();
     std::fs::create_dir_all(&directories.workflow_acceptance).unwrap();
     acceptance::persist_fixture_registration(&directories.workflow_acceptance,&prepared).unwrap();
-    let mut receipt = acceptance::verify_and_persist_candidate(&root,&prepared,&directories.workflow_acceptance,&acceptance::worker_roots(&root)).await.unwrap();
+    let mut receipt = acceptance::persist_historical_fixture_receipt(&root,&prepared,&directories.workflow_acceptance).await.unwrap();
     receipt.alignment = Some(alignment::persist_shipping_fixture(&root,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());
-    acceptance::assert_receipt_current(&root,&prepared,&receipt).await.unwrap();
+    assert!(format!("{:#}",acceptance::assert_receipt_current(&root,&prepared,&receipt).await.unwrap_err()).contains("legacy in-process"));
     workflow.bind_acceptance(&prepared).unwrap();
     workflow.checkpoint(crate::autoship_workflow::Stage::Verify,"acceptance_passed","review_verified_candidate",0,&[serde_json::to_string(&receipt).unwrap()]).await.unwrap();
-    workflow.record_review("scripted-independent-fixture",true,&serde_json::to_string(&verdict().unwrap()).unwrap()).unwrap();
+    workflow.record_review("scripted-independent-fixture",true,&serde_json::to_string(&verdict(&prepared).unwrap()).unwrap()).unwrap();
     workflow.finish().unwrap();
     // Opening a rejected draft records ownership, but never authorizes merge.
     record_opened_pr(&opened_prs_path(), 10, 20, &head, None);
     scenario("SUCCESS", true, false, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
-    // A resumed LGTM survives a delayed check and a subsequent merge failure.
-    record_opened_pr(&opened_prs_path(), 10, 20, &head, verdict());
+    // Even an exact-head historical approval cannot authorize legacy proof.
+    record_opened_pr(&opened_prs_path(),10,20,&head,verdict(&prepared));
+    scenario("SUCCESS",false,false,&head);
+    assert_eq!(merge_sweep(&root,false).await,0);
+    assert!(workflow::requires_reverification("fixture-owner/project",20).unwrap());
+    assert!(!fixture_root.join("merged").exists());
+    let candidate = workflow::prepare_resume_worktree(&root,20,"agent-fix/issue-10").await.unwrap();
+    let mut workflow = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root:&root,worktree:&candidate,repository:"fixture-owner/project",source_issue:Some(10),pr:Some(20),branch:"agent-fix/issue-10",contract:"synthetic migration",environment:"fixture-bootstrap",
+    }).await.unwrap().unwrap();
+    workflow.transition(crate::autoship_workflow::Stage::Scope,"legacy_verifier_proof_invalidated","migrate_behavioral_oracle",0).await.unwrap();
+    prepared=acceptance::migrate_historical_fixture(&candidate,&directories.workflow_acceptance,&prepared,modern.proposal.clone()).await.unwrap();
+    assert_eq!(prepared.proposal.contract.revision,2);
+    let mut receipt=acceptance::verify_and_persist_candidate(&candidate,&prepared,&directories.workflow_acceptance,&acceptance::worker_roots(&candidate)).await.unwrap();
+    receipt.alignment=Some(alignment::persist_shipping_fixture(&candidate,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());
+    acceptance::assert_receipt_current(&candidate,&prepared,&receipt).await.unwrap();
+    workflow.bind_acceptance(&prepared).unwrap();
+    workflow.checkpoint(crate::autoship_workflow::Stage::Verify,"migration_verified","review_verified_candidate",0,&[serde_json::to_string(&receipt).unwrap()]).await.unwrap();
+    workflow.record_review("scripted-independent-migrated-fixture",true,&serde_json::to_string(&verdict(&prepared).unwrap()).unwrap()).unwrap();
+    workflow.finish().unwrap();
+    // A newly verified LGTM survives delayed checks and subsequent merge failure.
+    record_opened_pr(&opened_prs_path(), 10, 20, &head, verdict(&prepared));
     scenario("PENDING", false, false, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, true, &head);

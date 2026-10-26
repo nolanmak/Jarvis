@@ -2035,3 +2035,27 @@ pub(super) fn persist_fixture_registration(
         .map_err(|error| error.error)?;
     write_manifest(control, &WorkflowManifest::from_prepared(source, prepared))
 }
+
+#[cfg(test)]
+pub(super) fn historical_fixture(root:&Path, modern:&PreparedAcceptance)->Result<PreparedAcceptance> {
+    let mut proposal=modern.proposal.clone();
+    for verifier in &mut proposal.contract.verifiers {
+        verifier.command=crate::autoship_contract::VerifierCommand::PythonUnittest{test:"autoship_verifiers.test_sum.Case.test_add".into()};
+    }
+    let registration=RegisteredContract::register(root,proposal.contract.clone(),modern.baseline.registration.baseline_head().into(),environment_id(root)?)?;
+    // Historical cached claims are deliberately not re-endorsed by observe().
+    let receipts=modern.baseline.receipts.iter().cloned().map(|mut receipt| {
+        receipt.binding=registration.binding(registration.baseline_head()).unwrap();receipt
+    }).collect();
+    Ok(PreparedAcceptance{proposal,baseline:BaselineEvidence{registration,receipts}})
+}
+#[cfg(test)]
+pub(super) async fn persist_historical_fixture_receipt(root:&Path, prepared:&PreparedAcceptance,control:&Path)->Result<CandidateReceiptReference> {
+    let binding=prepared.baseline.registration.binding(&actual_head(root).await?)?;
+    let receipts=prepared.baseline.receipts.iter().cloned().map(|mut receipt| {
+        receipt.binding=binding.clone();receipt.result=crate::autoship_contract::CheckResult::Passed;receipt
+    }).collect();
+    persist_candidate_artifact(control,&[root.to_path_buf()],CandidateArtifact{schema_version:1,binding,receipts})
+}
+#[cfg(test)]
+pub(super) use amendment::migrate_fixture as migrate_historical_fixture;

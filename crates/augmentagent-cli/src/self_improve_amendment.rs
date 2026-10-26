@@ -910,3 +910,25 @@ mod tests {
         );
     }
 }
+
+/// Scripted independent scope authority for the end-to-end migration fixture.
+/// New baseline and candidate observations still use real isolated subprocesses.
+#[cfg(test)]
+pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcceptance, mut proposal:ContractProposal)->Result<PreparedAcceptance> {
+    proposal.contract.revision=old.proposal.contract.revision+1;
+    let scratch=tempfile::tempdir()?;let baseline=scratch.path().join("baseline");
+    trusted_git(root,&["worktree","add","--detach",baseline.to_str().unwrap(),old.baseline.registration.baseline_head()]).await?;
+    let measured=register_and_reproduce(&baseline,proposal.clone()).await;
+    trusted_git(root,&["worktree","remove","--force",baseline.to_str().unwrap()]).await?;
+    let next=PreparedAcceptance{proposal:proposal.clone(),baseline:measured?};
+    augmentagent_channel_core::autoship_write_scope::register(root,old.baseline.registration.contract_hash(),old.proposal.contract.allowed_paths.iter().map(|scope| {
+        let (path,directory)=match scope {crate::autoship_contract::PathScope::File(path)=>(path,false),crate::autoship_contract::PathScope::Directory(path)=>(path,true)};
+        augmentagent_channel_core::autoship_write_scope::DeclaredPath{path:path.clone(),directory}
+    }).collect(),old.proposal.files.keys().cloned().collect())?;
+    let pending=Pending{version:1,source:old.proposal.contract.source()?,original_head:actual_head(root).await?,input_hash:digest(b"scripted migration input"),
+        old:old.clone(),next,authority:Decision{approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:false,approve_additional_files:vec![],reason:"Replace legacy claimed test status with independently measured arithmetic behavior".into(),proposal:Some(proposal)},
+        native_provider:"scripted-test-authority".into(),native_session:"scripted-distinct-test-session".into(),prompt_hash:digest(b"scripted migration request")};
+    let path=pending_path(control,pending.source);
+    immutable(control,path.file_name().unwrap().to_str().unwrap(),&serde_json::to_vec(&pending)?)?;
+    resume_pending(root,control,pending.source).await?.context("migration fixture did not activate")
+}
