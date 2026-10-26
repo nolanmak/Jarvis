@@ -1,0 +1,467 @@
+//! Executable acceptance adapter. Imported as a child of self_improve.
+//! Only the independent scoper may supply proposals; builders receive the
+//! pinned registration and cannot change it. Persistence belongs in control state.
+use super::*;
+use crate::autoship_contract::{
+    AcceptanceContract, BaselineResult, Observation, RegisteredContract, VerifierReceipt,
+};
+use anyhow::ensure;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use tokio::io::AsyncReadExt;
+
+const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
+const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+pub(super) const CONTRACT_PROMPT: &str = r#"
+Emit exactly one ```autoship-contract fenced JSON object with fields `contract`
+and `files`. contract schema_version=1, revision=1, issue=<number>, criteria are
+{id,requirement,verifier_ids}, allowed_paths are {kind:"file"|"directory",path},
+verifiers are {id,command,pinned_files,failure_witness}. command is typed:
+{kind:"python_unittest",test:"autoship_verifiers.test_case.Case.test_behavior"},
+{kind:"node_test",file:"autoship_verifiers/case.js",name:"specific test"}, or
+{kind:"cargo_test",package:"package",target:{kind:"integration",name:"autoship_case"},test:"test_behavior"}.
+files maps new dedicated verifier file paths to complete source. Put harnesses
+under autoship_verifiers/ or a package's tests/autoship_*.rs. Never overwrite
+existing source. Pin every harness/fixture file. The regression test MUST fail on
+baseline with the named assertion witness and pass after fixing implementation.
+Import/compile/setup errors do not count. Do not weaken assertions or edit the
+verifier after registration. Every criterion needs a verifier. No shell commands.
+"#;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ContractProposal {
+    pub contract: AcceptanceContract,
+    pub files: BTreeMap<String, String>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct BaselineEvidence {
+    pub registration: RegisteredContract,
+    pub receipts: Vec<VerifierReceipt>,
+}
+
+pub(super) fn parse_proposal(raw: &str, issue: u64) -> Result<ContractProposal> {
+    ensure!(raw.len() <= 2 * 1024 * 1024, "contract proposal too large");
+    let marker = "```autoship-contract\n";
+    let mut parts = raw.split(marker);
+    parts.next();
+    let body = parts
+        .next()
+        .context("missing executable contract proposal")?;
+    ensure!(
+        parts.next().is_none(),
+        "multiple executable contract proposals"
+    );
+    let json = body
+        .split_once("```")
+        .context("unterminated contract proposal")?
+        .0;
+    let proposal: ContractProposal = serde_json::from_str(json)?;
+    proposal.contract.validate()?;
+    ensure!(proposal.contract.issue == issue, "contract issue mismatch");
+    let pins: std::collections::BTreeSet<_> = proposal
+        .contract
+        .verifiers
+        .iter()
+        .flat_map(|v| v.pinned_files.iter().cloned())
+        .collect();
+    ensure!(
+        pins == proposal.files.keys().cloned().collect(),
+        "all independent harness files must be pinned"
+    );
+    for (path, contents) in &proposal.files {
+        ensure!(
+            harness_path(path),
+            "harness must be a new dedicated verifier file"
+        );
+        ensure!(contents.len() <= 512 * 1024, "harness too large");
+    }
+    Ok(proposal)
+}
+fn harness_path(path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
+        return false;
+    }
+    path.starts_with("autoship_verifiers/")
+        || (parts.len() >= 2
+            && parts[parts.len() - 2] == "tests"
+            && parts.last().unwrap().starts_with("autoship_")
+            && path.ends_with(".rs"))
+}
+/// Caller must own an exclusive clean baseline checkout. Refuses any existing
+/// harness rather than replacing implementation or a previously pinned test.
+pub(super) fn install_harness(root: &Path, proposal: &ContractProposal) -> Result<()> {
+    use std::io::Write;
+    let root = root.canonicalize()?;
+    for (relative, body) in &proposal.files {
+        ensure!(harness_path(relative), "invalid harness path");
+        let mut parent = root.clone();
+        let parts: Vec<_> = relative.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            parent.push(part);
+            match std::fs::symlink_metadata(&parent) {
+                Ok(meta) => ensure!(
+                    meta.is_dir() && !meta.file_type().is_symlink(),
+                    "harness parent is not a real directory"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&parent)?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.join(relative))?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+async fn actual_head(root: &Path) -> Result<String> {
+    let out = Command::new("/usr/bin/git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    ensure!(out.status.success(), "cannot identify verifier checkout");
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+
+/// Runner policy fingerprint changes when enforcement or toolchain identity
+/// changes. Includes system interpreter binaries and rustup selection metadata.
+/// The orchestrator must also pin the admitted Rust toolchain image; this hash
+/// does not attest every library in a mutable host installation.
+fn environment_id() -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(SANDBOX.as_bytes());
+    for path in [
+        PathBuf::from("/usr/bin/python3"),
+        PathBuf::from("/usr/bin/node"),
+    ] {
+        if path.exists() {
+            hash.update(path.to_string_lossy().as_bytes());
+            hash.update(std::fs::read(path)?);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let settings = PathBuf::from(home).join(".rustup/settings.toml");
+        if settings.exists() {
+            hash.update(std::fs::read(settings)?);
+        }
+    }
+    Ok(format!("sandbox-v1:{:x}", hash.finalize()))
+}
+
+pub(super) async fn register_and_reproduce(
+    root: &Path,
+    proposal: ContractProposal,
+) -> Result<BaselineEvidence> {
+    let status = Command::new("/usr/bin/git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .await?;
+    ensure!(
+        status.status.success() && status.stdout.is_empty(),
+        "baseline checkout must be clean before independent verifier installation"
+    );
+    let head = actual_head(root).await?;
+    install_harness(root, &proposal)?;
+    let registration =
+        RegisteredContract::register(root, proposal.contract, head, environment_id()?)?;
+    let receipts = execute_registered(root, &registration).await?;
+    match registration.baseline_result(&receipts)? {
+        BaselineResult::Reproduced => Ok(BaselineEvidence {
+            registration,
+            receipts,
+        }),
+        result => bail!("baseline not independently reproduced: {result:?}"),
+    }
+}
+/// Persist only under controller-owned state outside every admitted worker
+/// writable root. Creation is exclusive: revising a contract needs a new path.
+pub(super) fn persist_baseline(
+    path: &Path,
+    evidence: &BaselineEvidence,
+    writable_roots: &[PathBuf],
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path
+        .parent()
+        .context("evidence parent missing")?
+        .canonicalize()?;
+    for root in writable_roots {
+        ensure!(
+            !parent.starts_with(root.canonicalize()?),
+            "builder can rewrite acceptance evidence"
+        );
+    }
+    let destination = parent.join(path.file_name().context("evidence filename missing")?);
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(destination)?;
+    file.write_all(&serde_json::to_vec(evidence)?)?;
+    file.sync_all()?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Install the identical proposal harness in the candidate before building;
+/// do not recreate or overwrite it here. A candidate cannot re-register itself.
+pub(super) async fn verify_candidate(
+    root: &Path,
+    evidence: &BaselineEvidence,
+) -> Result<Vec<VerifierReceipt>> {
+    ensure!(
+        environment_id()?
+            == evidence
+                .registration
+                .binding(&actual_head(root).await?)?
+                .environment_id,
+        "verifier environment changed; re-register baseline"
+    );
+    let receipts = execute_registered(root, &evidence.registration).await?;
+    let binding = evidence.registration.binding(&actual_head(root).await?)?;
+    ensure!(
+        evidence
+            .registration
+            .candidate_passes(&evidence.receipts, &receipts, &binding)?,
+        "candidate did not satisfy executable contract"
+    );
+    Ok(receipts)
+}
+
+async fn execute_registered(
+    root: &Path,
+    registration: &RegisteredContract,
+) -> Result<Vec<VerifierReceipt>> {
+    let root = root.canonicalize()?;
+    let head = actual_head(&root).await?;
+    let binding = registration.binding(&head)?;
+    registration.verify_integrity(&root)?;
+    let target = crate::build_storage::effective_target(&root);
+    // Admission is the same production lease/storage accounting used by gates.
+    // Do not recursively invoke cargo-managed.sh while this lease is held.
+    let _lease = crate::build_storage::admit(&root, &target).await?;
+    let mut receipts = Vec::new();
+    for verifier in &registration.contract().verifiers {
+        registration.verify_integrity(&root)?;
+        let invocation = verifier.command.invocation()?;
+        let observation = isolated_observation(&root, &target, invocation).await?;
+        ensure!(
+            actual_head(&root).await? == head,
+            "checkout changed while verifying"
+        );
+        receipts.push(registration.observe(&root, &verifier.id, binding.clone(), &observation)?);
+    }
+    Ok(receipts)
+}
+
+async fn isolated_observation(
+    root: &Path,
+    target: &Path,
+    invocation: crate::autoship_contract::Invocation,
+) -> Result<Observation> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let canonical_target = target.canonicalize()?;
+    ensure!(
+        !root.starts_with(&canonical_target),
+        "build cache cannot contain verifier source"
+    );
+    let private = tempfile::Builder::new()
+        .prefix("autoship-verifier-")
+        .tempdir()?;
+    let runtime = private.path().join("runtime");
+    std::fs::create_dir(&runtime)?;
+    let home = runtime.join("home");
+    std::fs::create_dir(&home)?;
+    let cargo_home = runtime.join("cargo");
+    std::fs::create_dir(&cargo_home)?;
+    let helper = private.path().join("sandbox.py");
+    std::fs::write(&helper, SANDBOX)?;
+    let policy = private.path().join("policy.json");
+    let mut runtime_reads = Vec::<PathBuf>::new();
+    let mut program = PathBuf::from(match invocation.program {
+        "python3" => "/usr/bin/python3",
+        "node" => "/usr/bin/node",
+        "cargo" => "/nonexistent",
+        _ => bail!("unsupported verifier executable"),
+    });
+    let daemon_home = PathBuf::from(std::env::var_os("HOME").context("daemon home unavailable")?);
+    let rustup = daemon_home.join(".rustup");
+    if invocation.program == "cargo" {
+        program = daemon_home.join(".cargo/bin/cargo");
+        for path in [
+            daemon_home.join(".cargo/bin"),
+            rustup.join("toolchains"),
+            rustup.join("settings.toml"),
+        ] {
+            if path.exists() {
+                runtime_reads.push(path);
+            }
+        }
+        for name in ["registry", "git"] {
+            let path = daemon_home.join(".cargo").join(name);
+            if path.exists() {
+                symlink(&path, cargo_home.join(name))?;
+                runtime_reads.push(path);
+            }
+        }
+    }
+    ensure!(program.exists(), "verifier toolchain missing");
+    std::fs::write(
+        &policy,
+        serde_json::to_vec(&serde_json::json!({
+            "cwd":root, "read_roots":[root], "write_roots":[runtime,target], "runtime_reads":runtime_reads
+        }))?,
+    )?;
+    std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600))?;
+    let mut cmd = Command::new("/usr/bin/python3");
+    cmd.arg("-I").arg(&helper).arg(&policy).arg(program);
+    if invocation.program == "cargo" {
+        cmd.args([
+            "--offline",
+            "--config",
+            "profile.dev.debug=0",
+            "--config",
+            "profile.test.debug=0",
+            "--config",
+            "build.jobs=1",
+        ]);
+    }
+    cmd.args(invocation.args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("TMPDIR", &runtime)
+        .env("CARGO_HOME", &cargo_home)
+        .env("RUSTUP_HOME", rustup)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let mut child = cmd.spawn()?;
+    struct Group(u32);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            }
+        }
+    }
+    let _group = Group(child.id().context("verifier process has no pid")?);
+    async fn bounded(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        reader
+            .take(OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        ensure!(
+            bytes.len() <= OUTPUT_LIMIT as usize,
+            "verifier output exceeded limit"
+        );
+        Ok(bytes)
+    }
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let result = crate::build_storage::watch_reserve_roots(Some(target), Some(&runtime), async {
+        tokio::try_join!(
+            async { Ok::<_, anyhow::Error>(child.wait().await?) },
+            bounded(stdout),
+            bounded(stderr)
+        )
+    })
+    .await;
+    match result {
+        Ok((status, stdout, stderr)) => Ok(Observation {
+            exit_code: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            interrupted: false,
+            output_complete: true,
+        }),
+        Err(error) => Ok(Observation {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("verifier infrastructure: {error}"),
+            interrupted: true,
+            output_complete: false,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::ensure;
+    #[test]
+    fn verifier_harness_cannot_replace_source_or_escape() {
+        for path in [
+            "src/lib.rs",
+            "tests/test.rs",
+            "../tests/autoship_x.rs",
+            "autoship_verifiers/../src/lib.rs",
+            "/tests/autoship_x.rs",
+        ] {
+            assert!(!harness_path(path), "{path}");
+        }
+        for path in [
+            "autoship_verifiers/test_regression.py",
+            "crates/demo/tests/autoship_case.rs",
+        ] {
+            assert!(harness_path(path));
+        }
+    }
+    #[tokio::test]
+    async fn real_isolated_python_assertion_and_protected_write() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("test_case.py"), "import unittest\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  self.assertEqual(1, 2, 'intended regression witness')\n").unwrap();
+        let invocation = crate::autoship_contract::VerifierCommand::PythonUnittest {
+            test: "test_case.Case.test_behavior".into(),
+        }
+        .invocation()
+        .unwrap();
+        let observation = isolated_observation(root.path(), target.path(), invocation)
+            .await
+            .unwrap();
+        assert_eq!(observation.exit_code, Some(1), "{}", observation.stderr);
+        assert!(observation.stderr.contains("intended regression witness"));
+        let protected = root.path().join("protected");
+        std::fs::write(&protected, "unchanged").unwrap();
+        std::fs::write(root.path().join("test_case.py"), "import unittest\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  with self.assertRaises(PermissionError):\n   open('protected', 'w')\n  import socket\n  with self.assertRaises(PermissionError):\n   socket.socket()\n").unwrap();
+        let invocation = crate::autoship_contract::VerifierCommand::PythonUnittest {
+            test: "test_case.Case.test_behavior".into(),
+        }
+        .invocation()
+        .unwrap();
+        let observation = isolated_observation(root.path(), target.path(), invocation)
+            .await
+            .unwrap();
+        assert_eq!(observation.exit_code, Some(0), "{}", observation.stderr);
+        assert_eq!(std::fs::read_to_string(protected).unwrap(), "unchanged");
+    }
+}
