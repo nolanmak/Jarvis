@@ -39,6 +39,8 @@ use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 
 #[path = "self_improve_episode.rs"]
 mod episode;
+#[path = "self_improve_adopted.rs"]
+mod adopted_execution;
 #[path = "self_improve_adoption.rs"]
 mod adoption;
 #[path = "self_improve_policy_hold.rs"]
@@ -1560,7 +1562,7 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
     };
     let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
-    let mut merged = 0usize;
+    let mut merged = adopted_execution::sweep(repo_root, dry_run).await.unwrap_or_else(|error| { warn!("adopted merge reconciliation failed: {error:#}"); 0 });
 
     let mut examined = 0usize;
     // Start where the last tick left off, so a wall of ineligible drafts at
@@ -7789,6 +7791,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     r.resumed = true;
                     r
                 });
+        }
+    }
+    if red_main_issue.is_none() && lane != Lane::Build {
+        if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
+            return adopted_execution::resume(repo_root, &build_reasoner(), candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
         }
     }
     if lane == Lane::Resume {

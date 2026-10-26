@@ -145,8 +145,53 @@ impl SweepGuard {
         recorded: &str,
         now: i64,
     ) -> Result<Option<Self>> {
+        Self::acquire_source_at(
+            path,
+            repository,
+            Some(issue),
+            pr,
+            branch,
+            head,
+            recorded,
+            now,
+        )
+    }
+
+    pub(super) fn acquire_pr(
+        repository: &str,
+        pr: u64,
+        branch: &str,
+        head: &str,
+        recorded: &str,
+    ) -> Result<Option<Self>> {
+        Self::acquire_source_at(
+            &path(),
+            repository,
+            None,
+            pr,
+            branch,
+            head,
+            recorded,
+            millis(),
+        )
+    }
+
+    fn acquire_source_at(
+        path: &Path,
+        repository: &str,
+        issue: Option<u64>,
+        pr: u64,
+        branch: &str,
+        head: &str,
+        recorded: &str,
+        now: i64,
+    ) -> Result<Option<Self>> {
         let mut store = WorkflowStore::open(path)?;
-        let issue_id = durable::workflow_id(repository, issue)?;
+        let issue_id = match issue {
+            Some(issue) => durable::workflow_id(repository, issue)?,
+            None => durable::pr_workflow_id(repository, pr)?,
+        };
+
         let id = match store.resolve_pr(repository, pr)? {
             Some(id) => id,
             None => match store.snapshot(&issue_id)? {
@@ -159,6 +204,9 @@ impl SweepGuard {
             },
         };
         let existing = store.snapshot(&id)?;
+        if issue.is_none() && existing.is_none() {
+            return Ok(None);
+        }
         let binding = existing
             .as_ref()
             .map(|s| s.checkpoint.binding.clone())

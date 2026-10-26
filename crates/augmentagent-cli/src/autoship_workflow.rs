@@ -116,6 +116,8 @@ pub enum OperationKind {
     Push,
     MergePr,
     RetirePr,
+    ReadyPr,
+    RetargetPr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
