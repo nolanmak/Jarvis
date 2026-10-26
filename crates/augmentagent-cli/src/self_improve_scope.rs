@@ -198,6 +198,35 @@ async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,
     );
     Ok(output)
 }
+#[derive(Debug)]
+pub(super) struct CompletedInvalid(pub String);
+impl std::fmt::Display for CompletedInvalid {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"independent scope returned two invalid completed responses: {}",self.0)}}
+impl std::error::Error for CompletedInvalid {}
+/// Persist completed model output before parsing/side effects. Provider or
+/// infrastructure errors do not consume the bounded *completed-response*
+/// strategy slots; actual model admissions remain fully charged by the audit
+/// observer. A crash after response persistence resumes without another call.
+pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,prompt:&str,contract:bool,validate:impl Fn(&str)->Result<T>)->Result<T> {
+    let key=|attempt|amendment::digest(serde_json::to_string(&(purpose,epoch,&workflow.binding().contract,attempt)).unwrap().as_bytes());
+    recoverable_generation(prompt,
+        |attempt|workflow.scope_stage_response(&key(attempt)),
+        |attempt,raw|workflow.record_scope_stage_response(&key(attempt),raw),
+        |request|async move {workflow.check_resource_policy()?;let raw=run_inner(root,workflow.repository(),workflow,&request,contract).await?;workflow.audit_health().await?;Ok(raw)},
+        validate).await
+}
+async fn recoverable_generation<T,R,W,G,F>(prompt:&str,read:R,write:W,mut generate:G,validate:impl Fn(&str)->Result<T>)->Result<T>
+where R:Fn(u32)->Result<Option<String>>,W:Fn(u32,&str)->Result<()>,G:FnMut(String)->F,F:std::future::Future<Output=Result<String>> {
+    let mut error=String::new();
+    for attempt in 0..2 {
+        let raw=if let Some(raw)=read(attempt)? {raw} else {
+            let request=if attempt==0 {prompt.to_owned()}else{format!("{prompt}\nController rejected the previous completed response: {error}. Correct the requested schema/evidence without weakening any requirement.")};
+            let raw=generate(request).await?;write(attempt,&raw)?;raw
+        };
+        match validate(&raw) {Ok(value)=>return Ok(value),Err(problem)=>error=format!("{problem:#}")}
+    }
+    Err(CompletedInvalid(error).into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,4 +261,19 @@ mod tests {
         request.end_line = 601;
         assert!(excerpt("text", &request).is_err());
     }
+    #[tokio::test]
+    async fn transient_generation_then_restart_reuses_completed_output_without_burning_strategy() {
+        let saved=std::sync::Mutex::new(BTreeMap::<u32,String>::new());
+        let read=|index|Ok(saved.lock().unwrap().get(&index).cloned());
+        let write=|index,raw:&str|{saved.lock().unwrap().insert(index,raw.into());Ok(())};
+        let valid=|raw:&str|{ensure!(raw=="valid","schema invalid");Ok(raw.to_owned())};
+        assert!(recoverable_generation("request",read,write,|_|async{anyhow::bail!("synthetic provider unavailable")},valid).await.is_err());
+        assert!(saved.lock().unwrap().is_empty());
+        let calls=std::sync::atomic::AtomicUsize::new(0);
+        let result=recoverable_generation("request",read,write,|_|{let n=calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);async move{Ok(if n==0{"invalid"}else{"valid"}.into())}},valid).await.unwrap();
+        assert_eq!(result,"valid");assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),2);
+        let resumed=recoverable_generation("request",read,write,|_|async{panic!("completed output must not redispatch")},valid).await.unwrap();
+        assert_eq!(resumed,"valid");assert_eq!(saved.lock().unwrap().len(),2);
+    }
+
 }

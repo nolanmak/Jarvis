@@ -933,16 +933,17 @@ pub(super) async fn prepare_acceptance_for(
                 Ok(baseline)=>Ok((proposal,baseline)),
                 Err(error) if error.downcast_ref::<BaselineNotRed>().is_some()=>{
                     workflow.check_resource_policy()?;
-                    let epoch=amendment::digest(format!("{source}|{base}|{}",serde_json::to_string(required_criteria)?).as_bytes());
-                    if workflow.admit_epoch_attempt("initial_baseline_correction",&epoch,1)? {
-                        // Only this controller-owned disposable baseline is reset.
-                        trusted_git(&baseline_root,&["reset","--hard",base]).await?;
-                        trusted_git(&baseline_root,&["clean","-fdx"]).await?;
-                        let correction=format!("Independently correct this inadequate initial verifier without weakening ANY owner requirement. Previous registration did not reproduce intended behavioral red: {error}. Use actual original-base implementation. Preserve each original criterion verbatim. Scoper request:{scope}\nRequired criteria:{}\n{CONTRACT_PROMPT}",serde_json::to_string(required_criteria)?);
-                        let output=scope_authority::run(&baseline_root,workflow.repository(),workflow,&correction).await?;
-                        let next=proposal_with_retry(workflow,&baseline_root,source,&output,required_criteria).await?;
-                        register_and_reproduce(&baseline_root,next.clone(),&workflow.audit_logger()).await.map(|baseline|(next,baseline))
-                    } else {Err(error)}
+                    let epoch=amendment::digest(format!("{source}|{base}|{}|{}",environment_id(&baseline_root)?,serde_json::to_string(required_criteria)?).as_bytes());
+                    // Only this controller-owned disposable baseline is reset.
+                    trusted_git(&baseline_root,&["reset","--hard",base]).await?;
+                    trusted_git(&baseline_root,&["clean","-fdx"]).await?;
+                    let correction=format!("Independently correct this inadequate initial verifier without weakening ANY owner requirement. Previous registration did not reproduce intended behavioral red: {error}. Use actual original-base implementation. Preserve each original criterion verbatim. Scoper request:{scope}\nRequired criteria:{}\n{CONTRACT_PROMPT}",serde_json::to_string(required_criteria)?);
+                    let next=scope_authority::persistent(&baseline_root,workflow,"initial_baseline_correction",&epoch,&correction,true,|raw| {
+                        let proposal=parse_proposal_for(raw,source)?;
+                        for required in required_criteria {ensure!(proposal.contract.criteria.iter().any(|c|c.requirement.trim()==required.trim()),"corrected contract dropped original criterion: {required}");}
+                        Ok(proposal)
+                    }).await.map_err(|error|if error.downcast_ref::<scope_authority::CompletedInvalid>().is_some(){anyhow::Error::new(BaselineNotRed{detail:format!("{error:#}")})}else{error})?;
+                    register_and_reproduce(&baseline_root,next.clone(),&workflow.audit_logger()).await.map(|baseline|(next,baseline))
                 },
                 Err(error)=>Err(error),
             },

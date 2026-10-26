@@ -184,6 +184,20 @@ impl WorkflowStore {
         Ok(Some(Self {conn}))
     }
 
+    pub fn scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,now:i64)->Result<Option<String>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let value=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;tx.commit()?;Ok(value)
+    }
+    pub fn record_scope_stage_response(&mut self,lease:&Lease,binding:&Binding,key:&str,response:&str,now:i64)->Result<()> {
+        ensure!(key.len()==64 && response.len()<=2*1024*1024,"invalid bounded scope response");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_binding(&tx,lease,binding,now)?;
+        let prior:Option<String>=tx.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",params![lease.workflow,key],|r|r.get(0)).optional()?;
+        if let Some(prior)=prior {ensure!(prior==response,"scope response is immutable");} else {
+            tx.execute("INSERT INTO scope_stage_response VALUES(?1,?2,?3)",params![lease.workflow,key,response])?;
+            event(&tx,&lease.workflow,lease.generation,"scope_stage_response_recorded",&serde_json::json!({"key":key}).to_string(),now)?;
+        }tx.commit()?;Ok(())
+    }
+
     pub fn set_readiness_dependency(&mut self,lease:&Lease,binding:&Binding,repository:&str,issue:u64,record:Option<(&str,&str,&str,&str)>,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
@@ -239,6 +253,7 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS scope_stage_response(workflow TEXT NOT NULL REFERENCES workflow(id),key TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(workflow,key));
             CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
@@ -1859,6 +1874,18 @@ mod tests {
                     .is_err());
             }
         }
+    }
+
+    #[test]
+    fn completed_scope_response_survives_worker_restart_and_is_not_an_approval() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,old)=setup(&path);let key="a".repeat(64);
+        assert!(store.scope_stage_response(&old,&binding(),&key,30).unwrap().is_none());
+        store.record_scope_stage_response(&old,&binding(),&key,"synthetic output",31).unwrap();
+        assert!(store.record_scope_stage_response(&old,&binding(),&key,"different output",32).is_err());
+        drop(store);let mut store=WorkflowStore::open(&path).unwrap();let new=store.claim(&old.workflow,"next",1021,1000).unwrap().unwrap();
+        assert_eq!(store.scope_stage_response(&new,&binding(),&key,1022).unwrap().as_deref(),Some("synthetic output"));
+        assert!(store.scope_stage_response(&old,&binding(),&key,1022).is_err());
+        assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM review",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
     #[test]

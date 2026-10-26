@@ -169,11 +169,11 @@ pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Pat
         ensure!(meta.is_file() && meta.nlink()==1 && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0 && meta.len()<=128*1024,"unsafe decomposition receipt");
         serde_json::from_reader(file)?
     } else {
-        if !workflow.admit_epoch_attempt("initial_verifier_decomposition",&epoch,1)? {return Ok(vec![]);}
         let prompt=format!("{SLICE_SYSTEM}\nIndependent acceptance generation could not produce an intended-red behavioral verifier after bounded correction. Localize the missing executable observability and split into 2-6 smallest verifiable ordered children that together preserve the ENTIRE owner request. Do not create a research-only or owner-consent task merely because implementation is difficult. Return ONLY JSON {{\"children\":[{{\"title\":\"...\",\"body\":\"...\"}}]}}. Each original criterion must appear verbatim in at least one child body. Owner request:{}\n{}\nOriginal criteria:{}\nObserved failure:{}",issue.title,issue.body,serde_json::to_string(criteria)?,truncate(detail,16000));
-        let raw=scope_authority::assess(root,workflow.repository(),workflow,&prompt).await?;
-        let raw=raw.trim();let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
-        let plan:Decomposition=serde_json::from_str(raw)?;validate_decomposition(&plan,criteria)?;
+        let plan=scope_authority::persistent(root,workflow,"initial_verifier_decomposition",&epoch,&prompt,false,|raw| {
+            let raw=raw.trim();let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
+            let plan:Decomposition=serde_json::from_str(raw)?;validate_decomposition(&plan,criteria)?;Ok(plan)
+        }).await?;
         use std::io::Write;use std::os::unix::fs::PermissionsExt;
         let mut staged=tempfile::NamedTempFile::new_in(&control)?;staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
         staged.write_all(&serde_json::to_vec(&plan)?)?;staged.as_file().sync_all()?;staged.persist_noclobber(&path).map_err(|e|e.error)?;
