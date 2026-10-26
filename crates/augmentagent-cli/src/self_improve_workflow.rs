@@ -177,6 +177,7 @@ fn acquire_audit_generation(
     state: &Path, store: &mut WorkflowStore, lease: &Lease,
     worktree: Option<&Path>, binding: &mut Binding, now: i64,
 ) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    reconcile_runtime_retirements_in(store, now)?;
     let generation = store.audit_generation(&lease.workflow)?;
     let old = open_audit_generation(state, &lease.workflow, worktree, generation)?;
     if old.protected_health().is_ok() { return Ok(old); }
@@ -185,7 +186,7 @@ fn acquire_audit_generation(
     let proof = old.recovery_evidence(lease.generation)?;
     store.validate_lease(lease, binding, now)?;
     let recovery = serde_json::json!({"workflow":lease.workflow,
-        "old_audit_generation":generation,"new_audit_generation":lease.generation,
+        "old_audit_generation":generation,"old_audit_path":old.path(),"new_audit_generation":lease.generation,
         "lease_generation":lease.generation,"interrupted":proof});
     let next = open_audit_generation(state, &lease.workflow, worktree, lease.generation)?;
     next.protected_health()?;
@@ -193,7 +194,29 @@ fn acquire_audit_generation(
         "kind":"audit_generation_recovery","generation":lease.generation,
         "workflow":lease.workflow,"recovery":recovery}))?;
     *binding = store.recover_audit_generation(lease,generation,&recovery,now)?;
+    reconcile_runtime_retirements_in(store,now)?;
     Ok(next)
+}
+
+/// Free, bounded reconciliation; durable intent survives terminal workflows and
+/// crash between audit-generation commit and filesystem retirement.
+pub(super) fn reconcile_runtime_retirements()->Result<usize> {
+    let state=path();
+    if !state.exists(){return Ok(0);}
+    reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
+}
+fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
+    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){return Ok(0);}
+    let rows=store.pending_native_retirements(now,16)?;
+    let mut completed=0;
+    for (workflow,generation,audit_path) in rows {
+        let owner=augmentagent_channel_core::native_vm::RuntimeOwner{workflow_id:workflow.clone(),lease_generation:generation};
+        match augmentagent_channel_core::native_vm::retire_owned_runtimes(Path::new(&audit_path),&owner) {
+            Ok(_)=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+            Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
+        }
+    }
+    Ok(completed)
 }
 
 pub(super) fn requires_reverification(repository: &str, pr: u64) -> Result<bool> {
@@ -656,6 +679,7 @@ impl WorkflowGuard {
         audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
+        store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         let guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
@@ -760,6 +784,7 @@ impl WorkflowGuard {
         self.audit.set_model_call_observer(Arc::new(move |_provider| {
             anyhow::ensure!(!capacity_flag.load(Ordering::SeqCst), "resource_capacity: await_capacity checkpoint retained");
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
+            anyhow::ensure!(!matches!(store.snapshot(&lease.workflow)?.context("workflow missing")?.checkpoint.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot admit another model call");
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
             let charge = ResourceCharge { model_calls:1, ..Default::default() };
             if let Ok(bounded)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
@@ -800,6 +825,7 @@ impl WorkflowGuard {
         audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
+        store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
         let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
@@ -1389,6 +1415,7 @@ impl WorkflowGuard {
         )?;
         store.release(&self.lease, now)?;
         self.released = true;
+        reconcile_runtime_retirements_in(&mut store,now)?;
         Ok(())
     }
 }

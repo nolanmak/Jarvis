@@ -169,3 +169,17 @@ Contention is a pre-dispatch capacity dependency. This prevents concurrent
 refresh attempts from invalidating each other's tokens. The imported service
 credential belongs to this controlled writer domain; do not concurrently run
 another client against a copied refresh credential outside that protocol.
+
+Runtime retirement is an outbox operation. The workflow store records the exact
+owner and audit path before dispatch; terminal checkpoint transitions and
+quiescent audit-generation recovery queue retirement in the same SQLite
+transaction as the state transition. Free reconciliation retries the bounded
+oldest-attempt window, including terminal workflows no longer eligible for a
+builder. A crash after the pointer commit or after marker creation replays the
+same owner without touching later claims. Missing VM policy leaves the intent
+pending. Normal parked work does not authorize owner retirement.
+
+The runtime store also persists an exact closed-owner tuple, so a late caller
+cannot create a new session after that owner's cleanup was acknowledged.
+Workflow model admission rejects terminal stages independently. Retirement
+never removes protected audit or review evidence.

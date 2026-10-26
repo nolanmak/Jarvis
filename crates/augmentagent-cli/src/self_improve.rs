@@ -1553,6 +1553,11 @@ async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
 /// justification is that it finishes work already approved, and acting on a
 /// guess would make it something else.
 async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
+    if !dry_run {
+        if let Err(error)=workflow::reconcile_runtime_retirements() {
+            warn!("native runtime retirement reconciliation unavailable: {error:#}");
+        }
+    }
     if let Err(error)=publication::reconcile_pending(repo_root,dry_run).await {
         warn!("pending publication reconciliation unavailable: {error:#}");
     }

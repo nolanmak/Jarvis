@@ -268,6 +268,10 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS scope_stage_response(workflow TEXT NOT NULL REFERENCES workflow(id),key TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(workflow,key));
             CREATE TABLE IF NOT EXISTS pr_readiness_dependencies(workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_hash TEXT NOT NULL,base TEXT NOT NULL,evidence TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
+            CREATE TABLE IF NOT EXISTS workflow_native_owner (
+                workflow TEXT NOT NULL REFERENCES workflow(id), lease_generation INTEGER NOT NULL,
+                audit_path TEXT NOT NULL, retirement_reason TEXT, retired_at INTEGER,
+                attempted_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(workflow,lease_generation));
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
@@ -633,6 +637,9 @@ impl WorkflowStore {
                 &raw,
                 now_ms,
             )?;
+        }
+        if matches!(checkpoint.stage,Stage::Merged|Stage::Retired) {
+            tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'terminal_workflow') WHERE workflow=?1 AND retired_at IS NULL",[&lease.workflow])?;
         }
         tx.commit()?;
         Ok(())
@@ -1233,9 +1240,54 @@ impl WorkflowStore {
         // remains in review_recorded events). Hash recomputation can return to
         // the same candidate binding after recovery; it must not revive approval.
         tx.execute("DELETE FROM review WHERE workflow=?1", [&lease.workflow])?;
+        if let Some(old_path)=recovery.get("old_audit_path").and_then(|value|value.as_str()) {
+            tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'quiescent_audit_recovery') WHERE workflow=?1 AND audit_path=?2 AND lease_generation<?3 AND retired_at IS NULL",
+                params![lease.workflow,old_path,lease.generation])?;
+        }
         event(&tx,&lease.workflow,lease.generation,"audit_generation_recovered",&raw,now)?;
         tx.commit()?;
         Ok(checkpoint.binding)
+    }
+
+    /// Immutable owner registration precedes any native transport dispatch.
+    pub fn register_native_owner(&mut self,lease:&Lease,audit_path:&str,now:i64)->Result<()> {
+        ensure!(std::path::Path::new(audit_path).is_absolute() && audit_path.len()<=4096,"invalid native owner audit path");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx,lease,now)?;
+        let old:Option<String>=tx.query_row("SELECT audit_path FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?2",params![lease.workflow,lease.generation],|row|row.get(0)).optional()?;
+        if let Some(old)=old {ensure!(old==audit_path,"native owner audit path is immutable");}
+        else {
+            tx.execute("INSERT INTO workflow_native_owner(workflow,lease_generation,audit_path) VALUES(?1,?2,?3)",params![lease.workflow,lease.generation,audit_path])?;
+            event(&tx,&lease.workflow,lease.generation,"native_runtime_owner_registered",audit_path,now)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rotate a bounded free reconciliation window before external filesystem IO.
+    pub fn pending_native_retirements(&mut self,now:i64,limit:usize)->Result<Vec<(String,i64,String)>> {
+        ensure!(limit<=64,"native retirement batch too large");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows={
+            let mut statement=tx.prepare("SELECT workflow,lease_generation,audit_path FROM workflow_native_owner WHERE retirement_reason IS NOT NULL AND retired_at IS NULL ORDER BY attempted_at,workflow,lease_generation LIMIT ?1")?;
+            let rows=statement.query_map([limit as i64],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (workflow,generation,_) in &rows {
+            tx.execute("UPDATE workflow_native_owner SET attempted_at=?3 WHERE workflow=?1 AND lease_generation=?2",params![workflow,generation,now])?;
+        }
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    /// Acknowledgement is idempotent and only settles the exact authorized intent.
+    pub fn complete_native_retirement(&mut self,workflow:&str,generation:i64,audit_path:&str,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed=tx.execute("UPDATE workflow_native_owner SET retired_at=?4 WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retirement_reason IS NOT NULL AND retired_at IS NULL",
+            params![workflow,generation,audit_path,now])?;
+        if changed>0 {event(&tx,workflow,generation,"native_runtime_owner_retired",audit_path,now)?;}
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn validate_lease(&mut self, lease: &Lease, binding: &Binding, now_ms: i64) -> Result<()> {
@@ -1617,6 +1669,41 @@ mod tests {
             .unwrap();
         (store, lease)
     }
+    #[test]
+    fn terminal_runtime_retirement_intent_survives_crash_and_settles_once() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        store.register_native_owner(&lease,"/audit/shared",30).unwrap();
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Merged;
+        store.checkpoint(&lease,&checkpoint,31).unwrap();
+        drop(store); // crash before the filesystem side effect
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let expected=vec![(lease.workflow.clone(),lease.generation,"/audit/shared".into())];
+        assert_eq!(store.pending_native_retirements(32,16).unwrap(),expected);
+        store.complete_native_retirement(&lease.workflow,lease.generation,"/audit/wrong",33).unwrap();
+        assert_eq!(store.pending_native_retirements(34,16).unwrap(),expected);
+        store.complete_native_retirement(&lease.workflow,lease.generation,"/audit/shared",35).unwrap();
+        store.complete_native_retirement(&lease.workflow,lease.generation,"/audit/shared",36).unwrap();
+        assert!(store.pending_native_retirements(37,16).unwrap().is_empty());
+        assert_eq!(store.events(&lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_runtime_owner_retired").count(),1);
+    }
+    #[test]
+    fn audit_recovery_queues_old_owner_atomically_without_retiring_future_shared_path() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,old)=setup(&path);
+        store.register_native_owner(&old,"/audit/shared",30).unwrap();
+        store.release(&old,31).unwrap();
+        assert!(store.pending_native_retirements(32,16).unwrap().is_empty(),"normal park preserves resumable sessions");
+        let lease=store.claim(&old.workflow,"recovery",40,1000).unwrap().unwrap();
+        assert!(store.register_native_owner(&old,"/audit/shared",41).is_err());
+        store.recover_audit_generation(&lease,0,&serde_json::json!({"old_audit_path":"/audit/shared","quiescent":true}),42).unwrap();
+        store.register_native_owner(&lease,"/audit/shared",43).unwrap();
+        drop(store); // recovery pointer is committed, retirement hasn't executed
+        let mut store=WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.pending_native_retirements(44,16).unwrap(),vec![(old.workflow.clone(),old.generation,"/audit/shared".into())]);
+    }
+
     #[test]
     fn unavailable_publication_frontier_cannot_starve_later_workflows() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");

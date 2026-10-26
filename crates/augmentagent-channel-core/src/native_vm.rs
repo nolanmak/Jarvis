@@ -55,6 +55,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    if let Some(parent)=path.parent(){std::fs::File::open(parent)?.sync_all()?;}
     Ok(())
 }
 fn digest(value: &str) -> String {
@@ -146,7 +147,23 @@ pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<us
     let _lock=StateLock::acquire(&root)?;
     retire_owned_at(&root,audit_path,owner)
 }
+fn retirement_db(root:&Path)->Result<rusqlite::Connection> {
+    let path=root.join("runtime-retirement.sqlite");
+    let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)?;
+    let info=file.metadata()?;
+    ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native retirement database");
+    let db=rusqlite::Connection::open(path)?;
+    db.pragma_update(None,"synchronous","FULL")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS retired_owner(audit_path TEXT NOT NULL,workflow TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(audit_path,workflow,generation));")?;
+    Ok(db)
+}
+fn owner_retired(root:&Path,audit_path:&Path,owner:&RuntimeOwner)->Result<bool> {
+    Ok(retirement_db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE audit_path=?1 AND workflow=?2 AND generation=?3)",
+        rusqlite::params![audit_path.to_str().context("non-UTF8 audit path")?,owner.workflow_id,owner.lease_generation],|row|row.get(0))?)
+}
 fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) -> Result<usize> {
+    retirement_db(root)?.execute("INSERT OR IGNORE INTO retired_owner VALUES(?1,?2,?3)",rusqlite::params![audit_path.to_str().context("non-UTF8 audit path")?,expected_owner.workflow_id,expected_owner.lease_generation])?;
+    std::fs::File::open(root)?.sync_all()?;
     let mut count=0;
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
@@ -201,6 +218,7 @@ impl Launch {
                 "OAuth refresh requires an explicitly imported controller credential");
         }
         let state_lock=StateLock::acquire(&root)?;
+        ensure!(!owner_retired(&root,owner_logger.path(),&audit_owner)?,"native runtime owner has been retired");
         ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
         let count=prune_and_count(&root)?;
         let additional=usize::from(!matches!(native,Some(crate::native_session::Launch::Resume{..})));
@@ -343,6 +361,8 @@ mod tests {
         drop(lock);
         assert_eq!(prune_and_count(temp.path()).unwrap(),1);
         assert!(!held.exists()); assert!(resumable.exists());
+        assert!(owner_retired(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap());
+        assert!(!owner_retired(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:3}).unwrap());
     }
     #[test]
     fn scope_retirement_does_not_guess_interrupted_session_safe() {
