@@ -795,6 +795,28 @@
         "/tmp/autoship-1598-a73ac9ac-guard-tests.log"
       ],
       "scope": "29 durable store tests and22 guard tests. Initial incorrectly named guard filter matched zero; corrected self_improve::workflow::tests filter passed22. Later code changes are not covered."
+    },
+    "managed_core_email_store_afc0ee41": {
+      "revision": "afc0ee41",
+      "conclusion": "success",
+      "passed": 1020,
+      "ignored": 14,
+      "suites": {
+        "channel_core": 639,
+        "channel_email": 222,
+        "store": 159
+      },
+      "log": "/tmp/autoship-1598-afc0ee41-core-email-store.log",
+      "scope": "Managed single-job build and serial library tests; includes declared native eligibility, first dispatch failure memory, immutable triage cohorts. No authenticated provider or final rollout claim."
+    },
+    "email_history_cohort_review": {
+      "revisions": [
+        "f0ac9e86",
+        "ccfff8b2"
+      ],
+      "reviewer": "independent review agent",
+      "conclusion": "LGTM",
+      "scope": "First failure journal transaction and original cohort snapshot; newly errored actions without decision snapshots remain explicitly unknown."
     }
   },
   "remaining_cross_cutting_acceptance": [
