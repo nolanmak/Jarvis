@@ -455,6 +455,11 @@ pub(super) async fn run_if_due() -> Result<()> {
         .filter(|(_, c)| !previous.contains_key(&c.id))
         .take(MAX_REPLAY_CASES)
         .collect();
+    if remaining.is_empty() {
+        finish_batch(&conn,&batch,&cases,&examples,now)?;
+        return Ok(());
+    }
+    let Some(observation) = workflow::WorkflowGuard::acquire_observation(&format!("calibration:{batch}")).await? else { return Ok(()); };
     let (protected, fixture_expected) = fixtures()?;
     let page = format!("{batch}:{}", previous.len());
     if !remaining.is_empty() && !claim(&mut conn, &page, now)? {
@@ -471,6 +476,7 @@ pub(super) async fn run_if_due() -> Result<()> {
         if attempts >= 2 && now.saturating_sub(last) >= DAY_MS {
             conn.execute("INSERT OR IGNORE INTO replay_rejected VALUES(?1,'bounded page attempts exhausted; retain previous rubric')",[&batch])?;
         }
+        observation.finish()?;
         return Ok(());
     }
     drop(conn);
@@ -478,8 +484,8 @@ pub(super) async fn run_if_due() -> Result<()> {
     let reasoner = augmentagent_channel_core::build_pinned(provider)
         .context("calibration native Codex unavailable")?;
     let isolated = tempfile::tempdir()?;
-    let logger =
-        workflow::workflow_audit(&workflow::path(), &format!("calibration:{batch}"), None)?;
+    observation.bind_reasoner(reasoner.as_ref())?;
+    let logger = observation.audit_logger();
     let mut sessions: Vec<String> = previous.values().map(|r| r.session.clone()).collect();
     for (index, held) in remaining {
         let held_id = format!("candidate-{index}");
@@ -538,7 +544,9 @@ pub(super) async fn run_if_due() -> Result<()> {
     }
     logger.drain_checked().await?;
     let conn = open(&path)?;
-    let Some(version) = finish_batch(&conn, &batch, &cases, &examples, now)? else {
+    let finished = finish_batch(&conn, &batch, &cases, &examples, now)?;
+    observation.finish()?;
+    let Some(version) = finished else {
         return Ok(());
     };
     info!(%version,"promoted independently replayed review rubric");

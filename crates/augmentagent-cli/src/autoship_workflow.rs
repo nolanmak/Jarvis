@@ -153,6 +153,12 @@ pub fn default_path() -> std::path::PathBuf {
         })
 }
 
+fn observation_available(conn: &Connection, now_ms: i64, required: u64, cap: u64) -> Result<bool> {
+    let shipping: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow WHERE owner IS NOT NULL AND lease_until>?1 AND id NOT LIKE 'autoship-observation/%' AND id NOT LIKE 'autoship-canary/%')",[now_ms],|r|r.get(0))?;
+    let used: u64 = conn.query_row("SELECT COALESCE(SUM(calls),0) FROM observation_charge WHERE day=?1",[now_ms.div_euclid(86_400_000)],|r|r.get(0))?;
+    Ok(!shipping && required > 0 && used.checked_add(required).is_some_and(|total| total <= cap))
+}
+
 pub struct WorkflowStore {
     conn: Connection,
 }
@@ -200,6 +206,8 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS observation_charge (
+                workflow TEXT NOT NULL, receipt_id TEXT NOT NULL, day INTEGER NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(workflow,receipt_id));
             CREATE TABLE IF NOT EXISTS episode_action (
                 workflow TEXT NOT NULL REFERENCES workflow(id), epoch TEXT NOT NULL, action TEXT NOT NULL,
                 at_ms INTEGER NOT NULL, PRIMARY KEY(workflow,epoch,action));
@@ -892,6 +900,21 @@ impl WorkflowStore {
         charge: ResourceCharge,
         now_ms: i64,
     ) -> Result<()> {
+        self.charge_inner(lease, receipt_id, charge, now_ms, None)
+    }
+
+    pub fn charge_observation(&mut self, lease: &Lease, receipt_id: &str,
+        charge: ResourceCharge, now_ms: i64, daily_cap: u64) -> Result<()> {
+        ensure!(lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"), "observation budget requires diagnostic workflow namespace");
+        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap))
+    }
+
+    pub fn observation_available(&self, now_ms: i64, required: u64, daily_cap: u64) -> Result<bool> {
+        observation_available(&self.conn, now_ms, required, daily_cap)
+    }
+
+    fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
+        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>) -> Result<()> {
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
             i64::try_from(charge.wall_ms)?,
@@ -907,6 +930,10 @@ impl WorkflowStore {
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
         } else {
+            if let Some(cap) = observation_cap {
+                ensure!(observation_available(&tx, now_ms, charge.model_calls, cap)?, "optional observation deferred: shipping active or daily model-call budget exhausted");
+                tx.execute("INSERT INTO observation_charge VALUES(?1,?2,?3,?4)",params![lease.workflow,receipt_id,now_ms.div_euclid(86_400_000),values.1])?;
+            }
             // Check sums before SQL arithmetic can promote an overflowing
             // integer to floating point and corrupt accounting.
             let totals: (i64, i64, i64) = tx.query_row(
@@ -2130,5 +2157,43 @@ mod tests {
             .attach_pr_in_repo(&other_lease, "owner/repo", 42, 34)
             .is_err());
         assert_eq!(store.resolve_pr("owner/repo", 43).unwrap(), Some(other));
+    }
+}
+
+#[cfg(test)]
+mod observation_accounting_tests {
+    use super::*;
+    fn binding() -> Binding { Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()} }
+    #[test]
+    fn observations_are_charged_once_bounded_and_subordinate_to_shipping() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("ledger.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let observation="autoship-observation/replay";
+        store.register(observation,"probe",binding(),1).unwrap();
+        let lease=store.claim(observation,"probe-owner",2,1000).unwrap().unwrap();
+        let cost=||ResourceCharge {model_calls:1,..Default::default()};
+        store.charge_observation(&lease,"call1",cost(),3,2).unwrap();
+        store.charge_observation(&lease,"call1",cost(),4,2).unwrap();
+        assert_eq!(store.snapshot(observation).unwrap().unwrap().model_calls,1);
+        store.register("owner/repo#1","shipping",binding(),5).unwrap();
+        let shipping=store.claim("owner/repo#1","builder",6,1000).unwrap().unwrap();
+        assert!(!store.observation_available(7,1,2).unwrap());
+        assert!(store.charge_observation(&lease,"blocked",cost(),7,2).is_err());
+        assert_eq!(store.snapshot(observation).unwrap().unwrap().model_calls,1);
+        // Shipping work retains its own budget; diagnostic exhaustion cannot block it.
+        store.charge(&shipping,"real-builder-call",cost(),8).unwrap();
+        store.release(&shipping,9).unwrap();
+        store.charge_observation(&lease,"call2",cost(),10,2).unwrap();
+        assert!(store.charge_observation(&lease,"call3",cost(),11,2).is_err());
+        store.release(&lease,12).unwrap();
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        assert!(!store.observation_available(13,1,2).unwrap());
+        assert!(store.observation_available(86_400_001,1,2).unwrap());
+        let again=store.claim(observation,"next-day",86_400_001,1000).unwrap().unwrap();
+        store.charge_observation(&again,"call3",cost(),86_400_002,2).unwrap();
+        assert_eq!(store.snapshot(observation).unwrap().unwrap().model_calls,3);
+        assert_eq!(store.events(observation).unwrap().iter().filter(|(_,kind,_,_)|kind=="resource_charged").count(),3);
     }
 }

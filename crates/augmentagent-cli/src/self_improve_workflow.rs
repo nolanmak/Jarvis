@@ -27,6 +27,16 @@ pub(super) struct Start<'a> {
     pub environment: &'a str,
 }
 
+/// Separate optional-observation budget; never consumes the shipping attempt
+/// reservation. Twelve calls permits a complete bounded canary plus replay.
+fn observation_call_cap() -> u64 {
+    std::env::var("AUGMENTAGENT_AUTOPR_OBSERVATION_CALL_CAP").ok()
+        .and_then(|s|s.parse().ok()).unwrap_or(12)
+}
+pub(super) fn observation_available(required: u64) -> Result<bool> {
+    WorkflowStore::open(&path())?.observation_available(millis(),required,observation_call_cap())
+}
+
 pub(super) fn path() -> PathBuf {
     durable::default_path()
 }
@@ -326,6 +336,7 @@ impl SweepGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             released: false,
         };
+        inner.install_model_accounting()?;
         inner.audit_event("sweep_claimed", serde_json::json!({}))?;
         inner.spawn_renewal();
         Ok(Some(Self {
@@ -580,6 +591,7 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             released: false,
         };
+        guard.install_model_accounting()?;
         guard.audit_event("workflow_claimed", serde_json::json!({}))?;
         guard.spawn_renewal();
         let _ = start.repo_root; // Kept explicit: caller owns repository/worktree provenance validation.
@@ -631,25 +643,44 @@ impl WorkflowGuard {
     pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
         self.audit.clone()
     }
-    pub(super) fn bind_reasoner(&self, reasoner: &FallbackReasoner) -> Result<()> {
+    fn install_model_accounting(&self) -> Result<()> {
         let store = self.store.clone();
         let lease = self.lease.clone();
-        self.audit
-            .set_model_call_observer(Arc::new(move |_provider| {
-                store
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?
-                    .charge(
-                        &lease,
-                        &format!("model-call:{}", uuid::Uuid::new_v4()),
-                        ResourceCharge {
-                            model_calls: 1,
-                            ..Default::default()
-                        },
-                        millis(),
-                    )
-            }))?;
+        let observational = self.repository.starts_with("autoship-observation/") || self.repository.starts_with("autoship-canary/");
+        self.audit.set_model_call_observer(Arc::new(move |_provider| {
+            let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
+            let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
+            let charge = ResourceCharge { model_calls:1, ..Default::default() };
+            if observational {
+                store.charge_observation(&lease,&receipt,charge,millis(),observation_call_cap())
+            } else {
+                store.charge(&lease,&receipt,charge,millis())
+            }
+        }))
+    }
+    pub(super) fn bind_reasoner(&self, reasoner: &FallbackReasoner) -> Result<()> {
+        // The guard installs exactly one observer at acquisition. Rebinding a
+        // builder or attaching a separately constructed reviewer cannot double charge.
         reasoner.set_workflow_audit(self.audit.clone())
+    }
+
+    pub(super) async fn acquire_observation(key: &str) -> Result<Option<Self>> {
+        let state = path();
+        let mut store = WorkflowStore::open(&state)?;
+        let now = millis();
+        if !store.observation_available(now,1,observation_call_cap())? { return Ok(None); }
+        let hash = format!("{:x}",Sha256::digest(key.as_bytes()));
+        let id = format!("autoship-observation/{hash}");
+        let binding = Binding {head:hash.clone(),contract:"observation-v1".into(),evidence_hash:hash};
+        store.register(&id,"observational",binding.clone(),now)?;
+        let Some(lease) = store.claim(&id,&format!("observation:{}",uuid::Uuid::new_v4()),now,LEASE_MS)? else { return Ok(None); };
+        let audit = workflow_audit(&state,&id,None)?;
+        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
+            heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),released:false };
+        guard.install_model_accounting()?;
+        guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
+        guard.spawn_renewal();
+        Ok(Some(guard))
     }
     pub(super) async fn audit_health(&self) -> Result<()> {
         self.audit.drain_checked().await
@@ -2095,4 +2126,20 @@ mod tests {
         std::os::unix::fs::symlink("code.txt", &new_file).unwrap();
         assert!(git_binding(dir.path(), "C1", "rust-a", &[]).await.is_err());
     }
+    #[tokio::test]
+    async fn acquired_guard_accounts_direct_reviewers_without_builder_binding() {
+        let dir=repo(); let control=control_dir(); let path=control.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(7),pr:None,branch:"fixture",contract:"C1",environment:"test"},millis()).await.unwrap().unwrap();
+        guard.audit_logger().model_call_admitted("codex").unwrap();
+        assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,1);
+        let reasoner=FallbackReasoner::for_tests(vec![],augmentagent_channel_core::CooldownLatch::at(control.path().join("cooldowns.json")));
+        guard.bind_reasoner(&reasoner).unwrap(); guard.bind_reasoner(&reasoner).unwrap();
+        guard.audit_logger().model_call_admitted("codex").unwrap();
+        assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,2,"rebinding cannot duplicate observer charging");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let id=guard.id().to_owned(); guard.finish().unwrap();
+        let record=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+        assert!(record.wall_ms>0,"actual observed guard lifetime must be accounted");
+    }
+
 }

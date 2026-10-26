@@ -136,6 +136,10 @@ fn record(path: &Path, report: &Report) -> Result<()> {
 /// including failed/interrupted occurrences. Findings are reports, not a hidden
 /// unanimity gate on unrelated production PRs.
 pub(super) async fn run_if_due() -> Result<Option<Report>> {
+    // Preserve the occurrence when shipping is active or a complete probe
+    // cannot fit. This check is free; every eventual native dispatch is also
+    // charged and fenced atomically by its workflow observer.
+    if !workflow::observation_available(9)? { return Ok(None); }
     let path = database()?;
     let now = chrono::Utc::now().timestamp_millis();
     let Some(id) = claim(&path, now)? else {
