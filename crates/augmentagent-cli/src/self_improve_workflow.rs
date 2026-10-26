@@ -609,6 +609,13 @@ impl WorkflowGuard {
         Self::acquire_at(&path(), start, millis()).await
     }
 
+    /// Exercise the complete admission path against caller-owned disposable
+    /// state without touching environment variables or the daemon database.
+    #[cfg(test)]
+    pub(super) async fn acquire_fixture(state: &Path, start: Start<'_>) -> Result<Option<Self>> {
+        Self::acquire_at(state, start, millis()).await
+    }
+
     async fn acquire_at(state: &Path, start: Start<'_>, now: i64) -> Result<Option<Self>> {
         anyhow::ensure!(
             !start.repository.trim().is_empty(),

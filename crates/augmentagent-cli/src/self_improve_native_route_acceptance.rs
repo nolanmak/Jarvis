@@ -89,16 +89,67 @@ async fn initialize_fixture(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn fixture_start<'a>(root: &'a Path, repository: &'a str) -> workflow::Start<'a> {
+    workflow::Start {
+        repo_root: root,
+        worktree: root,
+        repository,
+        source_issue: Some(840),
+        pr: None,
+        branch: "disposable",
+        contract: "routed-transport-v1",
+        environment: "no-tools",
+    }
+}
+
 #[tokio::test]
 async fn routed_fixture_supports_real_workflow_git_binding_before_dispatch() -> Result<()> {
-    let root = tempfile::tempdir()?;
+    let root = tempfile::Builder::new()
+        .prefix("autoship-route-fixture-")
+        .tempdir_in("/tmp")?;
+    let control = tempfile::Builder::new()
+        .prefix("autoship-route-control-")
+        .tempdir_in("/tmp")?;
     initialize_fixture(root.path()).await?;
-    let binding =
-        workflow::git_binding(root.path(), "routed-transport-v1", "no-tools", &[]).await?;
+    let database = control.path().join("workflow.db");
+    let guard = workflow::WorkflowGuard::acquire_fixture(
+        &database,
+        fixture_start(root.path(), "autoship-canary/routed-fixture"),
+    )
+    .await?
+    .context("fixture did not acquire real workflow lease")?;
+    guard.audit_health().await?;
+    let id = guard.id().to_owned();
+    let store = crate::autoship_workflow::WorkflowStore::open(&database)?;
+    let snapshot = store
+        .snapshot(&id)?
+        .context("acquired fixture missing durable state")?;
     anyhow::ensure!(
-        binding.head.len() == 40 && binding.evidence_hash.len() == 64,
-        "real fixture binding unavailable"
+        snapshot.checkpoint.binding.head.len() == 40 && snapshot.model_calls == 0,
+        "pre-dispatch fixture state invalid"
     );
+    anyhow::ensure!(
+        guard
+            .audit_logger()
+            .native_runtime_owner()?
+            .context("fenced fixture owner missing")?
+            .workflow_id
+            == id,
+        "fixture runtime owner missing"
+    );
+    anyhow::ensure!(
+        guard.audit_logger().path().starts_with(control.path()),
+        "fixture audit escaped isolated control directory"
+    );
+    guard.finish()?;
+    let resumed = workflow::WorkflowGuard::acquire_fixture(
+        &database,
+        fixture_start(root.path(), "autoship-canary/routed-fixture"),
+    )
+    .await?
+    .context("fixture lease was not cleanly released")?;
+    anyhow::ensure!(resumed.id() == id, "fixture recovery changed identity");
+    resumed.finish()?;
     Ok(())
 }
 
@@ -167,18 +218,9 @@ async fn live_native_operator_routed_transport() -> Result<()> {
         .tempdir_in("/tmp")?;
     initialize_fixture(fixture.path()).await?;
     let repository = format!("autoship-canary/routed-{}", uuid::Uuid::new_v4());
-    let guard = workflow::WorkflowGuard::acquire(workflow::Start {
-        repo_root: fixture.path(),
-        worktree: fixture.path(),
-        repository: &repository,
-        source_issue: None,
-        pr: None,
-        branch: "disposable",
-        contract: "routed-transport-v1",
-        environment: "no-tools",
-    })
-    .await?
-    .context("workflow lease unavailable")?;
+    let guard = workflow::WorkflowGuard::acquire(fixture_start(fixture.path(), &repository))
+        .await?
+        .context("workflow lease unavailable")?;
     guard.check_resource_policy()?;
     let reasoner = augmentagent_channel_core::build_workflow_pinned(Codex)
         .context("required routed constructor unavailable")?;
