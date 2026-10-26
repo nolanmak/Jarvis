@@ -34,6 +34,16 @@ pub fn workflow_id(repo: &str, issue: u64) -> Result<String> {
     Ok(format!("{}#{issue}", repo.to_ascii_lowercase()))
 }
 
+/// PRs adopted without a source issue, or multiple PRs for one issue, each
+/// have their own identity. This key does not assert trust or approval.
+pub fn pr_workflow_id(repo: &str, pr: u64) -> Result<String> {
+    ensure!(
+        !repo.trim().is_empty() && pr > 0,
+        "invalid PR workflow identity"
+    );
+    Ok(format!("{}/pr/{pr}", repo.to_ascii_lowercase()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     pub head: String,
@@ -180,6 +190,8 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS pr_alias (
+                id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id));
             CREATE TABLE IF NOT EXISTS operation (
                 id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id),
                 kind TEXT NOT NULL, binding TEXT NOT NULL, receipt TEXT, created_at INTEGER NOT NULL);
@@ -487,6 +499,62 @@ impl WorkflowStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Atomically attach a remote PR and its canonical alias. The issue-build
+    /// workflow keeps its identity; a later resume resolves the same row. Other
+    /// PRs for that issue can own independent PR-keyed workflows.
+    pub fn attach_pr_in_repo(
+        &mut self,
+        lease: &Lease,
+        repo: &str,
+        pr: u64,
+        now_ms: i64,
+    ) -> Result<()> {
+        let alias = pr_workflow_id(repo, pr)?;
+        let pr = i64::try_from(pr)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now_ms)?;
+        let prior: Option<i64> = tx.query_row(
+            "SELECT pr FROM workflow WHERE id=?1",
+            [&lease.workflow],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            prior.is_none_or(|p| p == pr),
+            "workflow already bound to a different PR"
+        );
+        let owner: Option<String> = tx
+            .query_row("SELECT workflow FROM pr_alias WHERE id=?1", [&alias], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        ensure!(
+            owner.as_deref().is_none_or(|id| id == lease.workflow),
+            "PR alias owned by another workflow"
+        );
+        tx.execute(
+            "INSERT INTO pr_alias(id,workflow) VALUES(?1,?2) ON CONFLICT(id) DO NOTHING",
+            params![alias, lease.workflow],
+        )?;
+        tx.execute(
+            "UPDATE workflow SET pr=?2 WHERE id=?1",
+            params![lease.workflow, pr],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn resolve_pr(&self, repo: &str, pr: u64) -> Result<Option<String>> {
+        let alias = pr_workflow_id(repo, pr)?;
+        Ok(self
+            .conn
+            .query_row("SELECT workflow FROM pr_alias WHERE id=?1", [alias], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     /// Immutable per reviewer/head/contract. Corrections require a new contract
@@ -1190,5 +1258,33 @@ mod tests {
                 .progress_at_ms,
             now
         );
+    }
+    #[test]
+    fn publication_alias_survives_restart_and_other_prs_for_same_issue_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (mut store, lease) = setup(&path);
+        store
+            .attach_pr_in_repo(&lease, "Owner/Repo", 42, 30)
+            .unwrap();
+        drop(store);
+        let mut store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(
+            store.resolve_pr("owner/repo", 42).unwrap().as_deref(),
+            Some("owner/repo#1")
+        );
+        let other = pr_workflow_id("owner/repo", 43).unwrap();
+        store.register(&other, "second-fix", binding(), 31).unwrap();
+        let other_lease = store
+            .claim(&other, "second-worker", 32, 1000)
+            .unwrap()
+            .unwrap();
+        store
+            .attach_pr_in_repo(&other_lease, "owner/repo", 43, 33)
+            .unwrap();
+        assert!(store
+            .attach_pr_in_repo(&other_lease, "owner/repo", 42, 34)
+            .is_err());
+        assert_eq!(store.resolve_pr("owner/repo", 43).unwrap(), Some(other));
     }
 }
