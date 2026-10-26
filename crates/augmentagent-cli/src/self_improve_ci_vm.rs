@@ -35,8 +35,62 @@ pub(super) struct Outcome {
     pub stderr: String,
     #[serde(default)]
     pub plan: Option<serde_json::Value>,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    errno: Option<i64>,
 }
 impl Outcome {
+    // This envelope is emitted before a guest exists and may not carry source
+    // bindings. Retain only protocol enums, never exception text or paths.
+    fn setup_diagnostic(&self) -> serde_json::Value {
+        let stage = self
+            .stage
+            .as_deref()
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "request_read"
+                        | "request_schema"
+                        | "controller_bundle"
+                        | "private_directories"
+                        | "git_alternate"
+                        | "storage_lease"
+                        | "runtime_load"
+                        | "cache_prepare"
+                        | "command_prepare"
+                        | "vm_launch"
+                        | "receipt_validate"
+                )
+            })
+            .unwrap_or("unknown");
+        let category = self
+            .category
+            .as_deref()
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "Unavailable"
+                        | "OSError"
+                        | "ValueError"
+                        | "KeyError"
+                        | "FileNotFoundError"
+                        | "PermissionError"
+                        | "NotADirectoryError"
+                        | "IsADirectoryError"
+                        | "BlockingIOError"
+                        | "JSONDecodeError"
+                        | "CalledProcessError"
+                        | "TimeoutExpired"
+                        | "SubprocessError"
+                )
+            })
+            .unwrap_or("unknown");
+        serde_json::json!({"stage":stage,"category":category,
+            "errno":self.errno.filter(|value| (1..=4095).contains(value))})
+    }
     fn validate(&self, binding: &Binding, operation: &str) -> Result<()> {
         ensure!(
             self.version == 1 && self.boundary == "existing-build-vm",
@@ -52,7 +106,7 @@ impl Outcome {
         if self.status == "prerequisite_hold" {
             bail!(
                 "{PREREQUISITE}: admitted CI VM requires environment/resource recovery; {}",
-                truncate_tail(&self.stderr, 4096)
+                self.setup_diagnostic()
             );
         }
         ensure!(
@@ -279,6 +333,14 @@ impl Session {
         );
         let outcome: Outcome = serde_json::from_slice(&output.stdout)
             .context("shared CI prerequisite unavailable: missing valid supervised VM receipt")?;
+        if outcome.status == "prerequisite_hold" {
+            audit.record_controller(serde_json::json!({
+                "kind":"shared_ci_vm_prerequisite_hold", "operation":operation,
+                "binding":binding,"controller_authority_sha256":self.authority_sha256,
+                "diagnostic":outcome.setup_diagnostic(),
+                "process_exit_code":output.status.code(),"shipping_authority":false
+            }))?;
+        }
         outcome.validate(binding, operation)?;
         ensure!(
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned"),
@@ -291,6 +353,31 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_failure_retains_safe_phase_without_exception_content() {
+        let binding = super::super::tests::binding_fixture();
+        let mut data = serde_json::json!({"version":1,"boundary":"existing-build-vm",
+            "status":"prerequisite_hold","stage":"runtime_load","category":"PermissionError",
+            "errno":13,"reason":"private credential contents","stderr":"private path"});
+        let receipt: Outcome = serde_json::from_value(data.clone()).unwrap();
+        let error = receipt.validate(&binding, "plan").unwrap_err().to_string();
+        assert!(
+            error.contains(PREREQUISITE)
+                && error.contains("runtime_load")
+                && error.contains("PermissionError")
+        );
+        assert!(!error.contains("private"));
+        data["stage"] = serde_json::json!("secret-stage");
+        data["category"] = serde_json::json!("secret-category");
+        data["errno"] = serde_json::json!(999999);
+        let receipt: Outcome = serde_json::from_value(data).unwrap();
+        assert_eq!(
+            receipt.setup_diagnostic(),
+            serde_json::json!({"stage":"unknown","category":"unknown","errno":null})
+        );
+        assert!(receipt.validate(&binding, "step").is_err());
+    }
     #[test]
     fn vm_receipt_requires_exact_binding_and_observed_exit() {
         let binding = super::super::tests::binding_fixture();
