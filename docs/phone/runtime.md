@@ -715,12 +715,12 @@ the text never reaches history or the model):
 
 ## Terminal and recoverable relay conditions (#1549)
 
-Once a relay socket is authenticated and claimed, only nine conditions end it.
+Authenticated relay termination uses nine fixed diagnostic categories.
 `ingress::EndReason` enumerates them and a wildcard-free test keeps the set
 exact: `peer_closed` (the provider closed the WebSocket, or sent an error code
 Twilio documents as session-terminating: 64104, 64105, 64108), `transport_error`
-(a socket read or write failed), `owner_hangup` (the call left the connected
-state or a stop was requested, including an `end` we sent), `revoked` (call
+(a socket operation or provider call failed), `owner_hangup` (reserved for
+explicit evidence of an owner hangup, which is not currently available), `revoked` (call
 authority can no longer be verified; an unreadable call record fails closed the
 same way), `duration_limit`, `worker_failed` (the agent worker stopped before
 the connection did), `invalid_frame_limit`, `agent_end` (Jarvis said goodbye and
@@ -728,16 +728,12 @@ sent `end` itself, #1557) and `silence` (nobody spoke through both check-ins,
 #1556). The TwiML is `<Connect>` followed
 by `<Hangup/>`, so any other exit would hang up on the owner.
 
-An owner hang-up reaches the relay as a socket close (or a session-terminating
-error frame) before Twilio's status callback records the call leaving the
-connected state, so a close alone does not settle the reason: it is rechecked
-against the stored call for up to one second, and only positive evidence
-(`stop_requested`, or a state other than connected) upgrades it to
-`owner_hangup`. A store that cannot be read, or that does not answer inside the
-window, keeps `peer_closed`; teardown is delayed by at most that second. At most
-four closes recheck at once, so a stalled store cannot accumulate one parked
-read per concurrent close — a close that finds no free slot keeps `peer_closed`
-without waiting.
+A delayed status callback is rechecked for up to one second after a socket
+close or terminal provider error frame. A failed call retains `transport_error`;
+completed/canceled calls and generic stop requests remain `peer_closed` because
+they do not identify who ended the call. An unreadable or slow store preserves
+`peer_closed`. At most four rechecks may hold blocking reads, so a stalled store
+cannot accumulate unbounded abandoned tasks. No available slot means no wait.
 
 Everything else is recoverable and the loop continues:
 
