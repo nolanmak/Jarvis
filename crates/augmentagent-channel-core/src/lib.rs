@@ -37,6 +37,7 @@ pub mod providers;
 pub mod public_report;
 pub mod reasoner;
 pub mod resolve;
+pub mod run_resources;
 pub mod secret_loader;
 pub mod skills;
 pub mod state_dir;

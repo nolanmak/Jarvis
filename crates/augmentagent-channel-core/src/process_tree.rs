@@ -14,7 +14,51 @@ pub(crate) struct ProcessGroup {
     receipt: PathBuf,
     clean: Arc<AtomicBool>,
     active_request: Option<PathBuf>,
+    resource_required: bool,
+    resource_observed: AtomicBool,
+    resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
     _directory: tempfile::TempDir,
+}
+
+impl ProcessGroup {
+    pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        if let Some(logger)=logger { *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone())); }
+        Ok(())
+    }
+    pub(crate) async fn admit_model(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        self.admit(provider,logger,true).await
+    }
+    pub(crate) async fn admit_command(&self, label: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        self.admit(label,logger,false).await
+    }
+    async fn admit(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>, model:bool) -> anyhow::Result<()> {
+        self.bind_resource_audit(provider,logger)?;
+        let ready=self.receipt.with_file_name("launch-ready");
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
+                self.resource_outcome(provider,logger)?;
+                return Err(crate::reasoner::ReasonerError::ResourceCapacity {provider:provider.into(),message:"provider launch admission unavailable".into()}.into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        if self.resource_required {
+            let observation:serde_json::Value=serde_json::from_slice(&private_read(&self.receipt.with_file_name("resource-accounting.json"))?)?;
+            anyhow::ensure!(observation.get("phase").and_then(|v|v.as_str())==Some("admitted"),"resource admission not established");
+            if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
+            }
+        }
+        if model { if let Some(logger)=logger { logger.model_call_admitted(provider)?; } }
+        let mut proceed=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.receipt.with_file_name("launch-continue"))?;
+        proceed.write_all(b"admitted\n")?;
+        proceed.sync_all()?;
+        Ok(())
+    }
+    pub(crate) fn resource_outcome(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        if self.resource_observed.swap(true,Ordering::SeqCst) { return Ok(()); }
+        crate::run_resources::record_outcome(&self.receipt.with_file_name("resource-accounting.json"),self.resource_required,provider,logger)
+    }
 }
 
 impl Drop for ProcessGroup {
@@ -28,6 +72,9 @@ impl Drop for ProcessGroup {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
+        if let Ok(audit)=self.resource_audit.lock() {
+            if let Some((provider,logger))=audit.as_ref() { let _=self.resource_outcome(provider,Some(logger)); }
+        }
         let processes_reaped = std::fs::read_to_string(&self.receipt)
             .is_ok_and(|value| value == "all-descendants-reaped\n");
         let mut clean = processes_reaped;
@@ -40,6 +87,14 @@ impl Drop for ProcessGroup {
         if !clean {
             // Do not falsely acknowledge cleanup. Adapters stop the chain.
             if !processes_reaped { unsafe { libc::kill(self.id, libc::SIGKILL); } }
+            if self.resource_required {
+                // A killed supervisor cannot enumerate detached children.
+                // The controller-owned cgroup identity still bounds cleanup.
+                let _=std::process::Command::new("/usr/bin/python3").arg("-I")
+                    .arg(self.receipt.with_file_name("run-resource-scope.py")).arg("--cleanup")
+                    .arg(self.receipt.with_file_name("resource-accounting.json"))
+                    .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
             tracing::error!("provider descendant cleanup is unverified; failover blocked");
         }
     }
@@ -421,6 +476,14 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false)
+}
+pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
+    -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources)
+}
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool)
+    -> std::io::Result<(Child, ProcessGroup)> {
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
     let search = original.get_envs().find(|(key, _)| *key == "PATH")
@@ -445,6 +508,9 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
     let receipt = directory.path().join("cleanup-complete");
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&helper)?;
     file.write_all(include_bytes!("../../../scripts/provider-supervisor.py"))?;
+    let resource_policy=crate::run_resources::declared_policy().map_err(std::io::Error::other)?;
+    if required_resources && resource_policy.is_none() { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"required run resource declaration unavailable")); }
+    if resource_policy.is_some() { crate::run_resources::install_helper(directory.path()).map_err(std::io::Error::other)?; }
     let mut supervised = Command::new("python3");
     supervised.args([std::ffi::OsStr::new("-I"), helper.as_os_str(), receipt.as_os_str(), executable.as_os_str()])
         .args(original.get_args()).current_dir(cwd)
@@ -455,6 +521,10 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
         if let Some(value) = value { supervised.env(key, value); }
         else { supervised.env_remove(key); }
     }
+    supervised.env_remove("JARVIS_SUPERVISOR_ADMISSION");
+    if admission { supervised.env("JARVIS_SUPERVISOR_ADMISSION","1"); }
+    supervised.env_remove("JARVIS_RUN_RESOURCE_POLICY");
+    if let Some(policy)=&resource_policy { supervised.env("JARVIS_RUN_RESOURCE_POLICY",policy.to_string()); }
     let active_request = begin_request(journal, &receipt)?;
     let child = match supervised.spawn() {
         Ok(child) => child,
@@ -466,7 +536,7 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, _directory: directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), _directory: directory }))
 }
 
 #[cfg(test)]
@@ -661,6 +731,42 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");
         // Idle to the sweep, yet still unsettled, so recovery can act on it.
         assert!(request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap());
+    }
+
+    #[tokio::test]
+    async fn denied_model_admission_never_dispatches_waiting_provider() {
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("provider-effect");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
+        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+        logger.set_model_call_observer(Arc::new(|_|anyhow::bail!("synthetic budget denied"))).unwrap();
+        let clean=Arc::new(AtomicBool::new(true));
+        let (mut child,group)=spawn_admitted(&command,true,clean.clone(),None,false).unwrap();
+        let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
+        assert!(error.to_string().contains("synthetic budget denied"));
+        drop(group);
+        child.wait().await.unwrap();
+        assert!(clean.load(Ordering::SeqCst));
+        assert!(!effect.exists());
+    }
+
+    #[tokio::test]
+    async fn admitted_model_dispatches_once_after_controller_observer() {
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("provider-effect");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed=count.clone();let expected=effect.clone();
+        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+        logger.set_model_call_observer(Arc::new(move |_|{ assert!(!expected.exists()); observed.fetch_add(1,Ordering::SeqCst);Ok(()) })).unwrap();
+        let (child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        group.admit_model("codex",Some(&logger)).await.unwrap();
+        assert!(child.wait_with_output().await.unwrap().status.success());
+        drop(group);
+        assert_eq!(count.load(Ordering::SeqCst),1);
+        assert!(effect.exists());
     }
 
     #[tokio::test]

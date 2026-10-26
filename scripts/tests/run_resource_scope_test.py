@@ -1,0 +1,127 @@
+"""Real bounded descendants; run under an isolated delegated transient service.
+
+systemd-run --user --wait --pipe --collect -p Delegate='cpu memory pids' \
+ -p DelegateSubgroup=daemon -p MemoryMax=256M -p TasksMax=64 -p CPUQuota=100% \
+ /usr/bin/python3 /absolute/path/to/run_resource_scope_test.py
+"""
+import importlib.util
+import json
+import tempfile
+import time
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+
+SPEC = importlib.util.spec_from_file_location('resources', Path(__file__).parents[1]/'run-resource-scope.py')
+resources = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(resources)
+
+
+class ResourceTests(unittest.TestCase):
+    def setUp(self):
+        if resources.current_group().name != 'daemon':
+            self.skipTest('requires isolated DelegateSubgroup=daemon transient service')
+        self.scope = resources.RunScope({'memory_bytes':64*1024*1024,'pids':8,'cpu_percent':20})
+        self.addCleanup(self.scope.close)
+
+    def run_child(self, code):
+        return subprocess.run(['/usr/bin/python3','-I','-c',code],
+                              preexec_fn=self.scope.attach_child,
+                              capture_output=True,text=True,timeout=10)
+
+    def test_memory_exhaustion_is_local_and_observed(self):
+        result=self.run_child('x=bytearray(128*1024*1024); print(len(x))')
+        self.assertNotEqual(result.returncode,0)
+        observation=self.scope.observation()
+        self.assertTrue(observation['exhausted'])
+        self.assertGreater(observation['memory_events']['oom_kill'],0)
+        self.assertEqual(resources.current_group().name,'daemon')
+
+    def test_process_exhaustion_is_local_and_observed(self):
+        result=self.run_child('''import subprocess
+children=[]
+try:
+ for _ in range(32): children.append(subprocess.Popen(['/bin/sleep','10']))
+ raise SystemExit('PID ceiling failed')
+except BlockingIOError:
+ print('PIDS_LIMIT_OBSERVED')
+finally:
+ for child in children: child.kill()
+ for child in children: child.wait()
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('PIDS_LIMIT_OBSERVED',result.stdout)
+        self.assertTrue(self.scope.observation()['exhausted'])
+
+    def test_cpu_throttling_and_detached_descendants_keep_membership(self):
+        result=self.run_child('''import os,time,subprocess
+os.setsid()
+end=time.monotonic()+0.6
+while time.monotonic()<end: pass
+print(open('/proc/self/cgroup').read().strip())
+subprocess.Popen(['/bin/sleep','10'],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(self.scope.path.name,result.stdout)
+        observation=self.scope.observation()
+        self.assertGreater(observation['cpu_stat']['nr_throttled'],0)
+        self.assertFalse(observation['exhausted'])
+        path=self.scope.path
+        self.scope.close()
+        self.assertFalse(path.exists())
+
+    def test_worker_command_cannot_migrate_to_controller_or_rewrite_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);policy=root/'sandbox-policy.json'
+            policy.write_text(json.dumps({'cwd':str(root),'read_roots':[str(root)],'write_roots':[]}));policy.chmod(0o600)
+            destinations=[str(self.scope.path.parent/'daemon'/'cgroup.procs'),str(self.scope.path/'memory.max')]
+            code=f"import os; paths={destinations!r}\nfor path in paths:\n try:\n  open(path,'w').write(str(os.getpid()))\n  raise SystemExit('resource control write escaped')\n except PermissionError: pass\n"
+            result=subprocess.run(['/usr/bin/python3','-I',str(Path(__file__).parents[1]/'codex-command-sandbox.py'),str(policy),'/usr/bin/python3','-I','-c',code],preexec_fn=self.scope.attach_child,capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual((self.scope.path/'memory.max').read_text().strip(),str(64*1024*1024))
+
+    def test_supervisor_waits_for_controller_admission_and_records_effective_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);receipt=root/'cleanup-complete';effect=root/'effect'
+            env=dict(os.environ,JARVIS_SUPERVISOR_ADMISSION='1',
+                     JARVIS_RUN_RESOURCE_POLICY=json.dumps({'memory_bytes':64*1024*1024,'pids':8,'cpu_percent':20}))
+            child=subprocess.Popen(['/usr/bin/python3','-I',str(Path(__file__).parents[1]/'provider-supervisor.py'),str(receipt),
+                                    '/usr/bin/python3','-I','-c',f'from pathlib import Path; Path({str(effect)!r}).write_text("executed")'],env=env)
+            try:
+                deadline=time.monotonic()+3
+                while not (root/'launch-ready').exists() and time.monotonic()<deadline: time.sleep(0.01)
+                self.assertTrue((root/'launch-ready').exists())
+                self.assertFalse(effect.exists())
+                admitted=json.loads((root/'resource-accounting.json').read_text())
+                self.assertEqual(admitted['phase'],'admitted')
+                self.assertEqual(admitted['identity']['limits']['memory.max'],str(64*1024*1024))
+                (root/'launch-continue').write_text('admitted\n')
+                self.assertEqual(child.wait(timeout=5),0)
+                self.assertTrue(effect.exists())
+                completed=json.loads((root/'resource-accounting.json').read_text())
+                self.assertEqual(completed['phase'],'completed')
+                self.assertFalse(Path(completed['identity']['path']).exists())
+            finally:
+                if child.poll() is None: child.terminate();child.wait(timeout=5)
+
+    def test_denied_admission_never_dispatches_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);receipt=root/'cleanup-complete';effect=root/'effect'
+            env=dict(os.environ,JARVIS_SUPERVISOR_ADMISSION='1',
+                     JARVIS_RUN_RESOURCE_POLICY=json.dumps({'memory_bytes':1024**3,'pids':8,'cpu_percent':20}))
+            child=subprocess.run(['/usr/bin/python3','-I',str(Path(__file__).parents[1]/'provider-supervisor.py'),str(receipt),
+                                    '/usr/bin/python3','-I','-c',f'from pathlib import Path; Path({str(effect)!r}).touch()'],env=env,capture_output=True,timeout=5)
+            self.assertNotEqual(child.returncode,0)
+            self.assertFalse(effect.exists())
+            self.assertFalse((root/'launch-ready').exists())
+            self.assertEqual(json.loads((root/'resource-accounting.json').read_text())['phase'],'admission_failed')
+            self.assertEqual(receipt.read_text(),'all-descendants-reaped\n')
+
+    def test_ceiling_cannot_exceed_original_aggregate(self):
+        with self.assertRaises(RuntimeError):
+            resources.RunScope({'memory_bytes':1024**3,'pids':8,'cpu_percent':20})
+
+
+if __name__ == '__main__': unittest.main(verbosity=2)

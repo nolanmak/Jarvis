@@ -353,7 +353,9 @@ impl CodexCliReasoner {
         // policy, never exposed to native tools or placed on argv.
 
 
-        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, true, clean, opts.handoff_path.as_deref()).map_err(|e| {
+        let launch_audit=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
+        crate::run_resources::check_requirement(provider,launch_audit.as_ref())?;
+        let (mut child, process_group) = crate::process_tree::spawn_admitted(&cmd, true, clean, opts.handoff_path.as_deref(),launch_audit.as_ref().is_some_and(|logger|logger.run_resources_required())).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 anyhow::Error::new(ReasonerError::CleanupUncertain { provider: provider.into() })
             } else if e.kind() == std::io::ErrorKind::NotFound {
@@ -367,6 +369,8 @@ impl CodexCliReasoner {
                 })
             }
         })?;
+
+        process_group.admit_model(provider,launch_audit.as_ref()).await?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
@@ -483,7 +487,10 @@ impl CodexCliReasoner {
         }
 
         let status = child.wait().await?;
+        let logger=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
+        let resources=process_group.resource_outcome(provider, logger.as_ref());
         drop(process_group);
+        resources?;
         let stderr_buf = match stderr_task {
             Some(t) => t.await.unwrap_or_default(),
             None => String::new(),
@@ -539,6 +546,7 @@ impl CodexCliReasoner {
 
 #[async_trait]
 impl Reasoner for CodexCliReasoner {
+    fn defers_model_admission(&self) -> bool { true }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         self.call_capture(opts, user_message, false).await
     }

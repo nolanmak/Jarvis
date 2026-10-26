@@ -688,13 +688,18 @@ impl FallbackReasoner {
                 let mut authors = self.mutation_providers.lock().unwrap_or_else(|e| e.into_inner());
                 if !authors.contains(&entry.kind) { authors.push(entry.kind); }
             }
-            if let Some(logger) = &opts.audit_logger { logger.model_call_admitted(name)?; }
+            if !entry.reasoner.defers_model_admission() {
+                if let Some(logger) = &opts.audit_logger { logger.model_call_admitted(name)?; }
+            }
             self.note_call(name);
             let res = if transcript {
                 entry.reasoner.call_transcript(opts, &resumed_message).await
             } else {
                 entry.reasoner.call(opts, &resumed_message).await
             };
+            if opts.audit_logger.as_ref().is_some_and(|logger|logger.resource_capacity_seen()) {
+                return Err(ReasonerError::ResourceCapacity {provider:name.into(),message:"shared run capacity requires reconciliation before retry".into()}.into());
+            }
             match res {
                 Ok(text) => {
                     self.note_ok(name);
@@ -1712,6 +1717,18 @@ mod tests {
         let err = fb.call(&text_only_opts(), "hi").await.unwrap_err();
         assert!(ReasonerError::find_in(&err).is_none());
         assert_eq!(b.count(), 0, "untyped errors must not trigger failover");
+    }
+
+    #[tokio::test]
+    async fn run_capacity_exhaustion_never_fans_out_or_latches_provider() {
+        let dir=tempfile::tempdir().unwrap();let latch=latch_in(&dir);
+        let primary=Scripted::err(||ReasonerError::ResourceCapacity {provider:"codex".into(),message:"synthetic PID ceiling".into()}.into());
+        let fallback=Scripted::ok("must not run");
+        let chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,primary),(ProviderKind::Claude,fallback.clone())],latch.clone());
+        let error=chain.call(&text_only_opts(),"request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error),Some(ReasonerError::ResourceCapacity {..})));
+        assert_eq!(fallback.count(),0);
+        assert!(latch.latched_until("codex").is_none());
     }
 
     #[tokio::test]

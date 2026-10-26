@@ -272,6 +272,9 @@ pub enum ReasonerError {
     /// not the provider. Never latched; the chain may still try the next.
     #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
     GateTimeout { provider: String, waited_secs: u64 },
+    /// Host capacity is shared by providers; never fan out or blame the code.
+    #[error("{provider} resource capacity: {message}")]
+    ResourceCapacity { provider: String, message: String },
     /// A previous tool process may still be active. Retrying another provider
     /// could race that process, so this error must stop the fallback chain.
     #[error("{provider} process cleanup is unverified; recovery requires reconciliation")]
@@ -683,6 +686,9 @@ impl ReasonerOpts {
 /// fenced-block extraction layer lives here, once.
 #[async_trait]
 pub trait Reasoner: Send + Sync {
+    /// Native adapters admit the model only after resource/launch readiness.
+    /// HTTP implementations and test doubles retain fallback-owned admission.
+    fn defers_model_admission(&self) -> bool { false }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
 
     /// Like [`call`](Reasoner::call), but returns **everything the model said**
@@ -995,6 +1001,7 @@ fn rate_limited_error(provider: &str, message: String) -> anyhow::Error {
 
 #[async_trait]
 impl Reasoner for ClaudeCliReasoner {
+    fn defers_model_admission(&self) -> bool { true }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         self.call_with_capture(opts, user_message, TextCapture::LastBlock)
             .await
@@ -1289,11 +1296,14 @@ impl ClaudeCliReasoner {
             }
         }
         if let Some(scope) = &native_scope { scope.configure(&mut cmd); }
-        let (mut child, process_group) = crate::process_tree::spawn_supervised(
+        let launch_audit=opts.audit_logger.clone().or_else(default_audit_logger);
+        crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
+        let (mut child, process_group) = crate::process_tree::spawn_admitted(
             &cmd,
             clear_environment,
             clean,
             opts.handoff_path.as_deref(),
+            launch_audit.as_ref().is_some_and(|logger|logger.run_resources_required()),
         )
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -1307,6 +1317,8 @@ impl ClaudeCliReasoner {
                 CallError::from(error)
             }
         })?;
+
+        process_group.admit_model("claude",launch_audit.as_ref()).await?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
@@ -1416,7 +1428,9 @@ impl ClaudeCliReasoner {
         }
 
         let status = child.wait().await?;
+        let resources = process_group.resource_outcome("claude", audit_logger.as_ref());
         drop(process_group);
+        resources?;
         // Unmatched tool uses represent uncertain side effects. Dropping their
         // protected intent tickets leaves durable orphan/failure evidence.
         pending_tool_uses.clear();

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Own and reap one provider tree, including descendants that call setsid."""
 import ctypes
+import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
@@ -31,7 +33,47 @@ def supervise(receipt, argv):
         raise RuntimeError('provider supervision lost its parent')
     children_path = Path(f'/proc/self/task/{os.getpid()}/children')
     children_path.read_text()  # readiness before any provider can run
-    child = subprocess.Popen(argv, start_new_session=True)
+    resource_path = Path(receipt).with_name('resource-accounting.json')
+    scope = None
+    if 'JARVIS_RUN_RESOURCE_POLICY' in os.environ:
+        try:
+            spec = importlib.util.spec_from_file_location('run_resources', Path(__file__).with_name('run-resource-scope.py'))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            scope = module.declared_scope()
+            resource_path.write_text(json.dumps({'phase':'admitted', **scope.observation()}))
+            resource_path.chmod(0o600)
+        except BaseException:
+            resource_path.write_text(json.dumps({'phase':'admission_failed','exhausted':True}))
+            resource_path.chmod(0o600)
+            Path(receipt).write_text('all-descendants-reaped\n')
+            Path(receipt).chmod(0o600)
+            raise
+    if os.environ.pop('JARVIS_SUPERVISOR_ADMISSION', None) == '1':
+        ready = Path(receipt).with_name('launch-ready')
+        proceed = Path(receipt).with_name('launch-continue')
+        ready.write_text('ready\n')
+        ready.chmod(0o600)
+        deadline = time.monotonic() + 10
+        while not proceed.exists():
+            if stopping or time.monotonic() >= deadline:
+                if scope:
+                    resource_path.write_text(json.dumps({'phase':'cancelled_before_dispatch', **scope.observation()}))
+                    scope.close()
+                Path(receipt).write_text('all-descendants-reaped\n')
+                Path(receipt).chmod(0o600)
+                return 125
+            time.sleep(0.005)
+        if proceed.read_text() != 'admitted\n':
+            raise RuntimeError('invalid controller launch admission')
+    try:
+        child = subprocess.Popen(argv, start_new_session=True,
+                                 preexec_fn=scope.attach_child if scope else None)
+    except BaseException:
+        if scope:
+            resource_path.write_text(json.dumps({'phase':'launch_failed', **scope.observation()}))
+            scope.close()
+        raise
     status = None
     try:
         while not stopping:
@@ -58,6 +100,10 @@ def supervise(receipt, argv):
                 try:
                     pid, _ = os.waitpid(-1, os.WNOHANG)
                 except ChildProcessError:
+                    if scope:
+                        observation = scope.observation()
+                        scope.close()
+                        resource_path.write_text(json.dumps({'phase':'completed', **observation}))
                     descriptor = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(descriptor, 'w') as stream:
                         stream.write('all-descendants-reaped\n')

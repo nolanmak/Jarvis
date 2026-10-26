@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Controller-owned descendant ceilings inside a delegated service hierarchy.
+
+No wall-clock deadline and no network policy are implied. The supervising
+process stays in DelegateSubgroup=daemon; only its child enters run-*.
+"""
+import json
+import os
+from pathlib import Path
+import time
+import uuid
+
+CONTROLLERS = {'cpu', 'memory', 'pids'}
+
+
+def current_group():
+    rows = Path('/proc/self/cgroup').read_text().splitlines()
+    paths = [row[3:] for row in rows if row.startswith('0::/')]
+    if len(paths) != 1:
+        raise RuntimeError('unified cgroup membership is unavailable')
+    return Path('/sys/fs/cgroup') / paths[0].lstrip('/')
+
+
+def finite(path):
+    value = path.read_text().strip()
+    if not value.isdigit() or int(value) <= 0:
+        raise RuntimeError('aggregate resource ceiling is not finite')
+    return int(value)
+
+
+def counters(path):
+    return {key: int(value) for key, value in
+            (line.split() for line in path.read_text().splitlines())}
+
+
+class RunScope:
+    def __init__(self, policy):
+        if set(policy) != {'memory_bytes', 'pids', 'cpu_percent'}:
+            raise RuntimeError('invalid declared run resource policy')
+        for key, low, high in [('memory_bytes', 64*1024*1024, 64*1024**3),
+                               ('pids', 8, 4096), ('cpu_percent', 1, 1600)]:
+            if type(policy[key]) is not int or not low <= policy[key] <= high:
+                raise RuntimeError('invalid declared run resource limit')
+        leaf = current_group()
+        parent = leaf.parent
+        if (leaf.name != 'daemon' or not parent.name.endswith('.service')
+                or parent.resolve() != parent
+                or parent.stat().st_uid != os.getuid()
+                or parent.joinpath('cgroup.procs').read_text().strip()):
+            raise RuntimeError('run resources require delegated service with daemon leaf')
+        if not CONTROLLERS <= set((parent/'cgroup.controllers').read_text().split()):
+            raise RuntimeError('required delegated resource controllers unavailable')
+        memory = finite(parent/'memory.max')
+        pids = finite(parent/'pids.max')
+        cpu = (parent/'cpu.max').read_text().split()
+        if len(cpu) != 2 or not all(v.isdigit() for v in cpu):
+            raise RuntimeError('aggregate CPU quota is not finite')
+        quota, period = map(int, cpu)
+        if (policy['memory_bytes'] > memory or policy['pids'] > pids
+                or policy['cpu_percent'] * period > quota * 100):
+            raise RuntimeError('run ceiling exceeds aggregate service ceiling')
+        # The delegated root is empty by systemd contract. Never relocate the
+        # daemon or manipulate sibling service/slice groups to enable this.
+        (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
+        if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
+            raise RuntimeError('delegated controllers failed readback')
+        self.path = parent / ('run-' + uuid.uuid4().hex)
+        self.path.mkdir(mode=0o700)
+        self.closed = False
+        self.fd = None
+        try:
+            desired = {'memory.max': str(policy['memory_bytes']), 'memory.swap.max': '0',
+                       'memory.oom.group': '1', 'pids.max': str(policy['pids']),
+                       'cpu.max': f"{policy['cpu_percent'] * 1000} 100000"}
+            for name, value in desired.items():
+                (self.path/name).write_text(value)
+            actual = {name: (self.path/name).read_text().strip() for name in desired}
+            if actual != desired:
+                raise RuntimeError('run resource limits failed readback')
+            self.identity = {'path': str(self.path), 'inode': self.path.stat().st_ino,
+                             'limits': actual, 'aggregate': {'path': str(parent),
+                             'memory_bytes': memory, 'pids': pids, 'cpu_max': ' '.join(cpu)}}
+            self.fd = os.open(self.path/'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC)
+        except BaseException:
+            self.close()
+            raise
+
+    def attach_child(self):
+        # preexec_fn in a single-threaded trusted supervisor. No model code has
+        # executed yet; forked and setsid descendants inherit this membership.
+        os.write(self.fd, str(os.getpid()).encode('ascii'))
+        os.close(self.fd)
+
+    def observation(self):
+        memory = counters(self.path/'memory.events')
+        pids = counters(self.path/'pids.events')
+        cpu = counters(self.path/'cpu.stat')
+        return {'identity': self.identity, 'memory_events': memory,
+                'pids_events': pids, 'cpu_stat': cpu,
+                'exhausted': bool(memory.get('oom', 0) or memory.get('oom_kill', 0)
+                                  or pids.get('max', 0))}
+
+    def close(self):
+        if self.closed:
+            return
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.path.exists():
+            (self.path/'cgroup.kill').write_text('1')
+            deadline = time.monotonic() + 3
+            while counters(self.path/'cgroup.events').get('populated'):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('resource subtree cleanup is unverified')
+                time.sleep(0.01)
+            self.path.rmdir()
+        self.closed = True
+
+
+def declared_scope():
+    raw = os.environ.pop('JARVIS_RUN_RESOURCE_POLICY', None)
+    return RunScope(json.loads(raw)) if raw is not None else None
+
+
+def cleanup_receipt(receipt):
+    """Controller fallback if a supervisor died before acknowledging cleanup."""
+    import stat
+    descriptor=os.open(receipt,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(descriptor) as stream:
+        info=os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink!=1
+                or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>65536):
+            raise RuntimeError('invalid resource cleanup receipt')
+        identity=json.load(stream).get('identity')
+    if identity is None:
+        return
+    leaf=current_group()
+    path=Path(identity['path'])
+    if (leaf.name!='daemon' or path.parent!=leaf.parent
+            or not path.name.startswith('run-') or len(path.name)!=36
+            or any(c not in '0123456789abcdef' for c in path.name[4:])):
+        raise RuntimeError('resource cleanup outside controller service')
+    if not path.exists():
+        return
+    if path.resolve()!=path or path.stat().st_ino!=identity['inode']:
+        raise RuntimeError('resource identity changed before cleanup')
+    (path/'cgroup.kill').write_text('1')
+    deadline=time.monotonic()+3
+    while counters(path/'cgroup.events').get('populated'):
+        if time.monotonic()>=deadline:
+            raise RuntimeError('resource cleanup is unverified')
+        time.sleep(0.01)
+    path.rmdir()
+
+
+if __name__=='__main__':
+    import sys
+    if len(sys.argv)!=3 or sys.argv[1]!='--cleanup':
+        raise SystemExit('expected --cleanup receipt')
+    cleanup_receipt(sys.argv[2])
