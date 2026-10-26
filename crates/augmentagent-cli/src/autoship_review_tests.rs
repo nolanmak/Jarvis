@@ -39,7 +39,7 @@ fn finding(id: &str) -> Finding {
         claim: "docs omit changed behavior".into(),
         requested_change: "update runtime documentation".into(),
         conflicts_with: BTreeSet::new(),
-        repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 2,
+        repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 2,
     }
 }
 fn coverage() -> CoverageReceipt {
@@ -964,4 +964,14 @@ async fn missing_source_request_is_typed_non_authority_not_a_code_verdict() {
     assert!(matches!(parsed.rulings["F1"],Ruling::NeedEvidence {..}));
     receipt.rulings.insert("F1".into(),Ruling::NeedEvidence {source_paths:vec![],question:"guess".into()});
     assert!(adjudication_groups::validate(&receipt,&binding(),&findings,&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).is_err());
+}
+
+#[test]
+fn empty_candidate_target_is_not_an_executable_repair() {
+    let mut item=finding("empty");item.repair_target=Some(RepairTarget::Candidate{paths:BTreeSet::new()});
+    assert!(item.validate().is_err());
+    item.repair_target=Some(RepairTarget::ContractScope{paths:BTreeSet::from(["support.rs".into()])});
+    item.validate().unwrap();
+    let raw=serde_json::json!({"binding":binding(),"rulings":{"empty":{"decision":"uphold","evidence":"source","repair_criterion":"edit support.rs now"}}}).to_string();
+    assert!(validate_adjudicator_response(&raw,&binding(),&[item]).is_err(),"scope expansion must be independently amended before builder execution");
 }

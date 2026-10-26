@@ -566,7 +566,7 @@ mod tests {
                 claim: "supporting claim".into(),
                 requested_change: "change".into(),
                 conflicts_with: BTreeSet::from(["against".into()]),
-                repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 2,
+                repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 2,
             },
             aligned::Finding {
                 id: "against".into(),
@@ -575,7 +575,7 @@ mod tests {
                 claim: "opposing claim".into(),
                 requested_change: "preserve".into(),
                 conflicts_with: BTreeSet::from(["for".into()]),
-                repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 2,
+                repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 2,
             },
         ]
     }

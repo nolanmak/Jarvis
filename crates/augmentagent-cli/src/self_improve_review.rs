@@ -232,15 +232,23 @@ fn classify_repair_targets(findings:&mut Vec<aligned::Finding>,prepared:&accepta
             Some(RepairTarget::Candidate{paths})=>{
                 let affected:BTreeSet<_>=prepared.proposal.contract.verifiers.iter().filter(|v|v.pinned_files.iter().any(|p|paths.contains(p))).map(|v|v.id.clone()).collect();
                 if !affected.is_empty() {finding.repair_target=Some(RepairTarget::ControllerAcceptance{verifier_ids:affected});}
+                else {
+                    let outside:BTreeSet<_>=paths.iter().filter(|p|aligned::immutable_control_path(p) || !prepared.proposal.contract.allowed_paths.iter().any(|scope|scope.contains(p))).cloned().collect();
+                    if !outside.is_empty() {finding.repair_target=Some(RepairTarget::ContractScope{paths:outside});}
+                }
             }
+            Some(RepairTarget::ContractScope{..})=>{},
             None=>{}, // Historical unclassified findings go to final authority.
         }
     }
     let mut derived=Vec::new();
     for finding in findings.iter_mut() {
         if finding.criterion_id!="REGRESSION" {continue;}
-        let Some(RepairTarget::ControllerAcceptance{verifier_ids})=&finding.repair_target else {continue;};
-        let owners:Vec<_>=prepared.proposal.contract.criteria.iter().filter(|c|c.verifier_ids.iter().any(|id|verifier_ids.contains(id))).map(|c|c.id.clone()).collect();
+        let owners:Vec<_>=match &finding.repair_target {
+            Some(RepairTarget::ControllerAcceptance{verifier_ids})=>prepared.proposal.contract.criteria.iter().filter(|c|c.verifier_ids.iter().any(|id|verifier_ids.contains(id))).map(|c|c.id.clone()).collect(),
+            Some(RepairTarget::ContractScope{..})=>prepared.proposal.contract.criteria.iter().map(|c|c.id.clone()).collect(),
+            _=>continue,
+        };
         anyhow::ensure!(!owners.is_empty(),"registered verifier has no owner criterion");
         let original=finding.clone();
         finding.criterion_id=owners[0].clone();
@@ -685,7 +693,15 @@ async fn run_impl(
                 let mut shard_actor=actor.clone();shard_actor.session_id=native_id.clone();
                 shard_actor.independent_for(&builders,&origin)?;
                 group_sessions.push(native_id);
-                let (pass,missing)=aligned::parse_review_pass_with_missing(&raw,&binding,shard_actor,role,request.coverage.clone(),&contract)?;
+                let parsed=aligned::parse_review_pass_with_missing(&raw,&binding,shard_actor,role,request.coverage.clone(),&contract);
+                let (pass,missing)=match parsed {
+                    Ok(value)=>value,
+                    Err(error) if recovery_attempt==0=>{
+                        request=inputs.request(original_request.files.clone(),false,Some(serde_json::json!({"kind":"structured_review_correction","validation_error":truncate(&format!("{error:#}"),4000),"instruction":"Classify every finding with a nonempty typed repair target. Do not infer a code defect from missing evidence; return incomplete with exact missing_paths when necessary. Preserve all valid findings and the exact candidate binding."})))?;
+                        continue;
+                    }
+                    Err(error)=>return Err(error.context("bounded structured review correction exhausted")),
+                };
                 group_hashes.push(pass.coverage.prompt_hash.clone());
                 if group_review.observe(pass.completed,pass.findings).with_context(||format!("evidence group {i} still needs {missing:?}"))? { break; }
                 request=evidence_plan::recover(&inputs,&worktree,&head,original_request,&evidence_shards,&missing,group_review.pending()).await?;
@@ -794,16 +810,17 @@ async fn run_impl(
         ));
         passes.push(pass);
     }
-    let qa_findings = if context.qa_ok {
+    let mut qa_findings = if context.qa_ok {
         vec![]
     } else {
         vec![aligned::Finding {
         id:format!("qa-{}", &aligned::digest(context.qa_notes.as_bytes())[..16]), criterion_id:"REGRESSION".into(),
         evidence_hash:aligned::digest(context.qa_notes.as_bytes()), claim:context.qa_notes.into(),
         requested_change:"Resolve the concrete QA findings against this shared contract, or adjudicate conflicting scope instructions.".into(),
-        conflicts_with:BTreeSet::new(), repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: context.repair_round,
+        conflicts_with:BTreeSet::new(), repair_target: if files.is_empty(){None}else{Some(aligned::RepairTarget::Candidate {paths:files.keys().cloned().collect()})}, repair_rounds: context.repair_round,
     }]
     };
+    if let Some((prepared,_))=context.acceptance_evidence {classify_repair_targets(&mut qa_findings,prepared)?;}
     if !qa_findings.is_empty() {
         let keys:BTreeSet<_>=evidence_shards.keys().filter(|key|key.starts_with("source:")||key.starts_with("context:diff:")).cloned().collect();
         for key in &keys {finding_evidence.insert(key.clone(),evidence_shards[key].clone());}
@@ -1180,12 +1197,17 @@ mod tests {
             assert_eq!(value["controller_acceptance"],controller);
             assert!(request.prompt.len()+inputs.system_bytes<=aligned::MAX_PROMPT_BYTES);
         }
-        let mut finding=aligned::Finding {id:"F1".into(),criterion_id:"C1".into(),evidence_hash:"proof".into(),claim:"observer lacks child assertions".into(),requested_change:format!("add assertions to {pin}"),conflicts_with:BTreeSet::new(),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 0};
+        let mut finding=aligned::Finding {id:"F1".into(),criterion_id:"C1".into(),evidence_hash:"proof".into(),claim:"observer lacks child assertions".into(),requested_change:format!("add assertions to {pin}"),conflicts_with:BTreeSet::new(),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 0};
         finding.repair_target=Some(aligned::RepairTarget::Candidate{paths:BTreeSet::from([pin.into()])});
         finding.criterion_id="REGRESSION".into();
         let mut classified=vec![finding];classify_repair_targets(&mut classified,&prepared).unwrap();
         let mut finding=classified.pop().unwrap();assert_eq!(finding.criterion_id,"C1","controller defects map to their registered owner criterion, which final authority can amend");
         assert!(controller_verifier_dispute(&[finding.clone()],Some(&prepared)),"controller disputes go to final authority on their first round");
+        let mut scope=finding.clone();scope.criterion_id="REGRESSION".into();scope.repair_target=Some(aligned::RepairTarget::Candidate{paths:BTreeSet::from(["new_support.py".into()])});
+        let mut scoped=vec![scope];classify_repair_targets(&mut scoped,&prepared).unwrap();
+        assert_eq!(scoped[0].criterion_id,"C1");
+        assert!(matches!(&scoped[0].repair_target,Some(aligned::RepairTarget::ContractScope{paths}) if paths.contains("new_support.py")));
+        assert!(controller_verifier_dispute(&scoped,Some(&prepared)));
         finding.claim="incorrect sum".into();finding.requested_change="fix arithmetic.py".into();
         finding.repair_target=Some(aligned::RepairTarget::Candidate{paths:BTreeSet::from(["arithmetic.py".into()])});
         assert!(!controller_verifier_dispute(&[finding],Some(&prepared)));
@@ -1221,7 +1243,7 @@ mod tests {
             claim: "observable regression".into(),
             requested_change: "make fixture pass".into(),
             conflicts_with: BTreeSet::new(),
-            repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 0,
+            repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 0,
         };
         assert_eq!(
             deduplicate_findings(vec![first.clone(), first.clone()])

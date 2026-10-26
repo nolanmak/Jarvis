@@ -128,7 +128,7 @@ fn directives(
                 .find(|criterion| criterion.id == finding.criterion_id)
                 .context("adjudication references unknown owner criterion")?;
             directives.push(serde_json::json!({"finding_id":id,"owner_criterion_id":owner.id,"immutable_owner_requirement":owner.requirement,
-                "derived_interpretation":replacement_criterion,"evidence":evidence,"named_checks_as_data_only":rerun_checks}));
+                "repair_target":finding.repair_target,"derived_interpretation":replacement_criterion,"evidence":evidence,"named_checks_as_data_only":rerun_checks}));
         }
     }
     Ok(directives)
@@ -209,7 +209,9 @@ pub(crate) async fn apply(
         Ok(None) => bail!("adjudicated amendment produced no executable revision"),
         Err(error) => {
             let detail = format!("{error:#}");
-            let (outcome, action) = if detail.contains("immutable owner requirements")
+            let (outcome, action) = if detail.contains("protected repository controls") {
+                ("immutable_authorization_conflict","dependency_owner_requirement_decision")
+            } else if detail.contains("immutable owner requirements")
                 || detail.contains("weakened or dropped requirement")
             {
                 (

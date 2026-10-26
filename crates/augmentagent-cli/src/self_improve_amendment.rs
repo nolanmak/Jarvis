@@ -48,6 +48,24 @@ fn immutable(control: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     std::fs::File::open(control)?.sync_all()?;
     Ok(path)
 }
+fn validate_bound_scope_files(adjudication:Option<&str>,additional:&[String])->Result<()> {
+    let Some(raw)=adjudication else {return Ok(());};
+    let value:serde_json::Value=serde_json::from_str(raw)?;
+    let mut bound=None::<std::collections::BTreeSet<String>>;
+    for directive in value["directives"].as_array().into_iter().flatten() {
+        let target=&directive["repair_target"];
+        if target["kind"]=="contract_scope" {
+            let paths=target["paths"].as_array().context("scope directive lacks literal paths")?;
+            ensure!(!paths.is_empty(),"scope directive has no literal paths");
+            for path in paths {bound.get_or_insert_with(Default::default).insert(path.as_str().context("scope path is not text")?.to_owned());}
+        }
+    }
+    if let Some(bound)=bound {
+        ensure!(additional.iter().all(|path|bound.contains(path)),"scope amendment adds a file outside the final bound literal request");
+    }
+    Ok(())
+}
+
 fn validate_correction(
     old: &PreparedAcceptance,
     next: &ContractProposal,
@@ -61,14 +79,11 @@ fn validate_correction_with_files(
     candidate_environment: &str,
     additional_files: &[String],
 ) -> Result<()> {
+    for path in additional_files.iter().chain(next.contract.allowed_paths.iter().map(|scope| match scope {crate::autoship_contract::PathScope::File(path)|crate::autoship_contract::PathScope::Directory(path)=>path})).chain(next.files.keys()) {
+        ensure!(!crate::autoship_review::immutable_control_path(path),"adjudicated scope touches protected repository controls");
+    }
     for path in additional_files {
-        ensure!(
-            !path
-                .split('/')
-                .any(|part| matches!(part, ".git" | ".claude" | ".mcp.json" | ".github"))
-                && blast_radius_hit_in_diff(&format!("diff --git a/{path} b/{path}")).is_none(),
-            "adjudicated scope touches protected repository controls"
-        );
+        ensure!(blast_radius_hit_in_diff(&format!("diff --git a/{path} b/{path}")).is_none(),"adjudicated scope touches protected repository controls");
     }
     next.contract.validate()?;
     ensure!(
@@ -305,7 +320,7 @@ pub(super) async fn try_amend(
     let prompt = format!("{prompt}\n{}", environments.prompt()?);
     let prompt = format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {CONTRACT_PROMPT}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again.");
     let prompt = if let Some(directive) = adjudication {
-        format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. All deterministic checks rerun. Bound final ruling: {directive}")
+        format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. For a contract_scope directive, additional files must be a subset of its explicit bound paths and necessary for that unchanged owner requirement. Never authorize Git/provider configuration, credentials, CI or daemon control state; if a requested path is protected, derive a compliant implementation alternative or report the immutable authorization conflict. All deterministic checks rerun. Bound final ruling: {directive}")
     } else {
         prompt
     };
@@ -348,6 +363,7 @@ pub(super) async fn try_amend(
         adjudication.is_some() || decision.approve_additional_files.is_empty(),
         "scope expansion requires final adjudication"
     );
+    validate_bound_scope_files(adjudication,&decision.approve_additional_files)?;
     validate_correction_with_files(
         old,
         &proposal,
@@ -976,6 +992,13 @@ mod tests {
             &["support.py".into()]
         )
         .is_err());
+        let directive=serde_json::json!({"directives":[{"owner_criterion_id":"C1","repair_target":{"kind":"contract_scope","paths":["support.py"]}}]}).to_string();
+        assert!(validate_bound_scope_files(Some(&directive),&["support.py".into()]).is_ok());
+        assert!(validate_bound_scope_files(Some(&directive),&["unrequested.py".into()]).is_err());
+        for protected in [".git/config",".codex/config.toml",".claude/settings.json",".mcp.json",".gitmodules",".github/workflows/ci.yml",".env.production"] {
+            *next.contract.allowed_paths.last_mut().unwrap()=PathScope::File(protected.into());
+            assert!(validate_correction_with_files(&old,&next,"environment-a",&[protected.into()]).is_err(),"model cannot amend control boundary: {protected}");
+        }
         *next.contract.allowed_paths.last_mut().unwrap() = PathScope::File(".git/config".into());
         assert!(validate_correction_with_files(
             &old,
