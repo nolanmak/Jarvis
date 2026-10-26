@@ -32,14 +32,15 @@ if args[:2] == ['issue', 'list']:
         {'number': 1071, 'labels': [{'name':'agent-gave-up'}], 'comments': []},
     ]))
 elif args and args[0] == 'api':
-    assert '--paginate' in args and '--slurp' in args
+    assert '--paginate' not in args and '--slurp' not in args
+    page=int(args[-1].split('&page=')[1])
     issue=int(args[-1].split('/issues/')[1].split('/')[0])
     bodies={1082:['unrelated discussion'],1143:['<!-- self-improve-gave-up reason=scoper:not-fixable -->\\nAuto-PR gave up.']}.get(issue,[])
     if issue==1082 and os.path.exists(os.path.join(os.environ['JARVIS_1214_ROOT'],'late-comments')):
         bodies=['<!-- self-improve-gave-up reason=gate-red -->'] + ['discussion']*99
         bodies+=['<!-- self-improve-attempts-reset -->','<!-- self-improve-gave-up reason=review-reject -->']
     rows=[dict(id=i+1,body=b) for i,b in enumerate(bodies)]
-    print(json.dumps([rows[i:i+100] for i in range(0,len(rows),100)]))
+    print(json.dumps(rows[(page-1)*100:page*100]))
 elif args[:2] == ['issue', 'edit'] or args[:2] == ['issue', 'comment']:
     pass
 else:
@@ -187,6 +188,7 @@ fn readmit_uses_changed_reason_after_comment_one_hundred_without_mutation() {
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(),"921");
     let calls = std::fs::read_to_string(dir.join("gh-calls.jsonl")).unwrap();
-    assert!(calls.contains("--paginate") && calls.contains("--slurp"));
+    assert!(calls.contains("comments?per_page=100&page=2"));
+    assert!(!calls.contains("--paginate") && !calls.contains("--slurp"));
     assert!(!calls.contains("--remove-label") && !calls.contains("\"comment\""));
 }
