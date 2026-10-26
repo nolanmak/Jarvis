@@ -6524,30 +6524,31 @@ async fn resume_draft_pr(
         .await);
     }
 
-    // Worktree from the PR's branch, brought up to date with main. A merge
-    // conflict is a human's job — say so on the PR and move on.
-    let worktree = repo_root
-        .join(".self-improve-worktrees")
-        .join(lane_from_env().worktree_name());
-    reclaim_worktree(repo_root, &worktree, branch).await;
-    let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
-    let (ok, _o, e) = run(
-        "git",
-        &[
-            "worktree", "add", "-b", branch,
-            &worktree.to_string_lossy(),
-            &format!("origin/{branch}"),
-        ],
-        repo_root,
-    )
-    .await?;
-    if !ok {
-        bail!("resume: worktree add from origin/{branch} failed: {e}");
+    use crate::autoship_workflow::{OperationKind, Stage};
+    if dry_run {
+        return Ok(RunReport::held(format!("PR #{pr}: DRY RUN — would resume preserved work")));
     }
-    let cleanup = |wt: PathBuf, br: String, root: PathBuf| async move {
-        let _ = run("git", &["worktree", "remove", "--force", &wt.to_string_lossy()], &root).await;
-        let _ = run("git", &["branch", "-D", &br], &root).await;
+    let lock_path = run_lock_path().with_file_name(format!("self-improve-pr-{pr}.lock"));
+    let Some(_pr_lock) = RunLock::try_acquire(&lock_path)? else {
+        return Ok(RunReport::held(format!("PR #{pr}: another worker owns its worktree")));
     };
+    let repository = workflow::canonical_repository(repo_root).await?;
+    let worktree = workflow::prepare_resume_worktree(repo_root, pr, branch).await?;
+    let contract = format!("{}\n{}\n{}", issue.title, issue.body, pr_body);
+    let (toolchain_ok, toolchain, _) = run("rustc", &["--version", "--verbose"], &worktree).await?;
+    anyhow::ensure!(toolchain_ok, "cannot identify verifier toolchain");
+    let environment = format!("resume-workspace-v1\n{}\n{}", std::env::consts::OS, toolchain);
+    let Some(mut workflow) = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root, worktree: &worktree, repository: &repository,
+        source_issue: Some(issue.number), pr: Some(pr), branch,
+        contract: &contract, environment: &environment,
+    }).await? else {
+        return Ok(RunReport::held(format!("PR #{pr}: durable workflow is leased or deferred")));
+    };
+    workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
+    // An interrupted edit is valuable recovery state. Never reset it implicitly.
+    let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
+    anyhow::ensure!(status_ok, "cannot inspect preserved worktree");
     let git_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
         .unwrap_or_else(|_| "AugmentAgent".to_string());
     let git_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
@@ -6555,6 +6556,39 @@ async fn resume_draft_pr(
     let name_arg = format!("user.name={git_name}");
     let email_arg = format!("user.email={git_email}");
 
+    if !status.trim().is_empty() {
+        workflow.transition(Stage::Build, "recovering_interrupted_edits", "checkpoint_revision", 0).await?;
+        let files = conflicted_files(&status);
+        if !files.is_empty() {
+            let (_, hunks, _) = run("git", &["diff"], &worktree).await?;
+            reasoner.call_revision_with_storage(&fix_opts(worktree.clone()),
+                &build_conflict_prompt(&issue, &pr_body, &files, &hunks)).await?;
+        }
+        let (staged, _, error) = run("git", &["add", "-A"], &worktree).await?;
+        anyhow::ensure!(staged, "cannot stage recovered edits: {error}");
+        let (diff_ok, recovered_diff, _) = run("git", &["diff", "--cached", "origin/main"], &worktree).await?;
+        anyhow::ensure!(diff_ok, "cannot inspect recovered edits");
+        anyhow::ensure!(blast_radius_hit_in_diff(&recovered_diff).is_none(), "recovered edits touch a guarded path");
+        let (_, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+        for file in staged_names.lines() {
+            if let Ok(contents) = tokio::fs::read_to_string(worktree.join(file)).await {
+                anyhow::ensure!(!has_conflict_markers(&contents), "recovered edits retain conflict markers");
+            }
+        }
+        let (has_changes, _, _) = run("git", &["diff", "--cached", "--quiet"], &worktree).await?;
+        if !has_changes {
+            let (committed, _, error) = run("git", &["-c", &name_arg, "-c", &email_arg,
+                "commit", "-m", "autoship: checkpoint interrupted revision"], &worktree).await?;
+            anyhow::ensure!(committed, "cannot checkpoint recovered edits: {error}");
+        }
+        workflow.transition(Stage::Verify, "interrupted_edits_checkpointed", "verify_recovered_revision", 0).await?;
+    }
+    // Integrate intervening remote updates without dropping recovered local commits.
+    let (remote_ok, _, remote_error) = run("git", &["merge", "--no-edit", &format!("origin/{branch}")], &worktree).await?;
+    if !remote_ok {
+        workflow.transition(Stage::Reconcile, "remote_branch_conflict", "recover_conflict", 0).await?;
+        bail!("remote branch reconciliation needs recovery: {remote_error}");
+    }
     let (ok, _o, _e) = run("git", &["merge", "--no-edit", "origin/main"], &worktree).await?;
     let mut conflict_note: Option<String> = None;
     if !ok {
@@ -6640,8 +6674,7 @@ async fn resume_draft_pr(
                     files.join(", "),
                     truncate(&rs, 600)
                 );
-                publish_round(
-                    &worktree,
+                workflow.publish_round(
                     branch,
                     repo_root,
                     pr,
@@ -6649,13 +6682,12 @@ async fn resume_draft_pr(
                     "conflict resolution",
                     &findings,
                     dry_run,
-                )
-                .await;
+                ).await?;
                 conflict_note = Some(format!("Conflict resolution: {}", truncate(&rs, 200)));
             }
             Err(why) => {
                 let _ = run("git", &["merge", "--abort"], &worktree).await;
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 let _ = run(
                     &gh,
                     &[
@@ -6716,7 +6748,7 @@ async fn resume_draft_pr(
             // did exactly that on 2026-09-13 and -14 over `Cargo.lock`. Stand
             // down for good instead: unbilled, attempt recorded, labelled and
             // closed, with the way back spelled out on the PR.
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             let reason = format!("the diff touches the guarded path `{pattern}`");
             let _ = run(
                 &gh,
@@ -6757,7 +6789,7 @@ async fn resume_draft_pr(
             // of paid work on the live #839 resume. Codex is not consulted
             // on an oversized diff; the next round's only job is to cut.
             if rounds_done >= revise_rounds() {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 let _ = run(
                     &gh,
                     &["pr", "comment", &pr.to_string(), "--body",
@@ -6791,7 +6823,7 @@ async fn resume_draft_pr(
                         &worktree,
                     )
                     .await?;
-                    publish_round(&worktree, branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await;
+                    workflow.publish_round(branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await?;
                     summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
                     continue;
                 }
@@ -6801,7 +6833,7 @@ async fn resume_draft_pr(
                         issue.number,
                         failure_record(reasoner, FailureKind::ReasonerError, "resume:shrink", &format!("{e:#}")),
                     );
-                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     return Ok(RunReport::built(format!(
                         "PR #{pr}: resume refused — oversized, shrink errored"
                     )));
@@ -6811,6 +6843,7 @@ async fn resume_draft_pr(
         // Round 0 earns the FULL suite (first verification of an old branch
         // against today's main); later rounds verify the changed crates
         // (#870) — the full gate runs once more before any merge.
+        workflow.transition(Stage::Verify, "verification_started", "run_verifier", 0).await?;
         let gate_result = if rounds_done == 0 {
             verification_gate(&worktree).await
         } else {
@@ -6824,7 +6857,7 @@ async fn resume_draft_pr(
             // ledger mark at the top of this fn already moves the picker on.
             let verdict = preexisting_on_main(repo_root, &gate_err.to_string()).await;
             if let Some(v) = verdict.as_ref().filter(|v| v.introduced.is_empty()) {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::triage(format!(
                     "PR #{pr}: gate red on main too ({}); not charged",
                     v.preexisting.join(", ")
@@ -6872,7 +6905,7 @@ async fn resume_draft_pr(
                             &worktree,
                         )
                         .await?;
-                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run).await;
+                        workflow.publish_round(branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run).await?;
                         summary = format!(
                             "{summary}\nRound {rounds_done} (gate repair): {}",
                             truncate(&rs, 200)
@@ -6888,7 +6921,7 @@ async fn resume_draft_pr(
                     }
                 }
             }
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
@@ -6918,24 +6951,24 @@ async fn resume_draft_pr(
                         let _ = drop_root_scratch(&worktree).await;
                         let (staged, _, _) = run("git", &["add", "-A"], &worktree).await?;
                         if !staged {
-                            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                             bail!("resume: could not stage CI repair");
                         }
                         let msg = "auto-resume: repair GitHub CI findings";
                         let (committed, _, error) = run("git", &["-c", &name_arg, "-c", &email_arg,
                             "commit", "--allow-empty", "-m", &msg], &worktree).await?;
                         if !committed {
-                            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                             bail!("resume: could not commit CI repair: {error}");
                         }
-                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run).await;
+                        workflow.publish_round(branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run).await?;
                         summary = format!("{summary}\nCI repair: {}", truncate(&rs, 1000));
                         continue;
                     }
                     Err(e) => {
                         record_reasoner_error(issue.number, failure_record(reasoner,
                             FailureKind::ReasonerError, "resume:ci-repair", &format!("{e:#}")));
-                        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                        workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                         return Ok(RunReport::built(format!("PR #{pr}: CI repair unavailable; preserved for retry")));
                     }
                 }
@@ -6944,6 +6977,9 @@ async fn resume_draft_pr(
 
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
+        workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
+        let reviewed_binding = workflow.binding().clone();
+        let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         let (qa_ok, qa_notes) = match reasoner
             .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref()))
             .await
@@ -6956,9 +6992,9 @@ async fn resume_draft_pr(
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:qa-review", &format!("{e:#}")),
                 );
                 if !dry_run {
-                    let _ = run("git", &["push", "origin", branch], &worktree).await;
+                    workflow.push(branch).await?;
                 }
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 // Billed only when a builder round ran this tick (#1037).
                 let message = format!("PR #{pr}: resume QA review errored; draft kept");
                 return Ok(if rounds_done > 0 {
@@ -6995,11 +7031,11 @@ async fn resume_draft_pr(
                     if !dry_run {
                         let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
                         if !ok {
-                            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                             bail!("resume: preserving draft failed: {error}");
                         }
                     }
-                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     return Ok(hold_unreviewable(
                         repo_root,
                         pr,
@@ -7021,12 +7057,16 @@ async fn resume_draft_pr(
         }
         notes_log.push(format!("round {rounds_done}: QA {}; independent {}",
             if qa_ok { "approve" } else { "changes requested" }, independent.status()));
+        workflow.record_review(&format!("resume-qa-{rounds_done}-{review_attempt}"), qa_ok,
+            &serde_json::json!({"verdict": qa_ok, "notes": qa_notes}).to_string())?;
+        workflow.record_review(&format!("resume-independent-{rounds_done}-{review_attempt}"), independent.approved(),
+            &serde_json::json!({"verdict": independent.approved(), "notes": independent.notes}).to_string())?;
         if resume_may_merge(qa_ok, independent.approved()) {
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
                 // without the full suite passing once (#870).
                 if let Err(gate_err) = verification_gate(&worktree).await {
-                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     let _ = run(
                         &gh,
                         &["pr", "comment", &pr.to_string(), "--body",
@@ -7042,6 +7082,7 @@ async fn resume_draft_pr(
                     )));
                 }
             }
+            workflow.validate_binding(&reviewed_binding).await?;
             // Use the same policy as fresh publication and the merge sweep.
             let (names_ok, names, _) = run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
             let policy_allows = names_ok && may_automerge(&MergePolicy {
@@ -7059,7 +7100,7 @@ async fn resume_draft_pr(
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             });
             if dry_run {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: DRY RUN — double LGTM after {rounds_done} revision round(s), would merge"
                 )));
@@ -7067,17 +7108,13 @@ async fn resume_draft_pr(
             // The local reviewed head is the only commit this approval covers.
             let (head_ok, reviewed_head, _) = run("git", &["rev-parse", "HEAD"], &worktree).await?;
             if !head_ok || reviewed_head.trim().is_empty() {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 bail!("resume: could not identify the reviewed commit");
             }
             let reviewed_head = reviewed_head.trim();
             // Push whatever the rounds committed (the merge-with-main commit
             // included), surface the verdicts, and merge per policy.
-            let (ok, _o, e) = run("git", &["push", "origin", branch], &worktree).await?;
-            if !ok {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                bail!("resume: push failed: {e}");
-            }
+            workflow.push(branch).await?;
             // A pending check or failed merge must not discard this LGTM.
             opened_prs::record(issue.number, pr, reviewed_head, independent.recorded_verdict());
             let _ = run(
@@ -7092,7 +7129,7 @@ async fn resume_draft_pr(
             )
             .await;
             if !policy_allows {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 notify_review(&format!(
                     "📝 resumed draft has double LGTM but needs a human merge: {} — PR #{pr}",
                     issue.title
@@ -7103,7 +7140,7 @@ async fn resume_draft_pr(
                 )));
             }
             if checks_green(repo_root, pr).await != Some(true) {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; awaiting CI, merge sweep will retry"
                 )));
@@ -7114,19 +7151,18 @@ async fn resume_draft_pr(
                 _ => None,
             };
             let Some(readied) = ready_for_merge(repo_root, pr, draft).await else {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; ready state unavailable, merge sweep will retry"
                 )));
             };
-            // #893 — release the worktree BEFORE merging: gh's --delete-branch
-            // also deletes the local branch, which fails while a worktree
-            // holds it and turns a successful merge into a reported failure.
-            // Everything is pushed; nothing local is needed past this point.
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            workflow.transition(Stage::Merge, "approval_and_checks_ready", "merge_exact_head", 0).await?;
+            anyhow::ensure!(workflow.binding().head == reviewed_head, "reviewed head changed before merge");
+            let merge_intent = workflow.intent(OperationKind::MergePr)?;
+            workflow.validate_binding(&reviewed_binding).await?;
             let (ok, _o, e) = run(
                 &gh,
-                &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch", "--match-head-commit", reviewed_head],
+                &["pr", "merge", &pr.to_string(), "--squash", "--match-head-commit", reviewed_head],
                 repo_root,
             )
             .await.unwrap_or((false, String::new(), "spawn failed".into()));
@@ -7142,6 +7178,10 @@ async fn resume_draft_pr(
             if !ok {
                 warn!(pr, "gh pr merge exited non-zero but the PR is MERGED; treating as success: {e}");
             }
+            workflow.observe_remote(&merge_intent, &format!("github:pr:{pr}:merged:{}", reviewed_head), Some(pr))?;
+            workflow.transition(Stage::Merged, "remote_merge_observed", "complete", 0).await?;
+            workflow.finish()?;
+            let _ = run("git", &["worktree", "remove", &worktree.to_string_lossy()], repo_root).await;
             notify_review(&format!(
                 "✅ resumed draft merged: {} — PR #{pr}",
                 issue.title
@@ -7154,7 +7194,7 @@ async fn resume_draft_pr(
         let open_notes = if qa_ok { independent.notes.clone() } else { qa_notes.clone() };
         if rounds_done >= revise_rounds() {
             // Out of rounds: publish the improved state + verdicts, stay draft.
-            let _ = run("git", &["push", "origin", branch], &worktree).await;
+            workflow.push(branch).await?;
             if !qa_ok {
                 let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", &qa_findings_comment(&qa_notes)], repo_root).await;
             }
@@ -7170,13 +7210,13 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &open_notes))).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &open_notes)).await;
+                // Preserve this PR for the durable adjudication/recovery path.
             }
             notify_review(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
@@ -7216,7 +7256,7 @@ async fn resume_draft_pr(
                     issue.number,
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:revise", &format!("{e:#}")),
                 );
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: resume revision errored; draft unchanged"
                 )));
@@ -7231,7 +7271,7 @@ async fn resume_draft_pr(
             &worktree,
         )
         .await?;
-        publish_round(&worktree, branch, repo_root, pr, rounds_done, kind, &findings, dry_run).await;
+        workflow.publish_round(branch, repo_root, pr, rounds_done, kind, &findings, dry_run).await?;
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
 }
@@ -14144,26 +14184,17 @@ CODEX-REVIEW: lgtm").0);
         assert!(!merge_succeeded(false, None));
     }
 
-    // Structural guard for the ordering half of #893: the resume path must
-    // release the worktree BEFORE `gh pr merge --delete-branch`, or the
-    // local-branch deletion fails while a worktree holds the branch.
     #[test]
-    fn resume_cleans_up_worktree_before_merging() {
-        // Earlier failure paths also call cleanup, so anchor on the merge
-        // section: between `gh pr ready` and `gh pr merge` there must be one.
+    fn resume_preserves_worktree_until_merge_is_observed() {
         let src = include_str!("self_improve.rs");
-        let resume_start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let body = &src[resume_start..];
-        let ready_at = body.find("ready_for_merge(repo_root, pr,").expect("ready transition");
-        let merge_at = body
-            .find(r#""pr", "merge", &pr.to_string(), "--squash", "--delete-branch""#)
-            .expect("merge call");
-        assert!(ready_at < merge_at, "ready must precede merge");
-        let between = &body[ready_at..merge_at];
-        assert!(
-            between.contains("cleanup(worktree, branch.to_string()"),
-            "resume_draft_pr must release the worktree between `gh pr ready` and `gh pr merge --delete-branch`"
-        );
+        let start = src.find("async fn resume_draft_pr(").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start;
+        let body = &src[start..end];
+        assert!(!body.contains("--delete-branch"));
+        assert!(!body.contains("reclaim_worktree("));
+        assert!(body.find("workflow.observe_remote(&merge_intent").unwrap()
+            < body.find("\"worktree\", \"remove\"").unwrap());
+        assert!(body.contains("--match-head-commit"));
     }
 
     // #895 — every revision round must be pushed + commented on the PR.

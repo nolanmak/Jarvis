@@ -330,6 +330,126 @@ impl WorkflowGuard {
             .admit_attempt(&self.lease, purpose, &self.binding, limit, millis())
     }
 
+    pub(super) async fn validate_binding(&self, expected: &Binding) -> Result<()> {
+        self.validate_before_side_effect()?;
+        let evidence = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
+            .snapshot(&self.lease.workflow)?
+            .context("workflow missing")?
+            .checkpoint
+            .evidence;
+        let actual =
+            git_binding(&self.worktree, &self.contract, &self.environment, &evidence).await?;
+        anyhow::ensure!(
+            &actual == expected,
+            "workflow evidence changed; fresh verification and review required"
+        );
+        Ok(())
+    }
+
+    /// Transition stage while retaining the receipt set that reviewers saw.
+    pub(super) async fn transition(
+        &mut self,
+        stage: Stage,
+        reason: &str,
+        action: &str,
+        eligible_at_ms: i64,
+    ) -> Result<()> {
+        let evidence = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
+            .snapshot(&self.lease.workflow)?
+            .context("workflow missing")?
+            .checkpoint
+            .evidence;
+        self.checkpoint(stage, reason, action, eligible_at_ms, &evidence)
+            .await
+    }
+
+    /// Publish detached resumed work with a remote-head precondition. A lost
+    /// response is reconciled against ls-remote before any retry. No force push
+    /// is needed; ancestry and the lease both protect intervening remote edits.
+    pub(super) async fn push(&mut self, branch: &str) -> Result<String> {
+        self.transition(Stage::Publish, "publishing_revision", "push", millis())
+            .await?;
+        let operation = self.intent(OperationKind::Push)?;
+        let target = format!("refs/heads/{branch}");
+        let (ok, out, _) = run(
+            "git",
+            &["ls-remote", "--heads", "origin", &target],
+            &self.worktree,
+        )
+        .await?;
+        anyhow::ensure!(ok, "cannot reconcile remote revision before push");
+        let remote = out
+            .split_whitespace()
+            .next()
+            .context("remote PR branch disappeared")?;
+        if remote == operation.binding.head {
+            self.observe_remote(&operation, &format!("git-head:{remote}"), None)?;
+            return Ok(remote.to_string());
+        }
+        let (ancestor, _, _) = run(
+            "git",
+            &["merge-base", "--is-ancestor", remote, "HEAD"],
+            &self.worktree,
+        )
+        .await?;
+        anyhow::ensure!(
+            ancestor,
+            "remote PR changed; reconcile before publishing preserved work"
+        );
+        self.validate_before_side_effect()?;
+        self.validate_binding(&operation.binding).await?;
+        let expected = format!("--force-with-lease={target}:{remote}");
+        let refspec = format!("HEAD:{target}");
+        let (pushed, _, _) = run(
+            "git",
+            &["push", &expected, "origin", &refspec],
+            &self.worktree,
+        )
+        .await?;
+        let (observed, out, _) = run(
+            "git",
+            &["ls-remote", "--heads", "origin", &target],
+            &self.worktree,
+        )
+        .await?;
+        let observed_head = out.split_whitespace().next().unwrap_or("");
+        anyhow::ensure!(
+            observed && observed_head == operation.binding.head,
+            "push outcome not verified; preserved pending intent (command success: {pushed})"
+        );
+        self.observe_remote(&operation, &format!("git-head:{observed_head}"), None)?;
+        Ok(observed_head.to_string())
+    }
+
+    pub(super) async fn publish_round(
+        &mut self,
+        branch: &str,
+        repo_root: &Path,
+        pr: u64,
+        round: u32,
+        kind: &str,
+        findings: &str,
+        dry_run: bool,
+    ) -> Result<()> {
+        if dry_run {
+            return Ok(());
+        }
+        let head = self.push(branch).await?;
+        let _ = write_optional_pr_note(
+            repo_root,
+            &pr.to_string(),
+            &round_comment(round, kind, findings, &head),
+        )
+        .await;
+        Ok(())
+    }
+
     /// Caller has waited for worker teardown. Stage/evidence must already be
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
@@ -420,12 +540,146 @@ pub(super) async fn git_binding(
     let mut receipts = receipts.to_vec();
     receipts.sort();
     receipts.dedup();
-    let evidence = serde_json::to_vec(&(tree, base, environment, diff, receipts))?;
+    let untracked = untracked_evidence(worktree).await?;
+    let evidence = serde_json::to_vec(&(tree, base, environment, diff, untracked, receipts))?;
     Ok(Binding {
         head,
         contract: format!("{:x}", Sha256::digest(contract.as_bytes())),
         evidence_hash: format!("{:x}", Sha256::digest(evidence)),
     })
+}
+
+/// Canonical trusted repository identity shared by both execution lanes.
+pub(super) async fn canonical_repository(repo_root: &Path) -> Result<String> {
+    let (ok, out, _) = run(
+        &gh_bin(),
+        &[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ],
+        repo_root,
+    )
+    .await?;
+    let name = out.trim();
+    anyhow::ensure!(
+        ok && name.split('/').count() == 2
+            && name.split('/').all(|v| !v.is_empty()
+                && v.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
+        "canonical GitHub repository identity unavailable"
+    );
+    Ok(name.to_ascii_lowercase())
+}
+
+async fn untracked_evidence(worktree: &Path) -> Result<Vec<(String, String)>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (ok, paths, _) = run(
+        "git",
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        worktree,
+    )
+    .await?;
+    anyhow::ensure!(ok, "cannot enumerate untracked review evidence");
+    let root = worktree.canonicalize()?;
+    let mut evidence = Vec::new();
+    let mut total = 0usize;
+    for name in paths.split('\0').filter(|s| !s.is_empty()) {
+        anyhow::ensure!(evidence.len() < 4096, "too many untracked evidence files");
+        let relative = Path::new(name);
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+            "invalid untracked evidence path"
+        );
+        let mut path = root.clone();
+        for component in relative.components() {
+            path.push(component);
+            anyhow::ensure!(
+                !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+                "symlink cannot supply untracked review evidence"
+            );
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "untracked evidence must be a regular file"
+        );
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            total = total
+                .checked_add(n)
+                .context("untracked evidence size overflow")?;
+            anyhow::ensure!(total <= 64 * 1024 * 1024, "untracked review evidence exceeds 64 MiB; commit or remove build artifacts before review");
+            digest.update(&buffer[..n]);
+        }
+        evidence.push((name.to_string(), format!("{:x}", digest.finalize())));
+    }
+    evidence.sort();
+    Ok(evidence)
+}
+
+/// Reuse interrupted work. Never delete a per-PR worktree to make room for a
+/// new attempt; a mismatched repository is a hard error, not reclaimable data.
+pub(super) async fn prepare_resume_worktree(
+    repo_root: &Path,
+    pr: u64,
+    branch: &str,
+) -> Result<PathBuf> {
+    anyhow::ensure!(pr > 0, "PR identity required");
+    let path = repo_root
+        .join(".self-improve-worktrees")
+        .join(format!("resume-pr-{pr}"));
+    let (ok, _, _) = run("git", &["fetch", "origin", branch], repo_root).await?;
+    anyhow::ensure!(ok, "cannot refresh resumed PR branch");
+    if path.exists() {
+        anyhow::ensure!(
+            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "resume worktree path is a symlink"
+        );
+        let expected = git_evidence(
+            repo_root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?;
+        let actual = git_evidence(
+            &path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?;
+        anyhow::ensure!(
+            Path::new(&expected).canonicalize()? == Path::new(&actual).canonicalize()?,
+            "preserved resume worktree belongs to another repository"
+        );
+        return Ok(path);
+    }
+    let (ok, _, error) = run(
+        "git",
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &path.to_string_lossy(),
+            &format!("origin/{branch}"),
+        ],
+        repo_root,
+    )
+    .await?;
+    anyhow::ensure!(ok, "cannot create resumed PR worktree: {error}");
+    Ok(path)
 }
 
 async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
@@ -569,5 +823,20 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(dir.path().join("code.txt").exists());
+    }
+    #[tokio::test]
+    async fn untracked_contents_change_binding_and_symlinks_are_refused() {
+        let dir = repo();
+        let before = git_binding(dir.path(), "C1", "rust-a", &[]).await.unwrap();
+        let new_file = dir.path().join("new_test.rs");
+        std::fs::write(&new_file, "assert!(false);").unwrap();
+        let first = git_binding(dir.path(), "C1", "rust-a", &[]).await.unwrap();
+        std::fs::write(&new_file, "assert!(true);").unwrap();
+        let second = git_binding(dir.path(), "C1", "rust-a", &[]).await.unwrap();
+        assert_ne!(before.evidence_hash, first.evidence_hash);
+        assert_ne!(first.evidence_hash, second.evidence_hash);
+        std::fs::remove_file(&new_file).unwrap();
+        std::os::unix::fs::symlink("code.txt", &new_file).unwrap();
+        assert!(git_binding(dir.path(), "C1", "rust-a", &[]).await.is_err());
     }
 }
