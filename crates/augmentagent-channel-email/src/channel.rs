@@ -1507,7 +1507,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // it was delivered to an external recipient. Scrubbing here, before
         // anything persists, is what makes the sqlite `draftBody`, the Discord
         // card and the Gmail draft all carry the same clean text — including on
-        // the retry rail, which re-enters with the stored body.
+        // the retry rail, which re-enters with the stored body. This function
+        // holds the only non-test call to `create_draft_with_cc`, so gating it
+        // here covers every reasoner-generated draft the channel writes.
         let scrub = augmentagent_channel_core::outbound_scrub::scrub_internal_context(&initial_draft);
         if !scrub.is_clean() {
             warn!(

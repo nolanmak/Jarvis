@@ -12255,11 +12255,11 @@ mod approval_body_tests {
         );
     }
 
-    /// #1579 discipline: every Gmail write path strips internal prompt
-    /// context from the body before it creates or updates a draft, so an
-    /// echoed notes hint / wiki hint can never be delivered. Pinned
-    /// structurally on the three CLI paths plus the revise arm — the shared
-    /// `body_for_gmail_write` reader carries the gate for the former.
+    /// #1579 discipline: the inventory of every Gmail draft write this binary
+    /// makes, each with the gate its enclosing fn reaches before writing. The
+    /// count assertion is what keeps the list exhaustive — a write path added
+    /// later fails here until it is gated and listed. The needles are built
+    /// with `concat!` so these literals are not themselves matched.
     #[test]
     fn internal_context_is_scrubbed_on_every_gmail_write_path() {
         let src = include_str!("main.rs");
@@ -12267,27 +12267,28 @@ mod approval_body_tests {
         let reader = &src[reader_start..reader_start + src[reader_start..].find("\n}\n").expect("fn end")];
         assert!(
             reader.contains("body_without_internal_context("),
-            "body_for_gmail_write must carry the #1579 gate for its three callers"
+            "body_for_gmail_write must carry the #1579 gate for its callers"
         );
 
-        // The revise arm lives *after* this test module, so a plain literal
-        // anchor would match this test's own source first and make every
-        // ordering assertion below vacuous. `concat!` keeps the anchor out of
-        // the file as one contiguous string.
-        let revise_start = src
-            .find(concat!(
-                "let redraft = match ",
-                "body_without_leaked_subject(&redraft, &subject)"
-            ))
-            .expect("revise arm");
-        let revise = &src[revise_start..];
-        let scrub = revise.find("outbound_scrub::scrub_internal_context(&redraft)").expect("revise scrub");
-        let draft = revise.find("create_draft_with_attachment(").expect("draft write");
-        let persist = revise.find("refresh_pending_draft(action_id, &redraft)").expect("draft persist");
-        assert!(scrub < draft && scrub < persist, "the scrub must precede the write and the persist");
-        assert!(
-            revise[scrub..draft].contains("ActionStatus::Error"),
-            "an internal-context-only redraft must mark the action Error, not leave it pending"
+        let create = concat!(".create_draft", "_with_attachment(");
+        let update = concat!(".update_draft", "_with_attachment(");
+        let paths = [
+            ("async fn run_gmail_compose(", "body_for_gmail_write("),
+            ("async fn run_gmail_update_draft(", "body_for_gmail_write("),
+            ("async fn run_gmail_send_now(", "body_for_gmail_write("),
+            (concat!("async fn ", "run_revise("), "scrub_internal_context(&redraft)"),
+        ];
+        for (f, gate) in paths {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let gate_at = body.find(gate).unwrap_or_else(|| panic!("{f}: no #1579 gate"));
+            let write = body.find(create).or_else(|| body.find(update)).expect("draft write");
+            assert!(gate_at < write, "{f}: the scrub must precede the draft write");
+        }
+        assert_eq!(
+            src.matches(create).count() + src.matches(update).count(),
+            paths.len(),
+            "a Gmail draft write path was added: gate it for #1579 and list it here"
         );
     }
 
