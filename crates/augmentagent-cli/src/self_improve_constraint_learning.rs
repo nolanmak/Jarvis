@@ -90,19 +90,22 @@ fn source_rule(rule: &Constraint) -> &str {
         | Constraint::ForbiddenAddedText { source, .. } => source,
     }
 }
-fn replay_diff(rules: &[Constraint], diff: &str) -> Result<()> {
-    let paths = diff
-        .lines()
-        .filter_map(|line| line.strip_prefix("+++ b/"))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+#[derive(Serialize)]
+struct KnownChange {
+    diff: String,
+    // Git's NUL-delimited path output, not patch-header heuristics: this keeps
+    // deletions, renames, binary changes and quoted filenames in replay.
+    paths: Vec<String>,
+}
+fn replay_diff(rules: &[Constraint], change: &KnownChange) -> Result<()> {
+    let diff = &change.diff;
     let added = diff
         .lines()
         .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
         .map(|line| line[1..].to_owned())
         .collect::<Vec<_>>();
     ensure!(
-        contract::constraint_failures(rules, &paths, &added)?.is_empty(),
+        contract::constraint_failures(rules, &change.paths, &added)?.is_empty(),
         "learned constraint rejects known-valid change"
     );
     Ok(())
@@ -111,7 +114,7 @@ fn compatible(
     proposal: &Proposal,
     prepared: &acceptance::PreparedAcceptance,
     sources: &[Source],
-    known: &[String],
+    known: &[KnownChange],
 ) -> Result<()> {
     validate_proposal(proposal)?;
     for rule in &proposal.rules {
@@ -238,27 +241,70 @@ pub(super) async fn learn(
         store(control, &done, b"{\"result\":\"no_literal_rule\"}")?;
         return Ok(());
     };
-    let mut known = vec![
-        git(
+    let mut known = vec![KnownChange {
+        diff: git(
             root,
             &[
                 "diff",
                 "--no-ext-diff",
                 "--no-textconv",
+                "--no-renames",
+                "--binary",
                 "origin/main...HEAD",
             ],
         )
         .await?,
-    ];
+        paths: git(
+            root,
+            &[
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                "origin/main...HEAD",
+            ],
+        )
+        .await?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect(),
+    }];
     let accepted = git(root, &["log", "-5", "--format=%H", "origin/main"]).await?;
     for head in accepted.lines() {
-        known.push(
-            git(
+        known.push(KnownChange {
+            diff: git(
                 root,
-                &["show", "--format=", "--no-ext-diff", "--no-textconv", head],
+                &[
+                    "show",
+                    "--format=",
+                    "--first-parent",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    "--binary",
+                    head,
+                ],
             )
             .await?,
-        );
+            paths: git(
+                root,
+                &[
+                    "show",
+                    "--format=",
+                    "--first-parent",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    head,
+                ],
+            )
+            .await?
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        });
     }
     compatible(&proposal, prepared, &sources, &known)?;
     let proposed_hash = hash(&serde_json::to_vec(&proposal)?);
@@ -283,7 +329,10 @@ pub(super) async fn learn(
         mining_session,
         authority_session,
         decision,
-        known_valid_diff_hashes: known.iter().map(|s| hash(s.as_bytes())).collect(),
+        known_valid_diff_hashes: known
+            .iter()
+            .map(|change| Ok(hash(&serde_json::to_vec(change)?)))
+            .collect::<Result<_>>()?,
     };
     store(
         control,
@@ -335,11 +384,56 @@ mod tests {
             source: "https://github.com/o/r/pull/1#discussion_r1".into(),
             literal: "legitimate_call()".into(),
         }];
-        assert!(replay_diff(&rules, "+++ b/src/lib.rs\n+legitimate_call();\n").is_err());
-        assert!(replay_diff(&rules, "+++ b/src/lib.rs\n+different_call();\n").is_ok());
+        assert!(replay_diff(
+            &rules,
+            &KnownChange {
+                diff: "+++ b/src/lib.rs\n+legitimate_call();\n".into(),
+                paths: vec!["src/lib.rs".into()]
+            }
+        )
+        .is_err());
+        assert!(replay_diff(
+            &rules,
+            &KnownChange {
+                diff: "+++ b/src/lib.rs\n+different_call();\n".into(),
+                paths: vec!["src/lib.rs".into()]
+            }
+        )
+        .is_ok());
         let malicious = r#"{"proposal":{"version":1,"rules":[{"kind":"shell_predicate","command":"touch /tmp/forged"}],"replay":[]}}"#;
         assert!(json::<Mining>(malicious).is_err());
     }
+    #[test]
+    fn known_valid_deleted_renamed_and_binary_paths_veto_forbidden_rules() {
+        for diff in [
+            "--- a/old\n+++ /dev/null\n",
+            "Binary files a/old and b/new differ\n",
+            "rename from old\nrename to new\n",
+        ] {
+            let rule = Constraint::ForbiddenPath {
+                id: "R1".into(),
+                source: "https://github.com/o/r/pull/1#discussion_r1".into(),
+                scope: contract::PathScope::File("path with spaces/old\tname".into()),
+            };
+            let change = KnownChange {
+                diff: diff.into(),
+                paths: vec!["path with spaces/old\tname".into()],
+            };
+            assert!(replay_diff(
+                std::slice::from_ref(&rule),
+                &KnownChange {
+                    diff: diff.into(),
+                    paths: vec!["unrelated".into()]
+                }
+            )
+            .is_ok());
+            assert!(
+                replay_diff(&[rule], &change).is_err(),
+                "Git-decoded changed path must be replayed regardless of patch header format"
+            );
+        }
+    }
+
     #[test]
     fn policy_updates_require_previous_hash_and_preserve_history() {
         let control = tempfile::tempdir().unwrap();
