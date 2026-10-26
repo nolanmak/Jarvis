@@ -18,10 +18,10 @@ chrono-tz.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
-hmac = "0.12"
-sha1 = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
 sha2.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.8"
 axum = { version = "0.8", features = ["ws"] }
 futures.workspace = true
@@ -38,4 +38,4 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 mockito = "1"
 proptest = "1"
-roxmltree = "0.20"
+roxmltree = "0.21"
