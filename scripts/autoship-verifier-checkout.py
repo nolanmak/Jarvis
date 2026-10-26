@@ -15,6 +15,7 @@ def export(repository, head, destination):
     if any(destination.iterdir()):
         raise ValueError("verifier export must start empty")
     command = ["/usr/bin/git", "--no-replace-objects", "-C", str(repository)]
+    source_mtime = int(subprocess.check_output(command + ["show", "-s", "--format=%ct", head]).strip())
     entries = subprocess.check_output(command + ["ls-tree", "-r", "-z", "--full-tree", head])
     rows = [row for row in entries.split(b"\0") if row]
     if len(rows) > 100000:
@@ -51,6 +52,7 @@ def export(repository, head, destination):
                 if objects.stdout.read(1) != b"\n":
                     raise ValueError("invalid object stream terminator")
                 target.chmod(0o755 if mode == b"100755" else 0o644)
+                os.utime(target, (source_mtime, source_mtime))
                 digest.update(row + b"\0")
             objects.stdin.close()
             if objects.wait() != 0:
@@ -59,7 +61,7 @@ def export(repository, head, destination):
             objects.kill()
             objects.wait()
             raise
-    return {"schema_version": 1, "head": head, "files": len(rows), "bytes": total, "tree_manifest_sha256": digest.hexdigest()}
+    return {"schema_version": 1, "head": head, "files": len(rows), "bytes": total, "tree_manifest_sha256": digest.hexdigest(), "source_mtime": source_mtime}
 
 
 if __name__ == "__main__":

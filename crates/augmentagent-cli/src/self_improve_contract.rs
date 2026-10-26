@@ -411,7 +411,7 @@ async fn execute_registered(
     // Admission is the same production lease/storage accounting used by gates.
     // Do not recursively invoke cargo-managed.sh while this lease is held.
     let _lease = crate::build_storage::admit(&root, &target).await?;
-    let committed = verifier_checkout::materialize(&root, &head, registration).await?;
+    let committed = verifier_checkout::materialize(&root, &head, registration, &target).await?;
     let mut receipts = Vec::new();
     for verifier in &registration.contract().verifiers {
         registration.verify_integrity(&root)?;
