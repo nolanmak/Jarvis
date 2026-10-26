@@ -2,6 +2,7 @@
 //! accounting. Coverage means evidence supplied, never proof of model attention.
 use super::*;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 const INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
 const CRITERION: &str = "Adding two integer inputs returns their arithmetic sum.";
@@ -317,7 +318,7 @@ async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
     let result = aligned_review::run_inner(
         Codex,
         &[],
-        &issue,
+        &aligned_review::ReviewSubject { title: &issue.title, body: &issue.body },
         root.clone(),
         &[CRITERION.into()],
         aligned_review::ReviewContext {

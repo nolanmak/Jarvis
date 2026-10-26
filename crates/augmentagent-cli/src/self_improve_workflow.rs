@@ -276,6 +276,7 @@ impl SweepGuard {
         inner.spawn_renewal();
         let reviewed_base = serde_json::from_str::<serde_json::Value>(recorded).ok()
             .and_then(|value| value.pointer("/verdict/structured/binding/base")
+                .or_else(|| value.pointer("/structured/binding/base"))
                 .and_then(|base| base.as_str()).map(str::to_owned));
         Ok(Some(Self { inner: Some(inner), reviewed_base }))
     }

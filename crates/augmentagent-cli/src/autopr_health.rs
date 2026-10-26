@@ -1113,6 +1113,7 @@ mod tests {
             open_prs: None,
             draft_ages_days: vec![(990, 0)],
             unreviewable_drafts: vec![],
+            policy_held_drafts: vec![],
             runs_today: None,
             gave_up_by_reason: None,
         }
