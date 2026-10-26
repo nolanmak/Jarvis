@@ -258,7 +258,7 @@ else: raise Exception('unexpected call '+repr(a))
             "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha
         })).unwrap()).unwrap();
     };
-    let verdict = || Some(RecordedVerdict {provider:"codex".into(),backend:"native".into(),model:"synthetic".into(),diff_ok:true,system_ok:true});
+    let verdict = || Some(RecordedVerdict {structured:None,provider:"codex".into(),backend:"native".into(),model:"synthetic".into(),diff_ok:true,system_ok:true});
     // Opening a rejected draft records ownership, but never authorizes merge.
     record_opened_pr(&opened_prs_path(), 10, 20, &head, None);
     scenario("SUCCESS", true, false, &head);

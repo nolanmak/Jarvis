@@ -69,6 +69,29 @@ pub(super) async fn prepare(root: &Path, worktree: &Path, branch: &str) -> Resul
     Ok(())
 }
 
+/// Commit the exact guarded candidate before immutable-head review. Hooks still
+/// run; failure preserves the checkout and never produces an approval receipt.
+pub(super) async fn commit_candidate(worktree: &Path, issue: &Issue) -> Result<()> {
+    let (ok, _, error) = run("git", &["add", "-A"], worktree).await?;
+    anyhow::ensure!(ok, "candidate staging failed: {error}");
+    let (clean, _, _) = run("git", &["diff", "--cached", "--quiet", "HEAD"], worktree).await?;
+    if clean { return Ok(()); }
+    let name = format!("user.name={}", std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME").unwrap_or_else(|_| "AugmentAgent".into()));
+    let email = format!("user.email={}", std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL").unwrap_or_else(|_| "augmentagent@localhost".into()));
+    let message = format!("fix: {} (#{})", issue.title, issue.number);
+    let (ok, _, error) = run("git", &["-c", &name, "-c", &email, "commit", "-m", &message], worktree).await?;
+    anyhow::ensure!(ok, "candidate checkpoint commit refused: {error}");
+    Ok(())
+}
+
+pub(super) async fn environment_identity(worktree: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let (ok, compiler, _) = run("rustc", &["--version"], worktree).await?;
+    anyhow::ensure!(ok, "verifier compiler identity unavailable");
+    let lock = std::fs::read(worktree.join("Cargo.lock"))?;
+    Ok(format!("{};cargo-lock:{:x}", compiler.trim(), Sha256::digest(lock)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

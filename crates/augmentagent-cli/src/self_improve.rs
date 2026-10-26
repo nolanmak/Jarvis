@@ -7951,6 +7951,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .map(|s| s.criteria.clone())
         .unwrap_or_default();
 
+    let repository = workflow::canonical_repository(repo_root).await?;
+    let environment = recovery::environment_identity(&worktree).await?;
+    let contract = serde_json::to_string(&(issue.number, &criteria, &plan))?;
+    let Some(mut workflow_guard) = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root, worktree: &worktree, repository: &repository,
+        source_issue: Some(issue.number), pr: None, branch: &branch,
+        contract: &contract, environment: &environment,
+    }).await? else {
+        return Ok(RunReport::held(format!("issue #{}: workflow leased by another worker", issue.number)));
+    };
+    workflow_guard.transition(crate::autoship_workflow::Stage::Build, "criteria_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
+
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
     let prompt =
@@ -8400,9 +8412,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // gate, and satisfied the author's own QA, so it opens as a draft PR
         // carrying both verdicts for a human. It does count as a failed attempt,
         // because a second opinion disagreeing is exactly what this stage is for.
-        if qa_ok {
-            let review =
-                independent_review(&reasoner, &issue, &summary, &full_diff, worktree.clone(), None, &criteria).await;
+        {
+            recovery::commit_candidate(&worktree, &issue).await?;
+            workflow_guard.transition(crate::autoship_workflow::Stage::Review, "candidate_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
+            let review = independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
+                qa_ok, &review_notes, round, None, 0).await;
             if review.available && !review.approved() {
                 warn!(
                     issue = issue.number,
@@ -8431,7 +8445,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         let mut findings_override: Option<String> = None;
         loop {
             let source = match after_review(
-                qa_ok,
+                qa_ok || independent.as_ref().is_some_and(|r| r.approved()),
                 independent.as_ref().map(|r| (r.available, r.approved())),
                 round,
                 max_rounds,
@@ -8609,12 +8623,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             break 'stages Some(ParkReason::QaUnavailable(format!("{e:#}")));
                         }
                     }
-                    if qa_ok {
-                        let prior = independent.as_ref().map(|r| r.notes.clone());
-                        independent = Some(
-                            independent_review(&reasoner, &issue, &rev_summary, &diff2, worktree.clone(), prior.as_deref(), &criteria)
-                                .await,
-                        );
+                    {
+                        recovery::commit_candidate(&worktree, &issue).await?;
+                        workflow_guard.transition(crate::autoship_workflow::Stage::Review, "revision_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
+                        let previous = independent.as_ref().and_then(|r| r.structured.clone());
+                        independent = Some(independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
+                            qa_ok, &review_notes, round, previous.as_ref(), 0).await);
                     }
                     let verdict = match (qa_ok, independent.as_ref()) {
                         (false, _) => "QA changes requested".to_string(),
@@ -8679,7 +8693,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
         // What the stages ended on — the revised tree when there were rounds.
         let (_ok, full_after, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
-        if !qa_ok {
+        if !qa_ok && !independent.as_ref().is_some_and(|r| r.approved()) {
             // #1488 — QA still rejects with the budget spent: one attempt for
             // the run (#852), and the work parks with QA's notes on the PR.
             let attempts = record_attempt(
@@ -9065,7 +9079,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // Record EVERY publication, including rejected and parked drafts. Those
     // return early below but still need to be recoverable by later ticks.
     if let Some(n) = pr_number {
-        let verdict = if qa_ok && park.is_none() && !repaired_after_review {
+        let verdict = if (qa_ok || independent.approved()) && park.is_none() && !repaired_after_review {
             independent.recorded_verdict()
         } else {
             None
