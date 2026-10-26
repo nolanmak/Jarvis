@@ -13,7 +13,7 @@ MIB=1024**2
 
 class Tests(unittest.TestCase):
     def test_reviewer_probes_do_not_reserve_unreachable_build_vm(self):
-        for name in ('writer','adjudicator'):
+        for name in ('writer','adjudicator','routed_transport'):
             build=probe.reachable_build_memory(name,4096)
             self.assertEqual(build,0)
             budget=probe.resource_budget(1024,build,3*GIB)

@@ -270,3 +270,8 @@ They therefore reserve the native guest plus host overhead (2 GiB for a 1 GiB
 native guest), with a 4 GiB aggregate ceiling. This does not resize a guest or
 change production composition: production still reads the actual bridge grants.
 New probe names require an explicit capability classification.
+
+The `routed_transport` choice also has no build grant: it exercises the actual
+operator-routed native adapter with supplied text and no Bash. This checks that
+transport's admission and inference path; it does not replace the full issue or
+adoption pipeline acceptance runs.
