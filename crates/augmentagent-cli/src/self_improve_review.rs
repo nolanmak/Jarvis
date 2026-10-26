@@ -27,8 +27,17 @@ pub(super) async fn run(
     criteria: &[String],
     context: ReviewContext<'_>,
 ) -> IndependentReview {
+    let origin = match adoption::origin_for_candidate(&worktree, context.workflow).await {
+        Ok(origin) => origin,
+        Err(error) => {
+            return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnverifiable {
+                error: format!("{error:#}"),
+            })
+        }
+    };
     let authors = match builder.review_authors() {
         Ok(Some(authors)) => authors,
+        Ok(None) if origin.is_imported() => vec![],
         Ok(None) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnknown),
         Err(error) => {
             return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnverifiable {
@@ -36,12 +45,19 @@ pub(super) async fn run(
             })
         }
     };
-    let provider =
-        match select_reviewer(&reviewer_pool(), Ok(Some(authors.clone())), reviewer_status) {
-            Ok(provider) => provider,
-            Err(why) => return IndependentReview::unavailable(why),
-        };
-    match run_inner(provider, &authors, issue, worktree, criteria, context).await {
+    let provider = match if origin.is_imported() {
+        adoption::imported_reviewer()
+    } else {
+        select_reviewer(&reviewer_pool(), Ok(Some(authors.clone())), reviewer_status)
+    } {
+        Ok(provider) => provider,
+        Err(why) => return IndependentReview::unavailable(why),
+    };
+    match run_inner(
+        provider, &authors, issue, worktree, criteria, context, origin,
+    )
+    .await
+    {
         Ok(review) => review,
         Err(error) => IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
             reviewers: vec![provider],
@@ -202,6 +218,7 @@ async fn run_inner(
     worktree: PathBuf,
     criteria: &[String],
     context: ReviewContext<'_>,
+    origin: aligned::ReviewOrigin,
 ) -> Result<IndependentReview> {
     anyhow::ensure!(
         !criteria.is_empty(),
@@ -337,7 +354,8 @@ async fn run_inner(
             model,
             session_id: session.clone(),
         };
-        actor.independent_of(&builders)?;
+        origin.validate(&binding.head)?;
+        actor.independent_for(&builders, &origin)?;
         let mut findings = vec![];
         let mut request_hashes = vec![];
         let shards: Vec<_> = evidence_shards.iter().collect();
@@ -451,6 +469,7 @@ async fn run_inner(
             .collect(),
     )?;
     let mut structured = aligned::ReviewEvidence {
+        origin,
         binding: binding.clone(),
         builders,
         passes,
@@ -488,7 +507,7 @@ async fn run_inner(
                 None => context.adjudication_attempts_already_made,
             };
             structured.adjudication = Some(
-                aligned::adjudicate_native(
+                aligned::adjudicate_native_with_origin(
                     &structured.builders,
                     opts,
                     binding.clone(),
@@ -496,6 +515,7 @@ async fn run_inner(
                     &unresolved,
                     &adjudication_evidence,
                     attempts,
+                    &structured.origin,
                 )
                 .await?,
             );

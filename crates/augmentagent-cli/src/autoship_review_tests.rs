@@ -524,6 +524,7 @@ async fn repaired_new_head_does_not_need_previous_upheld_receipt() {
 #[test]
 fn serialized_receipts_cannot_reuse_partial_or_stale_coverage() {
     let receipt = ReviewEvidence {
+        origin: Default::default(),
         binding: binding(),
         builders: builders(),
         passes: passes(vec![]),
@@ -557,4 +558,100 @@ fn serialized_receipts_cannot_reuse_partial_or_stale_coverage() {
             "defect {defect} minted approval"
         );
     }
+}
+
+fn imported_fixture() -> (tempfile::TempDir, std::path::PathBuf, ReviewOrigin) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+    store
+        .observe_adoption("owner/repo", 42, "head-a", "trusted harness ownership", 1)
+        .unwrap();
+    let receipt = store
+        .issue_imported_origin("owner/repo", 42, "head-a", "head-a", 2)
+        .unwrap();
+    let origin = ReviewOrigin::Imported {
+        repository: "owner/repo".into(),
+        pr: 42,
+        source_head: "head-a".into(),
+        candidate_head: "head-a".into(),
+        receipt,
+    };
+    (dir, path, origin)
+}
+
+#[test]
+fn imported_unknown_history_requires_protected_exact_head_receipt() {
+    let (_dir, path, origin) = imported_fixture();
+    origin.validate_at(&path, "head-a").unwrap();
+    assert!(origin.validate_at(&path, "head-b").is_err());
+    let mut forged = origin.clone();
+    if let ReviewOrigin::Imported { receipt, .. } = &mut forged {
+        *receipt = "model-claimed-approval".into();
+    }
+    assert!(forged.validate_at(&path, "head-a").is_err());
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+    assert!(store
+        .issue_imported_origin("fork/repo", 42, "head-a", "head-a", 3)
+        .is_err());
+    store
+        .observe_adoption(
+            "owner/repo",
+            42,
+            "new-remote-head",
+            "trusted updated ownership",
+            4,
+        )
+        .unwrap();
+    assert!(
+        origin.validate_at(&path, "head-a").is_err(),
+        "new observed head invalidates imported approval receipt"
+    );
+}
+
+#[test]
+fn imported_reviews_use_distinct_native_sessions_without_fictional_builders() {
+    let (_dir, path, origin) = imported_fixture();
+    origin.validate_at(&path, "head-a").unwrap();
+    let mut current = passes(vec![]);
+    for pass in &mut current {
+        pass.actor.provider = "codex".into();
+    }
+    assert!(review_authority_checked(&binding(), &[], &current, None, &origin).is_ok());
+    assert!(
+        review_authority(&binding(), &[], &current, None).is_err(),
+        "unknown history alone never authorizes review"
+    );
+    let mut reused = current.clone();
+    reused[2].actor.session_id = reused[1].actor.session_id.clone();
+    assert!(review_authority_checked(&binding(), &[], &reused, None, &origin).is_err());
+    assert!(
+        review_authority_checked(
+            &binding(),
+            &[current[1].actor.clone()],
+            &current,
+            None,
+            &origin
+        )
+        .is_err(),
+        "known actual builder session cannot review itself"
+    );
+    current[1].actor.backend = "model-claimed".into();
+    assert!(review_authority_checked(&binding(), &[], &current, None, &origin).is_err());
+}
+
+#[test]
+fn model_response_cannot_grant_itself_imported_origin() {
+    let raw = serde_json::json!({"binding":binding(),"decision":"approve","findings":[],
+        "origin":{"kind":"imported","receipt":"LGTM"}})
+    .to_string();
+    assert!(parse_review_pass(
+        &raw,
+        &binding(),
+        actor("codex", "new-session"),
+        ReviewRole::Diff,
+        coverage(),
+        &criteria()
+    )
+    .is_err());
 }

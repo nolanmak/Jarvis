@@ -28,11 +28,7 @@ pub(super) struct Start<'a> {
 }
 
 pub(super) fn path() -> PathBuf {
-    std::env::var_os("AUGMENTAGENT_AUTOPR_WORKFLOW_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-workflow.sqlite3")
-        })
+    durable::default_path()
 }
 
 fn millis() -> i64 {
@@ -374,6 +370,19 @@ impl WorkflowGuard {
                 }
             }
         });
+    }
+
+    pub(super) fn repository(&self) -> &str {
+        &self.repository
+    }
+    pub(super) fn pr(&self) -> Result<Option<u64>> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .snapshot(self.id())?
+            .context("workflow missing")?
+            .pr)
     }
 
     pub(super) fn id(&self) -> &str {

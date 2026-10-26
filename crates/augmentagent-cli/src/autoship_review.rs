@@ -50,6 +50,57 @@ pub struct Actor {
     pub session_id: String,
 }
 
+/// Historical provenance remains unknown for imported work. Only a protected,
+/// exact-head adoption receipt permits independent fresh-session review.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReviewOrigin {
+    #[default]
+    RecordedBuilders,
+    Imported {
+        repository: String,
+        pr: u64,
+        source_head: String,
+        candidate_head: String,
+        receipt: String,
+    },
+}
+impl ReviewOrigin {
+    pub fn validate(&self, head: &str) -> Result<()> {
+        self.validate_at(&crate::autoship_workflow::default_path(), head)
+    }
+    fn validate_at(&self, path: &std::path::Path, head: &str) -> Result<()> {
+        if let Self::Imported {
+            repository,
+            pr,
+            source_head,
+            candidate_head,
+            receipt,
+        } = self
+        {
+            ensure!(
+                head == candidate_head,
+                "imported origin concerns another candidate"
+            );
+            ensure!(path.exists(), "protected adoption receipt unavailable");
+            ensure!(
+                crate::autoship_workflow::WorkflowStore::open(path)?.verify_imported_origin(
+                    repository,
+                    *pr,
+                    source_head,
+                    candidate_head,
+                    receipt
+                )?,
+                "untrusted, stale, or forged imported origin"
+            );
+        }
+        Ok(())
+    }
+    pub fn is_imported(&self) -> bool {
+        matches!(self, Self::Imported { .. })
+    }
+}
+
 impl Actor {
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -58,6 +109,24 @@ impl Actor {
                 .all(|v| !v.trim().is_empty()),
             "unknown review actor identity"
         );
+        Ok(())
+    }
+
+    pub fn independent_for(&self, builders: &[Actor], origin: &ReviewOrigin) -> Result<()> {
+        if !origin.is_imported() {
+            return self.independent_of(builders);
+        }
+        self.validate()?;
+        ensure!(
+            self.provider == "codex" && self.backend == "native",
+            "imported work requires native Codex review"
+        );
+        for builder in builders {
+            ensure!(
+                self.session_id != builder.session_id,
+                "review reused known builder session"
+            );
+        }
         Ok(())
     }
 
@@ -389,6 +458,30 @@ pub async fn adjudicate_native(
     evidence: &str,
     attempts_already_made: u32,
 ) -> Result<AdjudicationReceipt> {
+    adjudicate_native_with_origin(
+        builders,
+        opts,
+        binding,
+        criteria,
+        findings,
+        evidence,
+        attempts_already_made,
+        &ReviewOrigin::RecordedBuilders,
+    )
+    .await
+}
+
+pub async fn adjudicate_native_with_origin(
+    builders: &[Actor],
+    opts: ReasonerOpts,
+    binding: ReviewBinding,
+    criteria: &BTreeMap<String, String>,
+    findings: &[Finding],
+    evidence: &str,
+    attempts_already_made: u32,
+    origin: &ReviewOrigin,
+) -> Result<AdjudicationReceipt> {
+    origin.validate(&binding.head)?;
     let provider = augmentagent_channel_core::ProviderKind::Codex;
     let actor = Actor {
         provider: provider.name().into(),
@@ -399,10 +492,10 @@ pub async fn adjudicate_native(
         ),
         session_id: format!("autoship-adjudicate:{}", uuid::Uuid::new_v4()),
     };
-    actor.independent_of(builders)?;
+    actor.independent_for(builders, origin)?;
     let reasoner = augmentagent_channel_core::build_pinned(provider)
         .context("native Codex adjudicator is not configured")?;
-    adjudicate(
+    adjudicate_with_origin(
         reasoner.as_ref(),
         actor,
         builders,
@@ -412,6 +505,7 @@ pub async fn adjudicate_native(
         findings,
         evidence,
         attempts_already_made,
+        origin,
     )
     .await
 }
@@ -430,8 +524,36 @@ async fn adjudicate<R: Reasoner + ?Sized>(
     evidence: &str,
     attempts_already_made: u32,
 ) -> Result<AdjudicationReceipt> {
+    adjudicate_with_origin(
+        reasoner,
+        actor,
+        builders,
+        opts,
+        binding,
+        criteria,
+        findings,
+        evidence,
+        attempts_already_made,
+        &ReviewOrigin::RecordedBuilders,
+    )
+    .await
+}
+
+async fn adjudicate_with_origin<R: Reasoner + ?Sized>(
+    reasoner: &R,
+    actor: Actor,
+    builders: &[Actor],
+    mut opts: ReasonerOpts,
+    binding: ReviewBinding,
+    criteria: &BTreeMap<String, String>,
+    findings: &[Finding],
+    evidence: &str,
+    attempts_already_made: u32,
+    origin: &ReviewOrigin,
+) -> Result<AdjudicationReceipt> {
+    origin.validate(&binding.head)?;
     binding.validate()?;
-    actor.independent_of(builders)?;
+    actor.independent_for(builders, origin)?;
     ensure!(
         actor.provider == "codex" && actor.backend == "native",
         "final adjudicator must use pinned native Codex"
@@ -510,6 +632,8 @@ async fn adjudicate<R: Reasoner + ?Sized>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewEvidence {
+    #[serde(default)]
+    pub origin: ReviewOrigin,
     pub binding: ReviewBinding,
     pub builders: Vec<Actor>,
     pub passes: Vec<ReviewPass>,
@@ -518,11 +642,12 @@ pub struct ReviewEvidence {
 
 impl ReviewEvidence {
     pub fn authority(&self) -> Result<MergeAuthority> {
-        review_authority(
+        review_authority_with_origin(
             &self.binding,
             &self.builders,
             &self.passes,
             self.adjudication.as_ref(),
+            &self.origin,
         )
     }
 }
@@ -580,6 +705,33 @@ pub fn review_authority(
     passes: &[ReviewPass],
     adjudication: Option<&AdjudicationReceipt>,
 ) -> Result<MergeAuthority> {
+    review_authority_with_origin(
+        binding,
+        builders,
+        passes,
+        adjudication,
+        &ReviewOrigin::RecordedBuilders,
+    )
+}
+
+pub fn review_authority_with_origin(
+    binding: &ReviewBinding,
+    builders: &[Actor],
+    passes: &[ReviewPass],
+    adjudication: Option<&AdjudicationReceipt>,
+    origin: &ReviewOrigin,
+) -> Result<MergeAuthority> {
+    origin.validate(&binding.head)?;
+    review_authority_checked(binding, builders, passes, adjudication, origin)
+}
+
+fn review_authority_checked(
+    binding: &ReviewBinding,
+    builders: &[Actor],
+    passes: &[ReviewPass],
+    adjudication: Option<&AdjudicationReceipt>,
+    origin: &ReviewOrigin,
+) -> Result<MergeAuthority> {
     binding.validate()?;
     for role in [ReviewRole::Qa, ReviewRole::Diff, ReviewRole::System] {
         ensure!(
@@ -605,12 +757,12 @@ pub fn review_authority(
             "review incomplete or bound to another candidate"
         );
         pass.actor.validate()?;
-        if pass.role != ReviewRole::Qa {
+        if pass.role != ReviewRole::Qa || origin.is_imported() {
             ensure!(
                 pass.actor.backend == "native",
                 "review must use native transport"
             );
-            pass.actor.independent_of(builders)?;
+            pass.actor.independent_for(builders, origin)?;
         }
         ensure!(
             sessions.insert(&pass.actor.session_id),
@@ -636,7 +788,7 @@ pub fn review_authority(
         &receipt.binding == binding,
         "adjudication concerns another candidate"
     );
-    receipt.actor.independent_of(builders)?;
+    receipt.actor.independent_for(builders, origin)?;
     ensure!(
         receipt.actor.provider == "codex" && receipt.actor.backend == "native",
         "invalid adjudicator provider"

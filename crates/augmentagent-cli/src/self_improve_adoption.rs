@@ -173,6 +173,125 @@ pub(super) fn select_linked(
     Some((chosen.pr, chosen.source_issue?, chosen.branch.clone()))
 }
 
+pub(super) fn imported_reviewer(
+) -> std::result::Result<augmentagent_channel_core::ProviderKind, ReviewUnavailable> {
+    let provider = augmentagent_channel_core::ProviderKind::Codex;
+    match reviewer_status(provider) {
+        ReviewerStatus::Ready => Ok(provider),
+        ReviewerStatus::NotConfigured(detail) => Err(ReviewUnavailable::NoCapacity {
+            reviewers: vec![provider],
+            detail,
+        }),
+        ReviewerStatus::Latched(until) => Err(ReviewUnavailable::Latched {
+            until: vec![(provider.name().into(), until)],
+        }),
+    }
+}
+
+pub(super) async fn preflight(repo_root: &Path, pr: u64, branch: &str) -> Result<bool> {
+    let repository = workflow::canonical_repository(repo_root).await?;
+    let Some(owned) = lookup(&workflow::path(), &repository, pr)? else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        owned.branch == branch && owned.ready_for_review(),
+        "adopted PR branch/base changed"
+    );
+    let (ok, raw, _) = run(
+        &gh_bin(),
+        &[
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--json",
+            "headRefOid,isCrossRepository,author,baseRefName",
+        ],
+        repo_root,
+    )
+    .await?;
+    anyhow::ensure!(ok, "cannot revalidate adopted PR");
+    let row: serde_json::Value = serde_json::from_str(&raw)?;
+    anyhow::ensure!(
+        row.get("isCrossRepository").and_then(|v| v.as_bool()) == Some(false)
+            && row.get("headRefOid").and_then(|v| v.as_str()) == Some(owned.head.as_str())
+            && row
+                .pointer("/author/login")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case(&owned.author))
+            && row.get("baseRefName").and_then(|v| v.as_str()) == Some("main"),
+        "adopted ownership changed; rediscover before review"
+    );
+    Ok(true)
+}
+
+/// Authorize the actual local descendant, never invent historical providers.
+pub(super) async fn origin_for_candidate(
+    worktree: &Path,
+    workflow: Option<&workflow::WorkflowGuard>,
+) -> Result<crate::autoship_review::ReviewOrigin> {
+    use crate::autoship_review::ReviewOrigin;
+    let Some(workflow) = workflow else {
+        return Ok(ReviewOrigin::RecordedBuilders);
+    };
+    workflow.validate_before_side_effect()?;
+    let Some(pr) = workflow.pr()? else {
+        return Ok(ReviewOrigin::RecordedBuilders);
+    };
+    let Some(owned) = lookup(&workflow::path(), workflow.repository(), pr)? else {
+        return Ok(ReviewOrigin::RecordedBuilders);
+    };
+    anyhow::ensure!(
+        owned.ready_for_review(),
+        "adopted PR requires parent/base reconciliation"
+    );
+    let (ok, head, _) = run("git", &["rev-parse", "HEAD"], worktree).await?;
+    anyhow::ensure!(ok, "candidate head unavailable");
+    let head = head.trim();
+    let (descendant, _, _) = run(
+        "git",
+        &["merge-base", "--is-ancestor", &owned.head, head],
+        worktree,
+    )
+    .await?;
+    anyhow::ensure!(
+        descendant,
+        "candidate is not a descendant of trusted adopted head"
+    );
+    let receipt = WorkflowStore::open(&workflow::path())?.issue_imported_origin(
+        &owned.repository,
+        pr,
+        &owned.head,
+        head,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    Ok(ReviewOrigin::Imported {
+        repository: owned.repository,
+        pr,
+        source_head: owned.head,
+        candidate_head: head.into(),
+        receipt,
+    })
+}
+
+pub(super) async fn revise(
+    reasoner: &FallbackReasoner,
+    workflow: &workflow::WorkflowGuard,
+    opts: &augmentagent_channel_core::ReasonerOpts,
+    prompt: &str,
+) -> Result<String> {
+    let worktree = opts.cwd.as_deref().context("revision worktree missing")?;
+    let origin = origin_for_candidate(worktree, Some(workflow)).await?;
+    if origin.is_imported() {
+        // Normal dispatch records actual mutation providers. Imported unknown
+        // history remains unknown; it is never replaced by a fictional author.
+        let mut opts = opts.clone();
+        opts.session_id = None;
+        reasoner.call_with_storage(&opts, prompt).await
+    } else {
+        reasoner.call_revision_with_storage(opts, prompt).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

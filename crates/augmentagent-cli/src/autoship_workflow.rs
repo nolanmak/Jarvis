@@ -143,6 +143,14 @@ pub struct ResourceCharge {
     pub tokens: u64,
 }
 
+pub fn default_path() -> std::path::PathBuf {
+    std::env::var_os("AUGMENTAGENT_AUTOPR_WORKFLOW_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-workflow.sqlite3")
+        })
+}
+
 pub struct WorkflowStore {
     conn: Connection,
 }
@@ -190,6 +198,9 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS imported_origin (
+                receipt TEXT PRIMARY KEY, repository TEXT NOT NULL, pr INTEGER NOT NULL,
+                source_head TEXT NOT NULL, candidate_head TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS adopted_pr (
                 repository TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL,
                 record TEXT NOT NULL, first_seen INTEGER NOT NULL, observed_at INTEGER NOT NULL,
@@ -218,6 +229,49 @@ impl WorkflowStore {
                 generation INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, at_ms INTEGER NOT NULL);
             COMMIT;")?;
         Ok(Self { conn })
+    }
+
+    pub fn issue_imported_origin(
+        &mut self,
+        repository: &str,
+        pr: u64,
+        source_head: &str,
+        candidate_head: &str,
+        now: i64,
+    ) -> Result<String> {
+        ensure!(!candidate_head.is_empty(), "candidate head required");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owned: Option<String> = tx
+            .query_row(
+                "SELECT head FROM adopted_pr WHERE repository=?1 AND pr=?2",
+                params![repository, pr],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            owned.as_deref() == Some(source_head),
+            "candidate lacks current trusted adoption ownership"
+        );
+        let receipt = uuid::Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO imported_origin(receipt,repository,pr,source_head,candidate_head,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![receipt,repository,pr,source_head,candidate_head,now])?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub fn verify_imported_origin(
+        &self,
+        repository: &str,
+        pr: u64,
+        source_head: &str,
+        candidate_head: &str,
+        receipt: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT 1 FROM imported_origin o JOIN adopted_pr a ON a.repository=o.repository AND a.pr=o.pr
+            WHERE o.receipt=?1 AND o.repository=?2 AND o.pr=?3 AND o.source_head=?4 AND o.candidate_head=?5
+            AND (a.head=o.source_head OR a.head=o.candidate_head)", params![receipt,repository,pr,source_head,candidate_head], |_|Ok(())).optional()?.is_some())
     }
 
     /// Ownership observation is separate from execution and approvals. A new

@@ -4249,11 +4249,6 @@ async fn independent_review_with_context(
     workflow: Option<&workflow::WorkflowGuard>,
     acceptance_evidence: Option<(&acceptance::PreparedAcceptance, &acceptance::CandidateReceiptReference)>,
 ) -> IndependentReview {
-    match builder.review_authors() {
-        Ok(None) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnknown),
-        Err(error) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnverifiable { error: format!("{error:#}") }),
-        Ok(Some(_)) => {}
-    }
     let (compiler_ok, compiler, _) = match run("rustc", &["-vV"], &worktree).await {
         Ok(result) => result,
         Err(error) => return IndependentReview::not_run(format!("review environment unavailable: {error:#}")),
@@ -6581,7 +6576,11 @@ async fn resume_draft_pr(
     // merged `main`, ran the full gate and only then discovered there was
     // nobody to review it — then billed the run and blamed "capacity" for
     // what was usually unknown provenance, every day, forever.
-    if let Err(why) = select_reviewer(&reviewer_pool(), authors, reviewer_status) {
+    let imported = adoption::preflight(repo_root, pr, branch).await?;
+    if imported { prior_qa = None; prior_notes = None; }
+    let reviewer = if imported && authors.is_ok() { adoption::imported_reviewer() }
+        else { select_reviewer(&reviewer_pool(), authors, reviewer_status) };
+    if let Err(why) = reviewer {
         return Ok(hold_unreviewable(
             repo_root,
             pr,
@@ -6646,7 +6645,7 @@ async fn resume_draft_pr(
         let files = conflicted_files(&status);
         if !files.is_empty() {
             let (_, hunks, _) = run("git", &["diff"], &worktree).await?;
-            reasoner.call_revision_with_storage(&fix_opts(worktree.clone()),
+            adoption::revise(reasoner, &workflow, &fix_opts(worktree.clone()),
                 &build_conflict_prompt(&issue, &pr_body, &files, &hunks)).await?;
         }
         let (staged, _, error) = run("git", &["add", "-A"], &worktree).await?;
@@ -6690,8 +6689,7 @@ async fn resume_draft_pr(
             ConflictPlan::Resolve => {
                 let (_ok, hunks, _) = run("git", &["diff"], &worktree).await?;
                 builder_ran = true;
-                match reasoner
-                    .call_revision_with_storage(
+                match adoption::revise(reasoner, &workflow,
                         &fix_opts(worktree.clone()),
                         &build_conflict_prompt(&issue, &pr_body, &files, &hunks),
                     )
@@ -6894,8 +6892,7 @@ async fn resume_draft_pr(
             }
             rounds_done += 1;
             info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
-            match reasoner
-                .call_revision_with_storage(
+            match adoption::revise(reasoner, &workflow,
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now, prior_attempts.as_deref()),
                 )
@@ -6975,8 +6972,7 @@ async fn resume_draft_pr(
                     round = rounds_done,
                     "resume: gate-repair round"
                 );
-                match reasoner
-                    .call_revision_with_storage(
+                match adoption::revise(reasoner, &workflow,
                         &fix_opts(worktree.clone()),
                         &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now, prior_attempts.as_deref()),
                     )
@@ -7032,7 +7028,7 @@ async fn resume_draft_pr(
         if rounds_done < revise_rounds() {
             if let Some(findings) = ci_findings.take() {
                 rounds_done += 1;
-                let revised = reasoner.call_revision_with_storage(&fix_opts(worktree.clone()),
+                let revised = adoption::revise(reasoner, &workflow, &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref())).await;
                 match revised {
                     Ok(rs) => {
@@ -7332,8 +7328,7 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
-        let rev_summary = match reasoner
-            .call_revision_with_storage(
+        let rev_summary = match adoption::revise(reasoner, &workflow,
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
             )
@@ -11836,6 +11831,7 @@ mod tests {
     #[test]
     fn incomplete_structured_receipt_cannot_fall_back_to_true_legacy_flags() {
         let evidence = crate::autoship_review::ReviewEvidence {
+            origin: Default::default(),
             binding: crate::autoship_review::ReviewBinding { head:"head".into(),base:"base".into(),
                 environment_id:"env".into(),contract_hash:"contract".into(),evidence_hash:"evidence".into() },
             builders: vec![], passes:vec![], adjudication:None,
