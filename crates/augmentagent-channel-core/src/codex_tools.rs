@@ -518,7 +518,8 @@ mod tests {
         let mut opts=crate::reasoner::triage_opts(None);
         opts.env.push((crate::autoship_scope::SCOPE_ENV.into(),"1".into()));
         assert!(!isolated_storage_route(&opts,&runner),"a profile flag alone is not authority");
-        let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("audit.jsonl"),root.path().join("anchor"),&[]).unwrap());
+        let anchor=tempfile::tempdir().unwrap();
+        let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("audit.jsonl"),anchor.path().join("anchor"),&[]).unwrap());
         opts.audit_logger=Some(logger.clone());
         assert!(!isolated_storage_route(&opts,&runner),"ordinary audited sessions retain legacy protection");
         logger.require_run_resources().unwrap();
