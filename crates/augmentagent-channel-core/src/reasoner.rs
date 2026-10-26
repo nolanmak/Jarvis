@@ -690,6 +690,12 @@ pub trait Reasoner: Send + Sync {
     /// HTTP implementations and test doubles retain fallback-owned admission.
     fn defers_model_admission(&self) -> bool { false }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
+    /// Optional calibrated guidance is admitted only by a transport that proves
+    /// the replayed native route. Unknown adapters keep the original prompt.
+    async fn call_calibrated(&self, opts:&ReasonerOpts, user_message:&str, _supplement:&str, _serving_model:&str)->anyhow::Result<String> {
+        self.call(opts,user_message).await
+    }
+
 
     /// Like [`call`](Reasoner::call), but returns **everything the model said**
     /// across the turn rather than just its final text block.
@@ -1363,6 +1369,8 @@ impl ClaudeCliReasoner {
         // daemon actually spends, so capture it as the stream goes by.
         let call_started = std::time::Instant::now();
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
+        crate::triage_capture::start(&audit_session,routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str).unwrap_or(""),router.is_none());
+
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -1379,6 +1387,7 @@ impl ClaudeCliReasoner {
                     }
                 }
             }
+            crate::triage_capture::line(&audit_session,&line);
             if let Some(u) = crate::token_usage::parse_usage(&line) {
                 observed_usage = Some(u);
             }
@@ -1515,6 +1524,7 @@ impl ClaudeCliReasoner {
         if let Some(lease) = native_lease {
             lease.finish()?;
         }
+        crate::triage_capture::finish(&audit_session);
         Ok(final_text)
     }
 }

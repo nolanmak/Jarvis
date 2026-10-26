@@ -1061,6 +1061,15 @@ impl WorkflowStore {
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
+                // Calibration uses one observation identity per UTC day. An
+                // admitted lost response still counts after audit recovery
+                // changes its evidence binding; never count only successes.
+                if let Some(day)=purpose.strip_prefix("triage-calibration-day:") {
+                    ensure!(day.parse::<i64>()?==now_ms.div_euclid(86_400_000),"calibration day changed before admission");
+                    ensure!(lease.workflow.starts_with("autoship-observation/"),"calibration requires observation identity");
+                    let admitted:u64=tx.query_row("SELECT COALESCE(SUM(model_calls),0) FROM resource_charge WHERE workflow=?1",params![lease.workflow],|r|r.get(0))?;
+                    ensure!(admitted<u64::from(limit),"daily calibration admitted-call budget exhausted");
+                }
                 let key=serde_json::to_string(binding)?;
                 let count:u32=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",
                     params![lease.workflow,purpose,key],|r|r.get(0)).optional()?.unwrap_or(0);
@@ -2651,6 +2660,24 @@ mod observation_accounting_tests {
         assert!(store.charge_bounded_call(&next,"exhausted",9,Some(10),"component",&binding(),2).is_err());
         assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
         assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),2);
+    }
+    #[test]
+    fn calibration_day_budget_counts_lost_dispatches_across_restart_and_rebinding() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");
+        let id="autoship-observation/calibration-day";
+        let mut store=WorkflowStore::open(&path).unwrap();store.register(id,"probe",binding(),1).unwrap();
+        let lease=store.claim(id,"first",2,1000).unwrap().unwrap();
+        assert!(store.charge_bounded_call(&lease,"not-admitted",3,Some(0),"triage-calibration-day:0",&binding(),2).is_err());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
+        store.charge_bounded_call(&lease,"lost-response",4,Some(12),"triage-calibration-day:0",&binding(),2).unwrap();
+        store.release(&lease,5).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();let lease=store.claim(id,"recovered",6,1000).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;
+        checkpoint.binding.evidence_hash="recovered-audit-generation".into();
+        store.checkpoint(&lease,&checkpoint,7).unwrap();
+        store.charge_bounded_call(&lease,"second-lost-response",8,Some(12),"triage-calibration-day:0",&checkpoint.binding,2).unwrap();
+        assert!(store.charge_bounded_call(&lease,"third-refused",9,Some(12),"triage-calibration-day:0",&checkpoint.binding,2).is_err());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
     }
     #[test]
     fn observations_are_charged_once_bounded_and_subordinate_to_shipping() {

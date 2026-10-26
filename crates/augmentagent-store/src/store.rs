@@ -1233,6 +1233,11 @@ impl Store {
             attempt_n INTEGER NOT NULL, failure_class TEXT NOT NULL, guard TEXT NOT NULL,
             detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_email_retry_failures_time ON email_retry_failures(observed_at_ms);")?;
+        conn.execute_batch("SAVEPOINT triage_calibration_migration; DROP TRIGGER IF EXISTS capture_triage_action_cohort;")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_inputs (
+            id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, prompt TEXT NOT NULL,
+            base TEXT NOT NULL, model TEXT NOT NULL, decision TEXT NOT NULL,
+            replayable INTEGER NOT NULL, observed_at_ms INTEGER NOT NULL);")?;
         // Snapshot newly created triage cohorts atomically with the action.
         // Existing mutable status/email labels cannot reconstruct old decisions.
         conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_action_cohorts (
@@ -1240,7 +1245,33 @@ impl Store {
             observed_at_ms INTEGER NOT NULL);
             CREATE TRIGGER IF NOT EXISTS capture_triage_action_cohort AFTER INSERT ON actions
             WHEN NEW.status IN ('flagged','pending')
-            BEGIN INSERT OR IGNORE INTO triage_action_cohorts VALUES(NEW.id,NEW.status,NEW.createdAt); END;")?;
+            BEGIN INSERT OR IGNORE INTO triage_action_cohorts(action_id,cohort,observed_at_ms) VALUES(NEW.id,NEW.status,NEW.createdAt); END;")?;
+        if !column_exists(conn, "triage_action_cohorts", "input_id")? {
+            conn.execute("ALTER TABLE triage_action_cohorts ADD COLUMN input_id INTEGER", [])?;
+        }
+        // Input identity is attached by the exact async request scope, never
+        // by a mutable latest-message lookup. Unknown history stays unknown.
+        conn.execute_batch("DROP TRIGGER IF EXISTS capture_triage_action_cohort_with_input;")?;
+        if !column_exists(conn, "triage_calibration_inputs", "evidence")? {
+            conn.execute("ALTER TABLE triage_calibration_inputs ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}'",[])?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_versions (
+            version TEXT PRIMARY KEY, base TEXT NOT NULL, model TEXT NOT NULL,
+            supplement TEXT NOT NULL, receipt TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_active (singleton INTEGER PRIMARY KEY CHECK(singleton=1),version TEXT NOT NULL,disabled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS triage_calibration_rollbacks (id INTEGER PRIMARY KEY,version TEXT NOT NULL,receipt TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_calls (request_hash TEXT PRIMARY KEY,response TEXT NOT NULL,session TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS triage_calibration_versions_immutable BEFORE UPDATE ON triage_calibration_versions BEGIN SELECT RAISE(ABORT,'immutable calibration version'); END;
+            CREATE TRIGGER IF NOT EXISTS triage_calibration_versions_retained BEFORE DELETE ON triage_calibration_versions BEGIN SELECT RAISE(ABORT,'retained calibration version'); END;")?;
+        if !column_exists(conn, "triage_calibration_versions", "serving_model")? { conn.execute("ALTER TABLE triage_calibration_versions ADD COLUMN serving_model TEXT NOT NULL DEFAULT ''",[])?; }
+        if !column_exists(conn, "triage_calibration_calls", "observed_model")? { conn.execute("ALTER TABLE triage_calibration_calls ADD COLUMN observed_model TEXT NOT NULL DEFAULT ''",[])?; }
+        for column in ["audit_workflow","audit_path","proof_hash"] { if !column_exists(conn,"triage_calibration_calls",column)? {conn.execute(&format!("ALTER TABLE triage_calibration_calls ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),[])?;} }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_call_history(body TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_control(singleton INTEGER PRIMARY KEY CHECK(singleton=1),enabled INTEGER NOT NULL,revision INTEGER NOT NULL);
+            INSERT OR IGNORE INTO triage_calibration_control VALUES(1,1,0);
+            CREATE TABLE IF NOT EXISTS triage_calibration_experiments(id TEXT PRIMARY KEY,base TEXT NOT NULL,model TEXT NOT NULL,revision INTEGER NOT NULL,source TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS triage_calibration_one_pending ON triage_calibration_experiments(base,model,revision) WHERE state='pending';
+            RELEASE triage_calibration_migration;")?;
         // Issue #27: per-channel subscription registry (platform-agnostic).
         // Rows control which Discord/Slack/etc channels the poller watches and
         // which mode (priority / digest / store_only) they route through.
@@ -3107,6 +3138,7 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
         // #165: mask free-form bodies before persisting. Borrowed when no
         // secrets matched (zero-alloc fast path), owned otherwise.
         let original_body_masked = original_body.map(redact::mask);
@@ -3118,7 +3150,7 @@ impl Store {
         // populate them as 'classic' / NULL / NULL so the classic path stays
         // byte-identical post-migration. Code-mode callers use the dedicated
         // `log_action_code_mode` helper.
-        guard.execute(
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, toEmails, ccEmails, bccEmails) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, ?11, ?12, ?13)",
             params![
@@ -3137,6 +3169,8 @@ impl Store {
                 nz(bcc),
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3175,6 +3209,7 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
         // #165: mask free-form bodies + the code-mode tool-call trace
         // before persisting. `generated_source` is the LLM-emitted TS
         // program and is also caller-supplied free-form text, so it goes
@@ -3188,7 +3223,7 @@ impl Store {
         let trace_json_masked = redact::mask(trace_json);
         let generated_source_param: &str = &generated_source_masked;
         let trace_json_param: &str = &trace_json_masked;
-        guard.execute(
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, mode, generatedSource, toolCallTrace) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, 'code', ?11, ?12)",
             params![
@@ -3206,6 +3241,8 @@ impl Store {
                 trace_json_param,
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3251,7 +3288,8 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
+        let tx = guard.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'flagged', ?7, ?8, ?8, 0, NULL)",
             params![
@@ -3265,6 +3303,8 @@ impl Store {
                 now,
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 

@@ -770,6 +770,20 @@
         "self_improve::aligned_review::adjudication_windows::tests::empty_cached_page_requires_distinct_targeted_coverage_recovery"
       ],
       "provider_conformance": "Deterministic source/offset/budget checks passed at3c876779; final native evidence-recovery acceptance remains required."
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/triage_calibration.rs::call",
+      "permission_profile": "text",
+      "output_contract": "Independent original-time triage labels and replay decisions only; protected admission and audit-bound cache, no email actions",
+      "model_tier": "preserved",
+      "tier_rationale": "Preserves configured quality triage or independent Codex authority options; replay pins the actually observed native Claude model and removes tools and inherited environment.",
+      "conformance": [
+        "self_improve::triage_calibration::tests::later_owner_skip_cannot_supply_missing_original_time_ground_truth",
+        "self_improve::triage_calibration::tests::reducing_flags_cannot_promote_at_cost_of_protected_or_previously_correct_cases",
+        "self_improve::triage_calibration::tests::cached_response_requires_anchored_matching_result_and_healthy_original_audit",
+        "triage_capture::tests::guidance_only_applies_to_native_replayed_route_and_pins_exact_model"
+      ],
+      "provider_conformance": "Deterministic boundary regressions authored; actual protected native calibration replay remains required before claiming deployed tuning."
     }
   ]
 }

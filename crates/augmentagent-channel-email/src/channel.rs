@@ -486,7 +486,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         }
 
         // --- 1. TRIAGE call (Opus, wiki read-only, returns {decision, reason})
-        let triage_opts = crate::reasoner::triage_opts(self.config.wiki_root.clone());
+        let mut triage_opts = crate::reasoner::triage_opts(self.config.wiki_root.clone());
+        let captured = augmentagent_channel_core::triage_capture::Capture::new();
+        triage_opts.session_id=Some(captured.session.clone());
         let wiki_hint = self
             .config
             .wiki_root
@@ -503,7 +505,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             triage_prompt.push_str("\n\n");
             triage_prompt.push_str(context);
         }
-        let raw = self.reasoner.call(&triage_opts, &triage_prompt).await?;
+        // Only independently replayed supplements with this exact prompt/model
+        // binding are eligible. A missing/mismatched version changes nothing.
+        let calibration_base = serde_json::to_string(&(&triage_opts.system_prompt, learned))?;
+        let calibration_input = triage_prompt.clone();
+        let (supplement,serving_model) = self.store.triage_calibration_policy(&calibration_base,triage_opts.model.as_deref().unwrap_or("")).unwrap_or(None).unwrap_or_default();
+        let raw = self.reasoner.call_calibrated(&triage_opts, &triage_prompt, &supplement,&serving_model).await?;
         let decision = match parse_decision(&raw) {
             Ok(d) => d,
             Err(e) => {
@@ -529,7 +536,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 return Err(e.into());
             }
         };
-
+        // The exact request scope attaches evidence to newly created actions;
+        // failed/unsupported capture cannot borrow an older message snapshot.
+        let input = self.store.record_triage_calibration_input(&email.message_id,&calibration_input,&calibration_base,
+            triage_opts.model.as_deref().unwrap_or(""),match decision.decision { DecisionKind::Flag=>"flag",DecisionKind::Reply=>"reply",DecisionKind::Skip=>"skip", _=>"other" },
+            &serde_json::to_string(&captured.evidence())?).ok();
+        augmentagent_store::triage_calibration_scope(input, async {
         if !self.config.dry_run {
             if let Err(error)=crate::owner_alerts::persist_assessment(&self.store,&email,&raw,chrono::Utc::now().timestamp_millis()) {
                 warn!(message_id=%email.message_id,"owner alert assessment failed; background reevaluation will retry: {error}");
@@ -1083,6 +1095,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // mark_email_processed) is unchanged — see `dispatch_reply`'s
                 // `Some(existing_action_id)` arm.
                 if let Some(action_id) = code_mode_action_id {
+                    self.store.attach_triage_calibration_action(&action_id,&email.message_id)?;
                     let draft_body = self
                         .store
                         .get_action_with_email(&action_id)?
@@ -1276,6 +1289,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(Some(DispatchOutcome::Skipped))
             }
         }
+        }).await
     }
 
     /// Build the resolver context for #35 Phase 2 ask resolution.

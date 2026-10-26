@@ -122,7 +122,7 @@ mod tests {
         store.with_conn(|c| {
             c.execute("INSERT INTO emails(messageId,fromEmail,subject,triageResult,firstSeenAt) VALUES(?1,'sender@example.invalid','synthetic',?2,?3)",params![id,triage,at])?;
             c.execute("INSERT INTO actions(id,messageId,fromEmail,subject,status,createdAt,updatedAt) VALUES(?1,?1,'sender@example.invalid','synthetic',?2,?3,?3)",params![id,status,at])?;
-            c.execute("INSERT OR REPLACE INTO triage_action_cohorts VALUES(?1,?2,?3)",params![id,if triage=="flag" {"flagged"} else {"pending"},at])?;
+            c.execute("INSERT OR REPLACE INTO triage_action_cohorts(action_id,cohort,observed_at_ms) VALUES(?1,?2,?3)",params![id,if triage=="flag" {"flagged"} else {"pending"},at])?;
             Ok(())
         }).unwrap();
     }

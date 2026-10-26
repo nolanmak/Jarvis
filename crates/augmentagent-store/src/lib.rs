@@ -62,3 +62,6 @@ pub use store::{
 /// `Store::with_conn` closures without taking a direct `rusqlite` dep that
 /// could drift from the version this crate links.
 pub use rusqlite;
+
+mod triage_calibration;
+pub use triage_calibration::triage_calibration_scope;

@@ -26,6 +26,9 @@
 //! This module shells out to `gh` and `git`; it does not depend on the
 //! GitHub channel crate (different concern — that's inbound notifications).
 
+#[path = "triage_calibration.rs"]
+pub(crate) mod triage_calibration;
+
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

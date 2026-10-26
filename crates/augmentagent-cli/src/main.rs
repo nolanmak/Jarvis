@@ -375,6 +375,8 @@ enum Cmd {
         #[command(subcommand)]
         op: ImessageOp,
     },
+    /// Independently replay owner-outcome calibration before changing triage guidance.
+    TriageCalibration { #[command(subcommand)] op: self_improve::triage_calibration::Op },
     /// Similarity triage pre-filter (#1127): calibrate, stats, reset.
     TriagePrefilter {
         #[command(subcommand)]
@@ -4210,6 +4212,13 @@ async fn main() -> Result<()> {
             // counters with no visible card is pointless.
             if !dry_run {
                 if !no_email {
+                    let calibration_store=Arc::clone(&store);
+                    let calibration_skill=cli.skill_dir.clone();
+                    let calibration_shutdown=shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        self_improve::triage_calibration::run_background(calibration_store,calibration_skill,calibration_shutdown).await;
+                        Ok(())
+                    }));
                     let assessment_store=Arc::clone(&store);
                     let assessment_reasoner=build_reasoner();
                     let assessment_wiki=cli.wiki_dir.clone();
@@ -4932,6 +4941,7 @@ async fn main() -> Result<()> {
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
+        Cmd::TriageCalibration { op } => self_improve::triage_calibration::run(store, op).await,
         Cmd::TriagePrefilter { op } => triage_prefilter_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,

@@ -728,10 +728,14 @@ impl FallbackReasoner {
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
                 continue;
             }
-            let resumed_message = match &opts.handoff_path {
+            let mut resumed_message = match &opts.handoff_path {
                 Some(path) => crate::handoff::resume_message(path, user_message)?,
                 None => user_message.to_string(),
             };
+            let calibrated_model = crate::triage_capture::append(entry.kind == ProviderKind::Claude && !routed, &mut resumed_message);
+            let mut entry_opts = opts.clone();
+            if let Some(model) = calibrated_model { entry_opts.model=Some(model); }
+            let opts=&entry_opts;
             if mutating {
                 let (history, branch_record) = {
                     let bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
@@ -916,6 +920,10 @@ impl FallbackReasoner {
 
 #[async_trait]
 impl Reasoner for FallbackReasoner {
+    async fn call_calibrated(&self,opts:&ReasonerOpts,user_message:&str,supplement:&str,serving_model:&str)->anyhow::Result<String>{
+        crate::triage_capture::with_supplement(supplement,serving_model,self.dispatch(opts,user_message,false,None)).await
+    }
+
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         self.dispatch(opts, user_message, false, None).await
     }

@@ -1238,6 +1238,18 @@ impl WorkflowGuard {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?.set_readiness_dependency(&self.lease,&self.binding,&self.repository,issue,record,millis())
     }
 
+    pub(super) fn defer_observation_at_call_limit(&self,limit:u64,reset_at_ms:i64)->Result<bool> {
+        anyhow::ensure!(self.repository.starts_with("autoship-observation/"),"observation checkpoint requires diagnostic namespace");
+        self.validate_before_side_effect()?;
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?;
+        let snapshot=store.snapshot(self.id())?.context("observation workflow missing")?;
+        if snapshot.model_calls<limit {return Ok(false);}
+        let mut checkpoint=snapshot.checkpoint;
+        checkpoint.next=NextAction{reason:"calibration_admitted_call_budget".into(),action:"resume_calibration_after_budget_reset".into(),eligible_at_ms:reset_at_ms};
+        store.checkpoint(&self.lease,&checkpoint,millis())?;
+        Ok(true)
+    }
+
     pub(super) async fn bounded_native_calls<F:std::future::Future>(&self,purpose:String,limit:u32,future:F)->F::Output {
         BOUNDED_NATIVE_CALL.scope(BoundedNativeCall{workflow:self.id().to_owned(),purpose,binding:self.binding.clone(),limit},future).await
     }
