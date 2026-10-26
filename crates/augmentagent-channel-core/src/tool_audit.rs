@@ -110,7 +110,9 @@ const CLAUDE_REFUSALS: &[&str] = &[
 
 fn is_claude_refusal(content: &str) -> bool {
     let content = content.trim_start();
-    CLAUDE_REFUSALS.iter().any(|prefix| content.starts_with(prefix))
+    CLAUDE_REFUSALS
+        .iter()
+        .any(|prefix| content.starts_with(prefix))
 }
 
 impl AuditRecord {
@@ -298,6 +300,8 @@ pub fn default_audit_log_path() -> PathBuf {
 #[derive(Clone, Debug)]
 pub struct AuditLogger {
     path: PathBuf,
+    anchored: Option<crate::audit_chain::AnchoredAudit>,
+    audit_failed: Arc<std::sync::atomic::AtomicBool>,
     /// When this process last ran a retention pass (#1004). `None` in the
     /// field below means this logger never prunes at all.
     last_prune: Arc<Mutex<Option<std::time::Instant>>>,
@@ -319,10 +323,58 @@ impl AuditLogger {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            anchored: None,
+            audit_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_prune: Arc::new(Mutex::new(None)),
             manages_retention: false,
             write_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Dedicated workflow audit with its anchor outside every worker write root.
+    /// This log is retained as a complete workflow artifact and never pruned.
+    pub fn protected(
+        path: PathBuf,
+        anchor: PathBuf,
+        writable_roots: &[PathBuf],
+    ) -> anyhow::Result<Self> {
+        let anchored =
+            crate::audit_chain::AnchoredAudit::new(path.clone(), anchor, writable_roots)?;
+        Ok(Self {
+            anchored: Some(anchored),
+            ..Self::new(path)
+        })
+    }
+
+    /// Autoship must propagate this failure into workflow evidence rather than
+    /// issuing LGTM when its audit cannot be persisted or verified.
+    pub async fn record_checked(&self, record: &AuditRecord) -> anyhow::Result<()> {
+        let sink = self
+            .anchored
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("protected audit required"))?;
+        let result = async {
+            let value = serde_json::to_value(record)?;
+            tokio::task::spawn_blocking(move || sink.append(value)).await??;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if result.is_err() {
+            self.audit_failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    /// A failed append remains visible even if a later append succeeds.
+    /// Call after draining all audit writer tasks, before issuing LGTM.
+    pub fn protected_health(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.anchored.is_some(), "protected audit required");
+        anyhow::ensure!(
+            !self.audit_failed.load(std::sync::atomic::Ordering::Acquire),
+            "workflow audit lost a record"
+        );
+        Ok(())
     }
 
     /// The process-wide logger every preset shares (#1004). One instance so
@@ -390,6 +442,12 @@ impl AuditLogger {
     /// logged at `warn!` and swallowed — auditing never blocks the
     /// reasoner's reply.
     pub async fn record(&self, record: &AuditRecord) {
+        if self.anchored.is_some() {
+            if let Err(error) = self.record_checked(record).await {
+                warn!("tool-audit: protected append failed: {error}");
+            }
+            return;
+        }
         let line = match serde_json::to_string(record) {
             Ok(s) => s,
             Err(e) => {
@@ -483,8 +541,14 @@ pub fn build_audit_record(
     // The Claude lane runs every Bash command in a host shell unless its
     // permission check refused it. The Codex caller overrides this with the
     // runner its bridge reports.
-    let runner = (tool == "Bash")
-        .then(|| if is_error && is_claude_refusal(result_content) { "none" } else { "host" }.to_string());
+    let runner = (tool == "Bash").then(|| {
+        if is_error && is_claude_refusal(result_content) {
+            "none"
+        } else {
+            "host"
+        }
+        .to_string()
+    });
     AuditRecord {
         provider: Some(provider.name().to_string()),
         model: None,
@@ -754,8 +818,15 @@ mod tests {
             ("timeout 60 cargo test", "Exit code 101\nerror", true),
             ("git status", "clean", false),
         ] {
-            let record = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Bash".into(),
-                serde_json::json!({"command": command}), content, is_error);
+            let record = build_audit_record(
+                ProviderKind::Claude,
+                "ts".into(),
+                "s".into(),
+                "Bash".into(),
+                serde_json::json!({"command": command}),
+                content,
+                is_error,
+            );
             assert_eq!(record.runner.as_deref(), Some("host"), "{command}");
             assert_eq!(serde_json::to_value(&record).unwrap()["runner"], "host");
         }
@@ -765,14 +836,34 @@ mod tests {
             "Permission to use Bash with command cargo build has been denied.",
             "Hook PreToolUse:Bash denied this tool",
         ] {
-            let record = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Bash".into(),
-                serde_json::json!({"command": "cargo build"}), denial, true);
+            let record = build_audit_record(
+                ProviderKind::Claude,
+                "ts".into(),
+                "s".into(),
+                "Bash".into(),
+                serde_json::json!({"command": "cargo build"}),
+                denial,
+                true,
+            );
             assert_eq!(record.runner.as_deref(), Some("none"), "{denial}");
         }
-        let write = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Write".into(),
-            serde_json::json!({"command": "cargo test"}), "ok", false);
+        let write = build_audit_record(
+            ProviderKind::Claude,
+            "ts".into(),
+            "s".into(),
+            "Write".into(),
+            serde_json::json!({"command": "cargo test"}),
+            "ok",
+            false,
+        );
         assert!(write.runner.is_none());
-        assert!(serde_json::to_value(&write).unwrap().get("runner").is_none(), "non-Bash rows stay unchanged");
+        assert!(
+            serde_json::to_value(&write)
+                .unwrap()
+                .get("runner")
+                .is_none(),
+            "non-Bash rows stay unchanged"
+        );
     }
 
     /// #1047 C2 — every writer of `tool-audit.log` stamps the provider that
@@ -790,7 +881,14 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"note.md"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"synthetic"}]}}"#,
         ] {
-            crate::reasoner::audit_stream_line(line, &mut pending, "synthetic-claude", Some("synthetic-claude-model"), Some(&logger), None);
+            crate::reasoner::audit_stream_line(
+                line,
+                &mut pending,
+                "synthetic-claude",
+                Some("synthetic-claude-model"),
+                Some(&logger),
+                None,
+            );
         }
         let mut options = crate::reasoner::lint_opts("synthetic".into(), tmp.path().into());
         options.audit_logger = Some(logger.clone());
@@ -805,19 +903,32 @@ mod tests {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for _ in 0..40 {
             let body = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-            rows = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-            if rows.len() >= 2 { break; }
+            rows = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            if rows.len() >= 2 {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert_eq!(rows.len(), 2, "{rows:?}");
         for row in &rows {
-            assert!(row["provider"].is_string(), "audit row without a provider: {row}");
+            assert!(
+                row["provider"].is_string(),
+                "audit row without a provider: {row}"
+            );
         }
-        let by_session = |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["provider"].clone();
+        let by_session =
+            |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["provider"].clone();
         assert_eq!(by_session("synthetic-claude"), "claude");
         assert_eq!(by_session("synthetic-codex"), "codex");
-        let model_by_session = |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["model"].clone();
-        assert_eq!(model_by_session("synthetic-claude"), "synthetic-claude-model");
+        let model_by_session =
+            |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["model"].clone();
+        assert_eq!(
+            model_by_session("synthetic-claude"),
+            "synthetic-claude-model"
+        );
         assert!(model_by_session("synthetic-codex").is_string());
     }
 

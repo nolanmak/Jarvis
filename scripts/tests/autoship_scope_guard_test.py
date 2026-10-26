@@ -66,6 +66,32 @@ assert p.returncode != 0
         self.assertEqual(settings.read_text(), 'original-settings')
         self.assertEqual((self.work / 'allowed').read_text(), 'ok')
 
+    def test_audit_anchor_cannot_be_truncated_deleted_renamed_or_replaced(self):
+        self.require_kernel()
+        anchor_dir = self.base / 'audit-anchors'
+        anchor_dir.mkdir()
+        anchor = anchor_dir / 'run.json'
+        anchor.write_text('trusted-anchor')
+        audit = self.control / 'run.jsonl'
+        audit.write_text('trusted-record')
+        replacement = self.work / 'replacement'
+        replacement.write_text('forged')
+        code = f'''import os
+for path in {list(map(str, [anchor, audit]))!r}:
+ for operation in [lambda: open(path, 'w'), lambda: os.unlink(path),
+                   lambda: os.rename(path, {str(self.work / 'stolen')!r}),
+                   lambda: os.replace({str(replacement)!r}, path)]:
+  try:
+   operation()
+   raise SystemExit('audit mutation succeeded')
+  except PermissionError:
+   pass
+'''
+        result = self.run_guard(code)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(anchor.read_text(), 'trusted-anchor')
+        self.assertEqual(audit.read_text(), 'trusted-record')
+
     def test_symlink_in_workspace_does_not_grant_target_write(self):
         self.require_kernel()
         target = self.control / 'record'

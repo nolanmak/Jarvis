@@ -8,6 +8,7 @@
 //! one work-source contract instead of inventing their own per platform.
 
 pub mod archetype;
+pub mod audit_chain;
 pub mod autoship_scope;
 pub mod build_scratch;
 pub mod cerebras;
