@@ -26,10 +26,10 @@ with open(os.path.join(os.environ['JARVIS_1214_ROOT'], 'gh-calls.jsonl'), 'a') a
     log.write(json.dumps(args) + '\n')
 if args[:2] == ['issue', 'list']:
     print(json.dumps([
-        {'number': 1082, 'comments': [{'body': 'unrelated discussion'}]},
-        {'number': 921, 'comments': []},
-        {'number': 1143, 'comments': [{'body': '<!-- self-improve-gave-up reason=scoper:not-fixable -->\nAuto-PR gave up.'}]},
-        {'number': 1071, 'comments': []},
+        {'number': 1082, 'labels': [{'name':'agent-gave-up'}], 'comments': [{'body': 'unrelated discussion'}]},
+        {'number': 921, 'labels': [{'name':'agent-gave-up'}], 'comments': []},
+        {'number': 1143, 'labels': [{'name':'agent-gave-up'}], 'comments': [{'body': '<!-- self-improve-gave-up reason=scoper:not-fixable -->\nAuto-PR gave up.'}]},
+        {'number': 1071, 'labels': [{'name':'agent-gave-up'}], 'comments': []},
     ]))
 elif args[:2] == ['issue', 'edit'] or args[:2] == ['issue', 'comment']:
     pass

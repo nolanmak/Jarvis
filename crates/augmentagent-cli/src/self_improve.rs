@@ -1548,30 +1548,13 @@ async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
 /// guess would make it something else.
 async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
     let gh = gh_bin();
-    let (ok, out, _) = match run(
-        &gh,
-        &[
-            // Include ready PRs too: a failed merge or a crash after marking
-            // ready must not remove a managed PR from every recovery lane.
-            // Provenance and head-bound review checks below still apply.
-            "pr", "list", "--state", "open", "--limit", "1000",
-            "--search", "sort:created-asc",
-            "--json",
-            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
-        ],
-        repo_root,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("merge sweep: could not list PRs: {e:#}");
-            return 0;
-        }
+    // Repository connection pagination includes ready and draft PRs. Sort
+    // locally only after the complete pool is known, then apply fair windows.
+    let out = match complete_repository_inventory(repo_root, "pr", None,
+        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body").await {
+        Ok(out) => out,
+        Err(error) => { warn!("merge sweep inventory unavailable: {error:#}"); return 0; }
     };
-    if !ok {
-        return 0;
-    }
     let prs: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
     let Some(rows) = prs.as_array() else {
         return 0;
@@ -3601,66 +3584,14 @@ async fn find_resumable_draft(
     only: Option<u64>,
     dry_run: bool,
 ) -> Option<(u64, u64, String)> {
-    let gh = gh_bin();
-    let (ok, stdout, _) = run(
-        &gh,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "1000",
-            "--search",
-            "sort:created-asc",
-            "--json",
-            "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences",
-        ],
-        repo_root,
-    )
-    .await
-    .ok()?;
-    if !ok {
-        return None;
-    }
+    let stdout = complete_repository_inventory(repo_root, "pr", None,
+        "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences")
+        .await.ok()?;
     let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-
-    // #880 — a PR whose issue carries the gave-up label is NOT resumable.
-    // Without this, the daily ledger reset made a never-converging PR an
-    // annuity: #853 burned two full resume cycles (7 revision rounds, 8
-    // focused rejections) in one day, and nothing would have stopped a third
-    // tomorrow. The gave-up label is the existing "needs a human" bit — the
-    // resume path just never read it.
-    let (ok, labeled, _) = run(
-        &gh,
-        &[
-            "issue",
-            "list",
-            "--state",
-            "open",
-            "--label",
-            GAVE_UP_LABEL,
-            "--limit",
-            "200",
-            "--json",
-            "number",
-        ],
-        repo_root,
-    )
-    .await
-    .ok()?;
-    let gave_up: std::collections::HashSet<u64> = if ok {
-        serde_json::from_str::<serde_json::Value>(&labeled)
-            .ok()
-            .and_then(|v| {
-                v.as_array()
-                    .map(|a| a.iter().filter_map(|i| i.get("number")?.as_u64()).collect())
-            })
-            .unwrap_or_default()
-    } else {
-        // Can't tell — resume nothing rather than resume a labeled-out PR.
-        return None;
-    };
+    // Never treat a capped/malformed issue listing as absence of a hold.
+    let labelled = complete_labelled_issues(repo_root, "number,labels").await.ok()?;
+    let gave_up: std::collections::HashSet<u64> = labelled.iter()
+        .filter_map(|row| row.get("number")?.as_u64()).collect();
 
     // #1006 — resolved once here because the closing sweep below needs it
     // too: closing a PR is a write, and the loop must not perform one on a
@@ -9890,23 +9821,66 @@ fn parse_labelled(json: &str) -> Vec<(u64, Vec<String>)> {
         .collect()
 }
 
-const LABELLED_LIST_ARGS: [&str; 10] = [
-    "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL, "--limit", "500", "--json", "number,comments",
-];
-
-/// gh paginates internally up to --limit; grow that bound until the response
-/// proves completeness. A full final page is never the whole backlog by fiat.
+/// Search-backed gh lists cap at 1000 even when --limit is larger. In
+/// particular PR --search/--label and issue --label switch CLI backends.
+/// Keep this fixed argument builder on repository connections; apply labels
+/// and fair ordering locally after all pages have been received.
+fn repository_inventory_args(kind: &str, repository: Option<&str>, fields: &str, limit: usize) -> Vec<String> {
+    let mut args = vec![kind.into(), "list".into(), "--state".into(), "open".into(),
+        "--limit".into(), limit.to_string(), "--json".into(), fields.into()];
+    if let Some(repository) = repository { args.extend(["--repo".into(), repository.into()]); }
+    args
+}
+fn completed_inventory(raw: &str, limit: usize) -> Result<Option<String>> {
+    let mut rows: Vec<serde_json::Value> = serde_json::from_str(raw).context("repository inventory malformed")?;
+    anyhow::ensure!(rows.len() <= limit, "repository inventory exceeds requested bound");
+    let mut seen = std::collections::HashSet::new();
+    for row in &rows {
+        let number = row.get("number").and_then(serde_json::Value::as_u64).filter(|n| *n > 0)
+            .context("repository inventory lacks a valid number")?;
+        anyhow::ensure!(seen.insert(number), "repository inventory contains duplicate rows");
+    }
+    if rows.len() == limit { return Ok(None); }
+    // Repository-scoped issue/PR numbers give stable oldest-first order,
+    // independent of gh's descending repository connection order.
+    rows.sort_by_key(|row| row["number"].as_u64().unwrap());
+    Ok(Some(serde_json::to_string(&rows)?))
+}
+/// gh paginates a repository connection internally up to --limit. A full
+/// response at the safety ceiling is an explicit error, never a partial pool.
 async fn complete_labelled_inventory<F,Fut>(mut fetch:F)->Result<String>
 where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
     let max=(MAX_ISSUE_PAGES*ISSUES_PER_PAGE) as usize;
     let mut limit=500usize;
     loop {
         let raw=fetch(limit).await?;
-        let rows:Vec<serde_json::Value>=serde_json::from_str(&raw).context("readmission inventory malformed")?;
-        if rows.len()<limit { return Ok(raw); }
-        anyhow::ensure!(limit<max,"readmission inventory exceeds safe bound; refusing partial reset");
+        if let Some(complete) = completed_inventory(&raw, limit)? { return Ok(complete); }
+        anyhow::ensure!(limit<max,"repository inventory exceeds safe bound; refusing partial pool");
         limit=(limit*2).min(max);
     }
+}
+async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
+    anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
+    complete_labelled_inventory(|limit| async move {
+        let args=repository_inventory_args(kind,repository,fields,limit);
+        let (ok,raw,error)=run(&gh_bin(),&args.iter().map(String::as_str).collect::<Vec<_>>(),repo_root).await?;
+        anyhow::ensure!(ok,"gh repository inventory failed: {}",truncate(&error,300));
+        Ok(raw)
+    }).await
+}
+fn filter_inventory_label(raw:&str,label:&str)->Result<Vec<serde_json::Value>> {
+    let rows:Vec<serde_json::Value>=serde_json::from_str(raw)?;
+    let mut selected=Vec::new();
+    for row in rows {
+        let labels=row.get("labels").and_then(serde_json::Value::as_array).context("issue inventory labels unavailable")?;
+        anyhow::ensure!(labels.iter().all(|l|l.get("name").and_then(serde_json::Value::as_str).is_some()),"issue inventory label malformed");
+        if labels.iter().any(|l|l["name"].as_str()==Some(label)) { selected.push(row); }
+    }
+    Ok(selected)
+}
+async fn complete_labelled_issues(repo_root:&Path,fields:&str)->Result<Vec<serde_json::Value>> {
+    let raw=complete_repository_inventory(repo_root,"issue",None,fields).await?;
+    filter_inventory_label(&raw,GAVE_UP_LABEL)
 }
 
 /// #1214 — `augmentagent autopr readmit`: the labelled issues whose reason
@@ -9925,17 +9899,7 @@ pub(crate) async fn readmit(
     reset_history: bool,
 ) -> Result<Vec<u64>> {
     let gh = gh_bin();
-    let stdout=complete_labelled_inventory(|limit| {
-        let gh=gh.clone();
-        async move {
-            let bound=limit.to_string();
-            let mut args=LABELLED_LIST_ARGS;
-            args[7]=&bound;
-            let (ok,stdout,stderr)=run(&gh,&args,repo_root).await?;
-            anyhow::ensure!(ok,"gh readmission inventory failed: {}",truncate(&stderr,300));
-            Ok(stdout)
-        }
-    }).await?;
+    let stdout=serde_json::to_string(&complete_labelled_issues(repo_root,"number,comments,labels").await?)?;
     let history = AttemptHistory::load(&attempt_history_path());
     let matched: Vec<u64> = parse_labelled(&stdout)
         .into_iter()
@@ -9987,14 +9951,19 @@ pub(crate) async fn readmit(
 
 /// #1214 — the health watchdog's breakdown; `None` when `gh` cannot say.
 pub(crate) fn gave_up_breakdown_live(repo_root: &Path) -> Option<Vec<(String, u32)>> {
-    let out = std::process::Command::new(gh_bin())
-        .args(LABELLED_LIST_ARGS)
-        .current_dir(repo_root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let labelled = parse_labelled(&String::from_utf8_lossy(&out.stdout));
+    let mut limit=500usize;
+    let complete=loop {
+        let out=std::process::Command::new(gh_bin())
+            .args(repository_inventory_args("issue",None,"number,comments,labels",limit))
+            .current_dir(repo_root).stdin(std::process::Stdio::null()).output().ok()
+            .filter(|o|o.status.success())?;
+        if let Some(complete)=completed_inventory(&String::from_utf8_lossy(&out.stdout),limit).ok()? { break complete; }
+        let max=(MAX_ISSUE_PAGES*ISSUES_PER_PAGE) as usize;
+        if limit>=max { return None; }
+        limit=(limit*2).min(max);
+    };
+    let raw=serde_json::to_string(&filter_inventory_label(&complete,GAVE_UP_LABEL).ok()?).ok()?;
+    let labelled=parse_labelled(&raw);
     Some(gave_up_breakdown(&labelled, &AttemptHistory::load(&attempt_history_path())))
 }
 
@@ -10349,31 +10318,8 @@ async fn pick_issue_for_repo(
     repo_dir: &Path,
     store: &Store,
 ) -> Result<Option<Issue>> {
-    let gh = gh_bin();
-    let (ok, stdout, stderr) = run(
-        &gh,
-        &[
-            "issue",
-            "list",
-            "--repo",
-            &repo.full_name,
-            "--label",
-            FIXABLE_LABEL,
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,labels,author",
-            "--limit",
-            "50",
-        ],
-        repo_dir,
-    )
-    .await?;
-    if !ok {
-        bail!("gh issue list ({}) failed: {stderr}", repo.full_name);
-    }
-    let issues: serde_json::Value =
-        serde_json::from_str(&stdout).context("parse gh issue list")?;
+    let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
+    let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
     for iss in issues.as_array().cloned().unwrap_or_default() {
         let number = iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
         if number == 0 {
@@ -15874,8 +15820,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // page starves the very drafts this sweep exists to drain — rotation
         // only rotates within whatever the page happened to contain.
         assert!(
-            fn_body.contains("sort:created-asc"),
-            "list oldest-first, so the drafts most at risk are always in view"
+            fn_body.contains("complete_repository_inventory("),
+            "complete inventory must precede local oldest-first fair rotation"
         );
         assert!(
             !fn_body.contains("is:draft"),
@@ -17810,6 +17756,62 @@ else:
     }
 
     #[tokio::test]
+    async fn repository_inventory_crosses_search_cap_and_preserves_fair_authorization() {
+        const CHILD: &str = "AUTOSHIP_COMPLETE_INVENTORY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = tempfile::tempdir().unwrap();
+            let gh = root.path().join("gh.py");
+            std::fs::write(&gh,r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+a=sys.argv[1:]
+assert a[1]=='list' and a[a.index('--state')+1]=='open'
+limit=int(a[a.index('--limit')+1])
+# Reproduce gh's search-cap trap, and default descending repository ordering.
+if '--search' in a or '--label' in a: limit=min(limit,1000)
+rows=[]
+for n in range(1501,0,-1):
+    if a[0]=='pr':
+        rows.append(dict(number=n,headRefName='agent-fix/issue-'+str(n),headRefOid='a'*40,
+            baseRefName='main',isCrossRepository=n==1499,author=dict(login='stranger' if n==1500 else 'owner'),
+            title='synthetic',body='',closingIssuesReferences=[]))
+    else:
+        rows.append(dict(number=n,labels=[dict(name='agent-gave-up')] if n==1 else [],comments=[]))
+print(json.dumps(rows[:limit]))
+with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
+"#).unwrap();
+            std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","self_improve::tests::repository_inventory_crosses_search_cap_and_preserves_fair_authorization","--nocapture"])
+                .env(CHILD,root.path()).env("GH_BIN",gh).output().unwrap();
+            assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+            assert!(root.path().join("executed").exists());
+            return;
+        }
+        let root=PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let raw=complete_repository_inventory(&root,"pr",None,"number,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences").await.unwrap();
+        let rows:serde_json::Value=serde_json::from_str(&raw).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(),1501);
+        assert_eq!(rows[0]["number"],1);
+        let candidates=adoption::authorized(&rows,"owner/repo",&["owner".into()]);
+        assert_eq!(candidates.len(),1499);
+        assert!(candidates.iter().all(|p|p.pr!=1499 && p.pr!=1500));
+        let ledger=AttemptLedger::default();
+        let first=adoption::select_linked(&candidates,&ledger,1,&Default::default(),None,1498).unwrap();
+        assert_eq!(first.0,1501,"later authorized PR must remain reachable past the search cap");
+        let wrapped=adoption::select_linked(&candidates,&ledger,1,&Default::default(),None,first.0).unwrap();
+        assert_eq!(wrapped.0,1,"fair rotation wraps across the complete oldest-first pool");
+        let labelled=complete_labelled_issues(&root,"number,labels").await.unwrap();
+        assert_eq!(labelled.len(),1);
+        assert_eq!(labelled[0]["number"],1,"old issue labels outside the first 1000 remain visible");
+        let calls:Vec<Vec<String>>=std::fs::read_to_string(root.join("calls")).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert!(calls.iter().all(|a|!a.iter().any(|arg|matches!(arg.as_str(),"--search"|"--label"|"--draft"|"--author"))));
+        assert!(calls.iter().filter(|a|a.contains(&"2000".into())).count()>=2);
+        assert!(filter_inventory_label("[{\"number\":1}]",GAVE_UP_LABEL).is_err());
+        std::fs::write(root.join("executed"),"ok").unwrap();
+    }
+
+    #[tokio::test]
     async fn readmission_inventory_includes_rows_beyond_five_hundred() {
         let calls=std::cell::RefCell::new(Vec::new());
         let raw=complete_labelled_inventory(|limit| {
@@ -17821,6 +17823,10 @@ else:
         assert_eq!(*calls.borrow(),vec![500,1000]);
         assert!(complete_labelled_inventory(|_|async {Ok("{}".into())}).await.is_err());
         assert!(complete_labelled_inventory(|limit|async move {Ok(serde_json::to_string(&vec![serde_json::json!({"number":1});limit])?)}).await.is_err());
+        let error=complete_labelled_inventory(|limit|async move {
+            Ok(serde_json::to_string(&(1..=limit).map(|number|serde_json::json!({"number":number})).collect::<Vec<_>>())?)
+        }).await.unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds safe bound"),"a full safety ceiling never implies completeness");
     }
 
     #[test]
