@@ -47,12 +47,14 @@ def reachable_build_memory(probe, declared_build_mb):
     return declared_build_mb
 
 
-def resource_budget(native_mb, build_mb, available, controller_mb=256):
+def resource_budget(native_mb, build_mb, available, controller_mb=256, defer_run_admission=False):
     if (type(native_mb) is not int or not 512<=native_mb<=4096
             or type(build_mb) is not int or (build_mb!=0 and not 512<=build_mb<=4096)):
         raise ValueError('invalid declared guest memory')
     if type(controller_mb) is not int or not 256<=controller_mb<=2048:
         raise ValueError('controller allowance must be 256 through 2048 MiB')
+    if type(defer_run_admission) is not bool:
+        raise ValueError('invalid deferred admission selector')
     if type(available) is not int or available<0:
         raise ValueError('invalid host available memory')
     run=(native_mb+build_mb)*1024**2+1024**3
@@ -62,12 +64,15 @@ def resource_budget(native_mb, build_mb, available, controller_mb=256):
     # RunScope still checks real controller/sibling/ancestor/host usage before
     # each process dispatch. The allowance is not a controller RSS guarantee.
     needed=run+(controller_mb+256)*1024**2
-    if aggregate>10*1024**3 or available<needed:
+    startup_floor=(controller_mb+256)*1024**2 if defer_run_admission else needed
+    if aggregate>10*1024**3 or available<startup_floor:
         raise ValueError('insufficient host headroom for composed isolated probe; wait for capacity')
     return {'run_memory_bytes':run,'aggregate_ceiling_bytes':aggregate,
             'controller_allowance_bytes':controller_mb*1024**2,
             'host_margin_bytes':256*1024**2,'preflight_required_bytes':needed,
-            'observed_available_bytes':available,'final_admission':'RunScope'}
+            'observed_available_bytes':available,'final_admission':'RunScope',
+            'deferred_run_admission':defer_run_admission,'startup_floor_bytes':startup_floor,
+            'run_admitted_by_preflight':False}
 
 
 def binary_digest(binary):
@@ -106,6 +111,8 @@ def main():
     parser.add_argument("--build-vm-config", type=Path, help="explicit build runtime; defaults to native policy runtime")
     parser.add_argument("--controller-headroom-mb", type=int, default=256,
                         help="preflight controller allowance, minimum256MiB; final RunScope admission remains authoritative")
+    parser.add_argument("--defer-run-admission", action="store_true",
+                        help="start only the bounded controller; RunScope must admit the unchanged full run before VM/model dispatch")
     args = parser.parse_args()
     route_evidence,route_environment=routing.snapshot(args.operator_router_config,args.operator_selection_config)
     binary = args.binary.resolve(strict=True)
@@ -132,7 +139,7 @@ def main():
         parser.error(str(error))
     available=next((int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
     try:
-        budget=resource_budget(native_mb,build_mb,available,args.controller_headroom_mb)
+        budget=resource_budget(native_mb,build_mb,available,args.controller_headroom_mb,args.defer_run_admission)
     except ValueError as error:
         parser.error(str(error))
     run_memory=budget['run_memory_bytes']

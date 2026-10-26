@@ -282,3 +282,13 @@ that test and refuses stale binaries whose filters would run zero tests. The
 receipt retains the tested binary digest and inventory-output digest; a binary
 change between inventory validation and launch preparation also refuses launch.
 Inventory inspection executes no test body or provider call.
+
+An explicit `--defer-run-admission` probe option keeps that full-run estimate as
+metadata but permits starting the isolated lightweight controller when available
+memory covers only its allowance plus the host margin (512 MiB by default).
+The default remains the stricter full-run estimate. Deferred mode preserves
+both guest declarations, the full run reservation and aggregate ceiling; it
+never reports the run admitted by preflight. Required RunScope admission still
+occurs before native VM launch, and model billing occurs only after verified
+VM readiness. Insufficient actual memory therefore refuses the run without a
+model call. This option changes no production resource policy or process.

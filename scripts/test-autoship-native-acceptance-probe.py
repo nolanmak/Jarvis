@@ -13,6 +13,21 @@ MIB=1024**2
 
 
 class Tests(unittest.TestCase):
+    def test_explicit_deferred_mode_preserves_full_limits_and_requires_controller_floor(self):
+        available=6300*MIB
+        with self.assertRaises(ValueError):probe.resource_budget(1024,4096,available)
+        budget=probe.resource_budget(1024,4096,available,defer_run_admission=True)
+        self.assertTrue(budget['deferred_run_admission'])
+        self.assertFalse(budget['run_admitted_by_preflight'])
+        self.assertEqual(budget['run_memory_bytes'],6*GIB)
+        self.assertEqual(budget['aggregate_ceiling_bytes'],8*GIB)
+        self.assertEqual(budget['preflight_required_bytes'],6*GIB+512*MIB)
+        self.assertEqual(budget['startup_floor_bytes'],512*MIB)
+        self.assertEqual(budget['final_admission'],'RunScope')
+        self.assertEqual(probe.resource_budget(1024,4096,512*MIB,defer_run_admission=True)['startup_floor_bytes'],512*MIB)
+        with self.assertRaises(ValueError):probe.resource_budget(1024,4096,512*MIB-1,defer_run_admission=True)
+        with self.assertRaises(ValueError):probe.resource_budget(1024,4096,8*GIB,defer_run_admission='yes')
+
     def test_exact_ignored_inventory_required_before_launch(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);binary=root/'fixture-binary';mode=root/'mode'
