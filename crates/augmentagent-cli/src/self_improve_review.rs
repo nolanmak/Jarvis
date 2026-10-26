@@ -138,6 +138,59 @@ async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
     })
 }
 
+// Resolve callers against the immutable candidate, not a mutable working tree.
+// This is a lexical Rust-symbol lookup, not a claim of semantic call-graph coverage.
+async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Result<String> {
+    let removed_as_added = diff
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .map(|line| format!("+{}", &line[1..]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let symbols: BTreeSet<_> = changed_symbols(diff)
+        .into_iter()
+        .chain(changed_symbols(&removed_as_added))
+        .collect();
+    let mut paths = BTreeSet::new();
+    for symbol in &symbols {
+        let (ok, output, error) = super::run(
+            "git",
+            &[
+                "grep",
+                "-l",
+                "-z",
+                "--fixed-strings",
+                "-e",
+                symbol,
+                head,
+                "--",
+            ],
+            worktree,
+        )
+        .await?;
+        anyhow::ensure!(
+            ok || error.trim().is_empty(),
+            "caller lookup failed: {error}"
+        );
+        for path in output.split('\0').filter(|p| !p.is_empty()) {
+            let prefix = format!("{head}:");
+            let path = path
+                .strip_prefix(&prefix)
+                .context("unexpected git caller path")?;
+            paths.insert(path.to_owned());
+        }
+    }
+    let mut files = BTreeMap::new();
+    for path in paths {
+        let content = git(worktree, &["show", &format!("{head}:{path}")]).await?;
+        files.insert(path, content);
+    }
+    Ok(serde_json::to_string(&serde_json::json!({
+        "lookup": "All lexical matches for changed and removed Rust item names; not a semantic call graph",
+        "symbols": symbols, "full_files": files
+    }))?)
+}
+
 async fn run_inner(
     provider: augmentagent_channel_core::ProviderKind,
     authors: &[augmentagent_channel_core::ProviderKind],
@@ -164,7 +217,7 @@ async fn run_inner(
         .collect();
     contract.insert("REGRESSION".into(), "No newly demonstrated correctness, security or acceptance regression; report a reproducible example and concrete remedy.".into());
     let contract_hash = aligned::digest(&serde_json::to_vec(&contract)?);
-    let callers = caller_evidence(&worktree, &diff).await;
+    let callers = complete_caller_evidence(&worktree, &head, &diff).await?;
     let evidence_json =
         serde_json::to_string(&serde_json::json!({"diff":diff,"files":files,"callers":callers}))?;
     let binding = aligned::ReviewBinding {
@@ -544,6 +597,31 @@ mod tests {
         fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
         let err = candidate_snapshot(dir.path()).await.err().unwrap();
         assert!(err.to_string().contains("integrate current main"));
+    }
+
+    #[tokio::test]
+    async fn caller_evidence_preserves_all_matches_and_full_files_beyond_old_hit_cap() {
+        let dir = candidate_fixture();
+        for i in 0..20 {
+            std::fs::write(
+                dir.path().join(format!("caller-{i}.rs")),
+                format!("// context {i}\nfn caller() {{ changed(); }}\n// tail {i}\n"),
+            )
+            .unwrap();
+        }
+        fixture_git(dir.path(), &["add", "."]);
+        fixture_git(dir.path(), &["commit", "-qm", "callers"]);
+        let snapshot = candidate_snapshot(dir.path()).await.unwrap();
+        let raw = complete_caller_evidence(dir.path(), &snapshot.head, &snapshot.diff)
+            .await
+            .unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for i in 0..20 {
+            assert!(evidence["full_files"][format!("caller-{i}.rs")]
+                .as_str()
+                .unwrap()
+                .contains(&format!("// tail {i}")));
+        }
     }
 
     #[test]
