@@ -407,3 +407,28 @@ async fn runtime_retries_dispatch_after_reconciliation_database_failure() {
     tokio::time::timeout(std::time::Duration::from_secs(6), agent.0.notified()).await.expect("next tick resumes the durable task after recovery");
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn health_reports_actual_transport_without_claiming_provider_readiness_or_exposing_keys() {
+    for live in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let provider = Arc::new(Provider::default());
+        let mut config = PhoneConfig::new(true, "https://phone.example.test", "private-verification-secret-32-bytes", vec![]).unwrap();
+        if live {
+            config = config.with_live(Some(augmentagent_phone::live_config::LiveConfig::new("private-openai-key".into()).unwrap()));
+        }
+        let service = Arc::new(PhoneService::new(store, provider.clone(), Arc::new(Time(AtomicI64::new(100))), config));
+        let runtime = PhoneRuntime::start(service, Arc::new(WebhookAuth::new("AC-test", "private-twilio-token")), Arc::new(Agent), tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()).await.unwrap();
+        let health = runtime.health();
+        assert!(health.running);
+        assert_eq!(health.transport, if live { "openai_live" } else { "conversation_relay" });
+        assert_eq!(health.audio_model, live.then_some("gpt-live-1"));
+        assert_eq!(health.voice, if live { "gleam" } else { augmentagent_phone::voice::DEFAULT_ELEVENLABS_VOICE });
+        assert_eq!(health.provider_readiness, if live { "requires_per_call_preflight" } else { "not_probed" });
+        let report = format!("{health:?}");
+        for private in ["private-openai-key", "private-twilio-token", "private-verification-secret", "phone.example.test"] { assert!(!report.contains(private)); }
+        assert_eq!(*provider.starts.lock().unwrap(), 0, "health must never dial or probe a provider");
+        runtime.shutdown().await.unwrap();
+    }
+}

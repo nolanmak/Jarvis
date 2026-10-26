@@ -52,6 +52,7 @@ pub async fn start(
         listener,
     )
     .await?;
+    tracing::info!(target: "phone.health", health = ?runtime.health(), "phone runtime started");
     let endpoint = Arc::new(Endpoint {
         service: configured.service,
         tools: runtime.tools().clone(),
@@ -141,6 +142,9 @@ pub async fn supervise(runtime: PhoneRuntime, shutdown: CancellationToken) -> Re
             }
         }
     };
+    if unexpected {
+        tracing::warn!(target: "phone.health", health = ?runtime.health(), "phone runtime is unhealthy");
+    }
     let cleanup = runtime.shutdown().await;
     if unexpected || cleanup.is_err() {
         tracing::warn!("phone runtime stopped or cleanup remains pending; inspect phone status; text service remains available");

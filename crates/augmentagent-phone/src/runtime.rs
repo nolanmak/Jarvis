@@ -28,6 +28,17 @@ pub enum RuntimeError {
     #[error("phone runtime task did not finish cleanly")]
     Task,
 }
+/// Local runtime health, not proof of external provider access or audible
+/// quality. Contains no credentials, endpoints, caller identity or transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoneRuntimeHealth {
+    pub running: bool,
+    pub transport: &'static str,
+    pub audio_model: Option<&'static str>,
+    pub voice: String,
+    pub provider_readiness: &'static str,
+}
+
 pub struct PhoneRuntime {
     service: Arc<PhoneService>,
     tools: Arc<ToolServer>,
@@ -84,6 +95,16 @@ impl PhoneRuntime {
     }
     pub fn tools(&self) -> &Arc<ToolServer> {
         &self.tools
+    }
+    pub fn health(&self) -> PhoneRuntimeHealth {
+        let live = self.service.voice_backend() == crate::live_config::VoiceBackend::OpenAiLive;
+        PhoneRuntimeHealth {
+            running: self.is_running(),
+            transport: self.service.voice_backend().as_str(),
+            audio_model: live.then_some(crate::live_session::MODEL),
+            voice: if live { crate::live_session::VOICE.into() } else { self.service.config.voice.tts_voice().into() },
+            provider_readiness: if live { "requires_per_call_preflight" } else { "not_probed" },
+        }
     }
     pub fn is_running(&self) -> bool {
         !self.stop.is_cancelled() && self.tasks.iter().all(|task| !task.is_finished())
