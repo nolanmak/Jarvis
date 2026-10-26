@@ -196,7 +196,8 @@ pub(super) async fn try_amend(
     // weaken the verifier. Definition/environment failures get independent say.
     if !(repair_exhausted
         || failure.contains("environment changed")
-        || failure.contains("unexpected_failure"))
+        || failure.contains("unexpected_failure")
+        || failure.contains("legacy in-process"))
     {
         return Ok(None);
     }
@@ -251,6 +252,7 @@ pub(super) async fn try_amend(
         prompt.len() <= 512 * 1024,
         "verifier authority evidence needs smaller scoped revision"
     );
+    let prompt = format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {CONTRACT_PROMPT}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again.");
     let prompt = if let Some(directive) = adjudication {
         format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. All deterministic checks rerun. Bound final ruling: {directive}")
     } else {
@@ -491,16 +493,27 @@ pub(super) async fn resume_pending(
             && pending.prompt_hash.len() == 64,
         "invalid pending verifier authority"
     );
-    ensure!(
-        pending
-            .next
-            .baseline
-            .registration
-            .baseline_result(&pending.next.baseline.receipts)?
-            == BaselineResult::Reproduced,
-        "pending amendment lacks red baseline"
-    );
-    let approved_proposal = parse_proposal_for(
+    if pending
+        .next
+        .proposal
+        .contract
+        .verifiers
+        .iter()
+        .all(|verifier| verifier.command.controller_asserted())
+    {
+        ensure!(
+            pending
+                .next
+                .baseline
+                .registration
+                .baseline_result(&pending.next.baseline.receipts)?
+                == BaselineResult::Reproduced,
+            "pending amendment lacks red baseline"
+        );
+    }
+    // Finish an interrupted legacy file transaction as recovery metadata only;
+    // the migration gate rejects its old proof before any shipping/review.
+    let approved_proposal = parse_proposal_data(
         &format!(
             "```autoship-contract\n{}\n```",
             serde_json::to_string(
@@ -512,6 +525,7 @@ pub(super) async fn resume_pending(
             )?
         ),
         source,
+        false,
     )?;
     ensure!(
         serde_json::to_value(&approved_proposal)? == serde_json::to_value(&pending.next.proposal)?,

@@ -13,10 +13,10 @@ use tokio::io::AsyncReadExt;
 
 #[path = "self_improve_amendment.rs"]
 mod amendment;
-#[path = "self_improve_verifier_checkout.rs"]
-mod verifier_checkout;
 #[path = "self_improve_scope.rs"]
 mod scope_authority;
+#[path = "self_improve_verifier_checkout.rs"]
+mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
 #[path = "self_improve_adjudicated_contract.rs"]
 mod adjudicated;
@@ -27,18 +27,28 @@ const DEPENDENCY_AUDIT: &str = include_str!("../../../scripts/autoship-registry-
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 pub(super) const CONTRACT_PROMPT: &str = r#"
 Emit exactly one ```autoship-contract fenced JSON object with fields `contract`
-and `files`. contract schema_version=1, revision=1, exactly one of issue=<real issue number> or pull_request=<real PR number> (never invent an issue), criteria are
-{id,requirement,verifier_ids}, allowed_paths are {kind:"file"|"directory",path},
-verifiers are {id,command,pinned_files,failure_witness}. command is typed:
-{kind:"python_unittest",test:"autoship_verifiers.test_case.Case.test_behavior"},
-{kind:"node_test",file:"autoship_verifiers/case.js",name:"specific test"}, or
-{kind:"cargo_test",package:"package",target:{kind:"integration",name:"autoship_case"},test:"test_behavior"}.
-files maps new dedicated verifier file paths to complete source. Put harnesses
-under autoship_verifiers/ or a package's tests/autoship_*.rs. Never overwrite
-existing source. Pin every harness/fixture file. The regression test MUST fail on
-baseline with the named assertion witness and pass after fixing implementation.
-Import/compile/setup errors do not count. Do not weaken assertions or edit the
-verifier after registration. Every criterion needs a verifier. No shell commands.
+and `files`. contract schema_version=1, revision=1, exactly one real source:
+issue=<number> or pull_request=<number>. criteria are {id,requirement,verifier_ids};
+allowed_paths are {kind:"file"|"directory",path}; verifiers are
+{id,command,pinned_files,failure_witness}. EVERY command must be:
+{kind:"black_box",invocation:{kind:"python_script",file:"autoship_verifiers/observe.py",args:[]},oracle:{kind:"json",value:[5,3,0]}}
+or invocation {kind:"node_script",file:"autoship_verifiers/observe.js",args:[]}
+or {kind:"cargo_binary",package:"package",bin:"autoship_case",args:[]}.
+Oracle may also be {kind:"text",value:"exact observable output"}. The oracle is
+private controller data: NEVER put expected answers/assertions in child scripts.
+The pinned adapter calls actual implementation for concrete inputs and prints ONLY
+JSON/text behavior data. For Python script imports, explicitly add the repository
+cwd to sys.path; the script directory alone does not expose root modules.
+For Rust library behavior, a pinned package/src/bin/autoship_case.rs executable
+may call its public API. Use existing dependencies and binary discovery; do not
+assume a lib-only crate has an existing CLI. No shell strings or cargo test.
+files maps new dedicated adapter/fixture paths to complete source. Place Python/
+Node adapters under autoship_verifiers/ and Rust adapters under src/bin/autoship_*.rs.
+Pin every adapter/fixture file. Original baseline must exit successfully with
+valid observable data DIFFERENT from the oracle; candidate must return matching
+data. Crashes, invalid JSON and setup failures are not red. Test outcome strings,
+unittest/cargo-test/node-test summaries and exit(0) never prove correctness.
+Every original criterion needs a behavioral oracle. Do not weaken requirements.
 "#;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +67,13 @@ pub(super) fn parse_proposal(raw: &str, issue: u64) -> Result<ContractProposal> 
     parse_proposal_for(raw, AcceptanceSource::Issue(issue))
 }
 pub(super) fn parse_proposal_for(raw: &str, source: AcceptanceSource) -> Result<ContractProposal> {
+    parse_proposal_data(raw, source, true)
+}
+fn parse_proposal_data(
+    raw: &str,
+    source: AcceptanceSource,
+    require_controller: bool,
+) -> Result<ContractProposal> {
     source.validate()?;
     ensure!(raw.len() <= 2 * 1024 * 1024, "contract proposal too large");
     let marker = "```autoship-contract\n";
@@ -75,6 +92,15 @@ pub(super) fn parse_proposal_for(raw: &str, source: AcceptanceSource) -> Result<
         .0;
     let mut proposal: ContractProposal = serde_json::from_str(json)?;
     proposal.contract.validate()?;
+    ensure!(
+        !require_controller
+            || proposal
+                .contract
+                .verifiers
+                .iter()
+                .all(|verifier| verifier.command.controller_asserted()),
+        "legacy in-process verifier requires independent behavioral-oracle migration"
+    );
     ensure!(
         proposal.contract.source()? == source,
         "contract source mismatch"
@@ -121,6 +147,11 @@ fn harness_path(path: &str) -> bool {
         return false;
     }
     path.starts_with("autoship_verifiers/")
+        || (parts.len() >= 3
+            && parts[parts.len() - 3] == "src"
+            && parts[parts.len() - 2] == "bin"
+            && parts.last().unwrap().starts_with("autoship_")
+            && path.ends_with(".rs"))
         || (parts.len() >= 2
             && parts[parts.len() - 2] == "tests"
             && parts.last().unwrap().starts_with("autoship_")
@@ -328,6 +359,15 @@ pub(super) async fn verify_candidate(
     root: &Path,
     evidence: &BaselineEvidence,
 ) -> Result<Vec<VerifierReceipt>> {
+    ensure!(
+        evidence
+            .registration
+            .contract()
+            .verifiers
+            .iter()
+            .all(|verifier| verifier.command.controller_asserted()),
+        "legacy in-process verifier requires independent behavioral-oracle migration"
+    );
     let status = Command::new("/usr/bin/git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(root)
@@ -615,6 +655,7 @@ mod tests {
         for path in [
             "autoship_verifiers/test_regression.py",
             "crates/demo/tests/autoship_case.rs",
+            "crates/demo/src/bin/autoship_behavior.rs",
         ] {
             assert!(harness_path(path));
         }
@@ -846,14 +887,24 @@ pub(super) async fn prepare_acceptance_for(
                 && prepared.proposal.contract == *prepared.baseline.registration.contract(),
             "persisted acceptance workflow mismatch"
         );
-        ensure!(
-            prepared
-                .baseline
-                .registration
-                .baseline_result(&prepared.baseline.receipts)?
-                == BaselineResult::Reproduced,
-            "persisted baseline was never independently red"
-        );
+        if prepared
+            .proposal
+            .contract
+            .verifiers
+            .iter()
+            .all(|verifier| verifier.command.controller_asserted())
+        {
+            ensure!(
+                prepared
+                    .baseline
+                    .registration
+                    .baseline_result(&prepared.baseline.receipts)?
+                    == BaselineResult::Reproduced,
+                "persisted baseline was never independently red"
+            );
+        }
+        // Legacy artifacts preserve original source/criteria solely for the
+        // independent migration executor. They authorize no current receipt.
         prepared
     } else {
         ensure!(
@@ -982,9 +1033,9 @@ mod workflow_tests {
             contract: AcceptanceContract { schema_version: 1, revision: 1, issue: Some(42), pull_request: None,
                 criteria: vec![Criterion { id: "ready".into(), requirement: "Ready becomes true".into(), verifier_ids: vec!["regression".into()] }],
                 allowed_paths: vec![PathScope::File("behavior.py".into())],
-                verifiers: vec![Verifier { id: "regression".into(), command: VerifierCommand::PythonUnittest { test: "autoship_verifiers.test_regression.Case.test_ready".into() }, pinned_files: vec![path.into()], failure_witness: "intended ready regression".into() }],
+                verifiers: vec![Verifier { id: "regression".into(), command: VerifierCommand::BlackBox { invocation: crate::autoship_contract::BehaviorInvocation::PythonScript { file:path.into(),args:vec![] }, oracle:crate::autoship_contract::OutputOracle::Json { value:serde_json::json!(true) } }, pinned_files: vec![path.into()], failure_witness: "intended ready regression".into() }],
             },
-            files: [(path.into(), "import unittest\nimport behavior\nclass Case(unittest.TestCase):\n def test_ready(self):\n  self.assertTrue(behavior.READY, 'intended ready regression')\n".into())].into(),
+            files: [(path.into(), "import json, os, sys\nsys.path.insert(0, os.getcwd())\nimport behavior\nprint(json.dumps(behavior.READY))\n".into())].into(),
         };
         install_harness(root.path(), &proposal).unwrap();
         let registration = RegisteredContract::register(
@@ -1136,11 +1187,17 @@ fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<
             let prepared: PreparedAcceptance = private_json(&entry.path())?;
             ensure!(
                 prepared.baseline.registration.contract().source()? == source
-                    && prepared
-                        .baseline
-                        .registration
-                        .baseline_result(&prepared.baseline.receipts)?
-                        == BaselineResult::Reproduced,
+                    && (!prepared
+                        .proposal
+                        .contract
+                        .verifiers
+                        .iter()
+                        .all(|verifier| verifier.command.controller_asserted())
+                        || prepared
+                            .baseline
+                            .registration
+                            .baseline_result(&prepared.baseline.receipts)?
+                            == BaselineResult::Reproduced),
                 "orphaned baseline evidence is invalid"
             );
             let manifest = WorkflowManifest::from_prepared(source, &prepared);
@@ -1464,6 +1521,70 @@ pub(super) async fn verify_with_repair_for(
         prepared.proposal.contract.source()? == source,
         "repair source differs from acceptance contract"
     );
+    if prepared
+        .proposal
+        .contract
+        .verifiers
+        .iter()
+        .any(|verifier| !verifier.command.controller_asserted())
+    {
+        // Decode old artifacts for immutable source/intent recovery, never use
+        // their claimed red/green as proof. Migrate before another paid review.
+        recovery::commit_candidate_named(
+            worktree,
+            &format!("fix: preserve candidate before oracle migration ({source})"),
+        )
+        .await?;
+        workflow
+            .transition(
+                crate::autoship_workflow::Stage::Scope,
+                "legacy_verifier_proof_invalidated",
+                "migrate_behavioral_oracle",
+                0,
+            )
+            .await?;
+        match amendment::try_amend(
+            reasoner,
+            source,
+            title,
+            worktree,
+            prepared,
+            control,
+            workflow,
+            "legacy in-process verifier requires independent behavioral-oracle migration",
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(Some(next)) => {
+                *prepared = next;
+                workflow.bind_acceptance(prepared)?;
+            }
+            Ok(None) => {
+                workflow
+                    .transition(
+                        crate::autoship_workflow::Stage::Scope,
+                        "behavioral_oracle_migration_unresolved",
+                        "retry_behavioral_oracle_migration",
+                        chrono::Utc::now().timestamp_millis() + 300_000,
+                    )
+                    .await?;
+                bail!("legacy verifier migration requires a valid independently red behavioral oracle");
+            }
+            Err(error) => {
+                workflow
+                    .transition(
+                        crate::autoship_workflow::Stage::Scope,
+                        "behavioral_oracle_migration_retry",
+                        "retry_behavioral_oracle_migration",
+                        chrono::Utc::now().timestamp_millis() + 300_000,
+                    )
+                    .await?;
+                return Err(error).context("independent behavioral-oracle migration queued");
+            }
+        }
+    }
     for round in 0..=2 {
         recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
         let diff = trusted_git(worktree, &["diff", "origin/main...HEAD"]).await?;
@@ -1895,13 +2016,22 @@ pub(super) async fn assert_sweep_receipt(
 }
 
 #[cfg(test)]
-pub(super) fn persist_fixture_registration(control: &Path, prepared: &PreparedAcceptance) -> Result<()> {
+pub(super) fn persist_fixture_registration(
+    control: &Path,
+    prepared: &PreparedAcceptance,
+) -> Result<()> {
     use std::io::Write;
     let source = prepared.proposal.contract.source()?;
-    let path = evidence_path(control, source, prepared.baseline.registration.baseline_head())?;
+    let path = evidence_path(
+        control,
+        source,
+        prepared.baseline.registration.baseline_head(),
+    )?;
     let mut staged = tempfile::NamedTempFile::new_in(control)?;
     staged.write_all(&serde_json::to_vec(prepared)?)?;
     staged.as_file().sync_all()?;
-    staged.persist_noclobber(path).map_err(|error| error.error)?;
+    staged
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
     write_manifest(control, &WorkflowManifest::from_prepared(source, prepared))
 }

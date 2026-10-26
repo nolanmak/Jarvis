@@ -182,7 +182,7 @@ pub(super) fn episode_retries(
                 "rescope_remaining_findings"
                     | "complete_review_or_adjudication"
                     | "retry_adjudicated_amendment"
-                    | "verify_new_revision"
+                    | "verify_new_revision" | "migrate_behavioral_oracle" | "retry_behavioral_oracle_migration"
             )
         {
             result.insert(candidate.pr);

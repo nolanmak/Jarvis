@@ -259,8 +259,8 @@ async fn prepare_fixture_kind(root: &Path, control: &Path, issue: u64, seed_defe
                 "contract":{"schema_version":1,"revision":1,"issue":issue,
                     "criteria":[{"id":"SUM","requirement":CRITERION,"verifier_ids":["sum"]}],
                     "allowed_paths":[{"kind":"file","path":"arithmetic.py"},{"kind":"file","path":"rules.rs"}],
-                    "verifiers":[{"id":"sum","command":{"kind":"python_unittest","test":"autoship_verifiers.test_sum.Case.test_add"},"pinned_files":["autoship_verifiers/test_sum.py"],"failure_witness":"arithmetic sum regression"}]},
-                "files":{"autoship_verifiers/test_sum.py":"import unittest\nfrom arithmetic import add\nclass Case(unittest.TestCase):\n def test_add(self):\n  for a,b in [(2,3),(-2,5),(0,0)]:\n   self.assertEqual(add(a,b),a+b,'arithmetic sum regression')\n"}
+                    "verifiers":[{"id":"sum","command":{"kind":"black_box","invocation":{"kind":"python_script","file":"autoship_verifiers/test_sum.py","args":[]},"oracle":{"kind":"json","value":[5,3,0]}},"pinned_files":["autoship_verifiers/test_sum.py"],"failure_witness":"arithmetic sum regression"}]},
+                "files":{"autoship_verifiers/test_sum.py":"import json, os, sys\nsys.path.insert(0, os.getcwd())\nfrom arithmetic import add\nprint(json.dumps([add(a,b) for a,b in [(2,3),(-2,5),(0,0)]]))\n"}
             })
         ),
         issue,

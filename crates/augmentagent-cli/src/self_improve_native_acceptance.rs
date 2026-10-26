@@ -90,7 +90,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     // Production scoper selects actual immutable source, then independently
     // authors the contract and verifier. No scripted reviewer stands in here.
     let scope=acceptance::scope_original(&root,&repository,&guard,&format!(
-        "Scope issue #840: {requirement} Preserve this criterion verbatim. The only implementation change needed is arithmetic.py. Declare arithmetic.py and rules.rs as allowed FILE paths (rules.rs is reserved for a later diagnostic and must not change in this repair). Supply a Python unittest verifier for integer addition, including mixed signs and zero, with a concrete failure_witness. Do not request Rust builds: Rust files are supporting fixture evidence only.\n{}",acceptance::CONTRACT_PROMPT)).await?;
+        "Scope issue #840: {requirement} Preserve this criterion verbatim. The only implementation change needed is arithmetic.py. Declare arithmetic.py and rules.rs as allowed FILE paths (rules.rs is reserved for a later diagnostic and must not change in this repair). Supply a pinned Python behavior adapter that prints JSON results for mixed-sign and zero integer inputs; put expected results only in the controller black_box oracle, never child assertions. Do not request Rust builds: Rust files are supporting fixture evidence only.\n{}",acceptance::CONTRACT_PROMPT)).await?;
     let builder =
         augmentagent_channel_core::build_pinned(Codex).context("native Codex unavailable")?;
     let prepared = acceptance::prepare_acceptance(
