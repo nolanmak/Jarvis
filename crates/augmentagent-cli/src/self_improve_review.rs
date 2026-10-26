@@ -235,7 +235,36 @@ async fn run_inner(
             )?;
             anyhow::ensure!(pass.completed, "reviewer reported incomplete evidence group {i}; collect missing evidence before retry");
             request_hashes.push(pass.coverage.prompt_hash);
-            findings.extend(pass.findings);
+            let mut shard_findings = pass.findings;
+            let known: BTreeSet<_> = prior.iter().map(|f| f.id.as_str()).collect();
+            let mut remap = BTreeMap::new();
+            for finding in &shard_findings {
+                if !known.contains(finding.id.as_str()) {
+                    remap.insert(
+                        finding.id.clone(),
+                        format!(
+                            "finding-{}",
+                            &aligned::digest(&serde_json::to_vec(&(
+                                &finding.criterion_id,
+                                &finding.evidence_hash,
+                                &finding.claim,
+                                &finding.requested_change,
+                            ))?)[..20]
+                        ),
+                    );
+                }
+            }
+            for finding in &mut shard_findings {
+                if let Some(id) = remap.get(&finding.id) {
+                    finding.id = id.clone();
+                }
+                finding.conflicts_with = finding
+                    .conflicts_with
+                    .iter()
+                    .map(|id| remap.get(id).cloned().unwrap_or_else(|| id.clone()))
+                    .collect();
+            }
+            findings.extend(shard_findings);
         }
         let mut findings = deduplicate_findings(findings)?;
         for finding in &mut findings {
