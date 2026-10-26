@@ -25,6 +25,14 @@ pub struct Lease {
     targets: crate::storage_leases::TargetLeases,
 }
 impl Lease {
+    /// Duplicates share the flock open description; unlike /proc reopening,
+    /// they retain storage/prune exclusion if the controller dies first.
+    pub fn inherited_files(&self) -> Result<Vec<std::fs::File>> {
+        let mut files = vec![self.file.try_clone()?];
+        files.extend(self.targets.inherited_files()?);
+        Ok(files)
+    }
+
     pub fn parent_proof(&self, target: &Path) -> Result<String> {
         Ok(format!(
             "{}:{}:{}",
@@ -78,12 +86,8 @@ impl Lease {
     }
 }
 
-impl Drop for Lease {
-    fn drop(&mut self) {
-        self.targets = Default::default();
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
+// Close-only release: inherited supervisors/QEMU must retain the same flock
+// until descendants have exited. Explicit LOCK_UN would release their copies.
 
 pub async fn acquire() -> Result<Lease> {
     let state = state_dir()?;
@@ -1238,5 +1242,62 @@ mod tests {
         std::fs::remove_dir_all(&first).unwrap();
         assert_eq!(registered(&other, &state).len(), 1);
         assert!(register(&other, &target, None, &state).unwrap().shared);
+    }
+}
+
+#[cfg(test)]
+mod inherited_ci_storage_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[tokio::test]
+    async fn inherited_descendant_keeps_global_and_target_leases_after_parent_drop() {
+        let state = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut lease = Lease::try_at(state.path()).unwrap().unwrap();
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        let files = lease.inherited_files().unwrap();
+        let descriptors: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        let mut command = Command::new("/usr/bin/python3");
+        command.args(["-I", "-c", r#"
+import os,sys
+if os.fork():
+    os._exit(0)
+print('descendant-ready',flush=True)
+sys.stdin.readline()
+os._exit(0)
+"#]).stdin(Stdio::piped()).stdout(Stdio::piped());
+        unsafe { command.pre_exec(move || {
+            for fd in &descriptors {
+                let flags = libc::fcntl(*fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }); }
+        let mut child = command.spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "descendant-ready");
+        assert!(child.wait().unwrap().success(), "original worker has exited");
+        drop(lease);
+        drop(files);
+        assert!(Lease::try_at(state.path()).unwrap().is_none(), "descendant must retain global prune exclusion");
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_none(), "target inode/path exclusion must survive too");
+        input.write_all(b"exit\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(lease) = Lease::try_at(state.path()).unwrap() {
+                assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some());
+                drop(lease);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "descendant did not release inherited storage");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

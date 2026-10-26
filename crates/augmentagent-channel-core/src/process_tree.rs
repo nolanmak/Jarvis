@@ -514,18 +514,25 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None)
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[])
 }
 pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None)
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[])
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
 pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy))
+    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[])
 }
-fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>)
+pub(crate) fn spawn_admitted_storage(command: &Command, clean: Arc<AtomicBool>, required_resources: bool,
+    storage_files: &[std::fs::File]) -> std::io::Result<(Child, ProcessGroup)> {
+    if storage_files.is_empty() || storage_files.len() > 64 {
+        return Err(std::io::Error::other("invalid inherited storage descriptor set"));
+    }
+    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, None, storage_files)
+}
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File])
     -> std::io::Result<(Child, ProcessGroup)> {
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
@@ -572,6 +579,24 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     if admission { supervised.env("JARVIS_SUPERVISOR_ADMISSION","1"); }
     supervised.env_remove("JARVIS_RUN_RESOURCE_POLICY");
     if let Some(policy)=&resource_policy { supervised.env("JARVIS_RUN_RESOURCE_POLICY",policy.to_string()); }
+    supervised.env_remove("JARVIS_STORAGE_LEASE_FD");
+    supervised.env_remove("JARVIS_STORAGE_LEASE_FDS");
+    if !storage_files.is_empty() {
+        let descriptors: Vec<_> = storage_files.iter().map(AsRawFd::as_raw_fd).collect();
+        supervised.env("JARVIS_STORAGE_LEASE_FD", descriptors[0].to_string());
+        supervised.env("JARVIS_STORAGE_LEASE_FDS", descriptors.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+        // Change CLOEXEC only in the forked child, never globally in the daemon.
+        // These are true inherited duplicates of the controller-held leases.
+        unsafe { supervised.pre_exec(move || {
+            for descriptor in &descriptors {
+                let flags = libc::fcntl(*descriptor, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(*descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }); }
+    }
     let active_request = begin_request(journal, &receipt)?;
     let child = match supervised.spawn() {
         Ok(child) => child,

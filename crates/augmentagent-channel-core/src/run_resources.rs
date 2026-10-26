@@ -228,6 +228,19 @@ pub fn spawn_command(
     Ok((child, CommandGuard(guard)))
 }
 
+/// CI VM adapter launch retaining the actual build and target flock descriptions
+/// through the supervisor. No environment-only parent proof grants inheritance.
+pub fn spawn_command_with_storage(command: &tokio::process::Command,
+    logger: Option<&Arc<crate::tool_audit::AuditLogger>>, files: &[std::fs::File])
+    -> Result<(tokio::process::Child, CommandGuard)> {
+    check_requirement("verification", logger)?;
+    let (child, guard) = crate::process_tree::spawn_admitted_storage(command,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        logger.is_some_and(|logger| logger.run_resources_required()), files)?;
+    guard.bind_resource_audit("verification", logger)?;
+    Ok((child, CommandGuard(guard)))
+}
+
 #[cfg(test)]
 mod tests {
     /// Execute in an isolated delegated transient service, never the daemon unit.

@@ -16,11 +16,8 @@ struct Held {
     identity: Option<Identity>,
     file: File,
 }
-impl Drop for Held {
-    fn drop(&mut self) {
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
+// File close releases the lock only after inherited build descendants close
+// their copies. Never explicitly unlock the shared open-file description.
 
 #[derive(Default)]
 pub struct TargetLeases(Vec<Held>);
@@ -51,6 +48,10 @@ fn lock_directory() -> Result<PathBuf> {
 }
 
 impl TargetLeases {
+    pub fn inherited_files(&self) -> Result<Vec<File>> {
+        self.0.iter().map(|held| held.file.try_clone().map_err(Into::into)).collect()
+    }
+
     pub fn directory_fd(&self, root: &Path) -> Result<i32> {
         let metadata = std::fs::metadata(root)?;
         self.0

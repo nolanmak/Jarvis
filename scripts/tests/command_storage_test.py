@@ -109,6 +109,39 @@ with b.CommandStorage(json.loads(sys.argv[2]),sys.argv[3]):
                 supervisor.terminate()
                 supervisor.wait(timeout=8)
 
+    def test_supervisor_retains_global_and_target_descriptor_set(self):
+        paths = [self.root / 'disk-build.lock', self.root / 'target-inode.lock', self.root / 'target-path.lock']
+        descriptors = [os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600) for path in paths]
+        for descriptor in descriptors:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        env = {'PATH': os.defpath, 'JARVIS_STORAGE_LEASE_FD': str(descriptors[0]),
+               'JARVIS_STORAGE_LEASE_FDS': ','.join(map(str, descriptors))}
+        code = "import os,sys; [os.fstat(int(fd)) for fd in os.environ['JARVIS_STORAGE_LEASE_FDS'].split(',')]; print('all-inherited',flush=True); sys.stdin.readline()"
+        receipt = self.root / 'cleanup'
+        supervisor = subprocess.Popen([sys.executable, '-I', str(SCRIPTS / 'provider-supervisor.py'),
+            str(receipt), sys.executable, '-I', '-c', code], env=env, pass_fds=tuple(descriptors),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(supervisor.stdout.readline().strip(), 'all-inherited')
+            for descriptor in descriptors:
+                os.close(descriptor)
+            descriptors = []
+            for path in paths:
+                with open(path, 'r+') as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            supervisor.communicate('finish\n', timeout=8)
+            self.assertEqual(supervisor.returncode, 0)
+            self.assertEqual(receipt.read_text(), 'all-descendants-reaped\n')
+            for path in paths:
+                with open(path, 'r+') as contender:
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            if supervisor.poll() is None:
+                supervisor.terminate(); supervisor.wait(timeout=8)
+
 
 if __name__ == '__main__':
     unittest.main()
