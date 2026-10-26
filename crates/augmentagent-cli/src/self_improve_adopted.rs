@@ -334,6 +334,25 @@ async fn execute(
                 let (ok, _, error) =
                     run(&gh_bin(), &["pr", "ready", &pr.pr.to_string()], repo).await?;
                 anyhow::ensure!(ok, "cannot ready approved PR: {error}");
+                let (observed, raw, _) = run(
+                    &gh_bin(),
+                    &[
+                        "pr",
+                        "view",
+                        &pr.pr.to_string(),
+                        "--json",
+                        "isDraft,headRefOid",
+                    ],
+                    repo,
+                )
+                .await?;
+                let ready: serde_json::Value = serde_json::from_str(&raw)?;
+                anyhow::ensure!(
+                    observed
+                        && ready["isDraft"].as_bool() == Some(false)
+                        && ready["headRefOid"].as_str() == Some(binding.head.as_str()),
+                    "ready transition requires exact-head remote observation"
+                );
                 guard.observe_remote(
                     &intent,
                     &format!("github:pr:{}:ready:{}", pr.pr, binding.head),
