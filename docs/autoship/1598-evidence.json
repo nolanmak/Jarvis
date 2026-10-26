@@ -1091,6 +1091,20 @@
         "/tmp/autoship-1598-oauth-gateway-099d90af.log"
       ],
       "scope": "Synthetic rotation response, SIGKILL and fresh runtime seed; journal recovery, optional Codex response fields, path normalization, scope consistency, all-worker teardown and stale export ordering. Local gateway fixtures only. No live issuer rotation, no VM/provider call, no production credential writes. Packaged rebuild and native pipeline still pending."
+    },
+    "packaged_oauth_e043024e": {
+      "status": "build_passed",
+      "log": "/tmp/autoship-1598-oauth-packaged-build.log",
+      "binary_sha256": "7f7422fc226f0eff5ae0f79fa1e5f7a1aa5f8c725c9a3c033e2ece76c227c6aa",
+      "scope": "Managed one-job CLI test build with updated embedded helpers; exact ignored issue-test inventory verified."
+    },
+    "native_routed_transport_z239adcm": {
+      "status": "passed",
+      "head": "e043024e",
+      "log": "/tmp/autoship-native-acceptance-z239adcm/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-z239adcm/result.json",
+      "operator_route_unchanged": true,
+      "scope": "Actual packaged production Rust routed constructor, protected owner and host Responses exchange after OAuth/helper teardown changes. Transport only; refresh disabled, no full issue/adoption or live token renewal claim."
     }
   },
   "remaining_cross_cutting_acceptance": [
