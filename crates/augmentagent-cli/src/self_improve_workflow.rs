@@ -1218,9 +1218,9 @@ impl WorkflowGuard {
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
         self.audit.protected_health()?;
+        self.healthy_lease()?;
         self.audit_event("workflow_released", serde_json::json!({}))?;
         self.heartbeat.cancel();
-        self.healthy_lease()?;
         let mut store = self
             .store
             .lock()
@@ -2180,7 +2180,7 @@ mod tests {
         assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
         let eligible=after.checkpoint.next.eligible_at_ms;
         let reclaim_after=eligible.max(after.lease_until_ms)+1;
-        drop(guard);
+        assert!(guard.finish().is_err(), "capacity failure cannot falsely record a normal release");
         assert!(WorkflowGuard::acquire_at(&path,start(),eligible-1).await.unwrap().is_none());
         let resumed=WorkflowGuard::acquire_at(&path,start(),reclaim_after).await.unwrap().unwrap();
         assert!(!resumed.capacity_exhausted.load(Ordering::SeqCst));
