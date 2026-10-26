@@ -76,6 +76,33 @@ class AdapterTests(unittest.TestCase):
    lease.fds=[4,5];image.symlink_to(root/'other')
    with self.assertRaises(OSError):adapter.ensure_cache(image,64*1024*1024,lease)
 
+ def test_fixed_targeted_and_baseline_argv_and_validation(self):
+  for operation,packages,filters,expected in [
+   ('targeted',['core-lib','cli'],[],[['/toolchain/bin/cargo','build','-p','core-lib','-p','cli'],['/toolchain/bin/cargo','test','-p','core-lib','-p','cli','--no-fail-fast','--','--test-threads=1']]),
+   ('baseline',[],['tests::red'],[['/toolchain/bin/cargo','test','--workspace','--no-fail-fast','--','--test-threads=1','tests::red']])]:
+   with tempfile.TemporaryDirectory() as d:
+    request=self.fixture(Path(d));request.update(operation=operation,packages=packages,filters=filters,build_cache=str(Path(d)/'cache'),cache_bytes=67108864)
+    seen=[]
+    def run(runtime,workspace,argv,env,**kwargs):
+     self.assertEqual(argv[:3],['/usr/bin/python3','-I','-c'])
+     with patch.object(adapter.subprocess,'run',side_effect=lambda command:seen.append(command) or subprocess.CompletedProcess(command,0)),patch.object(adapter.sys,'argv',['script',argv[4]]):
+      exec(argv[3],{})
+     return {'exit_code':0,'stdout':'','stderr':''}
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache'):
+     self.assertEqual(adapter.execute(request,run=run)['status'],'passed')
+    self.assertEqual(seen,expected)
+  for invalid in [dict(operation='targeted',packages=[]),dict(operation='targeted',packages=['--workspace']),dict(operation='baseline',filters=['x;touch bad']),dict(operation='step',packages=['cli'])]:
+   with self.assertRaises(vm.Unavailable):adapter.cargo_request(invalid)
+ def test_repository_command_only_in_admitted_guest(self):
+  with tempfile.TemporaryDirectory() as d:
+   request=self.fixture(Path(d));request.update(operation='repository',command='printf owner-configured',build_cache=str(Path(d)/'cache'),cache_bytes=67108864)
+   def run(runtime,workspace,argv,env,**kwargs):
+    self.assertEqual(argv,['/bin/bash','--noprofile','--norc','-o','pipefail','-c','printf owner-configured'])
+    return {'exit_code':12,'stdout':'','stderr':'failed'}
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache'):
+    self.assertEqual(adapter.execute(request,run=run)['status'],'failed')
+  with self.assertRaises(vm.Unavailable):adapter.cargo_request({'operation':'repository','command':'x'*65537})
+
 class BuildVMExtensionTests(unittest.TestCase):
  def runtime(self,root):
   artifact=root/'artifact';artifact.write_bytes(b'synthetic');artifact.chmod(0o600)

@@ -94,3 +94,12 @@ supervised CI mode. Its caller enforces declared GitHub step/job deadlines
 (default job limit six hours), retains storage/resource supervision, and cleans
 up the VM on cancellation. Lightweight adapter fixtures exercise this interface;
 a real admitted VM run is still required before claiming deployment acceptance.
+
+Targeted iteration and baseline diagnosis use fixed controller Cargo argv inside
+the same VM. Package identifiers cannot begin with an option prefix; test filters
+are bounded Rust paths. These diagnostic operations do not replace full CI.
+Multi-repository owner-configured commands enter only through the private
+controller specification and execute in guest Bash, never a host shell. CI guest
+Cargo uses one build job, debug information disabled, and the existing registry
+broker for dependencies; enabling registry access does not add a guest NIC or
+general outbound access.

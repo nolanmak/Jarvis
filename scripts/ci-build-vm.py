@@ -99,11 +99,38 @@ def ensure_cache(path, capacity, lease):
         except FileNotFoundError:pass
 
 
+CARGO_OPERATIONS = """import json,subprocess,sys
+request=json.loads(sys.argv[1])
+selection=[arg for package in request['packages'] for arg in ('-p',package)] or ['--workspace']
+commands=[]
+if request['operation']=='targeted':commands.append(['/toolchain/bin/cargo','build',*selection])
+commands.append(['/toolchain/bin/cargo','test',*selection,'--no-fail-fast','--','--test-threads=1',*request['filters']])
+for command in commands:
+    result=subprocess.run(command)
+    if result.returncode:sys.exit(result.returncode if result.returncode>0 else 1)
+"""
+
+def cargo_request(request):
+    packages=request.get('packages',[]);filters=request.get('filters',[])
+    for values,pattern,label in ((packages,r'[A-Za-z0-9_][A-Za-z0-9_-]*','packages'),(filters,r'[A-Za-z0-9_:]+','filters')):
+        if not isinstance(values,list) or len(values)>128 or any(not isinstance(value,str) or len(value)>256 or not re.fullmatch(pattern,value) for value in values):
+            raise vm.Unavailable('invalid CI '+label)
+    operation=request['operation']
+    if operation in ('plan','step','repository') and (packages or filters):raise vm.Unavailable('irrelevant CI cargo arguments')
+    if operation=='targeted' and (not packages or filters):raise vm.Unavailable('targeted CI requires packages and no filters')
+    if operation=='repository':
+        command=request.get('command')
+        if not isinstance(command,str) or not command.strip() or '\0' in command or len(command.encode())>65536:raise vm.Unavailable('invalid owner repository command')
+    elif request.get('command') not in (None,''):raise vm.Unavailable('irrelevant owner repository command')
+    return {'operation':operation,'packages':packages,'filters':filters}
+
+
 def execute(request,run=vm.run):
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache'}
-    optional={'id','changed_files','cache_bytes'}
-    if set(request)-required-optional or not required<=set(request) or request['version']!=1 or request['operation'] not in ('plan','step'):raise vm.Unavailable('invalid CI VM request')
+    optional={'id','changed_files','cache_bytes','packages','filters','command'}
+    if set(request)-required-optional or not required<=set(request) or request['version']!=1 or request['operation'] not in ('plan','step','targeted','baseline','repository'):raise vm.Unavailable('invalid CI VM request')
     if not all(isinstance(request[key],str) and re.fullmatch(r'[a-f0-9]{40,64}',request[key]) for key in ('head','base')):raise vm.Unavailable('CI candidate binding invalid')
+    cargo=cargo_request(request)
     runner=private_bytes(request['runner']);contract=private_bytes(request['contract'])
     parsed=json.loads(contract)
     if parsed.get('version')!=1:raise vm.Unavailable('unsupported CI contract')
@@ -132,9 +159,14 @@ def execute(request,run=vm.run):
     else:
         if not isinstance(request['build_cache'],str):raise vm.Unavailable('managed CI cache image is required')
         ensure_cache(request['build_cache'],request.get('cache_bytes'),lease)
-        identifier=request.get('id')
-        if not isinstance(identifier,str) or len(identifier)>4096 or '\0' in identifier:raise vm.Unavailable('invalid CI command identity')
-        command+=['step','--id',identifier,'--input-head',request['head'],'--input-base',request['base'],'--state-dir','/ci-runtime']
+        if request['operation']=='step':
+            identifier=request.get('id')
+            if not isinstance(identifier,str) or len(identifier)>4096 or '\0' in identifier:raise vm.Unavailable('invalid CI command identity')
+            command+=['step','--id',identifier,'--input-head',request['head'],'--input-base',request['base'],'--state-dir','/ci-runtime']
+        elif request['operation']=='repository':
+            command=['/bin/bash','--noprofile','--norc','-o','pipefail','-c',request['command']]
+        else:
+            command=['/usr/bin/python3','-I','-c',CARGO_OPERATIONS,json.dumps(cargo,separators=(',',':'))]
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
                 ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract})
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),

@@ -115,7 +115,8 @@ if job.get('build_cache'):
     environment.update({'CARGO_HOME':'/build-cache/cargo-home','CARGO_TARGET_DIR':'/build-cache/target'})
 environment.update(job['environment'])
 if job.get('ci_context'):
-    environment.update({'GIT_ALTERNATE_OBJECT_DIRECTORIES':'/ci-git-objects','GIT_CONFIG_NOSYSTEM':'1','RUSTUP_TOOLCHAIN':'/toolchain'})
+    environment.update({'GIT_ALTERNATE_OBJECT_DIRECTORIES':'/ci-git-objects','GIT_CONFIG_NOSYSTEM':'1','RUSTUP_TOOLCHAIN':'/toolchain','CARGO_NET_OFFLINE':'false',
+        'CARGO_BUILD_JOBS':'1','CARGO_PROFILE_DEV_DEBUG':'0','CARGO_PROFILE_TEST_DEBUG':'0'})
 registry=make_proxy('/root/control')
 environment.update({'NODE_EXTRA_CA_CERTS':'/etc/jarvis-registry-ca.pem',
     'CARGO_HTTP_CAINFO':'/etc/jarvis-registry-ca.pem', 'NPM_CONFIG_AUDIT':'false',
