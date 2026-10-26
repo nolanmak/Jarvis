@@ -647,19 +647,19 @@ impl WorkflowGuard {
         self.audit.clone()
     }
     fn install_model_accounting(&self) -> Result<()> {
+        self.audit.require_run_resources()?;
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
         let capacity_flag = self.capacity_exhausted.clone();
-        self.audit.set_resource_capacity_observer(Arc::new(move |observation| {
+        self.audit.set_resource_capacity_observer(Arc::new(move |_observation| {
             // Refuse further work even if persistence itself fails. The protected
             // audit already contains the full independently observed resource event.
             capacity_flag.store(true, Ordering::SeqCst);
             let mut store = capacity_store.lock().map_err(|_| anyhow::anyhow!("workflow capacity lock poisoned"))?;
             let mut checkpoint = store.snapshot(&capacity_lease.workflow)?
                 .context("capacity workflow missing")?.checkpoint;
-            let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(observation)?));
-            checkpoint.evidence.retain(|entry| !entry.starts_with("resource-capacity:"));
-            checkpoint.evidence.push(format!("resource-capacity:{digest}"));
+            // Resource observations live in the protected audit, not in the
+            // acceptance evidence vector whose hash binds the verified candidate.
             checkpoint.next = NextAction {
                 reason: "resource_capacity".into(),
                 action: "await_capacity".into(),
@@ -2177,11 +2177,16 @@ mod tests {
         assert!(after.checkpoint.evidence.contains(&"protected-acceptance-receipt".to_owned()));
         assert_eq!(after.checkpoint.next.action,"await_capacity");
         assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
         let eligible=after.checkpoint.next.eligible_at_ms;
+        let reclaim_after=eligible.max(after.lease_until_ms)+1;
         drop(guard);
         assert!(WorkflowGuard::acquire_at(&path,start(),eligible-1).await.unwrap().is_none());
-        let resumed=WorkflowGuard::acquire_at(&path,start(),eligible+1).await.unwrap().unwrap();
+        let resumed=WorkflowGuard::acquire_at(&path,start(),reclaim_after).await.unwrap().unwrap();
         assert!(!resumed.capacity_exhausted.load(Ordering::SeqCst));
+        let recovered=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
+        assert_eq!(recovered.checkpoint.binding,before.checkpoint.binding);
+        assert_eq!(recovered.checkpoint.evidence,before.checkpoint.evidence);
     }
 
     #[tokio::test]
