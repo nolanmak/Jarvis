@@ -1010,6 +1010,24 @@
       "core_ignored": 14,
       "log": "/tmp/autoship-1598-ci-f54acffe-rust.log",
       "scope": "Rust job passed alongside bridge and installer; later optional check and fixture changes still require fresh CI."
+    },
+    "policy_hold_76188003": {
+      "passed": 7,
+      "optional_classifier_passed": 3,
+      "log": "/tmp/autoship-1598-76188003-policy-hold-tests.log",
+      "scope": "Actual fake-GH outage/recovery and mixed failed checks; unknown pending/red advisory identity remains unpaid and nonmergeable, terminal green checks do not require exemption, required/different workflow failures repair."
+    },
+    "native_writer_11o86qgg": {
+      "status": "passed",
+      "log": "/tmp/autoship-native-acceptance-11o86qgg/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-11o86qgg/result.json",
+      "operator_route_unchanged": true,
+      "scope": "Actual native historical writer-inventory negative/repaired adjudication replay; uses protected native reviewer, not routed builder or full issue/adoption pipeline."
+    },
+    "native_issue_operator_capacity_refusal": {
+      "status": "not_launched_insufficient_host_capacity",
+      "log": "/tmp/autoship-1598-native-issue-operator.log",
+      "scope": "No model or VM started. Full1Gi native+4Gi build+1Gi host budget preserved; current preflight needs6.5Gi host available including controller allowance and host margin."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -1086,7 +1104,7 @@
     {
       "severity": "P1",
       "gap": "Comment-only Claude workflow failure can block merge checks or send approved PRs back into billed repair",
-      "status": "verified_workflow_identity_classification_integrated_a19297d2; approved_policy_hold_callsite_followup_in_progress"
+      "status": "fixed_a19297d2_21c26af7_e2c5b1cf_76188003; helper_and_actual_remote_disposition_regressions_passed; final_CI_and_rollout_pending"
     },
     {
       "severity": "P1",
