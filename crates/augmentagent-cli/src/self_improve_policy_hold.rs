@@ -73,6 +73,56 @@ fn reason(
     merge_policy_blocker(policy)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApprovalDisposition {
+    Repair,
+    Free(&'static str),
+}
+
+/// Capacity admission only: the caller must already validate the exact-head
+/// approval. This cannot mint approval or waive the sweep's merge checks.
+fn approval_disposition(head: &str, reviewed_base: Option<&str>, remote_main: Option<&str>,
+    remote_head: Option<&str>, mergeable: Option<&str>, checks: Option<&str>) -> ApprovalDisposition {
+    use ApprovalDisposition::{Free, Repair};
+    let Some(reviewed_base) = reviewed_base else { return Repair; };
+    if remote_head.is_some_and(|actual| actual != head) { return Repair; }
+    if mergeable == Some("CONFLICTING") { return Repair; }
+    if remote_main.is_some_and(|base| base != reviewed_base) { return Repair; }
+    let rows = checks.and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok());
+    if rows.as_ref().is_some_and(|rows| rows.iter().any(|row| !is_optional_review_check(row)
+        && (row["bucket"] == "fail" || matches!(row["state"].as_str(),Some("FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "ERROR"))))) {
+        return Repair;
+    }
+    if remote_main.is_none() || remote_head.is_none() || mergeable != Some("MERGEABLE") {
+        return Free("merge-evidence-unavailable");
+    }
+    match checks.and_then(ci_checks_green) {
+        Some(true) => Free("approved-awaiting-free-merge"),
+        Some(false) => Free("approved-awaiting-ci"),
+        None => Free("ci-evidence-unavailable"),
+    }
+}
+
+async fn disposition_from_remote(repo: &Path, gh: &str, head: &str, reviewed_base: Option<&str>,
+    remote_main: Option<&str>, pr: u64) -> ApprovalDisposition {
+    let detail = match run(gh,&["pr","view",&pr.to_string(),"--json","headRefOid,mergeable"],repo).await {
+        Ok((true,raw,_)) => serde_json::from_str::<serde_json::Value>(&raw).ok(),
+        _ => None,
+    };
+    // gh uses nonzero status for pending/failed checks but still returns JSON.
+    let checks = run(gh,&["pr","checks",&pr.to_string(),"--json","name,state,bucket"],repo).await.ok().map(|(_,raw,_)|raw);
+    approval_disposition(head,reviewed_base,remote_main,
+        detail.as_ref().and_then(|v|v["headRefOid"].as_str()),
+        detail.as_ref().and_then(|v|v["mergeable"].as_str()),checks.as_deref())
+}
+
+pub(super) async fn reconciliation_disposition(repo: &Path, candidate: &adoption::AdoptedPr,
+    verdict: &RecordedVerdict) -> ApprovalDisposition {
+    let remote_main = workflow::remote_main_head(repo,&candidate.repository).await.ok();
+    disposition_from_remote(repo,&gh_bin(),&candidate.head,
+        verdict.structured.as_ref().map(|e|e.binding.base.as_str()),remote_main.as_deref(),candidate.pr).await
+}
+
 pub(super) async fn filter(repo: &Path, candidates: &mut Vec<adoption::AdoptedPr>, dry_run: bool) {
     let owner = merge_policy_owner(repo).await;
     let status = if dry_run {
@@ -102,6 +152,12 @@ pub(super) async fn filter(repo: &Path, candidates: &mut Vec<adoption::AdoptedPr
             eligible.push(candidate);
             continue;
         }
+        let disposition = reconciliation_disposition(repo,&candidate,record.as_ref().and_then(|r|r.verdict.as_ref()).expect("approved record has verdict")).await;
+        if disposition == ApprovalDisposition::Repair {
+            if let Some(conn) = &status { let _ = observe(conn,&candidate.repository,candidate.pr,&candidate.head,None,chrono::Utc::now().timestamp_millis()); }
+            eligible.push(candidate);
+            continue;
+        }
         let (body, author) = issue_facts(repo, issue).await;
         let gated = pr_gated_path(repo, candidate.pr).await;
         // Missing remote evidence is an infrastructure dependency, never a
@@ -124,11 +180,10 @@ pub(super) async fn filter(repo: &Path, candidates: &mut Vec<adoption::AdoptedPr
             repo_owner: owner.clone(),
             automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
         };
-        let blocker = if unavailable {
-            Some("policy-evidence-unavailable")
-        } else {
-            reason(record.as_ref(), candidate.pr, &candidate.head, &policy)
-        };
+        let blocker = if unavailable { Some("policy-evidence-unavailable") }
+            else { reason(record.as_ref(), candidate.pr, &candidate.head, &policy).or(match disposition {
+                ApprovalDisposition::Free(reason) => Some(reason), ApprovalDisposition::Repair => None,
+            }) };
         if let Some(conn) = &status {
             if let Err(error) = observe(
                 conn,
@@ -157,6 +212,121 @@ pub(super) async fn filter(repo: &Path, candidates: &mut Vec<adoption::AdoptedPr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_changed_integration_conflicts_and_failed_checks_admit_paid_repair() {
+        use ApprovalDisposition::{Free,Repair};
+        let decide = |base, mergeable, checks| approval_disposition("head",Some("base"),base,Some("head"),mergeable,checks);
+        let pending = r#"[{"name":"tests","state":"PENDING","bucket":"pending"}]"#;
+        let green = r#"[{"name":"tests","state":"SUCCESS","bucket":"pass"},{"name":"CodeRabbit","state":"FAILURE","bucket":"fail"}]"#;
+        assert_eq!(decide(Some("base"),Some("MERGEABLE"),Some(pending)),Free("approved-awaiting-ci"));
+        assert_eq!(decide(Some("base"),Some("MERGEABLE"),Some(green)),Free("approved-awaiting-free-merge"));
+        assert_eq!(decide(None,Some("MERGEABLE"),Some(green)),Free("merge-evidence-unavailable"));
+        assert_eq!(decide(Some("base"),Some("MERGEABLE"),Some("gateway error")),Free("ci-evidence-unavailable"));
+        assert_eq!(decide(Some("new-main"),Some("MERGEABLE"),Some(green)),Repair);
+        assert_eq!(decide(Some("base"),Some("CONFLICTING"),Some(green)),Repair);
+        assert_eq!(decide(Some("base"),Some("MERGEABLE"),Some(r#"[{"name":"tests","state":"FAILURE","bucket":"fail"}]"#)),Repair);
+        assert_eq!(approval_disposition("head",None,Some("base"),Some("head"),Some("MERGEABLE"),Some(green)),Repair);
+        assert_eq!(approval_disposition("head",Some("base"),Some("base"),Some("changed"),Some("MERGEABLE"),Some(green)),Repair);
+    }
+
+    fn fixture_git(root:&Path,args:&[&str])->String {
+        let out=std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+        assert!(out.status.success(),"{:?}: {}",args,String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().into()
+    }
+
+    /// Virtual time exercises the production network reader and admission
+    /// predicate, real Git integration and a deterministic fake GitHub service.
+    /// No native model or real GitHub mutation is involved.
+    #[tokio::test]
+    async fn seventy_two_hour_five_pr_admission_and_reconciliation_soak() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path().join("repo"); std::fs::create_dir(&root).unwrap();
+        fixture_git(&root,&["init","-q","-b","main"]);
+        fixture_git(&root,&["config","user.name","Synthetic Soak"]);
+        fixture_git(&root,&["config","user.email","soak@example.invalid"]);
+        std::fs::write(root.join("base"),"base").unwrap();
+        fixture_git(&root,&["add","."]); fixture_git(&root,&["commit","-qm","base"]);
+        let base=fixture_git(&root,&["rev-parse","HEAD"]);
+        fixture_git(&root,&["update-ref","refs/remotes/origin/main",&base]);
+        let mut heads=std::collections::BTreeMap::new();
+        let mut bases=std::collections::BTreeMap::new();
+        for pr in 1..=5u64 {
+            fixture_git(&root,&["checkout","-qb",&format!("pr-{pr}"),&base]);
+            std::fs::write(root.join(format!("change-{pr}")),format!("candidate {pr}")).unwrap();
+            fixture_git(&root,&["add","."]); fixture_git(&root,&["commit","-qm","candidate"]);
+            heads.insert(pr,fixture_git(&root,&["rev-parse","HEAD"])); bases.insert(pr,base.clone());
+        }
+        let gh=dir.path().join("fake-gh");
+        std::fs::write(&gh,r#"#!/usr/bin/python3
+import json, pathlib, subprocess, sys
+root=pathlib.Path.cwd(); statefile=root.parent/'remote.json'; state=json.loads(statefile.read_text())
+args=sys.argv[1:]; pr=args[2]; row=state[pr]
+def git(*args): return subprocess.check_output(['git',*args],cwd=root,stderr=subprocess.DEVNULL,text=True).strip()
+if args[1]=='view':
+ print(json.dumps({'headRefOid':git('rev-parse','pr-'+pr),'mergeable':row['mergeable']}))
+elif args[1]=='checks':
+ if row['checks']=='unknown': print('temporary gateway failure'); sys.exit(1)
+ print(json.dumps([{'name':'tests','state':row['checks'],'bucket':{'SUCCESS':'pass','FAILURE':'fail'}.get(row['checks'],'pending')}]))
+ sys.exit(0 if row['checks']=='SUCCESS' else 8)
+elif args[1]=='merge':
+ expected=args[args.index('--match-head-commit')+1]
+ if expected!=git('rev-parse','pr-'+pr) or row['checks']!='SUCCESS' or row['mergeable']!='MERGEABLE': sys.exit(1)
+ git('checkout','main'); git('merge','--no-edit','pr-'+pr)
+ git('update-ref','refs/remotes/origin/main','HEAD'); row['merged']=True
+ statefile.write_text(json.dumps(state))
+else: sys.exit(2)
+"#).unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let statefile=dir.path().join("remote.json");
+        let mut remote:serde_json::Value=serde_json::json!({});
+        for pr in 1..=5 { remote[pr.to_string()]=serde_json::json!({"checks":"PENDING","mergeable":"MERGEABLE","merged":false}); }
+        let mut repairs=0; let mut merged=0; let mut free_holds=0; let mut finished_at=None;
+        for hour in 0..72 {
+            // Persist/reload every tick, like a controller restarted between days.
+            for pr in 1..=5 {
+                if remote[pr.to_string()]["merged"]==true { continue; }
+                remote[pr.to_string()]["checks"]=serde_json::json!(if hour>=24 {"SUCCESS"} else if pr==2 && hour%3==0 {"unknown"} else if pr==3 && hour==12 {"FAILURE"} else {"PENDING"});
+                remote[pr.to_string()]["mergeable"]=serde_json::json!(if pr==4 && hour==18 {"CONFLICTING"} else {"MERGEABLE"});
+            }
+            if hour==20 {
+                fixture_git(&root,&["checkout","pr-5"]);
+                std::fs::write(root.join("change-5"),"external changed candidate").unwrap();
+                fixture_git(&root,&["commit","-qam","external head"]);
+            }
+            std::fs::write(&statefile,serde_json::to_vec(&remote).unwrap()).unwrap();
+            for pr in 1..=5u64 {
+                remote=serde_json::from_slice(&std::fs::read(&statefile).unwrap()).unwrap();
+                if remote[pr.to_string()]["merged"]==true { continue; }
+                let main=fixture_git(&root,&["rev-parse","origin/main"]);
+                let disposition=disposition_from_remote(&root,gh.to_str().unwrap(),&heads[&pr],Some(&bases[&pr]),Some(&main),pr).await;
+                match disposition {
+                    ApprovalDisposition::Repair=>{
+                        repairs+=1;
+                        fixture_git(&root,&["checkout",&format!("pr-{pr}")]);
+                        fixture_git(&root,&["merge","--no-edit","origin/main"]);
+                        heads.insert(pr,fixture_git(&root,&["rev-parse","HEAD"])); bases.insert(pr,main);
+                        remote[pr.to_string()]["mergeable"]=serde_json::json!("MERGEABLE");
+                        remote[pr.to_string()]["checks"]=serde_json::json!(if hour>=24 {"SUCCESS"} else {"PENDING"});
+                        std::fs::write(&statefile,serde_json::to_vec(&remote).unwrap()).unwrap();
+                    }
+                    ApprovalDisposition::Free("approved-awaiting-free-merge")=>{
+                        let (ok,_,error)=run(gh.to_str().unwrap(),&["pr","merge",&pr.to_string(),"--match-head-commit",&heads[&pr]],&root).await.unwrap();
+                        assert!(ok,"fake merge failed: {error}"); merged+=1;
+                        remote=serde_json::from_slice(&std::fs::read(&statefile).unwrap()).unwrap();
+                    }
+                    ApprovalDisposition::Free(_)=>{free_holds+=1;}
+                }
+            }
+            if hour<12 { assert_eq!(repairs,0,"unchanged pending/unknown CI was billed"); }
+            if merged==5 && finished_at.is_none() { finished_at=Some(hour); }
+        }
+        assert_eq!(merged,5); assert!(finished_at.unwrap()<=28);
+        assert!(free_holds>=100); assert_eq!(repairs,13,"only 3 concrete repairs plus 10 required main integrations");
+        for pr in 1..=5 { assert!(root.join(format!("change-{pr}")).exists()); }
+    }
 
     fn approved() -> OpenedPr {
         OpenedPr {

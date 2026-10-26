@@ -69,13 +69,9 @@ pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::
             }
         }
         if let Some(verdict) = approved(&store, &candidate)? {
-            let (ok, base, _) =
-                run("git", &["ls-remote", "origin", "refs/heads/main"], repo).await?;
-            if ok
-                && verdict.structured.as_ref().is_some_and(|e| {
-                    base.split_whitespace().next() == Some(e.binding.base.as_str())
-                })
-            {
+            if let policy_hold::ApprovalDisposition::Free(reason) =
+                policy_hold::reconciliation_disposition(repo,&candidate,&verdict).await {
+                info!(pr=candidate.pr,reason,"approved adopted PR stays in free reconciliation");
                 continue;
             }
         }
