@@ -43,6 +43,10 @@ mod source_reconcile;
 mod workflow;
 #[path = "self_improve_recovery.rs"]
 mod recovery;
+#[path = "self_improve_contract.rs"]
+mod acceptance;
+#[path = "self_improve_publication.rs"]
+mod publication;
 #[path = "self_improve_review.rs"]
 mod aligned_review;
 
@@ -8419,7 +8423,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             recovery::commit_candidate(&worktree, &issue).await?;
             workflow_guard.transition(crate::autoship_workflow::Stage::Review, "candidate_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
             let review = independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                qa_ok, &review_notes, round, None, 0).await;
+                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard)).await;
             if review.available && !review.approved() {
                 warn!(
                     issue = issue.number,
@@ -8631,7 +8635,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         workflow_guard.transition(crate::autoship_workflow::Stage::Review, "revision_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
                         let previous = independent.as_ref().and_then(|r| r.structured.clone());
                         independent = Some(independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                            qa_ok, &review_notes, round, previous.as_ref(), 0).await);
+                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard)).await);
                     }
                     let verdict = match (qa_ok, independent.as_ref()) {
                         (false, _) => "QA changes requested".to_string(),
@@ -8898,36 +8902,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }).await));
     }
-    // #815 — a run killed between the push and `gh pr create` leaves the
-    // remote branch behind with no PR. `has_open_agent_pr` only looks at
-    // PRs, so the issue is picked again, and this non-fast-forward push is
-    // where it dies — after three reasoner calls and a full workspace gate,
-    // every tick, forever. The `agent-fix/` namespace is pipeline-owned and
-    // this branch has already been shown to carry no open PR, so a fresh
-    // attempt is entitled to supersede the orphan. Force only in that
-    // narrow case, and say so in the log.
-    let (mut ok, _o, mut e) = run("git", &["push", "-u", "origin", &branch], &worktree).await?;
-    if !ok && remote_branch_exists(repo_root, &branch).await {
-        warn!(
-            issue = issue.number,
-            branch = %branch,
-            "orphaned remote branch from an interrupted run; superseding it"
-        );
-        let forced = run(
-            "git",
-            &["push", "--force", "-u", "origin", &branch],
-            &worktree,
-        )
-        .await?;
-        ok = forced.0;
-        e = forced.2;
-    }
-    if !ok {
-        cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        if park_charged {
-            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
-        }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git push", &detail, &diff, lines) }).await));
+    // Compare-and-swap publication preserves concurrent remote work and
+    // reconciles successful pushes whose responses were lost.
+    if let Err(error) = workflow_guard.push(&branch).await {
+        let e = format!("{error:#}");
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
+            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines)).await));
     }
     // #1037 — the push landed, plainly or by superseding an orphan above, so
     // the remote branch is now exactly this attempt's work, built from `main`.
@@ -9067,8 +9047,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // remote head that another actor might push during PR creation.
     let (head_ok, published_head, _) = run("git", &["rev-parse", "HEAD"], &worktree).await?;
     let published_head = if head_ok { published_head.trim() } else { "" };
-    let (ok, stdout, e) = run(&gh, &args, &worktree).await?;
-    cleanup(worktree, branch.clone(), repo_root.to_path_buf()).await;
+    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, &args).await;
+    let (ok, stdout, e) = match created {
+        Ok(created) => (true, created.url, String::new()),
+        Err(error) => (false, String::new(), format!("{error:#}")),
+    };
+    cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
     if !ok {
         // #815 — the branch is pushed but has no PR. Left as an `Err` this
         // re-picks the same issue next tick and dies at the push above.
@@ -9087,6 +9071,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         } else {
             None
         };
+        if let Some(ref receipt) = verdict {
+            workflow_guard.record_review("publication-review", independent.approved(), &serde_json::to_string(receipt)?)?;
+        }
         opened_prs::record(issue.number, n, published_head, verdict);
     }
     if independent.available && !independent.notes.is_empty() {
@@ -9114,6 +9101,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             reason.headline()
         ))
         .await;
+        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_parked", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: parked as draft PR ({}) — {pr_url}",
             issue.number,
@@ -9128,6 +9117,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             truncate(&merge_note, 300)
         ))
         .await;
+        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",
             issue.number
@@ -9232,28 +9223,36 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         || head_sha != published_head
         || checks_green(repo_root, pr_number.unwrap()).await != Some(true)
     {
+        workflow_guard.transition(crate::autoship_workflow::Stage::AwaitChecks, "ci_pending", "reconcile_checks", chrono::Utc::now().timestamp_millis()).await?;
+        workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: approved PR awaiting current-head CI; merge sweep will retry — {pr_url}",
             issue.number
         )));
     }
+    if source_reconcile::reconcile(repo_root, pr_number.unwrap(), issue.number, false).await
+        != source_reconcile::SourceAction::Continue {
+        return Ok(RunReport::built(format!("issue #{}: source changed before merge; reconciliation retained — {pr_url}", issue.number)));
+    }
+    workflow_guard.validate_binding(workflow_guard.binding()).await?;
+    let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
     let (ok, _o, e) = run(
         &gh,
-        &["pr", "merge", &branch, "--squash", "--delete-branch", "--match-head-commit", published_head],
+        &["pr", "merge", &branch, "--squash", "--match-head-commit", published_head],
         repo_root,
     )
     .await?;
-    let merged_anyway = match pr_number {
-        Some(n) if !ok => pr_is_merged(repo_root, n).await,
-        _ => false,
-    };
-    if !ok && !merged_anyway {
-        warn!(issue = issue.number, "auto-merge failed; PR left open: {e}");
+    let merged_observed = publication::merged_exact(repo_root, pr_number.unwrap(), published_head).await;
+    if !merged_observed {
+        warn!(issue = issue.number, command_ok=ok, "auto-merge not confirmed; preserving pending intent: {e}");
         return Ok(RunReport::built(format!(
             "issue #{}: PR opened but auto-merge FAILED (left open for review) — {pr_url}",
             issue.number
         )));
     }
+    workflow_guard.observe_remote(&merge_intent, &format!("github-merged:{}", pr_number.unwrap()), pr_number)?;
+    workflow_guard.transition(crate::autoship_workflow::Stage::Merged, "merge_observed", "complete", chrono::Utc::now().timestamp_millis()).await?;
+    workflow_guard.finish()?;
     notify_review(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
     Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
