@@ -117,6 +117,37 @@ class GatewayTests(unittest.TestCase):
             if frame['type'] in ('gateway_end', 'gateway_error'):
                 return frames
 
+    def test_exact_metadata_route_is_get_only_and_never_inference(self):
+        raw = policy(self.port)
+        path = '/backend-api/wham/accounts/check'
+        route = {'path_prefix': path, 'exact': True, 'methods': ['GET'], 'websocket': False}
+        raw['authorities'][0]['routes'] = [route]
+        host = g.HostGateway(raw, self.responses.put)
+        authority = f'127.0.0.1:{self.port}'
+        try:
+            host.policy.admit(authority, 'GET', path + '?private=value')
+            for method, candidate, websocket in [('GET', path + '/child', False),
+                    ('GET', path + 's', False), ('POST', path, False), ('GET', path, True)]:
+                with self.assertRaises(g.Denied):
+                    host.policy.admit(authority, method, candidate, websocket)
+                with self.assertRaises(g.Denied):
+                    host.record_exchange({'id': 'denied', 'authority': authority, 'method': method,
+                        'path': candidate, 'websocket': websocket}, [], 200, 1, 1, True)
+            host.record_exchange({'id': 'metadata', 'authority': authority, 'method': 'GET',
+                'path': path + '?private=value'}, [['Authorization', 'Bearer fixture']], 200, 1, 10, True)
+            row = host.transport_receipt()['exchanges'][0]
+            self.assertFalse(row['successful'])
+            self.assertIsNone(row['inference'])
+            expected = hashlib.sha256(json.dumps([authority, route], sort_keys=True,
+                separators=(',', ':')).encode()).hexdigest()
+            self.assertEqual(row['route_sha256'], expected)
+        finally:
+            host.close()
+        for invalid in (1, 0, 'true', None, []):
+            route['exact'] = invalid
+            with self.assertRaises(g.Denied):
+                g.Policy(raw)
+
     def test_request_exact_bytes_credentials_forwarded_not_diagnostic(self):
         self.host.receive(dict(type='gateway_open', id='request', authority=f'127.0.0.1:{self.port}', method='POST',
             path='/v1/messages', headers=[['Authorization', 'Bearer fixture-private'], ['Content-Length', '999']]))

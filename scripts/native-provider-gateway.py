@@ -116,6 +116,8 @@ class Policy:
                 raise Denied('policy')
             for route in entry['routes']:
                 prefix = route.get('path_prefix')
+                if 'exact' in route and not isinstance(route['exact'], bool):
+                    raise Denied('policy')
                 if path_value(prefix) != prefix or '?' in prefix or prefix == '/':
                     raise Denied('policy')
                 if not route.get('methods') or any(m not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS') for m in route['methods']):
@@ -135,6 +137,14 @@ class Policy:
             raise Denied('policy')
         return value
 
+    @staticmethod
+    def route_matches(route, method, decoded, websocket=False):
+        prefix = route['path_prefix']
+        matches = decoded == prefix if route.get('exact', False) else (
+            decoded.startswith(prefix) if prefix.endswith('/') else
+            decoded == prefix or decoded.startswith(prefix + '/'))
+        return matches and method in route['methods'] and (not websocket or route.get('websocket', False))
+
     def admit(self, auth, method, path, websocket=False):
         key, _, _ = authority(auth)
         entry = self.authorities.get(key)
@@ -142,9 +152,7 @@ class Policy:
         if entry is None:
             raise Denied('authority')
         for route in entry['routes']:
-            prefix = route['path_prefix']
-            matches = decoded.startswith(prefix) if prefix.endswith('/') else decoded == prefix or decoded.startswith(prefix + '/')
-            if matches and method in route['methods'] and (not websocket or route.get('websocket', False)):
+            if self.route_matches(route, method, decoded, websocket):
                 return key, entry
         raise Denied('route')
 
@@ -305,10 +313,8 @@ class HostGateway:
     def record_exchange(self, request, headers, status, request_bytes, response_bytes, completed):
         key, entry = self.policy.admit(request['authority'], request['method'], request['path'], request.get('websocket', False))
         path = path_value(request['path'])
-        route = next(route for route in entry['routes'] if request['method'] in route['methods']
-            and (path.startswith(route['path_prefix']) if route['path_prefix'].endswith('/') else
-                 path == route['path_prefix'] or path.startswith(route['path_prefix'] + '/'))
-            and (not request.get('websocket', False) or route.get('websocket', False)))
+        route = next(route for route in entry['routes'] if self.policy.route_matches(
+            route, request['method'], path, request.get('websocket', False)))
         route_id = hashlib.sha256(json.dumps([key, route], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         inference = {'/v1/responses': 'responses', '/backend-api/codex/responses': 'responses',
                      '/responses': 'responses', '/v1/chat/completions': 'chat_completions',
