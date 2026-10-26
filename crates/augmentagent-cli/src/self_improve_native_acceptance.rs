@@ -45,7 +45,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
         .tempdir_in("/tmp")?;
     let root = fixture.path().join("candidate");
     std::fs::create_dir(&root)?;
-    git(&root, &["init", "-q"]).await?;
+    git(&root, &["init", "-q", "-b", "disposable"]).await?;
     git(&root, &["config", "user.name", "Disposable Autoship Probe"]).await?;
     git(&root, &["config", "user.email", "probe@example.invalid"]).await?;
     std::fs::write(
@@ -93,6 +93,11 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
         "Scope issue #840: {requirement} Preserve this criterion verbatim. The only implementation change needed is arithmetic.py. Declare arithmetic.py and rules.rs as allowed FILE paths (rules.rs is reserved for a later diagnostic and must not change in this repair). Supply a pinned Python behavior adapter that prints JSON results for mixed-sign and zero integer inputs; put expected results only in the controller black_box oracle, never child assertions. Do not request Rust builds: Rust files are supporting fixture evidence only.\n{}",acceptance::CONTRACT_PROMPT)).await?;
     let builder =
         augmentagent_channel_core::build_pinned(Codex).context("native Codex unavailable")?;
+    // Match fresh production dispatch: native-session observation does not
+    // replace the durable provider authorship needed for review selection.
+    let branch = git(&root, &["symbolic-ref", "--short", "HEAD"]).await?;
+    builder.track_review_history(&root, &branch, false)?;
+    guard.bind_reasoner(builder.as_ref())?;
     let prepared = acceptance::prepare_acceptance(
         &root,
         &root,
@@ -119,10 +124,16 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     let session = augmentagent_channel_core::native_session::FreshBuilderSessions::new();
     session.scope(builder.call(&opts,"Fix arithmetic.py so add(a,b) returns the arithmetic sum. Use the guarded file tools to edit the actual file. Do not modify verifier files, rules.rs, shipping.rs, or Git metadata. Do not invoke cargo/npm or install anything; controller runs the Python verifier and commits. Return a concise summary after editing.")).await?;
     guard.audit_health().await?;
+    guard.record_episode_sessions(&session)?;
     let builders = session.observed();
     assert!(
         !builders.is_empty(),
         "no actual native builder transport session observed"
+    );
+    assert_eq!(
+        builder.review_authors()?,
+        Some(vec![Codex]),
+        "actual mutation dispatch must persist builder provenance before alignment"
     );
     assert_eq!(std::fs::read_to_string(root.join("rules.rs"))?,"pub fn checks_complete(done: usize, total: usize) -> bool { total > 0 && done == total }\n");
     git(&root, &["add", "."]).await?;
