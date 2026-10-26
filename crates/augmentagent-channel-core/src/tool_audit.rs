@@ -301,6 +301,10 @@ pub fn default_audit_log_path() -> PathBuf {
 pub struct AuditLogger {
     path: PathBuf,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
+    failure_path: Option<PathBuf>,
+    pending_dir: Option<PathBuf>,
+    pending_writers: Arc<std::sync::atomic::AtomicUsize>,
+    writers_changed: Arc<tokio::sync::Notify>,
     audit_failed: Arc<std::sync::atomic::AtomicBool>,
     /// When this process last ran a retention pass (#1004). `None` in the
     /// field below means this logger never prunes at all.
@@ -317,6 +321,37 @@ pub struct AuditLogger {
     write_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Debug)]
+pub struct AuditWriteGuard {
+    logger: AuditLogger,
+    pending: Option<PathBuf>,
+    completed: bool,
+}
+impl AuditWriteGuard {
+    pub fn complete(mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for AuditWriteGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            if let Some(path) = &self.pending {
+                let result = std::fs::remove_file(path)
+                    .and_then(|_| std::fs::File::open(path.parent().unwrap())?.sync_all());
+                if result.is_err() {
+                    self.logger.mark_failed();
+                }
+            }
+        } else {
+            self.logger.mark_failed();
+        }
+        self.logger
+            .pending_writers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.logger.writers_changed.notify_waiters();
+    }
+}
+
 impl AuditLogger {
     /// Build a logger writing to the given path. Use
     /// [`default_audit_log_path`] for the standard location.
@@ -324,6 +359,10 @@ impl AuditLogger {
         Self {
             path,
             anchored: None,
+            failure_path: None,
+            pending_dir: None,
+            pending_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            writers_changed: Arc::new(tokio::sync::Notify::new()),
             audit_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_prune: Arc::new(Mutex::new(None)),
             manages_retention: false,
@@ -338,10 +377,26 @@ impl AuditLogger {
         anchor: PathBuf,
         writable_roots: &[PathBuf],
     ) -> anyhow::Result<Self> {
+        let failure_path = anchor.with_extension("failure");
+        let pending_dir = anchor.with_extension("pending");
+        std::fs::create_dir_all(&pending_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            anyhow::ensure!(
+                !std::fs::symlink_metadata(&pending_dir)?
+                    .file_type()
+                    .is_symlink(),
+                "audit pending directory is a symlink"
+            );
+            std::fs::set_permissions(&pending_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let anchored =
             crate::audit_chain::AnchoredAudit::new(path.clone(), anchor, writable_roots)?;
         Ok(Self {
             anchored: Some(anchored),
+            failure_path: Some(failure_path),
+            pending_dir: Some(pending_dir),
             ..Self::new(path)
         })
     }
@@ -349,32 +404,153 @@ impl AuditLogger {
     /// Autoship must propagate this failure into workflow evidence rather than
     /// issuing LGTM when its audit cannot be persisted or verified.
     pub async fn record_checked(&self, record: &AuditRecord) -> anyhow::Result<()> {
+        self.record_value_checked(serde_json::to_value(record)?)
+            .await
+    }
+
+    /// Controller receipts have their own actor kind, never a fictional model.
+    pub fn record_controller(&self, value: serde_json::Value) -> anyhow::Result<()> {
+        let sink = self
+            .anchored
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("protected audit required"))?;
+        let ticket = self.begin_write()?;
+        let result = sink.append(value);
+        if result.is_err() {
+            self.mark_failed();
+        }
+        ticket.complete();
+        result
+    }
+
+    async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
         let sink = self
             .anchored
             .clone()
             .ok_or_else(|| anyhow::anyhow!("protected audit required"))?;
-        let result = async {
-            let value = serde_json::to_value(record)?;
-            tokio::task::spawn_blocking(move || sink.append(value)).await??;
-            Ok::<(), anyhow::Error>(())
-        }
+        let ticket = self.begin_write()?;
+        let logger = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let result = sink.append(value);
+            if result.is_err() {
+                logger.mark_failed();
+            }
+            ticket.complete();
+            result
+        })
         .await;
-        if result.is_err() {
-            self.audit_failed
-                .store(true, std::sync::atomic::Ordering::Release);
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.mark_failed();
+                Err(error.into())
+            }
         }
-        result
     }
 
-    /// A failed append remains visible even if a later append succeeds.
-    /// Call after draining all audit writer tasks, before issuing LGTM.
+    fn mark_failed(&self) {
+        self.audit_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(path) = &self.failure_path {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            if let Ok(mut file) = options.open(path) {
+                let _ = file
+                    .write_all(b"workflow audit continuity failed; reconcile before approval\n");
+                let _ = file.sync_all();
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+                }
+            }
+        }
+    }
+
+    /// Register BEFORE spawning a writer. Durable tickets survive cancellation
+    /// and process death; a restarted logger cannot silently forget lost rows.
+    pub fn begin_write(&self) -> anyhow::Result<AuditWriteGuard> {
+        let pending = if let Some(dir) = &self.pending_dir {
+            let path = dir.join(uuid::Uuid::new_v4().to_string());
+            let result = (|| -> anyhow::Result<()> {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                }
+                options.open(&path)?.sync_all()?;
+                std::fs::File::open(dir)?.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.mark_failed();
+                return Err(error);
+            }
+            Some(path)
+        } else {
+            None
+        };
+        self.pending_writers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(AuditWriteGuard {
+            logger: self.clone(),
+            pending,
+            completed: false,
+        })
+    }
+
+    pub async fn drain_checked(&self) -> anyhow::Result<()> {
+        loop {
+            let changed = self.writers_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .pending_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                break;
+            }
+            changed.await;
+        }
+        if self.anchored.is_some() {
+            self.protected_health()?;
+        }
+        Ok(())
+    }
+
     pub fn protected_health(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.anchored.is_some(), "protected audit required");
         anyhow::ensure!(
-            !self.audit_failed.load(std::sync::atomic::Ordering::Acquire),
+            !self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
+                && !self.failure_path.as_ref().is_some_and(|p| p.exists()),
             "workflow audit lost a record"
         );
-        Ok(())
+        anyhow::ensure!(
+            self.pending_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "workflow audit writers have not drained"
+        );
+        if let Some(dir) = &self.pending_dir {
+            anyhow::ensure!(
+                std::fs::read_dir(dir)?.next().is_none(),
+                "workflow audit has interrupted writer receipts"
+            );
+        }
+        let result = self.anchored.as_ref().unwrap().append(serde_json::json!({
+            "actor": "controller", "kind": "audit_integrity_check"
+        }));
+        if result.is_err() {
+            self.mark_failed();
+        }
+        result
     }
 
     /// The process-wide logger every preset shares (#1004). One instance so
@@ -983,5 +1159,47 @@ mod tests {
         assert_eq!(parsed1.tool, "Write");
         assert_eq!(parsed2.tool, "Bash");
         assert_eq!(parsed2.exit_code, Some(0));
+    }
+    fn protected_fixture() -> (tempfile::TempDir, AuditLogger, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::create_dir(dir.path().join("anchors")).unwrap();
+        let log = dir.path().join("logs/workflow.log");
+        let anchor = dir.path().join("anchors/workflow.json");
+        let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
+        (dir, logger, log, anchor)
+    }
+
+    #[tokio::test]
+    async fn protected_drain_waits_for_registered_writer() {
+        let (_dir, logger, _, _) = protected_fixture();
+        let ticket = logger.begin_write().unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), logger.drain_checked())
+                .await
+                .is_err()
+        );
+        ticket.complete();
+        logger.drain_checked().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_audit_writer_blocks_approval_after_restart() {
+        let (_dir, logger, log, anchor) = protected_fixture();
+        drop(logger.begin_write().unwrap());
+        assert!(logger.drain_checked().await.is_err());
+        let reopened = AuditLogger::protected(log, anchor, &[]).unwrap();
+        assert!(reopened.protected_health().is_err());
+    }
+
+    #[tokio::test]
+    async fn truncated_protected_log_fails_after_restart() {
+        let (_dir, logger, log, anchor) = protected_fixture();
+        logger
+            .record_controller(serde_json::json!({"actor":"controller","kind":"verified"}))
+            .unwrap();
+        std::fs::write(&log, b"").unwrap();
+        let reopened = AuditLogger::protected(log, anchor, &[]).unwrap();
+        assert!(reopened.drain_checked().await.is_err());
     }
 }
