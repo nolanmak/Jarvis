@@ -197,3 +197,22 @@ async fn finalization_timeout_drops_the_socket() {
     assert_eq!(finish.await.unwrap().err(), Some(LiveError::CloseTimeout));
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn secure_connection_reports_tls_failure_without_panicking() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("wss://localhost:{}/", listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = [0; 4096];
+        let _ = tcp.read(&mut buf).await;
+        let _ = tcp.write_all(b"invalid TLS").await;
+    });
+    let result = tokio::spawn(async move {
+        LiveConnection::connect_test(&endpoint, "synthetic-key", "silent").await
+    }).await;
+    server.abort();
+    assert!(result.is_ok(), "TLS provider selection panicked");
+    assert!(matches!(result.unwrap(), Err(LiveError::ConnectionLost)));
+}

@@ -1,5 +1,6 @@
 //! Explicit local-operator recovery. Never exposed through model tools and never
-//! clears uncertain creates, resets retry counters, dials, or requests hangup.
+//! clears uncertain provider creates, resets retry counters, dials, or requests hangup.
+//! Unfinished Live preflights can be sealed and retired before any provider create.
 use crate::{Clock, Error, FinalUsage, ProviderError, Telephony};
 use augmentagent_store::{
     phone::{CallState, ProviderUsage},
@@ -25,10 +26,13 @@ pub async fn reconcile(
     call_id: &str,
 ) -> Result<RecoveryOutcome, Error> {
     let call = store.phone_provider_call(call_id)?;
-    if store.phone_usage(call_id)?.is_some() {
+    if store.phone_usage(call_id)?.is_some() || (call.state.terminal() && call.provider_sid.is_none()) {
         return Ok(RecoveryOutcome::AlreadyFinalized);
     }
     let Some(sid) = call.provider_sid else {
+        if store.phone_recover_abandoned_preflight(call_id, clock.now_ms())? {
+            return Ok(RecoveryOutcome::Finalized);
+        }
         return Ok(RecoveryOutcome::UnknownProviderId);
     };
     let result = tokio::time::timeout(
