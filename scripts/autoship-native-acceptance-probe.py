@@ -4,12 +4,14 @@
 Build the test binary through cargo-managed.sh first. This launcher never builds,
 changes the production daemon, or publishes to GitHub. The adoption probe uses
 real Git/native models but simulated GitHub; the issue probe simulates only its
-remote-main identity lookup. Provider authentication stays with the normal CLI.
+remote-main identity lookup. An explicit private VM policy supplies declared
+provider credentials; no required-workflow host transport fallback is allowed.
 """
 import argparse
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 import subprocess
 import tempfile
@@ -27,10 +29,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("probe", choices=TESTS)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--vm-policy", type=Path, required=True,
+                        help="private disposable native VM policy prepared for this probe")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("binary must be an existing executable managed test artifact")
+    policy = args.vm_policy.resolve(strict=True)
+    info = policy.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        parser.error("VM policy must be a private file owned by the current user")
+    policy_digest = hashlib.sha256(policy.read_bytes()).hexdigest()
     os.umask(0o077)
     root = Path(tempfile.mkdtemp(prefix="autoship-native-acceptance-", dir="/tmp"))
     for name in ("state", "cache", "builder", "gate"):
@@ -42,7 +51,8 @@ def main():
         "AUGMENTAGENT_AUTOPR_REVIEWERS": "codex",
         "AUGMENTAGENT_AUTOPR_OBSERVATION_CALL_CAP": "32",
         "AUGMENTAGENT_GATE_MIN_FREE_GB": "0", "AUGMENTAGENT_GATE_BUILD_GROWTH_GB": "0",
-        "AUGMENTAGENT_RUN_RESOURCES": "1", "AUGMENTAGENT_RUN_MEMORY_BYTES": "1073741824",
+        "AUGMENTAGENT_NATIVE_VM_POLICY": str(policy),
+        "AUGMENTAGENT_RUN_RESOURCES": "1", "AUGMENTAGENT_RUN_MEMORY_BYTES": "2147483648",
         "AUGMENTAGENT_RUN_PIDS": "128", "AUGMENTAGENT_RUN_CPU_PERCENT": "100",
         "CARGO_BUILD_JOBS": "1", "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0", "CARGO_INCREMENTAL": "0", "PATH": os.environ["PATH"],
@@ -60,7 +70,7 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
         env["GH_BIN"] = str(gh)
     unit = "augmentagent-native-" + root.name.removeprefix("autoship-native-acceptance-")
     command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", f"--unit={unit}"]
-    for value in ("Delegate=cpu memory pids", "DelegateSubgroup=daemon", "MemoryMax=2G", "TasksMax=256", "CPUQuota=200%"):
+    for value in ("Delegate=cpu memory pids", "DelegateSubgroup=daemon", "MemoryMax=3G", "TasksMax=256", "CPUQuota=200%"):
         command += ["-p", value]
     command += [f"--setenv={key}={value}" for key, value in env.items()]
     command += ["/usr/bin/env"]
@@ -79,7 +89,7 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
     print(f"Evidence: {root}", flush=True)
     with (root / "transcript.log").open("w") as log:
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
-    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": digest.hexdigest(), "exit_code": result.returncode, "no_production_mutation": True}, indent=2) + "\n")
+    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": digest.hexdigest(), "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": result.returncode, "no_production_mutation": True}, indent=2) + "\n")
     print(f"Exit: {result.returncode}; transcript: {root / 'transcript.log'}", flush=True)
     return result.returncode
 
