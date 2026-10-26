@@ -177,6 +177,7 @@ def main():
             save()
         if key in checkpoint['done']:
             assert checkpoint['done'][key]['head'] == head
+            log = root / checkpoint['done'][key]['log']
             assert log.exists() and '1 passed' in log.read_text()
             print(f'Reusing verified stage {key}', flush=True)
             return
@@ -184,10 +185,13 @@ def main():
         env = dict(os.environ, AUTOSHIP_GITHUB_PROBE_REPOSITORY=repository,
                    AUTOSHIP_GITHUB_PROBE_ROOT=str(repo_root), AUTOSHIP_GITHUB_PROBE_MODE=mode,
                    AUTOSHIP_GITHUB_PROBE_PR=pr, AUTOSHIP_GITHUB_PROBE_HEAD=head, **extra)
+        log = root / f'{key}-attempt-{uuid.uuid4().hex[:12]}.log'
         result = subprocess.run([str(binary), '--exact', TEST, '--ignored', '--nocapture'],
                                 env=env, text=True, capture_output=True, timeout=600)
         output = result.stdout + '\n' + result.stderr
         log.write_text(output)
+        checkpoint.setdefault('attempts', []).append({'stage': key, 'head': head, 'log': log.name, 'exit': result.returncode})
+        save()
         if result.returncode or '1 passed' not in output:
             raise RuntimeError(f'probe {key} failed; retained exact error evidence at {log}')
         checkpoint['done'][key] = {'head': head, 'log': log.name}
@@ -197,40 +201,65 @@ def main():
     b, bh = create('advance-main', seed)
     probe('accepted', b, bh)
     probe('stale', a, ah)
-    if 'race' not in checkpoint:
-        git('fetch', 'origin')
-        git('checkout', 'candidate-a')
-        git('merge', '--no-edit', 'origin/main')
-        git('push')
-        wait(a)
-        ah = git('rev-parse', 'HEAD')
-        checkpoint['race'] = {'before': ah, 'after': None}
+    # An interrupted old-head race may already have advanced its ref. Preserve
+    # that experiment and use a new synthetic PR; never rewind the prior ref.
+    active = checkpoint.get('active_race')
+    if active and active.get('pr') and active.get('before'):
+        key = f"{active['pr']}-head-race"
+        observed = gh('pr', 'view', active['pr'], '--repo', repository, '--json', 'headRefOid', '--jq', '.headRefOid')
+        if key not in checkpoint['done'] and observed != active['before']:
+            checkpoint.setdefault('retired_races', []).append(active)
+            checkpoint.pop('active_race')
+            save()
+    if 'active_race' not in checkpoint:
+        checkpoint['active_race'] = {'branch': f"head-race-{uuid.uuid4().hex[:8]}"}
         save()
-    ah = checkpoint['race']['before']
-    if checkpoint['race']['after'] is None:
-        git('checkout', 'candidate-a')
-        if not (repo_root / 'race.txt').exists():
-            (repo_root / 'race.txt').write_text('synthetic concurrent candidate update\n')
-            git('add', 'race.txt')
+    active = checkpoint['active_race']
+    race_pr, race_before = create(active['branch'])
+    active.update(pr=race_pr, before=race_before)
+    save()
+    if not active.get('after'):
+        git('checkout', active['branch'])
+        path = repo_root / f"{active['branch']}-update.txt"
+        if not path.exists():
+            path.write_text('synthetic concurrent candidate update\n')
+            git('add', path.name)
             git('commit', '-m', 'Synthetic head race')
         race = git('rev-parse', 'HEAD')
-        assert race != ah
-        git('push', 'origin', 'HEAD:refs/heads/race-object')
-        checkpoint['race']['after'] = race
+        assert race != race_before
+        git('push', 'origin', f"HEAD:refs/heads/{active['branch']}-object")
+        active['after'] = race
         save()
-    race = checkpoint['race']['after']
-    probe('head-race', a, ah, AUTOSHIP_GITHUB_PROBE_BRANCH='candidate-a', AUTOSHIP_GITHUB_PROBE_RACE_HEAD=race)
-    wait(a)
-    probe('accepted', a, race)
+    race = active['after']
+    probe('head-race', race_pr, race_before, AUTOSHIP_GITHUB_PROBE_BRANCH=active['branch'], AUTOSHIP_GITHUB_PROBE_RACE_HEAD=race)
+    wait(race_pr)
+    probe('accepted', race_pr, race)
     lost, lh = create('lost-response')
     probe('lost', lost, lh)
     manual, mh = create('external-merge')
     if gh('pr', 'view', manual, '--repo', repository, '--json', 'state', '--jq', '.state') != 'MERGED':
         gh('pr', 'merge', manual, '--repo', repository, '--squash', '--match-head-commit', mh)
     probe('manual', manual, mh)
+    concurrent = checkpoint.get('active_manual_race')
+    if concurrent and concurrent.get('pr'):
+        key = f"{concurrent['pr']}-manual-race"
+        observed = gh('pr', 'view', concurrent['pr'], '--repo', repository, '--json', 'state', '--jq', '.state')
+        if key not in checkpoint['done'] and observed == 'MERGED':
+            checkpoint.setdefault('retired_manual_races', []).append(concurrent)
+            checkpoint.pop('active_manual_race')
+            save()
+    if 'active_manual_race' not in checkpoint:
+        checkpoint['active_manual_race'] = {'branch': f"external-race-{uuid.uuid4().hex[:8]}"}
+        save()
+    concurrent = checkpoint['active_manual_race']
+    concurrent_pr, concurrent_head = create(concurrent['branch'])
+    concurrent.update(pr=concurrent_pr, head=concurrent_head)
+    save()
+    probe('manual-race', concurrent_pr, concurrent_head)
     (root / 'result.json').write_text(json.dumps({'repository': repository, 'passed': True,
         'assertions': ['strict-base-rejection', 'head-race-rejection', 'own-receipt',
-                       'lost-response-no-replay-no-attribution', 'external-merge-no-attribution']}))
+                       'lost-response-no-replay-no-attribution', 'external-merge-no-attribution',
+                       'concurrent-external-merge-no-attribution']}))
     print(f'PASS: {repository}; retained evidence: {root}')
 
 

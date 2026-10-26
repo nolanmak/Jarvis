@@ -7,6 +7,8 @@ struct ProbeTransport<'a> {
     repository: String,
     race: Option<(String, String)>,
     discard: bool,
+    pr: u64,
+    external_merge: bool,
     mutations: usize,
 }
 #[async_trait::async_trait]
@@ -17,6 +19,32 @@ impl Github for ProbeTransport<'_> {
                 self.real.call(&["api", "--method", "PATCH",
                     &format!("repos/{}/git/refs/heads/{branch}", self.repository),
                     "-f", &format!("sha={head}"), "-F", "force=false"]).await?;
+                // Establish a mergeable NEW candidate before submitting the OLD
+                // expectedHeadOid. Otherwise pending checks mask the CAS boundary.
+                let mut ready=false;
+                for _ in 0..120 {
+                    let pull:serde_json::Value=serde_json::from_str(&self.real.call(&["api",
+                        &format!("repos/{}/pulls/{}",self.repository,self.pr)]).await?)?;
+                    let checks:serde_json::Value=serde_json::from_str(&self.real.call(&["pr","view",
+                        &self.pr.to_string(),"--json","headRefOid,statusCheckRollup"]).await?)?;
+                    let rows=checks["statusCheckRollup"].as_array().context("missing checks")?;
+                    let green=["privacy","node-release"].iter().all(|name| {
+                        let matching:Vec<_>=rows.iter().filter(|row|row["name"]==*name).collect();
+                        !matching.is_empty() && matching.iter().all(|row|row["status"]=="COMPLETED" && row["conclusion"]=="SUCCESS")
+                    });
+                    if pull["head"]["sha"]==head && checks["headRefOid"]==head && pull["mergeable"]==true
+                        && pull["mergeable_state"]=="clean" && green {ready=true;break;}
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                anyhow::ensure!(ready,"new race head did not become clean with completed checks");
+                println!("head-race new candidate clean before old-head mutation: {head}");
+            }
+            if self.external_merge {
+                self.external_merge=false;
+                // This action happens AFTER the controller's OPEN/head preflight.
+                // It deliberately bypasses only our receipt, never GitHub policy.
+                self.real.call(&["pr","merge",&self.pr.to_string(),"--squash"]).await?;
+                println!("external merge completed after controller preflight");
             }
             self.mutations += 1;
             let response = self.real.call(args).await?;
@@ -45,7 +73,7 @@ async fn disposable_github_merge_boundary() -> Result<()> {
     anyhow::ensure!(metadata["description"] == "Synthetic autoship acceptance fixture; no production source or credentials.", "fixture marker missing");
     let state = root.join(format!("probe-{pr}-{mode}.sqlite3"));
     let mut store = WorkflowStore::open(&state)?;
-    let id = format!("github-probe/{repository}/{pr}/{mode}");
+    let id = format!("github-probe/{repository}/{pr}/{mode}/{}",uuid::Uuid::new_v4());
     let binding = Binding {head:head.clone(),contract:"synthetic-publication-boundary".into(),evidence_hash:head.clone()};
     let now = chrono::Utc::now().timestamp_millis();
     store.register(&id,"fixture",binding.clone(),now)?;
@@ -53,7 +81,7 @@ async fn disposable_github_merge_boundary() -> Result<()> {
     store.attach_pr(&lease,pr,now)?;
     let operation = store.begin_operation(&lease,OperationKind::MergePr,&binding,now)?;
     let race = if mode == "head-race" { Some((std::env::var("AUTOSHIP_GITHUB_PROBE_BRANCH")?,std::env::var("AUTOSHIP_GITHUB_PROBE_RACE_HEAD")?)) } else { None };
-    let mut transport = ProbeTransport {real,repository:repository.clone(),race,discard:mode=="lost",mutations:0};
+    let mut transport = ProbeTransport {real,repository:repository.clone(),race,discard:mode=="lost",pr,external_merge:mode=="manual-race",mutations:0};
     if mode == "stale" {
         require_strict_integration(&mut transport,&repository).await?;
         let compare: serde_json::Value = serde_json::from_str(&transport.call(&["api",
@@ -102,6 +130,14 @@ async fn disposable_github_merge_boundary() -> Result<()> {
                 anyhow::ensure!(transport.mutations==1,"own merge count mismatch");
             },
             "lost" => { anyhow::ensure!(result.is_err() && transport.mutations==1,"lost-response fault not exercised"); },
+            "manual-race" => {
+                anyhow::ensure!(transport.mutations==1,"external race never reached own mutation");
+                match result {
+                    Ok(Some(receipt)) => anyhow::bail!("ATTRIBUTION BUG: externally merged PR yielded own receipt: {receipt:?}"),
+                    Ok(None) => (),
+                    Err(error) => println!("own mutation after external merge refused: {error:#}"),
+                }
+            },
             "manual" => { anyhow::ensure!(result?.is_none() && transport.mutations==0,"already merged candidate attributed to controller"); },
             _ => anyhow::bail!("unknown probe mode"),
         }
