@@ -127,6 +127,19 @@ fn choose_round_robin(
     Ok(Some(chosen))
 }
 
+fn reserve_source_less(
+    path: &Path,
+    fair_path: &Path,
+    eligible: Vec<adoption::AdoptedPr>,
+    dry_run: bool,
+) -> Result<Option<adoption::AdoptedPr>> {
+    let selected = choose_round_robin(path, eligible, dry_run)?;
+    if selected.is_some() && !dry_run {
+        FairSched::update_persist(fair_path, |fair| fair.reserve_resume());
+    }
+    Ok(selected)
+}
+
 pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::AdoptedPr>> {
     let candidates = discover(repo, dry_run).await?;
     let store = WorkflowStore::open(&workflow::path())?;
@@ -162,7 +175,7 @@ pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::
         }
         eligible.push(candidate);
     }
-    choose_round_robin(&workflow::path(), eligible, dry_run)
+    reserve_source_less(&workflow::path(), &fair_sched_path(), eligible, dry_run)
 }
 
 pub(super) async fn resume(
@@ -967,6 +980,41 @@ mod fairness_tests {
             seen,
             vec![10, 20, 30, 10],
             "oldest failure must not monopolize subsequent ticks"
+        );
+    }
+    #[test]
+    fn source_less_failed_reservations_yield_reserved_build_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let fair = dir.path().join("fair.json");
+        let mut turns = vec![];
+        for _ in 0..4 {
+            if prefer_build_now(Lane::Combined, true, &FairSched::load(&fair), 2) {
+                turns.push("fresh-issue".to_owned());
+                FairSched::update_persist(&fair, |state| state.record_billed(false));
+            } else {
+                let pr = reserve_source_less(
+                    &path,
+                    &fair,
+                    vec![candidate(10), candidate(20), candidate(30)],
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                turns.push(format!("pr-{}", pr.pr));
+                // Model a failed preflight: no successful/billed RunReport.
+            }
+        }
+        assert_eq!(turns, vec!["pr-10", "pr-20", "fresh-issue", "pr-30"]);
+        let before = std::fs::read(&fair).unwrap();
+        assert!(reserve_source_less(&path, &fair, vec![], false)
+            .unwrap()
+            .is_none());
+        reserve_source_less(&path, &fair, vec![candidate(40)], true).unwrap();
+        assert_eq!(
+            std::fs::read(&fair).unwrap(),
+            before,
+            "held or dry-run heads cannot consume scheduling debt"
         );
     }
     #[test]

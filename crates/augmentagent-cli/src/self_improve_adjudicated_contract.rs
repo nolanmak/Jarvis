@@ -228,7 +228,7 @@ pub(crate) async fn apply(
                 if let Some(pr) = workflow.pr()? {
                     if let Ok((true, raw, _)) = run(
                         "gh",
-                        &["pr", "view", &pr.to_string(), "--json", "headRefOid,body"],
+                        &["pr", "view", &pr.to_string(), "--json", "headRefOid,title,body"],
                         worktree,
                     )
                     .await
@@ -251,7 +251,7 @@ pub(crate) async fn apply(
                                 None
                             };
                             evidence.push(serde_json::json!({"kind":"adjudicated_dependency","remote_head":remote["headRefOid"],
-                                "pr_body_hash":amendment::digest(remote["body"].as_str().unwrap_or("").as_bytes()),"request_hash":request_hash}).to_string());
+                                "pr_body_hash":amendment::digest(remote["body"].as_str().unwrap_or("").as_bytes()),"pr_title_hash":amendment::digest(remote["title"].as_str().unwrap_or("").as_bytes()),"request_hash":request_hash}).to_string());
                         }
                     }
                 }

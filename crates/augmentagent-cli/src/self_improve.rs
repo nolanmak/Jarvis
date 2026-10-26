@@ -3706,6 +3706,7 @@ fn reserve_next_draft(
         chosen = select(f.resume_cursor);
         if let Some((pr, _, _)) = &chosen {
             f.advance(*pr);
+            f.reserve_resume();
         }
     });
     chosen
@@ -11093,6 +11094,9 @@ struct FairSched {
     /// Billed resumes since the last billed new-issue build.
     #[serde(default)]
     resumes_since_build: u32,
+    /// Admitted resume turns, including failures before a billable report.
+    #[serde(default)]
+    resume_reservations_since_build: u32,
 }
 
 impl FairSched {
@@ -11111,7 +11115,12 @@ impl FairSched {
     }
 
     /// One billed run: a resume adds to the debt, a build clears it.
+    fn reserve_resume(&mut self) {
+        self.resume_reservations_since_build = self.resume_reservations_since_build.saturating_add(1);
+    }
+
     fn record_billed(&mut self, resumed: bool) {
+        if !resumed { self.resume_reservations_since_build = 0; }
         self.resumes_since_build = if resumed {
             self.resumes_since_build.saturating_add(1)
         } else {
@@ -11204,7 +11213,7 @@ fn resume_per_build() -> u32 {
 /// combined lane interleaves: the explicit lanes keep their single purpose,
 /// and with resume-first off there is nothing to interleave against.
 fn prefer_build_now(lane: Lane, resume_first: bool, fair: &FairSched, per_build: u32) -> bool {
-    lane == Lane::Combined && resume_first && fair.resumes_since_build >= per_build
+    lane == Lane::Combined && resume_first && fair.resumes_since_build.max(fair.resume_reservations_since_build) >= per_build
 }
 
 /// Ledger path: `AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE` override (tests), else

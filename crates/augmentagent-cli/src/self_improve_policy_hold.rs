@@ -451,7 +451,7 @@ else: sys.exit(2)
 /// A remote head, PR request, or linked issue request change reopens repair.
 fn dependency_inputs_match(marker: Option<&serde_json::Value>, current: &serde_json::Value, linked_issue: bool) -> bool {
     let Some(marker) = marker else { return false; };
-    ["remote_head", "pr_body_hash"].iter().all(|key| marker[*key].as_str().is_some() && marker[*key] == current[*key])
+    ["remote_head", "pr_body_hash", "pr_title_hash"].iter().all(|key| marker[*key].as_str().is_some() && marker[*key] == current[*key])
         && (!linked_issue || (marker["request_hash"].as_str().is_some() && marker["request_hash"] == current["request_hash"]))
 }
 fn reopen_dependency(store: &mut crate::autoship_workflow::WorkflowStore, id: &str,
@@ -489,7 +489,7 @@ pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::Ad
         }
     } else { None };
     let current = serde_json::json!({"kind":"adjudicated_dependency_reconciliation","remote_head":candidate.head,
-        "pr_body_hash":crate::autoship_review::digest(candidate.body.as_bytes()),"request_hash":request_hash});
+        "pr_body_hash":crate::autoship_review::digest(candidate.body.as_bytes()),"pr_title_hash":crate::autoship_review::digest(candidate.title.as_bytes()),"request_hash":request_hash});
     let marker = snapshot.checkpoint.evidence.iter().filter_map(|item|serde_json::from_str::<serde_json::Value>(item).ok())
         .find(|value|value["kind"] == "adjudicated_dependency");
     if dependency_inputs_match(marker.as_ref(),&current,candidate.source_issue.is_some()) { return Some(reason); }
@@ -504,6 +504,13 @@ pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::Ad
 mod dependency_recovery_tests {
     use super::*;
     #[test]
+    fn source_less_title_edit_releases_same_head_dependency() {
+        let prior=serde_json::json!({"remote_head":"same-head","pr_body_hash":"same-body","pr_title_hash":"old-title","request_hash":null});
+        let mut current=prior.clone();current["pr_title_hash"]=serde_json::json!("new-explicit-owner-title");
+        assert!(dependency_inputs_match(Some(&prior),&prior,false));
+        assert!(!dependency_inputs_match(Some(&prior),&current,false));
+    }
+    #[test]
     fn issue_edit_after_failed_snapshot_reopens_durably_without_model_admission() {
         use crate::autoship_workflow::{Binding,WorkflowStore};
         let dir=tempfile::tempdir().unwrap();
@@ -514,9 +521,9 @@ mod dependency_recovery_tests {
         let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;
         checkpoint.next.action="dependency_owner_requirement_decision".into();
         checkpoint.next.reason="snapshot issue fetch failed".into();
-        checkpoint.evidence=vec![serde_json::json!({"kind":"adjudicated_dependency","remote_head":"unchanged-head","pr_body_hash":"same-pr","request_hash":null}).to_string()];
+        checkpoint.evidence=vec![serde_json::json!({"kind":"adjudicated_dependency","remote_head":"unchanged-head","pr_body_hash":"same-pr","pr_title_hash":"same-title","request_hash":null}).to_string()];
         store.checkpoint(&lease,&checkpoint,3).unwrap(); store.release(&lease,4).unwrap();
-        let current=serde_json::json!({"kind":"adjudicated_dependency_reconciliation","remote_head":"unchanged-head","pr_body_hash":"same-pr","request_hash":"edited-owner-request"});
+        let current=serde_json::json!({"kind":"adjudicated_dependency_reconciliation","remote_head":"unchanged-head","pr_body_hash":"same-pr","pr_title_hash":"same-title","request_hash":"edited-owner-request"});
         let missing:serde_json::Value=serde_json::from_str(&checkpoint.evidence[0]).unwrap();
         assert!(!dependency_inputs_match(Some(&missing),&current,true));
         assert!(!dependency_inputs_match(None,&current,true));
