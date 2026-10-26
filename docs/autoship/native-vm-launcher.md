@@ -275,3 +275,10 @@ The `routed_transport` choice also has no build grant: it exercises the actual
 operator-routed native adapter with supplied text and no Bash. This checks that
 transport's admission and inference path; it does not replace the full issue or
 adoption pipeline acceptance runs.
+
+Before starting a unit, the wrapper runs the selected managed binary's libtest
+inventory with `--list --ignored --exact EXPECTED_TEST`. It requires exactly
+that test and refuses stale binaries whose filters would run zero tests. The
+receipt retains the tested binary digest and inventory-output digest; a binary
+change between inventory validation and launch preparation also refuses launch.
+Inventory inspection executes no test body or provider call.

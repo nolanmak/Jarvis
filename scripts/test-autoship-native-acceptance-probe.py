@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import tempfile
 
 spec=importlib.util.spec_from_file_location('native_probe',Path(__file__).with_name('autoship-native-acceptance-probe.py'))
 probe=importlib.util.module_from_spec(spec)
@@ -12,6 +13,18 @@ MIB=1024**2
 
 
 class Tests(unittest.TestCase):
+    def test_exact_ignored_inventory_required_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);binary=root/'fixture-binary';mode=root/'mode'
+            expected=probe.TESTS['routed_transport']
+            binary.write_text("#!/usr/bin/python3\nimport pathlib,sys\nroot=pathlib.Path(__file__).parent\nassert sys.argv[1:]==['--list','--ignored','--exact',"+repr(expected)+"]\nmode=(root/'mode').read_text()\nif mode=='error':raise SystemExit(1)\nif mode=='exact':print(sys.argv[-1]+': test');print('1 test, 0 benchmarks')\nelif mode=='other':print('different_test: test')\nelse:print('0 tests, 0 benchmarks')\n")
+            binary.chmod(0o700)
+            for value in ['zero','other','error']:
+                mode.write_text(value)
+                with self.assertRaises(ValueError):probe.verify_test_inventory(binary,expected)
+            mode.write_text('exact')
+            self.assertEqual(len(probe.verify_test_inventory(binary,expected)),64)
+
     def test_reviewer_probes_do_not_reserve_unreachable_build_vm(self):
         for name in ('writer','adjudicator','routed_transport'):
             build=probe.reachable_build_memory(name,4096)

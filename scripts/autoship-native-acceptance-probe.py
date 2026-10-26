@@ -70,6 +70,31 @@ def resource_budget(native_mb, build_mb, available, controller_mb=256):
             'observed_available_bytes':available,'final_admission':'RunScope'}
 
 
+def binary_digest(binary):
+    digest=hashlib.sha256()
+    with binary.open('rb') as artifact:
+        for chunk in iter(lambda:artifact.read(1024*1024),b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_test_inventory(binary, expected):
+    # libtest listing executes no test body. An unknown filter otherwise exits
+    # successfully after running zero tests, which cannot be acceptance evidence.
+    result=subprocess.run([str(binary),'--list','--ignored','--exact',expected],
+                          stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15)
+    if result.returncode or len(result.stdout)>1024*1024 or len(result.stderr)>1024*1024:
+        raise ValueError('selected binary test inventory unavailable')
+    try:
+        lines=result.stdout.decode('utf-8').splitlines()
+    except UnicodeDecodeError:
+        raise ValueError('selected binary test inventory is not valid UTF-8') from None
+    tests=[line for line in lines if line.endswith(': test')]
+    if tests!=[expected+': test']:
+        raise ValueError('selected binary lacks the exact ignored acceptance test; rebuild through cargo-managed.sh')
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("probe", choices=TESTS)
@@ -86,6 +111,11 @@ def main():
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("binary must be an existing executable managed test artifact")
+    inventory_binary_digest=binary_digest(binary)
+    try:
+        inventory_digest=verify_test_inventory(binary,TESTS[args.probe])
+    except (ValueError,subprocess.TimeoutExpired,OSError) as error:
+        parser.error(str(error) if isinstance(error,ValueError) else 'selected binary inventory could not be verified')
     policy = args.vm_policy.resolve(strict=True)
     info = policy.stat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -153,10 +183,9 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
                 "AUGMENTAGENT_PRUNE_TARGET_DIRS", "AUGMENTAGENT_BUILD_STORAGE_PARENT_LEASE"):
         command += ["-u", key]
     command += [str(binary), "--exact", TESTS[args.probe], "--ignored", "--nocapture"]
-    digest = hashlib.sha256()
-    with binary.open("rb") as artifact:
-        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
-            digest.update(chunk)
+    tested_binary_digest=binary_digest(binary)
+    if tested_binary_digest!=inventory_binary_digest:
+        parser.error("selected binary changed after inventory validation; retry with a stable managed artifact")
     print(f"Evidence: {root}", flush=True)
     with (root / "transcript.log").open("w") as log:
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
@@ -164,7 +193,7 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
     (root / "operator-route-final.json").write_text(json.dumps({"unchanged":route_unchanged,"initial_sha256":hashlib.sha256((root/"operator-route.json").read_bytes()).hexdigest()}))
     if not route_unchanged:
         raise RuntimeError("operator routing changed during probe; result cannot establish one route")
-    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": digest.hexdigest(), "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": result.returncode, "no_production_mutation": True, "resource_preflight": budget}, indent=2) + "\n")
+    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": tested_binary_digest, "test_inventory_sha256": inventory_digest, "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": result.returncode, "no_production_mutation": True, "resource_preflight": budget}, indent=2) + "\n")
     print(f"Exit: {result.returncode}; transcript: {root / 'transcript.log'}", flush=True)
     return result.returncode
 
