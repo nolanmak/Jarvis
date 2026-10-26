@@ -158,9 +158,9 @@ def quiesce_worker(uid, timeout=5, enumerate_pids=None, kill=None, reap=None):
     raise RuntimeError('native descendants did not quiesce; runtime export refused')
 
 
-def export_home(send):
+def export_home(send, home=Path('/home/worker')):
     total = 0
-    for root, directories, files in os.walk('/home/worker', followlinks=False):
+    for root, directories, files in os.walk(home, followlinks=False):
         for name in directories:
             if (Path(root) / name).is_symlink():
                 error = ValueError('runtime directory symlink')
@@ -170,7 +170,7 @@ def export_home(send):
         for name in files:
             path = Path(root) / name
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
             except OSError as error:
                 error.export_kind = 'symlink' if path.is_symlink() else 'open_failure'
                 error.export_area = 'codex_arg0' if str(path).startswith('/home/worker/.codex/tmp/arg0/') else 'other'
@@ -182,7 +182,7 @@ def export_home(send):
                 total += info.st_size
                 if total > MAX_HOME:
                     raise ValueError('runtime export exceeds budget')
-                relative = str(path.relative_to('/home/worker'))
+                relative = str(path.relative_to(home))
                 send({'type': 'runtime_start', 'path': relative, 'size': info.st_size})
                 offset = 0
                 while data := stream.read(65536):

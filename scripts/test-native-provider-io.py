@@ -5,6 +5,8 @@ import os
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -23,6 +25,27 @@ GUEST = load('guest_native_io', 'native-provider-vm-guest.py')
 
 
 class NativeIoTests(unittest.TestCase):
+    def test_runtime_fifo_export_refuses_without_waiting_for_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.mkfifo(root / 'untrusted_fifo')
+            code = """import importlib.util,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('guest',sys.argv[1])
+guest=importlib.util.module_from_spec(spec);spec.loader.exec_module(guest)
+frames=[]
+try:
+    guest.export_home(frames.append,Path(sys.argv[2]))
+except ValueError:
+    assert not frames
+else:
+    raise AssertionError('FIFO accepted')
+"""
+            result = subprocess.run([sys.executable, '-I', '-c', code,
+                str(Path(__file__).with_name('native-provider-vm-guest.py')), str(root)],
+                capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_completion_failure_diagnostic_never_contains_exception_payload(self):
         frames = []
         with patch.object(GUEST, 'quiesce_worker', return_value={'remaining_workers': 0}), \
