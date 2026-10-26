@@ -280,12 +280,16 @@ pub(super) async fn origin_for_candidate(
         return Ok(ReviewOrigin::RecordedBuilders);
     };
     workflow.validate_before_side_effect()?;
-    let Some(pr) = workflow.pr()? else {
-        return Ok(ReviewOrigin::RecordedBuilders);
+    let fresh = || -> Result<ReviewOrigin> {
+        let binding = workflow.binding();
+        Ok(ReviewOrigin::FreshSession {
+            workflow_id: workflow.id().to_owned(), candidate_head: binding.head.clone(),
+            contract_hash: binding.contract.clone(), evidence_hash: binding.evidence_hash.clone(),
+            receipt: workflow.fresh_review_origin_receipt()?,
+        })
     };
-    let Some(owned) = lookup(&workflow::path(), workflow.repository(), pr)? else {
-        return Ok(ReviewOrigin::RecordedBuilders);
-    };
+    let Some(pr) = workflow.pr()? else { return fresh(); };
+    let Some(owned) = lookup(&workflow::path(), workflow.repository(), pr)? else { return fresh(); };
     anyhow::ensure!(
         owned.ready_for_review(),
         "adopted PR requires parent/base reconciliation"

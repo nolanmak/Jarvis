@@ -4166,6 +4166,30 @@ fn select_reviewer(
     }
 }
 
+/// Provider diversity is preferred, while a protected fresh-session origin
+/// permits native Codex to review work whose provider history includes Codex.
+/// This selects capacity only; approval still requires the controller receipt.
+fn select_session_isolated_reviewer(
+    pool: &[augmentagent_channel_core::ProviderKind],
+    authors: std::result::Result<Option<Vec<augmentagent_channel_core::ProviderKind>>, String>,
+    status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
+) -> std::result::Result<augmentagent_channel_core::ProviderKind, ReviewUnavailable> {
+    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+    let authors = match authors {
+        Ok(Some(authors)) if !authors.is_empty() => authors,
+        Ok(_) => return Err(ReviewUnavailable::ProvenanceUnknown),
+        Err(error) => return Err(ReviewUnavailable::ProvenanceUnverifiable { error }),
+    };
+    let native: Vec<_> = pool.iter().copied().filter(|provider| matches!(provider, Claude | Codex)).collect();
+    match select_reviewer(&native, Ok(Some(authors)), &status) {
+        Ok(provider) => Ok(provider),
+        Err(prior) => {
+            if native.contains(&Codex) && matches!(status(Codex), ReviewerStatus::Ready) { Ok(Codex) }
+            else { Err(prior) }
+        }
+    }
+}
+
 /// Select only providers of `pool` outside every recorded builder attempt.
 /// Unknown legacy provenance requires human review rather than assuming
 /// Claude built it. The pool is a parameter so tests pin it: reading the
@@ -18624,6 +18648,20 @@ else:
 
     /// C2 — the three reasons are told apart, and the selection that decides
     /// them is one pure function the preflight and the review both call.
+    #[test]
+    fn session_isolated_capacity_prefers_diversity_but_recovers_codex_builder_deadlock() {
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        let ready = |_| ReviewerStatus::Ready;
+        assert_eq!(select_session_isolated_reviewer(&[Codex, Claude], Ok(Some(vec![Codex])), ready), Ok(Claude));
+        let claude_latched = |provider| if provider == Claude { ReviewerStatus::Latched(None) } else { ReviewerStatus::Ready };
+        assert_eq!(select_session_isolated_reviewer(&[Claude, Codex], Ok(Some(vec![Codex])), claude_latched), Ok(Codex));
+        assert_eq!(select_session_isolated_reviewer(&[Claude, Codex], Ok(Some(vec![Claude, Codex])), ready), Ok(Codex));
+        assert!(select_session_isolated_reviewer(&[Claude], Ok(Some(vec![Codex])), claude_latched).is_err());
+        for authors in [None, Some(vec![])] {
+            assert_eq!(select_session_isolated_reviewer(&[Claude, Codex], Ok(authors), ready), Err(ReviewUnavailable::ProvenanceUnknown));
+        }
+    }
+
     #[test]
     fn review_gaps_are_told_apart_before_anything_is_spent() {
         use augmentagent_channel_core::ProviderKind::{Claude, Codex};

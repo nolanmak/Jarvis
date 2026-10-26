@@ -60,6 +60,7 @@ fn passes(findings: Vec<Finding>) -> Vec<ReviewPass> {
         .into_iter()
         .enumerate()
         .map(|(i, role)| ReviewPass {
+            additional_sessions: vec![],
             binding: binding(),
             actor: actor(
                 if role == ReviewRole::Qa {
@@ -654,4 +655,42 @@ fn model_response_cannot_grant_itself_imported_origin() {
         &criteria()
     )
     .is_err());
+}
+
+#[test]
+fn fresh_session_origin_is_protected_and_all_roles_reject_actual_builder_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
+    let workflow_binding = crate::autoship_workflow::Binding {
+        head: "head-a".into(), contract: "contract-1".into(), evidence_hash: "tree-base-env-receipts".into(),
+    };
+    store.register("owner/repo#1", "fix/example", workflow_binding.clone(), 10).unwrap();
+    let lease = store.claim("owner/repo#1", "worker-a", 20, 1000).unwrap().unwrap();
+    let receipt = store.issue_fresh_review_origin(&lease, &workflow_binding, 30).unwrap();
+    let origin = ReviewOrigin::FreshSession {
+        workflow_id: "owner/repo#1".into(), candidate_head: workflow_binding.head,
+        contract_hash: workflow_binding.contract, evidence_hash: workflow_binding.evidence_hash, receipt,
+    };
+    origin.validate_at(&path, "head-a").unwrap();
+    assert!(origin.validate_at(&path, "head-b").is_err());
+    let mut forged = origin.clone();
+    if let ReviewOrigin::FreshSession { receipt, .. } = &mut forged { *receipt = "model-claimed-fresh".into(); }
+    assert!(forged.validate_at(&path, "head-a").is_err());
+    let mut current = passes(vec![]);
+    for pass in &mut current { pass.actor.provider = "codex".into(); }
+    let builder = actor("codex", "actual-builder-session");
+    assert!(review_authority_checked(&binding(), &[builder.clone()], &current, None, &origin).is_ok());
+    for role in 0..3 {
+        let mut reused = current.clone();
+        reused[role].actor.session_id = builder.session_id.clone();
+        assert!(review_authority_checked(&binding(), &[builder.clone()], &reused, None, &origin).is_err());
+        let mut reused_shard = current.clone();
+        reused_shard[role].additional_sessions.push(builder.session_id.clone());
+        assert!(review_authority_checked(&binding(), &[builder.clone()], &reused_shard, None, &origin).is_err());
+    }
+    let mut repeated = current.clone();
+    repeated[1].additional_sessions.push(current[0].actor.session_id.clone());
+    assert!(review_authority_checked(&binding(), &[], &repeated, None, &origin).is_err());
+    assert!(review_authority(&binding(), &[], &current, None).is_err(), "unknown history without protected origin must fail closed");
 }

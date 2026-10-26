@@ -57,6 +57,13 @@ pub struct Actor {
 pub enum ReviewOrigin {
     #[default]
     RecordedBuilders,
+    FreshSession {
+        workflow_id: String,
+        candidate_head: String,
+        contract_hash: String,
+        evidence_hash: String,
+        receipt: String,
+    },
     Imported {
         repository: String,
         pr: u64,
@@ -70,6 +77,33 @@ impl ReviewOrigin {
         self.validate_at(&crate::autoship_workflow::default_path(), head)
     }
     fn validate_at(&self, path: &std::path::Path, head: &str) -> Result<()> {
+        if let Self::FreshSession {
+            workflow_id,
+            candidate_head,
+            contract_hash,
+            evidence_hash,
+            receipt,
+        } = self
+        {
+            ensure!(
+                head == candidate_head,
+                "fresh review origin concerns another candidate"
+            );
+            ensure!(path.exists(), "protected fresh review receipt unavailable");
+            let binding = crate::autoship_workflow::Binding {
+                head: candidate_head.clone(),
+                contract: contract_hash.clone(),
+                evidence_hash: evidence_hash.clone(),
+            };
+            ensure!(
+                crate::autoship_workflow::WorkflowStore::open(path)?.verify_fresh_review_origin(
+                    workflow_id,
+                    &binding,
+                    receipt
+                )?,
+                "untrusted, stale, or forged fresh review origin"
+            );
+        }
         if let Self::Imported {
             repository,
             pr,
@@ -96,6 +130,9 @@ impl ReviewOrigin {
         }
         Ok(())
     }
+    pub fn is_session_isolated(&self) -> bool {
+        matches!(self, Self::Imported { .. } | Self::FreshSession { .. })
+    }
     pub fn is_imported(&self) -> bool {
         matches!(self, Self::Imported { .. })
     }
@@ -113,13 +150,18 @@ impl Actor {
     }
 
     pub fn independent_for(&self, builders: &[Actor], origin: &ReviewOrigin) -> Result<()> {
-        if !origin.is_imported() {
+        if !origin.is_session_isolated() {
             return self.independent_of(builders);
         }
         self.validate()?;
         ensure!(
-            self.provider == "codex" && self.backend == "native",
-            "imported work requires native Codex review"
+            self.backend == "native"
+                && if origin.is_imported() {
+                    self.provider == "codex"
+                } else {
+                    matches!(self.provider.as_str(), "codex" | "claude")
+                },
+            "isolated review requires an admitted native provider"
         );
         for builder in builders {
             ensure!(
@@ -239,6 +281,9 @@ pub enum ReviewRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewPass {
+    /// Other actual native conversations used for bounded evidence shards.
+    #[serde(default)]
+    pub additional_sessions: Vec<String>,
     pub binding: ReviewBinding,
     pub actor: Actor,
     pub role: ReviewRole,
@@ -349,6 +394,7 @@ pub fn parse_review_pass(
         Decision::Incomplete => false,
     };
     Ok(ReviewPass {
+        additional_sessions: vec![],
         binding: binding.clone(),
         actor,
         role,
@@ -495,19 +541,26 @@ pub async fn adjudicate_native_with_origin(
     actor.independent_for(builders, origin)?;
     let reasoner = augmentagent_channel_core::build_pinned(provider)
         .context("native Codex adjudicator is not configured")?;
-    adjudicate_with_origin(
-        reasoner.as_ref(),
-        actor,
-        builders,
-        opts,
-        binding,
-        criteria,
-        findings,
-        evidence,
-        attempts_already_made,
-        origin,
-    )
-    .await
+    let (mut receipt, native_session_id) =
+        augmentagent_channel_core::native_session::fresh_review_scope(
+            provider,
+            adjudicate_with_origin(
+                reasoner.as_ref(),
+                actor,
+                builders,
+                opts,
+                binding,
+                criteria,
+                findings,
+                evidence,
+                attempts_already_made,
+                origin,
+            ),
+        )
+        .await?;
+    receipt.actor.session_id = native_session_id;
+    receipt.actor.independent_for(builders, origin)?;
+    Ok(receipt)
 }
 
 /// Execute one attempt with a pinned native Codex reasoner built by the caller.
@@ -757,7 +810,7 @@ fn review_authority_checked(
             "review incomplete or bound to another candidate"
         );
         pass.actor.validate()?;
-        if pass.role != ReviewRole::Qa || origin.is_imported() {
+        if pass.role != ReviewRole::Qa || origin.is_session_isolated() {
             ensure!(
                 pass.actor.backend == "native",
                 "review must use native transport"
@@ -768,6 +821,15 @@ fn review_authority_checked(
             sessions.insert(&pass.actor.session_id),
             "review passes must not share a session"
         );
+        for session_id in &pass.additional_sessions {
+            let mut shard_actor = pass.actor.clone();
+            shard_actor.session_id = session_id.clone();
+            shard_actor.independent_for(builders, origin)?;
+            ensure!(
+                sessions.insert(session_id),
+                "review shard reused a native session"
+            );
+        }
         for finding in &pass.findings {
             let fingerprint = finding.fingerprint()?;
             if let Some(prior) = unresolved.insert(&finding.id, fingerprint.clone()) {

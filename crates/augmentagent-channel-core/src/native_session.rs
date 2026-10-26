@@ -34,6 +34,25 @@ pub struct Lease {
 }
 
 tokio::task_local! { pub static CURRENT: Arc<NativeSession>; }
+tokio::task_local! { pub static FRESH_REVIEW: bool; }
+
+/// Override any inherited builder conversation. Each invocation creates a new
+/// native conversation and returns the identifier actually observed from the CLI.
+pub async fn fresh_review_scope<T>(
+    provider: ProviderKind,
+    call: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<(T, String)> {
+    let session = NativeSession::new(provider)?;
+    let result = FRESH_REVIEW.scope(true, CURRENT.scope(session.clone(), call)).await?;
+    let id = session.id().ok_or_else(|| anyhow::anyhow!("fresh review did not observe a native conversation identifier"))?;
+    anyhow::ensure!(!session.is_uncertain(), "fresh reviewer conversation is uncertain");
+    Ok((result, id))
+}
+
+pub fn is_fresh_review() -> bool {
+    FRESH_REVIEW.try_with(|fresh| *fresh).unwrap_or(false)
+}
+
 
 impl NativeSession {
     pub fn new(provider: ProviderKind) -> anyhow::Result<Arc<Self>> {
@@ -64,6 +83,8 @@ impl NativeSession {
             },
             None => Launch::Create { requested_id: None },
         };
+        anyhow::ensure!(!is_fresh_review() || matches!(launch, Launch::Create { .. }),
+            "fresh review cannot resume an existing native conversation");
         state.active = true;
         state.native_submitted_at_ms = None;
         state.first_text_output_at_ms = None;
@@ -161,5 +182,32 @@ impl Drop for Lease {
             state.active = false;
             state.uncertain = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod fresh_review_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_review_overrides_builder_and_cannot_resume_even_on_retry() {
+        let builder = NativeSession::from_id(ProviderKind::Codex, Some("actual-builder".into())).unwrap();
+        let (_, observed) = CURRENT.scope(builder.clone(), fresh_review_scope(ProviderKind::Codex, async {
+            let session = CURRENT.with(Arc::clone);
+            let mut lease = session.begin(ProviderKind::Codex)?;
+            assert!(matches!(lease.launch(), Launch::Create { .. }));
+            lease.observe("actual-review")?;
+            lease.finish()?;
+            assert!(session.begin(ProviderKind::Codex).is_err(), "retry must not resume reviewer history");
+            Ok(())
+        })).await.unwrap();
+        assert_eq!(observed, "actual-review");
+        assert_eq!(builder.id().as_deref(), Some("actual-builder"));
+        assert!(!builder.is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn fresh_review_requires_cli_observed_identity() {
+        assert!(fresh_review_scope(ProviderKind::Codex, async { Ok("LGTM") }).await.is_err());
     }
 }

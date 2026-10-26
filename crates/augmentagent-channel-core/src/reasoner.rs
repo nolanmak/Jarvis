@@ -1114,6 +1114,11 @@ impl ClaudeCliReasoner {
         capture: TextCapture,
         clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
+        let fresh_review = crate::native_session::is_fresh_review();
+        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
+            return Err(CallError::Other(anyhow::anyhow!("fresh review must use supplied evidence without tools, settings or handoff history")));
+        }
+        let review_directory = if fresh_review { Some(tempfile::tempdir()?) } else { None };
         let mut native_lease = crate::native_session::CURRENT
             .try_with(|session| Arc::clone(session))
             .ok()
@@ -1127,6 +1132,11 @@ impl ClaudeCliReasoner {
             "--permission-mode".into(),
             opts.permission_mode.clone(),
         ];
+        if fresh_review {
+            args.extend(["--safe-mode".into(), "--tools".into(), "".into(),
+                "--setting-sources".into(), "".into(), "--strict-mcp-config".into(),
+                "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()]);
+        }
         if let Some(lease) = &native_lease {
             match lease.launch() {
                 crate::native_session::Launch::Create { requested_id: Some(id) } => {
@@ -1172,7 +1182,7 @@ impl ClaudeCliReasoner {
             args.push(m.clone());
         }
 
-        if claude_bridge.is_none() {
+        if claude_bridge.is_none() && !fresh_review {
             for dir in &opts.add_dirs {
                 args.push("--add-dir".into());
                 args.push(dir.to_string_lossy().into_owned());
@@ -1232,7 +1242,9 @@ impl ClaudeCliReasoner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Scope Write/Edit by setting the spawned CLI's cwd when requested.
-        if let Some(bridge) = &claude_bridge {
+        if let Some(directory) = &review_directory {
+            cmd.current_dir(directory.path());
+        } else if let Some(bridge) = &claude_bridge {
             cmd.current_dir(&bridge.bridge.native_cwd);
         } else if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
@@ -4878,6 +4890,43 @@ mod failover_error_tests {
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
         assert_eq!(config["mcpServers"]["voice"]["env"]["AUGMENTAGENT_VOICE_TOOL_GRANT"],
             "SYNTHETIC_PRIVATE_GRANT");
+    }
+
+    #[tokio::test]
+    async fn fresh_claude_review_disables_native_customizations_and_builder_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_path = dir.path().join("argv.txt");
+        let cwd_path = dir.path().join("cwd.txt");
+        let bin = stub_cli(&dir, "fake-fresh-claude", &format!(r#"
+printf '%s\n' "$@" > '{}'
+pwd > '{}'
+session=''
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--session-id' ]; then session="$argument"; fi
+  previous="$argument"
+done
+cat >/dev/null
+echo "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}}"
+echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}}"
+"#, args_path.display(), cwd_path.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let provider = crate::providers::ProviderKind::Claude;
+        let builder = crate::native_session::NativeSession::from_id(provider, Some("builder-session".into())).unwrap();
+        let mut opts = dummy_opts();
+        opts.cwd = Some(dir.path().to_owned());
+        opts.add_dirs = vec![dir.path().to_owned()];
+        let (answer, native_id) = crate::native_session::CURRENT.scope(builder.clone(),
+            crate::native_session::fresh_review_scope(provider, reasoner.call(&opts, "review supplied evidence"))).await.unwrap();
+        assert_eq!(answer, "reviewed");
+        assert_ne!(native_id, "builder-session");
+        assert_eq!(builder.id().as_deref(), Some("builder-session"));
+        let argv = std::fs::read_to_string(args_path).unwrap();
+        for required in ["--safe-mode", "--tools\n\n", "--setting-sources\n\n", "--strict-mcp-config", "--disable-slash-commands"] {
+            assert!(argv.contains(required), "missing {required}: {argv}");
+        }
+        assert!(!argv.contains("--resume") && !argv.contains("builder-session") && !argv.contains("--add-dir"));
+        assert_ne!(std::fs::read_to_string(cwd_path).unwrap().trim(), dir.path().to_str().unwrap());
     }
 
     #[tokio::test]

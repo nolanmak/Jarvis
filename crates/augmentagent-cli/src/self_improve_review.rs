@@ -47,8 +47,17 @@ pub(super) async fn run(
     };
     let provider = match if origin.is_imported() {
         adoption::imported_reviewer()
+    } else if origin.is_session_isolated() {
+        select_session_isolated_reviewer(
+            &reviewer_pool(),
+            Ok(Some(authors.clone())),
+            reviewer_status,
+        )
     } else {
-        select_reviewer(&reviewer_pool(), Ok(Some(authors.clone())), reviewer_status)
+        return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnverifiable {
+            error: "provider-only history requires a protected fresh-session workflow receipt"
+                .into(),
+        });
     } {
         Ok(provider) => provider,
         Err(why) => return IndependentReview::unavailable(why),
@@ -213,7 +222,7 @@ async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Re
 
 async fn run_inner(
     provider: augmentagent_channel_core::ProviderKind,
-    authors: &[augmentagent_channel_core::ProviderKind],
+    _authors: &[augmentagent_channel_core::ProviderKind],
     issue: &Issue,
     worktree: PathBuf,
     criteria: &[String],
@@ -293,17 +302,9 @@ async fn run_inner(
         evidence_hash: aligned::digest(evidence_json.as_bytes()),
     };
     binding.validate()?;
-    let builders: Vec<_> = authors
-        .iter()
-        .map(|author| aligned::Actor {
-            provider: author.name().into(),
-            backend: "recorded-mutation-provenance".into(),
-            // Legacy provenance only records providers. Explicitly label unknown
-            // model/session rather than pretending the builder was a pinned model.
-            model: "not-recorded".into(),
-            session_id: format!("builder-provider:{}", author.name()),
-        })
-        .collect();
+    // Provider history does not identify historical native sessions. Preserve
+    // it in the original provenance ledger; never invent builder Actor IDs.
+    let builders = Vec::new();
     let reasoner = augmentagent_channel_core::build_pinned(provider)
         .context("native reviewer construction failed")?;
     let prior: Vec<_> = context
@@ -361,6 +362,7 @@ async fn run_inner(
         actor.independent_for(&builders, &origin)?;
         let mut findings = vec![];
         let mut request_hashes = vec![];
+        let mut native_sessions = vec![];
         let shards: Vec<_> = evidence_shards.iter().collect();
         for (i, group) in shards.chunks(2).enumerate() {
             opts.session_id = Some(format!("{session}:shard-{i}"));
@@ -372,19 +374,20 @@ async fn run_inner(
             let (prompt, coverage) = aligned::review_request(&binding, &format!("{}\n{}",issue.title,issue.body), &contract,
                 "The exact candidate diff and caller evidence are supplied in separately identified evidence shards.",
                 input_files.keys().cloned().collect(), &input_files, &prior)?;
-            let raw = augmentagent_channel_core::model_router::native_reviewer_scope(
+            let (raw, native_id) = augmentagent_channel_core::native_session::fresh_review_scope(
                 provider,
-                reasoner.call(&opts, &prompt),
+                augmentagent_channel_core::model_router::native_reviewer_scope(
+                    provider,
+                    reasoner.call(&opts, &prompt),
+                ),
             )
             .await?;
-            let pass = aligned::parse_review_pass(
-                &raw,
-                &binding,
-                actor.clone(),
-                role,
-                coverage,
-                &contract,
-            )?;
+            let mut shard_actor = actor.clone();
+            shard_actor.session_id = native_id.clone();
+            shard_actor.independent_for(&builders, &origin)?;
+            native_sessions.push(native_id);
+            let pass =
+                aligned::parse_review_pass(&raw, &binding, shard_actor, role, coverage, &contract)?;
             anyhow::ensure!(pass.completed, "reviewer reported incomplete evidence group {i}; collect missing evidence before retry");
             request_hashes.push(pass.coverage.prompt_hash);
             let mut shard_findings = pass.findings;
@@ -422,7 +425,14 @@ async fn run_inner(
         for finding in &mut findings {
             finding.repair_rounds = context.repair_round;
         }
+        anyhow::ensure!(
+            !native_sessions.is_empty(),
+            "review has no observed native conversation"
+        );
+        let mut actor = actor;
+        actor.session_id = native_sessions.remove(0);
         let pass = aligned::ReviewPass {
+            additional_sessions: native_sessions,
             binding: binding.clone(),
             actor,
             role,
