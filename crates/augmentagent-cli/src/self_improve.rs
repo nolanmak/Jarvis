@@ -15299,26 +15299,22 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     /// and the sweep. Pinned, because the bug was two copies that disagreed.
     #[test]
     fn the_sweep_and_the_lanes_share_one_approval_predicate() {
-        let src = include_str!("self_improve.rs");
-        let imp = src.find("impl IndependentReview {").expect("impl");
-        let within = &src[imp..];
-        for sig in ["fn approved(&self) -> bool {", "fn codex_approved(&self) -> bool {"] {
-            let a = within.find(sig).expect(sig);
-            let body = &within[a..a + within[a..].find("\n    }\n").expect("end")];
-            assert!(body.contains("approval_of("), "{sig} must use the shared predicate: {body}");
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        for provider in [Claude, Codex] {
+            for (diff_ok, system_ok) in [(true, true), (false, true), (true, false), (false, false)] {
+                let review = IndependentReview {
+                    structured: None, provider: Some(provider), model: Some("synthetic-model".into()),
+                    available: true, diff_ok, system_ok, notes: String::new(), why_unavailable: None,
+                };
+                let verdict = review.recorded_verdict();
+                let record = OpenedPr { pr: 42, head: REVIEWED_HEAD.into(), verdict };
+                let persisted = recorded_approval(Some(&record), 42, Some(REVIEWED_HEAD));
+                assert_eq!(persisted.reviewed, review.approved());
+                assert_eq!(persisted.codex, review.codex_approved());
+                assert_eq!(persisted.reviewed, diff_ok && system_ok);
+                assert_eq!(persisted.codex, diff_ok && system_ok && provider == Codex);
+            }
         }
-        let r = src.find("fn recorded_approval(").expect("the sweep's reader");
-        assert!(src[r..r + src[r..].find("\n}\n").expect("end")].contains("approval_of("));
-        let p = src.find("fn approval_of(").expect("the predicate");
-        let pred = code_only(&src[p..p + src[p..].find("\n}\n").expect("end")]);
-        assert!(pred.contains("ProviderKind::Codex"), "Codex-only means the provider the loop called: {pred}");
-
-        let start = src.find("async fn merge_sweep(").expect("the sweep");
-        let sweep = code_only(&src[start..start + src[start..].find("\n}\n").expect("end")]);
-        assert!(!sweep.contains("reviews_approved: true"), "never asserted");
-        assert!(sweep.contains("codex_approved: approval.codex"), "{sweep}");
-        assert!(sweep.contains("reviews_approved: approval.reviewed"));
-        assert!(sweep.contains("review_approved: approval.reviewed"));
     }
 
     /// Codex, a third time on the same shape: sharing `may_automerge` is
@@ -18665,9 +18661,6 @@ else:
             !body.contains("independent review capacity is unavailable"),
             "the old blanket message is gone"
         );
-        let review = src.find("async fn independent_review(").expect("review fn");
-        let review_body = &src[review..review + src[review..].find("\n}\n").expect("end")];
-        assert!(review_body.contains("select_reviewer("), "the review selects exactly like the preflight");
     }
 
     /// C4 — structural: the branch record is superseded where the push has

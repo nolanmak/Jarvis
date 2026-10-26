@@ -520,3 +520,33 @@ async fn repaired_new_head_does_not_need_previous_upheld_receipt() {
         MergeAuthority::IndependentApproval
     );
 }
+
+#[test]
+fn serialized_receipts_cannot_reuse_partial_or_stale_coverage() {
+    let receipt = ReviewEvidence {
+        binding: binding(),
+        builders: builders(),
+        passes: passes(vec![]),
+        adjudication: None,
+    };
+    assert!(receipt.authority().is_ok());
+    let encoded = serde_json::to_value(&receipt).unwrap();
+    for defect in 0..5 {
+        let mut tampered = encoded.clone();
+        match defect {
+            0 => tampered["passes"][1]["coverage"]["supplied_files"] = serde_json::json!({}),
+            1 => tampered["passes"][1]["completed"] = serde_json::json!(false),
+            2 => tampered["passes"][1]["binding"]["base"] = serde_json::json!("new-main"),
+            3 => {
+                tampered["passes"][1]["coverage"]["binding"]["environment_id"] =
+                    serde_json::json!("other-toolchain")
+            }
+            _ => tampered["passes"][1]["actor"]["provider"] = serde_json::json!("claude"),
+        }
+        let recovered: ReviewEvidence = serde_json::from_value(tampered).unwrap();
+        assert!(
+            recovered.authority().is_err(),
+            "defect {defect} minted approval"
+        );
+    }
+}

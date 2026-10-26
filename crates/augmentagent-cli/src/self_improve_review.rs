@@ -69,21 +69,18 @@ fn chunks(text: &str, budget: usize) -> Vec<&str> {
     result
 }
 
-async fn run_inner(
-    provider: augmentagent_channel_core::ProviderKind,
-    authors: &[augmentagent_channel_core::ProviderKind],
-    issue: &Issue,
-    worktree: PathBuf,
-    criteria: &[String],
-    context: ReviewContext<'_>,
-) -> Result<IndependentReview> {
-    anyhow::ensure!(
-        !criteria.is_empty(),
-        "acceptance criteria missing; scope before review"
-    );
+struct CandidateSnapshot {
+    head: String,
+    base: String,
+    diff: String,
+    required: BTreeSet<String>,
+    files: BTreeMap<String, String>,
+}
+
+async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
     let dirty = git(
         &worktree,
-        &["status", "--porcelain", "--untracked-files=no"],
+        &["status", "--porcelain", "--untracked-files=all"],
     )
     .await?;
     anyhow::ensure!(
@@ -98,6 +95,11 @@ async fn run_inner(
         .await?
         .trim()
         .to_owned();
+    let ancestor = git(&worktree, &["merge-base", &base, &head]).await?;
+    anyhow::ensure!(
+        ancestor.trim() == base,
+        "main advanced beyond candidate; integrate current main before review"
+    );
     let diff = git(&worktree, &["diff", "--binary", &base, &head, "--"]).await?;
     let paths = git(
         &worktree,
@@ -127,6 +129,34 @@ async fn run_inner(
         };
         files.insert(path.clone(), content);
     }
+    Ok(CandidateSnapshot {
+        head,
+        base,
+        diff,
+        required,
+        files,
+    })
+}
+
+async fn run_inner(
+    provider: augmentagent_channel_core::ProviderKind,
+    authors: &[augmentagent_channel_core::ProviderKind],
+    issue: &Issue,
+    worktree: PathBuf,
+    criteria: &[String],
+    context: ReviewContext<'_>,
+) -> Result<IndependentReview> {
+    anyhow::ensure!(
+        !criteria.is_empty(),
+        "acceptance criteria missing; scope before review"
+    );
+    let CandidateSnapshot {
+        head,
+        base,
+        diff,
+        required,
+        files,
+    } = candidate_snapshot(&worktree).await?;
     let mut contract: BTreeMap<String, String> = criteria
         .iter()
         .enumerate()
@@ -374,9 +404,10 @@ async fn run_inner(
     // local edit invalidates the evidence rather than borrowing its approval.
     anyhow::ensure!(
         git(&worktree, &["rev-parse", "HEAD"]).await?.trim() == head
+            && git(&worktree, &["rev-parse", "origin/main"]).await?.trim() == base
             && git(
                 &worktree,
-                &["status", "--porcelain", "--untracked-files=no"]
+                &["status", "--porcelain", "--untracked-files=all"]
             )
             .await?
             .trim()
@@ -435,6 +466,86 @@ fn deduplicate_findings(findings: Vec<aligned::Finding>) -> Result<Vec<aligned::
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_git(path: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn candidate_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fixture_git(path, &["init", "-q"]);
+        fixture_git(path, &["config", "user.name", "Synthetic Test"]);
+        fixture_git(path, &["config", "user.email", "synthetic@example.invalid"]);
+        std::fs::write(path.join("source.rs"), "fn old() {}\n").unwrap();
+        std::fs::write(path.join("deleted.rs"), "fn removed() {}\n").unwrap();
+        fixture_git(path, &["add", "."]);
+        fixture_git(path, &["commit", "-qm", "base"]);
+        fixture_git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(path.join("source.rs"), "fn changed() {}\n").unwrap();
+        std::fs::remove_file(path.join("deleted.rs")).unwrap();
+        fixture_git(path, &["add", "-A"]);
+        fixture_git(path, &["commit", "-qm", "candidate"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn snapshot_binds_exact_committed_files_and_deleted_source_to_main() {
+        let dir = candidate_fixture();
+        let snapshot = candidate_snapshot(dir.path()).await.unwrap();
+        assert_eq!(
+            snapshot.head,
+            fixture_git(dir.path(), &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            snapshot.base,
+            fixture_git(dir.path(), &["rev-parse", "origin/main"])
+        );
+        assert_eq!(snapshot.files["source.rs"], "fn changed() {}\n");
+        assert!(snapshot.files["deleted.rs"].contains("fn removed() {}"));
+        assert_eq!(snapshot.required, snapshot.files.keys().cloned().collect());
+        assert!(snapshot.diff.contains("-fn old() {}"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_untracked_staged_and_unstaged_candidate_code() {
+        let dir = candidate_fixture();
+        std::fs::write(dir.path().join("untracked.rs"), "fn hidden() {}\n").unwrap();
+        assert!(candidate_snapshot(dir.path()).await.is_err());
+        fixture_git(dir.path(), &["add", "untracked.rs"]);
+        assert!(candidate_snapshot(dir.path()).await.is_err());
+        fixture_git(dir.path(), &["reset", "--hard", "HEAD"]);
+        std::fs::write(dir.path().join("source.rs"), "fn hidden() {}\n").unwrap();
+        assert!(candidate_snapshot(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_advanced_main_instead_of_reviewing_its_reverse_diff() {
+        let dir = candidate_fixture();
+        let candidate = fixture_git(dir.path(), &["rev-parse", "HEAD"]);
+        fixture_git(dir.path(), &["checkout", "--detach", "origin/main"]);
+        std::fs::write(dir.path().join("unrelated.rs"), "fn sibling() {}\n").unwrap();
+        fixture_git(dir.path(), &["add", "."]);
+        fixture_git(dir.path(), &["commit", "-qm", "sibling ships"]);
+        fixture_git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        fixture_git(dir.path(), &["checkout", "--detach", &candidate]);
+        let err = candidate_snapshot(dir.path()).await.err().unwrap();
+        assert!(err.to_string().contains("integrate current main"));
+    }
+
     #[test]
     fn evidence_chunks_preserve_every_unicode_byte() {
         let text = "source αβγ\n".repeat(100);
