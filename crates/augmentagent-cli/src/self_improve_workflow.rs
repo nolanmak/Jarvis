@@ -425,6 +425,23 @@ impl WorkflowGuard {
         self.audit.clone()
     }
     pub(super) fn bind_reasoner(&self, reasoner: &FallbackReasoner) -> Result<()> {
+        let store = self.store.clone();
+        let lease = self.lease.clone();
+        self.audit
+            .set_model_call_observer(Arc::new(move |_provider| {
+                store
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?
+                    .charge(
+                        &lease,
+                        &format!("model-call:{}", uuid::Uuid::new_v4()),
+                        ResourceCharge {
+                            model_calls: 1,
+                            ..Default::default()
+                        },
+                        millis(),
+                    )
+            }))?;
         reasoner.set_workflow_audit(self.audit.clone())
     }
     pub(super) async fn audit_health(&self) -> Result<()> {

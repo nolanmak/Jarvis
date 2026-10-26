@@ -7820,6 +7820,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .join(".self-improve-worktrees")
         .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
     recovery::prepare(repo_root, &worktree, &branch).await?;
+    let repository = workflow::canonical_repository(repo_root).await?;
+    let environment = recovery::environment_identity(&worktree).await?;
+    let contract = serde_json::to_string(&(issue.number, &issue.title, &issue.body))?;
+    let Some(mut workflow_guard) = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root, worktree: &worktree, repository: &repository,
+        source_issue: Some(issue.number), pr: None, branch: &branch,
+        contract: &contract, environment: &environment,
+    }).await? else {
+        return Ok(RunReport::held(format!("issue #{}: workflow leased by another worker", issue.number)));
+    };
+    workflow_guard.bind_reasoner(reasoner.as_ref())?;
+    workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
     let candidate_base = candidate_base.trim();
@@ -7864,6 +7876,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
             let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
             info!(issue = issue.number, "auto-PR held: {why}");
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Ok(RunReport::held(why));
         }
@@ -7872,6 +7885,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // preset at all, so waiting will never fix it — that is a
             // configuration or deployment fault and must stay loud, or a
             // misconfigured chain looks exactly like a quiet quota day.
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             bail!(
                 "no provider in the chain is cleared for a FullAgentic call; \
@@ -7910,6 +7924,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // the owner to confirm and close; nothing is built, nothing billed,
         // and the ledger mark keeps the picker off it for the day.
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
             backoff_comment(
@@ -7942,7 +7957,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // #653 — the scoper judged this not agent-fixable (research
                 // ask, epic, owner decision, …). Label it out so it is scoped
                 // at most once, and leave the reason on the issue.
-                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 backoff_comment(
                     repo_root,
                     issue.number,
@@ -7998,7 +8014,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 if plan.len() >= MIN_SLICES {
                     match file_slices(repo_root, &issue, &plan).await {
                         Ok(children) if !children.is_empty() => {
-                            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::triage(format!(
                                 "issue #{}: oversized — sliced into {} child issues ({})",
                                 issue.number,
@@ -8011,6 +8028,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     }
                 }
             }
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             backoff_comment(
                 repo_root,
@@ -8046,17 +8064,6 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .map(|s| s.criteria.clone())
         .unwrap_or_default();
 
-    let repository = workflow::canonical_repository(repo_root).await?;
-    let environment = recovery::environment_identity(&worktree).await?;
-    let contract = serde_json::to_string(&(issue.number, &criteria, &plan))?;
-    let Some(mut workflow_guard) = workflow::WorkflowGuard::acquire(workflow::Start {
-        repo_root, worktree: &worktree, repository: &repository,
-        source_issue: Some(issue.number), pr: None, branch: &branch,
-        contract: &contract, environment: &environment,
-    }).await? else {
-        return Ok(RunReport::held(format!("issue #{}: workflow leased by another worker", issue.number)));
-    };
-    workflow_guard.bind_reasoner(reasoner.as_ref())?;
     let acceptance_control = acceptance::control_directory(&repository)?;
     let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
     let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,

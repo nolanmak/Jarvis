@@ -297,9 +297,11 @@ pub fn default_audit_log_path() -> PathBuf {
 
 /// Append-only NDJSON writer. Cheap to clone (`Arc<Mutex<…>>` inside) so
 /// the caller can hand it to spawned tasks.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuditLogger {
     path: PathBuf,
+    model_call_observer:
+        Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
     failure_path: Option<PathBuf>,
     pending_dir: Option<PathBuf>,
@@ -352,12 +354,48 @@ impl Drop for AuditWriteGuard {
     }
 }
 
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogger")
+            .field("path", &self.path)
+            .field("anchored", &self.anchored)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AuditLogger {
+    pub fn set_model_call_observer(
+        &self,
+        observer: Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        *self
+            .model_call_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))? = Some(observer);
+        Ok(())
+    }
+
+    pub fn model_call_admitted(&self, provider: &str) -> anyhow::Result<()> {
+        let observer = self
+            .model_call_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))?
+            .clone();
+        if let Some(observer) = observer {
+            observer(provider)?;
+        }
+        if self.anchored.is_some() {
+            self.record_controller(serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider}))?;
+        }
+        Ok(())
+    }
+
     /// Build a logger writing to the given path. Use
     /// [`default_audit_log_path`] for the standard location.
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            model_call_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,
             failure_path: None,
             pending_dir: None,

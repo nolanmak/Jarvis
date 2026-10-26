@@ -688,6 +688,7 @@ impl FallbackReasoner {
                 let mut authors = self.mutation_providers.lock().unwrap_or_else(|e| e.into_inner());
                 if !authors.contains(&entry.kind) { authors.push(entry.kind); }
             }
+            if let Some(logger) = &opts.audit_logger { logger.model_call_admitted(name)?; }
             self.note_call(name);
             let res = if transcript {
                 entry.reasoner.call_transcript(opts, &resumed_message).await
