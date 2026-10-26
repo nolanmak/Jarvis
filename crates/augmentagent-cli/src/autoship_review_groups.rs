@@ -4,12 +4,14 @@
 use super::*;
 
 pub fn components(findings:&[Finding])->Result<Vec<Vec<Finding>>> {
-    let mut by_id=BTreeMap::new();
+    let mut by_id=BTreeMap::<String,Finding>::new();
     for finding in findings {
         finding.validate()?;
-        if let Some(prior)=by_id.insert(finding.id.clone(),finding.clone()) {
-            ensure!(prior==*finding,"conflicting duplicate finding");
-        }
+        if let Some(prior)=by_id.get_mut(&finding.id) {
+            ensure!(prior.fingerprint()?==finding.fingerprint()?,"conflicting duplicate finding");
+            prior.conflicts_with.extend(finding.conflicts_with.clone());
+            prior.repair_rounds=prior.repair_rounds.max(finding.repair_rounds);
+        } else {by_id.insert(finding.id.clone(),finding.clone());}
     }
     let mut result=Vec::new();
     let mut remaining: BTreeSet<_>=by_id.keys().cloned().collect();

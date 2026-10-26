@@ -56,7 +56,7 @@ fn directives(
             "adjudicated amendment duplicate/missing review role"
         );
     }
-    let mut findings = BTreeMap::new();
+    let mut findings = BTreeMap::<String,crate::autoship_review::Finding>::new();
     let expected_coverage = &review.passes[0].coverage;
     for pass in &review.passes {
         ensure!(
@@ -89,12 +89,11 @@ fn directives(
                 receipt.finding_fingerprints.get(&finding.id) == Some(&finding.fingerprint()?),
                 "adjudicated amendment finding evidence changed"
             );
-            if let Some(prior) = findings.insert(finding.id.clone(), finding) {
-                ensure!(
-                    prior == finding,
-                    "adjudicated amendment duplicate inconsistent finding"
-                );
-            }
+            if let Some(prior) = findings.get_mut(&finding.id) {
+                ensure!(prior.fingerprint()?==finding.fingerprint()?,"adjudicated amendment duplicate inconsistent finding");
+                prior.conflicts_with.extend(finding.conflicts_with.clone());
+                prior.repair_rounds=prior.repair_rounds.max(finding.repair_rounds);
+            } else {findings.insert(finding.id.clone(),finding.clone());}
         }
     }
     ensure!(

@@ -904,3 +904,14 @@ async fn connected_conflicts_and_owner_criterion_never_split_final_authority() {
     let mut second=dismissed(&[b.clone()]).await;second.actor.session_id="synthetic-other".into();
     assert!(adjudication_groups::compose(&binding(),&[a,b],vec![first,second],&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).is_err());
 }
+
+#[test]
+fn duplicate_finding_observations_preserve_every_conflict_edge() {
+    let mut first=finding("A");first.criterion_id="REGRESSION".into();
+    let mut later=first.clone();later.conflicts_with.insert("B".into());later.repair_rounds=3;
+    let mut other=finding("B");other.criterion_id="REGRESSION".into();
+    let groups=adjudication_groups::components(&[first,later,other]).unwrap();
+    assert_eq!(groups.len(),1);
+    let a=groups[0].iter().find(|finding|finding.id=="A").unwrap();
+    assert!(a.conflicts_with.contains("B"));assert_eq!(a.repair_rounds,3);
+}
