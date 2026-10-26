@@ -30,6 +30,21 @@ TESTS = {
 }
 
 
+def reachable_build_memory(probe, declared_build_mb):
+    # Native writer replay and contradiction probes invoke the supplied-evidence
+    # adjudicator, which clears tools before fresh_review_scope. Their Python
+    # fixture observation runs in the controller's bounded command scope.
+    # Issue/adoption exercise builder and repair paths with guarded VM builds.
+    roles={'issue':'builder','adoption':'builder','writer':'reviewer','adjudicator':'reviewer'}
+    if set(roles)!=set(TESTS) or probe not in roles:
+        raise ValueError('probe capabilities must be explicitly classified')
+    if roles[probe]=='reviewer':
+        return 0
+    if type(declared_build_mb) is not int or not 512<=declared_build_mb<=4096:
+        raise ValueError('invalid declared build guest memory')
+    return declared_build_mb
+
+
 def resource_budget(native_mb, build_mb, available, controller_mb=256):
     if (type(native_mb) is not int or not 512<=native_mb<=4096
             or type(build_mb) is not int or (build_mb!=0 and not 512<=build_mb<=4096)):
@@ -79,7 +94,10 @@ def main():
     build_info=build_config.stat()
     if not stat.S_ISREG(build_info.st_mode) or build_info.st_uid!=os.getuid() or build_info.st_mode & 0o077:
         parser.error("build VM configuration must be private")
-    build_mb=0 if args.probe=='adjudicator' else json.loads(build_config.read_text())['memory_mb']
+    try:
+        build_mb=reachable_build_memory(args.probe,json.loads(build_config.read_text())['memory_mb'])
+    except ValueError as error:
+        parser.error(str(error))
     available=next((int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
     try:
         budget=resource_budget(native_mb,build_mb,available,args.controller_headroom_mb)

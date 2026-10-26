@@ -12,6 +12,20 @@ MIB=1024**2
 
 
 class Tests(unittest.TestCase):
+    def test_reviewer_probes_do_not_reserve_unreachable_build_vm(self):
+        for name in ('writer','adjudicator'):
+            build=probe.reachable_build_memory(name,4096)
+            self.assertEqual(build,0)
+            budget=probe.resource_budget(1024,build,3*GIB)
+            self.assertEqual(budget['run_memory_bytes'],2*GIB)
+            self.assertEqual(budget['aggregate_ceiling_bytes'],4*GIB)
+        for name in ('issue','adoption'):
+            build=probe.reachable_build_memory(name,4096)
+            self.assertEqual(build,4096)
+            self.assertEqual(probe.resource_budget(1024,build,7*GIB)['run_memory_bytes'],6*GIB)
+            with self.assertRaises(ValueError):probe.reachable_build_memory(name,0)
+        with self.assertRaises(ValueError):probe.reachable_build_memory('unclassified',4096)
+
     def test_full_guests_fit_at_six_and_half_gib_without_reserving_unit_ceiling(self):
         budget=probe.resource_budget(1024,4096,6*GIB+512*MIB)
         self.assertEqual(budget['run_memory_bytes'],6*GIB)

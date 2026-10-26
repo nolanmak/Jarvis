@@ -261,3 +261,12 @@ ceiling. The allowance is an estimate, not a guaranteed controller memory bound.
 Every real dispatch still passes RunScope's sibling, ancestor and host checks;
 controller growth or other workloads may cause a subsequent capacity refusal.
 The wrapper records these preliminary budgets with its result.
+
+Probe budgets follow reachable capabilities: `issue` and `adoption` include the
+configured build guest because they exercise builders/repairs. `writer` and
+`adjudicator` only execute bounded controller Python observations and the
+supplied-evidence native adjudicator, which clears tool grants before dispatch.
+They therefore reserve the native guest plus host overhead (2 GiB for a 1 GiB
+native guest), with a 4 GiB aggregate ceiling. This does not resize a guest or
+change production composition: production still reads the actual bridge grants.
+New probe names require an explicit capability classification.
