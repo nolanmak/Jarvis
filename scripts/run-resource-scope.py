@@ -88,6 +88,12 @@ def reserve(parent, requested):
     descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        # systemd delegates controllers but an unused subtree need not have
+        # enabled them yet. Child memory.current appears only after enablement.
+        # Do this inside the same admission lock, before reading sibling usage.
+        (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
+        if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
+            raise RuntimeError('delegated controllers failed readback')
         yield headroom(parent, requested, available_memory())
     finally:
         os.close(descriptor)
@@ -120,11 +126,6 @@ class RunScope:
                 or policy['cpu_percent'] * period > quota * 100):
             raise RuntimeError('run ceiling exceeds aggregate service ceiling')
         with reserve(parent, policy['memory_bytes']) as reservation:
-            # The delegated root is empty by systemd contract. Never relocate the
-            # daemon or manipulate sibling service/slice groups to enable this.
-            (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
-            if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
-                raise RuntimeError('delegated controllers failed readback')
             self.path = parent / ('run-' + uuid.uuid4().hex)
             self.path.mkdir(mode=0o700)
             self.closed = False

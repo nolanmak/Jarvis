@@ -157,6 +157,28 @@ subprocess.Popen(['/bin/sleep','10'],start_new_session=True,stdout=subprocess.DE
 
 
 class CompositionHeadroomTests(unittest.TestCase):
+    def test_first_admission_enables_child_accounting_before_reading_headroom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=Path(tmp)
+            controls=parent/'cgroup.subtree_control'
+            controls.write_text('')
+            events=[]
+            original=Path.write_text
+            def enable(path, value, *args, **kwargs):
+                if path==controls:
+                    events.append('enabled')
+                    return original(path, 'cpu memory pids')
+                return original(path,value,*args,**kwargs)
+            def check(path, requested, available):
+                self.assertEqual(events,['enabled'])
+                self.assertEqual(controls.read_text(),'cpu memory pids')
+                events.append('headroom')
+                return {'requested_bytes':requested}
+            with patch.object(Path,'write_text',enable), patch.object(resources,'headroom',check), patch.object(resources,'available_memory',return_value=1024**3):
+                with resources.reserve(parent,64*1024**2) as proof:
+                    self.assertEqual(proof['requested_bytes'],64*1024**2)
+            self.assertEqual(events,['enabled','headroom'])
+
     def fixture(self, root, total, daemon, run=None):
         parent=root/'fixture.service'; parent.mkdir()
         (parent/'memory.max').write_text(str(total))
