@@ -16482,7 +16482,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     // context instead of dropping it.
     #[test]
     fn not_fixable_specification_cannot_override_grounded_readiness() {
-        let body=run_once_src();let at=body.find("if !s.fixable").unwrap();let end=at+body[at..].find("// #843").unwrap();
+        let source=include_str!("self_improve.rs");let start=source.find("pub async fn run_once(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();let body=&source[start..end];let at=body.find("if !s.fixable").unwrap();let end=at+body[at..].find("// #843").unwrap();
         assert!(body[at..end].contains("overruled_scope_note"));
         assert!(!body[at..end].contains("label_gave_up"));
     }
@@ -17681,7 +17681,8 @@ else:
     #[test]
     fn historical_not_fixable_markers_remain_readable_without_authorizing_new_labels() {
         assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE,"scoper:not-fixable");
-        assert!(!run_once_src().contains("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}"));
+        let source=include_str!("self_improve.rs");let start=source.find("pub async fn run_once(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();
+        assert!(!source[start..end].contains("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}"));
     }
 
     /// C6 input — reasons come from the durable comments first, then the
