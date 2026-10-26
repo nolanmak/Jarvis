@@ -236,6 +236,83 @@ mod tests {
     }
 
     #[test]
+    fn persisted_exception_revalidates_policy_and_complete_hunk_evidence() {
+        let control = tempfile::tempdir().unwrap();
+        let patch = "+++ b/code.rs\n+necessary_owner_behavior();\n";
+        let hunk = ChangedHunk::new("code.rs", patch.as_bytes()).unwrap();
+        let evidence = vec![HunkEvidence {
+            hunk: hunk.clone(),
+            patch: patch.into(),
+        }];
+        let rules = vec![Constraint::ForbiddenAddedText {
+            id: "R1".into(),
+            source: "https://github.com/o/r/pull/1#discussion_r1".into(),
+            literal: "necessary_owner_behavior()".into(),
+        }];
+        let mappings = vec![Mapping {
+            hunk_id: hunk.id.clone(),
+            criterion_ids: vec!["C1".into()],
+            kind: Kind::Implementation,
+            evidence: "Actual required owner behavior".into(),
+        }];
+        let exception = Exception {
+            head: "head".into(),
+            contract_hash: "contract".into(),
+            policy_hash: "policy".into(),
+            input_hash: input_hash(&evidence).unwrap(),
+            provider: "codex".into(),
+            native_session: "observed-native-session".into(),
+            permits: vec![Permit {
+                rule_id: "R1".into(),
+                hunk_id: hunk.id,
+                criterion_ids: vec!["C1".into()],
+                reason: "Explicit owner requirement necessarily needs this exact behavior".into(),
+            }],
+        };
+        let path = store(
+            control.path(),
+            "exception.json",
+            &serde_json::to_vec(&exception).unwrap(),
+        )
+        .unwrap();
+        let restored: Exception = serde_json::from_slice(&private_bytes(&path).unwrap()).unwrap();
+        assert_current(
+            &rules,
+            &evidence,
+            &mappings,
+            "head",
+            "contract",
+            "policy",
+            Some(&restored),
+        )
+        .unwrap();
+        assert!(assert_current(
+            &rules,
+            &evidence,
+            &mappings,
+            "head",
+            "contract",
+            "changed-policy",
+            Some(&restored)
+        )
+        .is_err());
+        let altered = vec![HunkEvidence {
+            hunk: evidence[0].hunk.clone(),
+            patch: format!("{}+unrelated_work();\n", patch),
+        }];
+        assert!(assert_current(
+            &rules,
+            &altered,
+            &mappings,
+            "head",
+            "contract",
+            "policy",
+            Some(&restored)
+        )
+        .is_err());
+    }
+
+    #[test]
     fn exception_cannot_cover_another_hunk_or_criterion() {
         let failures = vec![("R1".into(), "hunk-1".into())];
         let mappings = vec![Mapping {
