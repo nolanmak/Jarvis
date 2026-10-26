@@ -118,6 +118,7 @@ async fn disposition_from_remote(repo: &Path, gh: &str, head: &str, reviewed_bas
 
 pub(super) async fn reconciliation_disposition(repo: &Path, candidate: &adoption::AdoptedPr,
     verdict: &RecordedVerdict) -> ApprovalDisposition {
+    if workflow::requires_reverification(&candidate.repository,candidate.pr).unwrap_or(true) { return ApprovalDisposition::Repair; }
     let remote_main = workflow::remote_main_head(repo,&candidate.repository).await.ok();
     disposition_from_remote(repo,&gh_bin(),&candidate.head,
         verdict.structured.as_ref().map(|e|e.binding.base.as_str()),remote_main.as_deref(),candidate.pr).await

@@ -118,6 +118,19 @@ fn workflow_audit(
     Ok(Arc::new(logger))
 }
 
+pub(super) fn requires_reverification(repository: &str, pr: u64) -> Result<bool> {
+    requires_reverification_at(&path(), repository, pr)
+}
+fn requires_reverification_at(path: &Path, repository: &str, pr: u64) -> Result<bool> {
+    let store = WorkflowStore::open(path)?;
+    let Some(id) = store.resolve_pr(repository, pr)? else {
+        return Ok(false);
+    };
+    Ok(store
+        .snapshot(&id)?
+        .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"))
+}
+
 fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let binding = value
@@ -140,6 +153,9 @@ fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
 pub(super) struct SweepGuard {
     inner: Option<WorkflowGuard>,
     reviewed_base: Option<String>,
+    source: crate::autoship_contract::AcceptanceSource,
+    branch: String,
+    worktree_lock: Mutex<Option<RunLock>>,
 }
 impl SweepGuard {
     pub(super) async fn acquire(
@@ -315,6 +331,11 @@ impl SweepGuard {
         Ok(Some(Self {
             inner: Some(inner),
             reviewed_base,
+            source: issue
+                .map(crate::autoship_contract::AcceptanceSource::Issue)
+                .unwrap_or(crate::autoship_contract::AcceptanceSource::PullRequest(pr)),
+            branch: branch.into(),
+            worktree_lock: Mutex::new(None),
         }))
     }
 
@@ -351,7 +372,72 @@ impl SweepGuard {
             ok && head.trim() == expected,
             "remote PR head changed since review"
         );
-        // A network read can span lease expiry; revalidate immediately before mutation.
+        {
+            let mut held = self
+                .worktree_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sweep worktree lock poisoned"))?;
+            if held.is_none() {
+                let path = run_lock_path().with_file_name(format!("self-improve-pr-{pr}.lock"));
+                *held = Some(
+                    RunLock::try_acquire(&path)?
+                        .context("PR checkout is currently being prepared by another worker")?,
+                );
+            }
+        }
+        let worktree = prepare_resume_worktree(repo, pr, &self.branch).await?;
+        let reference = {
+            let store = inner
+                .store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?;
+            store
+                .snapshot(inner.id())?
+                .context("sweep workflow missing")?
+                .checkpoint
+                .evidence
+                .into_iter()
+                .filter_map(|raw| {
+                    serde_json::from_str::<acceptance::CandidateReceiptReference>(&raw).ok()
+                })
+                .last()
+        };
+        let checked = async {
+            let reference = reference.context("protected acceptance checkpoint missing")?;
+            acceptance::assert_sweep_receipt(
+                &worktree,
+                &acceptance::control_directory(&inner.repository)?,
+                self.source,
+                &reference,
+                expected,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = checked {
+            inner.record_review(
+                &format!("sweep-invalidation-{}", uuid::Uuid::new_v4()),
+                false,
+                &serde_json::json!({"reason":format!("{error:#}"),"head":expected}).to_string(),
+            )?;
+            let mut store = inner
+                .store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?;
+            let mut checkpoint = store
+                .snapshot(inner.id())?
+                .context("sweep workflow missing")?
+                .checkpoint;
+            checkpoint.stage = Stage::Verify;
+            checkpoint.next = NextAction {
+                reason: "protected_acceptance_stale".into(),
+                action: "reverify_candidate".into(),
+                eligible_at_ms: millis(),
+            };
+            store.checkpoint(&inner.lease, &checkpoint, millis())?;
+            return Err(error).context("sweep approval invalidated; verification repair queued");
+        }
+        // Network and artifact reads can span lease expiry; fence immediately before mutation.
         inner.validate_before_side_effect()
     }
 
@@ -1579,6 +1665,38 @@ mod tests {
         let state = worktree.path().join("state/workflow.db");
         std::fs::create_dir_all(state.parent().unwrap()).unwrap();
         assert!(workflow_audit(&state, "owner/repo#7", Some(worktree.path())).is_err());
+    }
+
+    #[test]
+    fn stale_artifact_checkpoint_reengages_verification_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let id = durable::pr_workflow_id("owner/repo", 42).unwrap();
+        store
+            .register(
+                &id,
+                "fix/child",
+                Binding {
+                    head: "head".into(),
+                    contract: "contract".into(),
+                    evidence_hash: "evidence".into(),
+                },
+                10,
+            )
+            .unwrap();
+        let lease = store.claim(&id, "worker", 11, 1000).unwrap().unwrap();
+        store
+            .attach_pr_in_repo(&lease, "owner/repo", 42, 12)
+            .unwrap();
+        assert!(!requires_reverification_at(&path, "owner/repo", 42).unwrap());
+        let mut checkpoint = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.stage = Stage::Verify;
+        checkpoint.next.action = "reverify_candidate".into();
+        store.checkpoint(&lease, &checkpoint, 13).unwrap();
+        drop(store);
+        assert!(requires_reverification_at(&path, "owner/repo", 42).unwrap());
+        assert!(!requires_reverification_at(&path, "owner/repo", 43).unwrap());
     }
 
     #[test]
