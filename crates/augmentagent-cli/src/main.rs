@@ -8916,6 +8916,11 @@ async fn run_digest(
         }
     }
     let triage_outcomes = store.triage_outcome_report(since_ms, 25)?;
+    ctx.push_str("\n## Autoship native reviewer canary\n");
+    match self_improve::review_canary_summary() {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Canary evidence unavailable: {error:#}\n")),
+    }
     ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
     for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending)] {
         ctx.push_str(&format!("- {cohort}: approved {}, revised {}, skipped {}, aged out {}, unresolved {}\n",

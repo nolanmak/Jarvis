@@ -11792,13 +11792,37 @@ impl AutoPrLoop {
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         let sweep_root = root.clone();
-        self.run_with(shutdown, move || {
+        let canary_stop = shutdown.clone();
+        // Observability has its own lifetime: slow/unavailable reviewer probes
+        // must not delay merge reconciliation or consume a builder attempt.
+        // The protected daily claim prevents restart from multiplying probes.
+        let canary = async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(3600));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = canary_stop.cancelled() => return Ok(()),
+                    _ = timer.tick() => {}
+                }
+                if dry_run { continue; }
+                tokio::select! {
+                    _ = canary_stop.cancelled() => return Ok(()),
+                    result = review_canary_if_due() => {
+                        if let Err(error) = result {
+                            warn!("autoship review canary incomplete: {error:#}");
+                        }
+                    }
+                }
+            }
+        };
+        let shipping = self.run_with(shutdown, move || {
             let root = root.clone();
             async move { run_once(&root, dry_run).await }
         }, move || {
             let root = sweep_root.clone();
             async move { merge_sweep(&root, dry_run).await }
-        }).await
+        });
+        tokio::select! { result = shipping => result, result = canary => result }
     }
 
     /// Reconciliation runs independently of a builder's lifetime and budget.
