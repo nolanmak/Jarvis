@@ -682,6 +682,16 @@ if __name__ == '__main__':
         diagnostic = {'native_vm_failure': category}
         if isinstance(error, OSError) and isinstance(error.errno, int):
             diagnostic['errno'] = error.errno
+        ready = os.environ.get('JARVIS_NATIVE_VM_READY')
+        if ready and not Path(ready).exists():
+            failure = Path(ready).with_name('vm-startup-failure.json')
+            if not failure.exists():
+                # Fixed category/errno only: no exception messages, paths,
+                # credentials or provider payloads cross this receipt boundary.
+                try:
+                    atomic(failure, json.dumps(dict(diagnostic, phase='native_setup_failed')).encode())
+                except OSError:
+                    pass
         print(json.dumps(diagnostic), file=sys.stderr)
         print('Native VM boundary unavailable; launch terminated without host fallback.', file=sys.stderr)
         raise SystemExit(126)

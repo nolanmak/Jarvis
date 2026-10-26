@@ -41,6 +41,14 @@ impl ProcessGroup {
                 self.resource_outcome(provider,logger)?;
                 let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
                     .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if let Some(category)=startup.as_ref().and_then(native_setup_category) {
+                    if let Some(logger)=logger {
+                        logger.record_controller(serde_json::json!({"kind":"native_setup_failed","provider":provider,"category":category}))?;
+                    }
+                    return Err(crate::reasoner::ReasonerError::Local {
+                        message:format!("{provider}: native VM setup failed before model admission ({category}); resource limits were not exhausted")
+                    }.into());
+                }
                 let phase=if startup.as_ref().and_then(|value|value.get("phase")).and_then(|value|value.as_str())==Some("native_credential_in_use") {
                     "native_credential_in_use"
                 } else {"launch_readiness_unavailable"};
@@ -71,6 +79,18 @@ impl ProcessGroup {
         if self.resource_observed.swap(true,Ordering::SeqCst) { return Ok(()); }
         crate::run_resources::record_outcome(&self.receipt.with_file_name("resource-accounting.json"),self.resource_required,provider,logger)
     }
+}
+
+fn native_setup_category(value:&serde_json::Value)->Option<&'static str> {
+    if value.get("phase").and_then(|v|v.as_str())!=Some("native_setup_failed") {return None;}
+    Some(match value.get("native_vm_failure").and_then(|v|v.as_str()) {
+        Some("JSONDecodeError")=>"JSONDecodeError",Some("ValueError")=>"ValueError",
+        Some("RuntimeError")=>"RuntimeError",Some("TimeoutError")=>"TimeoutError",
+        Some("OSError")=>"OSError",Some("BrokenPipeError")=>"BrokenPipeError",
+        Some("FileNotFoundError")=>"FileNotFoundError",Some("PermissionError")=>"PermissionError",
+        Some("ChildProcessError")=>"ChildProcessError",Some("CalledProcessError")=>"CalledProcessError",
+        _=>"BoundaryFailure",
+    })
 }
 
 fn cleanup_receipt_complete(bytes:&[u8])->bool {
@@ -573,6 +593,12 @@ mod tests {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    #[test]
+    fn setup_diagnostics_do_not_masquerade_as_capacity_or_echo_untrusted_detail() {
+        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"FileNotFoundError","message":"private path"})),Some("FileNotFoundError"));
+        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"private credentials"})),Some("BoundaryFailure"));
+        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_credential_in_use"})),None);
+    }
     #[test]
     fn kernel_quiescence_receipt_settles_interrupted_request_without_fake_reaping() {
         let directory=tempfile::tempdir().unwrap();
