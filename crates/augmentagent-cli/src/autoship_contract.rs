@@ -690,6 +690,13 @@ impl RegisteredContract {
         binding: &EvidenceBinding,
     ) -> Result<()> {
         ensure!(
+            self.contract
+                .verifiers
+                .iter()
+                .all(|v| v.command.controller_asserted()),
+            "legacy in-process verifier receipts require independent behavioral-oracle migration"
+        );
+        ensure!(
             receipts.len() == self.contract.verifiers.len(),
             "missing verifier evidence"
         );

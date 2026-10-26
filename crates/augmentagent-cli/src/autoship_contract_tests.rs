@@ -529,3 +529,33 @@ fn every_legacy_inprocess_report_is_untrusted_even_with_zero_exit() {
         );
     }
 }
+
+#[test]
+fn cached_legacy_red_and_green_receipts_never_restore_authority() {
+    let (dir, _) = registered();
+    let mut c = contract();
+    c.verifiers[0].command = VerifierCommand::PythonUnittest {
+        test: "tests.Case.test_ready".into(),
+    };
+    let reg =
+        RegisteredContract::register(dir.path(), c, BASE.into(), "legacy-env".into()).unwrap();
+    let cached = |head: &str, result| VerifierReceipt {
+        verifier_id: "ready".into(),
+        binding: reg.binding(head).unwrap(),
+        result,
+        output_digest: "old-authenticated-output".into(),
+        diagnostic: String::new(),
+    };
+    let baseline = cached(BASE, CheckResult::IntendedFailure);
+    let candidate = cached(HEAD, CheckResult::Passed);
+    let serialized = serde_json::to_string(&reg).unwrap();
+    let reopened: RegisteredContract = serde_json::from_str(&serialized).unwrap();
+    assert!(reopened.verify_integrity(dir.path()).is_ok());
+    assert!(reopened.baseline_result(&[baseline.clone()]).is_err());
+    assert!(reopened
+        .baseline_result(&[cached(BASE, CheckResult::Passed)])
+        .is_err());
+    assert!(reopened
+        .candidate_passes(&[baseline], &[candidate], &reg.binding(HEAD).unwrap())
+        .is_err());
+}
