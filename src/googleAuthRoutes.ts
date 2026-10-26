@@ -17,6 +17,8 @@ export interface GoogleAttempt {
   createdAt: number;
   expiresAt: number;
   status: GoogleAttemptStatus;
+  /** Mailbox the caller asked for (login hint); `email` is what Google granted. */
+  requested_email?: string;
   email?: string;
   entity_id?: string;
   error?: string;
@@ -64,21 +66,19 @@ export function createGoogleAuthFlow(deps: GoogleAuthDeps) {
     configured: deps.configured,
 
     /** Mint a consent URL and record a pending attempt keyed by its state. */
-    async start(): Promise<{ attempt_id: string; auth_url: string; expires_at: string }> {
+    async start(
+      requestedEmail?: string,
+    ): Promise<{ attempt_id: string; auth_url: string; expires_at: string; requested_email?: string }> {
       if (!deps.configured()) {
         throw new GoogleAuthInputError(
           "GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET are not set; see .env.example",
         );
       }
       const attemptId = deps.randomId();
-      const out = await deps.runCli([
-        "google",
-        "auth-url",
-        "--redirect-uri",
-        deps.redirectUri(),
-        "--state",
-        attemptId,
-      ]);
+      const hint = requestedEmail?.trim().toLowerCase() || undefined;
+      const args = ["google", "auth-url", "--redirect-uri", deps.redirectUri(), "--state", attemptId];
+      if (hint) args.push("--login-hint", hint);
+      const out = await deps.runCli(args);
       const url = out.stdout.trim().split("\n").pop() ?? "";
       if (out.code !== 0 || !url.startsWith("https://accounts.google.com/")) {
         throw new Error(out.stderr.trim() || "could not build the Google consent URL");
@@ -89,12 +89,14 @@ export function createGoogleAuthFlow(deps: GoogleAuthDeps) {
         createdAt,
         expiresAt: createdAt + GOOGLE_ATTEMPT_TTL_MS,
         status: "pending",
+        ...(hint ? { requested_email: hint } : {}),
       };
       write(attempt);
       return {
         attempt_id: attemptId,
         auth_url: url,
         expires_at: new Date(attempt.expiresAt).toISOString(),
+        ...(hint ? { requested_email: hint } : {}),
       };
     },
 
@@ -164,6 +166,11 @@ export function createGoogleAuthFlow(deps: GoogleAuthDeps) {
         /* the connect succeeded; identity is still readable from gmail_accounts */
       }
       const done: GoogleAttempt = { ...attempt, status: "connected", email, entity_id: entityId };
+      // A different account than asked for still connected (and is saved);
+      // say so instead of letting the caller assume the requested one.
+      if (attempt.requested_email && email && email.toLowerCase() !== attempt.requested_email) {
+        done.error = `connected ${email}, not the requested ${attempt.requested_email}`;
+      }
       write(done);
       return { ok: true, message: `connected ${email ?? "mailbox"}`, attempt: done };
     },
