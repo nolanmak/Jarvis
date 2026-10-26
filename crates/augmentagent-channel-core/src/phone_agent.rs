@@ -365,6 +365,7 @@ impl FastBridge {
             // The durable queue admits at most 128 intents. A process-wide
             // guard also covers adapter replacement while work is running.
             if !running.insert(key.clone()) {
+                if let Some(events) = &events { events.duplicate(); }
                 return;
             }
         }
@@ -399,6 +400,7 @@ impl FastBridge {
             .into_iter()
             .find(|job| job.call_id == call.id && job.task_id == task_id)
         else {
+            if let Some(events) = events { events.duplicate(); }
             return Ok(());
         };
         let origin = self.origin(call)?;

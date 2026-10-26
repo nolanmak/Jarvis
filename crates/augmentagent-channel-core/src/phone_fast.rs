@@ -387,9 +387,14 @@ fn response_stream(mut response: reqwest::Response, mut parser: Parser) -> FastS
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => {
-                    let result = if pending.is_empty() { parser.finish() }
-                        else { Err(FastModelError("truncated_stream")) };
-                    if let Err(error) = result { let _ = tx.send(Err(error)).await; }
+                    let result = if pending.is_empty() {
+                        parser.finish()
+                    } else {
+                        Err(FastModelError("truncated_stream"))
+                    };
+                    if let Err(error) = result {
+                        let _ = tx.send(Err(error)).await;
+                    }
                     return;
                 }
                 Err(_) => {
@@ -406,11 +411,14 @@ fn response_stream(mut response: reqwest::Response, mut parser: Parser) -> FastS
                     return;
                 }
             };
-            let text = String::from_utf8(pending.drain(..valid).collect()).expect("validated UTF-8 prefix");
+            let text = String::from_utf8(pending.drain(..valid).collect())
+                .expect("validated UTF-8 prefix");
             match parser.push(&text) {
                 Ok(events) => {
                     for event in events {
-                        if tx.send(Ok(event)).await.is_err() { return; }
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 Err(error) => {
@@ -561,10 +569,16 @@ mod phone_fast_tests {
         };
         let anthropic = anthropic_body(&speculative);
         assert_eq!(anthropic["tool_choice"], json!({"type":"none"}));
-        assert_eq!(anthropic["tools"].as_array().unwrap().len(), TOOL_NAMES.len());
+        assert_eq!(
+            anthropic["tools"].as_array().unwrap().len(),
+            TOOL_NAMES.len()
+        );
         let cerebras = cerebras_body(&speculative, "m");
         assert_eq!(cerebras["tool_choice"], "none");
-        assert_eq!(cerebras["tools"].as_array().unwrap().len(), TOOL_NAMES.len());
+        assert_eq!(
+            cerebras["tools"].as_array().unwrap().len(),
+            TOOL_NAMES.len()
+        );
     }
 
     #[test]
@@ -701,6 +715,23 @@ mod phone_fast_tests {
         assert_eq!(o.finish(), Ok(()));
         o.push("data: {").unwrap();
         assert_eq!(o.finish(), Err(FastModelError("truncated_stream")));
+    }
+
+    #[test]
+    fn phone_fast_unfinished_tool_input_never_finishes_successfully() {
+        let mut a = Parser::Anthropic(AnthropicSse::default());
+        a.push(concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"lookup_fast\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        )).unwrap();
+        assert_eq!(a.finish(), Err(FastModelError("truncated_stream")));
+        let mut o = Parser::OpenAi(OpenAiSse::default());
+        o.push("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t\",\"function\":{\"name\":\"lookup_fast\",\"arguments\":\"{\"}}]}}]}\n\n").unwrap();
+        assert_eq!(o.finish(), Err(FastModelError("truncated_stream")));
+        assert_eq!(
+            o.push("data: [DONE]\n\n").err(),
+            Some(FastModelError("malformed_tool_input"))
+        );
     }
 
     #[test]

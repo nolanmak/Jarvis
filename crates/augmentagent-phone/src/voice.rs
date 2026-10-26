@@ -4,7 +4,7 @@
 //! attribute-safe alphabet before it can reach TwiML.
 use thiserror::Error;
 
-/// Default ElevenLabs voice ID with the explicit `flash_v2_5` model suffix.
+/// Jessica, the feminine ElevenLabs default, with an explicit `flash_v2_5` suffix.
 pub const DEFAULT_ELEVENLABS_VOICE: &str = "r1KmysJdVYZjJCm4mL3b-flash_v2_5";
 /// Fixed product nouns that recognition should bias toward on every call.
 pub const HINT_NOUNS: [&str; 6] = ["Jarvis", "Discord", "WhatsApp", "Slack", "Linear", "Notion"];

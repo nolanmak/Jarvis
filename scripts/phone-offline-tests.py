@@ -82,6 +82,8 @@ def main():
         label = package + "-" + (target or "lib")
         command = ["cargo", "test", "--locked", "-p", package, selector] + ([target] if target else [])
         jobs.append((label, command, minimum, False))
+    jobs.append(("augmentagent-channel-core-phone-fast",
+                 ["cargo", "test", "--locked", "-p", "augmentagent-channel-core", "--lib", "phone_fast_tests::"], 9, True))
     # These required CLI modules share a binary with unrelated, environment-
     # dependent tests. Only unrelated tests may be filtered; zero/ignored cases
     # or fewer than the required number still fail.

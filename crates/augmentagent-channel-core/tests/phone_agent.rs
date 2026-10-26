@@ -817,6 +817,11 @@ mod fast {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(sends(&reopened, &f.origin, &key).len(), 1);
         assert_eq!(provider.calls().len(), 1, "dispatched work never re-runs");
+        let (goodbye_id, speech, _rx) = speech_for(&f.call.id, "goodbye");
+        let goodbye = bridge.answer(&f.call, &format!("{goodbye_id}-goodbye"), "goodbye", speech, CancellationToken::new()).await.unwrap();
+        assert_eq!(goodbye, augmentagent_phone::end_call::DEFAULT_GOODBYE,
+            "a duplicate must not leave phantom work blocking the deterministic goodbye");
+
     }
 
     /// Revokes the owner's authority while the model is answering, then asks
