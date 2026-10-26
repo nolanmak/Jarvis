@@ -39,6 +39,12 @@ use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 
 #[path = "self_improve_adoption.rs"]
 mod adoption;
+#[path = "self_improve_policy_hold.rs"]
+mod policy_hold;
+
+pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
+    policy_hold::statuses()
+}
 #[path = "self_improve_source.rs"]
 mod source_reconcile;
 #[path = "self_improve_workflow.rs"]
@@ -2257,29 +2263,35 @@ struct MergePolicy {
 
 /// May this change auto-merge? The single answer both paths use.
 fn may_automerge(p: &MergePolicy) -> bool {
-    if !p.automerge_enabled || !p.reviews_approved || p.research_filed {
-        return false;
-    }
+    merge_policy_blocker(p).is_none()
+}
+
+/// Named policy dependencies shared by merge and free resume admission.
+fn merge_policy_blocker(p: &MergePolicy) -> Option<&'static str> {
+    if !p.automerge_enabled { return Some("automerge-disabled"); }
+    if !p.reviews_approved { return Some("review-required"); }
+    if p.research_filed { return Some("research-authorization-required"); }
     // #828 — an independent LGTM is REQUIRED, and with the override set it
     // also releases the `hard` band: two independent reviewers is a real
     // answer to blast radius where one model grading its own family's work
     // was not.
     let complexity_ok = p.complexity.auto_mergeable() || (p.codex_approved && codex_unlocks_hard());
     if !complexity_ok {
-        return false;
+        return Some("complexity-authorization-required");
     }
     if !automerge_receipt_ok(
         p.receipt_gated_file.as_deref(),
         p.codex_approved,
         p.lgtm_overrides_receipt.as_deref(),
     ) {
-        return false;
+        return Some("receipt-required");
     }
-    automerge_eligible(
+    if !automerge_eligible(
         &p.issue_author,
         p.repo_owner.as_deref(),
         p.automerge_authors.as_deref(),
-    )
+    ) { return Some("author-authorization-required"); }
+    None
 }
 
 /// #1029 — one open draft, as the sweep sees it through `gh`.
@@ -3698,7 +3710,7 @@ async fn find_resumable_draft(
     let owner = repository.split('/').next().map(str::to_string);
     let mut allowed = trusted_authors(repo_root).await;
     if let Some(owner) = &owner { if !allowed.contains(owner) { allowed.push(owner.clone()); } }
-    let adopted = adoption::authorized(&prs, &repository, &allowed);
+    let mut adopted = adoption::authorized(&prs, &repository, &allowed);
     if !dry_run {
         if let Err(error) = adoption::persist(&workflow::path(), &adopted) {
             warn!("cannot persist adopted PR ownership: {error:#}");
@@ -3731,6 +3743,10 @@ async fn find_resumable_draft(
         }
     }
 
+    // The durable exact-head verdict survives restart/midnight. Re-evaluate
+    // policy without model work; an unchanged authorization hold is not a
+    // new builder attempt. The merge sweep continues checking these PRs.
+    policy_hold::filter(repo_root, &mut adopted, dry_run).await;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let select = |cursor| {
         adoption::select_linked(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor)

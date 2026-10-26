@@ -119,6 +119,8 @@ pub struct HealthInputs {
     /// #1037 — drafts the resume lane is holding because no independent
     /// review is possible: `(pr, reason code, reason, days without a review)`.
     pub unreviewable_drafts: Vec<(u64, String, String, u32)>,
+    /// Recently reconciled approved heads awaiting a named policy dependency.
+    pub policy_held_drafts: Vec<(u64, String)>,
     /// #1215 — today's engaged runs against today's cap.
     pub runs_today: Option<RunsToday>,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
@@ -449,11 +451,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         });
     }
 
+    let policy_held: Vec<_> = i.policy_held_drafts.iter()
+        .filter(|(pr, _)| i.open_prs.as_ref().is_none_or(|open| open.contains(pr)))
+        .collect();
+    if !policy_held.is_empty() {
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "policy-held",
+            detail: format!("Approved PRs held without billed rebuild/review: {}",
+                policy_held.iter().map(|(pr, reason)| format!("#{pr}: {reason}")).collect::<Vec<_>>().join("; ")),
+            fix: "Free reconciliation rechecks the named dependency. A changed head requires fresh review; changed policy can release the existing approval.".into(),
+        });
+    }
     let stale: Vec<String> = i
         .draft_ages_days
         .iter()
         // A held draft is already reported, with its reason, just above.
         .filter(|(pr, _)| !held.iter().any(|(h, ..)| h == pr))
+        .filter(|(pr, _)| !policy_held.iter().any(|(h, _)| h == pr))
         .filter(|(_, d)| *d >= t.draft_stale_days)
         .map(|(pr, d)| format!("#{pr} ({d}d)"))
         .collect();
@@ -930,6 +945,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         open_prs: open_pr_numbers(),
         draft_ages_days: open_draft_ages(now),
         unreviewable_drafts: crate::self_improve::unreviewable_drafts(),
+        policy_held_drafts: crate::self_improve::policy_held_drafts(),
         runs_today: {
             let (runs, cap, braked) = crate::self_improve::runs_today_status();
             Some(RunsToday { runs, cap, braked })
@@ -1002,6 +1018,21 @@ async fn notify_owner_of(text: &str) {
 mod tests {
     // (tests continue below; the #1030 case is appended at the end)
     use super::*;
+
+    #[test]
+    fn policy_hold_is_distinct_from_stale_and_disappears_for_closed_pr() {
+        let input = HealthInputs {
+            policy_held_drafts: vec![(42, "receipt-required".into())],
+            open_prs: Some(vec![42]),
+            draft_ages_days: vec![(42, 20)],
+            ..healthy()
+        };
+        let findings = analyze(&input, &Thresholds::default());
+        assert!(findings.iter().any(|f| f.code == "policy-held" && f.detail.contains("receipt-required")));
+        assert!(!findings.iter().any(|f| f.code == "draft-stale"));
+        let closed = HealthInputs { open_prs: Some(vec![]), ..input };
+        assert!(!analyze(&closed, &Thresholds::default()).iter().any(|f| f.code == "policy-held"));
+    }
 
     /// #1215 C5 — the text report always says how much of today's budget
     /// is spent, healthy or not.
