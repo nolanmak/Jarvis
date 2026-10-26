@@ -2,6 +2,7 @@
 //! retain their existing transport; there is no required-workflow host fallback.
 use std::{collections::BTreeMap, io::Write, os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt}, path::{Path, PathBuf}};
 use anyhow::{Context, Result, ensure};
+use augmentagent_store::rusqlite;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use std::os::fd::AsRawFd;
