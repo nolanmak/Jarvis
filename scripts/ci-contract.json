@@ -377,10 +377,14 @@
       "shell": "bash"
     },
     "phone/offline/12": {
-      "body": "cargo check -p augmentagent-cli --locked",
+      "body": "python3 scripts/phone-upgrade-test.py --live",
       "shell": "bash"
     },
     "phone/offline/13": {
+      "body": "cargo check -p augmentagent-cli --locked",
+      "shell": "bash"
+    },
+    "phone/offline/14": {
       "body": "cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnings",
       "shell": "bash"
     },
@@ -1892,10 +1896,14 @@
             },
             {
               "command_id": "phone/offline/12",
-              "name": "CLI integration compiles"
+              "name": "ConversationRelay rollback preserves GPT-Live tasks and receipts"
             },
             {
               "command_id": "phone/offline/13",
+              "name": "CLI integration compiles"
+            },
+            {
+              "command_id": "phone/offline/14",
               "name": "Phone lint"
             },
             {
@@ -1905,7 +1913,7 @@
               "with": {
                 "if-no-files-found": "error",
                 "name": "phone-offline-${{ matrix.os }}",
-                "path": "target/phone-offline/\ntarget/phone-upgrade/\n"
+                "path": "target/phone-offline/\ntarget/phone-upgrade/\ntarget/phone-live-upgrade/\n"
               }
             }
           ],
@@ -1922,7 +1930,7 @@
         }
       },
       "role": "validation",
-      "sha256": "03dc8733a4fde84cfc34fcb1abed9231e9e7a044f7b1b9e3cf6ab27d366d5be7"
+      "sha256": "f4ec3952b4b0d94766b396d8d29c18b235aae4e3fec3c69d0fe4a85377aca82d"
     },
     ".github/workflows/platform.yml": {
       "defaults": {},

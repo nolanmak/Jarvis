@@ -93,6 +93,8 @@ pub enum Error {
     Provider(#[from] ProviderError),
     #[error("phone voice configuration is invalid: {0}")]
     Voice(#[from] voice::VoiceConfigError),
+    #[error("phone Live provider: {0}")]
+    Live(#[from] live_session::LiveError),
     #[error("phone silence policy is invalid: {0}")]
     Silence(#[from] silence::SilenceConfigError),
 }
@@ -117,6 +119,8 @@ impl Error {
             Self::Provider(ProviderError::Rejected) => "provider_rejected",
             Self::Provider(ProviderError::Uncertain) => "provider_uncertain",
             Self::Voice(_) | Self::Silence(_) => "not_configured",
+            Self::Live(live_session::LiveError::Authentication | live_session::LiveError::Access | live_session::LiveError::Configuration) => "not_configured",
+            Self::Live(_) => "provider_unavailable",
         }
     }
 }
@@ -133,6 +137,7 @@ pub struct PhoneConfig {
     verification_key: Vec<u8>,
     links: Vec<OwnerLink>,
     voice: voice::VoiceConfig,
+    live: Option<live_config::LiveConfig>,
     owner_first_name: Option<String>,
     debug_events: bool,
     barge_in: relay::BargeIn,
@@ -177,6 +182,7 @@ impl PhoneConfig {
             verification_key: verification_key.as_bytes().into(),
             links,
             voice: voice::VoiceConfig::default(),
+            live: None,
             owner_first_name: None,
             debug_events: false,
             barge_in: relay::BargeIn::default(),
@@ -185,6 +191,14 @@ impl PhoneConfig {
             proposals: proposals::ProposalPolicy::default(),
             silence: silence::SilencePolicy::default(),
         })
+    }
+    pub fn with_live(mut self, live: Option<live_config::LiveConfig>) -> Self {
+        self.live = live;
+        if self.live.is_some() {
+            self.fast = None;
+            self.preemptive = false;
+        }
+        self
     }
     /// Quiet hours and owner time zone for agent-proposed calls (#1553).
     pub fn with_proposals(mut self, proposals: proposals::ProposalPolicy) -> Self {
@@ -248,6 +262,7 @@ pub struct PhoneService {
     cleanup_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Whether this service holds an open call-proposal answer window (#1553).
     consent_window: std::sync::atomic::AtomicBool,
+    dispatch_ready: tokio::sync::Notify,
 }
 impl Drop for PhoneService {
     fn drop(&mut self) {
@@ -269,6 +284,7 @@ impl PhoneService {
             stopping: std::sync::atomic::AtomicBool::new(false),
             cleanup_inflight: Arc::new(std::sync::Mutex::new(Default::default())),
             consent_window: std::sync::atomic::AtomicBool::new(false),
+            dispatch_ready: tokio::sync::Notify::new(),
         }
     }
     /// Explicit operator-configured identities, for installing transport adapters
@@ -279,14 +295,25 @@ impl PhoneService {
     pub fn debug_events(&self) -> bool {
         self.config.debug_events
     }
-    /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
+    /// Operator selection for the next reserved call.
+    pub fn voice_backend(&self) -> live_config::VoiceBackend {
+        if self.config.live.is_some() {
+            live_config::VoiceBackend::OpenAiLive
+        } else {
+            live_config::VoiceBackend::ConversationRelay
+        }
+    }
+    /// Legacy text fast layer; always absent for Live sessions.
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
+        if self.config.live.is_some() {
+            return None;
+        }
         self.config.fast.as_ref()
     }
     /// `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer (#1555): TwiML
     /// requests interim prompts and the relay may speculate on them.
     pub fn preemptive(&self) -> bool {
-        self.config.preemptive && self.config.fast.is_some()
+        self.config.live.is_none() && self.config.preemptive && self.config.fast.is_some()
     }
     /// Silence check-in and automatic-end thresholds (#1556).
     pub fn silence_policy(&self) -> silence::SilencePolicy {
@@ -474,6 +501,7 @@ impl PhoneService {
     }
     async fn finish_call_reservation(&self, grant: &Grant, reserved: augmentagent_store::phone::CallReservation) -> Result<PhoneCall, Error> {
         if reserved.should_dial {
+            self.store.phone_set_voice_backend(&reserved.call.id, self.voice_backend().as_str())?;
             let action = format!(
                 "{}/phone/start/{}",
                 self.config.public_base, reserved.call.id
@@ -490,6 +518,17 @@ impl PhoneService {
                 },
                 grant.binding_revision,
             )?;
+            if let Some(live) = &self.config.live {
+                if let Err(error) = self.live_preflight(live, &reserved.call.id).await {
+                    self.store.phone_create_rejected(&reserved.call.id, self.clock.now_ms())?;
+                    return Err(error);
+                }
+                // Authorization can change while the readiness probe is in flight.
+                if let Err(error) = self.check(grant, false) {
+                    self.store.phone_create_rejected(&reserved.call.id, self.clock.now_ms())?;
+                    return Err(error);
+                }
+            }
             self.dial(&reserved.call, twiml).await?;
         }
         Ok(self.store.phone_call(&grant.owner_id, &reserved.call.id)?)
@@ -797,3 +836,23 @@ pub mod speculation;
 
 pub mod proposals;
 pub mod silence;
+
+pub mod live_transport;
+
+pub mod live_session;
+
+pub mod live_connection;
+
+pub mod live_context;
+
+pub mod live_call;
+
+pub mod live_config;
+
+mod live_media;
+
+pub mod live_usage;
+
+pub mod live_goodbye;
+
+pub mod live_playback;

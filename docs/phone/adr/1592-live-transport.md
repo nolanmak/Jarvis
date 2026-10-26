@@ -1,0 +1,203 @@
+# GPT-Live phone transport
+
+Status: implementation decision; account/live qualification pending. 2026-10-26.
+Epic #1591; transport #1592. The target model is exactly `gpt-live-1`.
+
+## Decision
+
+Use the existing Rust phone listener to bridge Twilio bidirectional Media Streams
+to the primary OpenAI Live WebSocket. Keep ConversationRelay as the production
+default until #1596 passes. Reuse the existing Twilio dial reservation, destination,
+owner binding, callback verification, call budget and single-consumer relay claim.
+No new number, redial loop, phone verification ceremony or startup dial is added.
+An owner-triggered readiness probe validates and finalizes a short Live session
+before dialing; it carries no owner context and is never triggered by callbacks.
+Its usage is persisted separately from the conversation in `phone_live_usage`.
+Both attempts are registered before connecting; a crash leaves an incomplete
+receipt with unknown usage. The final `session.closed` duration is recorded once,
+including for a provider-reported failure. Socket loss never becomes zero cost.
+Provider finalization, its reason, the local stop trigger and any finalization
+failure remain separate fields; none implies the human owner hung up.
+
+`phone metrics --last N` includes aggregate confirmed Live seconds and unknown
+attempt counts for probes and conversations. The displayed USD calculation is
+an estimate using the published $0.05/minute rate checked 2026-10-26, excludes
+Twilio/backend charges, and leaves the total unknown if any attempt has missing
+final usage. It prints no call/session IDs. Exact correlation remains in the
+private store for the canary receipt. Actual invoice/cost reconciliation and
+audible timing qualification remain in #1595/#1596.
+
+Playback evidence is checkpointed once per second and when collection ends.
+It separates input bytes received, provider output received, output successfully
+sent to Twilio, uncleared playback-mark bytes, requested clears, and returned
+marks classified as cleared. Bytes sent without a playback/clear receipt remain
+unconfirmed, including when the socket closes. A process crash leaves an open
+collector checkpoint; a finalized collector record cannot be overwritten by a
+late checkpoint. No audio or transcript is retained in these metrics.
+
+`phone metrics` reports first-provider-frame and first-playback-receipt timings
+relative to bridge startup, with separate sample counts and p50/p95 across calls.
+These are startup/transport diagnostics, not per-turn response latency. A mark
+describes buffer drain, not the first audible sample, and audio may be silence.
+The report explicitly leaves audible response latency unavailable. The epic's
+15-turn audible p50/p95 gate still needs independent caller-side timing evidence;
+neither these counters nor estimated server timing can satisfy it alone.
+
+This is an audio backend, not another Chat Completions fast provider. Backend
+work remains in Jarvis's native session/approval harness and durable task queue.
+
+Completed results up to 500 UTF-8 bytes can go directly to Live commentary.
+Longer results wait for a separate tool-free summary worker; full chat delivery
+does not wait for it. That worker uses the existing backend's pinned fast tier,
+no tools/MCP servers, no chat history, and only the completed result as data.
+It rechecks call authority before and after generation and validates a strict
+JSON response containing a nonempty summary of at most 500 UTF-8 bytes.
+
+Summary jobs have 30-second durable leases, a 15-second model deadline, and at
+most two attempts. Retries cannot rerun the original task; stale leases cannot
+replace newer summaries. Results over 64,000 bytes are not silently truncated
+for summarization. Oversized input or exhausted attempts produce an explicit
+spoken-summary failure notice directing the caller to chat. Hangup discards
+voice delivery while preserving the full native task result and chat outbox.
+These extra backend model calls are outside the Live voice-cost estimate.
+
+## Alternatives and evidence
+
+Twilio Agent Connect is the official integration. Its documented Python and
+TypeScript SDKs include `GPTLiveProvider`, support outbound calls, and bridge the
+same Media Streams protocol. The current tutorial demonstrates Responses
+rather than Jarvis's required client delegation; client integration still needs
+application work. Using TAC here would add a separately supervised runtime and
+an authenticated IPC layer around existing Rust authorization and task state.
+Choose the direct Rust bridge to keep those boundaries in one process. This is
+not a claim that TAC cannot support client delegation or that the account lacks
+TAC access. No TAC-only service/account dependency is introduced.
+
+OpenAI recommends WebRTC even for server connections. Here Twilio already
+provides an ordered WebSocket stream in G.711 mu-law. A WebRTC leg would add
+an RTP/ICE stack, clock conversion and another media queue. The supported Live
+WebSocket accepts the same codec at 8 kHz, so bytes can pass through unchanged.
+SIP would instead require trunk/project routing and a different inbound call
+correlation/control lifecycle; it offers no needed capability for this existing
+outbound-only service. Revisit the choice if measured latency misses #1591.
+
+## Wire and authority contract
+
+* TwiML selects `<Connect><Stream>` only for an explicitly enabled Live call.
+  The existing callback authorizes the persisted owner before connection.
+* Verify `X-Twilio-Signature` against the configured public WSS URL, then match
+  account SID, call SID and stream SID in `connected`/`start`. Persist a single
+  relay claim before opening any provider connection or executing backend work.
+* Require mono `audio/x-mulaw` at 8000 Hz. OpenAI uses
+  `audio.format={"type":"audio/pcmu","rate":8000}` for both directions.
+  Audio is base64 raw codec bytes without file headers.
+* Accept ordered `media` frames only after startup; reject wrong identities,
+  duplicate starts, malformed payloads, unsupported formats and reordered audio.
+* Forward `media` followed by a unique `mark`. A returned mark confirms that
+  preceding audio drained, not when its first sample became audible. A `clear`
+  releases audio but returned marks for cleared buffers are not playback proof.
+* Buffer at most two seconds (16,000 mu-law bytes) awaiting Twilio playback,
+  with a separate bounded outstanding-mark count. When capacity is exhausted,
+  hold at most one provider frame (16,000 bytes) locally and pause provider reads
+  until marks free capacity. Oversized provider frames fail the session. Never
+  queue unlimited delayed speech or silently drop tool results.
+* A `stop`, socket close or generic terminal call status does not establish an
+  owner hangup. Keep provider failure, app stop and ambiguous closure separate.
+* No raw audio/transcripts/provider error bodies enter public diagnostics.
+
+## Qualification still required
+
+Answered calls supply an initial developer message requesting a brief greeting;
+the pre-dial readiness probe does not. The socket fixture verifies greeting
+audio can reach Twilio before any inbound audio, but only a live call can prove
+that the selected voice actually follows that instruction.
+
+Ordinary conversational interruption stays with GPT-Live's native full-duplex
+behavior. Twilio's official `GPTLiveProvider` forwards output audio directly and
+explicitly leaves interruption to the model; its example does not configure
+Realtime barge-in or truncation. Follow that transport contract here. Keep
+sending caller audio while assistant audio and playback marks are outstanding.
+Do not clear or restart playback merely because a transcript fragment, a brief
+backchannel, or a delayed instruction acknowledgment arrived. A transcript can
+lag audio and clearing on it could discard a fresh response.
+
+The prompt asks the model to yield to corrections/stop/wait, use the newest
+request, and preserve backend tasks unless a delegated change modifies them.
+The signed duplex fixture sends four caller audio frames while all playback
+marks remain unacknowledged, with two backchannel and two interruption captions;
+it verifies uninterrupted bidirectional transport and no invented truncate or
+clear commands. The fake provider supplies those captions and responses: this
+is not evidence of speech recognition or successful model interruption.
+
+Qualification must measure actual native interruption and stale audio behavior,
+including Twilio's queue. Output audio has no timestamps or audio-done event,
+and transcripts have no completed-turn event. The application bounds pending
+Twilio playback to two seconds plus one locally buffered provider frame (at
+most two seconds). It pauses provider reads until playback marks free capacity,
+while still processing caller audio, marks, stop and duration/authorization
+checks. Oversized provider frames remain errors. These bounds do not identify an
+exact speech boundary from those events. If real calls fail the epic's no-stale-
+audio requirement, revise and requalify the transport/policy before rollout;
+the prompt and fixture alone do not satisfy that requirement. Explicit app
+termination (including goodbye) still clears pending Twilio playback. Cleared
+marks are never counted as heard audio.
+
+The local goodbye shortcut accumulates at most 512 bytes of caller transcript,
+starting a new candidate after an 800 ms transcript-time gap. An exact supported
+goodbye (including “that's all, thanks”) must remain unchanged for 1200 ms;
+energetic inbound mu-law audio postpones closing for another 1200 ms. Assistant
+text, quoted/questioned words, oversized candidates and longer phrases do not
+trigger it. This is a conservative application heuristic, not a provider turn
+boundary or proof that speech recognition is correct. Test background noise,
+paused continuations and the actual <=5 s hangup requirement in the canary.
+
+On a recognized goodbye, persist the stop request and `owner_goodbye`, clear
+Twilio's queued audio, and close its socket within a shared two-second budget.
+The independent cleanup watchdog retains the stop request if transport shutdown
+fails. OpenAI finalization follows separately so it cannot delay the phone
+hangup. Native jobs and their original-chat delivery remain active. The socket
+fixture verifies that call closure precedes a deliberately delayed provider
+finalization; it does not establish PSTN hangup latency.
+
+Fixtures pin documented message shapes with synthetic identities/audio; they
+are not captures from this account and cannot establish live compatibility.
+The signed HTTP/WSS integration tests must prove zero sessions/backend work on
+unsigned, replayed or cross-owner input. The account must pass an explicit call
+with the OpenAI project before production switches. Public media endpoint reach,
+codec agreement, interruption behavior, measured audible latency and usage are
+recorded in #1596. Missing OpenAI credentials block the canary, not offline work.
+
+## Incomplete history and staging retention
+
+Pending transcript text has an 8,192-fragment per-call limit and a 1 MiB
+aggregate byte limit. Delivered fingerprints do not consume the pending-fragment
+limit; a separate 65,536-event per-call bound limits replay metadata. A capacity
+refusal atomically records a content-free incomplete-history marker. The call
+continues, and current bounded delegation context and durable tasks remain
+available. A stable warning retries through the authorized original-chat outbox.
+Incomplete calls are excluded from automatic memory extraction, including its
+claim and completion transactions; the system never treats lost history as a
+complete conversation.
+
+Undelivered private staging text expires seven days after the call ends, in
+batches of at most 32 calls. Active calls and completed task results are untouched.
+Expiry removes pending transcript batches, preserves event fingerprints, and
+records the same durable warning; it never marks an expired batch delivered.
+Revoked origins cannot receive the warning until authorization permits delivery.
+Warning retries rotate so an unavailable origin cannot monopolize the queue.
+
+## Primary sources checked 2026-10-26
+
+- [OpenAI partner integrations](https://developers.openai.com/api/docs/guides/live-partner-integrations)
+- [OpenAI WebSocket audio formats and events](https://developers.openai.com/api/docs/guides/voice-websockets)
+- [OpenAI Live conversation events and startup input](https://developers.openai.com/api/docs/guides/live-conversations)
+- [OpenAI playback controls and interruption recovery](https://developers.openai.com/api/docs/guides/voice-server-controls?api=live#check-speech-before-playback)
+- [OpenAI Live usage accounting](https://developers.openai.com/api/docs/guides/voice-latency-cost)
+- [GPT-Live 1 published pricing](https://developers.openai.com/api/docs/models/gpt-live-1)
+- [OpenAI telephony choices](https://developers.openai.com/api/docs/guides/voice-sip)
+- [Twilio Agent Connect overview](https://www.twilio.com/docs/conversations/agent-connect/overview)
+- [Twilio GPT-Live TypeScript integration](https://www.twilio.com/en-us/blog/developers/tutorials/integrations/tac-gpt-live-voice-ai-agent-typescript)
+- [Twilio Media Streams messages](https://www.twilio.com/docs/voice/media-streams/websocket-messages)
+
+- [Twilio native GPT-Live output handling](https://github.com/twilio/twilio-agent-connect-python/blob/main/src/tac/channels/voice/media_streams/gpt_live/provider.py)
+- [Twilio full-duplex example](https://github.com/twilio/twilio-agent-connect-python/blob/main/getting_started/examples/partners/openai_gpt_live.py)

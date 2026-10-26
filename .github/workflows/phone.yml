@@ -64,34 +64,26 @@ jobs:
           key: phone-offline
       - name: Check that the runner rejects missing or skipped coverage
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/4"
-
       - name: Live receipt validator (synthetic fixtures only)
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/5"
-
       - name: Portable bridge search and parent lifetime
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/6"
-
       - name: Journal write guard including portable path resolution
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/7"
-
       - name: Compile opt-in native phone probes (no model calls)
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/8"
-
       - name: Required offline suites
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/9"
-
       - name: Service installation preserves private phone configuration
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/10"
-
       - name: Pre-phone database upgrade and rollback compatibility
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/11"
-
-      - name: CLI integration compiles
+      - name: ConversationRelay rollback preserves GPT-Live tasks and receipts
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/12"
-
-      - name: Phone lint
+      - name: CLI integration compiles
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/13"
-
+      - name: Phone lint
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/14"
       - name: Upload offline evidence (not live qualification)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -100,4 +92,5 @@ jobs:
           path: |
             target/phone-offline/
             target/phone-upgrade/
+            target/phone-live-upgrade/
           if-no-files-found: error
