@@ -526,6 +526,33 @@ def validate_runtime(path):
         raise ValueError('undeclared runtime file')
 
 
+def stage_native_companions(executable, guest_runtime, destination):
+    executable = Path(executable)
+    if executable.resolve().name != 'codex':
+        return
+    runtime = Path(guest_runtime)
+    manifest = json.loads((runtime / 'manifest.json').read_text())
+    digest = hashlib.sha256((Path(destination) / 'cli').read_bytes()).hexdigest()
+    entries = manifest.get('native_companions', {}).get(digest)
+    if not isinstance(entries, list) or len(entries) != 1:
+        raise ValueError('Codex runtime companion missing for executable digest; reprovision runtime')
+    entry = entries[0]
+    if entry.get('name') != 'codex-code-mode-host':
+        raise ValueError('Codex runtime companion identity invalid')
+    relative = safe_relative(entry['path'])
+    declared = {item['path']: item['sha256'] for item in manifest['files']}
+    source = runtime / relative
+    if source.is_symlink() or not source.resolve().is_relative_to(runtime) or declared.get(str(relative)) != entry.get('sha256'):
+        raise ValueError('Codex runtime companion is not manifested')
+    data = source.read_bytes()
+    if len(data) > 128 * 1024**2 or hashlib.sha256(data).hexdigest() != entry['sha256']:
+        raise ValueError('Codex runtime companion digest changed')
+    target = Path(destination) / entry['name']
+    with open(target, 'xb') as stream:
+        stream.write(data)
+        os.fchmod(stream.fileno(), 0o555)
+
+
 def main(spec_path):
     vm = module('native_vm_runtime', 'codex-build-vm.py')
     gateway_module = module('native_provider_gateway', 'native-provider-gateway.py')
@@ -564,6 +591,7 @@ def main(spec_path):
             raise ValueError('native executable is not trusted or exceeds budget')
         shutil.copyfile(executable, binary / 'cli')
         (binary / 'cli').chmod(0o555)
+        stage_native_companions(executable, spec['guest_runtime'], binary)
         assets = spec.get('assets', [])
         if len(assets) > 32:
             raise ValueError('native asset count exceeds budget')
