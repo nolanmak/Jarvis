@@ -254,7 +254,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "One managed Rust build/test at a time; latest completed workflow and foundation suites passed on ad29b3e7.",
+    "latest_rust_admission": "Managed CLI no-run succeeded at3c876779. New controller-oracle build is pending managed storage admission; final-head CI and deployment remain unproven.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -547,6 +547,38 @@
       "log": "/tmp/autoship-1598-native-probe-7591660bwriter.log",
       "sha256": "9df3261b7f041cf9841fbc042c3ea13498ee55bdedcb119177fef4b65e4df2e5",
       "note": "Representative historical PR1538 case: real second writer loses unrelated record and native adjudicator upholds; repaired complete inventory plus observed preservation dismisses stale objection. Two distinct native sessions, no remote publication or invented reviewer LGTM."
+    },
+    "authority_windows_and_readiness": {
+      "revision": "3c876779",
+      "passed": 75,
+      "failed": 0,
+      "suites": {
+        "autoship_review": 30,
+        "autoship_workflow": 29,
+        "grounded_readiness": 7,
+        "legacy_readmission": 3,
+        "adjudication_windows": 6
+      },
+      "log": "/tmp/autoship-1598-authority-window-tests.log",
+      "note": "Actual managed test binary; does not validate later controller-oracle delivery commits."
+    },
+    "native_vm_feasibility": {
+      "implementation_revision": "3f509a4c",
+      "passed": true,
+      "probe": "scripts/autoship-native-vm-boundary-probe.py",
+      "scope": "Synthetic auth only; no-NIC guest denies direct IPv4/IPv6/DNS and undeclared host credentials, allows declared auth and allowlisted gateway, executes Codex and Claude version commands. Real provider auth/inference, streaming and production wiring remain unproven."
+    },
+    "native_adoption_latest": {
+      "revision": "b961b4ea",
+      "passed": false,
+      "log": "/tmp/autoship-native-acceptance-sit4cxdg/transcript.log",
+      "failure": "Reviewer lacked controller oracle evidence and demanded pinned verifier edits; protected-file guard correctly refused. Controller-oracle delivery fix integrated b919b9e6; final source delivery review found follow-up gap. Full repaired pipeline rerun required."
+    },
+    "native_readiness_latest": {
+      "revision": "b961b4ea",
+      "passed": false,
+      "log": "/tmp/autoship-native-acceptance-ap47kv3f/transcript.log",
+      "failure": "Readiness returned not_applicable variant absent from schema; correction and protected raw-response recovery integrated 229862e2. Seven readiness tests pass at3c876779; native rerun pending."
     }
   },
   "remaining_cross_cutting_acceptance": [
