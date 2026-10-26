@@ -544,3 +544,16 @@ async fn full_duplex_keeps_input_flowing_during_unacknowledged_output() {
     assert_eq!(stats.cleared_receipt_bytes,0);
     assert!(stats.first_playback_receipt_ms.is_some());
 }
+
+#[tokio::test]
+async fn live_duration_starts_at_answer_and_expires_at_exact_boundary() {
+    let f = fixture("ws://127.0.0.1:1".into()).await;
+    let mut call = f.service.store.phone_provider_call(&f.id).unwrap();
+    call.created_ms = 0;
+    call.answered_ms = Some(60_000);
+    call.max_duration_seconds = 60;
+    assert!(!super::duration_expired(&call, 60_000));
+    assert!(!super::duration_expired(&call, 119_999));
+    assert!(super::duration_expired(&call, 120_000));
+    assert!(!super::duration_expired(&call, 59_000));
+}

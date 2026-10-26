@@ -134,7 +134,7 @@ async fn conversation(
                     }
                     if service.stopping.load(Ordering::SeqCst) {trigger="app_stop";return Ok(());}
                     service.authorize_call(&call.id).map_err(|_|LiveError::Access)?;
-                    if service.clock.now_ms().saturating_sub(call.created_ms)>=call.max_duration_seconds.saturating_mul(1000) {trigger="duration_limit";return Ok(());}
+                    if duration_expired(call, service.clock.now_ms()) {trigger="duration_limit";return Ok(());}
                     if goodbye.ready() {
                         trigger="owner_goodbye";
                         service.store.phone_record_end_reason(&call.id,"owner_goodbye",service.clock.now_ms())
@@ -227,3 +227,7 @@ async fn conversation(
 }
 #[cfg(test)]
 mod tests;
+
+fn duration_expired(call: &PhoneCall, now_ms: i64) -> bool {
+    call.answered_ms.is_some_and(|answered| now_ms.saturating_sub(answered) >= call.max_duration_seconds.saturating_mul(1000))
+}
