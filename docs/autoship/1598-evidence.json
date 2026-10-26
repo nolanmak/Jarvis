@@ -393,6 +393,17 @@
       "passed": 24,
       "failed": 0,
       "log": "/tmp/autoship-1598-review-contract-recovery.log"
+    },
+    "default_budget_native_diagnostic": {
+      "revision": "3383566e",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-probe-3383566ecanary.log",
+      "default_daily_cap": 12,
+      "reserved_calls": 8,
+      "actual_charged_calls": 3,
+      "active_workflow_owners_after_completion": 0,
+      "note": "Real native production diagnostic adapter; required resource delegation; no call-cap override."
     }
   },
   "remaining_cross_cutting_acceptance": [
