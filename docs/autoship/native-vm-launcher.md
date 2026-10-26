@@ -159,17 +159,29 @@ continue to resolve. Runtime upgrades require a newly staged manifest and an
 atomic policy update pointing to it; retain the prior runtime until old native
 runs have drained. Do not copy a host home directory into a runtime image.
 
-Configure the existing daemon unit with one environment-only drop-in, preserving
-its `ExecStart` and aggregate resource settings:
+Select the native profile with an environment-only drop-in on the existing
+daemon unit, preserving its `ExecStart` and existing drop-ins:
 
 ```ini
 [Service]
 Environment=AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/private/policy.json
 ```
 
-Use the configured `SYSTEMD_UNIT` (not a hardcoded unit name), reload the user
-manager, and let `scripts/check-for-updates.sh` perform its normal deferred,
-verified restart. The updater rebuild predicate includes every embedded VM,
+This selects a profile only; it does **not** enroll run resources. A service
+with `Delegate=no` or no `DelegateSubgroup=daemon` cannot admit required
+Autoship work merely because this environment variable is present.
+
+Use the configured `SYSTEMD_UNIT` (not a hardcoded unit name) and let
+`scripts/check-for-updates.sh` perform its normal guarded update. Before its
+verified restart, the updater invokes `configure-run-resources.sh --install`,
+which installs delegation and run-resource settings and reloads the manager.
+It preserves finite aggregate memory/task ceilings and stricter CPU limits.
+Do not substitute `--apply`, a direct daemon restart, or an `ExecStart` override.
+After restart, `configure-run-resources.sh --check` and protected actual run
+admission/cleanup receipts are mandatory acceptance checks. An unsupported-host
+status of 3 permits unrelated service updates but is **not** successful Autoship
+enrollment. Follow the [rollout procedure](rollout.md) and retain its
+[receipt template](rollout-receipt.template.json). The updater rebuild predicate includes every embedded VM,
 gateway and MCP helper; no separate installed Python copy can stay stale. The
 provisioning helper itself is read directly from the updated checkout. A missing
 profile keeps required Autoship native calls closed while unrelated interactive
