@@ -89,9 +89,9 @@ def observations(path, expected_session=None):
                 completed += 1
             if kind in ('turn.failed', 'error'):
                 failed = True
-            if kind == 'item.completed':
+            if kind in ('item.started', 'item.updated', 'item.completed'):
                 item = event.get('item', {})
-                if item.get('type') == 'agent_message':
+                if kind == 'item.completed' and item.get('type') == 'agent_message':
                     messages.append(item.get('text'))
                 if item.get('type') in ('command_execution', 'mcp_tool_call', 'web_search', 'tool_call'):
                     tools += 1
@@ -102,6 +102,32 @@ def observations(path, expected_session=None):
         raise ValueError('resume did not use the actual prior native session')
     return {'native_session': session, 'completed_turns': completed, 'tool_calls': tools,
             'exact_reply': True, 'stdout_sha256': digest_file(path)}
+
+
+def inference_receipt(completion, launch_sha256):
+    if completion.get('launch_sha256') != launch_sha256:
+        raise ValueError('gateway observation belongs to another launch')
+    receipt = completion.get('gateway_transport', {})
+    if receipt.get('version') != 1 or receipt.get('overflow') is not False:
+        raise ValueError('bounded host gateway observations are missing')
+    exchanges = receipt.get('exchanges')
+    if not isinstance(exchanges, list) or len(exchanges) > 256:
+        raise ValueError('invalid host exchange inventory')
+    proven = []
+    for exchange in exchanges:
+        websocket = exchange.get('transport') == 'websocket'
+        if (exchange.get('inference') == 'responses' and exchange.get('authenticated_request') is True
+                and exchange.get('remote_tls') is True and exchange.get('successful') is True
+                and type(exchange.get('request_bytes')) is int and exchange['request_bytes'] > 0
+                and type(exchange.get('response_bytes')) is int and exchange['response_bytes'] > 0
+                and isinstance(exchange.get('route_sha256'), str) and re.fullmatch(r'[a-f0-9]{64}', exchange['route_sha256'])
+                and (websocket and exchange.get('method') == 'GET' and exchange.get('status') == 101
+                     or not websocket and exchange.get('transport') == 'http' and exchange.get('method') == 'POST'
+                     and type(exchange.get('status')) is int and 200 <= exchange['status'] < 300 and exchange.get('completed') is True)):
+            proven.append(exchange)
+    if not proven:
+        raise ValueError('no host-observed authenticated inference exchange for this turn')
+    return {'inference_exchanges': len(proven), 'transport_sha256': hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()}
 
 
 def stop(process):
@@ -172,12 +198,14 @@ def launch_turn(root, policy, profile, executable, iteration, session_id, startu
             raise RuntimeError('native VM/provider returned a nonzero status')
         result = observations(turn / 'stdout.jsonl', session_id)
         completion = private_json(session / 'complete.json')
+        transport = inference_receipt(completion, digest_file(spec_path))
         quiescence = completion.get('worker_quiescence', {})
         if quiescence.get('remaining_workers') != 0 or quiescence.get('quiet_scans', 0) < 2:
             raise ValueError('native runtime export lacks worker quiescence')
         result.update({'iteration': iteration, 'exit_code': code, 'elapsed_seconds': round(time.monotonic()-started, 3),
             'stderr_sha256': digest_file(turn / 'stderr.log'), 'completion_sha256': digest_file(session / 'complete.json'),
-            'model': MODEL, 'resumed': session_id is not None, 'worker_quiescence': quiescence})
+            'model': MODEL, 'resumed': session_id is not None, 'worker_quiescence': quiescence,
+            'host_inference': transport})
         private_write(turn / 'receipt.json', result)
         return result
     except BaseException as error:

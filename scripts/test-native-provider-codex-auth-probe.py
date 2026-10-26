@@ -33,12 +33,27 @@ class ProbeTests(unittest.TestCase):
 
     def test_tool_use_and_partial_failure_never_pass_transport_proof(self):
         with tempfile.TemporaryDirectory() as temporary:
-            for event in [{'type':'turn.failed'}, {'type':'error'},
-                          {'type':'item.completed','item':{'type':'mcp_tool_call'}}]:
+            for event in ([{'type':'turn.failed'}, {'type':'error'}] +
+                          [{'type':phase,'item':{'type':'mcp_tool_call'}} for phase in ('item.started','item.updated','item.completed')]):
                 with self.assertRaises(ValueError):probe.observations(self.records(temporary,extra=event))
             path=self.records(temporary)
             path.write_text(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':probe.TOKEN}}))
             with self.assertRaises(ValueError):probe.observations(path)
+
+    def test_cli_json_alone_and_metadata_never_prove_provider_exchange(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertTrue(probe.observations(self.records(temporary))['exact_reply'])
+            with self.assertRaises(ValueError):probe.inference_receipt({}, 'launch')
+        row={'route_sha256':'a'*64,'transport':'http','inference':'responses','method':'POST','status':200,
+             'authenticated_request':True,'remote_tls':True,'successful':True,'request_bytes':42,'response_bytes':99,'completed':True}
+        def completion(value):return {'launch_sha256':'launch','gateway_transport':{'version':1,'overflow':False,'exchanges':[value]}}
+        self.assertEqual(probe.inference_receipt(completion(row),'launch')['inference_exchanges'],1)
+        for change in ({'inference':None,'method':'GET'}, {'status':401}, {'request_bytes':0},
+                       {'response_bytes':0}, {'authenticated_request':False}, {'remote_tls':False}, {'completed':False}):
+            with self.assertRaises(ValueError):probe.inference_receipt(completion(dict(row,**change)),'launch')
+        with self.assertRaises(ValueError):probe.inference_receipt(completion(row),'different-launch')
+        ws=dict(row,transport='websocket',method='GET',status=101,completed=False)
+        self.assertEqual(probe.inference_receipt(completion(ws),'launch')['inference_exchanges'],1)
 
     def test_current_quality_and_isolated_resume_arguments(self):
         first=probe.native_argv();second=probe.native_argv('real-session')

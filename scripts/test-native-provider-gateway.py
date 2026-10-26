@@ -4,6 +4,7 @@ import base64
 import hashlib
 import http.client
 import http.server
+import json
 import importlib.util
 import os
 from pathlib import Path
@@ -61,7 +62,11 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'data: last\n\n')
             self.wfile.flush()
             self.close_connection = True
-        elif self.path == '/v1/ws':
+        elif self.path == '/v1/denied':
+            self.send_response(401)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+        elif self.path in ('/v1/ws', '/v1/responses'):
             key = self.headers['Sec-WebSocket-Key']
             self.send_response(101)
             self.send_header('Upgrade', 'websocket')
@@ -124,6 +129,39 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(Fixture.requests, [('/v1/messages', data, 'Bearer fixture-private')])
         self.assertNotIn('fixture-private', str(frames))
 
+    def test_host_inference_receipt_is_redacted_and_excludes_metadata_get(self):
+        self.host.receive(dict(type='gateway_open', id='request', authority=f'127.0.0.1:{self.port}', method='POST',
+            path='/v1/responses?private-query', headers=[['Authorization', 'Bearer fixture-private']]))
+        data = b'private-input-and-output'
+        self.host.receive(dict(type='gateway_data', id='request', data=g.encode(data)))
+        self.host.receive(dict(type='gateway_end', id='request'))
+        self.assertEqual(self.result()[-1]['type'], 'gateway_end')
+        receipt = self.host.transport_receipt()
+        row = receipt['exchanges'][0]
+        self.assertTrue(row['successful'])
+        self.assertEqual((row['inference'], row['method'], row['status']), ('responses', 'POST', 200))
+        self.assertEqual((row['request_bytes'], row['response_bytes']), (len(data), len(data)))
+        self.assertFalse(row['remote_tls'], 'loopback fixture cannot attest a real remote provider')
+        encoded = json.dumps(receipt)
+        for secret in ('private-query', 'fixture-private', 'private-input-and-output', '/v1/responses'):
+            self.assertNotIn(secret, encoded)
+        request = {'id': 'metadata', 'authority': f'127.0.0.1:{self.port}', 'method': 'GET', 'path': '/v1/responses'}
+        self.host.record_exchange(request, [['Authorization', 'Bearer fixture']], 200, 1, 100, True)
+        rows = self.host.transport_receipt()['exchanges']
+        self.assertEqual(sum(bool(row['successful']) for row in rows), 1)
+        self.assertIsNone(next(row for row in rows if row['method'] == 'GET')['inference'])
+
+    def test_failed_upgrade_status_and_causes_are_safe_diagnostics(self):
+        error = g.Denied('websocket_upgrade');error.http_status = 401
+        self.host.record_failure(error, 'websocket_exchange')
+        outer = g.Denied('upstream_unavailable')
+        outer.__cause__ = ConnectionRefusedError(111, 'secret-host-query-credential')
+        self.host.record_failure(outer, 'upstream_connect')
+        rows = self.host.transport_receipt()['host_failures']
+        self.assertEqual(rows[0]['http_status'], 401)
+        self.assertEqual(rows[1]['cause_errno'], 111)
+        self.assertNotIn('secret-host-query-credential', json.dumps(rows))
+
     def test_sse_arrives_before_provider_finishes(self):
         self.open('/v1/events')
         self.host.receive(dict(type='gateway_end', id='request'))
@@ -169,6 +207,30 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(frame['type'], 'gateway_ws_frame')
         self.assertEqual(g.decode(frame['data'], g.CHUNK), b'actual duplex')
         self.assertEqual(self.result()[-1]['type'], 'gateway_end')
+
+    def test_websocket_inference_receipt_requires_application_bytes_both_ways(self):
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.host.receive(dict(type='gateway_open', id='request', authority=f'127.0.0.1:{self.port}', method='GET',
+             path='/v1/responses', websocket=True, headers=[['Sec-WebSocket-Key', key], ['Authorization', 'Bearer private-ws']]))
+        self.host.receive(dict(type='gateway_end', id='request'))
+        self.assertEqual(self.responses.get(timeout=2)['status'], 101)
+        self.assertFalse(any(row['successful'] for row in self.host.transport_receipt()['exchanges']))
+        self.host.receive(dict(type='gateway_ws_frame', id='request', opcode=1, fin=True, data=g.encode(b'private-application')))
+        self.assertEqual(self.result()[-1]['type'], 'gateway_end')
+        row = self.host.transport_receipt()['exchanges'][0]
+        self.assertTrue(row['successful'])
+        self.assertEqual((row['request_bytes'], row['response_bytes']), (19, 19))
+        self.assertNotIn('private-', json.dumps(self.host.transport_receipt()))
+
+    def test_actual_failed_upgrade_retains_only_http_status(self):
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.host.receive(dict(type='gateway_open', id='request', authority=f'127.0.0.1:{self.port}', method='GET',
+             path='/v1/denied', websocket=True, headers=[['Sec-WebSocket-Key', key], ['Authorization', 'Bearer private-ws']]))
+        self.host.receive(dict(type='gateway_end', id='request'))
+        self.assertEqual(self.result()[-1]['type'], 'gateway_error')
+        row = self.host.transport_receipt()['host_failures'][-1]
+        self.assertEqual((row['reason'], row['http_status']), ('websocket_upgrade', 401))
+        self.assertNotIn('private-ws', json.dumps(row))
 
     def test_large_websocket_message_is_losslessly_fragmented(self):
         key = base64.b64encode(os.urandom(16)).decode()

@@ -281,6 +281,74 @@ class HostGateway:
         self.lock = threading.Lock()
         self.closed = False
         self.guest_failures = []
+        self.host_failures = []
+        self.exchanges = {}
+        self.exchange_overflow = False
+        self.exchange_sequence = 0
+
+    def transport_receipt(self):
+        """Host observations only: no request headers, URLs, queries or payloads."""
+        with self.lock:
+            rows = [dict(value) for _, value in sorted(self.exchanges.items())]
+            return {'version': 1, 'exchanges': rows, 'overflow': self.exchange_overflow,
+                    'host_failures': list(self.host_failures)}
+
+    def record_exchange(self, request, headers, status, request_bytes, response_bytes, completed):
+        key, entry = self.policy.admit(request['authority'], request['method'], request['path'], request.get('websocket', False))
+        path = path_value(request['path'])
+        route = next(route for route in entry['routes'] if request['method'] in route['methods']
+            and (path.startswith(route['path_prefix']) if route['path_prefix'].endswith('/') else
+                 path == route['path_prefix'] or path.startswith(route['path_prefix'] + '/'))
+            and (not request.get('websocket', False) or route.get('websocket', False)))
+        route_id = hashlib.sha256(json.dumps([key, route], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        inference = {'/v1/responses': 'responses', '/backend-api/codex/responses': 'responses',
+                     '/responses': 'responses', '/v1/chat/completions': 'chat_completions',
+                     '/v1/messages': 'messages'}.get(path)
+        websocket = request.get('websocket', False)
+        inference = inference if request['method'] == 'POST' or websocket and request['method'] == 'GET' else None
+        authenticated = any(name.lower() in ('authorization', 'cookie') and bool(value.strip()) for name, value in headers)
+        value = {'route_sha256': route_id, 'method': request['method'], 'status': status,
+                 'transport': 'websocket' if websocket else 'http', 'inference': inference,
+                 'authenticated_request': authenticated, 'remote_tls': entry['tls'] and not entry['allow_loopback'],
+                 'request_bytes': request_bytes, 'response_bytes': response_bytes,
+                 'completed': completed, 'successful': bool(inference and authenticated and request_bytes > 0
+                    and response_bytes > 0 and (status == 101 if websocket else 200 <= status < 300 and completed))}
+        # Per-request identity is hashed and never stored as guest-provided text.
+        ident = str(request['_receipt_sequence']) if '_receipt_sequence' in request else hashlib.sha256(request['id'].encode()).hexdigest()
+        with self.lock:
+            if ident not in self.exchanges and len(self.exchanges) >= 256:
+                self.exchange_overflow = True
+            else:
+                self.exchanges[ident] = value
+            if not websocket and not 200 <= status < 300:
+                self.host_failures = (self.host_failures + [{'phase': 'upstream_response', 'category': 'HttpStatus',
+                    'http_status': status, 'method': request['method'], 'route_sha256': route_id}])[-16:]
+
+    def record_failure(self, error, phase):
+        category = type(error).__name__
+        if category not in {'Denied', 'TimeoutError', 'ConnectionError', 'ConnectionRefusedError',
+                            'ConnectionResetError', 'BrokenPipeError', 'OSError', 'gaierror', 'SSLError',
+                            'SSLCertVerificationError', 'RemoteDisconnected', 'BadStatusLine', 'IncompleteRead', 'Empty',
+                            'AttributeError', 'TypeError', 'ValueError', 'UnicodeEncodeError', 'UnicodeDecodeError'}:
+            category = 'Exception'
+        value = {'phase': phase, 'category': category}
+        if isinstance(error, Denied) and str(error) in {'upstream_unavailable', 'websocket_upgrade', 'websocket_key', 'websocket_frame', 'headers', 'redirect', 'response_limit', 'cancelled', 'address', 'route', 'authority', 'path', 'frame', 'websocket_request'}:
+            value['reason'] = str(error)
+        cause = error.__cause__ or error.__context__
+        if cause is not None:
+            cause_name = type(cause).__name__
+            if cause_name in {'TimeoutError', 'ConnectionRefusedError', 'ConnectionResetError', 'BrokenPipeError', 'OSError', 'gaierror', 'SSLError', 'SSLCertVerificationError'}:
+                value['cause_category'] = cause_name
+                if type(getattr(cause, 'errno', None)) is int:
+                    value['cause_errno'] = cause.errno
+        status = getattr(error, 'http_status', None)
+        if type(status) is int and 100 <= status <= 599:
+            value['http_status'] = status
+        number = getattr(error, 'errno', None)
+        if type(number) is int:
+            value['errno'] = number
+        with self.lock:
+            self.host_failures = (self.host_failures + [value])[-16:]
 
     def emit(self, kind, ident, **fields):
         try:
@@ -311,7 +379,9 @@ class HostGateway:
                         raise Denied('capacity')
                     state = State()
                     self.states[ident] = state
-                threading.Thread(target=self.serve, args=(ident, state, frame), daemon=True).start()
+                    self.exchange_sequence += 1
+                    request = dict(frame, _receipt_sequence=self.exchange_sequence)
+                threading.Thread(target=self.serve, args=(ident, state, request), daemon=True).start()
                 return
             with self.lock:
                 state = self.states.get(ident)
@@ -343,6 +413,7 @@ class HostGateway:
         return frame
 
     def serve(self, ident, state, request):
+        phase = 'request_framing'
         try:
             body = bytearray()
             while True:
@@ -354,6 +425,7 @@ class HostGateway:
                 body.extend(frame['decoded'])
             key, entry = self.policy.admit(request['authority'], request['method'], request['path'], request.get('websocket', False))
             supplied = headers_value(request.get('headers', []))
+            phase = 'upstream_connect'
             connection = safe_socket(entry, self.policy.timeout)
             state.socket = connection
             if state.cancelled.is_set():
@@ -361,13 +433,16 @@ class HostGateway:
             if request.get('websocket', False):
                 if body or request['method'] != 'GET':
                     raise Denied('websocket_request')
+                phase = 'websocket_exchange'
                 self.websocket(ident, state, request, supplied, key)
                 return
             # Reconstruct framing; an untrusted Content-Length cannot smuggle a
             # second request. Upstream connection is private and never pooled.
             headers = [(n, v) for n, v in supplied if n.lower() not in HOP | {'content-length'}]
             wire = f"{request['method']} {request['path']} HTTP/1.1\r\nHost: {key}\r\nConnection: close\r\nContent-Length: {len(body)}\r\n"
+            phase = 'request_send'
             connection.sendall((wire + ''.join(f'{n}: {v}\r\n' for n, v in headers) + '\r\n').encode('latin1') + body)
+            phase = 'response_headers'
             response = http.client.HTTPResponse(connection)
             response.begin()
             received = headers_value(response.getheaders())
@@ -380,6 +455,7 @@ class HostGateway:
                     self.policy.admit(location.netloc, redirect_method, urllib.parse.urlunsplit(('', '', location.path or '/', location.query, '')))
             self.emit('gateway_headers', ident, status=response.status, headers=[(n, v) for n, v in received if n.lower() not in HOP | {'content-length'}])
             total = 0
+            phase = 'response_body'
             while not state.cancelled.is_set():
                 chunk = response.read1(self.policy.frame_bytes)
                 if not chunk:
@@ -389,8 +465,10 @@ class HostGateway:
                     raise Denied('response_limit')
                 self.emit('gateway_data', ident, data=encode(chunk))
             if not state.cancelled.is_set():
+                self.record_exchange(request, supplied, response.status, len(body), total, True)
                 self.emit('gateway_end', ident)
-        except Exception:
+        except Exception as error:
+            self.record_failure(error, phase)
             # Exceptions may contain request headers, URLs, or response bodies.
             # Only a fixed code crosses the diagnostic boundary.
             self.emit('gateway_error', ident, code='upstream_failed')
@@ -410,7 +488,11 @@ class HostGateway:
         stream = state.socket.makefile('rb')
         status = stream.readline(8192)
         if not re.fullmatch(rb'HTTP/1\.[01] 101 [^\r\n]*\r\n', status):
-            raise Denied('websocket_upgrade')
+            error = Denied('websocket_upgrade')
+            observed = re.match(rb'HTTP/1\.[01] ([1-5][0-9]{2})(?: |\r)', status)
+            if observed:
+                error.http_status = int(observed[1])
+            raise error
         response = read_headers(stream)
         values = {n.lower(): v for n, v in response}
         expected = base64.b64encode(hashlib.sha1((keys[0] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')).digest()).decode('ascii')
@@ -418,6 +500,11 @@ class HostGateway:
             raise Denied('websocket_upgrade')
         self.emit('gateway_headers', ident, status=101, headers=response)
 
+        counters = {'request': 0, 'response': 0}
+        counter_lock = threading.Lock()
+        def observe(completed=False):
+            with counter_lock:
+                self.record_exchange(request, headers, 101, counters['request'], counters['response'], completed)
         def writer():
             try:
                 while not state.cancelled.is_set():
@@ -425,6 +512,10 @@ class HostGateway:
                     if frame['type'] != 'gateway_ws_frame':
                         raise Denied('websocket_frame')
                     ws_write(state.socket, frame['opcode'], frame['fin'], frame['decoded'], masked=True)
+                    if frame['opcode'] in (0, 1, 2):
+                        with counter_lock:
+                            counters['request'] += len(frame['decoded'])
+                        observe()
                     if frame['opcode'] == 8:
                         return
             except Exception:
@@ -436,9 +527,14 @@ class HostGateway:
             total += len(data)
             if total > self.policy.response_bytes:
                 raise Denied('response_limit')
+            if opcode in (0, 1, 2):
+                with counter_lock:
+                    counters['response'] += len(data)
+                observe()
             for part_opcode, part_fin, part in ws_chunks(opcode, fin, data, self.policy.frame_bytes):
                 self.emit('gateway_ws_frame', ident, opcode=part_opcode, fin=part_fin, data=encode(part))
             if opcode == 8:
+                observe(completed=True)
                 break
         self.emit('gateway_end', ident)
 

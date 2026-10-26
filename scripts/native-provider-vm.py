@@ -587,19 +587,21 @@ def main(spec_path):
             refresh_auth(spec, state / generation, original_auth, credential_lock)
             atomic(state / 'complete.json', json.dumps({'version': 1, 'exit_code': exit_code,
                    'generation': generation, 'export_bytes': exported,
-                   'auth_generation': original_auth, 'worker_quiescence': quiescence}).encode())
+                   'auth_generation': original_auth, 'worker_quiescence': quiescence,
+                   'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                   'gateway_transport': gateway.transport_receipt()}).encode())
             # Only controller-generated complete exports are retained. Keep the
             # previous generation through pointer publication for crash safety.
             previous = sorted(state.glob('generation-*'), key=lambda path: path.stat().st_mtime)
             for obsolete in previous[:-2]:
                 if obsolete.name != generation and not obsolete.is_symlink():
                     shutil.rmtree(obsolete)
-            if exit_code and gateway.guest_failures:
-                print(json.dumps({'native_gateway_failures': gateway.guest_failures}), file=sys.stderr, flush=True)
+            if exit_code and (gateway.guest_failures or gateway.host_failures):
+                print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
             return exit_code
         except Exception:
-            if gateway is not None and gateway.guest_failures:
-                print(json.dumps({'native_gateway_failures': gateway.guest_failures}), file=sys.stderr, flush=True)
+            if gateway is not None and (gateway.guest_failures or gateway.host_failures):
+                print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
             raise
         finally:
             if gateway is not None:
