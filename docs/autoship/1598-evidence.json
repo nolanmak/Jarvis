@@ -8,7 +8,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1537",
       "implementation_status": "partial",
       "evidence": [
-        "Real issue/PR source types, source-less acceptance/review/recovery, parent-base retarget under leases and free CI reconciliation integrated. Shared convergence controller and native isolation wired. Production end-to-end adoption smoke and autonomous merge attribution still pending."
+        "Selection/provenance/parent-retarget/free holds are integrated; read-only actual selector and audit-generation approval invalidation follow-ups are under central validation. Full native source-less adoption through repair and merge remains required before broad rollout."
       ]
     },
     {
@@ -44,7 +44,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1215",
       "implementation_status": "partial",
       "evidence": [
-        "Blanket deadline and calendar spreading removed; durable quota reservations and free merge reconciliation integrated. Local-calendar-day reporting added with DST tests pending execution. Seven-day observation not started."
+        "Calendar spreading and blanket cancellation removed; durable resource/quota reservations and free merge reconciliation implemented. Local-calendar/DST foundation tests passed. Seven-day production throughput observation has not started."
       ]
     },
     {
@@ -62,7 +62,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1476",
       "implementation_status": "partial",
       "evidence": [
-        "Fresh-session and rescope actions fenced per epoch; actual provider-native conversations isolated across fallbacks. Best commits and corresponding findings retained. Crash substep recovery still being completed; long-window outcome observation not started."
+        "Fresh-session recovery preserves contracts/best candidates/adjudications. Protected audit-generation and cancelled-worker recovery passed real isolated process probes. Thirty-day before/after operational analysis remains open."
       ]
     },
     {
@@ -106,7 +106,9 @@
       "title": "Acceptance criteria from the scoping pass, graded by both reviewers",
       "source": "https://github.com/nolanmak/Jarvis/issues/1012",
       "implementation_status": "audit_pending",
-      "evidence": []
+      "evidence": [
+        "Closed foundation preserved: acceptance criteria parsing, transport, schema, required mapping, and resume coverage remain integrated. No reopening or replacement of the closed issue."
+      ]
     },
     {
       "issue": 1151,
@@ -114,7 +116,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1151",
       "implementation_status": "partial",
       "evidence": [
-        "Full file/caller evidence transported in bounded shards; untracked files and stale main snapshots refused; seeded live reviewer probe pending"
+        "Complete evidence packing and bounded missing-file recovery passed full native clean/seeded probe on 3383566e. Overflowing caller evidence is now typed distinctly; streaming recovery is in development."
       ]
     },
     {
@@ -177,7 +179,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1184",
       "implementation_status": "partial",
       "evidence": [
-        "Isolated native reviewer origins and real session IDs integrated. Daily diagnostic canary scheduler and immutable private evidence store added; diagnostic preflight isolation is being corrected before live execution. No live detection result claimed."
+        "Distinct actual native builder/reviewer sessions and exact binding/coverage passed the full native clean/seeded probe on 3383566e. Native adjudicator correction uses a fresh session per call and passed on 8f317dd6."
       ]
     },
     {
@@ -195,7 +197,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/840",
       "implementation_status": "partial",
       "evidence": [
-        "Production native seeded-defect probe implemented but not run; diagnostic verifier/alignment separation found during audit and being corrected. Legacy historical bwrap incident is not assumed resolved from unit tests."
+        "Full production native adapter passed clean and seeded-defect probes on 3383566e; native final Codex contradiction probe passed on 8f317dd6. Deployment and ongoing diagnostic observations remain open."
       ]
     }
   ],
@@ -482,6 +484,29 @@
         "research::truncation_handles_multibyte_research_issue_text",
         "optional_digest_query_failure_preserves_other_sections"
       ]
+    },
+    "publication_fixture_repair": {
+      "revision": "1d42237c",
+      "passed": 8,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-publication-fixture-fix.log",
+      "note": "Earlier 421-pass suite exposed two failures: protected fixture placement and obsolete source assertion. Both corrected; newer dispatch/fairness changes require their own run."
+    },
+    "publication_store_initial": {
+      "revision": "fa64104d",
+      "passed": 24,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-publication-store.log"
+    },
+    "github_duplicate_open_pr_rejection": {
+      "passed": true,
+      "repository": "nolanmak/autoship-acceptance-6073a5330e3a4cae",
+      "head": "candidate-a",
+      "base": "main",
+      "archived_after_test": true,
+      "log": "/tmp/autoship-1598-github-duplicate-create.json",
+      "sha256": "6380e5a100ef5e1a670f8423a83bdf23bed3f349f10b1e56b36074800c938981",
+      "note": "Actual GitHub refused a second OPEN PR for identical repository/head/base; this does not prove exactly-one HTTP or eliminate concurrent terminal-history visibility races."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -524,6 +549,21 @@
       "severity": "P1",
       "gap": "Arbitrary two-shard review groups can omit context and stop native review as incomplete",
       "status": "fixed_in_3383566e; independent_delta_LGTM; central_and_full_native_positive_negative_probe_passed"
+    },
+    {
+      "severity": "P1",
+      "gap": "Primary scoping can guess material requirements or send model-only overtaken/refusal verdicts to human triage",
+      "status": "typed_grounded_readiness_foundation_integrated_7591660b; removal_of_old_human_lanes_and_baseline_relevance_proof_in_progress"
+    },
+    {
+      "severity": "P1",
+      "gap": "Pending publications can starve later entries or lose a returned remote identity during visibility lag",
+      "status": "durable_rotating_scan_dispatch_backoff_and_direct_identity_integrated_320b216c; central_validation_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Caller evidence exceeding collection bounds is misclassified as reviewer capacity and can repeat unchanged work",
+      "status": "typed_evidence_budget_integrated_04479fb2; executable_streaming_recovery_in_progress"
     }
   ]
 }
