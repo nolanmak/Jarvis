@@ -9,6 +9,8 @@ use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+#[path = "self_improve_constraint_learning.rs"]
+mod learning;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +83,10 @@ struct Authority {
     decision: String,
     proposal_hash: String,
     policy_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_policy_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance_sha256: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -215,6 +221,18 @@ pub(super) fn promote(
     std::fs::create_dir_all(control)?;
     let control = control.canonicalize()?;
     let authority_path = authority_receipt.canonicalize()?;
+    use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(control.join("constraint-policy.lock"))?;
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+        "constraint policy lease unavailable"
+    );
     for root in writable_roots {
         let root = root.canonicalize()?;
         ensure!(
@@ -239,13 +257,55 @@ pub(super) fn promote(
         authority: authority.clone(),
         authority_sha256: hash(&serde_json::to_vec(&authority)?),
     };
-    // Revision is explicit and immutable. A controller changes the selected
-    // policy by selecting a new workflow namespace, never overwriting a rule.
+    let current_path = control.join("promoted-constraints.json");
+    let bytes = serde_json::to_vec(&policy)?;
+    if current_path.exists() {
+        let old_bytes = private_bytes(&current_path)?;
+        if old_bytes == bytes {
+            return Ok(());
+        }
+        let old: Policy = serde_json::from_slice(&old_bytes)?;
+        ensure!(
+            authority.previous_policy_hash.as_deref() == Some(hash(&old_bytes).as_str())
+                && authority.policy_revision == old.revision + 1,
+            "constraint policy transition is stale"
+        );
+        for rule in &old.proposal.rules {
+            ensure!(
+                policy.proposal.rules.contains(rule),
+                "constraint promotion cannot silently remove an existing rule"
+            );
+        }
+        store(
+            &control,
+            &format!(
+                "constraints-revision-{}-{}.json",
+                old.revision,
+                hash(&old_bytes)
+            ),
+            &old_bytes,
+        )?;
+    } else {
+        ensure!(
+            authority.policy_revision == 1 && authority.previous_policy_hash.is_none(),
+            "initial constraint policy revision mismatch"
+        );
+    }
     store(
         &control,
-        "promoted-constraints.json",
-        &serde_json::to_vec(&policy)?,
+        &format!(
+            "constraints-revision-{}-{}.json",
+            policy.revision,
+            hash(&bytes)
+        ),
+        &bytes,
     )?;
+    use std::io::Write;
+    let mut staged = tempfile::NamedTempFile::new_in(&control)?;
+    staged.write_all(&bytes)?;
+    staged.as_file().sync_all()?;
+    staged.persist(&current_path).map_err(|error| error.error)?;
+    std::fs::File::open(&control)?.sync_all()?;
     Ok(())
 }
 fn policy(control: &Path) -> Result<(Vec<Constraint>, String)> {
@@ -266,6 +326,18 @@ fn policy(control: &Path) -> Result<(Vec<Constraint>, String)> {
             && policy.authority_sha256 == hash(&serde_json::to_vec(&policy.authority)?),
         "invalid promoted constraint provenance"
     );
+    if let Some(digest) = &policy.authority.provenance_sha256 {
+        ensure!(
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid constraint provenance hash"
+        );
+        let provenance =
+            private_bytes(&control.join(format!("constraint-provenance-{digest}.json")))?;
+        ensure!(
+            hash(&provenance) == *digest,
+            "constraint source/authority provenance changed"
+        );
+    }
     Ok((policy.proposal.rules, hash(&bytes)))
 }
 async fn git(root: &Path, args: &[&str]) -> Result<String> {
@@ -467,6 +539,11 @@ pub(super) async fn gate_for(
         .trim()
         .to_owned();
     let contract_hash = prepared.baseline.registration.contract_hash().to_owned();
+    // Learning is optional enrichment. Existing promoted rules remain mandatory;
+    // an unavailable miner cannot turn a healthy shipping pipeline into a hold.
+    if let Err(error) = learning::learn(builder, root, prepared, control, workflow).await {
+        tracing::warn!(error = %error, "autoship constraint learning deferred");
+    }
     let (rules, policy_hash) = policy(control)?;
     let evidence = hunks(root, &base, &head).await?;
     let actual: Vec<_> = evidence.iter().map(|e| e.hunk.clone()).collect();
@@ -877,6 +954,8 @@ mod tests {
             decision: "promote_literal_constraints".into(),
             proposal_hash: hash(&serde_json::to_vec(&proposal).unwrap()),
             policy_revision: 1,
+            previous_policy_hash: None,
+            provenance_sha256: None,
         };
         std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
