@@ -753,6 +753,26 @@
       "revision": "85a9ae90",
       "conclusion": "pass",
       "scope": "Synthetic actual configured QEMU q35/TCG64MiB no NIC paused. Inherited FD3 retained flock after bridge FD closure and supervisor death; lock released after QEMU killed/reaped. No authenticated provider inference; probe subtree/files cleaned."
+    },
+    "authenticated_codex_transport_first_attempt": {
+      "revision": "a530abf5",
+      "status": "failed_before_model_admission",
+      "evidence": "/tmp/autoship-native-codex-auth-dfunmr6x/inference-proof1",
+      "completed_turns": 0,
+      "auth_source_unchanged": true,
+      "cause": "111-byte AF_UNIX socket path exceeds Linux pathname capacity; production launcher fixed at 0086786e. Authenticated rerun pending; no transport pass claimed."
+    },
+    "native_vm_long_state_path": {
+      "revision": "0086786e",
+      "passed": 9,
+      "failed": 0,
+      "scope": "Local VM helper suite includes actual UNIX socket bind/connect under a long state path, cleanup, and preserved durable artifact. Not authenticated inference."
+    },
+    "native_resume_owner_delta_review": {
+      "revision": "512a8836",
+      "reviewer": "independent review agent",
+      "conclusion": "LGTM",
+      "scope": "Original-owner resume checks and external audit anchor fixture; later changes require their own validation."
     }
   },
   "remaining_cross_cutting_acceptance": [
