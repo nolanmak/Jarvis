@@ -10,6 +10,9 @@ to the primary OpenAI Live WebSocket. Keep ConversationRelay as the production
 default until #1596 passes. Reuse the existing Twilio dial reservation, destination,
 owner binding, callback verification, call budget and single-consumer relay claim.
 No new number, redial loop, phone verification ceremony or startup dial is added.
+An owner-triggered readiness probe validates and finalizes a short Live session
+before dialing; it carries no owner context and is never triggered by callbacks.
+Its usage must be accounted for separately from the conversation in #1595.
 
 This is an audio backend, not another Chat Completions fast provider. Backend
 work remains in Jarvis's native session/approval harness and durable task queue.

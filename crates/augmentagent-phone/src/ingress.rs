@@ -558,6 +558,13 @@ async fn relay(
         let _ = state.service.store.phone_request_stop(&call.owner, &id);
         return StatusCode::CONFLICT.into_response();
     }
+    let live = match state.service.store.phone_voice_backend(&id) {
+        Ok(backend) => backend == "openai_live",
+        Err(error) => return failure(error.into()),
+    };
+    if live && state.service.config.live.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let Ok(permit) = state.sockets.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -566,7 +573,11 @@ async fn relay(
         .max_message_size(32_768)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            run_socket(state, call, socket).await;
+            if live {
+                crate::live_media::run(state.service, state.auth.account().to_owned(), call, socket).await;
+            } else {
+                run_socket(state, call, socket).await;
+            }
         })
 }
 #[derive(Debug)]
