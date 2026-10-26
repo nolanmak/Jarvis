@@ -162,6 +162,12 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(rows[1]['cause_errno'], 111)
         self.assertNotIn('secret-host-query-credential', json.dumps(rows))
 
+    def test_request_admission_denial_is_observable_without_private_payload(self):
+        self.host.receive(dict(type='gateway_end', id='unknown-private-request'))
+        row = self.host.transport_receipt()['host_failures'][-1]
+        self.assertEqual(row, {'phase': 'request_admission', 'category': 'Denied', 'reason': 'unknown_request'})
+        self.assertNotIn('unknown-private-request', json.dumps(row))
+
     def test_sse_arrives_before_provider_finishes(self):
         self.open('/v1/events')
         self.host.receive(dict(type='gateway_end', id='request'))

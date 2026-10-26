@@ -332,7 +332,7 @@ class HostGateway:
                             'AttributeError', 'TypeError', 'ValueError', 'UnicodeEncodeError', 'UnicodeDecodeError'}:
             category = 'Exception'
         value = {'phase': phase, 'category': category}
-        if isinstance(error, Denied) and str(error) in {'upstream_unavailable', 'websocket_upgrade', 'websocket_key', 'websocket_frame', 'headers', 'redirect', 'response_limit', 'cancelled', 'address', 'route', 'authority', 'path', 'frame', 'websocket_request'}:
+        if isinstance(error, Denied) and str(error) in {'upstream_unavailable', 'websocket_upgrade', 'websocket_key', 'websocket_frame', 'headers', 'redirect', 'response_limit', 'cancelled', 'address', 'route', 'authority', 'path', 'frame', 'websocket_request', 'capacity', 'unknown_request', 'request_limit'}:
             value['reason'] = str(error)
         cause = error.__cause__ or error.__context__
         if cause is not None:
@@ -399,7 +399,8 @@ class HostGateway:
                     raise Denied('request_limit')
                 frame = dict(frame, decoded=data)
             state.queue.put_nowait(frame)
-        except (Denied, queue.Full, ValueError, TypeError, KeyError):
+        except (Denied, queue.Full, ValueError, TypeError, KeyError) as error:
+            self.record_failure(error, 'request_admission')
             with self.lock:
                 state = self.states.get(ident)
             if state:
