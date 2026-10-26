@@ -69,6 +69,9 @@ mod aligned_review;
 mod review_canary;
 #[path = "self_improve_review_calibration.rs"]
 mod review_calibration;
+#[cfg(test)]
+#[path = "self_improve_native_acceptance.rs"]
+mod native_acceptance;
 
 pub(crate) async fn review_canary_if_due() -> Result<Option<review_canary::Report>> {
     let canary = review_canary::run_if_due().await;

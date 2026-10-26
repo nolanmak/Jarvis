@@ -191,7 +191,7 @@ pub(crate) fn summary() -> Result<String> {
     })
 }
 
-fn detected_seed(evidence: &crate::autoship_review::ReviewEvidence) -> bool {
+pub(super) fn detected_seed(evidence: &crate::autoship_review::ReviewEvidence) -> bool {
     // Deterministic rubric: a completed independent pass must name the known
     // zero-check boundary and shipping/check predicate. Generic rejection or a
     // transport failure does not count as catching the planted defect.
