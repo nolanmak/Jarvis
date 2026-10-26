@@ -2,6 +2,9 @@
 //! execution contract. Targeted iteration remains in the parent module.
 use super::acceptance::verifier_checkout;
 use super::*;
+#[cfg(test)]
+#[path = "self_improve_ci_fixture.rs"]
+pub(in crate::self_improve) mod fixture;
 #[path = "self_improve_ci_vm.rs"]
 mod vm;
 use anyhow::ensure;
@@ -11,6 +14,16 @@ use std::collections::BTreeSet;
 
 const RUNNER: &str = include_str!("../../../scripts/ci-contract.py");
 const CONTRACT: &str = include_str!("../../../scripts/ci-contract.json");
+fn contract_for(root: &Path) -> Result<String> {
+    #[cfg(test)]
+    if let Some(contract) = fixture::selected(root)? {
+        return Ok(contract);
+    }
+    #[cfg(not(test))]
+    let _ = root;
+    Ok(CONTRACT.to_owned())
+}
+
 const PREREQUISITE: &str = "shared CI prerequisite unavailable";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -210,7 +223,7 @@ async fn binding_at(root: &Path, base_ref: &str) -> Result<Binding> {
         base_ref: base_ref.to_owned(),
         index_tree,
         status,
-        contract_sha256: digest(CONTRACT.as_bytes()),
+        contract_sha256: digest(contract_for(root)?.as_bytes()),
         runner_sha256: digest(RUNNER.as_bytes()),
     })
 }

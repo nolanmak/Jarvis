@@ -55,6 +55,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     )?;
     std::fs::write(root.join("rules.rs"),"pub fn checks_complete(done: usize, total: usize) -> bool { total > 0 && done == total }\n")?;
     std::fs::write(root.join("shipping.rs"),"// Empty check sets must never authorize shipping.\npub fn should_ship(done: usize, total: usize) -> bool { crate::rules::checks_complete(done, total) }\n")?;
+    shared_ci::fixture::install(&root)?;
     git(&root, &["add", "."]).await?;
     git(&root, &["commit", "-qm", "red arithmetic baseline"]).await?;
     let base = git(&root, &["rev-parse", "HEAD"]).await?;
@@ -145,6 +146,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     assert_eq!(std::fs::read_to_string(root.join("rules.rs"))?,"pub fn checks_complete(done: usize, total: usize) -> bool { total > 0 && done == total }\n");
     git(&root, &["add", "."]).await?;
     git(&root, &["commit", "-qm", "native builder candidate"]).await?;
+    shared_ci::fixture::scope(&root, verification_gate(&root, &guard.audit_logger())).await??;
     let mut reference =
         acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()], &guard.audit_logger())
             .await?;
@@ -248,7 +250,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
         serde_json::to_string(&seed)?
     );
     guard.audit_health().await?;
-    guard.audit_logger().record_controller(serde_json::json!({"kind":"disposable_native_acceptance_passed","native_builders":builders.iter().map(|b|serde_json::json!({"provider":b.provider.name(),"session_id":b.id,"uncertain":b.uncertain})).collect::<Vec<_>>(),"clean_review":evidence,"seeded_review":seed,"no_remote_publication":true}))?;
+    guard.audit_logger().record_controller(serde_json::json!({"kind":"disposable_native_acceptance_passed","ci_authority":"compiled disposable arithmetic fixture; not full Jarvis CI","full_jarvis_ci_pass":false,"native_builders":builders.iter().map(|b|serde_json::json!({"provider":b.provider.name(),"session_id":b.id,"uncertain":b.uncertain})).collect::<Vec<_>>(),"clean_review":evidence,"seeded_review":seed,"no_remote_publication":true}))?;
     guard.finish()?;
     Ok(())
 }

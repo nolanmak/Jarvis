@@ -152,13 +152,14 @@ impl Session {
         let directory = tempfile::Builder::new()
             .prefix("ci-controller-")
             .tempdir_in(target)?;
+        let contract = contract_for(root)?;
         for (name, bytes) in [
             ("ci-build-vm.py", ADAPTER),
             ("codex-build-vm.py", BUILD_VM),
             ("build-dependency-proxy.py", PROXY),
             ("provider-supervisor.py", SUPERVISOR),
             ("ci-contract.py", RUNNER.as_bytes()),
-            ("ci-contract.json", CONTRACT.as_bytes()),
+            ("ci-contract.json", contract.as_bytes()),
             ("runtime.json", runtime.as_slice()),
         ] {
             private_write(&directory.path().join(name), bytes)?;
