@@ -4,8 +4,8 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 const WORKFLOW: &str = ".github/workflows/claude-pr-review.yml";
 
-async fn api(root: &Path, endpoint: &str) -> Option<Value> {
-    let (_, out, _) = run(&gh_bin(), &["api", endpoint], root).await.ok()?;
+async fn api(root: &Path, gh: &str, endpoint: &str) -> Option<Value> {
+    let (_, out, _) = run(gh, &["api", endpoint], root).await.ok()?;
     serde_json::from_str(&out).ok()
 }
 fn required_contexts(rules: &Value, legacy: &Value) -> Option<BTreeSet<String>> {
@@ -62,6 +62,9 @@ fn optional(
 /// Unknown API evidence leaves every job in the ordinary mandatory check path.
 /// The marker is set only here, on controller-created rows from `gh pr checks`.
 pub(super) async fn classify(root: &Path, pr: u64, raw: &str) -> String {
+    classify_with_gh(root, &gh_bin(), pr, raw).await
+}
+pub(super) async fn classify_with_gh(root: &Path, gh: &str, pr: u64, raw: &str) -> String {
     let Ok(mut rows) = serde_json::from_str::<Vec<Value>>(raw) else {
         return raw.into();
     };
@@ -71,31 +74,32 @@ pub(super) async fn classify(root: &Path, pr: u64, raw: &str) -> String {
             object.remove("autoship_required_context");
         }
     }
-    let Some(rules) = api(root, "repos/{owner}/{repo}/rules/branches/main").await else {
-        return raw.into();
+    let sanitized = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
+    let Some(rules) = api(root, gh, "repos/{owner}/{repo}/rules/branches/main").await else {
+        return sanitized.clone();
     };
-    let Some(legacy) = api(root, "repos/{owner}/{repo}/branches/main/protection").await else {
-        return raw.into();
+    let Some(legacy) = api(root, gh, "repos/{owner}/{repo}/branches/main/protection").await else {
+        return sanitized.clone();
     };
     let Some(required) = required_contexts(&rules, &legacy) else {
-        return raw.into();
+        return sanitized.clone();
     };
     for row in &mut rows {
         if row["name"].as_str().is_some_and(|n| required.contains(n)) {
             row["autoship_required_context"] = true.into();
         }
     }
-    let Some(repository) = api(root, "repos/{owner}/{repo}").await else {
-        return serde_json::to_string(&rows).unwrap_or_else(|_| raw.into());
+    let Some(repository) = api(root, gh, "repos/{owner}/{repo}").await else {
+        return serde_json::to_string(&rows).unwrap_or_else(|_| sanitized.clone());
     };
     let Some(repo) = repository["full_name"].as_str() else {
-        return serde_json::to_string(&rows).unwrap_or_else(|_| raw.into());
+        return serde_json::to_string(&rows).unwrap_or_else(|_| sanitized.clone());
     };
-    let Some(pull) = api(root, &format!("repos/{{owner}}/{{repo}}/pulls/{pr}")).await else {
-        return serde_json::to_string(&rows).unwrap_or_else(|_| raw.into());
+    let Some(pull) = api(root, gh, &format!("repos/{{owner}}/{{repo}}/pulls/{pr}")).await else {
+        return serde_json::to_string(&rows).unwrap_or_else(|_| sanitized.clone());
     };
     let Some(head) = pull["head"]["sha"].as_str() else {
-        return serde_json::to_string(&rows).unwrap_or_else(|_| raw.into());
+        return serde_json::to_string(&rows).unwrap_or_else(|_| sanitized.clone());
     };
     let prefix = format!("https://github.com/{repo}/actions/runs/");
     let mut runs: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
@@ -125,6 +129,7 @@ pub(super) async fn classify(root: &Path, pr: u64, raw: &str) -> String {
         };
         let Some(job) = api(
             root,
+            gh,
             &format!("repos/{{owner}}/{{repo}}/actions/jobs/{job_id}"),
         )
         .await
@@ -136,6 +141,7 @@ pub(super) async fn classify(root: &Path, pr: u64, raw: &str) -> String {
         } else {
             let Some(run) = api(
                 root,
+                gh,
                 &format!("repos/{{owner}}/{{repo}}/actions/runs/{run_id}"),
             )
             .await
@@ -149,7 +155,7 @@ pub(super) async fn classify(root: &Path, pr: u64, raw: &str) -> String {
             row["autoship_optional_workflow"] = true.into();
         }
     }
-    serde_json::to_string(&rows).unwrap_or_else(|_| raw.into())
+    serde_json::to_string(&rows).unwrap_or_else(|_| sanitized.clone())
 }
 
 #[cfg(test)]

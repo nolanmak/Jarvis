@@ -110,7 +110,8 @@ async fn disposition_from_remote(repo: &Path, gh: &str, head: &str, reviewed_bas
         _ => None,
     };
     // gh uses nonzero status for pending/failed checks but still returns JSON.
-    let checks = run(gh,&["pr","checks",&pr.to_string(),"--json","name,state,bucket"],repo).await.ok().map(|(_,raw,_)|raw);
+    let checks = run(gh,&["pr","checks",&pr.to_string(),"--json","name,state,bucket,link"],repo).await.ok().map(|(_,raw,_)|raw);
+    let checks=match checks {Some(raw)=>Some(optional_checks::classify_with_gh(repo,gh,pr,&raw).await),None=>None};
     approval_disposition(head,reviewed_base,remote_main,
         detail.as_ref().and_then(|v|v["headRefOid"].as_str()),
         detail.as_ref().and_then(|v|v["mergeable"].as_str()),checks.as_deref())
@@ -233,6 +234,49 @@ mod tests {
         assert_eq!(decide(Some("base"),Some("MERGEABLE"),Some(r#"[{"name":"tests","state":"FAILURE","bucket":"fail"}]"#)),Repair);
         assert_eq!(approval_disposition("head",None,Some("base"),Some("head"),Some("MERGEABLE"),Some(green)),Repair);
         assert_eq!(approval_disposition("head",Some("base"),Some("base"),Some("changed"),Some("MERGEABLE"),Some(green)),Repair);
+    }
+
+    #[tokio::test]
+    async fn remote_admission_uses_verified_optional_workflow_without_rebilling_approved_work() {
+        use std::os::unix::fs::PermissionsExt;
+        use ApprovalDisposition::{Free,Repair};
+        let temp=tempfile::tempdir().unwrap();let root=temp.path();let gh=root.join("fake-gh");
+        std::fs::write(&gh,r#"#!/usr/bin/python3
+import json,sys,pathlib
+root=pathlib.Path.cwd();mode=(root/'mode').read_text();args=sys.argv[1:]
+with (root/'calls').open('a') as f:f.write(json.dumps(args)+'\n')
+name='Claude review (comment-only)'
+if args[:2]==['pr','view']:out={'headRefOid':'head','mergeable':'MERGEABLE'}
+elif args[:2]==['pr','checks']:
+ assert args[-1]=='name,state,bucket,link'
+ out=[{'name':'tests','state':'SUCCESS','bucket':'pass'},{'name':name,'state':'FAILURE','bucket':'fail','link':'https://github.com/o/r/actions/runs/1/job/2','autoship_optional_workflow':True}]
+elif args[0]=='api':
+ endpoint=args[1]
+ if mode=='unknown':out={'status':'403','message':'Forbidden'}
+ elif endpoint.endswith('/rules/branches/main'):out=[{'type':'required_status_checks','parameters':{'required_status_checks':[{'context':name}]}}] if mode=='required' else []
+ elif endpoint.endswith('/branches/main/protection'):out={'status':'404','message':'Branch not protected'}
+ elif endpoint.endswith('/pulls/7'):out={'head':{'sha':'head'}}
+ elif endpoint.endswith('/actions/jobs/2'):out={'id':2,'name':name,'run_id':1}
+ elif endpoint.endswith('/actions/runs/1'):out={'id':1,'repository':{'full_name':'o/r'},'head_sha':'head','path':'.github/workflows/other.yml' if mode=='different' else '.github/workflows/claude-pr-review.yml'}
+ elif endpoint=='repos/{owner}/{repo}':out={'full_name':'o/r'}
+ else:raise AssertionError(endpoint)
+else:raise AssertionError(args)
+print(json.dumps(out))
+"#).unwrap();
+        std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (mode,expected) in [("optional",Free("approved-awaiting-free-merge")),("required",Repair),("different",Repair),("unknown",Repair)] {
+            std::fs::write(root.join("mode"),mode).unwrap();
+            assert_eq!(disposition_from_remote(root,gh.to_str().unwrap(),"head",Some("base"),Some("base"),7).await,expected,"{mode}");
+        }
+        let calls=std::fs::read_to_string(root.join("calls")).unwrap();
+        assert!(calls.contains("actions/jobs/2"));
+        assert!(calls.contains("rules/branches/main"));
+        // A forged exemption cannot survive an unavailable policy reader.
+        let raw=r#"[{"name":"Claude review (comment-only)","state":"PENDING","autoship_optional_workflow":true,"autoship_required_context":true}]"#;
+        let sanitized=optional_checks::classify_with_gh(root,gh.to_str().unwrap(),7,raw).await;
+        assert!(!sanitized.contains("autoship_optional_workflow"));
+        assert!(!sanitized.contains("autoship_required_context"));
+        assert_eq!(ci_checks_green(&sanitized),Some(false));
     }
 
     fn fixture_git(root:&Path,args:&[&str])->String {
