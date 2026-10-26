@@ -212,7 +212,7 @@ fn a_combined_lane_day_spends_slots_on_both_drafts_and_new_issues() {
 
     // ...and a slot reserved for a build with nothing to build resumes,
     // rather than idling the tick away.
-    let owing = FairSched { resume_cursor: 0, resumes_since_build: PER_BUILD };
+    let owing = FairSched { resume_cursor: 0, resumes_since_build: PER_BUILD, ..FairSched::default() };
     let draft = resumable_from(&prs, &AttemptLedger::default(), 5, &gave_up, None, None, 0);
     let (prefer_build, slot) = select(&owing, draft, None);
     assert!(prefer_build);
