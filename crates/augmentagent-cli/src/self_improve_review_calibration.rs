@@ -232,6 +232,12 @@ fn source_identity(case: &Case) -> Result<serde_json::Value> {
         .as_object_mut()
         .unwrap()
         .remove("executable_acceptance");
+    if let Some(controller)=evidence.get_mut("controller_acceptance").and_then(serde_json::Value::as_object_mut) {
+        for field in ["baseline_results","candidate_results","contract_hash"] {controller.remove(field);}
+        if let Some(contract)=controller.get_mut("registered_contract").and_then(serde_json::Value::as_object_mut) {
+            for field in ["revision","schema_version","issue","pull_request"] {contract.remove(field);}
+        }
+    }
     Ok(evidence)
 }
 fn held_out_examples(training: &[Case], held: &Case) -> Result<String> {
@@ -648,6 +654,25 @@ mod tests {
             .unwrap()
             .get("executable_acceptance")
             .is_some());
+    }
+
+    #[test]
+    fn controller_observation_metadata_cannot_leak_duplicate_source_labels() {
+        let mut held=case("head-a","source");let mut duplicate=case("head-b","source");
+        for (case,number) in [(&mut held,1),(&mut duplicate,2)] {
+            let mut evidence:serde_json::Value=serde_json::from_str(&case.evidence).unwrap();
+            evidence["controller_acceptance"]=serde_json::json!({"contract_hash":format!("observation-{number}"),
+                "baseline_results":[{"binding":{"head":format!("base-{number}")}}],"candidate_results":[{"binding":{"head":format!("head-{number}")}}],
+                "registered_contract":{"revision":number,"schema_version":1,"issue":number,"criteria":["sum"],"oracle":{"expected":7}},
+                "pinned_source_hashes":{"observe.py":"same-source-hash"}});
+            case.evidence=evidence.to_string();
+        }
+        assert_eq!(held_out_examples(&[duplicate.clone()],&held).unwrap(),"[]");
+        assert!(unlabelled_evidence(&held).unwrap()["controller_acceptance"].get("candidate_results").is_some(),"dedup normalization must not strip actual replay evidence");
+        let mut changed:serde_json::Value=serde_json::from_str(&duplicate.evidence).unwrap();
+        changed["controller_acceptance"]["registered_contract"]["oracle"]["expected"]=serde_json::json!(8);
+        duplicate.evidence=changed.to_string();
+        assert_ne!(held_out_examples(&[duplicate],&held).unwrap(),"[]","actual changed controller oracle is different evidence");
     }
 
     #[test]
