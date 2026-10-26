@@ -381,6 +381,9 @@ impl AuditLogger {
             }
         }
         tickets.sort();
+        anyhow::ensure!(self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
+            || self.failure_path.as_ref().is_some_and(|path| path.exists())
+            || !tickets.is_empty(), "healthy audit generation cannot be replaced");
         sink.seal_for_recovery(|rows| {
             let generation = rows.iter().filter(|r| r["actor"] == "controller")
                 .filter_map(|r| r["generation"].as_i64()).max()
