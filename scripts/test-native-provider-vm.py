@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from unittest import mock
 import hashlib
@@ -277,6 +278,73 @@ os.kill(os.getpid(),signal.SIGKILL)
                     checkpoint.begin(dict(self.request, path='/v1/oauth/token?other=1'), self.entry, self.body)
             finally:
                 os.close(lock)
+
+    def test_scope_subset_is_refused_before_dispatch_even_if_response_omits_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); spec = self.fixture(root); lock = vm.credential_use(spec)
+            try:
+                checkpoint = vm.RefreshCheckpoint(spec, lock)
+                data = json.loads(self.body); data['scope'] = ''
+                with self.assertRaisesRegex(ValueError, 'changes credential scope'):
+                    checkpoint.begin(self.request, self.entry, json.dumps(data).encode())
+                self.assertFalse(checkpoint.journal.exists())
+                data['scope'] = 'inference'
+                checkpoint.begin(self.request, self.entry, json.dumps(data).encode())
+                response = json.loads(self.response); response.pop('scope')
+                checkpoint.commit(json.dumps(response).encode()); checkpoint.end()
+                self.assertEqual(json.loads(Path(spec['auth_file']).read_bytes())['claudeAiOauth']['scopes'], ['inference'])
+            finally:
+                os.close(lock)
+
+    def test_publication_drains_checkpoint_before_stale_guest_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); spec = self.fixture(root); lock = vm.credential_use(spec)
+            try:
+                original = vm.private_bytes(Path(spec['auth_file']), 1024 * 1024)
+                checkpoint = vm.RefreshCheckpoint(spec, lock)
+                checkpoint.begin(self.request, self.entry, self.body); checkpoint.sent()
+                staging = root / 'staging'; (staging / '.claude').mkdir(parents=True)
+                stale_export = json.loads(original)
+                stale_export['claudeAiOauth'].update(accessToken='guest-access', refreshToken='guest-refresh')
+                vm.atomic(staging / spec['auth_relative'], json.dumps(stale_export).encode())
+                def drain():
+                    checkpoint.commit(self.response); checkpoint.end()
+                gateway = mock.Mock(); gateway.close.side_effect = drain
+                generation = vm.publish_runtime_generation(gateway, spec, staging, root,
+                    hashlib.sha256(original).hexdigest(), lock)
+                self.assertTrue((root / generation).is_dir())
+                self.assertEqual(json.loads(Path(spec['auth_file']).read_bytes())['claudeAiOauth']['refreshToken'], 'new-refresh')
+                self.assertEqual(json.loads(checkpoint.journal.read_bytes())['state'], 'committed')
+            finally:
+                os.close(lock)
+
+    def test_close_waits_for_worker_inside_begin_before_refreshing_flag(self):
+        gateway_spec = importlib.util.spec_from_file_location('refresh_race_gateway', HERE / 'native-provider-gateway.py')
+        gateway = importlib.util.module_from_spec(gateway_spec); gateway_spec.loader.exec_module(gateway)
+        policy = {'version': 1, 'authorities': [{'authority': 'platform.claude.com:443', 'tls': True,
+            'allow_loopback': False, 'routes': [{'path_prefix': '/v1/oauth/token', 'exact': True,
+            'methods': ['POST'], 'websocket': False}]}]}
+        entered = threading.Event(); release = threading.Event(); closed = threading.Event()
+        def begin(*_):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError('fixture did not release worker')
+            return True
+        checkpoint = mock.Mock(); checkpoint.begin.side_effect = begin
+        host = gateway.HostGateway(policy, lambda _: None, refresh_checkpoint=checkpoint)
+        with mock.patch.object(gateway, 'safe_socket', return_value=mock.Mock()):
+            host.receive(dict(self.request, id='race', type='gateway_open', headers=[]))
+            host.receive({'id': 'race', 'type': 'gateway_data', 'data': gateway.encode(self.body)})
+            host.receive({'id': 'race', 'type': 'gateway_end'})
+            self.assertTrue(entered.wait(2))
+            closer = threading.Thread(target=lambda: (host.close(), closed.set()))
+            closer.start()
+            try:
+                self.assertFalse(closed.wait(0.1), 'close released lease while begin/recover remained active')
+            finally:
+                release.set(); closer.join(3)
+            self.assertTrue(closed.is_set())
+            checkpoint.end.assert_called_once()
 
     def test_codex_optional_tokens_and_distinct_journal_paths(self):
         with tempfile.TemporaryDirectory() as directory:

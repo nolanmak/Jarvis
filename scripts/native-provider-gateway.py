@@ -619,13 +619,12 @@ class HostGateway:
         for state in states:
             state.close()
         for state in states:
-            if state.refreshing:
-                state.finished.wait(self.policy.timeout)
-                state.close(force=True)
-                # Never release the enclosing credential lease while a worker
-                # can still publish a checkpoint. Socket shutdown interrupts
-                # transport; any remaining fsync must settle before teardown.
-                state.finished.wait()
+            state.finished.wait(self.policy.timeout)
+            state.close(force=True)
+            # begin/recover can already write credentials before refreshing is
+            # assigned. Join EVERY registered worker before releasing the lease.
+            # Socket shutdown interrupts transport; any remaining fsync settles.
+            state.finished.wait()
         with self.lock:
             if self.diagnostic_fd is not None:
                 os.close(self.diagnostic_fd)

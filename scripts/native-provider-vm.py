@@ -354,8 +354,8 @@ class RefreshCheckpoint:
             self.current = private_bytes(Path(self.spec['auth_file']), 1024 * 1024)
             original = json.loads(self.current)
             container, token = ('claudeAiOauth', 'refreshToken') if self.spec['provider'] == 'claude' else ('tokens', 'refresh_token')
-            if 'scope' in data and (not isinstance(data['scope'], str) or not set(data['scope'].split()) <= set(original[container]['scopes'])):
-                raise ValueError('refresh request expands credential scope')
+            if 'scope' in data and (not isinstance(data['scope'], str) or set(data['scope'].split()) != set(original[container]['scopes'])):
+                raise ValueError('refresh request changes credential scope')
             if data.get('refresh_token') != original[container][token]:
                 raise ValueError('refresh request does not match controlled credential')
             return True
@@ -408,6 +408,16 @@ class RefreshCheckpoint:
     def end(self):
         self.current = None
         self.lock.release()
+
+
+def publish_runtime_generation(gateway, spec, staging, state, original_auth, credential_lock):
+    # Gateway recovery/checkpoint workers share this launch's credential lease.
+    # Settle them before export writeback, not merely during final cleanup.
+    gateway.close()
+    generation = 'generation-' + uuid.uuid4().hex
+    os.replace(staging, state / generation)
+    refresh_auth(spec, state / generation, original_auth, credential_lock)
+    return generation
 
 
 def runtime_seed(runtime, auth_file, auth_relative):
@@ -762,9 +772,7 @@ def main(spec_path):
             if process.returncode:
                 raise RuntimeError('native VM shutdown failed')
             phase = 'publish_generation'
-            generation = 'generation-' + uuid.uuid4().hex
-            os.replace(staging, state / generation)
-            refresh_auth(spec, state / generation, original_auth, credential_lock)
+            generation = publish_runtime_generation(gateway, spec, staging, state, original_auth, credential_lock)
             atomic(state / 'complete.json', json.dumps({'version': 1, 'exit_code': exit_code,
                    'generation': generation, 'export_bytes': exported,
                    'auth_generation': original_auth, 'worker_quiescence': quiescence,
