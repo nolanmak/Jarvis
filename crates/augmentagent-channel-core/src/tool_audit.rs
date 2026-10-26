@@ -302,6 +302,7 @@ pub struct AuditLogger {
     path: PathBuf,
     model_call_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
+    resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
     failure_path: Option<PathBuf>,
     pending_dir: Option<PathBuf>,
@@ -364,6 +365,16 @@ impl std::fmt::Debug for AuditLogger {
 }
 
 impl AuditLogger {
+    pub fn set_resource_capacity_observer(&self, observer: Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>) -> anyhow::Result<()> {
+        *self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?=Some(observer);
+        Ok(())
+    }
+    pub fn resource_capacity_exhausted(&self, observation: &serde_json::Value) -> anyhow::Result<()> {
+        let observer=self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?.clone();
+        if let Some(observer)=observer {observer(observation)?;}
+        Ok(())
+    }
+
     pub fn set_model_call_observer(
         &self,
         observer: Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
@@ -396,6 +407,7 @@ impl AuditLogger {
         Self {
             path,
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
+            resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,
             failure_path: None,
             pending_dir: None,
