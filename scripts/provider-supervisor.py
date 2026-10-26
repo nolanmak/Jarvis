@@ -49,7 +49,11 @@ def supervise(receipt, argv):
             Path(receipt).write_text('all-descendants-reaped\n')
             Path(receipt).chmod(0o600)
             raise
-    if os.environ.pop('JARVIS_SUPERVISOR_ADMISSION', None) == '1':
+    vm_preflight = os.environ.pop('JARVIS_SUPERVISOR_VM_PREFLIGHT', None) == '1'
+    admission = os.environ.pop('JARVIS_SUPERVISOR_ADMISSION', None) == '1'
+    if vm_preflight and not admission:
+        raise RuntimeError('VM preflight requires controller admission')
+    if admission and not vm_preflight:
         ready = Path(receipt).with_name('launch-ready')
         proceed = Path(receipt).with_name('launch-continue')
         ready.write_text('ready\n')
@@ -66,6 +70,12 @@ def supervise(receipt, argv):
             time.sleep(0.005)
         if proceed.read_text() != 'admitted\n':
             raise RuntimeError('invalid controller launch admission')
+    if vm_preflight:
+        os.environ['JARVIS_NATIVE_VM_READY'] = str(Path(receipt).with_name('vm-ready'))
+        os.environ['JARVIS_NATIVE_VM_CONTINUE'] = str(Path(receipt).with_name('launch-continue'))
+    else:
+        os.environ.pop('JARVIS_NATIVE_VM_READY', None)
+        os.environ.pop('JARVIS_NATIVE_VM_CONTINUE', None)
     try:
         child = subprocess.Popen(argv, start_new_session=True,
                                  preexec_fn=scope.attach_child if scope else None)
@@ -78,6 +88,18 @@ def supervise(receipt, argv):
         raise
     status = None
     try:
+        if vm_preflight:
+            vm_ready = Path(receipt).with_name('vm-ready')
+            deadline = time.monotonic() + 60
+            while not vm_ready.exists():
+                if stopping or child.poll() is not None or time.monotonic() >= deadline:
+                    return 125
+                time.sleep(0.005)
+            if vm_ready.read_text() != 'ready\n':
+                raise RuntimeError('invalid VM readiness')
+            ready = Path(receipt).with_name('launch-ready')
+            ready.write_text('ready\n')
+            ready.chmod(0o600)
         while not stopping:
             try:
                 status = child.wait(timeout=0.05)

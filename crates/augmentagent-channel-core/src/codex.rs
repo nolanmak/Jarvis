@@ -355,7 +355,14 @@ impl CodexCliReasoner {
 
         let launch_audit=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         crate::run_resources::check_requirement(provider,launch_audit.as_ref())?;
-        let (mut child, process_group) = crate::process_tree::spawn_admitted(&cmd, true, clean, opts.handoff_path.as_deref(),launch_audit.as_ref().is_some_and(|logger|logger.run_resources_required())).map_err(|e| {
+        let native_vm = if crate::native_vm::required(launch_audit.as_ref()) {
+            Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, Some(&bridge), native_launch.as_ref())?)
+        } else { None };
+        let spawned = match &native_vm {
+            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref()),
+            None => crate::process_tree::spawn_admitted(&cmd, true, clean, opts.handoff_path.as_deref(), false),
+        };
+        let (mut child, process_group) = spawned.map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 anyhow::Error::new(ReasonerError::CleanupUncertain { provider: provider.into() })
             } else if e.kind() == std::io::ErrorKind::NotFound {
@@ -421,6 +428,9 @@ impl CodexCliReasoner {
             };
             let kind = v.get("type").and_then(|t| t.as_str());
             if kind == Some("thread.started") {
+                if let (Some(vm), Some(id)) = (&native_vm, v.get("thread_id").and_then(|value|value.as_str())) {
+                    vm.observe_session(id)?;
+                }
                 if let (Some(lease), Some(id)) =
                     (native_lease.as_mut(), v.get("thread_id").and_then(|value| value.as_str()))
                 {

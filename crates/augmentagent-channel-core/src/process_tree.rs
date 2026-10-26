@@ -15,6 +15,7 @@ pub(crate) struct ProcessGroup {
     clean: Arc<AtomicBool>,
     active_request: Option<PathBuf>,
     resource_required: bool,
+    vm_preflight: bool,
     resource_observed: AtomicBool,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
     _directory: tempfile::TempDir,
@@ -34,7 +35,7 @@ impl ProcessGroup {
     async fn admit(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>, model:bool) -> anyhow::Result<()> {
         self.bind_resource_audit(provider,logger)?;
         let ready=self.receipt.with_file_name("launch-ready");
-        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(5);
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(if self.vm_preflight { 65 } else { 5 });
         while !ready.exists() {
             if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
                 self.resource_outcome(provider,logger)?;
@@ -488,13 +489,18 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,false,false)
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false)
 }
 pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources)
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false)
 }
-fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool)
+/// Controller-only VM startup capability. Native code cannot run before admission.
+pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
+    -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(command,true,clean,journal,true,true,true)
+}
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool)
     -> std::io::Result<(Child, ProcessGroup)> {
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
@@ -533,6 +539,10 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
         if let Some(value) = value { supervised.env(key, value); }
         else { supervised.env_remove(key); }
     }
+    supervised.env_remove("JARVIS_SUPERVISOR_VM_PREFLIGHT");
+    supervised.env_remove("JARVIS_NATIVE_VM_READY");
+    supervised.env_remove("JARVIS_NATIVE_VM_CONTINUE");
+    if vm_preflight { supervised.env("JARVIS_SUPERVISOR_VM_PREFLIGHT","1"); }
     supervised.env_remove("JARVIS_SUPERVISOR_ADMISSION");
     if admission { supervised.env("JARVIS_SUPERVISOR_ADMISSION","1"); }
     supervised.env_remove("JARVIS_RUN_RESOURCE_POLICY");
@@ -548,7 +558,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), _directory: directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), _directory: directory }))
 }
 
 #[cfg(test)]

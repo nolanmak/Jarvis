@@ -1162,6 +1162,8 @@ impl ClaudeCliReasoner {
             }
         }
 
+        let launch_audit=opts.audit_logger.clone().or_else(default_audit_logger);
+        let vm_required = crate::native_vm::required(launch_audit.as_ref());
         let native_scope = crate::autoship_scope::NativeScope::from_opts(opts)?;
         let claude_bridge = if native_scope.is_some() {
             Some(crate::codex_tools::ClaudeBridgeLaunch::prepare(opts)?)
@@ -1245,8 +1247,8 @@ impl ClaudeCliReasoner {
 
 
         let mut cmd = match &native_scope {
-            Some(scope) => scope.command(&self.bin),
-            None => Command::new(&self.bin),
+            Some(scope) if !vm_required => scope.command(&self.bin),
+            _ => Command::new(&self.bin),
         };
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -1295,16 +1297,18 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        if let Some(scope) = &native_scope { scope.configure(&mut cmd); }
-        let launch_audit=opts.audit_logger.clone().or_else(default_audit_logger);
+        if !vm_required { if let Some(scope) = &native_scope { scope.configure(&mut cmd); } }
         crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
-        let (mut child, process_group) = crate::process_tree::spawn_admitted(
-            &cmd,
-            clear_environment,
-            clean,
-            opts.handoff_path.as_deref(),
-            launch_audit.as_ref().is_some_and(|logger|logger.run_resources_required()),
-        )
+        let native_launch = native_lease.as_ref().map(|lease|lease.launch());
+        let native_vm = if vm_required {
+            Some(crate::native_vm::Launch::prepare("claude", opts, &cmd,
+                claude_bridge.as_ref().map(|bridge|&bridge.bridge), native_launch.as_ref())?)
+        } else { None };
+        let spawned = match &native_vm {
+            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref()),
+            None => crate::process_tree::spawn_admitted(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false),
+        };
+        let (mut child, process_group) = spawned
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 CallError::Other(
@@ -1368,6 +1372,7 @@ impl ClaudeCliReasoner {
                         || value["type"] == "result"
                     {
                         if let Some(id) = value["session_id"].as_str() {
+                            if let Some(vm) = &native_vm { vm.observe_session(id)?; }
                             lease.observe(id)?;
                         }
                     }
