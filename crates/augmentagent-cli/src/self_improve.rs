@@ -48,6 +48,8 @@ mod adopted_execution;
 mod adoption;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
+#[path = "self_improve_legacy_readmission.rs"]
+mod legacy_readmission;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
@@ -10086,54 +10088,11 @@ fn stale_gave_up(fetched: &[(u64, String)]) -> Vec<u64> {
         .collect()
 }
 
-/// #955 — hand back the issues the not-fixable verdict labelled out although
-/// an earlier attempt had already built a diff for them. Removing the label
-/// is the whole re-triage: the next tick sees them as ordinary candidates
-/// again.
+/// Reconcile obsolete automatic model-only scope holds using authenticated
+/// timeline evidence. Manual/security holds remain outside this migration.
 async fn retriage_gave_up(repo_root: &Path, issues: &serde_json::Value) {
-    // #1517 — once per UTC day per process: the comment sets it reads do
-    // not change between idle ticks, and with the whole open set listed a
-    // per-tick sweep would be fifty GitHub reads every few minutes.
-    let today = utc_day_now();
-    if LAST_RETRIAGE_DAY.swap(today, std::sync::atomic::Ordering::SeqCst) == today {
-        return;
-    }
-    let gh = gh_bin();
-    let mut fetched = Vec::new();
-    // #1517 — the listing is now the whole open set, so bound the reads to
-    // the newest `MAX_RETRIAGE_READS` gave-up issues: one `gh issue view`
-    // each, on the idle path only.
-    for number in gave_up_numbers(issues).into_iter().take(MAX_RETRIAGE_READS) {
-        let n = number.to_string();
-        if let Ok((true, comments, _)) =
-            run(&gh, &["issue", "view", &n, "--json", "comments"], repo_root).await
-        {
-            fetched.push((number, comments));
-        }
-    }
-    for number in stale_gave_up(&fetched) {
-        let n = number.to_string();
-        if let Ok((true, _, _)) = run(
-            &gh,
-            &["issue", "edit", &n, "--remove-label", GAVE_UP_LABEL],
-            repo_root,
-        )
-        .await
-        {
-            info!(issue = number, "re-triage: removed `{GAVE_UP_LABEL}` (#955)");
-            backoff_comment(
-                repo_root,
-                number,
-                &format!(
-                    "Auto-fix triage: removing `{GAVE_UP_LABEL}` — an earlier \
-                     attempt already built a reviewable diff for this issue, \
-                     which #955 no longer squares with a not-agent-fixable \
-                     verdict."
-                ),
-            )
-            .await
-            .ok();
-        }
+    if let Err(error)=legacy_readmission::sweep(repo_root,Some(issues),false).await {
+        warn!("legacy hold readmission deferred: {error:#}");
     }
 }
 
@@ -11846,7 +11805,11 @@ impl AutoPrLoop {
             async move { run_once(&root, dry_run).await }
         }, move || {
             let root = sweep_root.clone();
-            async move { merge_sweep(&root, dry_run).await }
+            async move {
+                let merged=merge_sweep(&root,dry_run).await;
+                if let Err(error)=legacy_readmission::sweep(&root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
+                merged
+            }
         });
         tokio::select! { result = shipping => result, result = canary => result }
     }
