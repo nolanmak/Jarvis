@@ -234,6 +234,86 @@ def launch_turn(root, policy, profile, executable, iteration, session_id, startu
         os.close(stdout_fd);os.close(stderr_fd)
 
 
+def validate_existing(root, policy_path, policy, profile, executable):
+    root = root.absolute()
+    for directory in (root, root / 'native-session'):
+        metadata = directory.lstat()
+        if (directory.resolve() != directory or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077):
+            raise ValueError('existing evidence directory is not private')
+    if any((root / name).exists() for name in ('turn-2', 'recovery-intent.json', 'recovery-summary.json')):
+        raise ValueError('resume dispatch already exists; reconcile it instead of rebilling')
+    original = private_json(root / 'probe.json')
+    summary = private_json(root / 'summary.json')
+    launch = private_json(root / 'turn-1/launch.json')
+    command = private_json(root / 'turn-1/command.json')
+    failure = private_json(root / 'turn-1/failure.json')
+    completion = private_json(root / 'native-session/complete.json')
+    if (original.get('kind') != f'authenticated_{PROVIDER}_vm_transport_only'
+            or original.get('policy_sha256') != digest_file(policy_path)
+            or original.get('executable') != str(executable) or original.get('model') != MODEL
+            or original.get('auth_source_read_only') is not True
+            or summary.get('status') != 'failed' or summary.get('auth_source_unchanged') is not True):
+        raise ValueError('original failed proof identity does not match')
+    expected = {'provider': PROVIDER, 'runtime_config': policy['runtime_config'],
+        'guest_runtime': policy['guest_runtime'], 'memory_mb': policy['memory_mb'],
+        'session_directory': str(root / 'native-session'), 'resume': False,
+        'executable': str(executable), 'argv': native_argv(), 'environment': {'LANG': 'C.UTF-8'},
+        'auth_file': profile['auth_file'], 'auth_relative': profile['auth_relative'],
+        'refresh_auth': False, 'gateway': profile['gateway'], 'mcp_argv': None, 'assets': []}
+    if any(launch.get(key) != value for key, value in expected.items()):
+        raise ValueError('original native launch differs from declared transport')
+    if (command.get('native_argv') != launch['argv'] or command.get('model') != MODEL
+            or command.get('executable_sha256') != digest_file(executable)
+            or command.get('prompt') != PROMPT
+            or command.get('prompt_sha256') != hashlib.sha256(PROMPT.encode()).hexdigest()
+            or failure.get('stdout_sha256') != digest_file(root / 'turn-1/stdout.jsonl')
+            or failure.get('stderr_sha256') != digest_file(root / 'turn-1/stderr.log')):
+        raise ValueError('original command or captured output changed')
+    auth = completion.get('auth_generation')
+    if not isinstance(auth, str) or not re.fullmatch(r'[a-f0-9]{64}', auth) or auth != digest_file(Path(profile['auth_file'])):
+        raise ValueError('original authentication digest unavailable or changed')
+    quiescence = completion.get('worker_quiescence', {})
+    if completion.get('exit_code') != 0 or quiescence.get('remaining_workers') != 0 or quiescence.get('quiet_scans', 0) < 2:
+        raise ValueError('original launch did not finish cleanly')
+    transport = inference_receipt(completion, digest_file(root / 'turn-1/launch.json'))
+    observation = observations(root / 'turn-1/stdout.jsonl')
+    generation = completion.get('generation', '')
+    if not re.fullmatch(r'generation-[a-f0-9]{32}', generation) or not (root / 'native-session' / generation).is_dir():
+        raise ValueError('original exported generation unavailable')
+    return dict(observation, host_inference=transport, original_auth_sha256=auth,
+        original_summary_sha256=digest_file(root / 'summary.json'),
+        original_completion_sha256=digest_file(root / 'native-session/complete.json'))
+
+
+def resume_existing(root, policy_path, policy, profile, executable, startup_seconds):
+    root = root.absolute()
+    first = validate_existing(root, policy_path, policy, profile, executable)
+    private_write(root / 'recovered-turn-1.json', first)
+    # Durable single-dispatch intent: an interrupted second turn requires
+    # reconciliation, never another blind paid call from this helper.
+    private_write(root / 'recovery-intent.json', {'version': 1, 'phase': 'resume_existing_export',
+        'recovered_first_sha256': digest_file(root / 'recovered-turn-1.json')})
+    try:
+        second = launch_turn(root, policy, profile, executable, 2, first['native_session'], startup_seconds)
+        if digest_file(Path(profile['auth_file'])) != first['original_auth_sha256']:
+            raise ValueError('authentication changed during recovered proof')
+        if digest_file(root / 'summary.json') != first['original_summary_sha256']:
+            raise ValueError('original failure summary changed')
+        result = {'version': 1, 'status': 'passed', 'turns': 2, 'resume_proven': True,
+            'new_model_turns': 1, 'auth_source_unchanged': True,
+            'first_recovery_sha256': digest_file(root / 'recovered-turn-1.json'),
+            'second_receipt_sha256': digest_file(root / 'turn-2/receipt.json'),
+            'scope': 'recovered provider transport only; no shipping authority'}
+    except BaseException as error:
+        private_write(root / 'recovery-summary.json', {'version': 1, 'status': 'failed',
+            'category': type(error).__name__, 'original_failure_preserved': True})
+        raise
+    private_write(root / 'recovery-summary.json', result)
+    print(json.dumps(result, sort_keys=True), flush=True)
+    return 0
+
+
 def validate_profile(profile):
     pass
 
@@ -243,6 +323,7 @@ def main():
     parser.add_argument('--execute', action='store_true', required=True)
     parser.add_argument('--policy', type=Path, required=True)
     parser.add_argument('--executable', type=Path, required=True)
+    parser.add_argument('--resume-existing-proof', type=Path, help='validate prior completed first turn and dispatch only its second turn')
     parser.add_argument('--resume', action='store_true', help='verify a second real native turn in the same isolated conversation')
     parser.add_argument('--output', type=Path, help='new private retained evidence directory')
     parser.add_argument('--startup-seconds', type=int, default=60)
@@ -262,6 +343,10 @@ def main():
     metadata = executable.stat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in (0, os.getuid()) or metadata.st_mode & 0o022:
         raise ValueError('native executable is not trusted')
+    if args.resume_existing_proof is not None:
+        if args.output is not None or args.resume or args.diagnose_route:
+            raise ValueError('existing-proof recovery cannot combine with fresh output/resume/route diagnostics')
+        return resume_existing(args.resume_existing_proof, args.policy, policy, profile, executable, args.startup_seconds)
     root = (args.output or Path(policy['state_root']) / (PROVIDER + '-transport-probe-' + uuid.uuid4().hex)).absolute()
     root.mkdir(mode=0o700)
     private_write(root / 'probe.json', {'version': 1, 'kind': f'authenticated_{PROVIDER}_vm_transport_only',

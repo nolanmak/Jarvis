@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec=importlib.util.spec_from_file_location('codex_probe',Path(__file__).with_name('native-provider-codex-auth-probe.py'))
 probe=importlib.util.module_from_spec(spec);spec.loader.exec_module(probe)
@@ -68,6 +69,52 @@ class ProbeTests(unittest.TestCase):
         self.assertIn('features.shell_tool=false',first)
         self.assertIn('mcp_servers={}',first)
         self.assertEqual(first[-1],'-')
+
+    def recovery_fixture(self, directory):
+        root=Path(directory);turn=root/'turn-1';turn.mkdir(mode=0o700)
+        session=root/'native-session';session.mkdir(mode=0o700)
+        generation='generation-'+'a'*32;(session/generation).mkdir(mode=0o700)
+        executable=root/'native';executable.write_bytes(b'trusted fixture executable')
+        auth=root/'auth.json';probe.private_write(auth,{'fixture':True})
+        profile={'auth_file':str(auth),'auth_relative':'.codex/auth.json','gateway':{},'refresh_auth':False,'environment':[]}
+        policy={'runtime_config':'fixture-runtime','guest_runtime':'fixture-guest','memory_mb':512,'providers':{'codex':profile}}
+        policy_path=root/'policy.json';probe.private_write(policy_path,policy)
+        probe.private_write(root/'probe.json',{'kind':'authenticated_codex_vm_transport_only','policy_sha256':probe.digest_file(policy_path),'executable':str(executable),'model':probe.MODEL,'auth_source_read_only':True})
+        probe.private_write(root/'summary.json',{'status':'failed','auth_source_unchanged':True,'category':'AttributeError'})
+        launch={'provider':'codex','runtime_config':policy['runtime_config'],'guest_runtime':policy['guest_runtime'],'memory_mb':512,'session_directory':str(session),'resume':False,'executable':str(executable),'argv':probe.native_argv(),'environment':{'LANG':'C.UTF-8'},'auth_file':str(auth),'auth_relative':profile['auth_relative'],'refresh_auth':False,'gateway':{},'mcp_argv':None,'assets':[]}
+        probe.private_write(turn/'launch.json',launch)
+        probe.private_write(turn/'command.json',{'native_argv':launch['argv'],'model':probe.MODEL,'executable_sha256':probe.digest_file(executable),'prompt':probe.PROMPT,'prompt_sha256':probe.hashlib.sha256(probe.PROMPT.encode()).hexdigest()})
+        self.records(turn);(turn/'stderr.log').write_text('')
+        probe.private_write(turn/'failure.json',{'stdout_sha256':probe.digest_file(turn/'stdout.jsonl'),'stderr_sha256':probe.digest_file(turn/'stderr.log')})
+        completion={'exit_code':0,'generation':generation,'auth_generation':probe.digest_file(auth),'worker_quiescence':{'remaining_workers':0,'quiet_scans':2},'launch_sha256':probe.digest_file(turn/'launch.json'),'gateway_transport':{'version':1,'overflow':False,'exchanges':[{'route_sha256':'a'*64,'transport':'http','inference':'responses','method':'POST','status':200,'authenticated_request':True,'remote_tls':True,'successful':True,'request_bytes':1,'response_bytes':1,'completed':True}]}}
+        probe.private_write(session/'complete.json',completion)
+        return root,policy_path,policy,profile,executable
+
+    def test_existing_proof_validates_original_auth_and_never_rebills_first_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args=self.recovery_fixture(directory);root=args[0]
+            old_summary=(root/'summary.json').read_bytes()
+            self.assertEqual(probe.validate_existing(*args)['native_session'],'actual-fixture-session')
+            calls=[]
+            def dispatch(root,policy,profile,executable,iteration,session,budget):
+                calls.append((iteration,session));(root/'turn-2').mkdir(mode=0o700)
+                probe.private_write(root/'turn-2/receipt.json',{'fixture':True})
+                return {'native_session':session}
+            with patch.object(probe,'launch_turn',side_effect=dispatch):
+                self.assertEqual(probe.resume_existing(*args,60),0)
+                with self.assertRaises(ValueError):probe.resume_existing(*args,60)
+            self.assertEqual(calls,[(2,'actual-fixture-session')])
+            self.assertEqual((root/'summary.json').read_bytes(),old_summary)
+        for changed in ('missing_digest','changed_auth','changed_output','wrong_launch'):
+            with tempfile.TemporaryDirectory() as directory:
+                args=self.recovery_fixture(directory);root=args[0]
+                path=root/'native-session/complete.json';completion=probe.private_json(path)
+                if changed=='missing_digest':completion.pop('auth_generation')
+                if changed=='changed_auth':Path(args[3]['auth_file']).write_text('{}')
+                if changed=='changed_output':(root/'turn-1/stdout.jsonl').write_text('{}')
+                if changed=='wrong_launch':completion['launch_sha256']='wrong'
+                path.write_text(json.dumps(completion))
+                with self.assertRaises(ValueError):probe.validate_existing(*args)
 
     def test_evidence_is_private_and_immutable(self):
         with tempfile.TemporaryDirectory() as temporary:
