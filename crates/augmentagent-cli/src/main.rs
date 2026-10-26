@@ -6659,6 +6659,31 @@ fn read_optional_body(
     }
 }
 
+/// #1579 — drop any line of a Gmail body that repeats internal prompt
+/// context (the #1060 notes hint, the wiki-hint preamble, a boundary tag).
+/// A body with no text left refuses the write — whether the scrub took it all
+/// or the body was blank to begin with, there is no message to send. The
+/// notice names the markers only: their text can carry the owner's own note
+/// titles, which is the material this guard exists to contain.
+fn body_without_internal_context(body: String) -> Result<String> {
+    let scrub = augmentagent_channel_core::outbound_scrub::scrub_internal_context(&body);
+    if !scrub.is_clean() {
+        eprintln!(
+            "note: dropped {} line(s) echoing internal context ({}) from the body (#1579)",
+            scrub.dropped_lines,
+            scrub.marker_summary()
+        );
+    }
+    if scrub.is_empty() {
+        let tail = if scrub.is_clean() { "" } else { " once its internal context was dropped" };
+        anyhow::bail!("the body has no message text to send{tail}");
+    }
+    if scrub.is_clean() {
+        return Ok(body);
+    }
+    Ok(scrub.body)
+}
+
 /// CLI adapter for [`body_without_leaked_subject`]: a body-level `Subject:`
 /// naming something other than `--subject` is a usage error, and one that
 /// merely repeats `--subject` is dropped with a note. `inbound` is the
@@ -6676,7 +6701,7 @@ fn body_for_gmail_write(body: String, subject: &str, inbound: Option<&str>) -> R
             if receipt {
                 eprintln!("note: checked and dropped the \"register:\" receipt line from the body (#994)");
             }
-            Ok(clean)
+            body_without_internal_context(clean)
         }
         Err(e) => anyhow::bail!("{e}; pass the intended subject as --subject"),
     }
@@ -11898,9 +11923,10 @@ mod approval_body_tests {
 
     use super::strip_register_receipt;
     use super::{
-        body_without_leaked_subject, compose_card_identity, compose_pending_disposition,
-        revise_recipient, revise_subject, revised_subject, strip_approval_envelope_markers,
-        strip_leading_subject_line, subjects_agree, thread_for_revised_subject,
+        body_for_gmail_write, body_without_leaked_subject, compose_card_identity,
+        compose_pending_disposition, revise_recipient, revise_subject, revised_subject,
+        strip_approval_envelope_markers, strip_leading_subject_line,
+        subjects_agree, thread_for_revised_subject,
         thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
     };
 
@@ -12195,6 +12221,74 @@ mod approval_body_tests {
         assert!(
             body_without_leaked_subject("Subject: Hosting a PTE event\n", "Hosting a PTE event")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_body_echoing_the_notes_hint_loses_that_line_before_any_gmail_write() {
+        let hint = augmentagent_channel_core::prompt::notes_hint(&["Venue shortlist".into()]);
+        let clean = body_for_gmail_write(
+            format!("Hey Casey,\n\nThursday works.\n{hint}\n"),
+            "Re: Thursday's venue",
+            None,
+        )
+        .expect("the prose survives");
+        assert_eq!(clean, "Hey Casey,\n\nThursday works.\n");
+        assert!(!clean.contains("Venue shortlist"));
+    }
+
+    #[test]
+    fn a_body_that_is_nothing_but_internal_context_is_refused() {
+        let hint = augmentagent_channel_core::prompt::notes_hint(&["Venue shortlist".into()]);
+        let err = body_for_gmail_write(format!("{hint}\n"), "Re: Thursday's venue", None)
+            .expect_err("no message is left to send");
+        assert!(err.to_string().contains("internal context was dropped"), "{err}");
+        assert!(!err.to_string().contains("Venue shortlist"), "the refusal must not quote the dropped text: {err}");
+    }
+
+    #[test]
+    fn a_clean_body_passes_the_internal_context_gate_byte_identical() {
+        let body = "Hey Casey,\r\n\r\nThursday works.\r\n".to_string();
+        assert_eq!(
+            body_for_gmail_write(body.clone(), "Re: Thursday's venue", None).unwrap(),
+            body
+        );
+    }
+
+    /// #1579 discipline: the inventory of every Gmail draft write this binary
+    /// makes, each with the gate its enclosing fn reaches before writing. The
+    /// count assertion is what keeps the list exhaustive — a write path added
+    /// later fails here until it is gated and listed. The needles are built
+    /// with `concat!` so these literals are not themselves matched.
+    #[test]
+    fn internal_context_is_scrubbed_on_every_gmail_write_path() {
+        let src = include_str!("main.rs");
+        let reader_start = src.find("fn body_for_gmail_write(").expect("reader");
+        let reader = &src[reader_start..reader_start + src[reader_start..].find("\n}\n").expect("fn end")];
+        assert!(
+            reader.contains("body_without_internal_context("),
+            "body_for_gmail_write must carry the #1579 gate for its callers"
+        );
+
+        let create = concat!(".create_draft", "_with_attachment(");
+        let update = concat!(".update_draft", "_with_attachment(");
+        let paths = [
+            ("async fn run_gmail_compose(", "body_for_gmail_write("),
+            ("async fn run_gmail_update_draft(", "body_for_gmail_write("),
+            ("async fn run_gmail_send_now(", "body_for_gmail_write("),
+            (concat!("async fn ", "run_revise("), "scrub_internal_context(&redraft)"),
+        ];
+        for (f, gate) in paths {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let gate_at = body.find(gate).unwrap_or_else(|| panic!("{f}: no #1579 gate"));
+            let write = body.find(create).or_else(|| body.find(update)).expect("draft write");
+            assert!(gate_at < write, "{f}: the scrub must precede the draft write");
+        }
+        assert_eq!(
+            src.matches(create).count() + src.matches(update).count(),
+            paths.len(),
+            "a Gmail draft write path was added: gate it for #1579 and list it here"
         );
     }
 
@@ -14715,6 +14809,44 @@ impl ReplyApprover {
                     message: format!("redraft carries its own subject line: {message}"),
                 };
             }
+        };
+        // #1579 — the redraft runs the same prompt as the first draft, so it
+        // can echo the internal context that prompt carries. Scrub before
+        // anything persists or sends it; a redraft with no text left — all
+        // context, or blank to begin with — goes to Error like the dispatch
+        // path's, rather than sitting on a card the owner could still approve.
+        let redraft = {
+            let scrub = augmentagent_channel_core::outbound_scrub::scrub_internal_context(&redraft);
+            if !scrub.is_clean() {
+                tracing::warn!(
+                    action_id,
+                    markers = %scrub.marker_summary(),
+                    dropped_lines = scrub.dropped_lines,
+                    "revise: redraft echoed internal prompt context; dropped those lines"
+                );
+            }
+            if scrub.is_empty() {
+                let message = "redraft had no sendable text";
+                // The row must not stay pending with a body the owner could
+                // still approve, so a failed status write is surfaced rather
+                // than swallowed: the outcome then says the action is still
+                // sitting there, which is the only honest report.
+                if let Err(e) = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(message),
+                ) {
+                    tracing::error!(action_id, "revise: could not fail the action: {e:#}");
+                    return ApprovalActionOutcome::Failed {
+                        message: format!("{message}, and it is still pending: {e}"),
+                    };
+                }
+                return ApprovalActionOutcome::Failed {
+                    message: message.into(),
+                };
+            }
+            scrub.body
         };
         let split = |v: &Option<String>| -> Vec<String> {
             v.as_deref()
