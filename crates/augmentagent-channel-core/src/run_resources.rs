@@ -53,6 +53,31 @@ mod composition_tests {
         assert!(composed_memory(1024,4096,gib,Some(4*gib)).is_err());
         assert_eq!(composed_memory(1024,4096,gib,Some(6*gib)).unwrap(),6*gib);
     }
+    #[test]
+    fn insufficient_build_envelope_records_unpaid_durable_capacity() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let directory=tempfile::tempdir().unwrap();
+        for name in ["logs","anchors"] {
+            let path=directory.path().join(name); std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(directory.path().join("logs/audit.jsonl"),
+            directory.path().join("anchors/audit.json"),&[]).unwrap());
+        let callbacks=Arc::new(AtomicUsize::new(0)); let count=callbacks.clone();
+        logger.set_resource_capacity_observer(Arc::new(move |observation| {
+            assert_eq!(observation["phase"],"build_vm_memory_composition");
+            count.fetch_add(1,Ordering::SeqCst); Ok(())
+        })).unwrap();
+        let gib=1024*1024*1024;
+        let policy=composed_memory(4096,0,gib,Some(4*gib)).map(|memory|serde_json::json!({"memory_bytes":memory}));
+        let error=build_policy_or_defer(policy,Some(&logger)).unwrap_err();
+        assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),Some(crate::reasoner::ReasonerError::ResourceCapacity{..})));
+        assert_eq!(callbacks.load(Ordering::SeqCst),1);
+        assert!(logger.resource_capacity_seen());
+        logger.protected_health().unwrap();
+    }
+
 }
 
 /// Required workflow enrollment cannot be disabled by omitting service env.
@@ -228,13 +253,23 @@ pub fn spawn_command(
     Ok((child, CommandGuard(guard)))
 }
 
+fn build_policy_or_defer(policy: Result<serde_json::Value>, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> Result<serde_json::Value> {
+    match policy {
+        Ok(policy) => Ok(policy),
+        Err(_) => {
+            admission_failed("verification", logger, "build_vm_memory_composition")?;
+            unreachable!()
+        }
+    }
+}
+
 /// CI VM adapter launch retaining the actual build and target flock descriptions
 /// through the supervisor. No environment-only parent proof grants inheritance.
 pub fn spawn_command_with_storage(command: &tokio::process::Command,
     logger: Option<&Arc<crate::tool_audit::AuditLogger>>, files: &[std::fs::File], build_memory_mb: u64)
     -> Result<(tokio::process::Child, CommandGuard)> {
     check_requirement("verification", logger)?;
-    let policy = composed_native_policy(build_memory_mb, 0)?;
+    let policy = build_policy_or_defer(composed_native_policy(build_memory_mb, 0), logger)?;
     let (child, guard) = crate::process_tree::spawn_admitted_storage(command,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         logger.is_some_and(|logger| logger.run_resources_required()), files, &policy)?;
