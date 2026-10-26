@@ -930,6 +930,30 @@
       "status": "initial_turn_revalidated_after_parser_fix;resume_pending",
       "evidence_directory": "/tmp/autoship-native-codex-auth-dfunmr6x/claude-inference-proof1",
       "scope": "Actual host-observed authenticated TLS Messages exchange, native Opus4.8 observed, exact reply and completed quiescent export. Original probe failed parsing UI event string; existing evidence revalidated with corrected parser without rerunning inference. Does not yet prove session continuation or full workflow."
+    },
+    "claude_transport_resume_a10f3cf2": {
+      "status": "passed",
+      "turns": 2,
+      "new_model_turns_for_recovery": 1,
+      "evidence_directory": "/tmp/autoship-native-codex-auth-dfunmr6x/claude-inference-proof1",
+      "log": "/tmp/autoship-1598-claude-inference-proof1-resume.log",
+      "recovery_summary": {
+        "auth_source_unchanged": true,
+        "first_recovery_sha256": "040a927a821c6d96703d55ca4bb8d186a2a0edef3e0a0b96ea633f7c043771a0",
+        "new_model_turns": 1,
+        "resume_proven": true,
+        "scope": "recovered provider transport only; no shipping authority",
+        "second_receipt_sha256": "d1c5760d9d803c1b6559894c26669ba3aaab4372b7fe56224993fa990302ee2a",
+        "status": "passed",
+        "turns": 2,
+        "version": 1
+      },
+      "scope": "Actual Claude Opus4.8 native output, authenticated TLS Messages host receipts, same native session continuation, quiescent export and original source auth unchanged. Original parser failure retained; first completed turn revalidated without rebilling. Not full guarded MCP/shipping proof."
+    },
+    "workflow_665676a8": {
+      "passed": 33,
+      "log": "/tmp/autoship-1598-665676a8-workflow-tests.log",
+      "scope": "Fresh CLI compiled resource helper and durable workflow tests before merge of main892cdf7c."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -997,6 +1021,11 @@
       "severity": "P1",
       "gap": "First admission reads child memory accounting before enabling delegated controllers, refusing every run in a fresh service subtree",
       "status": "fixed_167dde92; actual_delegated_probe_red_then_green; rebuilt_core_helper_and_actual_kernel_recovery_passed"
+    },
+    {
+      "severity": "P1",
+      "gap": "Required native Rust launcher omitted build-dependency-proxy.py from embedded helper inventory, failing readiness before any model call",
+      "status": "actual_native_adjudicator_failed_cfxxoirc; isolated_packaged_import_reproduction_confirmed; fix_in_progress"
     }
   ],
   "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
