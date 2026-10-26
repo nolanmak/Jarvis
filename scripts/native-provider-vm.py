@@ -452,6 +452,14 @@ def main(spec_path):
         bridge = None
         gateway = None
         channel_socket = socket.socket(socket.AF_UNIX)
+        phase = 'channel_startup'
+        frame_counts = {}
+        admitted = False
+        exported = 0
+        received = set()
+        active_export = None
+        quiescence = None
+        exit_code = None
         try:
             deadline = time.monotonic() + 30
             while True:
@@ -499,8 +507,11 @@ def main(spec_path):
             exit_code = None
             active_export = None
             quiescence = None
+            phase = 'receive_frames'
             for frame in channel.receive():
                 kind = frame['type']
+                safe_kind = kind if kind in ('ready', 'stdout', 'stderr', 'mcp_input', 'worker_quiescent', 'runtime_start', 'runtime_data', 'runtime_end', 'completion_failure', 'guest_fatal', 'exit') else 'gateway' if kind.startswith('gateway_') else 'unknown'
+                frame_counts[safe_kind] = frame_counts.get(safe_kind, 0) + 1
                 if kind == 'ready' and not admitted:
                     ready = os.environ.get('JARVIS_NATIVE_VM_READY')
                     proceed = os.environ.get('JARVIS_NATIVE_VM_CONTINUE')
@@ -571,6 +582,12 @@ def main(spec_path):
                     os.fsync(stream.fileno())
                     stream.close()
                     active_export = None
+                elif kind == 'guest_fatal':
+                    reason = frame.get('reason')
+                    if reason not in ('stdin_write_failed', 'mcp_write_failed', 'oversized_or_truncated_frame', 'stdin_submit_failed', 'mcp_submit_failed', 'unknown_frame', 'controller_eof', 'receive_exception'):
+                        raise ValueError('invalid guest fatal diagnostic')
+                    print(json.dumps({'native_guest_fatal': reason}), file=sys.stderr, flush=True)
+                    raise RuntimeError('guest failed before completion')
                 elif kind == 'completion_failure':
                     if frame.get('phase') not in ('quiescence', 'output_drain', 'runtime_export', 'exit_receipt') or frame.get('category') not in ('ValueError', 'RuntimeError', 'OSError', 'PermissionError', 'FileNotFoundError', 'BoundaryFailure'):
                         raise ValueError('invalid completion diagnostic')
@@ -590,9 +607,11 @@ def main(spec_path):
                     raise ValueError('unknown native guest frame')
             if exit_code is None or active_export is not None or not admitted or quiescence is None:
                 raise RuntimeError('native VM disconnected without completion')
+            phase = 'qemu_shutdown'
             process.wait(timeout=10)
             if process.returncode:
                 raise RuntimeError('native VM shutdown failed')
+            phase = 'publish_generation'
             generation = 'generation-' + uuid.uuid4().hex
             os.replace(staging, state / generation)
             refresh_auth(spec, state / generation, original_auth, credential_lock)
@@ -611,6 +630,10 @@ def main(spec_path):
                 print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
             return exit_code
         except Exception:
+            print(json.dumps({'native_host_failure_state': {'phase': phase, 'frames': frame_counts,
+                'admitted': admitted, 'quiescent': quiescence is not None, 'export_bytes': exported,
+                'export_files': len(received), 'partial_export': active_export is not None,
+                'guest_exit_code': exit_code, 'qemu_exit_code': process.poll()}}), file=sys.stderr, flush=True)
             if gateway is not None:
                 # Retained observation is diagnostic only: no generation publication,
                 # complete.json, or successful launch authority follows this path.

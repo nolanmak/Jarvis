@@ -247,8 +247,15 @@ def main():
     started = threading.Event()
     child_ready = threading.Event()
     child = []
-    def failed_stream():
-        os._exit(126)
+    def fatal(reason):
+        try:
+            send({'type': 'guest_fatal', 'reason': reason})
+        finally:
+            os._exit(126)
+    def failed_stdin():
+        fatal('stdin_write_failed')
+    def failed_mcp():
+        fatal('mcp_write_failed')
     def stdin_write(data):
         if not child_ready.wait(60):
             raise RuntimeError('native child unavailable')
@@ -258,7 +265,7 @@ def main():
         if not child_ready.wait(60):
             raise RuntimeError('native child unavailable')
         child[0].stdin.close()
-    stdin_writer = BoundedWriter(stdin_write, stdin_finish, failed_stream)
+    stdin_writer = BoundedWriter(stdin_write, stdin_finish, failed_stdin)
     def mcp_write(data):
         if not relay_ready.wait(30):
             raise RuntimeError('native tool relay unavailable')
@@ -267,12 +274,12 @@ def main():
         if not relay_ready.wait(30):
             raise RuntimeError('native tool relay unavailable')
         relay_connection[0].shutdown(socket.SHUT_WR)
-    mcp_writer = BoundedWriter(mcp_write, mcp_finish, failed_stream) if job['mcp'] else None
-    def receive():
+    mcp_writer = BoundedWriter(mcp_write, mcp_finish, failed_mcp) if job['mcp'] else None
+    def receive_inner():
         with os.fdopen(fd, 'rb') as stream:
             for raw in iter(lambda: stream.readline(MAX_FRAME + 1), b''):
                 if len(raw) > MAX_FRAME or not raw.endswith(b'\n'):
-                    os._exit(126)
+                    fatal('oversized_or_truncated_frame')
                 frame = json.loads(raw)
                 kind = frame['type']
                 if kind == 'start' and not started.is_set():
@@ -283,15 +290,20 @@ def main():
                     try:
                         stdin_writer.submit(base64.b64decode(frame['data'], validate=True) if kind == 'stdin' else None)
                     except Exception:
-                        os._exit(126)
+                        fatal('stdin_submit_failed')
                 elif kind in ('mcp_output', 'mcp_end') and job['mcp']:
                     try:
                         mcp_writer.submit(base64.b64decode(frame['data'], validate=True) if kind == 'mcp_output' else None)
                     except Exception:
-                        os._exit(126)
+                        fatal('mcp_submit_failed')
                 else:
-                    os._exit(126)
-        os._exit(126)
+                    fatal('unknown_frame')
+        fatal('controller_eof')
+    def receive():
+        try:
+            receive_inner()
+        except BaseException:
+            fatal('receive_exception')
     threading.Thread(target=receive, daemon=True).start()
     send({'type': 'ready'})
     if not started.wait(60):
