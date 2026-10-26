@@ -736,6 +736,23 @@
       "run": "https://github.com/nolanmak/Jarvis/actions/runs/40346922286",
       "conclusion": "success",
       "scope": "Rust job green. Bridge suite failed strict TLS certificate validation; fixed at fbf1d59b and local gateway suite passed. Later changes require fresh CI."
+    },
+    "hosted_bridge_1bfbc7c1": {
+      "revision": "1bfbc7c1",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40352785569",
+      "conclusion": "success",
+      "scope": "Bridge suite green after strict TLS correction; Rust validation remains separate."
+    },
+    "runtime_retirement_review": {
+      "revision": "8d50b960",
+      "reviewer": "independent review agent",
+      "conclusion": "LGTM",
+      "scope": "Durable terminal/recovery intent, exact owner generation, bounded reconciliation, active-lock pruning protection, terminal model admission. Does not substitute for pending Rust regressions."
+    },
+    "real_qemu_storage_fd": {
+      "revision": "85a9ae90",
+      "conclusion": "pass",
+      "scope": "Synthetic actual configured QEMU q35/TCG64MiB no NIC paused. Inherited FD3 retained flock after bridge FD closure and supervisor death; lock released after QEMU killed/reaped. No authenticated provider inference; probe subtree/files cleaned."
     }
   },
   "remaining_cross_cutting_acceptance": [
