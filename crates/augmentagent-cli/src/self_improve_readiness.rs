@@ -75,15 +75,44 @@ pub(in crate::self_improve) fn summary()->Result<String> {
         let mut statement=conn.prepare("SELECT repository,issue,kind,evidence FROM issue_readiness_dependencies ORDER BY repository,issue LIMIT 25")?;
         let rows=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?;
         let mut out=String::from("Recorded readiness dependencies (rechecked against current issue/main before selection):\n");
-        for row in rows {let (repo,issue,kind,evidence)=row?;let detail=serde_json::from_str::<Assessment>(&evidence).ok().map(|a|a.slots.into_iter().filter_map(|(slot,value)|match value {Slot::ExternalDecision{question,..}=>Some(format!("{slot}: {question}")),_=>None}).collect::<Vec<_>>().join("; ")).unwrap_or_else(||"independently verified current-main satisfaction; reopens automatically when request/main changes".into());out.push_str(&format!("- {repo}#{issue}: {kind}: {}\n",truncate(&detail,1200)));}Ok(out)
+        for row in rows {let (repo,issue,kind,evidence)=row?;let detail=serde_json::from_str::<Assessment>(&evidence).ok().map(|a|a.slots.into_iter().filter_map(|(slot,value)|match value {Slot::ExternalDecision{question,..}=>Some(format!("{slot}: {question}")),_=>None}).collect::<Vec<_>>().join("; ")).unwrap_or_else(||"independently verified current-main satisfaction; reopens automatically when request/main changes".into());out.push_str(&format!("- {repo}#{issue}: {kind}: {}\n",truncate(&detail,1200)));}
+        let pr_table:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_readiness_dependencies')",[],|r|r.get(0))?;
+        if !pr_table {return Ok(out);}
+        let mut statement=conn.prepare("SELECT workflow,evidence FROM pr_readiness_dependencies ORDER BY workflow LIMIT 25")?;
+        let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?;
+        for row in rows {let (workflow,evidence)=row?;let assessment:Assessment=serde_json::from_str(&evidence)?;let questions=assessment.slots.into_iter().filter_map(|(slot,value)|match value{Slot::ExternalDecision{question,..}=>Some(format!("{slot}: {question}")),_=>None}).collect::<Vec<_>>().join("; ");out.push_str(&format!("- {workflow}: PR readiness: {}\n",truncate(&questions,1200)));}
+        Ok(out)
     })
 }
 
 pub(in crate::self_improve) async fn assess(root:&Path,issue:&Issue,workflow:&mut workflow::WorkflowGuard)->Result<Decision> {
+    assess_source(root,AcceptanceSource::Issue(issue.number),&issue.title,&issue.body,&request_hash(issue),workflow).await
+}
+fn pr_request_hash(pr:&adoption::AdoptedPr)->String {
+    amendment::digest(serde_json::to_string(&(AcceptanceSource::PullRequest(pr.pr),&pr.title,&pr.body,&pr.head,&pr.branch,&pr.base)).unwrap().as_bytes())
+}
+pub(in crate::self_improve) async fn assess_pr(root:&Path,pr:&adoption::AdoptedPr,workflow:&mut workflow::WorkflowGuard)->Result<Decision> {
+    ensure!(pr.source_issue.is_none() && workflow.id()==pr.workflow_id()?,"source-less readiness identity mismatch");
+    assess_source(root,AcceptanceSource::PullRequest(pr.pr),&pr.title,&pr.body,&pr_request_hash(pr),workflow).await
+}
+pub(in crate::self_improve) fn pr_dependency_base_at(path:&Path,pr:&adoption::AdoptedPr)->Result<Option<String>> {
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(path)? else{return Ok(None)};
+    store.query_connection(|conn| {
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_readiness_dependencies')",[],|r|r.get(0))?;
+        if !exists {return Ok(None);}
+        use rusqlite::OptionalExtension;
+        Ok(conn.query_row("SELECT base FROM pr_readiness_dependencies WHERE workflow=?1 AND request_hash=?2",rusqlite::params![pr.workflow_id()?,pr_request_hash(pr)],|r|r.get(0)).optional()?)
+    })
+}
+pub(in crate::self_improve) async fn pr_blocked(repo:&Path,path:&Path,pr:&adoption::AdoptedPr)->Result<bool> {
+    let Some(base)=pr_dependency_base_at(path,pr)? else{return Ok(false)};
+    Ok(workflow::remote_main_head(repo,&pr.repository).await?==base)
+}
+async fn assess_source(root:&Path,source:AcceptanceSource,title:&str,body:&str,hash:&str,workflow:&mut workflow::WorkflowGuard)->Result<Decision> {
     workflow.check_resource_policy()?;
     let base=actual_head(root).await?;
     let current_main=workflow::remote_main_head(root,workflow.repository()).await?;
-    let owner=format!("{}\n{}",issue.title,issue.body);
+    let owner=format!("{title}\n{body}");
     let prompt=format!("Assess codification readiness BEFORE producing a spec. For each fixed slot trigger, failure, surface, persistence, guards, rollout, resolve routine gaps from exact owner/repository evidence. A not-applicable slot still needs a grounded explanation. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON {{\"slots\":{{\"trigger\":{{\"status\":\"resolved\",\"decision\":\"...\",\"evidence\":[{{\"path\":null,\"quote\":\"exact owner text\"}}]}},...}}}}. External slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. All six slots mandatory. Owner request:\n{owner}");
     let raw=scope_authority::assess(root,workflow.repository(),workflow,&prompt).await?;
     let assessment=decode(&raw)?;
@@ -104,9 +133,13 @@ pub(in crate::self_improve) async fn assess(root:&Path,issue:&Issue,workflow:&mu
     }
     let gaps=validate(&assessment,&owner,&files)?;
     let evidence=serde_json::to_string(&assessment)?;
-    workflow.audit_logger().record_controller(serde_json::json!({"kind":"independent_readiness","base":base,"request_hash":request_hash(issue),"assessment":assessment}))?;
-    if gaps.is_empty() {workflow.set_readiness_dependency(issue.number,None)?;return Ok(Decision::Ready(evidence));}
-    workflow.set_readiness_dependency(issue.number,Some((&request_hash(issue),&current_main,"external_decision",&evidence)))?;
+    workflow.audit_logger().record_controller(serde_json::json!({"kind":"independent_readiness","base":base,"request_hash":hash,"source":source,"assessment":assessment}))?;
+    ensure!(workflow::remote_main_head(root,workflow.repository()).await?==current_main,"main changed during readiness assessment");
+    match source {
+        AcceptanceSource::Issue(number)=>workflow.set_readiness_dependency(number,if gaps.is_empty(){None}else{Some((hash,&current_main,"external_decision",&evidence))})?,
+        AcceptanceSource::PullRequest(number)=>workflow.set_pr_readiness_dependency(number,if gaps.is_empty(){None}else{Some((hash,&current_main,&evidence))})?,
+    }
+    if gaps.is_empty() {return Ok(Decision::Ready(evidence));}
     workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"material_external_decision_missing","await_request_or_main_change",0,&[evidence]).await?;
     Ok(Decision::Dependency(gaps.join("\n")))
 }
@@ -188,6 +221,37 @@ pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn adopted()->adoption::AdoptedPr {
+        adoption::AdoptedPr {repository:"owner/repo".into(),pr:970,source_issue:None,branch:"worktree/imported".into(),head:"candidate-a".into(),base:"main".into(),author:"owner".into(),title:"Expose status".into(),body:"Choose destination externally".into(),dependency:adoption::Dependency::Main}
+    }
+    #[test]
+    fn pr_dependency_is_fenced_read_only_and_released_by_actual_input_changes() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        let root=tempfile::Builder::new().prefix("pr-readiness-").tempdir_in("/tmp").unwrap();let path=root.path().join("workflow.db");
+        let pr=adopted();let id=pr.workflow_id().unwrap();
+        assert!(pr_dependency_base_at(&path,&pr).unwrap().is_none());assert!(!path.exists());
+        let binding=Binding{head:pr.head.clone(),contract:"pr-request".into(),evidence_hash:"source-evidence".into()};
+        let mut store=WorkflowStore::open(&path).unwrap();store.register(&id,&pr.branch,binding.clone(),1).unwrap();
+        let lease=store.claim(&id,"controller",2,100).unwrap().unwrap();
+        store.set_pr_readiness_dependency(&lease,&binding,&pr.repository,pr.pr,Some((&pr_request_hash(&pr),"main-a","grounded assessment")),3).unwrap();
+        let issue_id=crate::autoship_workflow::workflow_id(&pr.repository,pr.pr).unwrap();
+        assert!(store.snapshot(&issue_id).unwrap().is_none(),"no synthetic issue workflow");
+        drop(store);
+        let before=std::fs::read(&path).unwrap();
+        for _ in 0..2 {assert_eq!(pr_dependency_base_at(&path,&pr).unwrap().as_deref(),Some("main-a"));}
+        assert_eq!(before,std::fs::read(&path).unwrap(),"free reads cannot mutate dependency state");
+        for field in ["head","body","title","branch","base"] {
+            let mut changed=pr.clone();match field {"head"=>changed.head.push('b'),"body"=>changed.body.push_str(" via CLI"),"title"=>changed.title.push_str(" clarified"),"branch"=>changed.branch.push('2'),_=>changed.base="parent-branch".into()};
+            assert!(pr_dependency_base_at(&path,&changed).unwrap().is_none(),"{field} must reopen readiness");
+        }
+        assert_ne!(pr_dependency_base_at(&path,&pr).unwrap().as_deref(),Some("main-b"),"changed current main releases hold");
+        let mut store=WorkflowStore::open(&path).unwrap();let current=store.claim(&id,"new",103,100).unwrap().unwrap();
+        assert!(store.set_pr_readiness_dependency(&lease,&binding,&pr.repository,pr.pr,None,104).is_err());
+        assert!(store.set_pr_readiness_dependency(&current,&binding,&pr.repository,pr.pr+1,None,104).is_err());
+        store.set_pr_readiness_dependency(&current,&binding,&pr.repository,pr.pr,None,104).unwrap();
+        assert!(pr_dependency_base_at(&path,&pr).unwrap().is_none());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,0);
+    }
     fn issue()->Issue {Issue{number:970,title:"Expose status".into(),body:"Report current status".into(),author:"owner".into(),author_trusted:true,research_filed:false}}
     fn resolved()->Assessment {Assessment{slots:SLOTS.into_iter().map(|slot|(slot.into(),Slot::Resolved{decision:"Use existing CLI surface".into(),evidence:vec![Evidence{path:Some("src/main.rs".into()),quote:"fn status_cli()".into()}]})).collect()}}
     #[test]

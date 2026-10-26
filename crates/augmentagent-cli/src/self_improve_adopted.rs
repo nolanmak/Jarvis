@@ -163,6 +163,9 @@ async fn select_from_inventory(repo:&Path,candidates:Vec<adoption::AdoptedPr>,dr
         if !workflow_available(snapshot.as_ref(), now) {
             continue;
         }
+        if acceptance::readiness::pr_blocked(repo,state,&candidate).await? {
+            continue;
+        }
         if let Some(reason) = policy_hold::adjudicated_dependency_at(repo, &candidate, dry_run,state).await {
             info!(
                 pr = candidate.pr,
@@ -290,6 +293,11 @@ async fn execute(
     guard: &mut workflow::WorkflowGuard,
 ) -> Result<RunReport> {
     let source = AcceptanceSource::PullRequest(pr.pr);
+    let grounding=match acceptance::readiness::assess_pr(worktree,pr,guard).await? {
+        acceptance::readiness::Decision::Ready(evidence)=>evidence,
+        acceptance::readiness::Decision::Dependency(reason)=>return Ok(RunReport::held(format!("PR #{}: grounded external decision; re-evaluate on PR/main change: {}",pr.pr,truncate(&reason,1200)))),
+    };
+    let grounded_request=format!("{request}\nIndependent readiness evidence (grounding, not approval):\n{grounding}");
     let control = acceptance::control_directories(&pr.repository, guard.id())?.workflow_acceptance;
     let (ok, base, error) = run("git", &["merge-base", "origin/main", "HEAD"], worktree).await?;
     anyhow::ensure!(ok, "cannot resolve adopted acceptance baseline: {error}");
@@ -299,7 +307,7 @@ async fn execute(
         &control,
         source,
         base.trim(),
-        request,
+        &grounded_request,
         reasoner,
         &acceptance::worker_roots(worktree),
         &[],

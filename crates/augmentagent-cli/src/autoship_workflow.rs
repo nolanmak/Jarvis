@@ -209,6 +209,18 @@ impl WorkflowStore {
         tx.commit()?;Ok(())
     }
 
+    pub fn set_pr_readiness_dependency(&mut self,lease:&Lease,binding:&Binding,repository:&str,pr:u64,record:Option<(&str,&str,&str)>,now:i64)->Result<()> {
+        ensure!(lease.workflow==pr_workflow_id(repository,pr)?,"PR readiness requires its genuine PR workflow");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        if let Some((request_hash,base,evidence))=record {
+            ensure!(request_hash.len()==64 && !base.is_empty() && evidence.len()<=2*1024*1024,"invalid PR readiness dependency");
+            tx.execute("INSERT INTO pr_readiness_dependencies VALUES(?1,?2,?3,?4) ON CONFLICT(workflow) DO UPDATE SET request_hash=excluded.request_hash,base=excluded.base,evidence=excluded.evidence",params![lease.workflow,request_hash,base,evidence])?;
+        } else {tx.execute("DELETE FROM pr_readiness_dependencies WHERE workflow=?1",[&lease.workflow])?;}
+        event(&tx,&lease.workflow,lease.generation,"pr_readiness_dependency_changed",&serde_json::json!({"source":{"pull_request":pr},"blocked":record.is_some()}).to_string(),now)?;
+        tx.commit()?;Ok(())
+    }
+
     pub(crate) fn query_connection<T>(&self,query:impl FnOnce(&Connection)->Result<T>)->Result<T> { query(&self.conn) }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -254,6 +266,7 @@ impl WorkflowStore {
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS scope_stage_response(workflow TEXT NOT NULL REFERENCES workflow(id),key TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(workflow,key));
+            CREATE TABLE IF NOT EXISTS pr_readiness_dependencies(workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_hash TEXT NOT NULL,base TEXT NOT NULL,evidence TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
