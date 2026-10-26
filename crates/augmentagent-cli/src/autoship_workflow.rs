@@ -224,6 +224,12 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS bounded_attempt (
                 workflow TEXT NOT NULL REFERENCES workflow(id), purpose TEXT NOT NULL, binding TEXT NOT NULL,
                 attempts INTEGER NOT NULL, PRIMARY KEY(workflow, purpose, binding));
+            CREATE TABLE IF NOT EXISTS episode_state (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS episode_observation (
+                workflow TEXT NOT NULL REFERENCES workflow(id), receipt TEXT NOT NULL,
+                observation TEXT NOT NULL, decision TEXT NOT NULL,
+                PRIMARY KEY(workflow,receipt));
             CREATE TABLE IF NOT EXISTS workflow_event (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL REFERENCES workflow(id),
                 generation INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, at_ms INTEGER NOT NULL);
@@ -829,6 +835,28 @@ impl WorkflowStore {
         require_binding(&tx, lease, binding, now_ms)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Fenced, idempotent convergence accounting. Full observations remain in
+    /// the journal; only the bounded best-candidate controller state is folded.
+    pub fn observe_episode(&mut self, lease:&Lease, observation:&crate::autoship_episode::Observation, now_ms:i64) -> Result<crate::autoship_episode::Decision> {
+        use crate::autoship_episode::{Episode,Decision};
+        let raw=serde_json::to_string(observation)?;
+        ensure!(raw.len()<=32*1024, "episode observation exceeds bounded context");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,&observation.candidate.binding,now_ms)?;
+        let prior:Option<(String,String)>=tx.query_row("SELECT observation,decision FROM episode_observation WHERE workflow=?1 AND receipt=?2",params![lease.workflow,observation.receipt],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((old,decision))=prior {
+            ensure!(old==raw,"episode receipt cannot be rewritten");
+            return Ok(serde_json::from_str::<Decision>(&decision)?);
+        }
+        let state:Option<String>=tx.query_row("SELECT state FROM episode_state WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).optional()?;
+        let mut state:Episode=state.map(|raw|serde_json::from_str(&raw)).transpose()?.unwrap_or_default();
+        let decision=state.observe(observation)?;
+        tx.execute("INSERT INTO episode_state VALUES(?1,?2) ON CONFLICT(workflow) DO UPDATE SET state=excluded.state",params![lease.workflow,serde_json::to_string(&state)?])?;
+        tx.execute("INSERT INTO episode_observation VALUES(?1,?2,?3,?4)",params![lease.workflow,observation.receipt,raw,serde_json::to_string(&decision)?])?;
+        event(&tx,&lease.workflow,lease.generation,"episode_observed",&raw,now_ms)?;
+        tx.commit()?;Ok(decision)
     }
 
     pub fn events(&self, workflow: &str) -> Result<Vec<(i64, String, String, i64)>> {

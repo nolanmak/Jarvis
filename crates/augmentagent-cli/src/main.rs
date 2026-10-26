@@ -98,6 +98,7 @@ mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
 mod autoship_contract;
+mod autoship_episode;
 mod autoship_review;
 mod autoship_workflow;
 mod channel_router;
