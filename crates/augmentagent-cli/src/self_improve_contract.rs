@@ -56,7 +56,7 @@ pub(super) fn parse_proposal(raw: &str, issue: u64) -> Result<ContractProposal> 
         .split_once("```")
         .context("unterminated contract proposal")?
         .0;
-    let proposal: ContractProposal = serde_json::from_str(json)?;
+    let mut proposal: ContractProposal = serde_json::from_str(json)?;
     proposal.contract.validate()?;
     ensure!(proposal.contract.issue == issue, "contract issue mismatch");
     let pins: std::collections::BTreeSet<_> = proposal
@@ -76,6 +76,20 @@ pub(super) fn parse_proposal(raw: &str, issue: u64) -> Result<ContractProposal> 
         );
         ensure!(contents.len() <= 512 * 1024, "harness too large");
     }
+    for path in proposal.files.keys() {
+        if !proposal
+            .contract
+            .allowed_paths
+            .iter()
+            .any(|scope| scope.contains(path))
+        {
+            proposal
+                .contract
+                .allowed_paths
+                .push(crate::autoship_contract::PathScope::File(path.clone()));
+        }
+    }
+    proposal.contract.validate()?;
     Ok(proposal)
 }
 fn harness_path(path: &str) -> bool {
@@ -578,6 +592,13 @@ pub(super) async fn prepare_acceptance(
             "acceptance store is writable by worker"
         );
     }
+    let manifest = original_manifest(&control, issue)?;
+    let original_base = manifest
+        .as_ref()
+        .map(|m| m.original_base.as_str())
+        .unwrap_or(base)
+        .to_owned();
+    let base = original_base.as_str();
     let path = evidence_path(&control, issue, base)?;
     let prepared = if path.exists() {
         let file = std::fs::OpenOptions::new()
@@ -637,7 +658,17 @@ pub(super) async fn prepare_acceptance(
         std::fs::File::open(&control)?.sync_all()?;
         prepared
     };
-    // A changed base requires a new independently reproduced workflow contract.
+    let binding = WorkflowManifest::from_prepared(issue, &prepared);
+    if let Some(manifest) = manifest {
+        ensure!(
+            manifest == binding,
+            "workflow contract revision changed without bound adjudication"
+        );
+    } else {
+        write_manifest(&control, &binding)?;
+    }
+    // Main may have advanced; preserve the original reproduced base. Only a
+    // candidate that no longer descends from it needs explicit re-scoping.
     trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
     install_candidate_harness(candidate, &prepared)?;
     Ok(prepared)
@@ -755,6 +786,143 @@ mod workflow_tests {
         assert!(
             install_candidate_harness(root.path(), &prepared).is_err(),
             "restart must not repair away verifier tampering"
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowManifest {
+    version: u32,
+    issue: u64,
+    original_base: String,
+    contract_revision: u64,
+    contract_hash: String,
+}
+impl WorkflowManifest {
+    fn from_prepared(issue: u64, prepared: &PreparedAcceptance) -> Self {
+        Self {
+            version: 1,
+            issue,
+            original_base: prepared.baseline.registration.baseline_head().into(),
+            contract_revision: prepared.baseline.registration.contract().revision,
+            contract_hash: prepared.baseline.registration.contract_hash().into(),
+        }
+    }
+}
+fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0
+            && metadata.len() <= 4 * 1024 * 1024,
+        "workflow manifest is not private"
+    );
+    Ok(serde_json::from_reader(file)?)
+}
+fn original_manifest(control: &Path, issue: u64) -> Result<Option<WorkflowManifest>> {
+    let index = control.join(format!("issue-{issue}-workflow.json"));
+    if index.try_exists()? {
+        let manifest: WorkflowManifest = private_json(&index)?;
+        ensure!(
+            manifest.version == 1 && manifest.issue == issue,
+            "invalid acceptance workflow manifest"
+        );
+        evidence_path(control, issue, &manifest.original_base)?;
+        return Ok(Some(manifest));
+    }
+    // Recover the crash window between durable baseline and manifest creation.
+    // Never choose a newer baseline by timestamp or silently supersede evidence.
+    let prefix = format!("issue-{issue}-base-");
+    let mut recovered = None;
+    for entry in std::fs::read_dir(control)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".json") {
+            ensure!(recovered.is_none(), "multiple original baselines require bound adjudication; refusing automatic supersession");
+            let prepared: PreparedAcceptance = private_json(&entry.path())?;
+            ensure!(
+                prepared.baseline.registration.contract().issue == issue
+                    && prepared
+                        .baseline
+                        .registration
+                        .baseline_result(&prepared.baseline.receipts)?
+                        == BaselineResult::Reproduced,
+                "orphaned baseline evidence is invalid"
+            );
+            let manifest = WorkflowManifest::from_prepared(issue, &prepared);
+            ensure!(
+                evidence_path(control, issue, &manifest.original_base)? == entry.path(),
+                "baseline filename does not match evidence"
+            );
+            recovered = Some(manifest);
+        }
+    }
+    if let Some(manifest) = &recovered {
+        write_manifest(control, manifest)?;
+    }
+    Ok(recovered)
+}
+fn write_manifest(control: &Path, manifest: &WorkflowManifest) -> Result<()> {
+    use std::io::Write;
+    let path = control.join(format!("issue-{}-workflow.json", manifest.issue));
+    let mut file = tempfile::NamedTempFile::new_in(control)?;
+    file.write_all(&serde_json::to_vec(manifest)?)?;
+    file.as_file().sync_all()?;
+    file.persist_noclobber(path).map_err(|e| e.error)?;
+    std::fs::File::open(control)?.sync_all()?;
+    Ok(())
+}
+/// Map independently generated harness hunks to the criteria those pinned
+/// files verify. Implementation hunks still require an independent mapper.
+pub(super) fn harness_alignment(
+    prepared: &PreparedAcceptance,
+    hunks: &[crate::autoship_contract::ChangedHunk],
+) -> Vec<crate::autoship_contract::AlignmentMapping> {
+    let contract = prepared.baseline.registration.contract();
+    hunks.iter().filter(|hunk| prepared.proposal.files.contains_key(&hunk.path)).map(|hunk| {
+        let verifiers: std::collections::BTreeSet<_> = contract.verifiers.iter()
+            .filter(|verifier| verifier.pinned_files.contains(&hunk.path)).map(|verifier| &verifier.id).collect();
+        let criterion_ids = contract.criteria.iter().filter(|criterion| criterion.verifier_ids.iter()
+            .any(|id| verifiers.contains(id))).map(|criterion| criterion.id.clone()).collect();
+        crate::autoship_contract::AlignmentMapping { hunk_id: hunk.id.clone(), criterion_ids,
+            supporting_reason: Some("Independent pinned regression harness reproduces the original baseline failure".into()) }
+    }).collect()
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+    #[test]
+    fn original_base_and_revision_survive_updated_main_and_cannot_be_overwritten() {
+        let control = tempfile::tempdir().unwrap();
+        let original = WorkflowManifest {
+            version: 1,
+            issue: 42,
+            original_base: "a".repeat(40),
+            contract_revision: 1,
+            contract_hash: "pinned".into(),
+        };
+        write_manifest(control.path(), &original).unwrap();
+        let recovered = original_manifest(control.path(), 42).unwrap().unwrap();
+        assert_eq!(recovered, original);
+        let newer = WorkflowManifest {
+            original_base: "b".repeat(40),
+            contract_revision: 2,
+            ..original.clone()
+        };
+        assert!(write_manifest(control.path(), &newer).is_err());
+        assert_eq!(
+            original_manifest(control.path(), 42).unwrap().unwrap(),
+            original
         );
     }
 }
