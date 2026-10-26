@@ -477,6 +477,30 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_fixture_has_real_verifier_evidence_but_no_shipping_alignment() {
+        // The enclosing cargo-managed test owns the production build lease.
+        // Run this real verifier fixture with a separate registered storage
+        // namespace, never recursively acquiring that same production lease.
+        const CHILD: &str = "AUTOSHIP_CANARY_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = private_fixture();
+            let home = isolated.path().join("home");
+            let cache = isolated.path().join("cache");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::create_dir(&cache).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::review_canary::tests::diagnostic_fixture_has_real_verifier_evidence_but_no_shipping_alignment", "--nocapture"])
+                .env(CHILD, isolated.path()).env("HOME", &home)
+                .env("XDG_STATE_HOME", isolated.path().join("state"))
+                .env("CARGO_TARGET_DIR", cache.join("builder"))
+                .env("AUGMENTAGENT_GATE_TARGET_DIR", cache.join("gate"))
+                .env("AUGMENTAGENT_GATE_MIN_FREE_GB", "0")
+                .env("AUGMENTAGENT_BUILD_GROWTH_GB", "0")
+                .env_remove("AUGMENTAGENT_PRUNE_TARGET_DIRS")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(isolated.path().join("executed").exists(), "child test filter must execute the fixture");
+            return;
+        }
         let dir=private_fixture();
         let root=dir.path().join("candidate");
         let control=dir.path().join("control");
@@ -488,6 +512,7 @@ mod tests {
         assert!(shipping.to_string().contains("alignment"),"{shipping:#}");
         std::fs::write(&reference.artifact,b"changed evidence").unwrap();
         assert!(acceptance::assert_verifier_receipt_current(&root,&prepared,&reference).await.is_err());
+        std::fs::write(PathBuf::from(std::env::var_os(CHILD).unwrap()).join("executed"), b"ok").unwrap();
     }
 
     #[tokio::test]
