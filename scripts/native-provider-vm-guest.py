@@ -163,10 +163,18 @@ def export_home(send):
     for root, directories, files in os.walk('/home/worker', followlinks=False):
         for name in directories:
             if (Path(root) / name).is_symlink():
-                raise ValueError('runtime directory symlink')
+                error = ValueError('runtime directory symlink')
+                error.export_kind = 'directory_symlink'
+                error.export_area = 'codex_arg0' if str(Path(root) / name).startswith('/home/worker/.codex/tmp/arg0/') else 'other'
+                raise error
         for name in files:
             path = Path(root) / name
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError as error:
+                error.export_kind = 'symlink' if path.is_symlink() else 'open_failure'
+                error.export_area = 'codex_arg0' if str(path).startswith('/home/worker/.codex/tmp/arg0/') else 'other'
+                raise
             with os.fdopen(fd, 'rb') as stream:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -303,17 +311,38 @@ def main():
     for thread in threads:
         thread.start()
     code = process.wait()
-    # Quiesce the complete guest worker UID before privileged export. Reap
-    # adopted orphans and repeat the scan so concurrent forks cannot survive a
-    # one-time process snapshot or race directory traversal during export.
-    quiescence = quiesce_worker(uid)
-    send(dict(type='worker_quiescent', **quiescence))
-    for thread in threads:
-        thread.join(timeout=5)
-        if thread.is_alive():
-            raise RuntimeError('native output did not close')
-    export_home(send)
-    send({'type': 'exit', 'code': code if code >= 0 else 128 - code})
+    complete_worker(send, threads, uid, code)
+
+
+def complete_worker(send, threads, uid, code):
+    phase = 'quiescence'
+    try:
+        quiescence = quiesce_worker(uid)
+        send(dict(type='worker_quiescent', **quiescence))
+        phase = 'output_drain'
+        for thread in threads:
+            thread.join(timeout=5)
+            if thread.is_alive():
+                raise RuntimeError('native output did not close')
+        phase = 'runtime_export'
+        export_home(send)
+        phase = 'exit_receipt'
+        send({'type': 'exit', 'code': code if code >= 0 else 128 - code})
+    except Exception as error:
+        category = type(error).__name__
+        if category not in ('ValueError', 'RuntimeError', 'OSError', 'PermissionError', 'FileNotFoundError'):
+            category = 'BoundaryFailure'
+        diagnostic = {'type': 'completion_failure', 'phase': phase, 'category': category}
+        if isinstance(error, OSError) and isinstance(error.errno, int):
+            diagnostic['errno'] = error.errno
+        if getattr(error, 'export_kind', None) in ('symlink', 'directory_symlink', 'open_failure'):
+            diagnostic['export_kind'] = error.export_kind
+            diagnostic['export_area'] = error.export_area
+        try:
+            send(diagnostic)
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == '__main__':

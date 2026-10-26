@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 def load(name, filename):
@@ -22,6 +23,17 @@ GUEST = load('guest_native_io', 'native-provider-vm-guest.py')
 
 
 class NativeIoTests(unittest.TestCase):
+    def test_completion_failure_diagnostic_never_contains_exception_payload(self):
+        frames = []
+        with patch.object(GUEST, 'quiesce_worker', return_value={'remaining_workers': 0}), \
+             patch.object(GUEST, 'export_home', side_effect=OSError(40, 'private path and secret')):
+            with self.assertRaises(OSError):
+                GUEST.complete_worker(frames.append, [], 1000, 0)
+        self.assertEqual(frames[-1], {'type': 'completion_failure', 'phase': 'runtime_export',
+            'category': 'OSError', 'errno': 40})
+        self.assertNotIn('private', json.dumps(frames))
+        self.assertFalse(any(f['type'] == 'exit' for f in frames))
+
     def test_full_application_pipe_never_blocks_control_dispatcher(self):
         for module in (HOST, GUEST):
             with self.subTest(module=module.__name__):

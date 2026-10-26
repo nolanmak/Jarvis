@@ -571,6 +571,16 @@ def main(spec_path):
                     os.fsync(stream.fileno())
                     stream.close()
                     active_export = None
+                elif kind == 'completion_failure':
+                    if frame.get('phase') not in ('quiescence', 'output_drain', 'runtime_export', 'exit_receipt') or frame.get('category') not in ('ValueError', 'RuntimeError', 'OSError', 'PermissionError', 'FileNotFoundError', 'BoundaryFailure'):
+                        raise ValueError('invalid completion diagnostic')
+                    diagnostic = {'phase': frame['phase'], 'category': frame['category']}
+                    if type(frame.get('errno')) is int:
+                        diagnostic['errno'] = frame['errno']
+                    if frame.get('export_kind') in ('symlink', 'directory_symlink', 'open_failure') and frame.get('export_area') in ('codex_arg0', 'other'):
+                        diagnostic.update(export_kind=frame['export_kind'], export_area=frame['export_area'])
+                    print(json.dumps({'native_guest_completion_failure': diagnostic}), file=sys.stderr, flush=True)
+                    raise RuntimeError('guest completion failed')
                 elif kind == 'exit':
                     exit_code = frame['code']
                     if type(exit_code) is not int or not 0 <= exit_code <= 255:
@@ -601,6 +611,13 @@ def main(spec_path):
                 print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
             return exit_code
         except Exception:
+            if gateway is not None:
+                # Retained observation is diagnostic only: no generation publication,
+                # complete.json, or successful launch authority follows this path.
+                atomic(Path(spec_path).parent / 'failed-gateway-observation.json', json.dumps({
+                    'version': 1, 'diagnostic_only': True,
+                    'launch_sha256': hashlib.sha256(private_bytes(Path(spec_path), 2 * 1024 * 1024)).hexdigest(),
+                    'gateway_transport': gateway.transport_receipt()}).encode())
             if gateway is not None and (gateway.guest_failures or gateway.host_failures):
                 print(json.dumps({'native_gateway_failures': gateway.guest_failures, 'native_gateway_host_failures': gateway.host_failures}), file=sys.stderr, flush=True)
             raise

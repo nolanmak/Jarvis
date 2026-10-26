@@ -105,6 +105,8 @@ def observations(path, expected_session=None):
 
 
 def inference_receipt(completion, launch_sha256):
+    if completion.get('diagnostic_only') is True:
+        raise ValueError('failed-launch observation cannot attest completed transport')
     if completion.get('launch_sha256') != launch_sha256:
         raise ValueError('gateway observation belongs to another launch')
     receipt = completion.get('gateway_transport', {})

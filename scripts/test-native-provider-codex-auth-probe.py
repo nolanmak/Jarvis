@@ -48,6 +48,8 @@ class ProbeTests(unittest.TestCase):
              'authenticated_request':True,'remote_tls':True,'successful':True,'request_bytes':42,'response_bytes':99,'completed':True}
         def completion(value):return {'launch_sha256':'launch','gateway_transport':{'version':1,'overflow':False,'exchanges':[value]}}
         self.assertEqual(probe.inference_receipt(completion(row),'launch')['inference_exchanges'],1)
+        with self.assertRaises(ValueError):
+            probe.inference_receipt(dict(completion(row), diagnostic_only=True), 'launch')
         for change in ({'inference':None,'method':'GET'}, {'status':401}, {'request_bytes':0},
                        {'response_bytes':0}, {'authenticated_request':False}, {'remote_tls':False}, {'completed':False}):
             with self.assertRaises(ValueError):probe.inference_receipt(completion(dict(row,**change)),'launch')
