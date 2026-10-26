@@ -153,6 +153,7 @@ pub struct FallbackReasoner {
     mutation_providers: std::sync::Mutex<Vec<ProviderKind>>,
     review_history: std::sync::Mutex<ReviewLifecycle>,
     handoff_root: Option<std::path::PathBuf>,
+    workflow_audit: std::sync::Mutex<Option<std::sync::Arc<crate::tool_audit::AuditLogger>>>,
 }
 
 /// Why `kind` cannot serve calls on this box (binary absent, no resolvable
@@ -292,6 +293,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
         mutation_providers: std::sync::Mutex::new(Vec::new()),
+        workflow_audit: std::sync::Mutex::new(None),
         review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
         handoff_root: crate::handoff::system_root(),
     })
@@ -322,6 +324,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
         })
@@ -356,6 +359,7 @@ impl FallbackReasoner {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
         }
@@ -376,6 +380,7 @@ impl FallbackReasoner {
             latch,
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: None,
         }
@@ -536,6 +541,14 @@ impl FallbackReasoner {
             .join(", ")
     }
 
+    /// Harness-owned workflow sink overrides global preset logging without
+    /// changing which provider actually serves or is attributed to the call.
+    pub fn set_workflow_audit(&self, logger: std::sync::Arc<crate::tool_audit::AuditLogger>) -> anyhow::Result<()> {
+        logger.protected_health()?;
+        *self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))? = Some(logger);
+        Ok(())
+    }
+
     async fn dispatch(
         &self,
         opts: &ReasonerOpts,
@@ -543,6 +556,13 @@ impl FallbackReasoner {
         transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
+        let logger = self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone();
+        let mut effective_opts = opts.clone();
+        if let Some(logger) = &logger {
+            logger.drain_checked().await?;
+            effective_opts.audit_logger = Some(logger.clone());
+        }
+        let opts = &effective_opts;
         // Respect a caller-pinned routing snapshot (including native phone turns).
         // Unscoped dispatch still reloads configuration for the next request.
         let config = crate::model_router::current().map_err(|_| ReasonerError::Local {
@@ -555,9 +575,11 @@ impl FallbackReasoner {
         let config = crate::model_router::select_profile(config, selected)?;
         #[cfg(test)]
         let _ = AFTER_ROUTE_SELECTION.try_with(|hook| hook());
-        crate::model_selection::SELECTED_PROFILE.scope(selected,
+        let outcome = crate::model_selection::SELECTED_PROFILE.scope(selected,
             crate::model_router::SNAPSHOT.scope(config,
-                self.dispatch_snapshot(opts, user_message, transcript, revision_authors))).await
+                self.dispatch_snapshot(opts, user_message, transcript, revision_authors))).await;
+        if let Some(logger) = logger { logger.drain_checked().await?; }
+        outcome
     }
 
     async fn dispatch_snapshot(
@@ -1331,6 +1353,41 @@ mod tests {
 
     fn latch_in(dir: &tempfile::TempDir) -> CooldownLatch {
         CooldownLatch::at(dir.path().join("cooldowns.json"))
+    }
+
+    #[tokio::test]
+    async fn workflow_audit_overrides_presets_and_drains_actual_provider_writes() {
+        struct AuditedProvider;
+        #[async_trait]
+        impl Reasoner for AuditedProvider {
+            async fn call(&self, opts: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                let logger = opts.audit_logger.clone().expect("injected workflow audit");
+                let ticket = logger.begin_write()?;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let record = crate::tool_audit::build_audit_record(ProviderKind::Claude,
+                        "synthetic-time".into(), "actual-claude-session".into(), "Read".into(),
+                        serde_json::json!({"file_path":"synthetic.txt"}), "synthetic", false);
+                    logger.record(&record).await;
+                    ticket.complete();
+                });
+                Ok("completed".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::create_dir(dir.path().join("anchors")).unwrap();
+        let logger = Arc::new(crate::tool_audit::AuditLogger::protected(dir.path().join("logs/workflow.log"),
+            dir.path().join("anchors/workflow.json"), &[]).unwrap());
+        let fallback = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, Arc::new(AuditedProvider))], latch_in(&dir));
+        fallback.set_workflow_audit(logger.clone()).unwrap();
+        crate::model_router::native_reviewer_scope(ProviderKind::Claude,
+            fallback.call(&text_only_opts(), "synthetic")).await.unwrap();
+        let rows = std::fs::read_to_string(logger.path()).unwrap();
+        assert!(rows.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|row| row.get("provider").and_then(|v|v.as_str()) == Some("claude")
+                && row.get("session_id").and_then(|v|v.as_str()) == Some("actual-claude-session")));
+        logger.protected_health().unwrap();
     }
 
     #[tokio::test]

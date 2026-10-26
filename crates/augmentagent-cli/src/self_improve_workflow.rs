@@ -51,6 +51,49 @@ pub(super) struct WorkflowGuard {
     started: std::time::Instant,
     accounted_ms: Arc<AtomicU64>,
     released: bool,
+    audit: Arc<augmentagent_channel_core::AuditLogger>,
+}
+
+fn workflow_audit(
+    state: &Path,
+    id: &str,
+    worktree: Option<&Path>,
+) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    use std::os::unix::fs::PermissionsExt;
+    let root = state
+        .parent()
+        .context("workflow state has no parent")?
+        .join("autoship-audit");
+    for path in [&root, &root.join("logs"), &root.join("anchors")] {
+        std::fs::create_dir_all(path)?;
+        anyhow::ensure!(
+            !std::fs::symlink_metadata(path)?.file_type().is_symlink(),
+            "workflow audit directory is a symlink"
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut writes = Vec::new();
+    if let Some(worktree) = worktree {
+        writes.push(worktree.to_path_buf());
+    }
+    for cache in [
+        PathBuf::from(gate_target_dir()),
+        crate::build_storage::effective_target(worktree.unwrap_or(Path::new("."))),
+    ] {
+        if cache.exists() {
+            writes.push(cache);
+        }
+    }
+    // Native worker runtime directories are independently allocated outside
+    // protected control state; scope admission rejects overlapping roots.
+    let key = format!("{:x}", Sha256::digest(id.as_bytes()));
+    let logger = augmentagent_channel_core::AuditLogger::protected(
+        root.join("logs").join(format!("{key}.jsonl")),
+        root.join("anchors").join(format!("{key}.json")),
+        &writes,
+    )?;
+    logger.protected_health()?;
+    Ok(Arc::new(logger))
 }
 
 /// Free reconciliation shares the builder lease but never hashes the deploy
@@ -153,7 +196,9 @@ impl SweepGuard {
                 now,
             )?;
         }
+        let audit = workflow_audit(path, &id, None)?;
         let inner = WorkflowGuard {
+            audit,
             store: Arc::new(Mutex::new(store)),
             lease,
             repository: repository.into(),
@@ -167,6 +212,7 @@ impl SweepGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             released: false,
         };
+        inner.audit_event("sweep_claimed", serde_json::json!({}))?;
         inner.spawn_renewal();
         Ok(Some(Self { inner: Some(inner) }))
     }
@@ -311,7 +357,9 @@ impl WorkflowGuard {
                 now,
             )?;
         }
+        let audit = workflow_audit(state, &id, Some(start.worktree))?;
         let guard = Self {
+            audit,
             store: Arc::new(Mutex::new(store)),
             lease,
             repository: start.repository.into(),
@@ -325,6 +373,7 @@ impl WorkflowGuard {
             accounted_ms: Arc::new(AtomicU64::new(0)),
             released: false,
         };
+        guard.audit_event("workflow_claimed", serde_json::json!({}))?;
         guard.spawn_renewal();
         let _ = start.repo_root; // Kept explicit: caller owns repository/worktree provenance validation.
         Ok(Some(guard))
@@ -370,6 +419,22 @@ impl WorkflowGuard {
                 }
             }
         });
+    }
+
+    pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
+        self.audit.clone()
+    }
+    pub(super) fn bind_reasoner(&self, reasoner: &FallbackReasoner) -> Result<()> {
+        reasoner.set_workflow_audit(self.audit.clone())
+    }
+    pub(super) async fn audit_health(&self) -> Result<()> {
+        self.audit.drain_checked().await
+    }
+    fn audit_event(&self, kind: &str, details: serde_json::Value) -> Result<()> {
+        self.audit.record_controller(serde_json::json!({
+            "actor": "controller", "workflow": self.lease.workflow, "generation": self.lease.generation,
+            "kind": kind, "binding": self.binding, "details": details, "at_ms": millis(),
+        }))
     }
 
     pub(super) fn repository(&self) -> &str {
@@ -432,6 +497,7 @@ impl WorkflowGuard {
         evidence: &[String],
     ) -> Result<()> {
         self.healthy_lease()?;
+        self.audit_health().await?;
         let binding =
             git_binding(&self.worktree, &self.contract, &self.environment, evidence).await?;
         let now = millis();
@@ -461,6 +527,10 @@ impl WorkflowGuard {
             now,
         )?;
         self.binding = binding;
+        self.audit_event(
+            "stage_checkpoint",
+            serde_json::json!({"stage":stage,"reason":reason,"next_action":action}),
+        )?;
         Ok(())
     }
 
@@ -468,6 +538,7 @@ impl WorkflowGuard {
     /// exact expected SHA; this local check cannot fence an in-flight RPC.
     pub(super) fn validate_before_side_effect(&self) -> Result<()> {
         self.healthy_lease()?;
+        self.audit.protected_health()?;
         self.store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
@@ -476,10 +547,16 @@ impl WorkflowGuard {
 
     pub(super) fn intent(&self, kind: OperationKind) -> Result<Operation> {
         self.validate_before_side_effect()?;
-        self.store
+        let operation = self
+            .store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
-            .begin_operation(&self.lease, kind, &self.binding, millis())
+            .begin_operation(&self.lease, kind, &self.binding, millis())?;
+        self.audit_event(
+            "operation_intent",
+            serde_json::json!({"operation_id":operation.id,"operation_kind":kind}),
+        )?;
+        Ok(operation)
     }
 
     /// Pending intents mean remote outcome unknown, never "safe to repeat".
@@ -511,7 +588,12 @@ impl WorkflowGuard {
         if let Some(pr) = pr {
             store.attach_pr_in_repo(&self.lease, &self.repository, pr, now)?;
         }
-        store.complete_operation(&self.lease, &operation.id, receipt, now)
+        store.complete_operation(&self.lease, &operation.id, receipt, now)?;
+        self.audit_event(
+            "remote_observed",
+            serde_json::json!({"operation_id":operation.id,
+            "receipt_sha256":format!("{:x}", Sha256::digest(receipt.as_bytes())), "pr":pr}),
+        )
     }
 
     pub(super) fn record_review(
@@ -533,7 +615,12 @@ impl WorkflowGuard {
                     evidence: receipt.into(),
                 },
                 millis(),
-            )
+            )?;
+        self.audit_event(
+            "review_recorded",
+            serde_json::json!({"decision_id":decision_id,"approved":approved,
+            "receipt_sha256":format!("{:x}", Sha256::digest(receipt.as_bytes()))}),
+        )
     }
 
     pub(super) fn admit_attempt(&self, purpose: &str, limit: u32) -> Result<bool> {
@@ -691,6 +778,8 @@ impl WorkflowGuard {
     /// Caller has waited for worker teardown. Stage/evidence must already be
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
+        self.audit.protected_health()?;
+        self.audit_event("workflow_released", serde_json::json!({}))?;
         self.heartbeat.cancel();
         self.healthy_lease()?;
         let mut store = self
@@ -989,6 +1078,57 @@ mod tests {
                 .contract
         );
     }
+    #[tokio::test]
+    async fn controller_audit_is_anchored_and_lost_rows_block_publication() {
+        let dir = repo();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let mut guard = WorkflowGuard::acquire_at(
+            &path,
+            Start {
+                repo_root: dir.path(),
+                worktree: dir.path(),
+                repository: "owner/repo",
+                source_issue: Some(7),
+                pr: None,
+                branch: "fix/seven",
+                contract: "C1",
+                environment: "rust-a",
+            },
+            millis(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        guard
+            .transition(Stage::Review, "candidate_verified", "review", 0)
+            .await
+            .unwrap();
+        let log = guard.audit_logger().path().to_path_buf();
+        let records = std::fs::read_to_string(&log).unwrap();
+        assert!(records
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|row| row["actor"] == "controller"
+                && row["kind"] == "stage_checkpoint"
+                && row.get("provider").is_none()));
+        std::fs::write(&log, "").unwrap();
+        assert!(guard.intent(OperationKind::Push).is_err());
+        assert!(guard.record_review("LGTM", true, "approval").is_err());
+        assert!(
+            workflow_audit(&path, guard.id(), Some(dir.path())).is_err(),
+            "restart cannot clear audit failure"
+        );
+    }
+
+    #[test]
+    fn audit_storage_cannot_be_inside_worker_source_root() {
+        let worktree = tempfile::tempdir().unwrap();
+        let state = worktree.path().join("state/workflow.db");
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+        assert!(workflow_audit(&state, "owner/repo#7", Some(worktree.path())).is_err());
+    }
+
     #[tokio::test]
     async fn sweep_excludes_active_builder_releases_and_fences_lost_lease() {
         let dir = repo();

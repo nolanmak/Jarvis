@@ -6622,6 +6622,7 @@ async fn resume_draft_pr(
     }).await? else {
         return Ok(RunReport::held(format!("PR #{pr}: durable workflow is leased or deferred")));
     };
+    workflow.bind_reasoner(reasoner.as_ref())?;
     let acceptance_control = acceptance::control_directory(&repository)?;
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
@@ -8055,6 +8056,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }).await? else {
         return Ok(RunReport::held(format!("issue #{}: workflow leased by another worker", issue.number)));
     };
+    workflow_guard.bind_reasoner(reasoner.as_ref())?;
     let acceptance_control = acceptance::control_directory(&repository)?;
     let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
     let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
