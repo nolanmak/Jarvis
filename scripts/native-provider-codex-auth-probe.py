@@ -19,6 +19,9 @@ import sys
 import time
 import uuid
 
+PROVIDER = 'codex'
+INFERENCE_KIND = 'responses'
+ALLOW_WEBSOCKET = True
 MODEL = 'gpt-5.6-terra'
 TOKEN = 'AUTOSHIP_VM_OK'
 PROMPT = 'Reply with exactly AUTOSHIP_VM_OK. Do not use tools, read files, or perform any other action.'
@@ -118,12 +121,12 @@ def inference_receipt(completion, launch_sha256):
     proven = []
     for exchange in exchanges:
         websocket = exchange.get('transport') == 'websocket'
-        if (exchange.get('inference') == 'responses' and exchange.get('authenticated_request') is True
+        if (exchange.get('inference') == INFERENCE_KIND and exchange.get('authenticated_request') is True
                 and exchange.get('remote_tls') is True and exchange.get('successful') is True
                 and type(exchange.get('request_bytes')) is int and exchange['request_bytes'] > 0
                 and type(exchange.get('response_bytes')) is int and exchange['response_bytes'] > 0
                 and isinstance(exchange.get('route_sha256'), str) and re.fullmatch(r'[a-f0-9]{64}', exchange['route_sha256'])
-                and (websocket and exchange.get('method') == 'GET' and exchange.get('status') == 101
+                and (ALLOW_WEBSOCKET and websocket and exchange.get('method') == 'GET' and exchange.get('status') == 101
                      or not websocket and exchange.get('transport') == 'http' and exchange.get('method') == 'POST'
                      and type(exchange.get('status')) is int and 200 <= exchange['status'] < 300 and exchange.get('completed') is True)):
             proven.append(exchange)
@@ -153,7 +156,7 @@ def launch_turn(root, policy, profile, executable, iteration, session_id, startu
     if iteration == 1:
         session.mkdir(mode=0o700)
     argv = native_argv(session_id)
-    spec = {'version': 1, 'provider': 'codex', 'runtime_config': policy['runtime_config'],
+    spec = {'version': 1, 'provider': PROVIDER, 'runtime_config': policy['runtime_config'],
             'guest_runtime': policy['guest_runtime'], 'memory_mb': policy['memory_mb'],
             'session_directory': str(session), 'resume': session_id is not None,
             'executable': str(executable), 'argv': argv, 'environment': {'LANG': 'C.UTF-8'},
@@ -231,6 +234,10 @@ def launch_turn(root, policy, profile, executable, iteration, session_id, startu
         os.close(stdout_fd);os.close(stderr_fd)
 
 
+def validate_profile(profile):
+    pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--execute', action='store_true', required=True)
@@ -244,9 +251,10 @@ def main():
     if not 10 <= args.startup_seconds <= 180:
         raise ValueError('startup budget out of range')
     policy = private_json(args.policy)
-    profile = policy['providers']['codex']
+    profile = policy['providers'][PROVIDER]
     if policy.get('version') != 1 or profile.get('refresh_auth') or profile.get('environment'):
         raise ValueError('probe requires explicit read-only file authentication, no refresh or environment secrets')
+    validate_profile(profile)
     auth = Path(profile['auth_file'])
     private_json(auth)  # validate ownership/shape; never persist credential values
     auth_before = digest_file(auth)
@@ -254,9 +262,9 @@ def main():
     metadata = executable.stat()
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in (0, os.getuid()) or metadata.st_mode & 0o022:
         raise ValueError('native executable is not trusted')
-    root = (args.output or Path(policy['state_root']) / ('codex-transport-probe-' + uuid.uuid4().hex)).absolute()
+    root = (args.output or Path(policy['state_root']) / (PROVIDER + '-transport-probe-' + uuid.uuid4().hex)).absolute()
     root.mkdir(mode=0o700)
-    private_write(root / 'probe.json', {'version': 1, 'kind': 'authenticated_codex_vm_transport_only',
+    private_write(root / 'probe.json', {'version': 1, 'kind': f'authenticated_{PROVIDER}_vm_transport_only',
         'policy_sha256': digest_file(args.policy), 'executable': str(executable), 'model': MODEL,
         'resume_requested': args.resume, 'auth_source_read_only': True,
         'not_proven': ['MCP tool execution', 'full Autoship pipeline', 'cross-conversation OAuth refresh', 'production rollout']})
