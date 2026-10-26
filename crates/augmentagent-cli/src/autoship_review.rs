@@ -402,7 +402,7 @@ pub async fn adjudicate_native(
     let reasoner = augmentagent_channel_core::build_pinned(provider)
         .context("native Codex adjudicator is not configured")?;
     adjudicate(
-        &reasoner,
+        reasoner.as_ref(),
         actor,
         builders,
         opts,
@@ -506,6 +506,26 @@ async fn adjudicate<R: Reasoner + ?Sized>(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewEvidence {
+    pub binding: ReviewBinding,
+    pub builders: Vec<Actor>,
+    pub passes: Vec<ReviewPass>,
+    pub adjudication: Option<AdjudicationReceipt>,
+}
+
+impl ReviewEvidence {
+    pub fn authority(&self) -> Result<MergeAuthority> {
+        review_authority(
+            &self.binding,
+            &self.builders,
+            &self.passes,
+            self.adjudication.as_ref(),
+        )
+    }
+}
+
 /// These are collected by deterministic code, never deserialized from model
 /// output. They must concern the same exact candidate as `binding`.
 #[derive(Debug, Clone)]
@@ -547,6 +567,19 @@ pub fn merge_authority(
             && mandatory.mergeable,
         "mandatory merge checks are not all satisfied"
     );
+    review_authority(binding, builders, passes, adjudication)
+}
+
+/// Review-only verdict. This never claims that CI, scope or authorization pass;
+/// production merge paths must additionally call `merge_authority` or their
+/// existing deterministic gates before publishing a merge operation.
+pub fn review_authority(
+    binding: &ReviewBinding,
+    builders: &[Actor],
+    passes: &[ReviewPass],
+    adjudication: Option<&AdjudicationReceipt>,
+) -> Result<MergeAuthority> {
+    binding.validate()?;
     for role in [ReviewRole::Qa, ReviewRole::Diff, ReviewRole::System] {
         ensure!(
             passes.iter().filter(|p| p.role == role).count() == 1,
