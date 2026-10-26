@@ -221,13 +221,59 @@ fn final_source_evidence(
     }
 }
 
-fn controller_verifier_dispute(findings:&[aligned::Finding],prepared:Option<&acceptance::PreparedAcceptance>)->bool {
-    let Some(prepared)=prepared else {return false;};
-    findings.iter().any(|finding| {
-        let text=format!("{}\n{}",finding.claim,finding.requested_change).to_ascii_lowercase();
-        prepared.proposal.files.keys().any(|path|text.contains(&path.to_ascii_lowercase()))
-            || ["controller oracle","registered oracle","pinned verifier","registered verifier","black_box oracle","black-box oracle"].iter().any(|phrase|text.contains(phrase))
-    })
+fn classify_repair_targets(findings:&mut [aligned::Finding],prepared:&acceptance::PreparedAcceptance)->Result<()> {
+    use aligned::RepairTarget;
+    let registered:BTreeSet<_>=prepared.proposal.contract.verifiers.iter().map(|v|v.id.clone()).collect();
+    for finding in findings {
+        match &finding.repair_target {
+            Some(RepairTarget::ControllerAcceptance{verifier_ids})=>anyhow::ensure!(verifier_ids.is_subset(&registered),"finding names an unknown registered verifier"),
+            Some(RepairTarget::Candidate{paths})=>{
+                let affected:BTreeSet<_>=prepared.proposal.contract.verifiers.iter().filter(|v|v.pinned_files.iter().any(|p|paths.contains(p))).map(|v|v.id.clone()).collect();
+                if !affected.is_empty() {finding.repair_target=Some(RepairTarget::ControllerAcceptance{verifier_ids:affected});}
+            }
+            None=>{}, // Historical unclassified findings go to final authority.
+        }
+    }
+    Ok(())
+}
+fn controller_verifier_dispute(findings:&[aligned::Finding],_prepared:Option<&acceptance::PreparedAcceptance>)->bool {
+    findings.iter().any(|f| !matches!(f.repair_target,Some(aligned::RepairTarget::Candidate{..})))
+}
+
+// Audit-backed recovery is independent of reviewer wording. An attempted native
+// Write/Edit of a pinned source cannot become another ordinary builder repair.
+async fn immutable_write_findings(root:&Path,guard:&workflow::WorkflowGuard,prepared:&acceptance::PreparedAcceptance)->Result<Vec<aligned::Finding>> {
+    guard.audit_health().await?;
+    let raw=std::fs::read_to_string(guard.audit_logger().path())?;
+    immutable_write_findings_from_audit(root,prepared,&raw)
+}
+fn immutable_write_findings_from_audit(root:&Path,prepared:&acceptance::PreparedAcceptance,raw:&str)->Result<Vec<aligned::Finding>> {
+    let mut attempts=BTreeMap::<String,BTreeSet<String>>::new();
+    for line in raw.lines() {
+        let record:serde_json::Value=serde_json::from_str(line)?;
+        let tool=record["tool"].as_str().unwrap_or("").rsplit("__").next().unwrap_or("");
+        if !matches!(tool,"Write"|"Edit") {continue;}
+        let Some(path)=record["args"]["file_path"].as_str() else {continue;};
+        let path=Path::new(path);
+        let path=if path.is_absolute(){match path.strip_prefix(root){Ok(p)=>p,Err(_)=>continue}}else{path};
+        if path.components().any(|p|!matches!(p,std::path::Component::Normal(_))) {continue;}
+        let Some(path)=path.to_str() else {continue;};
+        for verifier in &prepared.proposal.contract.verifiers {
+            if verifier.pinned_files.iter().any(|p|p==path) {attempts.entry(verifier.id.clone()).or_default().insert(aligned::digest(line.as_bytes()));}
+        }
+    }
+    let mut findings=Vec::new();
+    for (verifier,records) in attempts {
+        for criterion in &prepared.proposal.contract.criteria {
+            if !criterion.verifier_ids.contains(&verifier) {continue;}
+            let hash=aligned::digest(&serde_json::to_vec(&(prepared.baseline.registration.contract_hash(),&verifier,&records))?);
+            findings.push(aligned::Finding {id:format!("controller-write-{}-{}",criterion.id,&hash[..16]),criterion_id:criterion.id.clone(),evidence_hash:hash,
+                claim:format!("Protected tool audit records an attempted write/edit to immutable registered verifier {verifier}. This is an attempted operation, not proof the verifier is defective; inspect its source and oracle."),
+                requested_change:"Resolve whether the owner criterion requires independent contract amendment, or dismiss the unsupported verifier-edit request. Never send immutable source changes to the candidate builder.".into(),
+                conflicts_with:BTreeSet::new(),repair_rounds:0,repair_target:Some(aligned::RepairTarget::ControllerAcceptance{verifier_ids:BTreeSet::from([verifier.clone()])})});
+        }
+    }
+    Ok(findings)
 }
 
 pub(super) async fn diagnostic_call_bound(worktree:&Path, issue:&ReviewSubject<'_>, prepared:&acceptance::PreparedAcceptance)->Result<u64> {
@@ -503,8 +549,9 @@ async fn run_impl(
     };
     let rubric = review_calibration::active()?;
     let controller_context=context.acceptance_evidence.map(|(prepared,reference)|controller_acceptance_context(prepared,Some(reference))).transpose()?;
+    let guarded_attempts=if let (Some(guard),Some((prepared,_)))=(context.workflow,context.acceptance_evidence) {immutable_write_findings(&worktree,guard,prepared).await?}else{Vec::new()};
     let evidence_json = serde_json::to_string(
-        &serde_json::json!({"diff":diff,"files":files,"callers":callers,"rubric":rubric,"controller_acceptance":controller_context,"controller_sources":context.acceptance_evidence.map(|(prepared,_)|&prepared.proposal.files),"executable_acceptance":context.acceptance_evidence.map(|(_, receipt)| receipt)}),
+        &serde_json::json!({"diff":diff,"files":files,"callers":callers,"rubric":rubric,"controller_acceptance":controller_context,"guarded_immutable_write_attempts":guarded_attempts,"controller_sources":context.acceptance_evidence.map(|(prepared,_)|&prepared.proposal.files),"executable_acceptance":context.acceptance_evidence.map(|(_, receipt)| receipt)}),
     )?;
     let binding = aligned::ReviewBinding {
         head: head.clone(),
@@ -659,6 +706,7 @@ async fn run_impl(
                 if let Some(old)=finding_evidence.insert(path,body.clone()) { anyhow::ensure!(old==body,"finding source changed across review groups"); }
             }
             let mut shard_findings=group.findings;
+            if let Some((prepared,_))=context.acceptance_evidence {classify_repair_targets(&mut shard_findings,prepared)?;}
             let known: BTreeSet<_> = prior.iter().map(|f| f.id.as_str()).collect();
             let mut remap = BTreeMap::new();
             for finding in &shard_findings {
@@ -672,6 +720,7 @@ async fn run_impl(
                                 &finding.evidence_hash,
                                 &finding.claim,
                                 &finding.requested_change,
+                                &finding.repair_target,
                             ))?)[..20]
                         ),
                     );
@@ -736,7 +785,7 @@ async fn run_impl(
         id:format!("qa-{}", &aligned::digest(context.qa_notes.as_bytes())[..16]), criterion_id:"REGRESSION".into(),
         evidence_hash:aligned::digest(context.qa_notes.as_bytes()), claim:context.qa_notes.into(),
         requested_change:"Resolve the concrete QA findings against this shared contract, or adjudicate conflicting scope instructions.".into(),
-        conflicts_with:BTreeSet::new(), repair_rounds:context.repair_round,
+        conflicts_with:BTreeSet::new(), repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: context.repair_round,
     }]
     };
     if !qa_findings.is_empty() {
@@ -754,6 +803,9 @@ async fn run_impl(
             .expect("QA pass collected above")
             .findings
             .extend(qa_findings);
+    }
+    if !guarded_attempts.is_empty() {
+        passes.iter_mut().find(|pass|pass.role==aligned::ReviewRole::System).context("system review missing")?.findings.extend(guarded_attempts);
     }
     let unresolved = deduplicate_findings(
         passes
@@ -1078,6 +1130,14 @@ mod tests {
         let reference=acceptance::CandidateReceiptReference {schema_version:1,binding,artifact:artifact.clone(),artifact_sha256:aligned::digest(&bytes),receipt_ids:vec!["oracle".into()],alignment:None};
         let prepared=acceptance::PreparedAcceptance {proposal,baseline:acceptance::BaselineEvidence {registration,receipts:vec![red]}};
         let controller=controller_acceptance_context(&prepared,Some(&reference)).unwrap();
+        let attempt=serde_json::json!({"tool":"mcp__jarvis__Write","args":{"file_path":root.path().join(pin),"content":"private-never-report"},"stderr_truncated":"denied"}).to_string();
+        let recovered=immutable_write_findings_from_audit(root.path(),&prepared,&attempt).unwrap();
+        assert_eq!(recovered.len(),1);
+        assert!(controller_verifier_dispute(&recovered,Some(&prepared)));
+        assert!(!serde_json::to_string(&recovered).unwrap().contains("private-never-report"));
+        let ordinary=serde_json::json!({"tool":"Write","args":{"file_path":"arithmetic.py"}}).to_string();
+        assert!(immutable_write_findings_from_audit(root.path(),&prepared,&ordinary).unwrap().is_empty());
+
         // Non-streamed, unchanged pinned observer: the diff contains no source
         // and there are no streamed caller groups. Final authority's small
         // fast path must still receive actual bytes, not only pin digests.
@@ -1104,9 +1164,12 @@ mod tests {
             assert_eq!(value["controller_acceptance"],controller);
             assert!(request.prompt.len()+inputs.system_bytes<=aligned::MAX_PROMPT_BYTES);
         }
-        let mut finding=aligned::Finding {id:"F1".into(),criterion_id:"C1".into(),evidence_hash:"proof".into(),claim:"observer lacks child assertions".into(),requested_change:format!("add assertions to {pin}"),conflicts_with:BTreeSet::new(),repair_rounds:0};
+        let mut finding=aligned::Finding {id:"F1".into(),criterion_id:"C1".into(),evidence_hash:"proof".into(),claim:"observer lacks child assertions".into(),requested_change:format!("add assertions to {pin}"),conflicts_with:BTreeSet::new(),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 0};
+        finding.repair_target=Some(aligned::RepairTarget::Candidate{paths:BTreeSet::from([pin.into()])});
+        classify_repair_targets(std::slice::from_mut(&mut finding),&prepared).unwrap();
         assert!(controller_verifier_dispute(&[finding.clone()],Some(&prepared)),"controller disputes go to final authority on their first round");
         finding.claim="incorrect sum".into();finding.requested_change="fix arithmetic.py".into();
+        finding.repair_target=Some(aligned::RepairTarget::Candidate{paths:BTreeSet::from(["arithmetic.py".into()])});
         assert!(!controller_verifier_dispute(&[finding],Some(&prepared)));
         std::fs::write(&artifact,b"tampered").unwrap();
         assert!(controller_acceptance_context(&prepared,Some(&reference)).is_err());
@@ -1140,7 +1203,7 @@ mod tests {
             claim: "observable regression".into(),
             requested_change: "make fixture pass".into(),
             conflicts_with: BTreeSet::new(),
-            repair_rounds: 0,
+            repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 0,
         };
         assert_eq!(
             deduplicate_findings(vec![first.clone(), first.clone()])

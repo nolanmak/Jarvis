@@ -39,7 +39,7 @@ fn finding(id: &str) -> Finding {
         claim: "docs omit changed behavior".into(),
         requested_change: "update runtime documentation".into(),
         conflicts_with: BTreeSet::new(),
-        repair_rounds: 2,
+        repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 2,
     }
 }
 fn coverage() -> CoverageReceipt {
@@ -928,6 +928,28 @@ async fn newly_dangling_or_connected_edges_invalidate_prior_leaf_authority() {
     assert!(review_authority(&binding(),&builders(),&passes(vec![connected.clone(),other.clone()]),Some(&receipt)).is_err(),"new relationship needs combined final context even when source facts did not change");
     let renewed=dismissed(&[connected.clone(),other.clone()]).await;
     assert!(review_authority(&binding(),&builders(),&passes(vec![connected,other]),Some(&renewed)).is_ok());
+}
+
+#[test]
+fn typed_controller_repairs_cannot_be_upheld_as_builder_mutations() {
+    let mut f=finding("F");
+    let old=f.fingerprint().unwrap();
+    f.repair_target=Some(RepairTarget::ControllerAcceptance{verifier_ids:BTreeSet::from(["oracle".into()])});
+    assert_ne!(old,f.fingerprint().unwrap());
+    let raw=serde_json::json!({"binding":binding(),"rulings":{"F":{"decision":"uphold","evidence":"actual source","repair_criterion":"rewrite the observer"}}}).to_string();
+    assert!(validate_adjudicator_response(&raw,&binding(),&[f.clone()]).is_err());
+    let raw=serde_json::json!({"binding":binding(),"rulings":{"F":{"decision":"dismiss","evidence":"actual controller assertion","rationale":"observer only emits actual behavior"}}}).to_string();
+    assert!(validate_adjudicator_response(&raw,&binding(),&[f]).is_ok());
+}
+#[test]
+fn legacy_finding_decodes_without_becoming_a_typed_candidate_repair() {
+    let mut value=serde_json::to_value(finding("legacy")).unwrap();value.as_object_mut().unwrap().remove("repair_target");
+    let legacy:Finding=serde_json::from_value(value).unwrap();
+    assert!(legacy.repair_target.is_none());
+    let expected=digest(&serde_json::to_vec(&(&legacy.id,&legacy.criterion_id,&legacy.evidence_hash,&legacy.claim,&legacy.requested_change)).unwrap());
+    assert_eq!(legacy.fingerprint().unwrap(),expected,"durable historical receipt fingerprints remain readable");
+    let mut bad=finding("bad");bad.repair_target=Some(RepairTarget::Candidate{paths:BTreeSet::from(["../outside".into()])});
+    assert!(bad.validate().is_err());
 }
 
 #[tokio::test]

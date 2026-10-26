@@ -60,7 +60,7 @@ pub(super) fn synthetic_aligned_review(head: &str, dismiss: bool) -> Independent
         model: "synthetic".into(), session_id: session.into() };
     let finding = Finding { id: "F1".into(), criterion_id: "C1".into(), evidence_hash: "proof".into(),
         claim: "contradictory doc requirement".into(), requested_change: "align requirement".into(),
-        conflicts_with: BTreeSet::new(), repair_rounds: 2 };
+        conflicts_with: BTreeSet::new(), repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 2 };
     let passes = [ReviewRole::Qa, ReviewRole::Diff, ReviewRole::System].into_iter().enumerate().map(|(i, role)| ReviewPass {
             additional_sessions: vec![],
         binding: binding.clone(), actor: actor("codex", &format!("review-{i}")), role, completed: true,
