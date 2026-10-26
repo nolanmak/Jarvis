@@ -260,11 +260,13 @@ pub(super) async fn run_if_due() -> Result<()> {
     // Keep protected eventual observations without relabelling the case. A
     // manual merge, absence of a revert, or PR closure never becomes truth.
     let store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
-    let mut statement = conn.prepare("SELECT id,json_extract(body,'$.workflow') FROM cases")?;
-    let histories = statement
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
+    let histories = {
+        let mut statement = conn.prepare("SELECT id,json_extract(body,'$.workflow') FROM cases")?;
+        let rows = statement
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
     for (case_id, workflow_id) in histories {
         for (sequence, kind, body, _) in store.events(&workflow_id)? {
             if kind == "merge_mutation_accepted" || kind == "episode_observed" {
