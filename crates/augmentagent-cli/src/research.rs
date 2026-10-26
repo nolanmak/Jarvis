@@ -752,8 +752,11 @@ where F:FnMut(u32)->Fut, Fut:std::future::Future<Output=Result<serde_json::Value
             if !seen.insert(number) { continue; }
             let title=row["title"].as_str().context("research dedup issue title missing")?.to_owned();
             titles.push(title.clone());
-            if row["labels"].as_array().is_some_and(|labels|labels.iter().any(|label|label["name"]==RESEARCH_LABEL)) {
-                research.push(OpenIssue {number,title,body:row["body"].as_str().unwrap_or_default().into()});
+            let body=row["body"].as_str().unwrap_or_default();
+            let labelled=row["labels"].as_array().is_some_and(|labels|labels.iter().any(|label|label["name"]==RESEARCH_LABEL));
+            let historical=body.contains("Auto-filed by the daily `augmentagent research` pipeline.");
+            if labelled || historical {
+                research.push(OpenIssue {number,title,body:body.into()});
             }
         }
     }
@@ -892,6 +895,15 @@ mod dedup_tests {
         assert_eq!(inventory.research[5].body,"Mechanism details");
         assert!(super::collect_open_inventory(|_|async {Ok(serde_json::json!({"message":"rate limit"}))}).await.is_err());
         assert!(super::collect_open_inventory(|_|async {Err(anyhow::anyhow!("network failed"))}).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn historical_research_without_label_still_enters_semantic_inventory() {
+        let inventory=super::collect_open_inventory(|page|async move {Ok(if page==1 {
+            serde_json::json!([{"number":472,"title":"Preserve coverage","body":"Persist findings.\n_Auto-filed by the daily `augmentagent research` pipeline._","labels":[]}])
+        } else {serde_json::json!([])})}).await.unwrap();
+        assert_eq!(inventory.research.len(),1);
+        assert_eq!(inventory.research[0].number,472);
     }
 
     #[test]
