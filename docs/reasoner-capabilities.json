@@ -757,6 +757,19 @@
         "self_improve::review_calibration::tests::executable_oracles_cover_success_and_regression"
       ],
       "provider_conformance": "Deterministic promotion and executable oracle checks; live native replay remains required for rubric promotion."
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve_adjudication_windows.rs::select_inner",
+      "permission_profile": "text",
+      "output_contract": "Exact immutable source windows for final adjudication; verified offsets and explicit unlocated findings, never code-change or merge authority",
+      "model_tier": "preserved",
+      "tier_rationale": "Narrows pinned Codex review options to supplied evidence only; clears tools, extra directories, environment, settings and handoff history.",
+      "conformance": [
+        "self_improve::aligned_review::adjudication_windows::tests::unknown_sources_invented_findings_unsupplied_bytes_and_split_unicode_are_rejected",
+        "self_improve::aligned_review::adjudication_windows::tests::actual_serialized_prompt_and_result_limits_include_escaping_and_system",
+        "self_improve::aligned_review::adjudication_windows::tests::empty_cached_page_requires_distinct_targeted_coverage_recovery"
+      ],
+      "provider_conformance": "Deterministic source/offset/budget checks passed at3c876779; final native evidence-recovery acceptance remains required."
     }
   ]
 }
