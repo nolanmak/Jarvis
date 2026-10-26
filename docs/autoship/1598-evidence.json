@@ -331,7 +331,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "Managed CLI no-run last succeeded at3c876779. Retry64665 also terminated storage-busy; kernel lock inspection identifies daemon1181725 as disk-build.lock holder while child workspace tests actively progress. No final-head build/CI/deployment claim.",
+    "latest_rust_admission": "Managed CLI no-run last succeeded at3c876779. Retry69789 terminated storage-busy while daemon workspace tests continue. Checkpoint13ea9f26 pushed to draft1603 for hosted CI; current final-head build and native probes remain unproven.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -668,6 +668,14 @@
         "the_locking_recorder_is_the_codebases_only_writer_of_the_map: inventory omitted probe launcher removing inherited override"
       ],
       "followup": "f066c941 updates these assertions; rebuild and rerun required."
+    },
+    "native_provider_gateway": {
+      "revision": "a5e18251",
+      "passed": 9,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-provider-gateway-tests.log",
+      "command": "python3 scripts/test-native-provider-gateway.py",
+      "scope": "Local real HTTP/TLS, SSE and WebSocket transport plus route/redirect/framing/capacity denial. Not native provider auth/inference or VM wiring proof."
     }
   },
   "remaining_cross_cutting_acceptance": [
