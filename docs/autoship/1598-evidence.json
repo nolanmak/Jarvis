@@ -71,7 +71,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1426",
       "implementation_status": "partial",
       "evidence": [
-        "Structured review/adjudication integrated in fresh/resume; dissent preserved; protected attempt slots implemented; full replay/rubric operational acceptance pending"
+        "Structured final adjudication, immutable replay storage and rubric validation are implemented. Native contradiction test passed8f317dd6; representative PR1538 writer-inventory negative/repaired replay passed7591660b. Production calibration and rollout observations remain open."
       ]
     },
     {
@@ -80,7 +80,8 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1453",
       "implementation_status": "partial",
       "evidence": [
-        "Native tools routed through confined MCP bridge with literal write grants and private settings. Combined Python boundary/registry/bridge suite: 188 run, 10 skipped, no failures. Earlier native write/read-denial probes passed; latest live probe stopped on Claude quota before tools. Provider transport egress not hostname-restricted."
+        "Native tools routed through confined MCP bridge with literal write grants and private settings. Combined Python boundary/registry/bridge suite: 188 run, 10 skipped, no failures. Earlier native write/read-denial probes passed; latest live probe stopped on Claude quota before tools. Provider transport egress not hostname-restricted.",
+        "Native provider process host/read confinement remains unimplemented; concrete host capability probes and exit requirements recorded in docs/autoship/provider-transport-boundary.md. Tool isolation does not prove this broader guarantee."
       ]
     },
     {
@@ -507,6 +508,45 @@
       "log": "/tmp/autoship-1598-github-duplicate-create.json",
       "sha256": "6380e5a100ef5e1a670f8423a83bdf23bed3f349f10b1e56b36074800c938981",
       "note": "Actual GitHub refused a second OPEN PR for identical repository/head/base; this does not prove exactly-one HTTP or eliminate concurrent terminal-history visibility races."
+    },
+    "publication_dispatch_recovery": {
+      "revision": "7591660b",
+      "passed": 8,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-dispatch-recovery.log",
+      "ignored": 1
+    },
+    "publication_dispatch_store": {
+      "revision": "7591660b",
+      "passed": 26,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-dispatch-store.log"
+    },
+    "adopted_selector_recovery": {
+      "revision": "7591660b",
+      "passed": 6,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-selector-recovery.log"
+    },
+    "readiness_foundation": {
+      "revision": "7591660b",
+      "passed": 3,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-readiness-foundation.log"
+    },
+    "caller_budget_classification": {
+      "revision": "7591660b",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-caller-budget.log"
+    },
+    "native_historical_writer_inventory_replay": {
+      "revision": "7591660b",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-probe-7591660bwriter.log",
+      "sha256": "9df3261b7f041cf9841fbc042c3ea13498ee55bdedcb119177fef4b65e4df2e5",
+      "note": "Representative historical PR1538 case: real second writer loses unrelated record and native adjudicator upholds; repaired complete inventory plus observed preservation dismisses stale objection. Two distinct native sessions, no remote publication or invented reviewer LGTM."
     }
   },
   "remaining_cross_cutting_acceptance": [
