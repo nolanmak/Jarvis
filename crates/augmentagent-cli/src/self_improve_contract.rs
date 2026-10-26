@@ -930,3 +930,156 @@ mod manifest_tests {
         );
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CandidateReceiptReference {
+    pub schema_version: u32,
+    pub binding: crate::autoship_contract::EvidenceBinding,
+    pub artifact: PathBuf,
+    pub artifact_sha256: String,
+    pub receipt_ids: Vec<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateArtifact {
+    schema_version: u32,
+    binding: crate::autoship_contract::EvidenceBinding,
+    receipts: Vec<VerifierReceipt>,
+}
+/// Reruns pinned verifiers against the clean committed candidate before writing
+/// a content-addressed artifact. The ledger receives only hashes/references.
+pub(super) async fn verify_and_persist_candidate(
+    candidate: &Path,
+    prepared: &PreparedAcceptance,
+    protected_control: &Path,
+    writable_roots: &[PathBuf],
+) -> Result<CandidateReceiptReference> {
+    let receipts = verify_candidate(candidate, &prepared.baseline).await?;
+    let binding = prepared
+        .baseline
+        .registration
+        .binding(&actual_head(candidate).await?)?;
+    ensure!(
+        receipts.iter().all(|receipt| receipt.binding == binding),
+        "candidate moved before receipt persistence"
+    );
+    persist_candidate_artifact(
+        protected_control,
+        writable_roots,
+        CandidateArtifact {
+            schema_version: 1,
+            binding,
+            receipts,
+        },
+    )
+}
+fn persist_candidate_artifact(
+    control: &Path,
+    writable_roots: &[PathBuf],
+    artifact: CandidateArtifact,
+) -> Result<CandidateReceiptReference> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    std::fs::create_dir_all(control)?;
+    let control = control.canonicalize()?;
+    for root in writable_roots {
+        ensure!(
+            !control.starts_with(root.canonicalize()?),
+            "candidate evidence is writable by worker"
+        );
+    }
+    let bytes = serde_json::to_vec(&artifact)?;
+    let artifact_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let path = control.join(format!("candidate-{artifact_sha256}.json"));
+    let receipt_ids = artifact
+        .receipts
+        .iter()
+        .map(|receipt| {
+            Ok(format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(receipt)?)
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reference = CandidateReceiptReference {
+        schema_version: 1,
+        binding: artifact.binding.clone(),
+        artifact: path.clone(),
+        artifact_sha256,
+        receipt_ids,
+    };
+    ensure!(
+        serde_json::to_vec(&reference)?.len() <= 32 * 1024,
+        "candidate checkpoint exceeds compact evidence budget"
+    );
+    if path.try_exists()? {
+        let existing: CandidateArtifact = private_json(&path)?;
+        ensure!(
+            existing == artifact,
+            "content-addressed candidate artifact was altered"
+        );
+        return Ok(reference);
+    }
+    let mut staged = tempfile::NamedTempFile::new_in(&control)?;
+    staged.write_all(&bytes)?;
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(&path) {
+        Ok(_) => (),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: CandidateArtifact = private_json(&path)?;
+            ensure!(
+                existing == artifact,
+                "concurrent candidate artifact mismatch"
+            );
+        }
+        Err(error) => return Err(error.error.into()),
+    }
+    std::fs::File::open(&control)?.sync_all()?;
+    Ok(reference)
+}
+
+#[cfg(test)]
+mod receipt_reference_tests {
+    use super::*;
+    #[test]
+    fn compact_artifacts_are_immutable_and_outside_worker_scope() {
+        let control = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let binding = crate::autoship_contract::EvidenceBinding {
+            head: "a".repeat(40),
+            base: "b".repeat(40),
+            environment_id: "env".into(),
+            contract_hash: "contract".into(),
+        };
+        let artifact = CandidateArtifact {
+            schema_version: 1,
+            binding: binding.clone(),
+            receipts: vec![VerifierReceipt {
+                verifier_id: "test".into(),
+                binding,
+                result: crate::autoship_contract::CheckResult::Passed,
+                output_digest: "output".into(),
+            }],
+        };
+        let reference =
+            persist_candidate_artifact(control.path(), &[work.path().into()], artifact.clone())
+                .unwrap();
+        assert!(serde_json::to_vec(&reference).unwrap().len() < 32 * 1024);
+        assert_eq!(
+            reference,
+            persist_candidate_artifact(control.path(), &[work.path().into()], artifact.clone())
+                .unwrap()
+        );
+        let mut changed = artifact.clone();
+        changed.receipts[0].output_digest = "forged".into();
+        std::fs::write(&reference.artifact, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(persist_candidate_artifact(
+            control.path(),
+            &[work.path().into()],
+            artifact.clone()
+        )
+        .is_err());
+        assert!(persist_candidate_artifact(work.path(), &[work.path().into()], artifact).is_err());
+    }
+}

@@ -191,7 +191,10 @@ impl NativeScope {
             .arg(&self.script)
             .arg(&self.policy)
             .arg("--")
-            .arg(executable);
+            .arg(executable)
+            // Candidate-owned project/local settings and MCP configuration are
+            // control inputs, even though the containing source tree is writable.
+            .args(["--setting-sources", "", "--strict-mcp-config"]);
         command
     }
 
