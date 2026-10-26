@@ -112,6 +112,20 @@ pub(super) fn assert_current(
     );
     verify_permits(&failures, mappings, &exception.permits)
 }
+fn cache_key(
+    head: &str,
+    contract_hash: &str,
+    policy_hash: &str,
+    input_hash: &str,
+) -> Result<String> {
+    Ok(hash(&serde_json::to_vec(&(
+        head,
+        contract_hash,
+        policy_hash,
+        input_hash,
+    ))?))
+}
+
 pub(super) async fn resolve(
     builder: &FallbackReasoner,
     root: &Path,
@@ -129,11 +143,25 @@ pub(super) async fn resolve(
     }
     let contract_hash = prepared.baseline.registration.contract_hash();
     let input_hash = input_hash(evidence)?;
-    let epoch = hash(&serde_json::to_vec(&(
-        contract_hash,
-        policy_hash,
-        &input_hash,
-    ))?);
+    let epoch = cache_key(head, contract_hash, policy_hash, &input_hash)?;
+    let control =
+        acceptance::control_directories(workflow.repository(), workflow.id())?.workflow_acceptance;
+    std::fs::create_dir_all(&control)?;
+    let filename = format!("constraint-exception-{epoch}.json");
+    let cached = control.join(&filename);
+    if cached.exists() {
+        let exception: Exception = serde_json::from_slice(&private_bytes(&cached)?)?;
+        assert_current(
+            rules,
+            evidence,
+            mappings,
+            head,
+            contract_hash,
+            policy_hash,
+            Some(&exception),
+        )?;
+        return Ok(Some(exception));
+    }
     ensure!(
         workflow.admit_epoch_attempt("constraint-exception", &epoch, 2)?,
         "promoted_constraint_failed: unchanged conflict adjudication exhausted"
@@ -181,11 +209,32 @@ pub(super) async fn resolve(
         policy_hash,
         Some(&exception),
     )?;
+    store(&control, &filename, &serde_json::to_vec(&exception)?)?;
     Ok(Some(exception))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exception_cache_binding_changes_with_head_contract_policy_or_hunk_input() {
+        let first = cache_key("head-a", "contract-a", "policy-a", "input-a").unwrap();
+        assert_eq!(
+            first,
+            cache_key("head-a", "contract-a", "policy-a", "input-a").unwrap()
+        );
+        for values in [
+            ("head-b", "contract-a", "policy-a", "input-a"),
+            ("head-a", "contract-b", "policy-a", "input-a"),
+            ("head-a", "contract-a", "policy-b", "input-a"),
+            ("head-a", "contract-a", "policy-a", "input-b"),
+        ] {
+            assert_ne!(
+                first,
+                cache_key(values.0, values.1, values.2, values.3).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn exception_cannot_cover_another_hunk_or_criterion() {
         let failures = vec![("R1".into(), "hunk-1".into())];
