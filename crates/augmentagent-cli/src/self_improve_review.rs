@@ -221,12 +221,12 @@ fn final_source_evidence(
     }
 }
 
-fn classify_repair_targets(findings:&mut [aligned::Finding],prepared:&acceptance::PreparedAcceptance)->Result<()> {
+fn classify_repair_targets(findings:&mut Vec<aligned::Finding>,prepared:&acceptance::PreparedAcceptance)->Result<()> {
     use aligned::RepairTarget;
     let registered:BTreeSet<_>=prepared.proposal.contract.verifiers.iter().map(|v|v.id.clone()).collect();
-    for finding in findings {
+    for finding in findings.iter_mut() {
         match &finding.repair_target {
-            Some(RepairTarget::ControllerAcceptance{verifier_ids})=>anyhow::ensure!(verifier_ids.is_subset(&registered),"finding names an unknown registered verifier"),
+            Some(RepairTarget::ControllerAcceptance{verifier_ids})=>anyhow::ensure!(!verifier_ids.is_empty() && verifier_ids.is_subset(&registered),"finding names an unknown registered verifier"),
             Some(RepairTarget::Candidate{paths})=>{
                 let affected:BTreeSet<_>=prepared.proposal.contract.verifiers.iter().filter(|v|v.pinned_files.iter().any(|p|paths.contains(p))).map(|v|v.id.clone()).collect();
                 if !affected.is_empty() {finding.repair_target=Some(RepairTarget::ControllerAcceptance{verifier_ids:affected});}
@@ -234,6 +234,20 @@ fn classify_repair_targets(findings:&mut [aligned::Finding],prepared:&acceptance
             None=>{}, // Historical unclassified findings go to final authority.
         }
     }
+    let mut derived=Vec::new();
+    for finding in findings.iter_mut() {
+        if finding.criterion_id!="REGRESSION" {continue;}
+        let Some(RepairTarget::ControllerAcceptance{verifier_ids})=&finding.repair_target else {continue;};
+        let owners:Vec<_>=prepared.proposal.contract.criteria.iter().filter(|c|c.verifier_ids.iter().any(|id|verifier_ids.contains(id))).map(|c|c.id.clone()).collect();
+        anyhow::ensure!(!owners.is_empty(),"registered verifier has no owner criterion");
+        let original=finding.clone();
+        finding.criterion_id=owners[0].clone();
+        for owner in owners.iter().skip(1) {
+            let mut copy=original.clone();copy.id=format!("{}:owner:{owner}",original.id);copy.criterion_id=owner.clone();
+            copy.conflicts_with.insert(finding.id.clone());finding.conflicts_with.insert(copy.id.clone());derived.push(copy);
+        }
+    }
+    findings.extend(derived);
     Ok(())
 }
 fn controller_verifier_dispute(findings:&[aligned::Finding],_prepared:Option<&acceptance::PreparedAcceptance>)->bool {
@@ -1166,7 +1180,9 @@ mod tests {
         }
         let mut finding=aligned::Finding {id:"F1".into(),criterion_id:"C1".into(),evidence_hash:"proof".into(),claim:"observer lacks child assertions".into(),requested_change:format!("add assertions to {pin}"),conflicts_with:BTreeSet::new(),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::new() }), repair_rounds: 0};
         finding.repair_target=Some(aligned::RepairTarget::Candidate{paths:BTreeSet::from([pin.into()])});
-        classify_repair_targets(std::slice::from_mut(&mut finding),&prepared).unwrap();
+        finding.criterion_id="REGRESSION".into();
+        let mut classified=vec![finding];classify_repair_targets(&mut classified,&prepared).unwrap();
+        let mut finding=classified.pop().unwrap();assert_eq!(finding.criterion_id,"C1","controller defects map to their registered owner criterion, which final authority can amend");
         assert!(controller_verifier_dispute(&[finding.clone()],Some(&prepared)),"controller disputes go to final authority on their first round");
         finding.claim="incorrect sum".into();finding.requested_change="fix arithmetic.py".into();
         finding.repair_target=Some(aligned::RepairTarget::Candidate{paths:BTreeSet::from(["arithmetic.py".into()])});
