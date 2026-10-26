@@ -1024,6 +1024,10 @@ print(child.pid, flush=True)
             'git diff .git/synthetic-private-metadata /dev/null',
             'git diff -- .git/synthetic-private-metadata /dev/null',
             'git diff innocent.txt /dev/null',
+            f'git --git-dir={self.root / ".git"} diff --no-index .git/synthetic-private-metadata /dev/null',
+            f'git -C {self.root} diff --no-index .git/synthetic-private-metadata /dev/null',
+            'git show HEAD:.env',
+            'git difftool --extcmd=cat',
         ]:
             with self.assertRaises(bridge.Denied):
                 policy.run_command(command)
