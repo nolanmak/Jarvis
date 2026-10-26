@@ -30,7 +30,7 @@ host isolation for pathname UNIX sockets on ABI 8. The kernel adds that control
 in ABI 9; v3 uses syscall argument filtering instead. See the
 [kernel Landlock documentation](https://docs.kernel.org/userspace-api/landlock.html).
 
-## Ordered implementation
+## Runtime requirements shared by the launch designs
 
 1. Introduce a controller-owned native launch profile shared by both native
    entry points, enrolled by the protected workflow policy, including text-only
@@ -57,48 +57,100 @@ in ABI 9; v3 uses syscall argument filtering instead. See the
    channels where native CLI FD handling supports them; otherwise use a tightly
    scoped local endpoint that grants no general shell or control-plane access.
    No original credential-bearing policy file is readable by the native process.
-4. Install v3 read/execute grants for exact provider runtime, resolved binaries
-   and necessary libraries/system trust data. Enumerate them from a trusted
+4. For a host-process design, install v3 read/execute grants for exact provider
+   runtime, resolved binaries and necessary libraries/system trust data. The
+   preferred VM design instead exposes only declared guest files and devices. Enumerate them from a trusted
    deployment profile, never task/model text. Include no broad `/`, `/home`,
    `/proc`, `/run`, or original provider-config grant. Source reads and Git
-   operations flow through the broker. Deny new AF_UNIX sockets; isolate any
+   operations flow through the broker. In the host-process design deny new
+   AF_UNIX sockets; in the VM design never export host socket paths. Isolate any
    legitimate native IPC separately. A direct caller cannot set an env flag to
    disable a required profile.
-5. Provision the network boundary below, then execute every acceptance case
+5. Implement the preferred no-NIC VM boundary below, then execute every acceptance case
    before declaring the native transport isolated or enabling required dispatch.
 
-## Necessary privileged prerequisite
+## Preferred route: existing unprivileged KVM boundary
 
-This host denies unprivileged network namespace creation and noninteractive
-privileged execution. A system administrator must provision a narrowly scoped
-root-owned launcher/broker capable of creating or entering a worker network and
-mount namespace. Giving the daemon unrestricted sudo, CAP_SYS_ADMIN, or generic
-StartTransientUnit permission is not acceptable. A system service can establish
-`PrivateNetwork`/`NetworkNamespacePath`; a user service on this host cannot bypass
-the missing user-namespace capability. See
-[systemd execution namespace controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+**Correction to the initial plan:** privileged host network namespaces are not a
+necessary prerequisite on this deployment. The existing owner-provisioned QEMU
+runtime and accessible `/dev/kvm` already support a separate guest filesystem and
+network stack without changing host namespaces. This route is preferred over
+provisioning a privileged launch broker.
 
-The launch broker must authenticate the controller UID, accept only a fixed
-versioned launch schema and registered native executable, reject arbitrary unit
-properties/paths/commands, drop privilege before provider execution, and return
-namespace/cgroup identities before dispatch. Workers remain beneath the existing
-aggregate CPU/memory/task ceiling; a sibling system unit must not escape those
-limits. The ordinary daemon/updater must not enter the worker network namespace.
+A real 512 MiB guest probe passed on 2026-10-26 using the production
+`codex-build-vm.py` runner. The guest had only loopback. Direct external IPv4,
+IPv6, host-alias TCP, and virtual/external UDP DNS attempts failed. An unmounted
+synthetic host credential was inaccessible; the explicitly supplied synthetic
+credential remained readable. The existing guest-local HTTPS gateway fetched
+76 bytes from its declared registry endpoint and rejected an unlisted hostname
+and traversal route. Native Codex 0.164.0 and Claude 2.1.310 binaries both executed
+`--version` inside the guest. No actual credentials or model calls were involved.
 
-Worker namespaces have no general host route, DNS path, inherited network
-socket, or host UNIX-socket mount. Their sole external path is a controller-owned
-allowlisting transport gateway. Proxy environment variables configure native
-clients but are not enforcement. A generic CONNECT tunnel plus allowed port 443
-is insufficient for a strict HTTP-host claim: TLS SNI/HTTP authority mismatch,
-CDN fronting, redirects, alternate ports, IP literals and resolver rebinding need
-explicit handling. Use a trusted HTTP gateway that validates authority and
-upstream TLS and permits only configured provider endpoints; if transparent TLS
-interception is necessary, provision a worker-only trust root and first prove
-native clients support it. The gateway handles credentials as sensitive data and
-must not log headers/bodies. If native authentication requires TLS pinning that
-precludes this design, use a supported provider-specific gateway transport rather
-than silently weakening the guarantee. Endpoint lists must be derived from
-observed legitimate authentication/inference and reviewed, not guessed here.
+Reproduce after the central build queue is idle:
+
+```sh
+systemd-run --user --wait --pipe --collect \
+  --unit=autoship-native-vm-feasibility \
+  --property=MemoryMax=1G --property=TasksMax=64 --property=CPUQuota=100% \
+  /usr/bin/python3 scripts/autoship-native-vm-boundary-probe.py \
+  --execute --native-versions
+```
+
+This proves the available isolation substrate and executable compatibility, not
+provider authentication, model inference, streaming, session continuation, or a
+new provider gateway. The probe has a short deadline; productive native sessions
+must not inherit the build runner's 900-second maximum.
+
+### Implementation using the proven substrate
+
+1. Add a dedicated native VM launcher using the trusted `Runtime.load`, initrd,
+   QEMU sandbox and lifecycle helpers. Keep `-nic none`, no TAP/bridge, no host
+   home, and no host process/filesystem namespace. Export only a clean declared
+   candidate snapshot, pinned executable/runtime, and that actual conversation's
+   isolated provider auth/runtime. Preserve original provider identity and actual
+   session IDs. Source changes return through guarded diff application; never
+   export a host checkout containing Git credential config or controller state.
+2. Reuse the existing guest-local TLS adapter/mailbox pattern, or the existing
+   virtio-serial framing from code-mode compute, for a dedicated provider gateway.
+   The gateway must support bounded streaming request/response frames and the
+   provider's required HTTP/WebSocket semantics. Validate every upstream
+   authority, route, redirect and header on the **host**. Enforce upstream TLS and
+   reject IP literals, alternate ports, private-address resolution, DNS rebinding
+   and disallowed redirects. Protect authentication values from logs. Guest-local
+   trust provisioning must be proven against actual native clients; unsupported
+   certificate pinning is a compatibility failure, never a reason to add a NIC.
+3. Keep the policy-owning tool broker outside the native worker's authority.
+   Guest root/controller helpers may serve the unprivileged provider over stdio
+   or a declared local guest channel. A host-side framed broker exposes only the
+   workflow's existing tool API, not arbitrary host command/path access. It must
+   not trust guest claims about successful review, budget, audit or admission.
+4. Wrap QEMU, gateway and broker descendants with the existing required-workflow
+   resource/admission and cancellation controls. VM memory plus overhead must fit
+   the declared per-run cap; all runs remain under aggregate service limits. No
+   provider admission charge before required VM/resource/gateway readiness, no
+   duplicate charge per streamed network frame, no whole productive-run timeout.
+5. Fail closed for every required native provider and fallback when KVM, runtime,
+   pinned executable, explicit auth/runtime or gateway policy is unavailable.
+   Unrelated interactive calls and ordinary daemon updates retain their current
+   launch policy. Native fullflow and cancellation acceptance must run before
+   changing production dispatch.
+
+QEMU's user-mode `restrict=on` networking is another unprivileged option: its
+[primary documentation](https://www.qemu.org/docs/master/system/invocation.html)
+says ordinary host/outside routing is disabled while explicit forwarding remains
+available. It is **not used by this probe**. The staged kernel currently includes
+9p support but no staged NIC driver; more importantly, no-NIC transport avoids
+having to establish SLIRP DNS/IPv6/forwarding exclusions at all. Do not replace the
+proven no-NIC posture with `restrict=on` on the strength of documentation alone.
+
+### Fallback environment prerequisite
+
+If a deployment lacks accessible KVM and cannot provision this user-owned runtime,
+a separately reviewed privileged system-service namespace launcher remains an
+alternative. The current host's unprivileged namespace failures still matter for
+that alternative, but do not block the VM route. Never grant unrestricted sudo,
+CAP_SYS_ADMIN or generic transient-unit authority to the application, and never
+silently revert required workflows to unrestricted host processes.
 
 ## Binary acceptance and reversible rollout
 
@@ -118,7 +170,7 @@ observed legitimate authentication/inference and reviewed, not guessed here.
   Lost admission receipt prevents dispatch. Cancellation reaps descendants and
   closes broker channels before releasing the workflow lease.
 - Stage artifacts and validation in an isolated test service. Take deployment
-  snapshots only with `augmentagent deploy snapshot`. Install the narrow broker
+  snapshots only with `augmentagent deploy snapshot`. Install the native VM gateway/broker
   and required profiles, run synthetic plus live native acceptance, then enable
   autoship dispatch. Rollback pauses affected autoship admission and reverts the
   broker/profile version; it must not silently launch required workers unconfined.
