@@ -188,6 +188,8 @@ async fn plan(root: &Path, binding: &Binding) -> Result<Plan> {
     )
     .await?;
     let mut command = Command::new("/usr/bin/python3");
+    // Discovery is data-only. Even rustc --version can execute a candidate
+    // path toolchain; prerequisite probes belong inside the admitted build VM.
     command.args([
         "-I",
         "-c",
@@ -201,7 +203,6 @@ async fn plan(root: &Path, binding: &Binding) -> Result<Plan> {
         &binding.base,
         "--platform",
         "linux",
-        "--probe-prerequisites",
     ]);
     for path in names.split('\0').filter(|path| !path.is_empty()) {
         command.arg("--changed-file").arg(path);
