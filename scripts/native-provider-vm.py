@@ -143,6 +143,23 @@ class Channel:
                 yield frame
 
 
+def jwt_identity(token):
+    parts = token.split('.')
+    if len(parts) != 3 or any(not part for part in parts):
+        raise ValueError('credential identity token is not a JWT')
+    raw = parts[1].encode()
+    payload = json.loads(base64.b64decode(raw + b'=' * (-len(raw) % 4), altchars=b'-_', validate=True))
+    if not isinstance(payload, dict) or not all(key in payload for key in ('sub', 'iss', 'aud')):
+        raise ValueError('credential identity claims unavailable')
+    identity = {key: payload[key] for key in ('sub', 'iss', 'aud')}
+    account = payload.get('https://api.openai.com/auth', {})
+    if not isinstance(account, dict):
+        raise ValueError('credential account claims malformed')
+    identity['account'] = {key: account[key] for key in
+        ('chatgpt_account_id', 'user_id', 'organization_id') if key in account}
+    return identity
+
+
 def refreshed_credential(original, refreshed, provider):
     """Only provider-declared rotating fields may change; identity stays fixed."""
     if not isinstance(original, dict) or not isinstance(refreshed, dict):
@@ -182,6 +199,8 @@ def refreshed_credential(original, refreshed, provider):
             raise ValueError('invalid credential expiry')
     if not set(rotating) <= set(before):
         raise ValueError('required rotating credential fields unavailable')
+    if provider == 'codex' and jwt_identity(before['id_token']) != jwt_identity(after['id_token']):
+        raise ValueError('credential identity token account changed')
     return refreshed
 
 

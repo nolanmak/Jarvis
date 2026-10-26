@@ -86,9 +86,10 @@ ready.with_name('actual-model-dispatch').write_text('called')
                 vm.validate_runtime(root)
 
     def test_refresh_tokens_preserves_identity_and_concurrent_owner_update(self):
+        token = 'header.' + vm.base64.urlsafe_b64encode(json.dumps({'sub':'same-user','iss':'same-issuer','aud':'same-client'}).encode()).decode().rstrip('=') + '.signature'
         original = {'auth_mode': 'chatgpt', 'OPENAI_API_KEY': None, 'last_refresh': 'old',
                     'tokens': {'access_token': 'old-access', 'refresh_token': 'old-refresh',
-                               'id_token': 'old-id', 'account_id': 'same-account'}}
+                               'id_token': token, 'account_id': 'same-account'}}
         updated = json.loads(json.dumps(original))
         updated['tokens']['access_token'] = 'new-access'
         updated['tokens']['refresh_token'] = 'new-refresh'
@@ -115,6 +116,10 @@ ready.with_name('actual-model-dispatch').write_text('called')
         forged = json.loads(json.dumps(updated))
         forged['OPENAI_API_KEY'] = 'different-static-key'
         with self.assertRaisesRegex(ValueError, 'identity or configuration'):
+            vm.refreshed_credential(original, forged, 'codex')
+        forged = json.loads(json.dumps(updated))
+        forged['tokens']['id_token'] = 'header.' + vm.base64.urlsafe_b64encode(json.dumps({'sub':'other-user','iss':'same-issuer','aud':'same-client'}).encode()).decode().rstrip('=') + '.signature'
+        with self.assertRaisesRegex(ValueError, 'identity token account changed'):
             vm.refreshed_credential(original, forged, 'codex')
 
     def test_credential_use_serializes_seed_through_refresh_not_just_writeback(self):
