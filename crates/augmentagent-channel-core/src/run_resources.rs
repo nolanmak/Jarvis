@@ -197,6 +197,39 @@ pub fn spawn_command(
 
 #[cfg(test)]
 mod tests {
+    /// Execute in an isolated delegated transient service, never the daemon unit.
+    #[test]
+    #[ignore = "requires isolated delegated systemd service with daemon subgroup"]
+    fn recovery_kernel_proof_refuses_live_descendants_then_accepts_cleanup() {
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+        let helper = tempfile::tempdir().unwrap();
+        super::install_helper(helper.path()).unwrap();
+        let script = r#"
+import importlib.util,json,subprocess,sys
+spec=importlib.util.spec_from_file_location('scope',sys.argv[1])
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+s=m.RunScope({'memory_bytes':67108864,'pids':8,'cpu_percent':20})
+p=subprocess.Popen(['/bin/sleep','60'],preexec_fn=s.attach_child)
+print(json.dumps(s.identity),flush=True)
+sys.stdin.readline()
+s.close();p.wait()
+"#;
+        let mut child = Command::new("python3").arg("-c").arg(script)
+            .arg(helper.path().join("run-resource-scope.py"))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let identity: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(super::verify_quiescent(&identity).is_err());
+        child.stdin.take().unwrap().write_all(b"cleanup\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(super::verify_quiescent(&identity).unwrap()["verified_state"], "removed_empty_subtree");
+        let mut forged = identity;
+        forged["host_sha256"] = serde_json::json!("different-host");
+        assert!(super::verify_quiescent(&forged).is_err());
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[tokio::test]
