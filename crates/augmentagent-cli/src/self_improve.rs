@@ -3800,6 +3800,9 @@ enum ReviewUnavailable {
         reviewers: Vec<augmentagent_channel_core::ProviderKind>,
         detail: String,
     },
+    /// Controller evidence exceeds a bounded request/collection budget. This is
+    /// incomplete evidence, not a provider outage or a code rejection.
+    EvidenceBudget { detail: String },
     /// Every independent reviewer is on a quota cooldown: `(provider, reset)`.
     Latched {
         until: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>,
@@ -3929,6 +3932,7 @@ impl ReviewUnavailable {
             Self::ProvenanceUnknown | Self::ProvenanceUnverifiable { .. } => "provenance-unknown",
             Self::AllReviewersBuiltIt | Self::NoCapacity { .. } => "no-reviewer-capacity",
             Self::Latched { .. } => "reviewer-latched",
+            Self::EvidenceBudget { .. } => "review-evidence-budget",
         }
     }
 
@@ -3965,6 +3969,7 @@ impl ReviewUnavailable {
                 "no reviewer capacity: no independent reviewer ({}) is configured and able to serve",
                 names(reviewers)
             ),
+            Self::EvidenceBudget { .. } => "complete caller evidence exceeds the bounded review budget".into(),
             Self::Latched { until } => {
                 // Soonest reset first: that is when the draft can move again.
                 let mut until = until.clone();
@@ -3991,7 +3996,7 @@ impl ReviewUnavailable {
     fn log_line(&self) -> String {
         match self {
             Self::ProvenanceUnverifiable { error } => format!("{} ({error})", self.headline()),
-            Self::NoCapacity { detail, .. } if !detail.is_empty() => {
+            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } if !detail.is_empty() => {
                 format!("{} ({detail})", self.headline())
             }
             _ => self.headline(),
@@ -5820,6 +5825,9 @@ fn unreviewable_plan(
         };
     }
     let advice = match why {
+        ReviewUnavailable::EvidenceBudget { .. } => {
+            "The candidate needs bounded evidence decomposition before independent review can finish. No approval or code rejection has been recorded."
+        }
         ReviewUnavailable::Latched { .. } => {
             "Nothing needs doing: the loop tries again on its next pass after the reset (at \
              most once a UTC day)."

@@ -5,6 +5,23 @@ use super::*;
 use crate::autoship_review as aligned;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Typed controller limit: never report evidence collection as provider capacity.
+#[derive(Debug)]
+struct EvidenceBudget(String);
+impl std::fmt::Display for EvidenceBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "incomplete caller evidence: {}", self.0)
+    }
+}
+impl std::error::Error for EvidenceBudget {}
+fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, error: anyhow::Error) -> IndependentReview {
+    IndependentReview::unavailable(if error.downcast_ref::<EvidenceBudget>().is_some() {
+        ReviewUnavailable::EvidenceBudget { detail: format!("{error:#}") }
+    } else {
+        ReviewUnavailable::NoCapacity { reviewers: vec![provider], detail: format!("aligned review needs recovery: {error:#}") }
+    })
+}
+
 pub(super) struct ReviewContext<'a> {
     pub qa_ok: bool,
     pub qa_notes: &'a str,
@@ -93,10 +110,7 @@ pub(super) async fn run_for_subject(
     .await
     {
         Ok(review) => review,
-        Err(error) => IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
-            reviewers: vec![provider],
-            detail: format!("aligned review needs recovery: {error:#}"),
-        }),
+        Err(error) => unavailable_from_error(provider, error),
     }
 }
 
@@ -281,16 +295,18 @@ async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Re
     }
     const MAX_CALLER_FILES: usize = 256;
     const MAX_CALLER_BYTES: usize = 8 * 1024 * 1024;
-    anyhow::ensure!(paths.len() <= MAX_CALLER_FILES,
-        "incomplete caller evidence: {} files exceed {MAX_CALLER_FILES}; split the candidate into smaller API changes",paths.len());
+    if paths.len() > MAX_CALLER_FILES {
+        return Err(EvidenceBudget(format!("{} files exceed {MAX_CALLER_FILES}; decompose evidence without omitting callers", paths.len())).into());
+    }
     let mut files = BTreeMap::new();
     let mut total_bytes = 0usize;
     for path in paths {
         let spec=format!("{head}:{path}");
         let bytes=git(worktree,&["cat-file","-s",&spec]).await?.trim().parse::<usize>()?;
         total_bytes=total_bytes.checked_add(bytes).context("caller evidence byte count overflow")?;
-        anyhow::ensure!(total_bytes <= MAX_CALLER_BYTES,
-            "incomplete caller evidence: source exceeds {MAX_CALLER_BYTES} bytes; split the candidate into smaller API changes");
+        if total_bytes > MAX_CALLER_BYTES {
+            return Err(EvidenceBudget(format!("source exceeds {MAX_CALLER_BYTES} bytes; decompose evidence without omitting callers")).into());
+        }
         let content = git(worktree, &["show", &spec]).await?;
         anyhow::ensure!(content.len()==bytes,"immutable caller evidence size changed");
         files.insert(path, content);
@@ -898,6 +914,13 @@ mod tests {
         let error=complete_caller_evidence(dir.path(),&head,"+fn changed() {}").await.unwrap_err();
         assert!(error.to_string().contains("incomplete caller evidence"));
         assert!(error.to_string().contains("files exceed"));
+        let review=unavailable_from_error(augmentagent_channel_core::ProviderKind::Codex,error.context("source collection"));
+        assert!(!review.available && !review.approved());
+        let why=review.why_unavailable.as_ref().unwrap();
+        assert!(matches!(why,ReviewUnavailable::EvidenceBudget { .. }));
+        assert_eq!(why.code(),"review-evidence-budget");
+        assert!(!why.permanent());
+        assert!(review.structured.is_none());
     }
     #[test]
     fn new_supplemental_context_invalidates_old_dismissal_reuse() {
