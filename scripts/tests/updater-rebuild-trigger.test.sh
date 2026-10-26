@@ -152,6 +152,7 @@ expect_rebuild scripts/code-mode-compute.py
 expect_rebuild scripts/code-mode-compute-guest.py
 expect_rebuild scripts/code-mode-compute-prepare.py
 expect_rebuild sidecars/code-mode-runner/runner.ts
+expect_rebuild scripts/ci-build-vm.py
 expect_rebuild scripts/ci-contract.py
 expect_rebuild scripts/ci-contract.json
 expect_rebuild scripts/pdf-runtime.py

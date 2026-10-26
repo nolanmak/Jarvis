@@ -111,8 +111,10 @@ def prerequisite_check(requirements,root):
             continue
         if requirement['kind']=='rust_component':
             try:
-                done=subprocess.run(['rustup','component','list','--installed'],capture_output=True,text=True,timeout=10,env={**os.environ,'RUSTUP_AUTO_INSTALL':'0'})
-                if done.returncode or not any(line.startswith(requirement['component']+'-') for line in done.stdout.splitlines()):missing.append('rust component:'+requirement['component'])
+                tool={'clippy':'cargo-clippy','rustfmt':'rustfmt'}.get(requirement['component'])
+                if tool is None:missing.append('rust component:'+requirement['component']);continue
+                done=subprocess.run([tool,'--version'],capture_output=True,text=True,timeout=10,env={**os.environ,'RUSTUP_AUTO_INSTALL':'0'})
+                if done.returncode:missing.append('rust component:'+requirement['component'])
             except (OSError,subprocess.TimeoutExpired):missing.append('rust component:'+requirement['component'])
             continue
         if requirement['kind']!='tool':missing.append(requirement['action']);continue
@@ -131,8 +133,12 @@ def prerequisite_check(requirements,root):
         except (OSError,subprocess.TimeoutExpired):missing.append(tool+':'+version)
     return missing
 
+def timeout_seconds(value):
+    if type(value) is not int or not 1<=value<=360:raise ValueError('shared CI prerequisite unavailable: unsupported timeout declaration')
+    return value*60
+
 def plan(contract,args):
-    checks=[];root=Path(args.root).resolve();shared=any(p in ('scripts/ci-contract.py','scripts/ci-contract.json','scripts/ci-contract-sync.py') for p in args.changed_file)
+    checks=[];measured={};root=Path(args.root).resolve();shared=any(p in ('scripts/ci-contract.py','scripts/ci-contract.json','scripts/ci-contract-sync.py') for p in args.changed_file)
     drift=verify(contract,root)
     if drift:checks.append({'id':'contract-authority-change','status':'remote_required','reason':'workflow inventory differs from controller contract','paths':drift,'workflow':'controller-contract','job':'authority-change','matrix':{},'platform':args.platform,'working_directory':'.','environment':{},'shell':'bash','body':'','argv':[],'prerequisites':[]})
     for filename,workflow in contract['workflows'].items():
@@ -144,12 +150,17 @@ def plan(contract,args):
                 try:runner=resolve(job['runs-on'],context)
                 except ValueError:runner='unresolved'
                 target='darwin' if runner.startswith('macos-') else 'linux' if runner.startswith('ubuntu-') else 'unsupported'
-                requirements=tool_prerequisites([{**s,'_body':contract['commands'].get(s.get('command_id'),{}).get('body','')} for s in job['steps']],target)
-                missing=prerequisite_check(requirements,root) if applies and target==args.platform and args.probe_prerequisites else []
                 for index,step in enumerate(job['steps']):
                     identifier=step.get('command_id')
                     if not identifier:continue
                     command=contract['commands'][identifier];status='ready';reason='';environment={}
+                    requirements=tool_prerequisites([{**s,'_body':contract['commands'].get(s.get('command_id'),{}).get('body','')} for s in job['steps'][:index+1]],target)
+                    missing=[]
+                    if applies and target==args.platform and args.probe_prerequisites:
+                        key=digest(requirements)
+                        if key not in measured:measured[key]=prerequisite_check(requirements,root)
+                        missing=measured[key]
+
                     working=step.get('working-directory',job.get('defaults',{}).get('run',{}).get('working-directory',workflow.get('defaults',{}).get('run',{}).get('working-directory','.')))
                     try:
                         environment={key:resolve(value,context) for key,value in {**workflow.get('env',{}),**job.get('env',{}),**step.get('env',{})}.items()}
@@ -157,19 +168,21 @@ def plan(contract,args):
                         if not applies or not condition(job.get('if'),target) or not condition(step.get('if'),target):status='not_applicable';reason='workflow paths or declared condition'
                         elif target!=args.platform:status='remote_required';reason='requires '+runner
                         elif host_setup(command['body']):status='remote_required';reason='host provisioning is never executed from candidate CI'
-                        elif missing:status='prerequisite_hold';reason='; '.join(missing)
+                        elif getattr(args,'vm_runtime',False) and any('https://github.com/gitleaks/gitleaks/releases/' in contract['commands'].get(s.get('command_id'),{}).get('body','') for s in job['steps'][:index+1]):status='remote_required';reason='pinned gitleaks release artifact requires controller provisioning'
+                        elif missing:status='remote_required' if getattr(args,'vm_runtime',False) else 'prerequisite_hold';reason='runtime prerequisites: '+'; '.join(missing)
                         elif requirements and not args.probe_prerequisites:status='prerequisite_hold';reason='prerequisites not measured'
                     except ValueError as error:status='remote_required';reason=str(error)
                     variant=identifier+(' @'+json.dumps(matrix,sort_keys=True,separators=(',',':')) if matrix else '')
                     checks.append({'id':variant,'command_id':identifier,'workflow':filename,'job':job_id,'matrix':matrix,'platform':target,'status':status,'reason':reason,
-                        'body':command['body'],'shell':command['shell'],'working_directory':working,'environment':environment,'prerequisites':requirements,
+                        'body':command['body'],'shell':command['shell'],'job_timeout_seconds':timeout_seconds(job.get('timeout-minutes',360)),
+                        'step_timeout_seconds':timeout_seconds(step['timeout-minutes']) if 'timeout-minutes' in step else None,'working_directory':working,'environment':environment,'prerequisites':requirements,
                         'argv':[sys.executable,'-I',str(RUNNER),'step','--id',variant,'--input-base',args.base,'--input-head',args.head]})
     return {'version':1,'contract_sha256':getattr(args,'contract_sha256',digest(contract)),'head':args.head,'base':args.base,'checks':checks,'complete':not any(c['status']=='prerequisite_hold' for c in checks),'remote_pending':any(c['status']=='remote_required' for c in checks)}
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--contract');parser.add_argument('--contract-json')
     sub=parser.add_subparsers(dest='operation',required=True)
-    p=sub.add_parser('plan');p.add_argument('--head',required=True);p.add_argument('--base',required=True);p.add_argument('--platform',choices=['linux','darwin'],default=sys.platform);p.add_argument('--root',default='.');p.add_argument('--changed-file',action='append',default=[]);p.add_argument('--probe-prerequisites',action='store_true')
+    p=sub.add_parser('plan');p.add_argument('--head',required=True);p.add_argument('--base',required=True);p.add_argument('--platform',choices=['linux','darwin'],default=sys.platform);p.add_argument('--root',default='.');p.add_argument('--changed-file',action='append',default=[]);p.add_argument('--probe-prerequisites',action='store_true');p.add_argument('--vm-runtime',action='store_true')
     p=sub.add_parser('step');p.add_argument('--id',required=True);p.add_argument('--input-base');p.add_argument('--input-head');p.add_argument('--hosted',action='store_true');p.add_argument('--state-dir',type=Path)
     p=sub.add_parser('verify');p.add_argument('--root',default='.')
     args=parser.parse_args();contract=load(args)
@@ -188,7 +201,7 @@ def main():
         context={'matrix.'+k:v for k,v in matrix.items()};context.update({'github.workspace':str(root),'github.event.pull_request.base.sha':args.input_base or '', 'github.event.pull_request.head.sha':args.input_head or ''})
         runner=resolve(job['runs-on'],context);host='darwin' if runner.startswith('macos-') else 'linux' if runner.startswith('ubuntu-') else 'unsupported'
         if host!=sys.platform or not condition(job.get('if'),sys.platform) or not condition(step.get('if'),sys.platform):raise ValueError('shared CI prerequisite unavailable: platform or condition')
-        requirements=tool_prerequisites([{**s,'_body':contract['commands'].get(s.get('command_id'),{}).get('body','')} for s in job['steps']],host)
+        requirements=tool_prerequisites([{**s,'_body':contract['commands'].get(s.get('command_id'),{}).get('body','')} for s in job['steps'][:int(step_index)+1]],host)
         missing=prerequisite_check(requirements,root)
         if missing:raise ValueError('shared CI prerequisite unavailable: '+'; '.join(missing))
         if host_setup(command['body']):raise ValueError('shared CI prerequisite unavailable: host setup cannot execute locally')

@@ -114,6 +114,8 @@ def seed_build_cache():
 if job.get('build_cache'):
     environment.update({'CARGO_HOME':'/build-cache/cargo-home','CARGO_TARGET_DIR':'/build-cache/target'})
 environment.update(job['environment'])
+if job.get('ci_context'):
+    environment.update({'GIT_ALTERNATE_OBJECT_DIRECTORIES':'/ci-git-objects','GIT_CONFIG_NOSYSTEM':'1','RUSTUP_TOOLCHAIN':'/toolchain'})
 registry=make_proxy('/root/control')
 environment.update({'NODE_EXTRA_CA_CERTS':'/etc/jarvis-registry-ca.pem',
     'CARGO_HTTP_CAINFO':'/etc/jarvis-registry-ca.pem', 'NPM_CONFIG_AUDIT':'false',
@@ -210,7 +212,7 @@ def qemu_command(config, image, shares, build_cache):
 
 
 def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None,
-        scratch_dir=None, build_cache=None, storage_lease=None):
+        scratch_dir=None, build_cache=None, storage_lease=None, ci_context=None):
     """Execute argv in a disposable source snapshot; return after verified VM exit.
 
     `scratch_dir` holds the VM's private control files (default temp dir when
@@ -266,6 +268,19 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
                 raise Unavailable('npm dependency mount traverses a non-directory or symlink')
         if not source.is_absolute() or source.resolve() != source or not source.is_dir():
             raise Unavailable('invalid read-only npm dependency directory')
+    if ci_context is not None:
+        if set(ci_context)!={'state','git_objects','runner','contract'}:
+            raise Unavailable('invalid controller CI context')
+        for key in ('state','git_objects'):
+            path=Path(ci_context[key]);info=path.lstat()
+            if (not path.is_absolute() or path.resolve()!=path or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid!=os.getuid() or info.st_mode&0o022 or path.is_relative_to(workspace)
+                    or workspace.is_relative_to(path)):
+                raise Unavailable('CI state and Git objects require separate owned directories')
+            if key=='state' and info.st_mode&0o077:raise Unavailable('CI state is not private')
+        for key in ('runner','contract'):
+            if not isinstance(ci_context[key],bytes) or not 0<len(ci_context[key])<=2*1024*1024:
+                raise Unavailable('invalid controller CI bundle')
     config = runtime.config
     with tempfile.TemporaryDirectory(prefix='jarvis-build-vm-', dir=scratch_dir) as temporary:
         private = Path(temporary)
@@ -308,6 +323,14 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             module_commands.append(f'insmod /{name} || poweroff -f')
         dependency_mounts = []
         shares = [('runtime', Path('/usr'), True), ('workspace', workspace, False), ('control', control, False)]
+        if ci_context is not None:
+            entries.extend((name,stat.S_IFDIR|0o755,b'',0,0) for name in ('ci-runtime','ci-git-objects','ci-tools'))
+            entries.extend([('ci-tools/runner.py',stat.S_IFREG|0o444,ci_context['runner'],0,0),
+                            ('ci-tools/contract.json',stat.S_IFREG|0o444,ci_context['contract'],0,0)])
+            shares.extend([('ci_runtime',Path(ci_context['state']),False),('ci_objects',Path(ci_context['git_objects']),True)])
+            dependency_mounts.extend([
+                'mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev ci_runtime /ci-runtime || poweroff -f',
+                'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev ci_objects /ci-git-objects || poweroff -f'])
         if build_cache is not None:
             dependency_mounts.append(f'/bootstrap/busybox mkdir -p {BUILD_CACHE_MOUNT} || poweroff -f')
             dependency_mounts.append(f'mount -t ext4 -o nosuid,nodev,discard /dev/vda {BUILD_CACHE_MOUNT} || poweroff -f')
@@ -340,7 +363,7 @@ poweroff -f
         entries.extend([('init', stat.S_IFREG | 0o755, boot.encode(), 0, 0),
             ('guest.py', stat.S_IFREG | 0o400, GUEST_RUNNER.encode(), 0, 0),
             ('job.json', stat.S_IFREG | 0o400, json.dumps({'argv': argv, 'environment': environment,
-                'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None}).encode(), 0, 0)])
+                'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None,'ci_context':ci_context is not None}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
         command = qemu_command(config, image, shares, build_cache)
         host_environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir']}
@@ -350,21 +373,22 @@ poweroff -f
         if storage_lease is not None:
             storage_lease.check()
             host_environment["JARVIS_STORAGE_LEASE_FD"] = str(storage_lease.fd)
+            host_environment["JARVIS_STORAGE_LEASE_FDS"] = ','.join(str(fd) for fd in getattr(storage_lease,'fds',[storage_lease.fd]))
         with tempfile.TemporaryFile(dir=private) as log:
             process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
                 env=host_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-                pass_fds=() if storage_lease is None else (storage_lease.fd,))
+                pass_fds=() if storage_lease is None else tuple(getattr(storage_lease,'fds',[storage_lease.fd])))
             try:
-                deadline = time.monotonic() + min(max(timeout, 1), 900)
+                deadline = None if timeout is None else time.monotonic() + min(max(timeout, 1), 900)
                 while True:
                     if storage_lease is not None:
                         storage_lease.check()
-                    remaining = deadline - time.monotonic()
+                    remaining = 1 if deadline is None else deadline - time.monotonic()
                     if remaining <= 0:
                         raise Unavailable('VM command timed out')
                     broker.poll(remaining)
                     try:
-                        status = process.wait(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+                        status = process.wait(timeout=min(0.05, max(0.001, remaining)))
                         break
                     except subprocess.TimeoutExpired:
                         continue

@@ -78,3 +78,19 @@ controller authority nor permanently rejects workflow PRs. The updated contract
 requires normal independent review and exact-head hosted inventory/CI evidence;
 normal updater deployment then replaces the embedded version. A local pass
 never waives mandatory hosted CI or proves macOS behavior from Linux.
+
+The controller CI adapter (`scripts/ci-build-vm.py`) runs prerequisite probes and
+commands inside the existing no-NIC build VM, with a pinned toolchain, read-only
+Git object share, and private per-attempt job runtime. Candidate toolchain files
+are not probed on the host. The controller supplies embedded runner/contract
+bytes and actual inherited global plus target storage-lock descriptors. Cache
+images reside inside the registered, leased build target; initial formatting is
+fixed controller code, with private ownership, exact capacity and disk-growth
+reserve checks. Missing guest tools and the unprovisioned pinned gitleaks release
+are explicit hosted requirements, not successful local checks.
+
+The adapter removes the build tool's arbitrary 900-second ceiling only for this
+supervised CI mode. Its caller enforces declared GitHub step/job deadlines
+(default job limit six hours), retains storage/resource supervision, and cleans
+up the VM on cancellation. Lightweight adapter fixtures exercise this interface;
+a real admitted VM run is still required before claiming deployment acceptance.

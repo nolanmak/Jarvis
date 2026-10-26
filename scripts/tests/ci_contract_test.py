@@ -94,6 +94,14 @@ class ContractTests(unittest.TestCase):
    def call(index,head):return subprocess.run([sys.executable,'-I',str(ROOT/'scripts/ci-contract.py'),'--contract-json',json.dumps(c),'step','--id','test/check/'+str(index),'--state-dir',state,'--input-head',head,'--input-base','base'],cwd=root,capture_output=True,text=True)
    self.assertEqual(call(0,'head').returncode,0);self.assertEqual(call(1,'head').returncode,0)
    self.assertNotEqual(call(1,'new-head').returncode,0)
+ def test_github_declared_and_default_deadlines_are_explicit(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);c=self.fixture(root);job=c['workflows']['.github/workflows/test.yml']['jobs']['check']
+   row=ci.plan(c,self.args(root))['checks'][0];self.assertEqual(row['job_timeout_seconds'],21600);self.assertIsNone(row['step_timeout_seconds'])
+   job['timeout-minutes']=45;job['steps'][0]['timeout-minutes']=7
+   row=ci.plan(c,self.args(root))['checks'][0];self.assertEqual(row['job_timeout_seconds'],2700);self.assertEqual(row['step_timeout_seconds'],420)
+   job['timeout-minutes']=False
+   with self.assertRaisesRegex(ValueError,'timeout'):ci.plan(c,self.args(root))
  def test_unknown_expression_or_action_is_not_silent_pass(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);c=self.fixture(root);job=c['workflows']['.github/workflows/test.yml']['jobs']['check'];job['env']={'X':'${{ secrets.UNDECLARED }}'}
