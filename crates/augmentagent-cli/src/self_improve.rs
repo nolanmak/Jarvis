@@ -8101,8 +8101,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut spent = 0u32;
     if diff.trim().is_empty() {
         // #1491 — an empty diff is asked once why: make the change now, or
-        // say the issue is already fixed or under-specified. Either answer is
-        // the owner's to verify, and neither is a failed attempt.
+        // say the issue is already fixed or under-specified. Neither claim
+        // authorizes completion: registered acceptance drives repair below.
         let mut reply = NoChange::Silent;
         if spent < revise_rounds() {
             spent += 1;
@@ -15344,6 +15344,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "crates/augmentagent-cli/src/self_improve_lifecycle_tests.rs",
                 "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
                 "docs/CODEX-FALLBACK.md",
+                // Removes inherited overrides; never reads or writes the map.
+                "scripts/autoship-native-acceptance-probe.py",
             ],
             "something outside this crate names the opened-PR map: it must go through opened_prs"
         );
@@ -18072,7 +18074,6 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         for kind in [
-            "FailureKind::NoChanges",
             "FailureKind::GuardRefusal",
             "FailureKind::ReviewReject",
         ] {
