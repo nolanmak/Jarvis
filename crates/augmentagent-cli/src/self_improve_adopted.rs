@@ -38,15 +38,23 @@ fn approved(
     let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
         return Ok(None);
     };
+    let Some(snapshot) = store.snapshot(&id)? else {
+        return Ok(None);
+    };
     let review = store
-        .current_reviews(&id)?
+        .events(&id)?
         .into_iter()
-        .filter(|r| {
-            r.binding.head == candidate.head
-                && r.approved
+        .rev()
+        .filter(|(_, kind, _, _)| kind == "review_recorded")
+        .filter_map(|(_, _, raw, _)| {
+            serde_json::from_str::<crate::autoship_workflow::Review>(&raw).ok()
+        })
+        .find(|r| {
+            r.binding == snapshot.checkpoint.binding
+                && r.binding.head == candidate.head
                 && r.reviewer.starts_with("adopted-publication-")
         })
-        .last();
+        .filter(|r| r.approved);
     Ok(review
         .and_then(|r| serde_json::from_str::<RecordedVerdict>(&r.evidence).ok())
         .filter(|v| v.structured.is_some() && approval_of(Some(v)).reviewed))
@@ -201,7 +209,9 @@ async fn execute(
         .map(|c| c.requirement.clone())
         .collect();
     let mut previous = None;
-    for round in 0..=revise_rounds() {
+    let mut round = 0;
+    let mut native_sessions = None;
+    loop {
         let receipt = acceptance::verify_with_repair_for(
             reasoner, source, &pr.title, worktree, &prepared, &control, guard,
         )
@@ -240,6 +250,24 @@ async fn execute(
                 &serde_json::to_string(&verdict)?,
             )?;
         }
+        let (_, diff, _) = run(
+            "git",
+            &["diff", "--numstat", "origin/main...HEAD"],
+            worktree,
+        )
+        .await?;
+        let changed_lines = diff
+            .lines()
+            .flat_map(|line| line.split_whitespace().take(2))
+            .filter_map(|n| n.parse::<usize>().ok())
+            .sum();
+        let evaluated = episode::evaluate(
+            guard,
+            &review,
+            prepared.proposal.contract.criteria.len(),
+            changed_lines,
+        )
+        .await?;
         if review.approved() {
             guard.push(&pr.branch).await?;
             acceptance::assert_receipt_current(worktree, &prepared, &receipt).await?;
@@ -344,10 +372,47 @@ async fn execute(
                 pr.pr
             )));
         }
-        if !review.available || round == revise_rounds() {
+        let strategy = match &evaluated.decision {
+            crate::autoship_episode::Decision::FreshSession { .. }
+            | crate::autoship_episode::Decision::Rescope { .. } => {
+                let session = episode::session_for(
+                    reasoner, source, &pr.title, &pr.body, worktree, guard, &prepared, &evaluated,
+                )
+                .await?;
+                let Some(session) = session else {
+                    break;
+                };
+                round = 0;
+                previous = None;
+                if native_sessions.is_none() {
+                    native_sessions = Some(
+                        augmentagent_channel_core::native_session::FreshBuilderSessions::new(),
+                    );
+                }
+                Some(session)
+            }
+            crate::autoship_episode::Decision::CompleteEvidence
+            | crate::autoship_episode::Decision::RepairInfrastructure
+            | crate::autoship_episode::Decision::Adjudicate => break,
+            _ => None,
+        };
+        if !review.available || round >= revise_rounds() {
             break;
         }
-        adoption::revise(reasoner,guard,&fix_opts(worktree.to_path_buf()),&format!("Address verified review findings for this PR. Preserve pinned acceptance; do not weaken verifiers.\n{request}\n{}",review.notes)).await?;
+        let (opts,prompt) = match strategy {
+            Some(session) => (session.opts,session.prompt),
+            None => (fix_opts(worktree.to_path_buf()),format!("Address verified review findings for this PR. Preserve pinned acceptance; do not weaken verifiers.\n{request}\n{}",review.notes)),
+        };
+        let call = adoption::revise(reasoner, guard, &opts, &prompt);
+        let result = match &native_sessions {
+            Some(sessions) => sessions.scope(call).await,
+            None => call.await,
+        };
+        if let Some(sessions) = &native_sessions {
+            guard.record_episode_sessions(sessions)?;
+        }
+        result?;
+        round += 1;
     }
     guard.push(&pr.branch).await?;
     guard

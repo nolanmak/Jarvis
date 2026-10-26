@@ -178,6 +178,29 @@ pub(super) async fn session(
     prepared: &acceptance::PreparedAcceptance,
     evaluated: &Evaluated,
 ) -> Result<Option<RepairSession>> {
+    session_for(
+        reasoner,
+        crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+        &issue.title,
+        &issue.body,
+        root,
+        workflow,
+        prepared,
+        evaluated,
+    )
+    .await
+}
+
+pub(super) async fn session_for(
+    reasoner: &FallbackReasoner,
+    source: crate::autoship_contract::AcceptanceSource,
+    title: &str,
+    body: &str,
+    root: &Path,
+    workflow: &mut workflow::WorkflowGuard,
+    prepared: &acceptance::PreparedAcceptance,
+    evaluated: &Evaluated,
+) -> Result<Option<RepairSession>> {
     let (best, rescope) = match &evaluated.decision {
         Decision::FreshSession { best_head } => (best_head, false),
         Decision::Rescope { best_head } => (best_head, true),
@@ -230,7 +253,7 @@ pub(super) async fn session(
     })).collect();
     let mut prompt = serde_json::to_string(&serde_json::json!({
         "instruction":"Repair this committed candidate against the unchanged executable acceptance contract. These are the remaining verified findings. Do not consult prior builder transcripts or prior LGTM claims. Preserve pinned verifier bytes and scope.",
-        "issue":{"number":issue.number,"title":issue.title,"body":issue.body},
+        "source":{"identity":source,"title":title,"body":body},
         "contract":prepared.proposal.contract,"remaining_facts":facts
     }))?;
     if rescope {
