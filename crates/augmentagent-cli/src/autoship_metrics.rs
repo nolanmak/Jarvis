@@ -1,10 +1,10 @@
 //! Windowed observations from controller records. Missing history and unknown
 //! token usage are explicit; approvals and PR creation are never shipping.
+use crate::autoship_workflow::{Binding, OperationKind};
 use anyhow::{ensure, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::Serialize;
 use std::{collections::BTreeSet, path::Path};
-use crate::autoship_workflow::{Binding, OperationKind};
 
 #[derive(Debug, Serialize)]
 pub struct Window {
@@ -25,33 +25,51 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     // One read transaction gives all aggregates the same database snapshot.
     conn.execute_batch("BEGIN")?;
-    let first_recorded_event_ms = conn.query_row(
-        "SELECT min(at_ms) FROM workflow_event", [], |row| row.get(0))?;
+    let first_recorded_event_ms =
+        conn.query_row("SELECT min(at_ms) FROM workflow_event", [], |row| {
+            row.get(0)
+        })?;
     let charges_without_timestamp = conn.query_row(
         "SELECT count(*) FROM resource_charge r WHERE NOT EXISTS (
          SELECT 1 FROM workflow_event e WHERE e.workflow=r.workflow
-         AND e.kind='resource_charged' AND e.payload=r.id)", [], |row| row.get(0))?;
+         AND e.kind='resource_charged' AND e.payload=r.id)",
+        [],
+        |row| row.get(0),
+    )?;
     let (model_calls, observed_wall_ms, reported_tokens) = conn.query_row(
         "SELECT coalesce(sum(r.model_calls),0),coalesce(sum(r.wall_ms),0),coalesce(sum(r.tokens),0)
          FROM resource_charge r WHERE EXISTS (SELECT 1 FROM workflow_event e
          WHERE e.workflow=r.workflow AND e.payload=r.id AND e.kind='resource_charged'
-         AND e.at_ms>=?1 AND e.at_ms<?2)", params![since, until],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+         AND e.at_ms>=?1 AND e.at_ms<?2)",
+        params![since, until],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
     let active_workflows = conn.query_row(
         "SELECT count(DISTINCT workflow) FROM workflow_event WHERE at_ms>=?1 AND at_ms<?2",
-        params![since, until], |row| row.get(0))?;
+        params![since, until],
+        |row| row.get(0),
+    )?;
     let mut statement = conn.prepare(
         "SELECT o.workflow,o.kind,o.binding,o.receipt,w.pr FROM operation o
          JOIN workflow w ON w.id=o.workflow WHERE o.receipt IS NOT NULL
          AND EXISTS (SELECT 1 FROM workflow_event e WHERE e.workflow=o.workflow
-         AND e.kind='operation_completed' AND e.payload=o.id AND e.at_ms>=?1 AND e.at_ms<?2)")?;
-    let rows = statement.query_map(params![since, until], |row| Ok((
-        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-        row.get::<_, String>(3)?, row.get::<_, Option<u64>>(4)?)))?;
+         AND e.kind='operation_completed' AND e.payload=o.id AND e.at_ms>=?1 AND e.at_ms<?2)",
+    )?;
+    let rows = statement.query_map(params![since, until], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<u64>>(4)?,
+        ))
+    })?;
     let mut merges = BTreeSet::new();
     for row in rows {
         let (workflow, kind, binding, receipt, pr) = row?;
-        if serde_json::from_str::<OperationKind>(&kind)? != OperationKind::MergePr { continue; }
+        if serde_json::from_str::<OperationKind>(&kind)? != OperationKind::MergePr {
+            continue;
+        }
         let binding: Binding = serde_json::from_str(&binding)?;
         if let Some(pr) = pr {
             if receipt == format!("github:pr:{pr}:merged:{}", binding.head) {
@@ -59,9 +77,17 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
             }
         }
     }
-    Ok(Window { since_ms: since, until_ms: until, first_recorded_event_ms,
-        confirmed_merge_operations: merges.len(), model_calls, observed_wall_ms,
-        reported_tokens, charges_without_timestamp, active_workflows })
+    Ok(Window {
+        since_ms: since,
+        until_ms: until,
+        first_recorded_event_ms,
+        confirmed_merge_operations: merges.len(),
+        model_calls,
+        observed_wall_ms,
+        reported_tokens,
+        charges_without_timestamp,
+        active_workflows,
+    })
 }
 
 pub fn summary(since: i64, until: i64) -> Result<String> {
@@ -82,20 +108,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workflow.db");
         let mut store = WorkflowStore::open(&path).unwrap();
-        let binding = Binding { head: "head".into(), contract: "contract".into(), evidence_hash: "evidence".into() };
-        store.register("owner/repo#1", "topic", binding.clone(), 10).unwrap();
-        let lease = store.claim("owner/repo#1", "worker", 10, 1000).unwrap().unwrap();
+        let binding = Binding {
+            head: "head".into(),
+            contract: "contract".into(),
+            evidence_hash: "evidence".into(),
+        };
+        store
+            .register("owner/repo#1", "topic", binding.clone(), 10)
+            .unwrap();
+        let lease = store
+            .claim("owner/repo#1", "worker", 10, 1000)
+            .unwrap()
+            .unwrap();
         store.attach_pr(&lease, 42, 20).unwrap();
-        let op = store.begin_operation(&lease, OperationKind::MergePr, &binding, 25).unwrap();
-        let charge = ResourceCharge { wall_ms: 70, model_calls: 2, tokens: 0 };
+        let op = store
+            .begin_operation(&lease, OperationKind::MergePr, &binding, 25)
+            .unwrap();
+        let charge = ResourceCharge {
+            wall_ms: 70,
+            model_calls: 2,
+            tokens: 0,
+        };
         store.charge(&lease, "attempt", charge, 30).unwrap();
         store.charge(&lease, "attempt", charge, 40).unwrap();
         let before = read(&path, 20, 50).unwrap();
         assert_eq!(before.confirmed_merge_operations, 0);
         assert_eq!(before.model_calls, 2);
         assert_eq!(before.observed_wall_ms, 70);
-        store.complete_operation(&lease, &op.id, "github:pr:42:merged:head", 70).unwrap();
-        store.complete_operation(&lease, &op.id, "github:pr:42:merged:head", 80).unwrap();
+        store
+            .complete_operation(&lease, &op.id, "github:pr:42:merged:head", 70)
+            .unwrap();
+        store
+            .complete_operation(&lease, &op.id, "github:pr:42:merged:head", 80)
+            .unwrap();
         let after = read(&path, 50, 100).unwrap();
         assert_eq!(after.confirmed_merge_operations, 1);
         assert_eq!(after.model_calls, 0);
@@ -108,14 +153,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workflow.db");
         let mut store = WorkflowStore::open(&path).unwrap();
-        let binding = Binding { head: "head".into(), contract: "contract".into(), evidence_hash: "evidence".into() };
-        store.register("owner/repo#1", "topic", binding.clone(), 10).unwrap();
-        let lease = store.claim("owner/repo#1", "worker", 10, 1000).unwrap().unwrap();
+        let binding = Binding {
+            head: "head".into(),
+            contract: "contract".into(),
+            evidence_hash: "evidence".into(),
+        };
+        store
+            .register("owner/repo#1", "topic", binding.clone(), 10)
+            .unwrap();
+        let lease = store
+            .claim("owner/repo#1", "worker", 10, 1000)
+            .unwrap()
+            .unwrap();
         store.attach_pr(&lease, 42, 20).unwrap();
-        for (kind, receipt) in [(OperationKind::CreatePr, "github:pr:42:merged:head"),
-            (OperationKind::MergePr, "github:pr:42:merged:unreviewed")] {
+        for (kind, receipt) in [
+            (OperationKind::CreatePr, "github:pr:42:merged:head"),
+            (OperationKind::MergePr, "github:pr:42:merged:unreviewed"),
+        ] {
             let op = store.begin_operation(&lease, kind, &binding, 30).unwrap();
-            store.complete_operation(&lease, &op.id, receipt, 40).unwrap();
+            store
+                .complete_operation(&lease, &op.id, receipt, 40)
+                .unwrap();
         }
         assert_eq!(read(&path, 0, 100).unwrap().confirmed_merge_operations, 0);
     }
