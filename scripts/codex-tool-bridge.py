@@ -1775,6 +1775,15 @@ class Policy:
                 runtime_reads.extend(str(path) for path in metadata)
                 run_env.update(git_env)
                 run_env.update({'GIT_DIR': str(metadata[0]), 'GIT_WORK_TREE': str(self.cwd)})
+                if git_subcommand(argv) in ('diff', 'log'):
+                    # Object reads bypass filesystem-level .env/control-name
+                    # filters. Enforce the same exclusions on history output;
+                    # adding pathspecs also rejects direct blob-to-blob diff.
+                    if '--' not in argv[1:]:
+                        argv.append('--')
+                    for name in sorted(CONTROL_PARTS | {'.env', '.env.*'}):
+                        argv.extend([f':(top,exclude,glob)**/{name}',
+                                     f':(top,exclude,glob)**/{name}/**'])
                 argv = [argv[0], '--no-pager', '-c', 'core.hooksPath=/dev/null',
                         '-c', 'core.fsmonitor=false', *argv[1:]]
             if snapshot:
