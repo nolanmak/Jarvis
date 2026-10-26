@@ -644,7 +644,7 @@ fn build_prompt(
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() > max {
-        format!("{}…", &s[..max])
+        { let mut end=max; while !s.is_char_boundary(end) { end-=1; } format!("{}…", &s[..end]) }
     } else {
         s.to_string()
     }
@@ -1077,4 +1077,16 @@ mod tests {
         let s = "here you go:\n```json\n{\"gaps\":[]}\n```\nbye";
         assert_eq!(slice_json_object(s), Some("{\"gaps\":[]}"));
     }
+}
+
+#[test]
+fn truncation_handles_multibyte_research_issue_text() {
+    for cap in [0,1,2,3,160,1200] {
+        let text="😀é漢—".repeat(200);
+        let result=truncate(&text,cap);
+        assert!(result.ends_with('…'));
+        assert!(result.len()<=cap+3);
+        assert!(text.starts_with(result.strip_suffix('…').unwrap()));
+    }
+    assert_eq!(truncate("é",2),"é");
 }

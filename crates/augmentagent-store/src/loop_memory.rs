@@ -25,13 +25,15 @@ pub(super) fn migrate(conn: &Connection) -> StoreResult<()> {
         request_id TEXT PRIMARY KEY, loop_id TEXT NOT NULL, prompt TEXT NOT NULL,
         answer TEXT, state TEXT NOT NULL, error TEXT, updated_at_ms INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_loop_occurrence_time ON loop_occurrences(updated_at_ms);
+        CREATE TABLE IF NOT EXISTS loop_execution_prompts (request_id TEXT PRIMARY KEY, prompt TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS loop_coverage (
         loop_id TEXT NOT NULL, fingerprint TEXT NOT NULL, finding TEXT NOT NULL,
         evidence TEXT NOT NULL, request_id TEXT NOT NULL, completed_at_ms INTEGER NOT NULL,
         PRIMARY KEY(loop_id,fingerprint));
         CREATE TABLE IF NOT EXISTS loop_occurrence_failures (
         id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, stage TEXT NOT NULL,
-        detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);",
+        detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_loop_failure_retry ON loop_occurrence_failures(request_id,stage,observed_at_ms);",
     )?;
     Ok(())
 }
@@ -53,18 +55,36 @@ impl Store {
         request_id: &str,
         prompt: &str,
     ) -> StoreResult<LoopOccurrence> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        conn.execute(
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx=conn.transaction()?;
+        tx.execute(
             "INSERT OR IGNORE INTO loop_occurrences VALUES (?1,?2,?3,NULL,'pending',NULL,?4)",
             params![request_id, loop_id, redact::mask(prompt), now_millis()],
         )?;
-        let row = conn.query_row("SELECT request_id,loop_id,prompt,answer,state,error,updated_at_ms FROM loop_occurrences WHERE request_id=?1",params![request_id],occurrence)?;
+        let row = tx.query_row("SELECT request_id,loop_id,prompt,answer,state,error,updated_at_ms FROM loop_occurrences WHERE request_id=?1",params![request_id],occurrence)?;
         if row.loop_id != loop_id {
             return Err(StoreError::InvalidInput(
                 "loop occurrence identity mismatch".into(),
             ));
         }
+        // Execution data has the same private-store semantics as user_loops.prompt.
+        // Keep it separate from the redacted audit rows exposed to digests/history.
+        tx.execute("INSERT OR IGNORE INTO loop_execution_prompts VALUES (?1,?2)",params![request_id,prompt])?;
+        tx.commit()?;
         Ok(row)
+    }
+    pub fn loop_execution_prompt(&self,request_id:&str)->StoreResult<String> {
+        let conn=self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.query_row("SELECT prompt FROM loop_execution_prompts WHERE request_id=?1",params![request_id],|r|r.get(0))?)
+    }
+    /// Delivery-only retry delay preserves the answer and occurrence identity.
+    /// Exponential delay starts at one minute and caps at one hour, persisted
+    /// through the append-only failure journal rather than process memory.
+    pub fn loop_delivery_retry_ready(&self,request_id:&str,now_ms:i64)->StoreResult<bool> {
+        let conn=self.conn.lock().expect("store mutex poisoned");
+        let (count,last):(i64,Option<i64>)=conn.query_row("SELECT COUNT(*),MAX(observed_at_ms) FROM loop_occurrence_failures WHERE request_id=?1 AND stage='delivery'",params![request_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let delay=60_000_i64.saturating_mul(1_i64 << count.saturating_sub(1).clamp(0,6)).min(3_600_000);
+        Ok(last.is_none_or(|last|now_ms>=last.saturating_add(delay)))
     }
     pub fn save_loop_answer(&self, request_id: &str, answer: &str) -> StoreResult<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
@@ -230,5 +250,34 @@ impl Store {
             .query_map(params![since_ms, limit as i64], occurrence)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn execution_prompt_survives_reopen_without_leaking_into_audit() {
+        let dir=tempfile::tempdir().unwrap(); let path=dir.path().join("db");
+        let original="Use this literal fixture: {\"password\":\"synthetic-secret-shaped-value\"}";
+        {let store=Store::open(&path).unwrap();let audit=store.prepare_loop_occurrence("loop","occurrence",original).unwrap();assert!(!audit.prompt.contains("synthetic-secret-shaped-value"));}
+        let store=Store::open(&path).unwrap();
+        store.prepare_loop_occurrence("loop","occurrence","changed retry context").unwrap();
+        assert_eq!(store.loop_execution_prompt("occurrence").unwrap(),original);
+        assert!(!store.loop_occurrences_since(0,10).unwrap()[0].prompt.contains("synthetic-secret-shaped-value"));
+    }
+    #[test]
+    fn delivery_backoff_persists_and_caps_without_advancing_occurrence() {
+        let dir=tempfile::tempdir().unwrap(); let path=dir.path().join("db");
+        let store=Store::open(&path).unwrap();
+        store.prepare_loop_occurrence("loop","occurrence","prompt").unwrap();
+        assert!(store.loop_delivery_retry_ready("occurrence",0).unwrap());
+        store.save_loop_answer("occurrence","answer").unwrap();
+        for _ in 0..10 {store.fail_loop_occurrence("occurrence","delivery unavailable",true,i64::MAX).unwrap();}
+        let last=store.loop_occurrence_failures("occurrence").unwrap().last().unwrap().2;
+        drop(store);let store=Store::open(&path).unwrap();
+        assert!(!store.loop_delivery_retry_ready("occurrence",last+3_599_999).unwrap());
+        assert!(store.loop_delivery_retry_ready("occurrence",last+3_600_000).unwrap());
+        assert_eq!(store.prepare_loop_occurrence("loop","occurrence","prompt").unwrap().answer.as_deref(),Some("answer"));
     }
 }

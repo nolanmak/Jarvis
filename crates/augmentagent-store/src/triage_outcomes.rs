@@ -57,12 +57,12 @@ pub struct TriageOutcomeReport {
 }
 
 fn outcome(status: &str, verb: Option<&str>, revised: bool) -> OwnerOutcome {
+    if status == "timed_out" { return OwnerOutcome::AgedOut; }
     match verb {
         Some("skip" | "reject" | "cancel") => OwnerOutcome::Skipped,
         Some("approve" | "send" | "send_now" | "schedule") if revised => OwnerOutcome::Revised,
         Some("approve" | "send" | "send_now" | "schedule") => OwnerOutcome::Approved,
         Some("revise") => OwnerOutcome::Revised,
-        _ if status == "timed_out" => OwnerOutcome::AgedOut,
         _ => OwnerOutcome::Unresolved,
     }
 }
@@ -192,4 +192,18 @@ mod tests {
         assert_eq!(report.disagreement_review_set.len(), 1);
         assert_ne!(report.disagreement_review_set[0].action_id, "edited");
     }
+    #[test]
+    fn expired_revision_is_aged_out_not_precision_success() {
+        let dir=tempfile::tempdir().unwrap();
+        let store=Store::open(dir.path().join("db")).unwrap();
+        add(&store,"expired-revision","flag","timed_out",100);
+        decision(&store,"expired-revision","revise","revised");
+        let report=store.triage_outcome_report(0,10).unwrap();
+        assert_eq!(report.flagged.aged_out,1);
+        assert_eq!(report.flagged.revised,0);
+        assert_eq!(report.flagged_then_aged_out,1);
+        assert_eq!(report.observed_owner_resolutions,0);
+        assert_eq!(report.flag_precision,None);
+    }
+
 }

@@ -734,9 +734,16 @@ impl LoopScheduler {
             Err(error) => { warn!(loop_id = %l.id, "loop journal unavailable: {error:#}"); return; }
         };
         if occurrence.state == "delivered" { return; }
+        match self.store.loop_delivery_retry_ready(&request_id,now_millis()) {
+            Ok(true)=>{}, Ok(false)=>return,
+            Err(error)=>{warn!(loop_id=%l.id,"delivery retry journal unavailable: {error}");return;}
+        }
         let result = match occurrence.answer {
             Some(answer) => Ok(answer),
-            None => self.runner.run_prompt(&request_id, &l.owner, &occurrence.prompt, l.model_profile.as_deref()).await,
+            None => match self.store.loop_execution_prompt(&request_id) {
+                Ok(prompt)=>self.runner.run_prompt(&request_id, &l.owner, &prompt, l.model_profile.as_deref()).await,
+                Err(error)=>Err(error.into()),
+            },
         };
         match result {
             Ok(raw_answer) => {
@@ -1128,6 +1135,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_runner_receives_original_prompt_while_history_is_masked() {
+        let (store,_file)=tmp_store();
+        let prompt="Inspect literal fixture {\"password\":\"synthetic-secret-shaped-value\"}";
+        store.create_user_loop_with_model("owner","discord","channel",60,prompt,None,None,None,None,false).unwrap();
+        let store=Arc::new(store);
+        let runner=Arc::new(CoverageRunner { replies:std::sync::Mutex::new(std::collections::VecDeque::from(["done".into()])),prompts:std::sync::Mutex::new(vec![]) });
+        let poster=Arc::new(CoveragePoster {posts:std::sync::Mutex::new(vec![]),fail_once:std::sync::atomic::AtomicBool::new(false)});
+        let row=store.list_active_user_loops().unwrap().remove(0);
+        LoopScheduler::new(store.clone(),runner.clone(),poster).run_one(&row,0).await;
+        assert!(runner.prompts.lock().unwrap()[0].starts_with(prompt));
+        assert!(!store.loop_occurrences_since(0,10).unwrap()[0].prompt.contains("synthetic-secret-shaped-value"));
+    }
+
+    #[tokio::test]
     async fn scheduled_coverage_suppresses_exact_duplicates_but_not_new_evidence() {
         let (store, _file) = tmp_store();
         store.create_user_loop_with_model("owner", "discord", "channel", 60, "Report synthetic changes", None, None, None, None, false).unwrap();
@@ -1185,6 +1206,9 @@ mod tests {
         assert!(row.last_run_ms.is_none(), "failed delivery retains occurrence identity");
         assert!(store.loop_coverage(&row.id, 10).unwrap().is_empty());
         LoopScheduler::new(store.clone(), runner.clone(), poster.clone()).run_one(&row, 0).await;
+        assert!(poster.posts.lock().unwrap().is_empty(),"immediate restart must retain delivery backoff");
+        store.with_conn(|conn| {conn.execute("UPDATE loop_occurrence_failures SET observed_at_ms=observed_at_ms-60001",[])?;Ok(())}).unwrap();
+        LoopScheduler::new(store.clone(), runner.clone(), poster.clone()).run_one(&row,0).await;
         assert_eq!(runner.prompts.lock().unwrap().len(), 1, "no model repeat after persisted answer");
         assert_eq!(poster.posts.lock().unwrap().len(), 1);
         assert_eq!(store.loop_coverage(&row.id, 10).unwrap().len(), 1);

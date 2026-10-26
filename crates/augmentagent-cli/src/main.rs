@@ -8876,6 +8876,20 @@ async fn run_stale_draft_sweep(
     }
 }
 
+fn optional_digest_rows<T,E:std::fmt::Display>(ctx:&mut String,section:&str,result:std::result::Result<Vec<T>,E>)->Vec<T> {
+    match result { Ok(rows)=>rows,Err(error)=>{ctx.push_str(&format!("{section} unavailable: {error}\n"));vec![]} }
+}
+
+#[test]
+fn optional_digest_query_failure_preserves_other_sections() {
+    let mut ctx=String::from("Inbox evidence\n");
+    let rows:Vec<String>=optional_digest_rows(&mut ctx,"Retry failure evidence",Err("malformed row"));
+    assert!(rows.is_empty());
+    let rows=optional_digest_rows(&mut ctx,"Loop evidence",Ok::<_,&str>(vec!["successful occurrence"]));
+    ctx.push_str(rows[0]);
+    assert!(ctx.contains("Inbox evidence") && ctx.contains("Retry failure evidence unavailable") && ctx.contains("successful occurrence"));
+}
+
 async fn run_digest(
     cli: &Cli,
     store: Arc<Store>,
@@ -8916,7 +8930,7 @@ async fn run_digest(
             ctx.push_str(&format!("- {status}: {n}\n"));
         }
     }
-    let triage_outcomes = store.triage_outcome_report(since_ms, 25)?;
+
     ctx.push_str("\n## Autoship native reviewer canary\n");
     match self_improve::review_canary_summary() {
         Ok(summary) => ctx.push_str(&format!("{summary}\n")),
@@ -8928,6 +8942,8 @@ async fn run_digest(
         Err(error) => ctx.push_str(&format!("Workflow evidence unavailable: {error:#}\n")),
     }
     ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
+    match store.triage_outcome_report(since_ms,25) {
+        Ok(triage_outcomes) => {
     for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending)] {
         ctx.push_str(&format!("- {cohort}: approved {}, revised {}, skipped {}, aged out {}, unresolved {}\n",
             counts.approved, counts.revised, counts.skipped, counts.aged_out, counts.unresolved));
@@ -8942,15 +8958,18 @@ async fn run_digest(
         ctx.push_str(&format!("- Disagreement review case {}: {:?}; {}. Review only; no automatic policy change.\n",
             case.action_id, case.owner_outcome, case.evidence));
     }
+        },
+        Err(error) => ctx.push_str(&format!("Triage outcome evidence unavailable: {error}\n")),
+    }
     ctx.push_str("\n## Retry failure memory (latest 25; full history retained)\n");
-    for failure in store.email_retry_failures_since(since_ms, 25)? {
+    for failure in optional_digest_rows(&mut ctx,"Retry failure evidence",store.email_retry_failures_since(since_ms, 25)) {
         ctx.push_str(&format!("- action {} / message {}: attempt {}, guard {}, failure {}\n",
             failure.action_id, failure.message_id, failure.attempt_n,
             truncate(&failure.guard, 80), truncate(&failure.failure_class, 240)));
     }
     ctx.push_str("\n## Scheduled loop progress (latest 25 occurrences; full evidence retained)\n");
-    for occurrence in store.loop_occurrences_since(since_ms, 25)? {
-        let coverage = store.loop_coverage(&occurrence.loop_id, 5)?;
+    for occurrence in optional_digest_rows(&mut ctx,"Scheduled loop evidence",store.loop_occurrences_since(since_ms, 25)) {
+        let coverage = optional_digest_rows(&mut ctx,&format!("Loop {} coverage",occurrence.loop_id),store.loop_coverage(&occurrence.loop_id, 5));
         ctx.push_str(&format!("- loop {} / occurrence {}: {}; covered observations shown {}; outcome {}\n",
             occurrence.loop_id, occurrence.request_id, occurrence.state, coverage.len(),
             truncate(occurrence.error.as_deref().or(occurrence.answer.as_deref()).unwrap_or("pending"), 300)));
