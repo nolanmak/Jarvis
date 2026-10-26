@@ -852,3 +852,5 @@ pub mod live_config;
 mod live_media;
 
 pub mod live_usage;
+
+pub mod live_goodbye;

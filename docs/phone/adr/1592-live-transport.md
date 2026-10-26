@@ -88,6 +88,23 @@ implementation must specify a bounded recovery policy and test late audio after
 clearing, short backchannels, and longer corrections. Do not claim the prompt
 alone guarantees immediate yielding or that a returned cleared mark was heard.
 
+The local goodbye shortcut accumulates at most 512 bytes of caller transcript,
+starting a new candidate after an 800 ms transcript-time gap. An exact supported
+goodbye (including “that's all, thanks”) must remain unchanged for 1200 ms;
+energetic inbound mu-law audio postpones closing for another 1200 ms. Assistant
+text, quoted/questioned words, oversized candidates and longer phrases do not
+trigger it. This is a conservative application heuristic, not a provider turn
+boundary or proof that speech recognition is correct. Test background noise,
+paused continuations and the actual <=5 s hangup requirement in the canary.
+
+On a recognized goodbye, persist the stop request and `owner_goodbye`, clear
+Twilio's queued audio, and close its socket within a shared two-second budget.
+The independent cleanup watchdog retains the stop request if transport shutdown
+fails. OpenAI finalization follows separately so it cannot delay the phone
+hangup. Native jobs and their original-chat delivery remain active. The socket
+fixture verifies that call closure precedes a deliberately delayed provider
+finalization; it does not establish PSTN hangup latency.
+
 Fixtures pin documented message shapes with synthetic identities/audio; they
 are not captures from this account and cannot establish live compatibility.
 The signed HTTP/WSS integration tests must prove zero sessions/backend work on

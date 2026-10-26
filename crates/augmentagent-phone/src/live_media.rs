@@ -117,6 +117,7 @@ async fn conversation(
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut final_event = None;
     let mut trigger = "error";
+    let mut goodbye = crate::live_goodbye::LiveGoodbye::default();
     let outcome:Result<(),LiveError>=async {
         let mut coordinator = LiveCall::new(service.clone(), &call.id, &session_id)?;
         loop {
@@ -125,6 +126,21 @@ async fn conversation(
                     if service.stopping.load(Ordering::SeqCst) {trigger="app_stop";return Ok(());}
                     service.authorize_call(&call.id).map_err(|_|LiveError::Access)?;
                     if service.clock.now_ms().saturating_sub(call.created_ms)>=call.max_duration_seconds.saturating_mul(1000) {trigger="duration_limit";return Ok(());}
+                    if goodbye.ready() {
+                        trigger="owner_goodbye";
+                        service.store.phone_record_end_reason(&call.id,"owner_goodbye",service.clock.now_ms())
+                            .map_err(|_|LiveError::Unavailable)?;
+                        // Persist the hangup request before network I/O so the
+                        // independent watchdog can finish it after disconnect.
+                        service.store.phone_request_stop(&call.owner,&call.id)
+                            .map_err(|_|LiveError::Unavailable)?;
+                        let clear=media.clear().map_err(|_|LiveError::Protocol)?;
+                        tokio::time::timeout(Duration::from_secs(2),async {
+                            send(socket,Message::Text(clear.to_string().into())).await?;
+                            send(socket,Message::Close(None)).await
+                        }).await.map_err(|_|LiveError::ConnectionLost)??;
+                        return Ok(());
+                    }
                     for result in coordinator.pending_results()? {
                         if coordinator.reply_pending(&result.delegation_id) {continue;}
                         let content=if result.result.len()<=500 {result.result.as_str()} else {"There's an update on your task in our chat. The full result is available there."};
@@ -135,7 +151,7 @@ async fn conversation(
                 incoming=socket.recv()=>{
                     match incoming {
                         Some(Ok(Message::Text(text)))=>match media.receive(&text).map_err(|_|LiveError::Protocol)? {
-                            StreamInput::Audio(audio)=>connection.send_audio(&audio).await?,
+                            StreamInput::Audio(audio)=>{goodbye.audio(&audio);connection.send_audio(&audio).await?;},
                             StreamInput::Stopped=>{trigger="twilio_stop";return Ok(());},
                             StreamInput::Ignored|StreamInput::Played{..}|StreamInput::Cleared=>{},
                             StreamInput::Started=>return Err(LiveError::Protocol),
@@ -162,11 +178,15 @@ async fn conversation(
                                 Err(LiveError::ConnectionLost)
                             } else {Ok(())};
                         },
-                        _=>match coordinator.event(&input)? {
+                        _=>{
+                            let action=coordinator.event(&input)?;
+                            goodbye.observe(&input);
+                            match action {
                             LiveAction::Clarify{delegation_id}=>{
                                 connection.commentary(&delegation_id,"Please ask the caller to repeat the complete request; the transcript was incomplete and no task was started.").await?;
                             }
                             LiveAction::Queued{..}|LiveAction::None=>{},
+                            }
                         },
                     }
                 }

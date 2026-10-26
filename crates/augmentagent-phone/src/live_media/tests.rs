@@ -432,3 +432,48 @@ async fn lost_provider_socket_has_unknown_usage_and_incomplete_finalization() {
     assert_eq!(rows[0].error.as_deref(), Some("connection_lost"));
     assert!(rows[0].finalization_error.is_some());
 }
+
+#[tokio::test]
+async fn owner_goodbye_closes_twilio_before_provider_finalization_and_keeps_tasks() {
+    let provider=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint=format!("ws://{}/",provider.local_addr().unwrap());
+    let (finalize_tx,finalize_rx)=tokio::sync::oneshot::channel();
+    let backend=tokio::spawn(async move {
+        let (tcp,_)=provider.accept().await.unwrap();
+        let mut ws=accept_async(tcp).await.unwrap();
+        let _=ws.next().await;
+        ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        for event in [
+            json!({"type":"session.input_transcript.delta","event_id":"task","delta":"Look up the weather.","start_ms":0,"end_ms":100}),
+            json!({"type":"session.delegation.created","event_id":"delegate","delegation":{"type":"delegation","target":"client","id":"task-one"},"offset_ms":110}),
+            json!({"type":"session.input_transcript.delta","event_id":"bye-one","delta":"That's all,","start_ms":2000,"end_ms":2300}),
+            json!({"type":"session.input_transcript.delta","event_id":"bye-two","delta":" thanks.","start_ms":2300,"end_ms":2500}),
+        ] { ws.send(Message::Text(event.to_string().into())).await.unwrap(); }
+        let close=ws.next().await.unwrap().unwrap();
+        let close:serde_json::Value=serde_json::from_str(close.to_text().unwrap()).unwrap();
+        assert_eq!(close["type"],"session.close");
+        finalize_rx.await.unwrap();
+        ws.send(Message::Text(json!({"type":"session.closed","event_id":"evt-close","reason":"close_requested","session":{"id":"live-test"},"usage":{"seconds":2}}).to_string().into())).await.unwrap();
+    });
+    let f=fixture(endpoint).await;
+    let (mut ws,_)=connect_async(request(&f,true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        loop { match ws.next().await {Some(Ok(Message::Close(_)))|None=>break,Some(Ok(_))=>{},other=>panic!("unexpected close: {other:?}") } }
+    }).await.expect("goodbye must close Twilio without waiting for slow OpenAI finalization");
+    assert!(f.service.store.phone_provider_call(&f.id).unwrap().stop_requested);
+    assert_eq!(f.service.store.phone_end_reason(&f.id).unwrap().as_deref(),Some("owner_goodbye"));
+    assert_eq!(f.service.store.phone_pending_dispatches().unwrap().len(),1);
+    assert!(f.service.store.phone_live_usage(1).unwrap()[0].trigger.is_none());
+    finalize_tx.send(()).unwrap();
+    backend.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2),async {
+        loop {
+            let rows=f.service.store.phone_live_usage(1).unwrap();
+            if rows[0].trigger.is_some() { assert_eq!(rows[0].trigger.as_deref(),Some("owner_goodbye")); break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(f.service.store.phone_pending_dispatches().unwrap().len(),1);
+}
