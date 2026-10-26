@@ -157,6 +157,37 @@ async fn revocation_prevents_dispatch_and_result_disclosure() {
     assert!(call.event(&delegation()).is_err());
     assert!(call.pending_results().is_err());
     assert!(f.store.phone_pending_dispatches().unwrap().is_empty());
+    struct NoDelivery;
+    #[async_trait]
+    impl augmentagent_phone::ingress::ConversationAgent for NoDelivery {
+        async fn answer(
+            &self,
+            _: &augmentagent_store::phone::PhoneCall,
+            _: &str,
+            _: &str,
+            _: augmentagent_phone::ingress::SpeechSender,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+            panic!("no reasoning");
+        }
+        async fn interrupted(
+            &self,
+            _: &augmentagent_store::phone::PhoneCall,
+            _: &str,
+        ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+            Ok(())
+        }
+        async fn call_ended(
+            &self,
+            _: &augmentagent_store::phone::PhoneCall,
+            _: &str,
+            _: &str,
+        ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+            panic!("revoked chat must receive no transcript");
+        }
+    }
+    f.service.deliver_live_history(&NoDelivery).await.unwrap();
+    assert!(f.store.phone_live_history_pending(&f.id).unwrap());
 }
 #[tokio::test]
 async fn only_correlated_provider_ack_releases_live_result() {
@@ -217,5 +248,62 @@ async fn live_enqueue_wakes_existing_worker_without_waiting_for_recovery_poll() 
         .await
         .expect("Live intent must wake native worker before five-second recovery poll");
     drop(call);
+    f.runtime.take().unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn transcript_delivery_retries_off_audio_path_and_survives_call_end() {
+    use augmentagent_phone::ingress::{AgentError, ConversationAgent, SpeechSender};
+    use augmentagent_store::phone::PhoneCall;
+    use tokio_util::sync::CancellationToken;
+    struct Agent {
+        attempts: std::sync::Mutex<Vec<(String, String)>>,
+        delivered: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl ConversationAgent for Agent {
+        async fn answer(
+            &self,
+            _: &PhoneCall,
+            _: &str,
+            _: &str,
+            _: SpeechSender,
+            _: CancellationToken,
+        ) -> Result<String, AgentError> {
+            panic!("no voice reasoning turn");
+        }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn call_ended(&self, _: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+            let mut attempts = self.attempts.lock().unwrap();
+            attempts.push((key.into(), text.into()));
+            if attempts.len() == 1 {
+                return Err(AgentError);
+            }
+            self.delivered.notify_one();
+            Ok(())
+        }
+    }
+    let agent = Arc::new(Agent {
+        attempts: Default::default(),
+        delivered: tokio::sync::Notify::new(),
+    });
+    let mut f = fixture_with_agent(Some(agent.clone())).await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    call.event(&transcript()).unwrap();
+    call.event(&transcript()).unwrap();
+    assert!(f.store.phone_live_history_pending(&f.id).unwrap());
+    drop(call);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        agent.delivered.notified(),
+    )
+    .await
+    .expect("durable transcript retry should run after Live ends");
+    let attempts = agent.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    assert_eq!(attempts[0].1.matches("Check my calendar.").count(), 1);
     f.runtime.take().unwrap().shutdown().await.unwrap();
 }

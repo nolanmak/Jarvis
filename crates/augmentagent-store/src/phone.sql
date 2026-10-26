@@ -198,3 +198,22 @@ CREATE TABLE IF NOT EXISTS phone_voice_backends (
     call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
     backend TEXT NOT NULL CHECK(backend IN ('conversation_relay','openai_live'))
 );
+
+-- Private transcript outbox. Text is erased after durable chat acceptance;
+-- fingerprints retain replay protection without retaining another transcript.
+CREATE TABLE IF NOT EXISTS phone_live_history_batches (
+    id TEXT PRIMARY KEY,
+    attempt_order INTEGER NOT NULL DEFAULT 0,
+    call_id TEXT NOT NULL REFERENCES phone_calls(id),
+    text TEXT,
+    delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1))
+);
+CREATE TABLE IF NOT EXISTS phone_live_transcripts (
+    call_id TEXT NOT NULL REFERENCES phone_live_sessions(call_id),
+    event_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    user INTEGER NOT NULL CHECK(user IN (0,1)),
+    text TEXT,
+    batch_id TEXT REFERENCES phone_live_history_batches(id),
+    PRIMARY KEY(call_id,event_id)
+);

@@ -54,6 +54,7 @@ impl PhoneRuntime {
             stop.clone(),
         ));
         let memory = tokio::spawn(memory_worker(service.clone(), agent.clone(), stop.clone()));
+        let history = tokio::spawn(history_worker(service.clone(), agent.clone(), stop.clone()));
         let proposals = tokio::spawn(proposal_worker(service.clone(), agent.clone(), stop.clone()));
         let router = crate::ingress::router(service.clone(), auth, agent);
         let listener_stop = stop.clone();
@@ -77,7 +78,7 @@ impl PhoneRuntime {
             service,
             tools,
             stop,
-            tasks: vec![http, watchdog, memory, proposals, dispatches],
+            tasks: vec![http, watchdog, memory, proposals, dispatches, history],
         })
     }
     pub fn tools(&self) -> &Arc<ToolServer> {
@@ -279,6 +280,41 @@ async fn watchdog(
     if failure {
         Err(RuntimeError::Task)
     } else {
+        Ok(())
+    }
+}
+
+// Network delivery never runs on the audio loop or the native task worker.
+async fn history_worker(
+    service: Arc<PhoneService>,
+    agent: Arc<dyn ConversationAgent>,
+    stop: CancellationToken,
+) -> Result<(), RuntimeError> {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = tick.tick() => {},
+        }
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = service.deliver_live_history(agent.as_ref()) => {},
+        }
+    }
+}
+
+impl PhoneService {
+    pub async fn deliver_live_history(&self, agent: &dyn ConversationAgent) -> Result<(), Error> {
+        for batch in self.store.phone_live_history_batches()? {
+            let call = self.store.phone_provider_call(&batch.call_id)?;
+            // Call completion is allowed; revoked or changed chat authority is not.
+            if self.authorize_call_origin(&call).is_err() { continue; }
+            if matches!(tokio::time::timeout(Duration::from_secs(5),
+                agent.mirror_transcript(&call, &batch.key, &batch.text)).await, Ok(Ok(()))) {
+                self.store.phone_live_history_delivered(&call.id, &batch.key)?;
+            }
+        }
         Ok(())
     }
 }

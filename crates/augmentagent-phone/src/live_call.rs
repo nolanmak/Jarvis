@@ -46,8 +46,28 @@ impl LiveCall {
             .authorize_call(&self.call_id)
             .map_err(|_| LiveError::Access)?;
         match input {
-            LiveInput::Transcript { .. } => {
+            LiveInput::Transcript {
+                event_id,
+                user,
+                text,
+                start_ms,
+                end_ms,
+            } => {
                 self.context.push(input)?;
+                self.service
+                    .store
+                    .phone_append_live_transcript(
+                        &self.call_id,
+                        &self.session_id,
+                        &augmentagent_store::phone::LiveTranscript {
+                            event_id: event_id.clone(),
+                            user: *user,
+                            text: text.clone(),
+                            start_ms: *start_ms,
+                            end_ms: *end_ms,
+                        },
+                    )
+                    .map_err(|_| LiveError::Unavailable)?;
             }
             LiveInput::Delegation { id, offset_ms } => {
                 let Some(description) = self.context.request(*offset_ms)? else {

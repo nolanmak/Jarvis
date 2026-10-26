@@ -102,6 +102,11 @@ pub trait ConversationAgent: Send + Sync {
     async fn call_ended(&self, _call: &PhoneCall, _key: &str, _text: &str) -> Result<(), AgentError> {
         Err(AgentError)
     }
+    /// Accept a transcript batch into the same authenticated, idempotent chat
+    /// outbox as call notices. Generated text is not evidence of playback.
+    async fn mirror_transcript(&self, call: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+        self.call_ended(call, key, text).await
+    }
 }
 /// What a spoken system announcement says about a dispatched task (#1556):
 /// progress holds the silence clock, a result releases it. Carries task IDs.
