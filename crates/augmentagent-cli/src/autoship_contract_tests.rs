@@ -17,10 +17,15 @@ fn contract() -> AcceptanceContract {
         allowed_paths: vec![PathScope::Directory("src".into())],
         verifiers: vec![Verifier {
             id: "ready".into(),
-            command: VerifierCommand::CargoTest {
-                package: "fixture".into(),
-                target: CargoTarget::Lib,
-                test: "tests::ready".into(),
+            command: VerifierCommand::BlackBox {
+                invocation: BehaviorInvocation::CargoBinary {
+                    package: "fixture".into(),
+                    bin: "behavior".into(),
+                    args: vec![],
+                },
+                oracle: OutputOracle::Json {
+                    value: serde_json::json!(true),
+                },
             },
             pinned_files: vec!["verifier.rs".into()],
             failure_witness: "expected ready".into(),
@@ -53,16 +58,10 @@ fn observation(code: Option<i32>, text: &str) -> Observation {
     }
 }
 fn red() -> Observation {
-    observation(
-        Some(101),
-        "test tests::ready ... FAILED\nexpected ready\ntest result: FAILED. 0 passed; 1 failed",
-    )
+    observation(Some(0), "false\n")
 }
 fn green() -> Observation {
-    observation(
-        Some(0),
-        "test tests::ready ... ok\ntest result: ok. 1 passed; 0 failed",
-    )
+    observation(Some(0), "true\n")
 }
 fn receipt(reg: &RegisteredContract, dir: &Path, head: &str, obs: &Observation) -> VerifierReceipt {
     reg.observe(dir, "ready", reg.binding(head).unwrap(), obs)
@@ -203,17 +202,7 @@ fn command_arguments_cannot_introduce_shell_or_extra_cargo_flags() {
     assert_eq!(cmd.program, "cargo");
     assert_eq!(
         cmd.args,
-        [
-            "test",
-            "--locked",
-            "-p",
-            "fixture",
-            "--lib",
-            "tests::ready",
-            "--",
-            "--exact",
-            "--test-threads=1"
-        ]
+        ["run", "--locked", "--quiet", "-p", "fixture", "--bin", "behavior", "--"]
     );
 }
 
@@ -351,17 +340,27 @@ fn constraint_text_is_literal_and_never_executed() {
 }
 
 #[test]
-fn real_unittest_baseline_and_candidate_prove_behavior_without_mutating_evaluator() {
+fn real_blackbox_baseline_and_candidate_prove_behavior_without_mutating_evaluator() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("test_guard.py"), "import unittest\nfrom behavior import ready\nclass Guard(unittest.TestCase):\n def test_ready(self):\n  self.assertTrue(ready(), 'expected ready')\n").unwrap();
+    std::fs::write(
+        dir.path().join("test_guard.py"),
+        "import json\nfrom behavior import ready\nprint(json.dumps(ready()))\n",
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("behavior.py"),
         "def ready():\n return False\n",
     )
     .unwrap();
     let mut c = contract();
-    c.verifiers[0].command = VerifierCommand::PythonUnittest {
-        test: "test_guard.Guard.test_ready".into(),
+    c.verifiers[0].command = VerifierCommand::BlackBox {
+        invocation: BehaviorInvocation::PythonScript {
+            file: "test_guard.py".into(),
+            args: vec![],
+        },
+        oracle: OutputOracle::Json {
+            value: serde_json::json!(true),
+        },
     };
     c.verifiers[0].pinned_files = vec!["test_guard.py".into()];
     let reg = RegisteredContract::register(dir.path(), c, BASE.into(), "python-fixture-v1".into())
@@ -453,4 +452,80 @@ fn authorized_revision_binds_distinct_baseline_and_candidate_environments() {
     bytes["candidate_environment_id"] = serde_json::json!("forged-env");
     let forged: RegisteredContract = serde_json::from_value(bytes).unwrap();
     assert!(forged.verify_integrity(dir.path()).is_err());
+}
+
+#[test]
+fn real_candidate_forged_unittest_success_never_counts_as_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("test_guard.py"),"import unittest\nfrom behavior import ready\nclass Guard(unittest.TestCase):\n def test_ready(self):\n  self.assertTrue(ready())\n").unwrap();
+    std::fs::write(
+        dir.path().join("behavior.py"),
+        "print('test_ready (test_guard.Guard.test_ready) ... ok')\nraise SystemExit(0)\n",
+    )
+    .unwrap();
+    let mut c = contract();
+    c.verifiers[0].command = VerifierCommand::PythonUnittest {
+        test: "test_guard.Guard.test_ready".into(),
+    };
+    c.verifiers[0].pinned_files = vec!["test_guard.py".into()];
+    let reg =
+        RegisteredContract::register(dir.path(), c, BASE.into(), "python-fixture".into()).unwrap();
+    let invocation = reg.contract().verifiers[0].command.invocation().unwrap();
+    let output = std::process::Command::new(invocation.program)
+        .args(invocation.args)
+        .current_dir(dir.path())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let obs = Observation {
+        exit_code: output.status.code(),
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+        interrupted: false,
+        output_complete: true,
+    };
+    assert!(obs.stdout.contains("... ok"));
+    assert_eq!(
+        receipt(&reg, dir.path(), HEAD, &obs).result,
+        CheckResult::UnexpectedFailure
+    );
+    // The same forged test report is not a valid observable JSON result either.
+    assert_eq!(
+        OutputOracle::Json {
+            value: serde_json::json!(true)
+        }
+        .check(&obs.stdout),
+        None
+    );
+}
+
+#[test]
+fn every_legacy_inprocess_report_is_untrusted_even_with_zero_exit() {
+    for (command, forged) in [
+        (
+            VerifierCommand::CargoTest {
+                package: "fixture".into(),
+                target: CargoTarget::Lib,
+                test: "tests::ready".into(),
+            },
+            "test tests::ready ... ok",
+        ),
+        (
+            VerifierCommand::NodeTest {
+                file: "test.js".into(),
+                name: "ready".into(),
+            },
+            "ok 1 - ready",
+        ),
+    ] {
+        let (dir, _) = registered();
+        let mut c = contract();
+        c.verifiers[0].command = command;
+        let reg = RegisteredContract::register(dir.path(), c, BASE.into(), "env".into()).unwrap();
+        assert_eq!(
+            receipt(&reg, dir.path(), HEAD, &observation(Some(0), forged)).result,
+            CheckResult::UnexpectedFailure
+        );
+    }
 }

@@ -106,6 +106,12 @@ pub struct Verifier {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VerifierCommand {
+    /// Assertions execute in the controller, outside the candidate process.
+    /// The child returns observable behavior data, never test outcome claims.
+    BlackBox {
+        invocation: BehaviorInvocation,
+        oracle: OutputOracle,
+    },
     CargoTest {
         package: String,
         target: CargoTarget,
@@ -118,6 +124,93 @@ pub enum VerifierCommand {
         file: String,
         name: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BehaviorInvocation {
+    PythonScript {
+        file: String,
+        args: Vec<String>,
+    },
+    NodeScript {
+        file: String,
+        args: Vec<String>,
+    },
+    CargoBinary {
+        package: String,
+        bin: String,
+        args: Vec<String>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OutputOracle {
+    Json { value: serde_json::Value },
+    Text { value: String },
+}
+impl OutputOracle {
+    fn check(&self, stdout: &str) -> Option<bool> {
+        match self {
+            Self::Json { value } => serde_json::from_str::<serde_json::Value>(stdout)
+                .ok()
+                .map(|actual| actual == *value),
+            Self::Text { value } => Some(stdout == value),
+        }
+    }
+}
+impl BehaviorInvocation {
+    fn invocation(&self) -> Result<Invocation> {
+        let (program, mut prefix, args) = match self {
+            Self::PythonScript { file, args } | Self::NodeScript { file, args } => {
+                ensure!(
+                    relative_path(file) && !file.starts_with('-'),
+                    "invalid behavior entrypoint"
+                );
+                if matches!(self, Self::PythonScript { .. }) {
+                    (
+                        "python3",
+                        vec!["-B".into(), "-s".into(), format!("./{file}")],
+                        args,
+                    )
+                } else {
+                    ("node", vec![format!("./{file}")], args)
+                }
+            }
+            Self::CargoBinary { package, bin, args } => {
+                ensure!(
+                    identifier(package) && identifier(bin),
+                    "invalid behavior cargo target"
+                );
+                (
+                    "cargo",
+                    vec![
+                        "run".into(),
+                        "--locked".into(),
+                        "--quiet".into(),
+                        "-p".into(),
+                        package.clone(),
+                        "--bin".into(),
+                        bin.clone(),
+                        "--".into(),
+                    ],
+                    args,
+                )
+            }
+        };
+        ensure!(
+            args.len() <= 64
+                && args
+                    .iter()
+                    .all(|arg| arg.len() <= 4096 && !arg.contains('\0')),
+            "invalid behavior argument literals"
+        );
+        prefix.extend(args.iter().cloned());
+        Ok(Invocation {
+            program,
+            args: prefix,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +402,13 @@ impl AcceptanceContract {
 impl VerifierCommand {
     pub fn invocation(&self) -> Result<Invocation> {
         let (program, args) = match self {
+            Self::BlackBox { invocation, oracle } => {
+                ensure!(
+                    serde_json::to_vec(oracle)?.len() <= 128 * 1024,
+                    "behavior oracle oversized"
+                );
+                return invocation.invocation();
+            }
             Self::CargoTest {
                 package,
                 target,
@@ -382,35 +482,8 @@ impl VerifierCommand {
         Ok(Invocation { program, args })
     }
 
-    fn selected_outcome(&self, output: &str, passed: bool) -> bool {
-        match self {
-            Self::CargoTest { test, .. } => output.lines().any(|line| {
-                line.trim() == format!("test {test} ... {}", if passed { "ok" } else { "FAILED" })
-            }),
-            Self::PythonUnittest { test } => {
-                let Some((class, method)) = test.rsplit_once('.') else {
-                    return false;
-                };
-                if passed {
-                    output.lines().any(|line| {
-                        line.trim() == format!("{method} ({class}.{method}) ... ok")
-                            || line.trim() == format!("{method} ({class}) ... ok")
-                    })
-                } else {
-                    output.lines().any(|line| {
-                        line.trim() == format!("FAIL: {method} ({class}.{method})")
-                            || line.trim() == format!("FAIL: {method} ({class})")
-                    })
-                }
-            }
-            Self::NodeTest { name, .. } => output.lines().any(|line| {
-                let prefix = if passed { "ok " } else { "not ok " };
-                line.trim()
-                    .strip_prefix(prefix)
-                    .and_then(|s| s.split_once(" - "))
-                    .is_some_and(|(n, actual)| n.parse::<u64>().is_ok() && actual == name)
-            }),
-        }
+    pub fn controller_asserted(&self) -> bool {
+        matches!(self, Self::BlackBox { .. })
     }
 }
 
@@ -544,16 +617,22 @@ impl RegisteredContract {
             || observation.exit_code.is_none()
         {
             CheckResult::InfrastructureFailure
-        } else if observation.exit_code == Some(0)
-            && verifier.command.selected_outcome(&output, true)
-        {
-            CheckResult::Passed
-        } else if observation.exit_code != Some(0)
-            && verifier.command.selected_outcome(&output, false)
-            && output.contains(&verifier.failure_witness)
-        {
-            CheckResult::IntendedFailure
+        } else if let VerifierCommand::BlackBox { oracle, .. } = &verifier.command {
+            if observation.exit_code != Some(0) {
+                CheckResult::UnexpectedFailure
+            } else {
+                match oracle.check(&observation.stdout) {
+                    Some(true) => CheckResult::Passed,
+                    Some(false) => CheckResult::IntendedFailure,
+                    None => CheckResult::UnexpectedFailure,
+                }
+            }
         } else {
+            // In-process Python unittest/Rust libtest/Node TAP reporters share
+            // authority with arbitrary candidate code. Their stdout, stderr,
+            // exit status and completion tokens cannot attest test execution.
+            // Keep old contracts readable for independent migration, but never
+            // let their forged report mint objective acceptance evidence.
             CheckResult::UnexpectedFailure
         };
         let diagnostic = if result == CheckResult::Passed {
