@@ -279,6 +279,12 @@
       "failed": 0,
       "revision": "6896aaa6",
       "note": "Before adding calibration entry; full production inventory and bridge contract suite."
+    },
+    "notifications": {
+      "passed": 17,
+      "failed": 0,
+      "revision": "d45052b4",
+      "note": "Complete notify_tests suite, including registry coverage of retry escalation."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -290,5 +296,23 @@
     "Historical constraint mining and recurring replay promotion",
     "Full native/disposable-repository integrated soak and rollout",
     "24-hour, seven-day and 30-day operational observations"
+  ],
+  "known_review_findings": [
+    {
+      "severity": "P1",
+      "gap": "Source-less PR selection can starve newer PRs and reserved new-issue slots",
+      "status": "fix_in_progress"
+    },
+    {
+      "severity": "P1",
+      "gap": "In-process test success text can be forged by candidate code before assertions execute",
+      "status": "controller_asserted_out_of_process_behavior_protocol_in_progress"
+    },
+    {
+      "severity": "P1",
+      "gap": "Ignored candidate-local executable inputs such as Python bytecode can differ from reviewed source",
+      "status": "clean_committed_execution_fix_in_progress",
+      "evidence": "Independent review reproduced baseline red becoming green with same source and timestamp/size-matching ignored pyc."
+    }
   ]
 }
