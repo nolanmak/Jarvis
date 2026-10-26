@@ -116,6 +116,15 @@ pub(super) fn workflow_audit(
     id: &str,
     worktree: Option<&Path>,
 ) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    let generation = WorkflowStore::open(state)?.audit_generation(id)?;
+    let logger = open_audit_generation(state, id, worktree, generation)?;
+    logger.protected_health()?;
+    Ok(logger)
+}
+
+fn open_audit_generation(
+    state: &Path, id: &str, worktree: Option<&Path>, generation: i64,
+) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
     use std::os::unix::fs::PermissionsExt;
     let root = state
         .parent()
@@ -144,26 +153,55 @@ pub(super) fn workflow_audit(
     // Native worker runtime directories are independently allocated outside
     // protected control state; scope admission rejects overlapping roots.
     let key = format!("{:x}", Sha256::digest(id.as_bytes()));
+    let key = if generation == 0 { key } else { format!("{key}-generation-{generation}") };
     let logger = augmentagent_channel_core::AuditLogger::protected(
         root.join("logs").join(format!("{key}.jsonl")),
         root.join("anchors").join(format!("{key}.json")),
         &writes,
     )?;
-    logger.protected_health()?;
     Ok(Arc::new(logger))
+}
+
+fn acquire_audit_generation(
+    state: &Path, store: &mut WorkflowStore, lease: &Lease,
+    worktree: Option<&Path>, binding: &mut Binding, now: i64,
+) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    let generation = store.audit_generation(&lease.workflow)?;
+    let old = open_audit_generation(state, &lease.workflow, worktree, generation)?;
+    if old.protected_health().is_ok() { return Ok(old); }
+    // No model-authored evidence or elapsed-time heuristic authorizes recovery.
+    // This verifies the anchored old chain and kernel quiescence independently.
+    let proof = old.recovery_evidence(lease.generation)?;
+    store.validate_lease(lease, binding, now)?;
+    let recovery = serde_json::json!({"workflow":lease.workflow,
+        "old_audit_generation":generation,"new_audit_generation":generation+1,
+        "lease_generation":lease.generation,"interrupted":proof});
+    let next = open_audit_generation(state, &lease.workflow, worktree, generation+1)?;
+    next.protected_health()?;
+    next.record_controller(serde_json::json!({"actor":"controller",
+        "kind":"audit_generation_recovery","generation":lease.generation,
+        "workflow":lease.workflow,"recovery":recovery}))?;
+    *binding = store.recover_audit_generation(lease,generation,&recovery,now)?;
+    Ok(next)
 }
 
 pub(super) fn requires_reverification(repository: &str, pr: u64) -> Result<bool> {
     requires_reverification_at(&path(), repository, pr)
 }
 fn requires_reverification_at(path: &Path, repository: &str, pr: u64) -> Result<bool> {
+    requires_reverification_at_time(path, repository, pr, millis())
+}
+fn requires_reverification_at_time(path: &Path, repository: &str, pr: u64, now: i64) -> Result<bool> {
     let store = WorkflowStore::open(path)?;
     let Some(id) = store.resolve_pr(repository, pr)? else {
         return Ok(false);
     };
     Ok(store
         .snapshot(&id)?
-        .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"))
+        .is_some_and(|snapshot| snapshot.checkpoint.next.action == "reverify_candidate"
+            || (snapshot.checkpoint.next.action == "await_capacity"
+                && snapshot.checkpoint.next.eligible_at_ms <= now
+                && snapshot.lease_until_ms <= now)))
 }
 
 fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
@@ -601,7 +639,8 @@ impl WorkflowGuard {
                 now,
             )?;
         }
-        let audit = workflow_audit(state, &id, Some(start.worktree))?;
+        let audit = acquire_audit_generation(state, &mut store, &lease,
+            Some(start.worktree), &mut binding, now)?;
         let guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
@@ -732,10 +771,12 @@ impl WorkflowGuard {
         if !store.observation_available(now,1,observation_call_cap())? { return Ok(None); }
         let hash = format!("{:x}",Sha256::digest(key.as_bytes()));
         let id = format!("autoship-observation/{hash}");
-        let binding = Binding {head:hash.clone(),contract:"observation-v1".into(),evidence_hash:hash};
+        let mut binding = Binding {head:hash.clone(),contract:"observation-v1".into(),evidence_hash:hash};
         store.register(&id,"observational",binding.clone(),now)?;
         let Some(lease) = store.claim(&id,&format!("observation:{}",uuid::Uuid::new_v4()),now,LEASE_MS)? else { return Ok(None); };
-        let audit = workflow_audit(&state,&id,None)?;
+        // A recovered observation retains its generation binding across later leases.
+        binding = store.snapshot(&id)?.context("observation workflow missing")?.checkpoint.binding;
+        let audit = acquire_audit_generation(&state,&mut store,&lease,None,&mut binding,now)?;
         let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
@@ -1797,6 +1838,79 @@ mod tests {
         drop(store);
         assert!(requires_reverification_at(&path, "owner/repo", 42).unwrap());
         assert!(!requires_reverification_at(&path, "owner/repo", 43).unwrap());
+    }
+
+    #[test]
+    fn interrupted_audit_generation_reopens_without_erasing_failure_or_old_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&state).unwrap();
+        let id = durable::pr_workflow_id("owner/repo",42).unwrap();
+        let mut binding = Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(&id,"fix/recovery",binding.clone(),10).unwrap();
+        let old_lease = store.claim(&id,"old",11,1000).unwrap().unwrap();
+        store.record_review(&old_lease,&Review {reviewer:"prior".into(),binding:binding.clone(),approved:true,evidence:"old".into()},12).unwrap();
+        let old = open_audit_generation(&state,&id,None,0).unwrap();
+        old.require_run_resources().unwrap();
+        old.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed",
+            "workflow":id,"generation":old_lease.generation})).unwrap();
+        drop(old.begin_write().unwrap());
+        assert!(old.protected_health().is_err());
+        let lease = store.claim(&id,"new",1012,1000).unwrap().unwrap();
+        let current = acquire_audit_generation(&state,&mut store,&lease,None,&mut binding,1013).unwrap();
+        current.protected_health().unwrap();
+        assert!(old.protected_health().is_err(),"the failed sink must remain failed");
+        assert!(store.current_reviews(&id).unwrap().is_empty());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.next.action,"reverify_candidate");
+        drop(current);
+        drop(store);
+        workflow_audit(&state,&id,None).unwrap().protected_health().unwrap();
+    }
+
+    #[test]
+    fn audit_generation_recovery_does_not_accept_tampered_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&state).unwrap();
+        let id = durable::pr_workflow_id("owner/repo",42).unwrap();
+        let mut binding = Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(&id,"fix/recovery",binding.clone(),10).unwrap();
+        let old_lease = store.claim(&id,"old",11,1000).unwrap().unwrap();
+        let old = open_audit_generation(&state,&id,None,0).unwrap();
+        old.require_run_resources().unwrap();
+        old.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed",
+            "workflow":id,"generation":old_lease.generation})).unwrap();
+        drop(old.begin_write().unwrap());
+        let key = format!("{:x}",Sha256::digest(id.as_bytes()));
+        std::fs::write(dir.path().join("autoship-audit/logs").join(format!("{key}.jsonl")),b"forged").unwrap();
+        let lease = store.claim(&id,"new",1012,1000).unwrap().unwrap();
+        assert!(acquire_audit_generation(&state,&mut store,&lease,None,&mut binding,1013).is_err());
+        assert_eq!(store.audit_generation(&id).unwrap(),0);
+    }
+
+    #[test]
+    fn capacity_retry_is_admitted_only_when_due_and_unleased_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let id = durable::pr_workflow_id("owner/repo",42).unwrap();
+        store.register(&id,"fix/capacity",Binding {head:"head".into(),
+            contract:"contract".into(),evidence_hash:"evidence".into()},10).unwrap();
+        let lease = store.claim(&id,"worker",11,1000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,"owner/repo",42,12).unwrap();
+        let mut checkpoint = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.next = NextAction { reason:"resource_capacity".into(),
+            action:"await_capacity".into(),eligible_at_ms:500 };
+        store.checkpoint(&lease,&checkpoint,13).unwrap();
+        drop(store);
+        assert!(!requires_reverification_at_time(&path,"owner/repo",42,499).unwrap());
+        assert!(!requires_reverification_at_time(&path,"owner/repo",42,500).unwrap(),"live lease excludes repair");
+        assert!(requires_reverification_at_time(&path,"owner/repo",42,1012).unwrap());
+        let mut reopened = WorkflowStore::open(&path).unwrap();
+        let next = reopened.claim(&id,"next",1012,1000).unwrap().unwrap();
+        assert!(!requires_reverification_at_time(&path,"owner/repo",42,1013).unwrap());
+        reopened.release(&next,1014).unwrap();
+        assert!(requires_reverification_at_time(&path,"owner/repo",42,1015).unwrap());
     }
 
     #[test]
