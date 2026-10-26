@@ -190,6 +190,13 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS adopted_pr (
+                repository TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL,
+                record TEXT NOT NULL, first_seen INTEGER NOT NULL, observed_at INTEGER NOT NULL,
+                PRIMARY KEY(repository,pr));
+            CREATE TABLE IF NOT EXISTS adoption_event (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, repository TEXT NOT NULL, pr INTEGER NOT NULL,
+                head TEXT NOT NULL, at_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS pr_alias (
                 id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id));
             CREATE TABLE IF NOT EXISTS operation (
@@ -211,6 +218,56 @@ impl WorkflowStore {
                 generation INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, at_ms INTEGER NOT NULL);
             COMMIT;")?;
         Ok(Self { conn })
+    }
+
+    /// Ownership observation is separate from execution and approvals. A new
+    /// remote commit updates its head without resetting a live worker's lease.
+    pub fn observe_adoption(
+        &mut self,
+        repository: &str,
+        pr: u64,
+        head: &str,
+        record: &str,
+        now: i64,
+    ) -> Result<bool> {
+        ensure!(
+            !repository.is_empty() && pr > 0 && !head.is_empty(),
+            "adoption identity required"
+        );
+        ensure!(record.len() <= 128 * 1024, "adoption record too large");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT head FROM adopted_pr WHERE repository=?1 AND pr=?2",
+                params![repository, pr],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let changed = old.as_deref() != Some(head);
+        tx.execute("INSERT INTO adopted_pr(repository,pr,head,record,first_seen,observed_at) VALUES(?1,?2,?3,?4,?5,?5)
+            ON CONFLICT(repository,pr) DO UPDATE SET head=excluded.head,record=excluded.record,observed_at=excluded.observed_at",
+            params![repository,pr,head,record,now])?;
+        if changed {
+            tx.execute(
+                "INSERT INTO adoption_event(repository,pr,head,at_ms) VALUES(?1,?2,?3,?4)",
+                params![repository, pr, head, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn adopted_pr(&self, repository: &str, pr: u64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT record FROM adopted_pr WHERE repository=?1 AND pr=?2",
+                params![repository, pr],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Register authorized ownership only. Existing registration is not reset

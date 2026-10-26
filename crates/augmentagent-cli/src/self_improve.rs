@@ -37,6 +37,8 @@ use tracing::{info, warn};
 
 use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 
+#[path = "self_improve_adoption.rs"]
+mod adoption;
 #[path = "self_improve_source.rs"]
 mod source_reconcile;
 #[path = "self_improve_workflow.rs"]
@@ -1560,7 +1562,9 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
             .get("headRefName")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let Some(issue) = issue_from_branch(branch) else {
+        let adopted = adoption::lookup(&workflow::path(), &repository, pr).ok().flatten()
+            .filter(|owned| owned.branch == branch && owned.ready_for_review());
+        let Some(issue) = issue_from_branch(branch).or_else(|| adopted.as_ref().and_then(|owned| owned.source_issue)) else {
             continue;
         };
         if source_reconcile::reconcile(repo_root, pr, issue, dry_run).await
@@ -1598,7 +1602,7 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 pr,
                 head_sha.as_deref(),
                 record.as_ref(),
-            ),
+            ) || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue)),
             mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
                 Some("MERGEABLE") => Some(true),
                 Some("CONFLICTING") => Some(false),
@@ -3639,7 +3643,7 @@ async fn find_resumable_draft(
             "--search",
             "sort:created-asc",
             "--json",
-            "number,isDraft,headRefName,isCrossRepository,headRepositoryOwner",
+            "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences",
         ],
         repo_root,
     )
@@ -3690,7 +3694,24 @@ async fn find_resumable_draft(
     // #1006 — resolved once here because the closing sweep below needs it
     // too: closing a PR is a write, and the loop must not perform one on a
     // pull request it cannot prove is its own.
-    let owner = repo_owner_from_remote(repo_root).await;
+    let repository = workflow::canonical_repository(repo_root).await.ok()?;
+    let owner = repository.split('/').next().map(str::to_string);
+    let mut allowed = trusted_authors(repo_root).await;
+    if let Some(owner) = &owner { if !allowed.contains(owner) { allowed.push(owner.clone()); } }
+    let adopted = adoption::authorized(&prs, &repository, &allowed);
+    if !dry_run {
+        if let Err(error) = adoption::persist(&workflow::path(), &adopted) {
+            warn!("cannot persist adopted PR ownership: {error:#}");
+            return None;
+        }
+    }
+    for candidate in &adopted {
+        if !candidate.ready_for_review() {
+            info!(pr=candidate.pr, dependency=?candidate.dependency, "adopted PR awaits parent/base reconciliation");
+        } else if candidate.source_issue.is_none() {
+            info!(pr=candidate.pr, "adopted source-less PR requires PR-scoped acceptance context");
+        }
+    }
 
     // #934 — a draft whose issue already gave up is closed on sight (branch
     // kept, revival instructions in the comment) so `gh pr list` shows only
@@ -3712,7 +3733,7 @@ async fn find_resumable_draft(
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let select = |cursor| {
-        resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref(), cursor)
+        adoption::select_linked(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor)
     };
     // #1532 — a pinned red-main fix neither consults nor moves the rotation,
     // and a dry run reserves nothing.
