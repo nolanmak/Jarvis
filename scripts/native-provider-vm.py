@@ -465,7 +465,8 @@ def main(spec_path):
                         raise TimeoutError('native VM channel admission timed out')
                     time.sleep(0.02)
             channel = Channel(channel_socket)
-            gateway = gateway_module.HostGateway(spec['gateway'], channel.send)
+            diagnostic_path = Path(spec_path).parent / 'gateway-route-denials.jsonl' if spec.get('probe_route_diagnostics') is True else None
+            gateway = gateway_module.HostGateway(spec['gateway'], channel.send, diagnostic_path=diagnostic_path)
             if spec.get('mcp_argv'):
                 bridge = subprocess.Popen(spec['mcp_argv'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           stderr=subprocess.DEVNULL, env={'PATH': os.defpath, 'HOME': str(Path.home())})

@@ -274,7 +274,7 @@ class State:
 
 
 class HostGateway:
-    def __init__(self, policy, send_frame):
+    def __init__(self, policy, send_frame, diagnostic_path=None):
         self.policy = Policy(policy)
         self.send_frame = send_frame
         self.states = {}
@@ -285,6 +285,15 @@ class HostGateway:
         self.exchanges = {}
         self.exchange_overflow = False
         self.exchange_sequence = 0
+        self.diagnostic_fd = None
+        self.diagnostic_rows = 0
+        if diagnostic_path is not None:
+            diagnostic_path = Path(diagnostic_path)
+            parent = diagnostic_path.parent
+            info = parent.stat()
+            if parent.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError('route diagnostic directory is not private')
+            self.diagnostic_fd = os.open(diagnostic_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
 
     def transport_receipt(self):
         """Host observations only: no request headers, URLs, queries or payloads."""
@@ -324,7 +333,7 @@ class HostGateway:
                 self.host_failures = (self.host_failures + [{'phase': 'upstream_response', 'category': 'HttpStatus',
                     'http_status': status, 'method': request['method'], 'route_sha256': route_id}])[-16:]
 
-    def record_failure(self, error, phase):
+    def record_failure(self, error, phase, request=None):
         category = type(error).__name__
         if category not in {'Denied', 'TimeoutError', 'ConnectionError', 'ConnectionRefusedError',
                             'ConnectionResetError', 'BrokenPipeError', 'OSError', 'gaierror', 'SSLError',
@@ -332,6 +341,20 @@ class HostGateway:
                             'AttributeError', 'TypeError', 'ValueError', 'UnicodeEncodeError', 'UnicodeDecodeError'}:
             category = 'Exception'
         value = {'phase': phase, 'category': category}
+        route = None
+        if isinstance(request, dict):
+            method = request.get('method')
+            if method in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'):
+                value['method'] = method
+            try:
+                path = path_value(request.get('path'))
+                value['path_sha256'] = hashlib.sha256(path.encode()).hexdigest()
+                route = {'method': value.get('method', 'invalid'), 'path_sha256': value['path_sha256'],
+                         'path_without_query': path if len(path.encode()) <= 4096 else None,
+                         'path_omitted': len(path.encode()) > 4096,
+                         'websocket': request.get('websocket') is True}
+            except (Denied, TypeError, ValueError):
+                pass
         if isinstance(error, Denied) and str(error) in {'upstream_unavailable', 'websocket_upgrade', 'websocket_key', 'websocket_frame', 'headers', 'redirect', 'response_limit', 'cancelled', 'address', 'route', 'authority', 'path', 'frame', 'websocket_request', 'capacity', 'unknown_request', 'request_limit'}:
             value['reason'] = str(error)
         cause = error.__cause__ or error.__context__
@@ -349,6 +372,15 @@ class HostGateway:
             value['errno'] = number
         with self.lock:
             self.host_failures = (self.host_failures + [value])[-16:]
+            if route is not None and isinstance(error, Denied) and str(error) == 'route' and self.diagnostic_fd is not None and self.diagnostic_rows < 16:
+                # Explicit probe-only artifact. Never headers, query, authority,
+                # request/response payload or authentication material.
+                raw = (json.dumps(route, sort_keys=True) + '\n').encode()
+                written = 0
+                while written < len(raw):
+                    written += os.write(self.diagnostic_fd, raw[written:])
+                os.fsync(self.diagnostic_fd)
+                self.diagnostic_rows += 1
 
     def emit(self, kind, ident, **fields):
         try:
@@ -400,7 +432,7 @@ class HostGateway:
                 frame = dict(frame, decoded=data)
             state.queue.put_nowait(frame)
         except (Denied, queue.Full, ValueError, TypeError, KeyError) as error:
-            self.record_failure(error, 'request_admission')
+            self.record_failure(error, 'request_admission', frame)
             with self.lock:
                 state = self.states.get(ident)
             if state:
@@ -545,6 +577,10 @@ class HostGateway:
             states = list(self.states.values())
         for state in states:
             state.close()
+        with self.lock:
+            if self.diagnostic_fd is not None:
+                os.close(self.diagnostic_fd)
+                self.diagnostic_fd = None
 
 
 def read_headers(stream):

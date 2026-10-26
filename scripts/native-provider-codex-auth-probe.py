@@ -144,7 +144,7 @@ def stop(process):
         process.wait()
 
 
-def launch_turn(root, policy, profile, executable, iteration, session_id, startup_seconds):
+def launch_turn(root, policy, profile, executable, iteration, session_id, startup_seconds, diagnose_route=False):
     turn = root / f'turn-{iteration}'
     turn.mkdir(mode=0o700)
     session = root / 'native-session'
@@ -156,7 +156,8 @@ def launch_turn(root, policy, profile, executable, iteration, session_id, startu
             'session_directory': str(session), 'resume': session_id is not None,
             'executable': str(executable), 'argv': argv, 'environment': {'LANG': 'C.UTF-8'},
             'auth_file': profile['auth_file'], 'auth_relative': profile['auth_relative'],
-            'refresh_auth': False, 'gateway': profile['gateway'], 'mcp_argv': None, 'assets': []}
+            'refresh_auth': False, 'gateway': profile['gateway'], 'mcp_argv': None, 'assets': [],
+            'probe_route_diagnostics': diagnose_route}
     spec_path = turn / 'launch.json'
     private_write(spec_path, spec)
     launcher = Path(__file__).with_name('native-provider-vm.py').resolve()
@@ -193,6 +194,13 @@ def launch_turn(root, policy, profile, executable, iteration, session_id, startu
         process.stdin.write(PROMPT.encode());process.stdin.close()
         # Intentionally no whole-inference wall timeout. External explicit
         # cancellation/resource failure remains observable and retains logs.
+        if diagnose_route:
+            diagnostic = turn / 'gateway-route-denials.jsonl'
+            while process.poll() is None:
+                if diagnostic.exists() and diagnostic.stat().st_size:
+                    stop(process)
+                    raise RuntimeError('explicit diagnostic stopped after first denied route')
+                time.sleep(.02)
         code = process.wait()
         if code:
             raise RuntimeError('native VM/provider returned a nonzero status')
@@ -229,6 +237,7 @@ def main():
     parser.add_argument('--resume', action='store_true', help='verify a second real native turn in the same isolated conversation')
     parser.add_argument('--output', type=Path, help='new private retained evidence directory')
     parser.add_argument('--startup-seconds', type=int, default=60)
+    parser.add_argument('--diagnose-route', action='store_true', help='retain private query-free denied path and stop after the first route refusal')
     args = parser.parse_args()
     if not 10 <= args.startup_seconds <= 180:
         raise ValueError('startup budget out of range')
@@ -252,10 +261,10 @@ def main():
     print(json.dumps({'status': 'started', 'evidence_directory': str(root), 'model': MODEL}), flush=True)
     receipts = []
     try:
-        first = launch_turn(root, policy, profile, executable, 1, None, args.startup_seconds)
+        first = launch_turn(root, policy, profile, executable, 1, None, args.startup_seconds, args.diagnose_route)
         receipts.append(first)
         if args.resume:
-            receipts.append(launch_turn(root, policy, profile, executable, 2, first['native_session'], args.startup_seconds))
+            receipts.append(launch_turn(root, policy, profile, executable, 2, first['native_session'], args.startup_seconds, args.diagnose_route))
         unchanged = digest_file(auth) == auth_before
         if not unchanged:
             raise RuntimeError('authentication source changed during read-only probe')

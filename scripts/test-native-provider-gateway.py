@@ -168,6 +168,28 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(row, {'phase': 'request_admission', 'category': 'Denied', 'reason': 'unknown_request'})
         self.assertNotIn('unknown-private-request', json.dumps(row))
 
+    def test_denied_route_diagnostic_is_opt_in_private_bounded_and_query_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'routes.jsonl'
+            frames = []
+            host = g.HostGateway(policy(self.port), frames.append, diagnostic_path=path)
+            try:
+                for index in range(20):
+                    host.receive({'type':'gateway_open','id':str(index),'authority':f'127.0.0.1:{self.port}',
+                        'method':'POST','path':'/not-declared/required?private-query',
+                        'headers':[['Authorization','Bearer private-credential']]})
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual(len(rows), 16)
+                self.assertEqual(rows[0]['path_without_query'], '/not-declared/required')
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                public = json.dumps(host.transport_receipt())
+                self.assertNotIn('/not-declared', public)
+                self.assertEqual(host.transport_receipt()['host_failures'][-1]['method'], 'POST')
+                for secret in ('private-query', 'private-credential', 'Authorization'):
+                    self.assertNotIn(secret, path.read_text() + public + json.dumps(frames))
+            finally:
+                host.close()
+
     def test_sse_arrives_before_provider_finishes(self):
         self.open('/v1/events')
         self.host.receive(dict(type='gateway_end', id='request'))
