@@ -325,7 +325,7 @@ else: raise Exception('unexpected call '+repr(a))
         }
         evidence.adjudication.as_mut().unwrap().binding = evidence.binding.clone();
         assert!(review.approved(), "fixture approval must validate before sweep");
-        review.recorded_verdict(&prepared)
+        review.recorded_verdict()
     };
     let mut workflow = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root:&root, worktree:&root, repository:"fixture-owner/project", source_issue:Some(10),pr:Some(20),
