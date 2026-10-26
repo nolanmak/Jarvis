@@ -63,9 +63,12 @@ def main():
         edit = work / 'edit.txt'
         edit.write_text('before\n')
         policy = root / 'policy.json'
+        protected_roots = [str(control), str(provider)]
+        if config.is_dir():
+            protected_roots.append(str(config))
         policy.write_text(json.dumps(dict(version=2, write_roots=[str(implementation), str(runtime)],
                                          write_files=[str(good), str(edit)],
-                                         protected_roots=[str(control), str(provider), str(config)],
+                                         protected_roots=protected_roots,
                                          network='provider_transport')))
         policy.chmod(0o600)
         prompt = (f'This is a disposable filesystem enforcement probe. Use native Write to write '
