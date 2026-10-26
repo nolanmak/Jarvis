@@ -84,6 +84,8 @@ def main():
                         help='explicit reviewed authority/method/route policy, never inferred')
     parser.add_argument('--environment-key', action='append', default=[])
     parser.add_argument('--memory-mb', type=int, default=1024)
+    parser.add_argument('--max-state-bytes', type=int, default=8 * 1024**3)
+    parser.add_argument('--max-sessions', type=int, default=16)
     args = parser.parse_args()
     root = args.directory.absolute()
     root.mkdir(mode=0o700)  # new only: never replace an operator's existing policy
@@ -117,6 +119,7 @@ def main():
                'environment': args.environment_key}
     policy = {'version': 1, 'runtime_config': str(args.runtime_config.resolve()),
               'guest_runtime': str(guest), 'state_root': str(state), 'memory_mb': args.memory_mb,
+              'max_state_bytes': args.max_state_bytes, 'max_sessions': args.max_sessions,
               'providers': {args.provider: profile}}
     path = root / 'policy.json'
     path.write_text(json.dumps(policy, sort_keys=True))

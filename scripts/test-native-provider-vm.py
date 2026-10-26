@@ -117,6 +117,20 @@ ready.with_name('actual-model-dispatch').write_text('called')
         with self.assertRaisesRegex(ValueError, 'identity or configuration'):
             vm.refreshed_credential(original, forged, 'codex')
 
+    def test_credential_use_serializes_seed_through_refresh_not_just_writeback(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            spec = {'refresh_auth': True, 'provider': 'codex', 'auth_file': str(root / 'codex.json'),
+                    'credential_directory': str(root)}
+            first = vm.credential_use(spec)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    vm.credential_use(spec)
+            finally:
+                os.close(first)
+            second = vm.credential_use(spec)
+            os.close(second)
+
     def test_claude_refresh_cannot_expand_scope_or_replace_static_fields(self):
         old = {'claudeAiOauth': {'accessToken': 'a', 'refreshToken': 'r', 'expiresAt': 1,
                                 'scopes': ['inference'], 'subscriptionType': 'max'}}

@@ -1304,6 +1304,7 @@ impl ClaudeCliReasoner {
             Some(crate::native_vm::Launch::prepare("claude", opts, &cmd,
                 claude_bridge.as_ref().map(|bridge|&bridge.bridge), native_launch.as_ref())?)
         } else { None };
+        if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         let spawned = match &native_vm {
             Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref()),
             None => crate::process_tree::spawn_admitted(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false),

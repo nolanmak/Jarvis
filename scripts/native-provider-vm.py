@@ -112,7 +112,7 @@ def safe_relative(raw):
     path = Path(raw)
     if (not isinstance(raw, str) or not raw or path.is_absolute()
             or any(part in ('..', '.') for part in path.parts)
-            or '\0' in raw or len(raw) > 4096):
+            or '\0' in raw or len(raw) > 1024 or len(path.parts) > 16):
         raise ValueError('invalid native runtime export path')
     return path
 
@@ -185,9 +185,9 @@ def refreshed_credential(original, refreshed, provider):
     return refreshed
 
 
-def refresh_auth(spec, generation, original_digest):
+def credential_use(spec):
     if not spec.get('refresh_auth'):
-        return
+        return None
     auth = Path(spec['auth_file'])
     controlled = Path(spec['credential_directory'])
     if auth != controlled / (spec['provider'] + '.json'):
@@ -204,7 +204,19 @@ def refresh_auth(spec, generation, original_digest):
         info = os.fstat(lock_fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
             raise ValueError('credential refresh lock is not private')
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except BaseException:
+        os.close(lock_fd)
+        raise
+
+
+def refresh_auth(spec, generation, original_digest, held_lock=None):
+    if not spec.get('refresh_auth'):
+        return
+    lock_fd = held_lock if held_lock is not None else credential_use(spec)
+    auth = Path(spec['auth_file'])
+    try:
         current = private_bytes(auth, 1024 * 1024)
         if hashlib.sha256(current).hexdigest() != original_digest:
             return  # Independently refreshed controller credentials always win.
@@ -213,7 +225,8 @@ def refresh_auth(spec, generation, original_digest):
         if updated != json.loads(current):
             atomic(auth, json.dumps(updated, separators=(',', ':')).encode())
     finally:
-        os.close(lock_fd)
+        if held_lock is None:
+            os.close(lock_fd)
 
 
 def runtime_seed(runtime, auth_file, auth_relative):
@@ -341,6 +354,13 @@ def main(spec_path):
         raise ValueError('native conversation recovery requires completed runtime export')
     lock_fd = os.open(state / 'lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        credential_lock = credential_use(spec)
+    except BlockingIOError:
+        ready = os.environ.get('JARVIS_NATIVE_VM_READY')
+        if ready:
+            atomic(Path(ready).with_name('vm-startup-failure.json'), b'{"phase":"native_credential_in_use"}')
+        raise RuntimeError('native credential is in use; retry after capacity is available') from None
     seed, original_auth = runtime_seed(state, spec.get('auth_file'), spec['auth_relative'])
     with tempfile.TemporaryDirectory(prefix='native-vm-launch-', dir=state) as temporary:
         private = Path(temporary)
@@ -348,11 +368,15 @@ def main(spec_path):
         binary.mkdir()
         executable = Path(spec['executable'])
         info = executable.stat()
-        if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
-            raise ValueError('native executable is not trusted')
+        if not executable.is_absolute() or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or info.st_size > 512 * 1024 * 1024:
+            raise ValueError('native executable is not trusted or exceeds budget')
         shutil.copyfile(executable, binary / 'cli')
         (binary / 'cli').chmod(0o555)
-        for asset in spec.get('assets', []):
+        assets = spec.get('assets', [])
+        if len(assets) > 32:
+            raise ValueError('native asset count exceeds budget')
+        asset_bytes = 0
+        for asset in assets:
             name = safe_relative(asset['name'])
             if len(name.parts) != 1 or not str(name).startswith('asset-'):
                 raise ValueError('invalid native input asset')
@@ -362,7 +386,11 @@ def main(spec_path):
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024:
                     raise ValueError('native input asset exceeds policy')
-                (binary / name).write_bytes(stream.read(16 * 1024 * 1024 + 1))
+                data = stream.read(16 * 1024 * 1024 + 1)
+                asset_bytes += len(data)
+                if asset_bytes > 16 * 1024 * 1024:
+                    raise ValueError('native total asset budget exceeded')
+                (binary / name).write_bytes(data)
                 (binary / name).chmod(0o444)
         # The guest receives only a relay executable, never the host bridge
         # policy, settings, hooks, source checkout or daemon credential store.
@@ -426,6 +454,7 @@ def main(spec_path):
             admitted = False
             exported = 0
             received = set()
+            export_directories = set()
             staging = private / 'export'
             staging.mkdir(mode=0o700)
             exit_code = None
@@ -469,10 +498,13 @@ def main(spec_path):
                     if active_export is not None or type(size) is not int or size < 0:
                         raise ValueError('invalid runtime export start')
                     exported += size
-                    if exported > MAX_HOME or str(relative) in received:
+                    if exported > MAX_HOME or str(relative) in received or len(received) >= 4096:
                         raise ValueError('native runtime export exceeds budget or duplicates file')
                     received.add(str(relative))
                     target = staging / relative
+                    export_directories.update(str(parent) for parent in relative.parents if str(parent) != '.')
+                    if len(export_directories) > 2048:
+                        raise ValueError('native runtime directory budget exceeded')
                     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                     stream = open(target, 'xb')
                     os.fchmod(stream.fileno(), 0o600)
@@ -506,7 +538,7 @@ def main(spec_path):
                 raise RuntimeError('native VM shutdown failed')
             generation = 'generation-' + uuid.uuid4().hex
             os.replace(staging, state / generation)
-            refresh_auth(spec, state / generation, original_auth)
+            refresh_auth(spec, state / generation, original_auth, credential_lock)
             atomic(state / 'complete.json', json.dumps({'version': 1, 'exit_code': exit_code,
                    'generation': generation, 'export_bytes': exported,
                    'auth_generation': original_auth}).encode())
@@ -534,6 +566,8 @@ def main(spec_path):
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
+            if credential_lock is not None:
+                os.close(credential_lock)
 
 
 if __name__ == '__main__':

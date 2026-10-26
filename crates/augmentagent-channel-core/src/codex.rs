@@ -358,6 +358,7 @@ impl CodexCliReasoner {
         let native_vm = if crate::native_vm::required(launch_audit.as_ref()) {
             Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, Some(&bridge), native_launch.as_ref())?)
         } else { None };
+        if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         let spawned = match &native_vm {
             Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref()),
             None => crate::process_tree::spawn_admitted(&cmd, true, clean, opts.handoff_path.as_deref(), false),

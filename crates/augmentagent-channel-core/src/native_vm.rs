@@ -2,8 +2,16 @@
 //! retain their existing transport; there is no required-workflow host fallback.
 use std::{collections::BTreeMap, io::Write, os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt}, path::{Path, PathBuf}};
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use std::os::fd::AsRawFd;
+
+/// Controller-fenced owner; unrelated claims may reuse the same audit file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeOwner {
+    pub workflow_id: String,
+    pub lease_generation: i64,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +21,8 @@ struct Policy {
     guest_runtime: PathBuf,
     state_root: PathBuf,
     memory_mb: u32,
+    max_state_bytes: u64,
+    max_sessions: usize,
     providers: BTreeMap<String, Provider>,
 }
 #[derive(Deserialize)]
@@ -52,15 +62,126 @@ fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+// Conservative per-session upper bound: native executable <=512MiB,
+// assets <=16MiB, two64MiB generations, one64MiB seed and export, metadata.
+const SESSION_BYTES: u64 = 1024 * 1024 * 1024;
+struct StateLock(std::fs::File);
+impl StateLock {
+    fn acquire(root:&Path) -> Result<Self> {
+        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW).open(root.join("state.lock"))?;
+        let info=file.metadata()?;
+        ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native state lock");
+        ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX)}==0,"native state lock unavailable");
+        Ok(Self(file))
+    }
+}
+impl Drop for StateLock { fn drop(&mut self) { unsafe{libc::flock(self.0.as_raw_fd(),libc::LOCK_UN)}; } }
+fn available_bytes(root:&Path)->Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path=std::ffi::CString::new(root.as_os_str().as_bytes())?;
+    let mut info=std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    ensure!(unsafe{libc::statvfs(path.as_ptr(),info.as_mut_ptr())}==0,"native state free-space observation unavailable");
+    let info=unsafe{info.assume_init()};
+    Ok((info.f_bavail as u64).saturating_mul(info.f_frsize as u64))
+}
+fn tree_bytes(root:&Path) -> Result<u64> {
+    let mut total=0u64;
+    for entry in std::fs::read_dir(root)? {
+        let entry=entry?; let metadata=entry.path().symlink_metadata()?;
+        ensure!(!metadata.file_type().is_symlink(),"native state contains a symlink");
+        total=total.checked_add(if metadata.is_dir(){tree_bytes(&entry.path())?}else{metadata.len()}).context("native state size overflow")?;
+    }
+    Ok(total)
+}
+pub(crate) fn retire(session:&Path) {
+    let Some(root)=session.parent().and_then(Path::parent) else{return};
+    let Ok(_lock)=StateLock::acquire(root) else{return};
+    if session.join("owned.json").is_file() {
+        let _=write(&session.join("retired.json"),b"{\"version\":1,\"reason\":\"native_scope_retired\"}");
+    }
+}
+fn prune_and_count(root:&Path) -> Result<usize> {
+    let mut count=0;
+    for provider in std::fs::read_dir(root)? {
+        let provider=provider?.path();
+        if !provider.is_dir() || provider.file_name().is_some_and(|name|name=="credentials") {continue;}
+        ensure!(!provider.is_symlink(),"native provider state symlink");
+        for entry in std::fs::read_dir(&provider)? {
+            let session=entry?.path();
+            if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
+            ensure!(session.is_dir() && !session.is_symlink(),"native session state is not a directory");
+            let reconciled=session.join("retired-owner.json").exists();
+            let retired=session.join("owned.json").exists() && (reconciled
+                || (session.join("retired.json").exists() && session.join("complete.json").exists()));
+            let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW).open(session.join("lock"))?;
+            let available=unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0;
+            if retired && available {
+                let receipts=if reconciled {vec!["retired-owner.json","owned.json"]} else {vec!["retired.json","owned.json","complete.json"]};
+                for name in receipts { let _:serde_json::Value=serde_json::from_slice(&private(&session.join(name))?)?; }
+                let aliases=provider.join("aliases");
+                if aliases.is_dir() {
+                    for entry in std::fs::read_dir(aliases)? {
+                        let alias=entry?.path();
+                        let target:String=serde_json::from_slice(&private(&alias)?)?;
+                        if session.file_name().is_some_and(|name|name==target.as_str()){std::fs::remove_file(alias)?;}
+                    }
+                }
+                std::fs::remove_dir_all(&session)?;
+            } else {count+=1;}
+        }
+    }
+    Ok(count)
+}
+
+/// Called by the workflow controller only after fenced recovery or completion.
+/// It authorizes retirement of owned runtime data, including interrupted exports;
+/// active session locks still prevent reclamation. Approval/audit history is not
+/// stored here and is never removed by this operation.
+pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<usize> {
+    let Some(policy_path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(0)};
+    let policy:Policy=serde_json::from_slice(&private(Path::new(&policy_path))?)?;
+    let root=policy.state_root.canonicalize()?;
+    let _lock=StateLock::acquire(&root)?;
+    retire_owned_at(&root,audit_path,owner)
+}
+fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) -> Result<usize> {
+    let mut count=0;
+    for provider in std::fs::read_dir(root)? {
+        let provider=provider?.path();
+        if !provider.is_dir() || provider.file_name().is_some_and(|name|name=="credentials"){continue;}
+        ensure!(!provider.is_symlink(),"native owner directory symlink");
+        for entry in std::fs::read_dir(&provider)? {
+            let session=entry?.path();
+            if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
+            ensure!(session.is_dir() && !session.is_symlink(),"native owner session symlink");
+            if !session.join("owned.json").exists(){continue;}
+            let owner:serde_json::Value=serde_json::from_slice(&private(&session.join("owned.json"))?)?;
+            if owner.get("audit_path").and_then(|v|v.as_str())!=audit_path.to_str()
+                || owner.get("owner")!=Some(&serde_json::to_value(expected_owner)?){continue;}
+            let marker=session.join("retired-owner.json");
+            if !marker.exists(){
+                write(&marker,&serde_json::to_vec(&serde_json::json!({"version":1,"reason":"fenced_workflow_owner_reconciled","audit_path":audit_path,"owner":expected_owner}))?)?;
+                count+=1;
+            }
+        }
+    }
+    Ok(count)
+}
+
 pub(crate) struct Launch {
     pub command: Command,
     aliases: PathBuf,
     session: PathBuf,
+    ephemeral: bool,
     _directory: tempfile::TempDir,
 }
 impl Launch {
     pub fn prepare(provider: &str, opts: &crate::reasoner::ReasonerOpts, original: &Command,
         bridge: Option<&crate::codex_tools::BridgeLaunch>, native: Option<&crate::native_session::Launch>) -> Result<Self> {
+        let owner_logger=opts.audit_logger.as_ref().context("native runtime owner audit unavailable")?;
+        let audit_owner=owner_logger.native_runtime_owner()?.context("native runtime fenced owner unavailable")?;
         let policy_path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY")
             .context("required native VM policy unavailable")?;
         let policy: Policy = serde_json::from_slice(&private(Path::new(&policy_path))?)?;
@@ -78,6 +199,15 @@ impl Launch {
             let expected = root.join("credentials").join(format!("{provider}.json"));
             ensure!(profile.auth_file.as_ref() == Some(&expected),
                 "OAuth refresh requires an explicitly imported controller credential");
+        }
+        let state_lock=StateLock::acquire(&root)?;
+        ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
+        let count=prune_and_count(&root)?;
+        let additional=usize::from(!matches!(native,Some(crate::native_session::Launch::Resume{..})));
+        if count.saturating_add(additional)>policy.max_sessions
+            || (count.saturating_add(additional) as u64).saturating_mul(SESSION_BYTES)>policy.max_state_bytes
+            || tree_bytes(&root)?>policy.max_state_bytes || available_bytes(&root)?<SESSION_BYTES {
+            crate::run_resources::admission_failed(provider,opts.audit_logger.as_ref(),"native_runtime_state_capacity")?;
         }
         let provider_root = root.join(provider);
         std::fs::create_dir_all(&provider_root)?;
@@ -98,9 +228,11 @@ impl Launch {
                 let path = provider_root.join(format!("session-{}", uuid::Uuid::new_v4()));
                 std::fs::create_dir(&path)?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner_logger.path(),"owner":audit_owner}))?)?;
                 path
             }
         };
+        drop(state_lock);
         let directory = tempfile::Builder::new().prefix("launch-").tempdir_in(&provider_root)?;
         let helpers: &[(&str, &[u8])] = &[
             ("native-provider-vm.py", include_bytes!("../../../scripts/native-provider-vm.py")),
@@ -163,17 +295,63 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, aliases, session, _directory:directory };
+        let result = Self { command, aliases, session, ephemeral:native.is_none(), _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
         Ok(result)
     }
+    pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
+        lease.register_vm_retirement(self.session.clone());
+    }
     pub fn observe_session(&self, id: &str) -> Result<()> {
         ensure!(!id.is_empty() && id.len() <= 256, "invalid observed native session");
+        let root=self.session.parent().and_then(Path::parent).context("native state root missing")?;
+        let _lock=StateLock::acquire(root)?;
+        ensure!(self.session.is_dir() && !self.session.join("retired-owner.json").exists(),"native workflow owner was retired");
         let alias = self.aliases.join(digest(id));
         let name = self.session.file_name().context("missing session directory")?.to_string_lossy();
         let value = serde_json::to_vec(name.as_ref())?;
         if alias.exists() { ensure!(private(&alias)? == value, "native session alias collision"); }
         else { write(&alias,&value)?; }
         Ok(())
+    }
+}
+
+impl Drop for Launch { fn drop(&mut self) { if self.ephemeral {retire(&self.session);} } }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn session(root:&Path,name:&str,owner:&str,complete:bool)->PathBuf {
+        let path=root.join("codex").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap()).unwrap();
+        if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
+        path
+    }
+    #[test]
+    fn retirement_preserves_active_and_resumable_sessions_then_reclaims_released_owner() {
+        let temp=tempfile::tempdir().unwrap();
+        let held=session(temp.path(),"session-held","/audit/one",true);
+        let resumable=session(temp.path(),"session-resumable","/audit/two",true);
+        let interrupted=session(temp.path(),"session-interrupted","/audit/one",false);
+        let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(held.join("lock")).unwrap();
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2}).unwrap(),0);
+        assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap(),2);
+        assert_eq!(prune_and_count(temp.path()).unwrap(),2);
+        assert!(held.exists()); assert!(resumable.exists()); assert!(!interrupted.exists());
+        drop(lock);
+        assert_eq!(prune_and_count(temp.path()).unwrap(),1);
+        assert!(!held.exists()); assert!(resumable.exists());
+    }
+    #[test]
+    fn scope_retirement_does_not_guess_interrupted_session_safe() {
+        let temp=tempfile::tempdir().unwrap();
+        let interrupted=session(temp.path(),"session-interrupted","/audit/one",false);
+        retire(&interrupted);
+        assert_eq!(prune_and_count(temp.path()).unwrap(),1);
+        assert!(interrupted.exists());
+        retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap();
+        assert_eq!(prune_and_count(temp.path()).unwrap(),0);
     }
 }

@@ -303,6 +303,7 @@ pub struct AuditLogger {
     model_call_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
+    native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
     resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
@@ -456,6 +457,18 @@ impl AuditLogger {
 
     /// Build a logger writing to the given path. Use
     /// [`default_audit_log_path`] for the standard location.
+    /// Set once for this logger instance after the workflow's fenced claim.
+    pub fn set_native_runtime_owner(&self, owner:crate::native_vm::RuntimeOwner)->anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && owner.lease_generation>0 && !owner.workflow_id.is_empty(),"invalid native runtime owner");
+        let mut current=self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?;
+        anyhow::ensure!(current.as_ref().is_none_or(|existing|existing==&owner),"native runtime owner cannot change within a logger instance");
+        *current=Some(owner);
+        Ok(())
+    }
+    pub fn native_runtime_owner(&self)->anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
+        Ok(self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?.clone())
+    }
+
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
@@ -463,6 +476,7 @@ impl AuditLogger {
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,
             failure_path: None,
             pending_dir: None,

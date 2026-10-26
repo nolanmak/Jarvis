@@ -15,6 +15,8 @@ The file must be owner-private, regular and single-link. Its version 1 shape is:
   "guest_runtime": "/controller/private-native-vm-runtime",
   "state_root": "/controller/private-native-vm",
   "memory_mb": 1024,
+  "max_state_bytes": 8589934592,
+  "max_sessions": 16,
   "providers": {
     "codex": {
       "auth_file": "/controller/provider/auth.json",
@@ -81,7 +83,7 @@ fresh-session authentication after rotation remains a rollout acceptance test.
 
 Local executable validation:
 
-- `python3 scripts/test-native-provider-vm.py`: seven tests cover pre-admission
+- `python3 scripts/test-native-provider-vm.py`: eight tests cover pre-admission
   refusal, cancellation cleanup, completed-generation recovery and symlink
   rejection and undeclared runtime siblings. These do not execute a VM or contact a provider.
 - `scripts/native-provider-vm-local-probe.py --execute --runtime-config PATH`:
@@ -138,3 +140,32 @@ refreshes the original authentication file automatically. All profile paths are
 controller inputs. This document describes the reviewed rollout artifact, not
 an assertion that production has been configured or authenticated acceptance
 has passed.
+
+## Runtime retention and serialized credential use
+
+The declared aggregate byte/session budget is checked under a private cross-
+process lock before dispatch. Each retained session reserves a conservative
+1 GiB upper bound for its executable, bounded input assets and runtime exports;
+filesystem free space must also cover that reservation. Active/resumable
+sessions are not discarded to meet the budget. Actual fresh reviewer/builder
+scope retirement marks completed runtimes eligible for reclamation; a separate
+explicit fenced workflow-owner retirement can release interrupted exports.
+Reclamation requires the session execution lock to be free and removes only
+controller-owned runtime generations and their native-session aliases.
+
+The workflow controller must call `native_vm::retire_owned_runtimes` after
+quiescent fenced recovery or terminal ownership resolution, using the protected
+audit path plus workflow ID and fenced lease generation recorded in each runtime
+ownership receipt. A later healthy lease may reuse an audit path; it is a
+different owner and cannot retire that later lease by path alone. Bind the
+logger once with `set_native_runtime_owner` after its fenced workflow claim. Age and PID absence are
+not retirement authority. Capacity refusal persists the existing workflow
+capacity dependency without admitting a model call; a subsequent retry prunes
+newly retired state before evaluating that dependency again.
+
+Refresh-enabled credentials have one held use lock across initial seed, native
+execution, token refresh and descendant cleanup, not merely at file writeback.
+Contention is a pre-dispatch capacity dependency. This prevents concurrent
+refresh attempts from invalidating each other's tokens. The imported service
+credential belongs to this controlled writer domain; do not concurrently run
+another client against a copied refresh credential outside that protocol.

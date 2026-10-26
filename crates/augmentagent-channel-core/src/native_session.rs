@@ -24,6 +24,7 @@ struct State {
 pub struct NativeSession {
     provider: ProviderKind,
     state: Mutex<State>,
+    retired_vm: Mutex<Vec<std::path::PathBuf>>,
 }
 
 pub struct Lease {
@@ -114,6 +115,7 @@ impl NativeSession {
             "native session ID is empty");
         Ok(Arc::new(Self {
             provider,
+            retired_vm: Mutex::new(Vec::new()),
             state: Mutex::new(State { id, active: false, uncertain: false,
                 native_submitted_at_ms: None, first_text_output_at_ms: None }),
         }))
@@ -160,7 +162,18 @@ impl NativeSession {
     }
 }
 
+impl Drop for NativeSession {
+    fn drop(&mut self) {
+        if let Ok(paths)=self.retired_vm.lock() { for path in paths.iter() { crate::native_vm::retire(path); } }
+    }
+}
 impl Lease {
+    pub(crate) fn register_vm_retirement(&self, path:std::path::PathBuf) {
+        if is_fresh_review() || FRESH_BUILDERS.try_with(|_|()).is_ok() {
+            let mut paths=self.session.retired_vm.lock().expect("native retirement mutex poisoned");
+            if !paths.contains(&path) { paths.push(path); }
+        }
+    }
     pub fn launch(&self) -> Launch {
         self.launch.clone()
     }

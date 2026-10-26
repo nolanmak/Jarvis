@@ -39,7 +39,12 @@ impl ProcessGroup {
         while !ready.exists() {
             if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
                 self.resource_outcome(provider,logger)?;
-                return crate::run_resources::admission_failed(provider,logger,"launch_readiness_unavailable");
+                let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
+                    .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                let phase=if startup.as_ref().and_then(|value|value.get("phase")).and_then(|value|value.as_str())==Some("native_credential_in_use") {
+                    "native_credential_in_use"
+                } else {"launch_readiness_unavailable"};
+                return crate::run_resources::admission_failed(provider,logger,phase);
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
