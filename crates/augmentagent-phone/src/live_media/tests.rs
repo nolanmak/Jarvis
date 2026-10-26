@@ -477,3 +477,51 @@ async fn owner_goodbye_closes_twilio_before_provider_finalization_and_keeps_task
     }).await.unwrap();
     assert_eq!(f.service.store.phone_pending_dispatches().unwrap().len(),1);
 }
+
+#[tokio::test]
+async fn full_duplex_keeps_input_flowing_during_unacknowledged_output() {
+    let provider=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint=format!("ws://{}/",provider.local_addr().unwrap());
+    let backend=tokio::spawn(async move {
+        let (tcp,_)=provider.accept().await.unwrap();
+        let mut ws=accept_async(tcp).await.unwrap();
+        let _=ws.next().await;
+        ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        for (index,text) in ["mm-hmm","yeah","stop","Actually, use tomorrow instead"].iter().enumerate() {
+            // This fixture models provider behavior, not speech recognition or
+            // interruption quality. The bridge must keep both directions live.
+            let input=tokio::time::timeout(std::time::Duration::from_secs(1),ws.next()).await.unwrap().unwrap().unwrap();
+            let input:serde_json::Value=serde_json::from_str(input.to_text().unwrap()).unwrap();
+            assert_eq!(input["type"],"session.input_audio.append");
+            assert_eq!(input["audio"],STANDARD.encode([128+index as u8;160]));
+            ws.send(Message::Text(json!({"type":"session.input_transcript.delta","event_id":format!("input-{index}"),"delta":text,"start_ms":index*1000,"end_ms":index*1000+100}).to_string().into())).await.unwrap();
+            ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([132+index as u8;160])}).to_string().into())).await.unwrap();
+        }
+        let close=ws.next().await.unwrap().unwrap();
+        let close:serde_json::Value=serde_json::from_str(close.to_text().unwrap()).unwrap();
+        assert_eq!(close["type"],"session.close");
+        ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","reason":"close_requested","session":{"id":"live-test"},"usage":{"seconds":4}}).to_string().into())).await.unwrap();
+    });
+    let f=fixture(endpoint).await;
+    let (mut ws,_)=connect_async(request(&f,true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    let mut marks=Vec::new();
+    for index in 0..4 {
+        ws.send(Message::Text(json!({"event":"media","sequenceNumber":(index+2).to_string(),"streamSid":"MZ-test","media":{"track":"inbound","chunk":(index+1).to_string(),"timestamp":(index*20).to_string(),"payload":STANDARD.encode([128+index as u8;160])}}).to_string().into())).await.unwrap();
+        let output=tokio::time::timeout(std::time::Duration::from_secs(1),ws.next()).await.unwrap().unwrap().unwrap();
+        let output:serde_json::Value=serde_json::from_str(output.to_text().unwrap()).unwrap();
+        assert_eq!(output["event"],"media","no local clear/truncate or hangup inferred from a transcript");
+        assert_eq!(output["media"]["payload"],STANDARD.encode([132+index as u8;160]));
+        let mark=ws.next().await.unwrap().unwrap();
+        let mark:serde_json::Value=serde_json::from_str(mark.to_text().unwrap()).unwrap();
+        marks.push(mark["mark"].clone());
+        // Deliberately defer all playback receipts while sending more input.
+    }
+    for (index,mark) in marks.into_iter().enumerate() {
+        ws.send(Message::Text(json!({"event":"mark","sequenceNumber":(index+6).to_string(),"streamSid":"MZ-test","mark":mark}).to_string().into())).await.unwrap();
+    }
+    assert!(!f.service.store.phone_provider_call(&f.id).unwrap().stop_requested);
+    ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"10","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
+    backend.await.unwrap();
+}

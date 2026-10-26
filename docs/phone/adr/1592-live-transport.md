@@ -79,14 +79,32 @@ the pre-dial readiness probe does not. The socket fixture verifies greeting
 audio can reach Twilio before any inbound audio, but only a live call can prove
 that the selected voice actually follows that instruction.
 
-Interruption qualification must account for the Live protocol rather than
-importing Realtime turn events: output audio has no timestamps or audio-done
-event, and transcript fragments have no completed-turn event. OpenAI documents
-local playback clearing and instruction steering, but an instruction acceptance
-is not a safe-resume or playback acknowledgment. The remaining interruption
-implementation must specify a bounded recovery policy and test late audio after
-clearing, short backchannels, and longer corrections. Do not claim the prompt
-alone guarantees immediate yielding or that a returned cleared mark was heard.
+Ordinary conversational interruption stays with GPT-Live's native full-duplex
+behavior. Twilio's official `GPTLiveProvider` forwards output audio directly and
+explicitly leaves interruption to the model; its example does not configure
+Realtime barge-in or truncation. Follow that transport contract here. Keep
+sending caller audio while assistant audio and playback marks are outstanding.
+Do not clear or restart playback merely because a transcript fragment, a brief
+backchannel, or a delayed instruction acknowledgment arrived. A transcript can
+lag audio and clearing on it could discard a fresh response.
+
+The prompt asks the model to yield to corrections/stop/wait, use the newest
+request, and preserve backend tasks unless a delegated change modifies them.
+The signed duplex fixture sends four caller audio frames while all playback
+marks remain unacknowledged, with two backchannel and two interruption captions;
+it verifies uninterrupted bidirectional transport and no invented truncate or
+clear commands. The fake provider supplies those captions and responses: this
+is not evidence of speech recognition or successful model interruption.
+
+Qualification must measure actual native interruption and stale audio behavior,
+including Twilio's queue. Output audio has no timestamps or audio-done event,
+and transcripts have no completed-turn event. The application bounds pending
+playback to two seconds and fails an overflow explicitly, but cannot infer an
+exact speech boundary from those events. If real calls fail the epic's no-stale-
+audio requirement, revise and requalify the transport/policy before rollout;
+the prompt and fixture alone do not satisfy that requirement. Explicit app
+termination (including goodbye) still clears pending Twilio playback. Cleared
+marks are never counted as heard audio.
 
 The local goodbye shortcut accumulates at most 512 bytes of caller transcript,
 starting a new candidate after an 800 ms transcript-time gap. An exact supported
@@ -125,3 +143,6 @@ recorded in #1596. Missing OpenAI credentials block the canary, not offline work
 - [Twilio Agent Connect overview](https://www.twilio.com/docs/conversations/agent-connect/overview)
 - [Twilio GPT-Live TypeScript integration](https://www.twilio.com/en-us/blog/developers/tutorials/integrations/tac-gpt-live-voice-ai-agent-typescript)
 - [Twilio Media Streams messages](https://www.twilio.com/docs/voice/media-streams/websocket-messages)
+
+- [Twilio native GPT-Live output handling](https://github.com/twilio/twilio-agent-connect-python/blob/main/src/tac/channels/voice/media_streams/gpt_live/provider.py)
+- [Twilio full-duplex example](https://github.com/twilio/twilio-agent-connect-python/blob/main/getting_started/examples/partners/openai_gpt_live.py)
