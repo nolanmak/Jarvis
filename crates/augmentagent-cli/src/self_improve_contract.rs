@@ -18,6 +18,8 @@ mod scope_authority;
 #[path = "self_improve_verifier_checkout.rs"]
 mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
+#[path = "self_improve_readiness.rs"]
+pub(super) mod readiness;
 #[path = "self_improve_adjudicated_contract.rs"]
 mod adjudicated;
 pub(super) use adjudicated::apply as apply_adjudicated_amendment;

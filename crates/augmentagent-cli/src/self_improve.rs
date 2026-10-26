@@ -999,14 +999,12 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
                 "untrusted issue author — requires owner approval before any build/push"
             );
         }
-        return Ok(Some(Issue {
-            number,
-            title,
-            body,
-            author,
-            author_trusted,
-            research_filed,
-        }));
+        let candidate=Issue {number,title,body,author,author_trusted,research_filed};
+        if acceptance::readiness::blocked(repo_root,&candidate).await? {
+            info!(issue=number,"unchanged material readiness dependency; free reconciliation");
+            continue;
+        }
+        return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
     // back the issues a not-fixable verdict labelled out on evidence that does
@@ -1165,8 +1163,8 @@ author. Keep each under 200 characters.\n\
 \n\
 For fixable issues, after the header produce the spec:\n\
 - Interpretation: what the issue is actually asking for, resolving any \
-ambiguity with the most reasonable reading of the code and stating the \
-assumption you made.\n\
+routine gaps using the grounded readiness decision and repository evidence. \
+Never invent a material owner decision or silently choose an unsupported surface.\n\
 - Files to touch: concrete paths, with what changes in each and which \
 existing functions/patterns to reuse.\n\
 - The smallest correct approach, and one sentence on why not the \
@@ -7891,7 +7889,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
+    let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
+        acceptance::readiness::Decision::Ready(evidence)=>evidence,
+        acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
+    };
     let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
     // #1515 — what landed on main since the issue was written, so the scoper
     // judges the issue against today's code rather than the code it
     // described. Empty when nothing merged or the date is unknown.
