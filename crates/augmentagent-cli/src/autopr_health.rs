@@ -22,6 +22,8 @@
 //! | `no-progress`    | the catch-all: nothing merged in N days             |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
 //! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
+//! | `pr-unknown-state` | 2026-10-25: #1493/#1492/#1481/#1388 open and green, outside every lane, with nothing recorded about why (#1598) |
+//! | `pr-stale-progress`| a managed PR stuck on one reason code past its stage threshold (#1598) |
 //!
 //! Analysis is pure over [`HealthInputs`] so every rule is unit-tested
 //! against the shape of the incident it exists for; collection is a thin
@@ -123,6 +125,13 @@ pub struct HealthInputs {
     pub runs_today: Option<RunsToday>,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
+    /// #1598 item 12 — the per-PR progress ledger. `None` when the loop has
+    /// written no readable ledger, which is absent evidence rather than a
+    /// finding: a deployment older than the ledger must stay quiet.
+    pub ledger: Option<Vec<crate::self_improve::LedgerEntry>>,
+    /// #1598 item 12 — `(pr, age in minutes)` for every OPEN pull request on
+    /// a loop-managed branch, by the same predicate the sweep decides from.
+    pub managed_pr_ages_mins: Vec<(u64, i64)>,
 }
 
 /// #1215 — how much of today's run budget is spent.
@@ -146,6 +155,10 @@ pub struct Thresholds {
     pub deploy_lag_mins: i64,
     pub red_main_hours: i64,
     pub draft_stale_days: i64,
+    /// #1598 item 12 — how long an open managed PR may stay unaccounted for.
+    pub pr_unknown_mins: i64,
+    /// #1598 item 12 — how long a managed PR may sit on one reason code.
+    pub pr_stale_progress_mins: i64,
 }
 
 impl Default for Thresholds {
@@ -166,6 +179,12 @@ impl Default for Thresholds {
             deploy_lag_mins: 60,
             red_main_hours: 6,
             draft_stale_days: 5,
+            // The sweep examines ten candidates a tick and ticks every
+            // 30 min, so a rotating window covers a large backlog well
+            // inside four hours; longer than that is a gap, not a queue.
+            pr_unknown_mins: 240,
+            // A day on one reason code means no lane is moving it.
+            pr_stale_progress_mins: 24 * 60,
         }
     }
 }
@@ -467,6 +486,65 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         });
     }
 
+    // #1598 item 12 — an unknown skip is not healthy.
+    //
+    // This is the October 2026 audit's core failure, and the only one the
+    // watchdog could not see: #1493/#1492/#1481/#1388 were open, green and
+    // outside every lane, and no rule fired because no evidence existed. The
+    // ledger is that evidence, so a managed PR missing from it — or frozen on
+    // one reason code — is now a finding. A box with no readable ledger says
+    // nothing here, exactly like every other absent input.
+    if let Some(ledger) = &i.ledger {
+        let unknown: Vec<String> = i
+            .managed_pr_ages_mins
+            .iter()
+            .filter(|(_, mins)| *mins >= t.pr_unknown_mins)
+            .filter(|(pr, _)| !ledger.iter().any(|e| e.pr == *pr))
+            .map(|(pr, mins)| format!("#{pr} (open {}h)", mins / 60))
+            .collect();
+        if !unknown.is_empty() {
+            out.push(Finding {
+                severity: Severity::Alert,
+                code: "pr-unknown-state",
+                detail: format!(
+                    "open agent pull requests the loop cannot account for — no state or \
+                     reason recorded for any of them: {}",
+                    unknown.join(", ")
+                ),
+                fix: "The sweep never reached a verdict on these. Check the last \
+                      `merge sweep` lines in stderr.log, and `augmentagent self-improve \
+                      --dry-run` for what the lanes see."
+                    .into(),
+            });
+        }
+
+        let stale: Vec<String> = ledger
+            .iter()
+            .filter(|e| i.managed_pr_ages_mins.iter().any(|(pr, _)| *pr == e.pr))
+            .filter_map(|e| {
+                let then = DateTime::parse_from_rfc3339(&e.last_progress_utc).ok()?;
+                let mins = mins_since(now, then.with_timezone(&Utc));
+                (mins >= t.pr_stale_progress_mins).then(|| {
+                    format!("#{} {} for {}h", e.pr, e.reason_code, mins / 60)
+                })
+            })
+            .collect();
+        if !stale.is_empty() {
+            out.push(Finding {
+                severity: Severity::Warn,
+                code: "pr-stale-progress",
+                detail: format!(
+                    "open agent pull requests whose state has not changed within the \
+                     stage threshold: {}",
+                    stale.join(", ")
+                ),
+                fix: "Each reason code says what is holding it; `autopr-ledger.json` in \
+                      the state dir carries the detail and next action."
+                    .into(),
+            });
+        }
+    }
+
     out.sort_by(|a, b| b.severity.cmp(&a.severity));
     out
 }
@@ -762,6 +840,40 @@ fn open_draft_ages(now: DateTime<Utc>) -> Vec<(u64, i64)> {
         .unwrap_or_default()
 }
 
+/// #1598 item 12 — `(pr, age in minutes)` for every open pull request on a
+/// loop-managed branch. Empty when `gh` could not be asked: the ledger rules
+/// compare against this list, so a guess either way would be worse than
+/// silence.
+fn managed_pr_ages(now: DateTime<Utc>) -> Vec<(u64, i64)> {
+    let Some(out) = std::process::Command::new("gh")
+        .args([
+            "pr", "list", "--state", "open", "--limit", "1000", "--json",
+            "number,headRefName,createdAt",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v.as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|p| {
+                    let n = p.get("number")?.as_u64()?;
+                    crate::self_improve::issue_from_branch(p.get("headRefName")?.as_str()?)?;
+                    let created = DateTime::parse_from_rfc3339(p.get("createdAt")?.as_str()?).ok()?;
+                    Some((n, mins_since(now, created.with_timezone(&Utc))))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Is the deployed build at `origin/main`, and if not, how stale is it?
 /// Measured from the commit date of what is deployed, so the answer does not
 /// depend on when the updater last ran.
@@ -935,6 +1047,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
             Some(RunsToday { runs, cap, braked })
         },
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
+        ledger: crate::self_improve::ledger_entries(),
+        managed_pr_ages_mins: managed_pr_ages(now),
     }
 }
 
@@ -1002,6 +1116,7 @@ async fn notify_owner_of(text: &str) {
 mod tests {
     // (tests continue below; the #1030 case is appended at the end)
     use super::*;
+    use crate::self_improve::ledger_entry;
 
     /// #1215 C5 — the text report always says how much of today's budget
     /// is spent, healthy or not.
@@ -1084,6 +1199,8 @@ mod tests {
             unreviewable_drafts: vec![],
             runs_today: None,
             gave_up_by_reason: None,
+            ledger: None,
+            managed_pr_ages_mins: Vec::new(),
         }
     }
 
@@ -1706,5 +1823,85 @@ mod tests {
 
         // Missing file ⇒ None.
         assert!(read_baseline_red(&dir.path().join("nope")).is_none());
+    }
+
+    /// #1598 item 12 — the October 2026 audit shape, which no rule could see:
+    /// #1493/#1492/#1481/#1388 were open with green checks, outside every
+    /// lane, and the watchdog called the loop healthy because nothing recorded
+    /// that they had been passed over.
+    #[test]
+    fn an_open_managed_pr_the_loop_cannot_account_for_is_not_healthy() {
+        let now = Utc::now();
+        let t = Thresholds::default();
+        let codes = |i: &HealthInputs| -> Vec<&'static str> {
+            analyze(i, &t).into_iter().map(|f| f.code).collect()
+        };
+
+        let audit_prs = [1493u64, 1492, 1481, 1388];
+        let mut i = HealthInputs { now_or_epoch: Some(now), daemon_active: true, ..Default::default() };
+        i.managed_pr_ages_mins = audit_prs.iter().map(|pr| (*pr, 6 * 60)).collect();
+
+        // No ledger at all is absent evidence, not a finding: a deployment
+        // older than the ledger must stay quiet.
+        assert!(!codes(&i).contains(&"pr-unknown-state"), "a missing ledger must not fire");
+
+        // A ledger that accounts for none of them is the audit.
+        i.ledger = Some(Vec::new());
+        assert!(codes(&i).contains(&"pr-unknown-state"), "{:?}", analyze(&i, &t));
+        let f = analyze(&i, &t).into_iter().find(|f| f.code == "pr-unknown-state").unwrap();
+        assert_eq!(f.severity, Severity::Alert);
+        for pr in audit_prs {
+            assert!(f.detail.contains(&format!("#{pr}")), "{}", f.detail);
+        }
+
+        // Each one accounted for, recently, is healthy — a recorded skip is a
+        // decision, not a stall.
+        i.ledger = Some(
+            audit_prs
+                .iter()
+                .map(|pr| ledger_entry(*pr, "skipped", "not-ours", &now.to_rfc3339()))
+                .collect(),
+        );
+        assert!(!codes(&i).contains(&"pr-unknown-state"));
+        assert!(!codes(&i).contains(&"pr-stale-progress"));
+
+        // Open younger than the threshold is still in the sweep's queue.
+        i.ledger = Some(Vec::new());
+        i.managed_pr_ages_mins = vec![(1493, t.pr_unknown_mins - 1)];
+        assert!(!codes(&i).contains(&"pr-unknown-state"));
+    }
+
+    /// #1598 item 12 — a managed PR frozen on one reason code past its stage
+    /// threshold. `last_progress_utc` is when the conclusion last CHANGED, so
+    /// re-reaching the same skip every tick does not look like movement.
+    #[test]
+    fn a_managed_pr_stuck_on_one_reason_code_is_reported() {
+        let now = Utc::now();
+        let t = Thresholds::default();
+        let stuck_since = now - chrono::Duration::minutes(t.pr_stale_progress_mins + 10);
+        let entry = ledger_entry(1538, "skipped", "no-publication-record", &stuck_since.to_rfc3339());
+        let mut i = HealthInputs { now_or_epoch: Some(now), daemon_active: true, ..Default::default() };
+        i.ledger = Some(vec![entry.clone()]);
+        i.managed_pr_ages_mins = vec![(1538, t.pr_stale_progress_mins + 10)];
+        let f = analyze(&i, &t)
+            .into_iter()
+            .find(|f| f.code == "pr-stale-progress")
+            .expect("a stuck managed PR is reported");
+        assert!(f.detail.contains("#1538"), "{}", f.detail);
+        assert!(f.detail.contains("no-publication-record"), "{}", f.detail);
+
+        // A record for a PR that is no longer open is history, not a problem —
+        // the same convention `review-held` follows.
+        i.managed_pr_ages_mins = Vec::new();
+        assert!(
+            !analyze(&i, &t).iter().any(|f| f.code == "pr-stale-progress"),
+            "a closed PR's record must not keep alarming"
+        );
+
+        // And progress within the threshold is progress.
+        i.managed_pr_ages_mins = vec![(1538, t.pr_stale_progress_mins + 10)];
+        i.ledger =
+            Some(vec![crate::self_improve::LedgerEntry { last_progress_utc: now.to_rfc3339(), ..entry }]);
+        assert!(!analyze(&i, &t).iter().any(|f| f.code == "pr-stale-progress"));
     }
 }

@@ -1521,6 +1521,10 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
     let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
     let start = sweep_window_start(ordered.len(), sweep_tick_seed(), MAX_SWEEP_EXAMINED);
     ordered.rotate_left(start);
+    // #1598 item 12 — captured before the bounded walk, so the pull requests
+    // this tick's window never reaches can still be accounted for below
+    // instead of being silently absent from the ledger.
+    let managed = managed_rows(&ordered);
     for row in ordered {
         if merged >= MAX_SWEEP_MERGES || examined >= MAX_SWEEP_EXAMINED {
             break;
@@ -1607,11 +1611,34 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
             },
         };
         let candidate_head = head_sha.clone();
+        // #1598 item 12 — one conclusion about this candidate, whatever it
+        // turns out to be. Best effort by construction: `note` cannot fail
+        // back to this code, so no ledger problem can change what merges.
+        let ledger = |state: &str, code: &str, detail: &str, next: &str| {
+            if dry_run {
+                return;
+            }
+            autopr_ledger::note(LedgerNote {
+                pr,
+                issue,
+                head: head_sha.as_deref().unwrap_or_default(),
+                state,
+                reason_code: code,
+                detail,
+                next_action: next,
+            });
+        };
         match sweep_verdict(&candidate) {
             SweepVerdict::Skip(why) => {
                 // Said, not swallowed: a silent skip is indistinguishable from
                 // the sweep being broken.
                 info!("merge sweep skipped {why}");
+                ledger(
+                    "skipped",
+                    why.code,
+                    &why.detail,
+                    "re-examined on the next sweep tick",
+                );
             }
             SweepVerdict::Merge => {
                 // CodeRabbit: every other path in this loop honours `dry_run`,
@@ -1629,6 +1656,12 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 // Preserve the original state when a merge must be retried.
                 let Some(readied) = ready_for_merge(repo_root, pr,
                     row.get("isDraft").and_then(serde_json::Value::as_bool)).await else {
+                    ledger(
+                        "blocked",
+                        "ready-failed",
+                        "approved, but the draft could not be marked ready for merge",
+                        "retried on the next sweep tick",
+                    );
                     continue;
                 };
                 // Codex: a check can go green-to-red without a new commit —
@@ -1642,6 +1675,12 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                         let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
                             .await;
                     }
+                    ledger(
+                        "blocked",
+                        "checks-regressed",
+                        "checks went non-green between the sweep's read and the merge",
+                        "re-read on the next sweep tick",
+                    );
                     continue;
                 }
 
@@ -1662,11 +1701,13 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 )
                 .await
                 .unwrap_or((false, String::new(), "spawn failed".into()));
+                let mut draft_restored = true;
                 if !ok && readied {
                     let (undone, ..) =
                         run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
                             .await
                             .unwrap_or((false, String::new(), String::new()));
+                    draft_restored = undone;
                     if !undone {
                         warn!(
                             pr = candidate.pr,
@@ -1687,13 +1728,63 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                         candidate.pr, candidate.issue
                     ))
                     .await;
+                    ledger("merged", "merged", "squash-merged at the reviewed head", "none");
                 } else {
                     warn!(pr, "merge sweep: merge failed, left open: {}", truncate(&e, 200));
+                    ledger(
+                        "merge-failed",
+                        if draft_restored { "merge-rejected" } else { "merge-rejected-draft-stuck" },
+                        &format!("gh refused the merge: {}", truncate(&e, 200)),
+                        if draft_restored {
+                            "retried on the next sweep tick"
+                        } else {
+                            "a human must restore the draft state"
+                        },
+                    );
                 }
             }
         }
     }
+    // #1598 item 12 — anything managed this tick's bounded window never
+    // reached is `deferred` with its next action, never absent. Entries
+    // written above are left exactly as they are.
+    if !dry_run {
+        let notes: Vec<LedgerNote<'_>> = managed
+            .iter()
+            .map(|(pr, issue, head)| LedgerNote {
+                pr: *pr,
+                issue: *issue,
+                head,
+                state: "deferred",
+                reason_code: "sweep-window-full",
+                detail: "this tick's examination budget was spent before reaching it",
+                next_action: "examined once the rotating sweep window reaches it",
+            })
+            .collect();
+        autopr_ledger::note_absent(&notes);
+    }
     merged
+}
+
+/// #1598 item 12 — `(pr, issue, head)` for every row on a loop-managed
+/// branch.
+///
+/// Pure, and over the same branch predicate the sweep itself decides from, so
+/// "managed" means one thing in the ledger and in the gate. A branch that
+/// encodes no issue is not loop-managed and gets no entry: recording every
+/// human pull request would grow the file without accounting for anything.
+fn managed_rows(rows: &[&serde_json::Value]) -> Vec<(u64, u64, String)> {
+    rows.iter()
+        .filter_map(|row| {
+            let pr = row.get("number")?.as_u64()?;
+            let issue = issue_from_branch(row.get("headRefName")?.as_str()?)?;
+            let head = row
+                .get("headRefOid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Some((pr, issue, head.to_string()))
+        })
+        .collect()
 }
 
 /// Return whether this attempt changed a draft to ready. Unknown state or a
@@ -2095,6 +2186,257 @@ use opened_prs::testing::{
     record_at as record_opened_pr, resolved_path as opened_prs_path,
 };
 
+/// #1598 item 12 — what the loop last concluded about one managed pull
+/// request, in a form a machine can read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LedgerEntry {
+    pub pr: u64,
+    pub issue: u64,
+    /// The head the conclusion was reached at. A moved head is progress.
+    #[serde(default)]
+    pub head: String,
+    /// Where this PR stands: `skipped`, `deferred`, `merged`, `merge-failed`.
+    pub state: String,
+    /// Stable reason code — see [`sweep_verdict`] and [`autopr_ledger`].
+    pub reason_code: String,
+    #[serde(default)]
+    pub detail: String,
+    /// How many times in a row the loop reached this same conclusion.
+    #[serde(default)]
+    pub retry_count: u32,
+    pub first_seen_utc: String,
+    /// When the conclusion last CHANGED — the signal a PR is stuck.
+    pub last_progress_utc: String,
+    #[serde(default)]
+    pub next_action: String,
+}
+
+/// #1598 item 12 — one conclusion about one managed pull request, on its way
+/// into the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LedgerNote {
+    pub pr: u64,
+    pub issue: u64,
+    pub head: String,
+    pub state: String,
+    pub reason_code: String,
+    pub detail: String,
+    pub next_action: String,
+}
+
+/// #1598 item 12 — the per-PR progress ledger, and everything that can touch
+/// it.
+///
+/// The October 2026 audit's core failure was not a wrong decision, it was an
+/// unrecorded one: #1493/#1492/#1481/#1388 sat open with green checks, outside
+/// every lane, and the only trace of why was an `info!` line that had long
+/// scrolled out of the log. So every managed pull request the sweep looks at —
+/// and every one its per-tick budget kept it from looking at — leaves a state
+/// and a stable reason code here, which [`crate::autopr_health`] reads out of
+/// process.
+///
+/// Same encapsulation as [`opened_prs`]: the resolver, the serializer and the
+/// path-taking forms stay private so the rest of the crate cannot reach the
+/// file. Unlike that map, nothing here may ever change an outcome — every
+/// entry point returns `()`, so a failure is logged and dropped.
+mod autopr_ledger {
+    use std::collections::BTreeMap;
+    use std::os::unix::io::AsRawFd;
+    use std::path::{Path, PathBuf};
+
+    use tracing::warn;
+
+    use super::{LedgerEntry, LedgerNote};
+
+    fn path() -> PathBuf {
+        if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_LEDGER_FILE") {
+            if !p.trim().is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-ledger.json")
+    }
+
+    /// Replace the ledger with one entry per note, carrying each pull
+    /// request's progress history forward. `notes` is the whole managed open
+    /// list, so work that has closed drops out and the file stays bounded by
+    /// what is actually open — no separate retirement pass to get wrong.
+    pub(super) fn record(notes: &[LedgerNote]) {
+        write(&path(), notes);
+    }
+
+    /// Every entry, or `None` when the ledger cannot be read at all — which
+    /// the watchdog treats as absent evidence rather than as a problem, so a
+    /// deployment that predates the ledger stays quiet.
+    pub(super) fn entries() -> Option<Vec<LedgerEntry>> {
+        read_checked(&path()).map(|m| m.into_values().collect())
+    }
+
+    /// The path-taking forms, so tests can drive a scratch ledger. Test-only,
+    /// so no production code can bypass the serialization above.
+    #[cfg(test)]
+    pub(super) mod testing {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        use crate::self_improve::{LedgerEntry, LedgerNote};
+
+        pub fn write_at(path: &Path, notes: &[LedgerNote]) {
+            super::write(path, notes);
+        }
+
+        pub fn read_at(path: &Path) -> BTreeMap<String, LedgerEntry> {
+            super::read(path)
+        }
+
+        pub fn read_checked_at(path: &Path) -> Option<BTreeMap<String, LedgerEntry>> {
+            super::read_checked(path)
+        }
+
+        pub fn fold(prev: Option<&LedgerEntry>, n: &LedgerNote, now: &str) -> LedgerEntry {
+            super::fold(prev, n, now)
+        }
+    }
+
+    /// Build `n`'s entry from what the ledger already said about that pull
+    /// request. Reaching the same conclusion at the same head is a retry, NOT
+    /// progress: `last_progress_utc` must mean "when this PR last moved", or a
+    /// PR stuck on one reason for a week would look freshly judged every tick.
+    fn fold(prev: Option<&LedgerEntry>, n: &LedgerNote, now: &str) -> LedgerEntry {
+        let moved = prev.is_none_or(|p| {
+            p.state != n.state || p.reason_code != n.reason_code || p.head != n.head
+        });
+        LedgerEntry {
+            pr: n.pr,
+            issue: n.issue,
+            head: n.head.clone(),
+            state: n.state.clone(),
+            reason_code: n.reason_code.clone(),
+            detail: n.detail.clone(),
+            retry_count: match prev {
+                Some(p) if !moved => p.retry_count.saturating_add(1),
+                _ => 0,
+            },
+            first_seen_utc: prev.map_or(now, |p| p.first_seen_utc.as_str()).to_string(),
+            last_progress_utc: match prev {
+                Some(p) if !moved => p.last_progress_utc.clone(),
+                _ => now.to_string(),
+            },
+            next_action: n.next_action.clone(),
+        }
+    }
+
+    fn write(path: &Path, notes: &[LedgerNote]) {
+        // Nothing managed and open is indistinguishable from `gh` having
+        // failed, and wiping the ledger on a failed read would make every
+        // judged pull request look unaccounted for.
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(path = %path.display(), "ledger dir create failed: {e}");
+            }
+        }
+        // No lock, unlike the opened-PR map this file sits beside: every write
+        // carries the COMPLETE managed open list, so a concurrent writer
+        // cannot rename away a record the other one holds — the worst an
+        // interleaving costs is one pull request's progress history, and the
+        // sweep's run lock already keeps two of them from overlapping.
+        let now = chrono::Utc::now().to_rfc3339();
+        let prev = read(path);
+        let entries: BTreeMap<String, LedgerEntry> = notes
+            .iter()
+            .map(|n| {
+                let key = n.pr.to_string();
+                (key.clone(), fold(prev.get(&key), n, &now))
+            })
+            .collect();
+        let json = match serde_json::to_vec_pretty(&entries) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(path = %path.display(), "ledger serialize failed: {e}");
+                return;
+            }
+        };
+        // Per-writer temp name: a fixed `.tmp` sibling lets one lane rename
+        // another's partial bytes into place.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            warn!(path = %tmp.display(), "ledger write failed: {e}");
+            remove_stale_tmp(&tmp);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(path = %path.display(), "ledger rename failed: {e}");
+            remove_stale_tmp(&tmp);
+        }
+    }
+
+    fn remove_stale_tmp(tmp: &Path) {
+        match std::fs::remove_file(tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(path = %tmp.display(), "ledger temp cleanup failed: {e}"),
+        }
+    }
+
+    /// The ledger, or `None` when it is absent or damaged. The distinction
+    /// matters only to the watchdog, which must not raise a finding from a
+    /// file it could not read — that would be crying wolf about its own
+    /// evidence rather than about the loop.
+    fn read_checked(path: &Path) -> Option<BTreeMap<String, LedgerEntry>> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                warn!(path = %path.display(), "ledger read failed: {e}");
+                return None;
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                warn!(path = %path.display(), "ledger parse failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// The writer's view: an unreadable ledger is empty, so the next pass
+    /// re-records what it still knows rather than refusing to write at all.
+    fn read(path: &Path) -> BTreeMap<String, LedgerEntry> {
+        read_checked(path).unwrap_or_default()
+    }
+}
+
+/// #1598 item 12 — every managed pull request's state and reason, for the
+/// health watchdog. `None` when no readable ledger exists.
+pub(crate) fn ledger_entries() -> Option<Vec<LedgerEntry>> {
+    autopr_ledger::entries()
+}
+
+/// One ledger entry for a test, placeholder everywhere the caller does not
+/// care. Shared with [`crate::autopr_health`], whose rules read the same rows.
+#[cfg(test)]
+pub(crate) fn ledger_entry(pr: u64, state: &str, reason_code: &str, progress: &str) -> LedgerEntry {
+    LedgerEntry {
+        pr,
+        issue: pr.saturating_sub(100),
+        head: "aaaa111".into(),
+        state: state.into(),
+        reason_code: reason_code.into(),
+        detail: "detail".into(),
+        retry_count: 0,
+        first_seen_utc: progress.into(),
+        last_progress_utc: progress.into(),
+        next_action: "next tick".into(),
+    }
+}
+
 /// #1029 — the loop's own signature on a PR body, and the only evidence that
 /// the loop actually opened a pull request.
 ///
@@ -2224,35 +2566,64 @@ struct SweepCandidate {
     policy: MergePolicy,
 }
 
+/// #1598 item 12 — a skip, its stable machine-readable code and the sentence
+/// a human reads.
+///
+/// The code is the ledger's key to the reason and is never reworded; `detail`
+/// is the prose the sweep has always logged. Derefs to that prose so every
+/// existing reader — the `info!` line, the tests that assert what a refusal
+/// mentions — is unchanged by the code being carried alongside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkipReason {
+    code: &'static str,
+    detail: String,
+}
+
+impl std::ops::Deref for SkipReason {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SweepVerdict {
     Merge,
     /// Left alone, with the reason — a silent skip is indistinguishable from
     /// the sweep being broken.
-    Skip(String),
+    Skip(SkipReason),
 }
 
 /// Should the sweep merge this draft? Pure: the sweep spends no reasoner call,
 /// so the whole decision is evidence already on the PR.
 fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
-    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
+    let skip = |code: &'static str, why: &str| {
+        SweepVerdict::Skip(SkipReason { code, detail: format!("PR #{}: {why}", c.pr) })
+    };
     if c.ours != Some(true) {
-        return skip("not ours — the loop only finishes work it opened (#1006)");
+        return skip("not-ours", "not ours — the loop only finishes work it opened (#1006)");
     }
     if !c.loop_authored {
         // Same repository is not the same as loop-authored. A human can open
         // `agent-fix/issue-N` here by hand; the sweep merges with nobody
         // watching, so it needs the loop's own signature on the body.
-        return skip("no matching local publication record, reviewed head, or self-improve body signature");
+        return skip("no-publication-record", "no matching local publication record, reviewed head, or self-improve body signature");
     }
     if c.mergeable != Some(true) {
-        return skip("conflict with main, or mergeability unknown; a rebase is the resume lane's job");
+        return skip("conflicting", "conflict with main, or mergeability unknown; a rebase is the resume lane's job");
     }
     if c.checks_green != Some(true) {
-        return skip("checks are not green, or their state is unknown");
+        return skip("checks-not-green", "checks are not green, or their state is unknown");
     }
     if !c.review_approved {
-        return skip("no approving independent review recorded by the loop for this head");
+        return skip("no-recorded-approval", "no approving independent review recorded by the loop for this head");
     }
     // Unknown must DENY, and it must do so where nothing can release it.
     // Codex: routing an unreadable diff through the receipt gate as a gated
@@ -2264,12 +2635,16 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     // file", never "on a file nobody could name".
     if c.policy.receipt_gated_file.as_deref() == Some(UNREADABLE_DIFF) {
         return skip(
+            "unreadable-diff",
             "its diff could not be read, so whether it touches a receipt-gated \
              path is unknown; no override applies to an unknown",
         );
     }
     if !may_automerge(&c.policy) {
-        return skip("the merge policy withholds it (complexity, receipt gate, or author)");
+        return skip(
+            "policy-withheld",
+            "the merge policy withholds it (complexity, receipt gate, or author)",
+        );
     }
     SweepVerdict::Merge
 }
@@ -3514,7 +3889,7 @@ async fn notify_review(text: &str) {
 }
 
 /// Issue number encoded in an agent branch name (`agent-fix/issue-845` → 845).
-fn issue_from_branch(branch: &str) -> Option<u64> {
+pub(crate) fn issue_from_branch(branch: &str) -> Option<u64> {
     branch.strip_prefix(BRANCH_PREFIX)?.parse().ok()
 }
 
@@ -18993,6 +19368,280 @@ else:
         assert!(!second.billed && !second.is_idle(), "{}", second.message);
     }
 
+    /// A candidate the sweep would merge, as the ledger tests mutate it.
+    fn sweepable(pr: u64, issue: u64) -> SweepCandidate {
+        SweepCandidate {
+            pr,
+            issue,
+            ours: Some(true),
+            loop_authored: true,
+            mergeable: Some(true),
+            checks_green: Some(true),
+            review_approved: true,
+            policy: policy(Complexity::Medium),
+        }
+    }
+
+    /// #1598 item 12 — every skip the sweep can reach carries a distinct,
+    /// stable reason code.
+    ///
+    /// The codes are the ledger's whole vocabulary. Rewording the sentence a
+    /// human reads must not change what a machine matched on, and two
+    /// branches sharing a code would make two unrelated problems — a fork and
+    /// a red check — look like one.
+    #[test]
+    fn every_sweep_skip_branch_carries_a_distinct_stable_reason_code() {
+        let ready = sweepable(1020, 1007);
+        assert_eq!(sweep_verdict(&ready), SweepVerdict::Merge);
+        let code = |mutate: fn(&mut SweepCandidate)| -> &'static str {
+            let mut c = ready.clone();
+            mutate(&mut c);
+            match sweep_verdict(&c) {
+                SweepVerdict::Skip(r) => r.code,
+                SweepVerdict::Merge => panic!("this mutation must not merge"),
+            }
+        };
+        let codes = [
+            code(|c| c.ours = None),
+            code(|c| c.loop_authored = false),
+            code(|c| c.mergeable = None),
+            code(|c| c.checks_green = None),
+            code(|c| c.review_approved = false),
+            code(|c| c.policy.receipt_gated_file = Some(UNREADABLE_DIFF.to_string())),
+            code(|c| c.policy.reviews_approved = false),
+        ];
+        // Every branch of `sweep_verdict`, in order, so a new one added
+        // without a code of its own shows up here as a shifted expectation.
+        assert_eq!(
+            codes,
+            [
+                "not-ours",
+                "no-publication-record",
+                "conflicting",
+                "checks-not-green",
+                "no-recorded-approval",
+                "unreadable-diff",
+                "policy-withheld",
+            ]
+        );
+    }
+
+    /// #1598 item 12 — the October 2026 audit's core failure, in one test.
+    ///
+    /// A green, mergeable pull request the loop cannot prove is its own used
+    /// to produce one `info!` line and nothing else, so #1493/#1492/#1481/
+    /// #1388 sat open and unexplained until a human noticed. The conclusion is
+    /// now persisted, with the code a machine can read.
+    #[test]
+    fn a_green_pr_the_sweep_passes_over_leaves_a_machine_readable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-ledger.json");
+        // Everything perfect except provenance — the #1493 shape exactly.
+        let mut c = sweepable(1493, 1393);
+        c.ours = None;
+        let SweepVerdict::Skip(why) = sweep_verdict(&c) else {
+            panic!("a PR the loop cannot vouch for must never merge")
+        };
+        autopr_ledger::testing::write_at(
+            &path,
+            &[LedgerNote {
+                pr: c.pr,
+                issue: c.issue,
+                head: "aaaa111",
+                state: "skipped",
+                reason_code: why.code,
+                detail: &why.detail,
+                next_action: "re-examined on the next sweep tick",
+            }],
+            true,
+        );
+        let e = autopr_ledger::testing::read_at(&path).remove("1493").expect("a record");
+        assert_eq!(e.pr, 1493);
+        assert_eq!(e.issue, 1393);
+        assert_eq!(e.state, "skipped");
+        assert_eq!(e.reason_code, "not-ours");
+        assert!(e.detail.contains("not ours"), "{}", e.detail);
+        assert!(!e.next_action.is_empty(), "a state with no next action is still a dead end");
+        assert!(!e.first_seen_utc.is_empty() && !e.last_progress_utc.is_empty());
+        // UTC internally, per #1598; any local-day bucketing is a render-time
+        // concern, not a stored one.
+        assert!(e.last_progress_utc.ends_with("+00:00"), "{}", e.last_progress_utc);
+    }
+
+    /// #1598 item 12 — reaching the same conclusion again is a retry, not
+    /// progress.
+    ///
+    /// `last_progress_utc` has to mean "when this PR last moved", or a draft
+    /// stuck on one reason for a week would look freshly judged on every tick
+    /// and the watchdog's stale rule could never fire.
+    #[test]
+    fn re_reaching_the_same_conclusion_is_a_retry_and_a_new_one_is_progress() {
+        let mut map = std::collections::BTreeMap::new();
+        let note = |code: &'static str, head: &'static str| LedgerNote {
+            pr: 1538,
+            issue: 1537,
+            head,
+            state: "skipped",
+            reason_code: code,
+            detail: "d",
+            next_action: "n",
+        };
+        let apply = |map: &mut std::collections::BTreeMap<String, LedgerEntry>, n, now| {
+            autopr_ledger::testing::apply(map, &n, now, true);
+        };
+
+        apply(&mut map, note("checks-not-green", "aaa"), "2026-10-25T00:00:00+00:00");
+        apply(&mut map, note("checks-not-green", "aaa"), "2026-10-25T01:00:00+00:00");
+        apply(&mut map, note("checks-not-green", "aaa"), "2026-10-25T02:00:00+00:00");
+        let e = &map["1538"];
+        assert_eq!(e.retry_count, 2);
+        assert_eq!(e.first_seen_utc, "2026-10-25T00:00:00+00:00");
+        assert_eq!(e.last_progress_utc, "2026-10-25T00:00:00+00:00", "a retry is not progress");
+
+        // A different reason is progress, and so is the same reason at a new
+        // head: the PR moved even though the verdict reads the same.
+        apply(&mut map, note("policy-withheld", "aaa"), "2026-10-25T03:00:00+00:00");
+        assert_eq!(map["1538"].retry_count, 0);
+        assert_eq!(map["1538"].last_progress_utc, "2026-10-25T03:00:00+00:00");
+        apply(&mut map, note("policy-withheld", "bbb"), "2026-10-25T04:00:00+00:00");
+        assert_eq!(map["1538"].last_progress_utc, "2026-10-25T04:00:00+00:00");
+        assert_eq!(map["1538"].first_seen_utc, "2026-10-25T00:00:00+00:00", "first seen is first");
+
+        // Insert-only notes (the deferred lane) never overwrite a real
+        // verdict, or a tick's bounded window would erase what it concluded.
+        autopr_ledger::testing::apply(
+            &mut map,
+            &LedgerNote {
+                pr: 1538,
+                issue: 1537,
+                head: "bbb",
+                state: "deferred",
+                reason_code: "sweep-window-full",
+                detail: "d",
+                next_action: "n",
+            },
+            "2026-10-25T05:00:00+00:00",
+            false,
+        );
+        assert_eq!(map["1538"].reason_code, "policy-withheld");
+        assert_eq!(map["1538"].last_progress_utc, "2026-10-25T04:00:00+00:00");
+    }
+
+    /// #1598 item 12 — a managed PR the tick's bounded window never reaches
+    /// is still accounted for.
+    ///
+    /// `MAX_SWEEP_EXAMINED` bounds the looking, which means most of a long
+    /// backlog gets no verdict on any given tick. Without this those rows
+    /// would be absent from the ledger and indistinguishable from the audit's
+    /// unaccounted-for pull requests.
+    #[test]
+    fn a_managed_pr_outside_the_examination_window_is_deferred_not_absent() {
+        let rows: serde_json::Value = serde_json::json!([
+            {"number": 1493, "headRefName": "agent-fix/issue-1393", "headRefOid": "aaa"},
+            {"number": 1492, "headRefName": "agent-fix/issue-1392"},
+            {"number": 900, "headRefName": "feat/some-human-branch", "headRefOid": "ccc"},
+            {"headRefName": "agent-fix/issue-1"},
+        ]);
+        let refs: Vec<&serde_json::Value> = rows.as_array().unwrap().iter().collect();
+        assert_eq!(
+            managed_rows(&refs),
+            vec![
+                (1493, 1393, "aaa".to_string()),
+                // An unknown head is still a managed PR to account for.
+                (1492, 1392, String::new()),
+            ],
+            "a human branch is not loop-managed, and a numberless row has no key"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-ledger.json");
+        let notes: Vec<LedgerNote<'_>> = managed_rows(&refs)
+            .iter()
+            .map(|(pr, issue, _)| LedgerNote {
+                pr: *pr,
+                issue: *issue,
+                head: "aaa",
+                state: "deferred",
+                reason_code: "sweep-window-full",
+                detail: "d",
+                next_action: "n",
+            })
+            .collect::<Vec<_>>();
+        autopr_ledger::testing::write_at(&path, &notes, false);
+        let map = autopr_ledger::testing::read_at(&path);
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(map["1493"].state, "deferred");
+        assert_eq!(map["1493"].reason_code, "sweep-window-full");
+    }
+
+    /// #1598 item 12 — the ledger is bounded, and retires finished work
+    /// before anything still waiting. 501 entries, one of which is `merged`
+    /// and the freshest: the cap must still claim that one.
+    #[test]
+    fn the_ledger_retires_merged_entries_before_it_drops_live_ones() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("1".into(), ledger_entry(1, "merged", "r", "2026-10-01T00:00:00+00:00"));
+        for pr in 2..=501u64 {
+            map.insert(pr.to_string(), ledger_entry(pr, "skipped", "r", "2026-09-01T00:00:00+00:00"));
+        }
+        autopr_ledger::testing::prune(&mut map);
+        assert_eq!(map.len(), 500);
+        assert!(!map.contains_key("1"), "the merged entry is retired first");
+        assert!(map.contains_key("2") && map.contains_key("501"));
+    }
+
+    /// #1598 item 12 — two lanes recording at once lose nothing.
+    ///
+    /// The exact failure #1533 fixed in the opened-PR map: the build, resume
+    /// and sweep lanes hold different run locks, so two unserialized
+    /// read-modify-writes rename one lane's stale view over the other's
+    /// record. A ledger that drops records is worse than no ledger, because
+    /// the watchdog's unknown-state rule would then alarm about a PR the loop
+    /// actually judged.
+    #[test]
+    fn concurrent_ledger_writers_lose_no_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-ledger.json");
+        let threads: Vec<_> = (0..8u64)
+            .map(|lane| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20u64 {
+                        let pr = lane * 100 + i;
+                        autopr_ledger::testing::write_at(
+                            &path,
+                            &[LedgerNote {
+                                pr,
+                                issue: pr,
+                                head: "aaa",
+                                state: "skipped",
+                                reason_code: "checks-not-green",
+                                detail: "d",
+                                next_action: "n",
+                            }],
+                            true,
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let map = autopr_ledger::testing::read_at(&path);
+        assert_eq!(map.len(), 160, "a lane's records were renamed away: {}", map.len());
+
+        // A staging file a killed writer left behind is never read back in,
+        // and a damaged ledger is absent evidence rather than a finding.
+        std::fs::write(path.with_extension("json.tmp.999.0"), b"{partial").unwrap();
+        assert_eq!(autopr_ledger::testing::read_at(&path).len(), 160);
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(
+            autopr_ledger::testing::read_checked_at(&path).is_none(),
+            "a damaged ledger must not look like an empty one to the watchdog"
+        );
+        assert!(autopr_ledger::testing::read_at(&path).is_empty(), "but the writer carries on");
+    }
 }
 
 #[cfg(test)]
