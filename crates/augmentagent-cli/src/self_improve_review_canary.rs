@@ -24,10 +24,13 @@ fn database() -> Result<PathBuf> {
         .join("review-canaries.db"))
 }
 fn connect(path: &Path, read_only: bool) -> Result<rusqlite::Connection> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     let parent = path.parent().context("canary state parent missing")?;
     if !read_only {
-        std::fs::create_dir_all(parent)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
     let parent = parent.canonicalize()?;
     let directory = std::fs::metadata(&parent)?;
@@ -318,7 +321,10 @@ async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
     let result = aligned_review::run_inner(
         Codex,
         &[],
-        &aligned_review::ReviewSubject { title: &issue.title, body: &issue.body },
+        &aligned_review::ReviewSubject {
+            title: &issue.title,
+            body: &issue.body,
+        },
         root.clone(),
         &[CRITERION.into()],
         aligned_review::ReviewContext {
@@ -344,9 +350,17 @@ async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn private_fixture() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // tempfile uses the process umask on this host (0002), unlike the
+        // controller-owned state boundary which requires no group writes.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
     #[test]
     fn daily_canary_claim_survives_crash_and_never_records_false_completion() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_fixture();
         let path = dir.path().join("canaries.db");
         let id = claim(&path, 100).unwrap().unwrap();
         assert!(claim(&path, 101).unwrap().is_none());
@@ -377,7 +391,7 @@ mod tests {
     #[test]
     fn canary_store_is_private_read_only_when_reported_and_completions_are_immutable() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_fixture();
         let path = dir.path().join("first-start/control/canaries.db");
         let id = claim(&path, 100).unwrap().unwrap();
         assert_eq!(
@@ -428,7 +442,7 @@ mod tests {
     #[test]
     fn canary_store_refuses_redirected_and_multiply_linked_control_files() {
         use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_fixture();
         let real = dir.path().join("real.db");
         open(&real).unwrap();
         let link = dir.path().join("link.db");
@@ -439,6 +453,19 @@ mod tests {
         std::fs::hard_link(&real, dir.path().join("hard.db")).unwrap();
         assert!(open(&real).is_err());
         assert!(connect(&real, true).is_err());
+    }
+
+    #[test]
+    fn existing_group_writable_control_directory_is_rejected_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_fixture();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(open(&dir.path().join("canaries.db")).is_err());
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
+        assert!(!dir.path().join("canaries.db").exists());
     }
 
     #[tokio::test]

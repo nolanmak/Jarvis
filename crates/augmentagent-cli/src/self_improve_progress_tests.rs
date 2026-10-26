@@ -254,6 +254,7 @@ elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
     print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
+elif a[0]=='api' and '/git/ref/heads/main' in a[1]: print(s['base'])
 elif a[0]=='api' and '/issues/' in a[1]: print(json.dumps(dict(state='open')))
 elif a[0]=='api': print('[]')
 elif a[:2]==['pr','edit']: time.sleep(30)
@@ -286,10 +287,21 @@ else: raise Exception('unexpected call '+repr(a))
     let head = "a".repeat(40);
     let scenario = |checks: &str, draft: bool, fail_merge: bool, sha: &str| {
         std::fs::write(root.join("scenario"), serde_json::to_vec(&serde_json::json!({
-            "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha
+            "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha,"base":"c".repeat(40)
         })).unwrap()).unwrap();
     };
-    let verdict = || Some(RecordedVerdict {structured:None,provider:"codex".into(),backend:"native".into(),model:"synthetic".into(),diff_ok:true,system_ok:true});
+    let verdict = || {
+        let mut review = synthetic_aligned_review(&head,true);
+        let evidence = review.structured.as_mut().unwrap();
+        evidence.binding.base = "c".repeat(40);
+        for pass in &mut evidence.passes {
+            pass.binding = evidence.binding.clone();
+            pass.coverage.binding = evidence.binding.clone();
+        }
+        evidence.adjudication.as_mut().unwrap().binding = evidence.binding.clone();
+        assert!(review.approved(), "fixture approval must validate before sweep");
+        review.recorded_verdict()
+    };
     // Opening a rejected draft records ownership, but never authorizes merge.
     record_opened_pr(&opened_prs_path(), 10, 20, &head, None);
     scenario("SUCCESS", true, false, &head);
@@ -307,6 +319,11 @@ else: raise Exception('unexpected call '+repr(a))
     assert_eq!(ready_for_merge(&root, 20, None).await, None);
     scenario("SUCCESS", false, false, &"b".repeat(40));
     assert_eq!(merge_sweep(&root, false).await, 0);
+    scenario("SUCCESS", false, false, &head);
+    let mut advanced: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("scenario")).unwrap()).unwrap();
+    advanced["base"] = serde_json::json!("d".repeat(40));
+    std::fs::write(root.join("scenario"),serde_json::to_vec(&advanced).unwrap()).unwrap();
+    assert_eq!(merge_sweep(&root, false).await, 0, "approval cannot cover advanced remote main");
     scenario("SUCCESS", false, false, &head);
     assert_eq!(merge_sweep(&root, true).await, 0);
     assert!(!root.join("merged").exists());
