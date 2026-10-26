@@ -10466,7 +10466,8 @@ pub async fn run_multi_repo_once(
         .await
         .with_context(|| format!("mkdir {}", workroot.display()))?;
 
-    let reasoner = build_reasoner();
+    // This legacy approval-broker lane does not own an Autoship WorkflowGuard.
+    let reasoner = augmentagent_channel_core::build_reasoner();
     let mut report: Vec<String> = Vec::new();
 
     for repo in &repos {
