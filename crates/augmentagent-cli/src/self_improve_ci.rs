@@ -227,6 +227,29 @@ async fn binding_at(root: &Path, base_ref: &str) -> Result<Binding> {
         runner_sha256: digest(RUNNER.as_bytes()),
     })
 }
+// Metadata is controller authority even when the service uses umask 0002.
+// Check the opened inode before truncating; HEAD already exists after git init.
+fn write_private_git_metadata(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == unsafe { libc::geteuid() },
+        "{PREREQUISITE}: invalid controller Git metadata inode"
+    );
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.set_len(0)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// Literal Git blobs plus a minimal private Git database. No checkout filters,
 /// ignored bytecode, candidate Git config/hooks, or live worktree artifact enters.
 async fn snapshot(
@@ -274,13 +297,13 @@ async fn snapshot(
     // Git's alternate object database is read-only from the snapshot's point of
     // view; its own refs/index/config remain private. No source checkout path is
     // used to execute CI scripts, and no original Git configuration is copied.
-    std::fs::write(
-        directory.path().join(".git/objects/info/alternates"),
-        format!("{}\n", objects.display()),
+    write_private_git_metadata(
+        &directory.path().join(".git/objects/info/alternates"),
+        format!("{}\n", objects.display()).as_bytes(),
     )?;
-    std::fs::write(
-        directory.path().join(".git/HEAD"),
-        format!("{}\n", binding.verification_head),
+    write_private_git_metadata(
+        &directory.path().join(".git/HEAD"),
+        format!("{}\n", binding.verification_head).as_bytes(),
     )?;
     git(
         directory.path(),
@@ -325,7 +348,7 @@ async fn snapshot(
                     && line.bytes().all(|b| b.is_ascii_hexdigit())),
             "{PREREQUISITE}: invalid shallow commit IDs"
         );
-        std::fs::write(directory.path().join(".git/shallow"), shallow)?;
+        write_private_git_metadata(&directory.path().join(".git/shallow"), shallow.as_bytes())?;
     }
     git(directory.path(), &["read-tree", &binding.verification_head]).await?;
     git(directory.path(), &["update-index", "--refresh"]).await?;
@@ -718,8 +741,48 @@ mod tests {
     }
     #[tokio::test]
     async fn staged_snapshot_covers_changes_without_moving_branch_and_detects_mutation() {
+        const CHILD: &str = "AUTOSHIP_CI_SNAPSHOT_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "self_improve::shared_ci::tests::staged_snapshot_covers_changes_without_moving_branch_and_detects_mutation", "--nocapture"]).env(CHILD, "1");
+            unsafe {
+                child.pre_exec(|| {
+                    libc::umask(0o002);
+                    Ok(())
+                });
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
+        let lock_state = tempfile::tempdir().unwrap();
+        let lock_path = lock_state.path().join("disk-build.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let old = std::fs::metadata(&lock_path).unwrap();
+        assert_eq!(old.mode() & 0o777, 0o664);
+        let lease = crate::build_storage::Lease::try_at(lock_state.path())
+            .unwrap()
+            .unwrap();
+        let hardened = std::fs::metadata(&lock_path).unwrap();
+        assert_eq!((old.dev(), old.ino()), (hardened.dev(), hardened.ino()));
+        assert_eq!(hardened.mode() & 0o777, 0o600);
+        assert!(crate::build_storage::Lease::try_at(lock_state.path())
+            .unwrap()
+            .is_none());
+        drop(lease);
+        assert!(crate::build_storage::Lease::try_at(lock_state.path())
+            .unwrap()
+            .is_some());
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.name", "Fixture"],
@@ -754,6 +817,33 @@ mod tests {
         let target = cache.path().join("target");
         std::fs::create_dir(&target).unwrap();
         let exported = super::snapshot(root, &snapshot, &target).await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(root.join("source.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664,
+            "child must reproduce service umask"
+        );
+        for relative in [".git/objects/info/alternates", ".git/HEAD"] {
+            assert_eq!(
+                std::fs::metadata(exported.path().join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let shallow = exported.path().join(".git/shallow");
+        write_private_git_metadata(&shallow, b"test boundary\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&shallow).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(shallow).unwrap();
         assert!(!exported.path().join("ignored.pyc").exists());
         assert_eq!(
             std::fs::read_to_string(exported.path().join("source.txt")).unwrap(),

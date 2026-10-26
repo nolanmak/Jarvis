@@ -2,6 +2,7 @@
 //! grants permission to remove another project's output.
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -49,8 +50,18 @@ impl Lease {
             .truncate(false)
             .read(true)
             .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(state.join("disk-build.lock"))?;
+        let metadata = f.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("build admission lock must be an owned regular single-link file");
+        }
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // Migrate historical umask-derived 0664 locks through the held inode.
+            // Never replace the lock, chmod a pathname, or alter another holder.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.sync_all()?;
             Ok(Some(Self {
                 file: f,
                 targets: Default::default(),
