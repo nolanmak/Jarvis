@@ -73,6 +73,47 @@ class CommittedSource(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "regular committed blobs"):
             self.exported(head)
 
+    def test_real_process_oversized_manifest_and_record_are_bounded(self):
+        from unittest.mock import patch
+        producer = ["/usr/bin/python3", "-c", "import sys; sys.stdout.buffer.write(b'x\\0' * 100001)"]
+        with self.assertRaisesRegex(ValueError, "file bound"):
+            for _ in checkout.manifest(producer):
+                pass
+        with patch.object(checkout, "MAX_MANIFEST_BYTES", 8192):
+            with self.assertRaisesRegex(ValueError, "manifest byte bound"):
+                list(checkout.manifest(producer))
+        with self.assertRaisesRegex(ValueError, "record bound"):
+            list(checkout.manifest(["/usr/bin/python3", "-c", "import sys; sys.stdout.buffer.write(b'x' * 20000)"]))
+
+    def test_disk_reserve_refusal_emits_no_authoritative_receipt(self):
+        (self.repo / "source.py").write_text("literal committed bytes")
+        head = self.commit()
+        target = self.root / "export"
+        target.mkdir()
+        result = subprocess.run(["/usr/bin/python3", str(pathlib.Path(checkout.__file__)),
+                                 str(self.repo), head, str(target), str(2**63)],
+                                capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"disk reserve exhausted", result.stderr)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_space_loss_during_blob_write_cannot_return_receipt(self):
+        from unittest.mock import patch
+        (self.repo / "large").write_bytes(b"x" * (2 * 1024 * 1024))
+        head = self.commit()
+        target = self.root / "export"
+        target.mkdir()
+        calls = []
+        def space(path, reserve, size=0):
+            calls.append(size)
+            if len(calls) == 4:
+                raise ValueError("verifier export disk reserve exhausted")
+        with patch.object(checkout, "require_space", side_effect=space):
+            with self.assertRaisesRegex(ValueError, "disk reserve"):
+                checkout.export(self.repo, head, target, 100)
+        self.assertLess((target / "large").stat().st_size, 2 * 1024 * 1024)
+
 
 if __name__ == "__main__":
     unittest.main()

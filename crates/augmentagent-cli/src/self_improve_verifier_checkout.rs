@@ -122,18 +122,26 @@ pub(super) async fn materialize(
         !source.path().starts_with(target.canonicalize()?),
         "verifier source overlaps writable cache"
     );
-    let output = Command::new("/usr/bin/python3")
-        .args(["-I", "-c", EXPORTER])
-        .arg(root)
-        .arg(head)
-        .arg(source.path())
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
+    let output =
+        crate::build_storage::watch_reserve_roots(Some(target), Some(source.path()), async {
+            Ok(Command::new("/usr/bin/python3")
+                .args(["-I", "-c", EXPORTER])
+                .arg(root)
+                .arg(head)
+                .arg(source.path())
+                .arg(
+                    ((crate::disk::gate_min_free_gb() * 1024.0 * 1024.0 * 1024.0) as u64)
+                        .to_string(),
+                )
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await?)
+        })
         .await?;
     ensure!(
         output.status.success(),
