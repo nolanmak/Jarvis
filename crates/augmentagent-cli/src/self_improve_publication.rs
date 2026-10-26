@@ -1,6 +1,8 @@
 //! Recover uncertain GitHub creation before attempting another publication.
 use super::*;
 use crate::autoship_workflow::OperationKind;
+#[path = "self_improve_publication_checkout.rs"]
+mod checkout;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Published {
@@ -129,6 +131,7 @@ async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_wor
         let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
         let now=chrono::Utc::now().timestamp_millis();
         if snapshot.lease_until_ms>now || snapshot.checkpoint.next.eligible_at_ms>now {return Ok(());}
+        if !checkout::recover(repo,store,id,&request).await? {return Ok(());}
         let acquired=workflow::WorkflowGuard::acquire(workflow::Start {
             repo_root:repo,worktree:&request.worktree,repository:&repository,source_issue:Some(request.issue),pr:snapshot.pr,
             branch:&request.branch,contract:&request.contract,environment:&request.environment,
@@ -702,16 +705,26 @@ else:sys.exit(2)
         let head=run("git",&["rev-parse","HEAD"],&repo).await.unwrap().1.trim().to_owned();
         assert!(run("git",&["update-ref","refs/remotes/origin/main",&head],&repo).await.unwrap().0);
         std::fs::write(root.join("head"),&head).unwrap();
-        let mut guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&repo,repository:"owner/repo",source_issue:Some(1),pr:None,branch:"agent-fix/issue-1",contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
+        let worktree=root.join("retained-worker");
+        assert!(run("git",&["worktree","add","-b","agent-fix/issue-1",worktree.to_str().unwrap(),&head],&repo).await.unwrap().0);
+        let mut guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&worktree,repository:"owner/repo",source_issue:Some(1),pr:None,branch:"agent-fix/issue-1",contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
         guard.audit_logger().model_call_admitted("codex").unwrap(); // Simulated already-paid builder admission.
-        assert!(publish(&guard,&repo,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1","--base","main"]).await.is_err());
+        assert!(publish(&guard,&worktree,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1","--base","main"]).await.is_err());
         guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",0).await.unwrap();
         let id=guard.id().to_owned();guard.finish().unwrap();
+        // Simulate filesystem loss while Git still retains the exact commit and
+        // linked-worktree registration. Free reconciliation must restore it.
+        std::fs::remove_dir_all(&worktree).unwrap();
+        if std::env::var("AUTOSHIP_PENDING_PUBLICATION_RESPONSE").as_deref()==Ok("lost") {
+            assert!(run("git",&["update-ref","-d","refs/heads/agent-fix/issue-1"],&repo).await.unwrap().0);
+        }
         assert!(pending_issue(&repo,1).await.unwrap());
         // A successful create response supplied direct identity, even while
         // both direct lookup and list visibility remain unavailable. Retrying
         // free reconciliation must not dispatch another create.
         reconcile_pending(&repo,false).await.unwrap();
+        assert!(worktree.join("source").exists());
+        assert_eq!(run("git",&["rev-parse","HEAD"],&worktree).await.unwrap().1.trim(),head);
         assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap().lines().count(),1);
         // Reconciliation set a visibility backoff; expire only fixture time.
         rusqlite::Connection::open(workflow::path()).unwrap().execute(
