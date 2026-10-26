@@ -979,6 +979,11 @@
       "status": "failed_second_round_F1_verdict",
       "log": "/tmp/autoship-native-acceptance-h3w_9z52/transcript.log",
       "scope": "Actual packaged launch now reaches model, first contradiction round passes, second F1 Uphold assertion failed; response/evidence diagnosis pending. Not accepted as completed adjudicator proof."
+    },
+    "native_setup_classification_0aac33d1": {
+      "passed": 1,
+      "log": "/tmp/autoship-1598-setup-diagnostics-tests.log",
+      "scope": "Typed safe setup category regression; actual native admission proceeded after missing helper fix. Separate resource exhaustion precedence independently reviewed."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -1051,6 +1056,16 @@
       "severity": "P1",
       "gap": "Required native Rust launcher omitted build-dependency-proxy.py from embedded helper inventory, failing readiness before any model call",
       "status": "fixed_689f1e8c; exact_embedded_inventory_import_regression_passed; native_workflow_rerun_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Comment-only Claude workflow failure can block merge checks or send approved PRs back into billed repair",
+      "status": "verified_workflow_identity_classification_integrated_a19297d2; approved_policy_hold_callsite_followup_in_progress"
+    },
+    {
+      "severity": "P1",
+      "gap": "Live main lacks strict required-status-check protection required by the new publisher for atomic integration",
+      "status": "read_only_confirmed_2026_10_26; preservation_aware_rollout_proposal_prepared; remote_configuration_unmodified"
     }
   ],
   "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
