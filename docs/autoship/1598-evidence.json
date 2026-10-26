@@ -458,6 +458,30 @@
       "skipped": 10,
       "failed": 0,
       "log": "/tmp/autoship-1598-object-paths.log"
+    },
+    "reviewed_autoship_gaps": {
+      "revision": "abafa0dd",
+      "passed": 420,
+      "failed": 0,
+      "ignored": 11,
+      "log": "/tmp/autoship-1598-reviewed-gaps.log",
+      "note": "Includes directory amendments, read-only dependency helper, delayed PR visibility, and caller evidence limits. Later selector/publication follow-ups require separate validation."
+    },
+    "expired_loop_delivery": {
+      "revision": "fa64104d",
+      "passed": 63,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-expired-delivery.log",
+      "note": "Full loop tests include expiry/backoff/restart and no additional model execution after final delivery."
+    },
+    "research_and_digest_followups": {
+      "revision": "abafa0dd",
+      "passed": 2,
+      "failed": 0,
+      "tests": [
+        "research::truncation_handles_multibyte_research_issue_text",
+        "optional_digest_query_failure_preserves_other_sections"
+      ]
     }
   },
   "remaining_cross_cutting_acceptance": [
