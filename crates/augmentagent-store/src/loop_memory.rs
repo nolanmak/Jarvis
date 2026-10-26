@@ -28,7 +28,10 @@ pub(super) fn migrate(conn: &Connection) -> StoreResult<()> {
         CREATE TABLE IF NOT EXISTS loop_coverage (
         loop_id TEXT NOT NULL, fingerprint TEXT NOT NULL, finding TEXT NOT NULL,
         evidence TEXT NOT NULL, request_id TEXT NOT NULL, completed_at_ms INTEGER NOT NULL,
-        PRIMARY KEY(loop_id,fingerprint));",
+        PRIMARY KEY(loop_id,fingerprint));
+        CREATE TABLE IF NOT EXISTS loop_occurrence_failures (
+        id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, stage TEXT NOT NULL,
+        detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -76,7 +79,7 @@ impl Store {
                 "loop occurrence answer is immutable".into(),
             ));
         }
-        conn.execute("UPDATE loop_occurrences SET answer=?2,state='answered',updated_at_ms=?3 WHERE request_id=?1",params![request_id,answer,now_millis()])?;
+        conn.execute("UPDATE loop_occurrences SET answer=?2,state='answered',updated_at_ms=?3 WHERE request_id=?1 AND state!='delivered'",params![request_id,answer,now_millis()])?;
         Ok(())
     }
     pub fn loop_coverage(&self, loop_id: &str, limit: usize) -> StoreResult<Vec<LoopFinding>> {
@@ -185,6 +188,21 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Append-only failures survive a later successful delivery of the occurrence.
+    pub fn loop_occurrence_failures(
+        &self,
+        request_id: &str,
+    ) -> StoreResult<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare("SELECT stage,detail,observed_at_ms FROM loop_occurrence_failures WHERE request_id=?1 ORDER BY id")?;
+        let rows = stmt
+            .query_map(params![request_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn loop_recent_occurrences(
         &self,
         loop_id: &str,

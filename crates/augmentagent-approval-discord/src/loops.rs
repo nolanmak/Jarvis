@@ -1188,6 +1188,11 @@ mod tests {
         assert_eq!(runner.prompts.lock().unwrap().len(), 1, "no model repeat after persisted answer");
         assert_eq!(poster.posts.lock().unwrap().len(), 1);
         assert_eq!(store.loop_coverage(&row.id, 10).unwrap().len(), 1);
+        let request_id = loop_request_id(&row.id, row.created_at_ms, row.last_run_ms);
+        let failures = store.loop_occurrence_failures(&request_id).unwrap();
+        assert_eq!(failures.len(), 1, "later success must not erase the failed delivery audit");
+        assert_eq!(failures[0].0, "delivery");
+        assert!(failures[0].1.contains("synthetic lost delivery"));
     }
 
     #[test]
