@@ -85,6 +85,14 @@ impl LiveConnection {
         let event = self.session.audio(audio)?;
         self.send(event).await
     }
+    pub async fn commentary(
+        &mut self,
+        delegation_id: &str,
+        content: &str,
+    ) -> Result<(), LiveError> {
+        let event = self.session.commentary(delegation_id, content)?;
+        self.send(event).await
+    }
     async fn send(&mut self, event: serde_json::Value) -> Result<(), LiveError> {
         let result = timeout(
             WRITE,

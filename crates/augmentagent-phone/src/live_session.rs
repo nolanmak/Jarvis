@@ -3,7 +3,7 @@
 //! the peer sends no frames, and close its socket on any terminal state.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use thiserror::Error;
 use tokio::time::Instant;
 
@@ -70,6 +70,17 @@ pub enum LiveInput {
     Ignored,
     Started,
     Audio(Vec<u8>),
+    Transcript {
+        event_id: String,
+        user: bool,
+        text: String,
+        start_ms: f64,
+        end_ms: f64,
+    },
+    Delegation {
+        id: String,
+        offset_ms: f64,
+    },
     Closed {
         reason: CloseReason,
         seconds: Option<f64>,
@@ -80,6 +91,7 @@ pub struct LiveSession {
     instructions: String,
     id: Option<String>,
     deadline: Option<Instant>,
+    delegations: HashMap<String, f64>,
 }
 impl LiveSession {
     pub fn new(instructions: &str) -> Result<Self, LiveError> {
@@ -91,6 +103,7 @@ impl LiveSession {
             instructions: instructions.into(),
             id: None,
             deadline: None,
+            delegations: HashMap::new(),
         })
     }
     pub fn state(&self) -> LiveState {
@@ -151,6 +164,25 @@ impl LiveSession {
             return Err(LiveError::Capacity);
         }
         Ok(json!({"type":"session.input_audio.append","audio":STANDARD.encode(audio)}))
+    }
+    /// Cap UTF-8 bytes conservatively: byte-level tokenization cannot exceed
+    /// this 500-byte bound. Larger results must be summarized by the backend;
+    /// never silently truncate a result or claim work completed.
+    pub fn commentary(&mut self, delegation_id: &str, content: &str) -> Result<Value, LiveError> {
+        self.check_deadline()?;
+        if self.state != LiveState::Active {
+            return Err(LiveError::State);
+        }
+        if !self.delegations.contains_key(delegation_id) {
+            return Err(LiveError::Protocol);
+        }
+        if content.trim().is_empty() || content.len() > 500 {
+            return Err(LiveError::Capacity);
+        }
+        Ok(
+            json!({"type":"session.commentary.append", "event_id":uuid::Uuid::new_v4().to_string(),
+            "delegation_id":delegation_id,"content":content}),
+        )
     }
     pub fn close(&mut self) -> Result<Value, LiveError> {
         self.check_deadline()?;
@@ -252,9 +284,81 @@ impl LiveSession {
                 }
                 Ok(LiveInput::Audio(bytes))
             }
+            "session.input_transcript.delta" | "session.output_transcript.delta" => {
+                if self.state == LiveState::Closing {
+                    return Ok(LiveInput::Ignored);
+                }
+                if self.state != LiveState::Active {
+                    return Err(LiveError::State);
+                }
+                let event_id = bounded_id(&v["event_id"])?;
+                let start_ms = timeline(&v["start_ms"])?;
+                let end_ms = timeline(&v["end_ms"])?;
+                if end_ms < start_ms {
+                    return Err(LiveError::Protocol);
+                }
+                let text = v["delta"].as_str().ok_or(LiveError::Protocol)?;
+                if text.len() > 8000 {
+                    return Err(LiveError::Capacity);
+                }
+                Ok(LiveInput::Transcript {
+                    event_id,
+                    user: kind == "session.input_transcript.delta",
+                    text: text.into(),
+                    start_ms,
+                    end_ms,
+                })
+            }
+            "session.delegation.created" => {
+                if self.state == LiveState::Closing {
+                    return Ok(LiveInput::Ignored);
+                }
+                if self.state != LiveState::Active {
+                    return Err(LiveError::State);
+                }
+                bounded_id(&v["event_id"])?;
+                let delegation = &v["delegation"];
+                if delegation["type"] != "delegation" || delegation["target"] != "client" {
+                    return Err(LiveError::Protocol);
+                }
+                let id = bounded_id(&delegation["id"])?;
+                let offset_ms = timeline(&v["offset_ms"])?;
+                if let Some(previous) = self.delegations.get(&id) {
+                    return if *previous == offset_ms {
+                        Ok(LiveInput::Ignored)
+                    } else {
+                        Err(LiveError::Protocol)
+                    };
+                }
+                if self.delegations.len() >= 128 {
+                    return Err(LiveError::Capacity);
+                }
+                self.delegations.insert(id.clone(), offset_ms);
+                Ok(LiveInput::Delegation { id, offset_ms })
+            }
             // Additional supported events are added with their consumers. Unknown
             // extensions carry no authority and must never trigger backend work.
             _ => Ok(LiveInput::Ignored),
         }
     }
+}
+
+fn bounded_id(value: &Value) -> Result<String, LiveError> {
+    value
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+        .map(str::to_owned)
+        .ok_or(LiveError::Protocol)
+}
+fn timeline(value: &Value) -> Result<f64, LiveError> {
+    value
+        .as_f64()
+        .filter(|ms| ms.is_finite() && *ms >= 0.0 && *ms <= 86_400_000.0)
+        .ok_or(LiveError::Protocol)
 }

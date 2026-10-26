@@ -155,3 +155,77 @@ fn socket_loss_is_not_successful_finalization() {
     assert_eq!(s.state(), LiveState::Failed);
     assert_eq!(s.audio(&[255; 160]).err(), Some(LiveError::State));
 }
+
+#[test]
+fn transcript_fragments_preserve_role_and_timeline_without_inventing_turn_ends() {
+    let mut s = active();
+    for (kind, user) in [
+        ("session.input_transcript.delta", true),
+        ("session.output_transcript.delta", false),
+    ] {
+        let event = json!({"type":kind,"event_id":if user {"evt-user"} else {"evt-agent"},
+            "delta":"Please check my calendar.","start_ms":100.5,"end_ms":900.5});
+        assert!(
+            matches!(s.receive(&event.to_string()).unwrap(), LiveInput::Transcript {user:role, text, start_ms:100.5, end_ms:900.5, ..} if role == user && text == "Please check my calendar.")
+        );
+    }
+}
+#[test]
+fn client_delegation_is_metadata_and_replays_do_not_dispatch_twice() {
+    let mut s = active();
+    let mut event = json!({"type":"session.delegation.created","event_id":"evt-delegate","offset_ms":950,
+        "delegation":{"id":"del-test","type":"delegation","target":"client"}});
+    assert!(
+        matches!(s.receive(&event.to_string()).unwrap(), LiveInput::Delegation {id,offset_ms:950.0} if id == "del-test")
+    );
+    event["event_id"] = json!("evt-replay");
+    assert!(matches!(
+        s.receive(&event.to_string()).unwrap(),
+        LiveInput::Ignored
+    ));
+    event["offset_ms"] = json!(1000);
+    assert_eq!(
+        s.receive(&event.to_string()).err(),
+        Some(LiveError::Protocol)
+    );
+}
+#[test]
+fn commentary_requires_known_delegation_and_bounded_speakable_content() {
+    let mut s = active();
+    assert_eq!(
+        s.commentary("del-unknown", "Done.").err(),
+        Some(LiveError::Protocol)
+    );
+    s.receive(
+        &json!({"type":"session.delegation.created","event_id":"evt-delegate","offset_ms":950,
+        "delegation":{"id":"del-test","type":"delegation","target":"client"}})
+        .to_string(),
+    )
+    .unwrap();
+    let event = s.commentary("del-test", "Your calendar is clear.").unwrap();
+    assert_eq!(event["type"], "session.commentary.append");
+    assert_eq!(event["delegation_id"], "del-test");
+    assert_eq!(event["content"], "Your calendar is clear.");
+    assert_ne!(
+        event["event_id"],
+        s.commentary("del-test", "All done.").unwrap()["event_id"]
+    );
+    assert_eq!(
+        s.commentary("del-test", &"a".repeat(501)).err(),
+        Some(LiveError::Capacity)
+    );
+}
+#[test]
+fn invalid_timeline_and_nonclient_delegation_fail_closed() {
+    for event in [
+        json!({"type":"session.input_transcript.delta","event_id":"evt","delta":"Hi","start_ms":300,"end_ms":200}),
+        json!({"type":"session.delegation.created","event_id":"evt","offset_ms":950,"delegation":{"id":"del","type":"delegation","target":"responses"}}),
+    ] {
+        let mut s = active();
+        assert_eq!(
+            s.receive(&event.to_string()).err(),
+            Some(LiveError::Protocol)
+        );
+        assert_eq!(s.state(), LiveState::Failed);
+    }
+}
