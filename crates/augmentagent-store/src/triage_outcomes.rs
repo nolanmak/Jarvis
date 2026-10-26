@@ -47,6 +47,9 @@ pub struct TriageOutcomeReport {
     pub since_ms: i64,
     pub flagged: OutcomeCounts,
     pub pending: OutcomeCounts,
+    /// Historical actions without a trustworthy immutable decision snapshot.
+    #[serde(default)]
+    pub unknown_cohort: OutcomeCounts,
     /// Fraction of explicit owner resolutions that needed action. Aged-out and
     /// unresolved records are reported separately, not counted as skip/success.
     pub flag_precision: Option<f64>,
@@ -75,7 +78,7 @@ impl Store {
         review_set_limit: usize,
     ) -> StoreResult<TriageOutcomeReport> {
         self.with_conn(|conn| {
-            let mut statement = conn.prepare("SELECT a.id,a.status,COALESCE(e.triageResult,''),
+            let mut statement = conn.prepare("SELECT a.id,a.status,COALESCE(c.cohort,''),
                 (SELECT h.verb FROM approval_history h WHERE h.action_id=a.id
                  AND h.finished_at IS NOT NULL AND h.outcome IN ('completed','revised')
                  AND trim(h.actor) NOT IN ('','unknown')
@@ -83,22 +86,24 @@ impl Store {
                 EXISTS(SELECT 1 FROM approval_history h WHERE h.action_id=a.id AND h.verb='revise'
                  AND h.outcome='revised' AND h.finished_at IS NOT NULL AND trim(h.actor) NOT IN ('','unknown'))
                 FROM actions a JOIN emails e ON e.messageId=a.messageId
-                WHERE a.createdAt>=?1 AND (e.triageResult='flag' OR a.status IN ('flagged','pending','timed_out')
+                LEFT JOIN triage_action_cohorts c ON c.action_id=a.id
+                WHERE a.createdAt>=?1 AND (c.cohort IN ('flagged','pending') OR a.status IN ('flagged','pending','timed_out')
                  OR EXISTS(SELECT 1 FROM approval_history h WHERE h.action_id=a.id))
                 ORDER BY a.createdAt DESC,a.id")?;
-            let mut report = TriageOutcomeReport { since_ms, flagged: Default::default(), pending: Default::default(), flag_precision:None,
+            let mut report = TriageOutcomeReport { since_ms, flagged: Default::default(), pending: Default::default(), unknown_cohort:Default::default(), flag_precision:None,
                 observed_owner_resolutions:0, flagged_then_aged_out:0, disagreement_review_set:vec![] };
             let rows = statement.query_map(params![since_ms], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,bool>(4)?)))?;
             for row in rows {
                 let (action_id,status,triage,verb,revised) = row?;
                 let result = outcome(&status,verb.as_deref(),revised);
-                if triage == "flag" || status == "flagged" {
+                if triage == "flagged" {
                     report.flagged.record(result);
                     if result == OwnerOutcome::Skipped && !revised && report.disagreement_review_set.len() < review_set_limit.min(100) {
                         report.disagreement_review_set.push(DisagreementCase { action_id, owner_outcome:result,
                             evidence:"agent_flagged_owner_skipped_without_recorded_revision".into() });
                     }
-                } else { report.pending.record(result); }
+                } else if triage == "pending" { report.pending.record(result); }
+                else { report.unknown_cohort.record(result); }
             }
             report.observed_owner_resolutions = report.flagged.approved + report.flagged.revised + report.flagged.skipped;
             report.flag_precision = (report.observed_owner_resolutions > 0).then(||
@@ -117,6 +122,7 @@ mod tests {
         store.with_conn(|c| {
             c.execute("INSERT INTO emails(messageId,fromEmail,subject,triageResult,firstSeenAt) VALUES(?1,'sender@example.invalid','synthetic',?2,?3)",params![id,triage,at])?;
             c.execute("INSERT INTO actions(id,messageId,fromEmail,subject,status,createdAt,updatedAt) VALUES(?1,?1,'sender@example.invalid','synthetic',?2,?3,?3)",params![id,status,at])?;
+            c.execute("INSERT OR REPLACE INTO triage_action_cohorts VALUES(?1,?2,?3)",params![id,if triage=="flag" {"flagged"} else {"pending"},at])?;
             Ok(())
         }).unwrap();
     }
@@ -204,6 +210,38 @@ mod tests {
         assert_eq!(report.flagged_then_aged_out,1);
         assert_eq!(report.observed_owner_resolutions,0);
         assert_eq!(report.flag_precision,None);
+    }
+
+    #[test]
+    fn original_cohorts_survive_retriage_and_unknown_history_is_not_inferred() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("db");
+        let store=Store::open(&path).unwrap();
+        store.with_conn(|c| {
+            c.execute("INSERT INTO emails(messageId,fromEmail,subject,firstSeenAt) VALUES('message','sender@example.invalid','synthetic',100)",[])?;
+            Ok(())
+        }).unwrap();
+        let pending=store.log_action("message",None,"sender@example.invalid","synthetic",None,Some("reply"),crate::ActionStatus::Pending).unwrap();
+        store.update_action_status(&pending,crate::ActionStatus::Flagged,None,Some("retry escalation")).unwrap();
+        store.mark_email_processed("message",crate::TriageResult::Flag).unwrap();
+        let flagged=store.log_flagged_action("message",None,"sender@example.invalid","synthetic",None,"needs attention").unwrap();
+        store.update_action_status(&flagged,crate::ActionStatus::Skipped,None,None).unwrap();
+        decision(&store,&flagged,"skip","completed");
+        store.mark_email_processed("message",crate::TriageResult::Reply).unwrap();
+        // Simulate a pre-migration action whose mutable final status is known,
+        // but original cohort is not. Neither status nor email label repairs it.
+        let legacy=store.log_action("message",None,"sender@example.invalid","synthetic",None,None,crate::ActionStatus::Pending).unwrap();
+        store.with_conn(|c| { c.execute("DELETE FROM triage_action_cohorts WHERE action_id=?1",params![legacy])?;Ok(()) }).unwrap();
+        decision(&store,&legacy,"approve","completed");
+        drop(store);
+        let store=Store::open(path).unwrap();
+        let report=store.triage_outcome_report(0,10).unwrap();
+        assert_eq!(report.pending.unresolved,1,"reply escalation cannot rewrite original cohort");
+        assert_eq!(report.flagged.skipped,1,"later message re-triage cannot erase original flag");
+        assert_eq!(report.unknown_cohort.approved,1);
+        assert_eq!(report.observed_owner_resolutions,1);
+        assert_eq!(report.flag_precision,Some(0.0));
+        assert_eq!(report.disagreement_review_set[0].action_id,flagged);
     }
 
 }

@@ -1233,6 +1233,14 @@ impl Store {
             attempt_n INTEGER NOT NULL, failure_class TEXT NOT NULL, guard TEXT NOT NULL,
             detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_email_retry_failures_time ON email_retry_failures(observed_at_ms);")?;
+        // Snapshot newly created triage cohorts atomically with the action.
+        // Existing mutable status/email labels cannot reconstruct old decisions.
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_action_cohorts (
+            action_id TEXT PRIMARY KEY, cohort TEXT NOT NULL CHECK(cohort IN ('flagged','pending')),
+            observed_at_ms INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS capture_triage_action_cohort AFTER INSERT ON actions
+            WHEN NEW.status IN ('flagged','pending')
+            BEGIN INSERT OR IGNORE INTO triage_action_cohorts VALUES(NEW.id,NEW.status,NEW.createdAt); END;")?;
         // Issue #27: per-channel subscription registry (platform-agnostic).
         // Rows control which Discord/Slack/etc channels the poller watches and
         // which mode (priority / digest / store_only) they route through.

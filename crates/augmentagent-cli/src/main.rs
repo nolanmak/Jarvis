@@ -5462,9 +5462,9 @@ async fn main() -> Result<()> {
             } else {
                 print!("{}", tu::format_report(&rolled));
                 if let Some(report) = outcome_report {
-                    println!("Triage outcomes: flag precision {} ({} observed owner resolutions); flagged then aged out {}; unresolved flags {}.",
+                    println!("Triage outcomes: flag precision {} ({} observed owner resolutions); flagged then aged out {}; unresolved flags {}; unknown original cohort {}.",
                         report.flag_precision.map(|v| format!("{:.1}%",v*100.0)).unwrap_or_else(|| "not observed".into()),
-                        report.observed_owner_resolutions, report.flagged_then_aged_out, report.flagged.unresolved);
+                        report.observed_owner_resolutions, report.flagged_then_aged_out, report.flagged.unresolved, report.unknown_cohort.total());
                 }
                 if raw.is_empty() {
                     println!("  (log: {})", path.display());
@@ -8946,7 +8946,7 @@ async fn run_digest(
     ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
     match store.triage_outcome_report(since_ms,25) {
         Ok(triage_outcomes) => {
-    for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending)] {
+    for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending), ("unknown original cohort", &triage_outcomes.unknown_cohort)] {
         ctx.push_str(&format!("- {cohort}: approved {}, revised {}, skipped {}, aged out {}, unresolved {}\n",
             counts.approved, counts.revised, counts.skipped, counts.aged_out, counts.unresolved));
     }
