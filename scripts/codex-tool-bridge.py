@@ -1747,6 +1747,23 @@ class Policy:
                     raise Denied('direct git push is unavailable through the bridge; use the CCat public-push gate')
                 if any(arg.split('=', 1)[0] in ('--ext-diff', '--textconv') for arg in argv[1:]):
                     raise Denied('external Git diff helpers are not permitted')
+                if '--no-index' in argv[1:]:
+                    # Git metadata is granted below so ordinary repository diff
+                    # can resolve objects/index. no-index would turn that extra
+                    # authority into arbitrary reads of protected .git files.
+                    raise Denied('filesystem comparisons must use scoped file tools, not Git no-index')
+                # Git also infers no-index when either operand is outside the
+                # repository. Check literal operands before granting metadata,
+                # including links whose lexical name appears to be in scope.
+                for operand in argv[1:]:
+                    if operand.startswith('-'):
+                        continue
+                    lexical = Path(os.path.abspath(self.cwd / operand))
+                    resolved = lexical.resolve()
+                    if lexical not in self.read_roots:
+                        self._relative(str(lexical))
+                    if resolved not in self.read_roots:
+                        self._relative(str(resolved))
                 git_env = {'PATH': self.environment.get('PATH', os.defpath),
                     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
                     'GIT_OPTIONAL_LOCKS': '0'}

@@ -1009,6 +1009,27 @@ print(child.pid, flush=True)
             policy.run_command('git diff --ext-diff')
 
     @requires_sandbox
+    def test_git_metadata_grant_cannot_be_used_as_unscoped_file_reader(self):
+        subprocess.run(['git','init','-q',str(self.root)],check=True)
+        protected=self.root/'.git'/'synthetic-private-metadata'
+        protected.write_text('SYNTHETIC_METADATA_ONLY')
+        (self.root/'innocent.txt').symlink_to(protected)
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[],'allowed_tools':['Read','Bash(git diff*)']})
+        with self.assertRaises(bridge.Denied):
+            policy.read(str(protected))
+        for command in [
+            'git diff --no-index .git/synthetic-private-metadata /dev/null',
+            f'git diff --no-index {protected} /dev/null',
+            'git diff .git/synthetic-private-metadata /dev/null',
+            'git diff -- .git/synthetic-private-metadata /dev/null',
+            'git diff innocent.txt /dev/null',
+        ]:
+            with self.assertRaises(bridge.Denied):
+                policy.run_command(command)
+        self.assertEqual(protected.read_text(),'SYNTHETIC_METADATA_ONLY')
+
+    @requires_sandbox
     def test_real_npm_can_run_a_dependency_free_project_test(self):
         import shutil
         if not shutil.which('npm'):
