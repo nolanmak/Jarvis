@@ -302,6 +302,8 @@ pub struct AuditLogger {
     path: PathBuf,
     model_call_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
+    run_resources_required: Arc<std::sync::atomic::AtomicBool>,
+    resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
     resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
     failure_path: Option<PathBuf>,
@@ -369,7 +371,17 @@ impl AuditLogger {
         *self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?=Some(observer);
         Ok(())
     }
+    /// Controller-owned workflow requirement, independent of model/child env.
+    pub fn require_run_resources(&self) -> anyhow::Result<()> {
+        self.protected_health()?;
+        anyhow::ensure!(self.is_protected(),"workflow resources require protected audit");
+        self.run_resources_required.store(true,std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    pub fn run_resources_required(&self) -> bool { self.run_resources_required.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn resource_capacity_seen(&self) -> bool { self.resource_capacity_seen.load(std::sync::atomic::Ordering::SeqCst) }
     pub fn resource_capacity_exhausted(&self, observation: &serde_json::Value) -> anyhow::Result<()> {
+        self.resource_capacity_seen.store(true,std::sync::atomic::Ordering::SeqCst);
         let observer=self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?.clone();
         if let Some(observer)=observer {observer(observation)?;}
         Ok(())
@@ -408,6 +420,8 @@ impl AuditLogger {
             path,
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
+            resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             anchored: None,
             failure_path: None,
             pending_dir: None,
