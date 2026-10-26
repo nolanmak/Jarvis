@@ -108,8 +108,9 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1453",
       "implementation_status": "partial",
       "evidence": [
-        "Native tools routed through confined MCP bridge with literal write grants and private settings. Combined Python boundary/registry/bridge suite: 188 run, 10 skipped, no failures. Earlier native write/read-denial probes passed; latest live probe stopped on Claude quota before tools. Provider transport egress not hostname-restricted.",
-        "Native provider process host/read confinement remains unimplemented; concrete host capability probes and exit requirements recorded in docs/autoship/provider-transport-boundary.md. Tool isolation does not prove this broader guarantee."
+        "Common required native VM launcher, minimal manifest-verified runtime, no guest NIC, declared credential import, guarded MCP relay and exact provider gateway policy are implemented. This supersedes the earlier unimplemented transport-boundary note; authenticated provider acceptance is still pending.",
+        "Real synthetic VM streaming/quiescence stress proof passed at 12b93e3e (service autoship-native-vm-io-proof5, invocation 978329b99e3e41ad81ceae2e7d7bdaf1). This does not prove authenticated provider inference or every fallback.",
+        "Durable native-owner retirement outbox integrated at 8d50b960; Rust crash/reopen regressions and independent review pending."
       ],
       "remaining_acceptance": [
         "Implement and validate authenticated streaming native provider calls inside no-NIC VM with declared credentials and guarded MCP relay.",
@@ -717,6 +718,24 @@
       "failed": 0,
       "log": "/tmp/autoship-1598-native-io-tests.log",
       "scope": "Real local pipe backpressure and synthetic process-list cleanup fixtures; no real guest descendant proof."
+    },
+    "integrated_native_python_8d50b960": {
+      "revision": "8d50b960",
+      "passed": 28,
+      "failed": 0,
+      "suites": {
+        "vm": 8,
+        "io": 6,
+        "gateway": 9,
+        "command_storage": 5
+      },
+      "scope": "Local Python suites; not authenticated transport or final Rust validation."
+    },
+    "hosted_rust_11115c45": {
+      "revision": "11115c45",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40346922286",
+      "conclusion": "success",
+      "scope": "Rust job green. Bridge suite failed strict TLS certificate validation; fixed at fbf1d59b and local gateway suite passed. Later changes require fresh CI."
     }
   },
   "remaining_cross_cutting_acceptance": [
