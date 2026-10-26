@@ -1901,7 +1901,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 ///   search/recent. `memory_write` is deliberately not granted.
 /// - A scoped Bash allowlist of `augmentagent` subcommands (all of `gmail`,
 ///   including `send` and `send-now`; `finance` status/transactions/summary;
-///   `calendar` list-events/create-event; `loop`; `loops`; `meetup events`;
+///   `calendar` list-events/create-event/rsvp; `loop`; `loops`; `meetup events`;
 ///   `socialapi`/`linkedin` dm and comment; `linkedin recent-dms`;
 ///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`) and
 ///   `aa-gh issue` create/list/view/comment.
@@ -1974,6 +1974,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // approval channel. Args are always required, so no no-arg form.
     let bash_calendar_create_abs = format!("Bash({} calendar create-event *)", bin.display());
     let bash_calendar_create_bare = "Bash(augmentagent calendar create-event *)".to_string();
+    // #1224 — `calendar rsvp` answers an invite on the owner's behalf.
+    // accept/tentative write directly (a direct owner instruction; one click
+    // to change in Google Calendar); a decline only previews unless
+    // `--post true` raises an approval card. Args always required.
+    let bash_calendar_rsvp_abs = format!("Bash({} calendar rsvp *)", bin.display());
+    let bash_calendar_rsvp_bare = "Bash(augmentagent calendar rsvp *)".to_string();
     // #571 / #572 — operator-initiated social drafts. Same safety argument
     // as `gmail compose --post` and `calendar create-event`: these verbs
     // touch no social API at all. They write a pending action row and post
@@ -2235,6 +2241,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_calendar_list_bare_noargs,
             bash_calendar_create_abs,
             bash_calendar_create_bare,
+            bash_calendar_rsvp_abs,
+            bash_calendar_rsvp_bare,
             bash_socialapi_dm_abs,
             bash_socialapi_dm_bare,
             bash_socialapi_comment_abs,

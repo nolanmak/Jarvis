@@ -169,7 +169,16 @@ impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
 
     pub async fn poll_once(&self) -> anyhow::Result<PollOutcome> {
         let mut outcome = PollOutcome::default();
-        let accounts = self.store.get_active_gmail_accounts()?;
+        // #1573 — `google:<address>` entities are connected through the
+        // operator's own OAuth client and have no Composio connection to
+        // call Calendar with. They are skipped here (not errored per tick)
+        // until the direct Calendar client reuses that grant.
+        let accounts: Vec<_> = self
+            .store
+            .get_active_gmail_accounts()?
+            .into_iter()
+            .filter(|a| !a.entity_id.starts_with("google:"))
+            .collect();
         outcome.accounts_polled = accounts.len();
         if accounts.is_empty() {
             warn!("no active gmail accounts; calendar polling skipped");

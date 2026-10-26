@@ -6,6 +6,7 @@
 //! `augmentagent-channel-core`; this crate owns only Gmail-specific transport.
 
 pub mod gmail;
+pub mod google;
 pub mod inbound;
 pub mod outbound;
 pub mod owner_alerts;
@@ -18,6 +19,7 @@ mod channel;
 mod argv_stub;
 
 pub use channel::{
+    DEFAULT_POLL_SECS,
     DispatchOutcome, GmailChannel, GmailChannelConfig, GmailWorkHandler, PollOutcome,
 };
 pub use inbound::{email_to_work_item, GmailInbound};

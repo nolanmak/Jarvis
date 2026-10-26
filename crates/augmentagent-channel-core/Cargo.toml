@@ -46,11 +46,14 @@ libc = "0.2"
 # #35 Phase 2 — Composio-backed free/busy + Drive search resolver clients.
 # Self-contained reqwest client (intentional duplication, see resolve.rs).
 reqwest = { workspace = true }
+# #1546 — the phone fast model streams events as a futures Stream.
+futures = { workspace = true }
 
 [dev-dependencies]
+# #1548 — paused-clock timing tests for the phone queue notices.
+tokio = { workspace = true, features = ["test-util"] }
 augmentagent-messages = { path = "../augmentagent-messages" }
 syn = { version = "2", features = ["full", "visit"] }
-futures = { workspace = true }
 # #501 — timeparse DST fixture tests pin America/New_York (chrono::Local
 # reads TZ once at process start, so env-pinning in tests is unreliable).
 chrono-tz = { workspace = true }

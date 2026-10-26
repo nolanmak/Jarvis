@@ -611,20 +611,21 @@ fn gate_env() -> Vec<(String, String)> {
 /// Shared cargo target dir for gate + builder runs (#692).
 /// `AUGMENTAGENT_GATE_TARGET_DIR` overrides; defaults under `~/.cache`.
 fn gate_target_dir() -> String {
-    std::env::var("AUGMENTAGENT_GATE_TARGET_DIR").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        format!("{home}/.cache/augmentagent-gate-target")
-    })
+    crate::disk::gate_target_dir().to_string_lossy().into_owned()
 }
 
-/// #1407 — refuse a gate that would start on a nearly full disk. The text is
-/// classified `Infra` by [`infra_failure_reason`], so the run is neither
-/// charged to the builder nor cached as a red `main`.
+/// Validate the build filesystem before setting up a gate. Admission then
+/// reclaims storage and checks the floor under its lease; infrastructure
+/// refusals are never charged to a builder or cached as red main.
 fn gate_disk_guard() -> Result<()> {
-    match crate::disk::gate_floor_refusal(Path::new(&gate_target_dir())) {
-        Some(why) => bail!("{why}"),
-        None => Ok(()),
+    // Admission performs cleanup before the final floor check. This early
+    // probe only rejects an unmeasurable filesystem; no stale low-space
+    // refusal may bypass recovery.
+    let target = crate::build_storage::effective_target(&std::env::current_dir()?);
+    if crate::disk::available_bytes(&target).is_none() {
+        bail!("{}: cannot inspect build filesystem", crate::disk::LOW_DISK_REFUSAL);
     }
+    Ok(())
 }
 
 /// True if an env-var name looks like a provider secret (case-insensitive
@@ -664,15 +665,33 @@ async fn run_sandboxed(
     cwd: &Path,
     env: &[(String, String)],
 ) -> Result<(bool, String, String)> {
-    let out = Command::new(cmd)
+    let child = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .output()
-        .await
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()
         .with_context(|| format!("spawn (sandboxed) {cmd} {args:?}"))?;
+    // Kill the whole process group on cancellation/pressure, including cargo
+    // underneath the shell pipeline. A dropped output future alone only kills
+    // the shell and can leave a writer alive after its storage lease drops.
+    struct Group(u32);
+    impl Drop for Group {
+        fn drop(&mut self) { unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) }; }
+    }
+    let _group = Group(child.id().context("spawned gate has no pid")?);
+    let env_path = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, value)| {
+        let path = PathBuf::from(value); if path.is_absolute() { path } else { cwd.join(path) }
+    });
+    let target = env_path("CARGO_TARGET_DIR");
+    let temp = env_path("TMPDIR");
+    let output = async { Ok::<_, anyhow::Error>(child.wait_with_output().await?) };
+    let out = crate::build_storage::watch_reserve_roots(target.as_deref(), temp.as_deref(), output).await?;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1493,11 +1512,6 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
         return 0;
     };
     let owner = repo_owner_from_remote(repo_root).await;
-    // This box's own record of the PRs it opened. The half of provenance that
-    // cannot be produced from GitHub, and the half that binds to a specific
-    // pull request rather than to a shape.
-    let opened = opened_prs_path();
-    // Resolved the same way the fresh path resolves it, override included.
     let policy_owner = merge_policy_owner(repo_root).await;
     let mut merged = 0usize;
 
@@ -1533,8 +1547,10 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
             .map(str::to_string);
         // #1076 — the verdict the loop RECORDED when it opened this PR at this
         // head, through the predicate the lanes use. Never the body: it carries
-        // model output, and a model can write any approval line it likes.
-        let record = opened_pr_for(&opened, issue);
+        // model output, and a model can write any approval line it likes. This
+        // box's own record is the half of provenance GitHub cannot produce, and
+        // the half that binds to a specific pull request rather than a shape.
+        let record = opened_prs::get(issue);
         let approval = recorded_approval(record.as_ref(), pr, head_sha.as_deref());
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
@@ -1802,25 +1818,6 @@ async fn merge_policy_owner(repo_root: &Path) -> Option<String> {
         .or(repo_owner_from_remote(repo_root).await)
 }
 
-/// #1029 — where this box records the pull requests the loop itself opened.
-///
-/// Codex, correctly, across three rounds: a body marker is forgeable and an
-/// attempt record only proves the daemon WORKED an issue, not that it opened a
-/// given PR. A prior failed attempt plus a hand-made `agent-fix/issue-N` draft
-/// carrying the marker would have satisfied both.
-///
-/// This binds the record to the artefact: the loop writes the PR number when
-/// it creates one, so the sweep can ask "did I open exactly this PR?" rather
-/// than "does this look like something I would open?".
-fn opened_prs_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_OPENED_FILE") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-opened-prs.json")
-}
-
 /// What the loop recorded when it opened a PR: which PR, and the head its
 /// independent reviews actually covered.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1886,38 +1883,217 @@ fn recorded_approval(record: Option<&OpenedPr>, pr: u64, head: Option<&str>) -> 
     approval_of(reviewed_here.and_then(|r| r.verdict.as_ref()))
 }
 
-/// Record that the loop opened `pr` for `issue`, at reviewed head `head`.
-fn record_opened_pr(
-    path: &Path,
-    issue: u64,
-    pr: u64,
-    head: &str,
-    verdict: Option<RecordedVerdict>,
-) {
-    let mut map = read_opened_prs(path);
-    map.insert(issue.to_string(), OpenedPr { pr, head: head.to_string(), verdict });
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+/// The opened-PR map and everything that can touch it.
+///
+/// #1533 — the build and resume lanes hold *different* run locks, so they can
+/// both record at once. Two unserialized read-modify-write cycles drop one
+/// lane's record, and a missing head-bound verdict stalls the merge sweep for
+/// that PR forever. [`record`] closes that by holding a flock on a stable
+/// sibling of the map across its whole read-modify-write.
+///
+/// That only holds if nothing writes the map any other way, which is why this
+/// is a module rather than a group of functions: the path resolver, the
+/// serializer and the path-taking entry points are all private here, so the
+/// compiler — not a source scan — guarantees the rest of the crate cannot
+/// reach the file at all. The only ways in are [`record`] and [`get`], neither
+/// of which names a path.
+mod opened_prs {
+    use std::os::unix::io::AsRawFd;
+    use std::path::{Path, PathBuf};
+
+    use tracing::warn;
+
+    use super::{OpenedPr, RecordedVerdict};
+
+    /// #1029 — where this box records the pull requests the loop itself opened.
+    ///
+    /// Codex, correctly, across three rounds: a body marker is forgeable and an
+    /// attempt record only proves the daemon WORKED an issue, not that it opened
+    /// a given PR. A prior failed attempt plus a hand-made `agent-fix/issue-N`
+    /// draft carrying the marker would have satisfied both.
+    ///
+    /// This binds the record to the artefact: the loop writes the PR number when
+    /// it creates one, so the sweep can ask "did I open exactly this PR?" rather
+    /// than "does this look like something I would open?".
+    fn path() -> PathBuf {
+        if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_OPENED_FILE") {
+            if !p.trim().is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-opened-prs.json")
     }
-    if let Ok(json) = serde_json::to_vec_pretty(&map) {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+
+    /// Record that the loop opened `pr` for `issue`, at reviewed head `head`.
+    /// The sole writer, and the sole production caller of [`path`].
+    pub(super) fn record(issue: u64, pr: u64, head: &str, verdict: Option<RecordedVerdict>) {
+        record_at(&path(), issue, pr, head, verdict);
+    }
+
+    /// What this box opened for `issue`, if anything.
+    pub(super) fn get(issue: u64) -> Option<OpenedPr> {
+        get_at(&path(), issue)
+    }
+
+    /// The path-taking forms, so tests can drive a scratch map. They exist only
+    /// in a test build, so no amount of new production code can bypass the
+    /// serialization above with a path of its own.
+    #[cfg(test)]
+    pub(super) mod testing {
+        use std::path::{Path, PathBuf};
+
+        use crate::self_improve::{OpenedPr, RecordedVerdict};
+
+        pub fn record_at(
+            path: &Path,
+            issue: u64,
+            pr: u64,
+            head: &str,
+            verdict: Option<RecordedVerdict>,
+        ) {
+            super::record_at(path, issue, pr, head, verdict);
+        }
+
+        pub fn get_at(path: &Path, issue: u64) -> Option<OpenedPr> {
+            super::get_at(path, issue)
+        }
+
+        pub fn read(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
+            super::read(path)
+        }
+
+        pub fn lock_path(path: &Path) -> PathBuf {
+            super::lock_path(path)
+        }
+
+        pub fn resolved_path() -> PathBuf {
+            super::path()
         }
     }
+
+    /// The mutex for the map: a stable sibling of the data file, never the
+    /// rename target. Flocking the data file itself would not exclude
+    /// anything, because the rename below swaps the inode out from under
+    /// whoever holds that lock.
+    fn lock_path(path: &Path) -> PathBuf {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        path.with_file_name(format!("{name}.lock"))
+    }
+
+    /// Hold the mutex, or `None` if it cannot be held at all. A signal
+    /// interrupting `flock` is not a failure — it is retried, since giving up
+    /// there would leave the caller writing unserialized.
+    fn lock(lock_path: &Path) -> Option<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| warn!(path = %lock_path.display(), "opened-PR lock open failed: {e}"))
+            .ok()?;
+        loop {
+            // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Some(file);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            warn!(path = %lock_path.display(), "opened-PR lock flock failed: {e}");
+            return None;
+        }
+    }
+
+    fn record_at(path: &Path, issue: u64, pr: u64, head: &str, verdict: Option<RecordedVerdict>) {
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(path = %path.display(), "opened-PR map dir create failed: {e}");
+            }
+        }
+        // Fail closed: an unlocked read-modify-write can rename a stale map over
+        // a sibling lane's record, which is the stall this guards against. Our
+        // own record is recoverable (the next pass re-records it); a clobbered
+        // sibling is not visible to anyone.
+        let _lock = match lock(&lock_path(path)) {
+            Some(f) => f,
+            None => return,
+        };
+
+        let mut map = read(path);
+        map.insert(issue.to_string(), OpenedPr { pr, head: head.to_string(), verdict });
+        let json = match serde_json::to_vec_pretty(&map) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(path = %path.display(), "opened-PR map serialize failed: {e}");
+                return;
+            }
+        };
+        // Per-writer temp name: the fixed `.tmp` sibling let one lane rename the
+        // other's partial bytes into place.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            warn!(path = %tmp.display(), "opened-PR map write failed: {e}");
+            remove_stale_tmp(&tmp);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(path = %path.display(), "opened-PR map rename failed: {e}");
+            remove_stale_tmp(&tmp);
+        }
+        // Lock released when `_lock` drops.
+    }
+
+    /// Drop a staging file a failed write or rename left behind, reporting what
+    /// stops us: an orphan `.tmp.<pid>.<seq>` sibling is never picked up again,
+    /// so a silent failure here would accumulate junk beside the map.
+    fn remove_stale_tmp(tmp: &Path) {
+        match std::fs::remove_file(tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(path = %tmp.display(), "opened-PR map temp cleanup failed: {e}"),
+        }
+    }
+
+    fn read(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            // Nothing recorded yet is the common case, not a fault.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Default::default(),
+            Err(e) => {
+                warn!(path = %path.display(), "opened-PR map read failed: {e}");
+                return Default::default();
+            }
+        };
+        // A damaged map reads as empty, exactly as it did before #1533: serde
+        // decodes the object as a whole, so there are no per-record survivors to
+        // salvage, and the next pass re-records what each lane still owns.
+        match serde_json::from_slice(&bytes) {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(path = %path.display(), "opened-PR map parse failed: {e}");
+                Default::default()
+            }
+        }
+    }
+
+    fn get_at(path: &Path, issue: u64) -> Option<OpenedPr> {
+        read(path).get(&issue.to_string()).cloned()
+    }
 }
 
-fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
-/// What this box opened for `issue`, if anything.
-fn opened_pr_for(path: &Path, issue: u64) -> Option<OpenedPr> {
-    read_opened_prs(path).get(&issue.to_string()).cloned()
-}
+/// The map's path-taking entry points under their historic names, for tests
+/// only: production code cannot name them, because `opened_prs` keeps them
+/// private outside a test build.
+#[cfg(test)]
+use opened_prs::testing::{
+    get_at as opened_pr_for, lock_path as opened_prs_lock_path, read as read_opened_prs,
+    record_at as record_opened_pr, resolved_path as opened_prs_path,
+};
 
 /// #1029 — the loop's own signature on a PR body, and the only evidence that
 /// the loop actually opened a pull request.
@@ -3459,7 +3635,37 @@ async fn find_resumable_draft(
     }
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref())
+    let select = |cursor| {
+        resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref(), cursor)
+    };
+    // #1532 — a pinned red-main fix neither consults nor moves the rotation,
+    // and a dry run reserves nothing.
+    if only.is_some() || dry_run {
+        return select(FairSched::load(&fair_sched_path()).resume_cursor);
+    }
+    reserve_next_draft(&fair_sched_path(), select)
+}
+
+/// #1532 — hand out the next draft and reserve it in ONE locked
+/// read-modify-write, so the cursor the choice is made from is the same inode
+/// the choice advances. A plain load-then-select-then-advance let the resume
+/// and combined lanes (separate processes, separate flocks — see [`Lane`])
+/// both read the same stale cursor and resume the same draft twice.
+///
+/// The reservation lands at SELECTION time, not on success: a resume that
+/// later wedges must not pin the cursor to itself forever.
+fn reserve_next_draft(
+    path: &Path,
+    select: impl FnOnce(u64) -> Option<(u64, u64, String)>,
+) -> Option<(u64, u64, String)> {
+    let mut chosen = None;
+    FairSched::update_persist(path, |f| {
+        chosen = select(f.resume_cursor);
+        if let Some((pr, _, _)) = &chosen {
+            f.advance(*pr);
+        }
+    });
+    chosen
 }
 
 /// Is this PR's head branch in THIS repository, rather than a fork?
@@ -3504,6 +3710,11 @@ fn agent_pr_exists(prs: &serde_json::Value, owner: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Which draft to resume next. `cursor` is the last PR number handed out
+/// (#1532): selection prefers the lowest eligible number ABOVE it and wraps
+/// to the overall lowest when none is, so a backlog bigger than the daily cap
+/// rotates instead of re-serving the same lowest-numbered drafts every day.
+/// A pinned `only` ignores the cursor — red-main's fix PR is not negotiable.
 fn resumable_from(
     prs: &serde_json::Value,
     ledger: &AttemptLedger,
@@ -3511,8 +3722,10 @@ fn resumable_from(
     gave_up: &std::collections::HashSet<u64>,
     only: Option<u64>,
     owner: Option<&str>,
+    cursor: u64,
 ) -> Option<(u64, u64, String)> {
-    prs.as_array()?
+    let eligible = prs
+        .as_array()?
         .iter()
         .filter_map(|pr| {
             let number = pr.get("number")?.as_u64()?;
@@ -3529,7 +3742,16 @@ fn resumable_from(
             (wanted && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
                 .then(|| (number, issue, branch.to_string()))
         })
+        .collect::<Vec<_>>();
+    if only.is_some() {
+        return eligible.into_iter().min_by_key(|(number, _, _)| *number);
+    }
+    eligible
+        .iter()
+        .filter(|(number, _, _)| *number > cursor)
         .min_by_key(|(number, _, _)| *number)
+        .or_else(|| eligible.iter().min_by_key(|(number, _, _)| *number))
+        .cloned()
 }
 
 /// Outcome of the independent stage (#828).
@@ -4175,6 +4397,30 @@ fn automerge_eligible(author: &str, owner: Option<&str>, authors_csv: Option<&st
     }
 }
 
+#[async_trait::async_trait]
+trait StorageCalls {
+    async fn call_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String>;
+    async fn call_revision_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String>;
+}
+
+#[async_trait::async_trait]
+impl StorageCalls for augmentagent_channel_core::FallbackReasoner {
+    async fn call_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
+        let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
+        let mut opts = opts.clone();
+        opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));
+        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call(&opts, prompt)).await
+    }
+    async fn call_revision_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
+        let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
+        let mut opts = opts.clone();
+        opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));
+        crate::build_storage::watch_reserve(Path::new(&gate_target_dir()), self.call_revision(&opts, prompt)).await
+    }
+}
+
 fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: SELF_IMPROVE_SYSTEM.to_string(),
@@ -4186,6 +4432,8 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         // test runs re-leaked 4 GB / 4,500 files within two hours.
         env: vec![
             ("CARGO_TARGET_DIR".into(), gate_target_dir()),
+            ("CARGO_PROFILE_DEV_DEBUG".into(), "0".into()),
+            ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
             ("TMPDIR".into(), format!("{}/tmp", gate_target_dir())),
         ],
         allowed_tools: vec![
@@ -4195,6 +4443,8 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
             "Write".into(),
             "Edit".into(),
             "Bash(cargo *)".into(),
+            "Bash(./scripts/cargo-managed.sh *)".into(),
+            "Bash(scripts/cargo-managed.sh *)".into(),
             "Bash(npm *)".into(),
             "Bash(git diff*)".into(),
             "Bash(git status*)".into(),
@@ -4328,7 +4578,9 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// pushed or merged; this trims the redundancy, not the bar.
 async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
     gate_disk_guard()?;
-    let env = gate_env();
+    let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(worktree))?));
     let pkgs: String = crates
         .iter()
         .map(|c| format!("-p {c}"))
@@ -4372,11 +4624,13 @@ async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
 
 async fn verification_gate(worktree: &Path) -> Result<()> {
     gate_disk_guard()?;
+    let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
     // postinstall`, which the issue body could influence; none need
     // provider keys, so this is behavior-preserving for honest fixes.
-    let env = gate_env();
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(worktree))?));
     info!("verification gate: cargo build (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
@@ -4724,7 +4978,9 @@ async fn baseline_failures(
     // Names were validated to Rust-path characters by `failing_tests`.
     let filters = tests.join(" ");
     info!(%pkg_args, %filters, "baseline check: cargo test on origin/main (sandboxed env)");
-    let env = gate_env();
+    let _storage = crate::build_storage::admit(&worktree, &crate::build_storage::effective_target(&worktree)).await?;
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(&worktree))?));
     let result = run_sandboxed(
         "bash",
         &["-lc", &gate_sh(&format!(
@@ -6354,7 +6610,7 @@ async fn resume_draft_pr(
                 let (_ok, hunks, _) = run("git", &["diff"], &worktree).await?;
                 builder_ran = true;
                 match reasoner
-                    .call_revision(
+                    .call_revision_with_storage(
                         &fix_opts(worktree.clone()),
                         &build_conflict_prompt(&issue, &pr_body, &files, &hunks),
                     )
@@ -6557,7 +6813,7 @@ async fn resume_draft_pr(
             rounds_done += 1;
             info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
             match reasoner
-                .call_revision(
+                .call_revision_with_storage(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now, prior_attempts.as_deref()),
                 )
@@ -6637,7 +6893,7 @@ async fn resume_draft_pr(
                     "resume: gate-repair round"
                 );
                 match reasoner
-                    .call_revision(
+                    .call_revision_with_storage(
                         &fix_opts(worktree.clone()),
                         &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now, prior_attempts.as_deref()),
                     )
@@ -6693,7 +6949,7 @@ async fn resume_draft_pr(
         if rounds_done < revise_rounds() {
             if let Some(findings) = ci_findings.take() {
                 rounds_done += 1;
-                let revised = reasoner.call_revision(&fix_opts(worktree.clone()),
+                let revised = reasoner.call_revision_with_storage(&fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref())).await;
                 match revised {
                     Ok(rs) => {
@@ -6861,7 +7117,7 @@ async fn resume_draft_pr(
                 bail!("resume: push failed: {e}");
             }
             // A pending check or failed merge must not discard this LGTM.
-            record_opened_pr(&opened_prs_path(), issue.number, pr, reviewed_head, independent.recorded_verdict());
+            opened_prs::record(issue.number, pr, reviewed_head, independent.recorded_verdict());
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
@@ -6985,7 +7241,7 @@ async fn resume_draft_pr(
             "resume: revising against findings"
         );
         let rev_summary = match reasoner
-            .call_revision(
+            .call_revision_with_storage(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
             )
@@ -7207,6 +7463,9 @@ pub struct RunReport {
     /// #931 — idle-class with a reason: the tick ends here, unbilled, and
     /// the loop does not spin through its triage burst.
     held: bool,
+    /// #1532 — this run resumed a sitting draft rather than building a new
+    /// issue, so the fair-scheduling debt counter can tell them apart.
+    resumed: bool,
 }
 
 impl RunReport {
@@ -7215,6 +7474,7 @@ impl RunReport {
             message: IDLE_MSG.to_string(),
             billed: false,
             held: true,
+            resumed: false,
         }
     }
     fn triage(message: String) -> Self {
@@ -7222,6 +7482,7 @@ impl RunReport {
             message,
             billed: false,
             held: false,
+            resumed: false,
         }
     }
     fn built(message: String) -> Self {
@@ -7229,6 +7490,7 @@ impl RunReport {
             message,
             billed: true,
             held: false,
+            resumed: false,
         }
     }
     /// Nothing was spent and nothing more should be this tick — `main` is
@@ -7238,6 +7500,7 @@ impl RunReport {
             message,
             billed: false,
             held: true,
+            resumed: false,
         }
     }
     fn is_idle(&self) -> bool {
@@ -7342,11 +7605,33 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #871 — lanes: the resume lane does ONLY this (idling when no draft is
     // eligible), the build lane skips it entirely, and the default combined
     // lane keeps resume-first (still flippable via the knob).
-    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() {
+    // #1532 — but not absolutely: after `resume_per_build()` billed resumes
+    // the combined lane reserves this slot for a new issue. Without it, more
+    // non-converging drafts than the daily cap starved every new issue
+    // forever, because review rejections stay retryable and both day-keyed
+    // files reset at midnight.
+    // An unlocked read is enough HERE, unlike the cursor reservation above:
+    // only the combined lane acts on the debt, and it holds the #816 run lock
+    // that the build lane shares, so the sole concurrent writer is the resume
+    // lane. Reading its increment a tick late costs one extra resume, never a
+    // starved build — the debt only grows until a build clears it, and every
+    // tick re-reads it from disk.
+    let fair = FairSched::load(&fair_sched_path());
+    let prefer_build = prefer_build_now(
+        lane,
+        resume_first_enabled(),
+        &fair,
+        resume_per_build(),
+    );
+    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() && !prefer_build {
         if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
             let reasoner = build_reasoner();
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
-                .await;
+                .await
+                .map(|mut r| {
+                    r.resumed = true;
+                    r
+                });
         }
     }
     if lane == Lane::Resume {
@@ -7355,12 +7640,34 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 
     let issue = match red_main_issue {
         Some(issue) => issue,
-        None => {
-            let Some(issue) = pick_issue(repo_root, dry_run).await? else {
+        None => match pick_issue(repo_root, dry_run).await? {
+            Some(issue) => issue,
+            None => {
+                // #1532 — a slot reserved for a build with nothing to build
+                // is spent on a waiting draft, never on idling.
+                if prefer_build {
+                    if let Some((pr, issue_no, resume_branch)) =
+                        find_resumable_draft(repo_root, None, dry_run).await
+                    {
+                        let reasoner = build_reasoner();
+                        return resume_draft_pr(
+                            repo_root,
+                            &reasoner,
+                            pr,
+                            issue_no,
+                            &resume_branch,
+                            dry_run,
+                        )
+                        .await
+                        .map(|mut r| {
+                            r.resumed = true;
+                            r
+                        });
+                    }
+                }
                 return Ok(RunReport::idle());
-            };
-            issue
-        }
+            }
+        },
     };
     note_current_issue(issue.number);
     info!(issue = issue.number, title = %issue.title, "selected issue");
@@ -7669,7 +7976,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let opts = fix_opts(worktree.clone());
     let prompt =
         build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria);
-    let mut summary = match reasoner.call(&opts, &prompt).await {
+    let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
             // #1030 — classify BEFORE recording anything. A provider can
@@ -7729,7 +8036,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             spent += 1;
             info!(issue = issue.number, "builder made no changes; one follow-up");
             match reasoner
-                .call_revision(&fix_opts(worktree.clone()), &build_no_change_prompt(&issue))
+                .call_revision_with_storage(&fix_opts(worktree.clone()), &build_no_change_prompt(&issue))
                 .await
             {
                 Ok(text) => {
@@ -7881,7 +8188,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         spent += 1;
         let snapshot = snapshot_tree(&worktree).await?;
         match reasoner
-            .call_revision(
+            .call_revision_with_storage(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &shrink_findings(lines), lines, prior_attempts.as_deref()),
             )
@@ -7995,7 +8302,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             info!(issue = issue.number, round, max_rounds, "initial gate red; repair round");
             let snapshot = snapshot_tree(&worktree).await?;
             match reasoner
-                .call_revision(
+                .call_revision_with_storage(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &gate_findings(&gate_text), lines, prior_attempts.as_deref()),
                 )
@@ -8165,7 +8472,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
             match reasoner
-                .call_revision(
+                .call_revision_with_storage(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
                 )
@@ -8525,7 +8832,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 "commit refused by the personal-data guard; one repair round"
             );
             match reasoner
-                .call_revision(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
+                .call_revision_with_storage(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
                 .await
             {
                 Ok(summary_of_fix) => {
@@ -8777,7 +9084,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         } else {
             None
         };
-        record_opened_pr(&opened_prs_path(), issue.number, n, published_head, verdict);
+        opened_prs::record(issue.number, n, published_head, verdict);
     }
     if independent.available && !independent.notes.is_empty() {
         let _ = run(&gh, &["pr", "comment", &pr_url, "--body",
@@ -9870,7 +10177,9 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
     // #300 — same secret-stripping as the single-repo gate: the per-repo
     // `build_cmd` runs attacker-influenceable build scripts and must not
     // inherit provider keys.
-    let env = gate_env();
+    let _storage = crate::build_storage::admit(workspace, &crate::build_storage::effective_target(workspace)).await?;
+    let mut env = gate_env();
+    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(workspace))?));
     let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env).await?;
     if !ok {
         bail!("build_cmd `{cmd}` failed:\n{}", truncate(&e, 1500));
@@ -10027,7 +10336,7 @@ async fn process_one_repo(
         "GitHub issue #{} in repo {}: {}\n\n{}\n\nImplement the fix now.",
         issue.number, repo.full_name, issue.title, issue.body
     );
-    let summary = match reasoner.call(&opts, &prompt).await {
+    let summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
             do_cleanup().await;
@@ -10270,6 +10579,9 @@ pub struct AutoPrLoop {
     /// Where the daily counter persists (#814); injectable so a loop test
     /// never touches the owner's state.
     counter_path: PathBuf,
+    /// Where the fair-scheduling state persists (#1532); injectable for the
+    /// same reason as `counter_path`.
+    fair_path: PathBuf,
     /// The provider cooldown latch the quota brake reads (#1215).
     latch: augmentagent_channel_core::CooldownLatch,
     /// Wall clock, injectable so a whole UTC day can be scripted (#1215).
@@ -10467,6 +10779,139 @@ impl AttemptLedger {
             Err(e) => warn!("could not serialize attempt ledger: {e}"),
         }
     }
+}
+
+/// #1532 — fair scheduling across UTC days: where the draft rotation stands,
+/// and how much a run of resumes owes the new-issue lane.
+///
+/// Deliberately NOT keyed by day, unlike [`DailyCounter`] and
+/// [`AttemptLedger`] — that is the whole point. Review rejections park a
+/// draft for retry indefinitely, `resumable_from` served the lowest PR number
+/// first, and both day-keyed files reset at midnight: with more
+/// non-converging drafts than the daily cap, the same lowest-numbered drafts
+/// consumed every billed slot every day and nothing else was ever reached.
+/// Carrying the cursor and the debt counter across the rollover is what makes
+/// the backlog rotate and guarantees new issues a share of the budget.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct FairSched {
+    /// Last draft PR number handed to a resume.
+    #[serde(default)]
+    resume_cursor: u64,
+    /// Billed resumes since the last billed new-issue build.
+    #[serde(default)]
+    resumes_since_build: u32,
+}
+
+impl FairSched {
+    /// Defaults on a missing or corrupt file, mirroring [`DailyCounter::load`]:
+    /// no state means lowest-first resume-first, which is where we already
+    /// were.
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn advance(&mut self, pr: u64) {
+        self.resume_cursor = pr;
+    }
+
+    /// One billed run: a resume adds to the debt, a build clears it.
+    fn record_billed(&mut self, resumed: bool) {
+        self.resumes_since_build = if resumed {
+            self.resumes_since_build.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
+    /// Atomically read-modify-write under an exclusive flock, for the same
+    /// reason as [`AttemptLedger::mark_persist`] (#871): the resume and build
+    /// lanes are separate processes racing this one file.
+    fn update_persist(path: &Path, edit: impl FnOnce(&mut Self)) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(path = %path.display(), "fair-scheduling state open failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            warn!("fair-scheduling state flock failed; updating without it");
+        }
+        // Read AND write the very inode this flock covers, never re-opening
+        // by path: two lanes must not end up locking different inodes while
+        // both believe they hold the state.
+        let mut state = Self::read_from(&mut file).unwrap_or_default();
+        edit(&mut state);
+        if let Err(e) = state.write_into(&mut file) {
+            warn!(path = %path.display(), "could not persist fair-scheduling state: {e}");
+        }
+        // Lock released when `file` drops.
+    }
+
+    /// Defaults on anything unreadable or corrupt, exactly like [`Self::load`].
+    fn read_from(file: &mut std::fs::File) -> Option<Self> {
+        use std::io::{Read, Seek};
+        let mut buf = Vec::new();
+        file.rewind().ok()?;
+        file.read_to_end(&mut buf).ok()?;
+        serde_json::from_slice(&buf).ok()
+    }
+
+    /// Best-effort persist, like [`DailyCounter::save`]: losing this state
+    /// costs the rotation its memory, not the run.
+    fn write_into(&self, file: &mut std::fs::File) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        let bytes = serde_json::to_vec(self)?;
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(&bytes)
+    }
+}
+
+/// Fair-scheduling state path: `AUGMENTAGENT_AUTOPR_FAIR_FILE` override
+/// (tests), else the daemon state dir next to the attempt ledger.
+fn fair_sched_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_FAIR_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    augmentagent_channel_core::state_dir::state_dir()
+        .map(|dir| dir.join("autopr-fair.json"))
+        .unwrap_or_else(|| PathBuf::from("autopr-fair.json"))
+}
+
+/// #1532 — billed resumes the combined lane may spend before it reserves a
+/// slot for a new issue. Default 2, so owner directive #866 ("sitting drafts
+/// outrank new work") survives as a 2:1 bias rather than as the absolute
+/// priority that starved every new issue.
+fn resume_per_build() -> u32 {
+    std::env::var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+/// #1532 — is this billed slot reserved for a new-issue build? Only the
+/// combined lane interleaves: the explicit lanes keep their single purpose,
+/// and with resume-first off there is nothing to interleave against.
+fn prefer_build_now(lane: Lane, resume_first: bool, fair: &FairSched, per_build: u32) -> bool {
+    lane == Lane::Combined && resume_first && fair.resumes_since_build >= per_build
 }
 
 /// Ledger path: `AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE` override (tests), else
@@ -11079,6 +11524,7 @@ impl AutoPrLoop {
             interval: std::time::Duration::from_secs(interval),
             daily_cap: Self::cap_from(daily_cap),
             counter_path: daily_counter_path(),
+            fair_path: fair_sched_path(),
             latch: augmentagent_channel_core::CooldownLatch::system(),
             clock: Arc::new(chrono::Utc::now),
         })
@@ -11102,6 +11548,7 @@ impl AutoPrLoop {
             interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
             daily_cap,
             counter_path: state.join("autopr-daily-runs.json"),
+            fair_path: state.join("autopr-fair.json"),
             latch: augmentagent_channel_core::CooldownLatch::at(state.join("reasoner-cooldowns.json")),
             clock: Arc::new(chrono::Utc::now),
         }
@@ -11197,6 +11644,12 @@ impl AutoPrLoop {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         counter.record(today);
+                        // #1532 — the single debt-accounting site, next to the
+                        // one that spends the budget: a billed resume owes the
+                        // new-issue lane a slot, a billed build settles up.
+                        // Persisted, so it survives the post-merge daemon
+                        // restart exactly as the run count does (#814).
+                        FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
                         // #1215 — spread the rest of today's runs over the
                         // rest of the day. This replaces #851's same-tick
                         // continuation, which spent every run back to back
@@ -11520,6 +11973,7 @@ for tool, arguments in [
                 COUNTER_FILE_ENV,
                 "AUGMENTAGENT_AUTOPR_BASELINE_FILE",
                 "AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE",
+                "AUGMENTAGENT_AUTOPR_FAIR_FILE",
                 "AUGMENTAGENT_AUTOPR_HISTORY_FILE",
                 "AUGMENTAGENT_AUTOPR_OPENED_FILE",
                 "AUGMENTAGENT_COOLDOWN_FILE",
@@ -11537,6 +11991,7 @@ for tool, arguments in [
         assert_eq!(attempt_ledger_path(), state.join("autopr-attempted.json"));
         assert_eq!(attempt_history_path(), state.join("autopr-attempt-history.json"));
         assert_eq!(daily_counter_path(), state.join("autopr-daily-runs.json"));
+        assert_eq!(fair_sched_path(), state.join("autopr-fair.json"));
         assert_eq!(opened_prs_path(), state.join("autopr-opened-prs.json"));
         assert_eq!(run_lock_path().parent(), Some(state.as_path()));
         assert_eq!(augmentagent_channel_core::CooldownLatch::system().path(), state.join("reasoner-cooldowns.json"));
@@ -13060,6 +13515,146 @@ CODEX-REVIEW: lgtm").0);
         }
     }
 
+    /// #1532 — the fair-scheduling state: durable, lock-safe, and NOT reset by
+    /// the UTC-day rollover, which is what makes the interleave survive to the
+    /// next day. A missing or corrupt file reproduces today's behaviour
+    /// (cursor 0 = lowest-first, debt 0 = resume-first).
+    #[test]
+    fn fair_scheduling_state_outlives_the_day_and_reserves_build_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-fair.json");
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"{ nope").unwrap();
+        for fallback in [FairSched::load(&path), FairSched::load(&junk)] {
+            assert_eq!((fallback.resume_cursor, fallback.resumes_since_build), (0, 0));
+            assert!(!prefer_build_now(Lane::Combined, true, &fallback, 2));
+        }
+
+        // Two resumes are the #866 bias; the third slot is the new issue's.
+        let mut fair = FairSched::default();
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+        fair.record_billed(true);
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+        fair.record_billed(true);
+        assert!(prefer_build_now(Lane::Combined, true, &fair, 2));
+        // Only the combined lane interleaves, and only with resume-first on.
+        assert!(!prefer_build_now(Lane::Resume, true, &fair, 2));
+        assert!(!prefer_build_now(Lane::Build, true, &fair, 2));
+        assert!(!prefer_build_now(Lane::Combined, false, &fair, 2));
+        // A billed build settles up.
+        fair.record_billed(false);
+        assert!(!prefer_build_now(Lane::Combined, true, &fair, 2));
+
+        // Persisted across the rollover: at one resume per build the lane
+        // alternates ACROSS days, which a day-keyed quota cannot do.
+        FairSched::update_persist(&path, |f| {
+            f.advance(104);
+            f.record_billed(true);
+        });
+        let tomorrow = FairSched::load(&path);
+        assert_eq!((tomorrow.resume_cursor, tomorrow.resumes_since_build), (104, 1));
+        assert!(prefer_build_now(Lane::Combined, true, &tomorrow, 1),
+            "yesterday's resume still owes today's build");
+
+        // #871's hazard — two lane processes on one file — is covered by
+        // `concurrent_reservations_never_hand_the_same_draft_out_twice`.
+        // An in-place rewrite must leave no tail of the longer old record.
+        FairSched::update_persist(&path, |f| *f = FairSched::default());
+        assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&FairSched::default()).unwrap());
+    }
+
+    /// #1532 — the resume and combined lanes are separate processes with
+    /// separate flocks, so reading the cursor, selecting, and advancing must
+    /// be ONE locked step: done separately, both lanes read the same cursor
+    /// and resume the same draft twice. Ten reservations over the issue's
+    /// five-draft backlog rotate through it exactly twice, with no draft
+    /// handed out a third time and none skipped.
+    #[test]
+    fn concurrent_reservations_never_hand_the_same_draft_out_twice() {
+        const POOL: [u64; 5] = [100, 101, 102, 103, 104];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-fair.json");
+        let lanes: Vec<_> = (0..2)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    (0..5)
+                        .map(|_| {
+                            reserve_next_draft(&p, |cursor| {
+                                let pr = *POOL.iter().find(|n| **n > cursor).unwrap_or(&POOL[0]);
+                                Some((pr, pr - 90, format!("agent-fix/issue-{}", pr - 90)))
+                            })
+                            .expect("a draft is always eligible")
+                            .0
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut handed_out: Vec<u64> =
+            lanes.into_iter().flat_map(|l| l.join().unwrap()).collect();
+        handed_out.sort_unstable();
+        assert_eq!(handed_out, vec![100, 100, 101, 101, 102, 102, 103, 103, 104, 104],
+            "{handed_out:?}");
+        assert_eq!(FairSched::load(&path).resume_cursor, 104);
+    }
+
+    #[test]
+    fn resume_per_build_defaults_to_two_and_never_zero() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD");
+        assert_eq!(resume_per_build(), 2);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", "4");
+        assert_eq!(resume_per_build(), 4);
+        // A zero would reserve every slot for builds and never resume.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", "0");
+        assert_eq!(resume_per_build(), 1);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", "nonsense");
+        assert_eq!(resume_per_build(), 2);
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_PER_BUILD"),
+        }
+    }
+
+    /// #1532, structural: the two halves of the interleave in `run_once` —
+    /// the resume-first block yields its slot when a build is owed, and the
+    /// reserved slot falls back to a resume rather than idling. Plus: the
+    /// debt is accounted exactly once, where the budget is spent.
+    #[test]
+    fn the_reserved_build_slot_yields_to_a_waiting_draft_before_idling() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end of run_once");
+        let body = &src[start..end];
+        let resume_first = body
+            .find("lane != Lane::Build && resume_first_enabled() && !prefer_build")
+            .expect("the resume-first block yields a reserved slot");
+        let pick = body.find("match pick_issue(repo_root, dry_run).await?").expect("the picker");
+        assert!(resume_first < pick, "resume-first still precedes the picker");
+        let none_arm = &body[pick..];
+        let fallback = none_arm.find("if prefer_build {").expect("the reserved-slot fallback");
+        let resume = none_arm.find("find_resumable_draft(repo_root, None, dry_run)").expect("fallback resume");
+        let idle = none_arm.find("return Ok(RunReport::idle());").expect("the idle exit");
+        assert!(fallback < resume && resume < idle, "fall back to a draft, then idle");
+
+        // One debt-accounting site, in the loop's billed arm.
+        let production = &src[..src.find("mod tests {").unwrap()];
+        assert_eq!(production.matches("f.record_billed(").count(), 1);
+        let loop_start = production.find("async fn run_with<F, T>(").expect("run_with");
+        let billed = production[loop_start..].find("Ok(r) if r.billed =>").expect("billed arm");
+        let record = production[loop_start..].find("f.record_billed(r.resumed)").expect("debt update");
+        assert!(billed < record, "the debt update follows the billed arm");
+        assert!(
+            !production[loop_start + billed + 1..loop_start + record].contains("Ok(r)"),
+            "the debt update sits inside the billed arm, not a later one"
+        );
+    }
+
     #[test]
     fn revise_is_on_by_default_and_disableable() {
         // Pin the env either way (#838's lesson: never read ambient state).
@@ -13734,7 +14329,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             .expect("gate-repair loop");
         let repair = &body[repair_at..];
         let pre_repair = repair.find("preexisting_on_main(").expect("baseline check before repair");
-        let call = repair.find("call_revision(").expect("repair round");
+        let call = repair.find("call_revision_with_storage(").expect("repair round");
         assert!(pre_repair < call, "baseline check must precede the repair round");
         let gate_at = body
             .find("if let Err(gate_err) = gate_result {")
@@ -14174,7 +14769,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let run_start = src.find("pub async fn run_once(").expect("run_once");
         let run_body = &src[run_start..run_start + src[run_start..].find("\n}\n").expect("end")];
         assert!(
-            run_body.contains("record_opened_pr("),
+            run_body.contains("opened_prs::record("),
             "opening a PR must record it, or the sweep can never recognise it"
         );
     }
@@ -14243,6 +14838,236 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // failure direction has to be "do not merge".
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(opened_pr_for(&path, 1007), None);
+    }
+
+    /// #1533 — the build and resume lanes hold different run locks, so they
+    /// write this map concurrently. Every record has to survive: a lost one
+    /// leaves the merge sweep with no head-bound verdict and stalls that PR.
+    #[test]
+    fn concurrent_writers_never_lose_each_others_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/opened.json");
+        const WRITERS: u64 = 16;
+        const ROUNDS: u64 = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS as usize));
+
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let issue = 70000 + w;
+                barrier.wait();
+                for round in 0..ROUNDS {
+                    record_opened_pr(&path, issue, 80000 + w, &format!("head{w}{round}"), None);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let map = read_opened_prs(&path);
+        for w in 0..WRITERS {
+            assert_eq!(
+                map.get(&(70000 + w).to_string()),
+                Some(&OpenedPr {
+                    pr: 80000 + w,
+                    head: format!("head{w}{}", ROUNDS - 1),
+                    verdict: None
+                }),
+                "issue {} lost its record among {WRITERS} concurrent writers",
+                70000 + w
+            );
+        }
+    }
+
+    /// A corrupt map cannot swallow the record that follows it: the prior
+    /// entries are already gone, and losing the new one too would stall the
+    /// sweep. Reads of the corrupt state still refuse to match (fail-closed).
+    #[test]
+    fn a_corrupt_map_still_takes_the_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(opened_pr_for(&path, 1007), None, "corrupt state matches nothing");
+
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1020, head: "aaaa111".into(), verdict: None })
+        );
+    }
+
+    /// The staging file is cleaned up by the rename, and the mutex lives
+    /// beside the data file rather than being renamed over.
+    #[test]
+    fn recording_leaves_no_temporary_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+
+        let lock = opened_prs_lock_path(&path);
+        assert_ne!(lock, path, "the lock must not be the data file");
+        assert!(lock.exists(), "the lock sibling is created");
+        assert!(path.exists(), "and the data file is written");
+    }
+
+    /// Codex: an unlocked write is worse than no write. With the mutex
+    /// unobtainable (a directory sits where the lock file goes) the recorder
+    /// must leave the map alone rather than rename a stale copy over a sibling
+    /// lane's record — the very loss #1533 reports.
+    #[test]
+    fn an_unobtainable_lock_leaves_a_siblings_record_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        record_opened_pr(&path, 994, 1000, "cccc333", None);
+        let lock = opened_prs_lock_path(&path);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+        assert_eq!(opened_pr_for(&path, 1007), None, "nothing written without the lock");
+        assert_eq!(
+            opened_pr_for(&path, 994),
+            Some(OpenedPr { pr: 1000, head: "cccc333".into(), verdict: None }),
+            "and the sibling's record survives"
+        );
+    }
+
+    /// #1533, verbatim: the resume lane records a verdict for one issue while
+    /// the build lane publishes another. The pre-existing record is unrelated
+    /// to the new one and must still be there afterwards — losing it is the
+    /// stall the issue reports.
+    #[test]
+    fn an_unrelated_record_survives_a_later_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.json");
+        let resumed = OpenedPr {
+            pr: 1000,
+            head: "cccc333".into(),
+            verdict: Some(RecordedVerdict {
+                provider: "codex".into(),
+                backend: String::new(),
+                model: String::new(),
+                diff_ok: true,
+                system_ok: true,
+            }),
+        };
+        record_opened_pr(&path, 994, resumed.pr, &resumed.head, resumed.verdict.clone());
+
+        record_opened_pr(&path, 1007, 1020, "aaaa111", None);
+
+        assert_eq!(opened_pr_for(&path, 994), Some(resumed), "the resume lane's record survives");
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1020, head: "aaaa111".into(), verdict: None })
+        );
+    }
+
+    /// Codex, twice: a scan for the identifiers this module happens to use
+    /// cannot prove a bypass writer does not exist, because such a writer
+    /// would name none of them. So the enforcement is no longer textual — the
+    /// `opened_prs` module keeps the path resolver, the serializer and the
+    /// path-taking entry points private, and the crate fails to COMPILE if
+    /// anything outside tries to reach the file. What is left for a test is
+    /// the inventory of the module's two public doors (asserted below from the
+    /// pre-compilation source, so an added caller is named rather than merely
+    /// compiled) and the one thing privacy cannot express: that the writer
+    /// takes the lock before it reads.
+    #[test]
+    fn the_locking_recorder_is_the_codebases_only_writer_of_the_map() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().to_path_buf();
+        let mut pending = vec![repo.clone()];
+        let mut mentions = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    // Build output, vendored deps, and the nested checkouts the
+                    // loop leaves behind (each has its own `.git`) are not this
+                    // repository's source.
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let nested_checkout = p.join(".git").exists();
+                    if !nested_checkout && !matches!(name.as_str(), "target" | "node_modules") {
+                        pending.push(p);
+                    }
+                    continue;
+                }
+                // Not every file is text; a binary cannot name a path either.
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                if src.contains("autopr-opened-prs.json")
+                    || src.contains("AUGMENTAGENT_AUTOPR_OPENED_FILE")
+                {
+                    mentions.push(p.strip_prefix(&repo).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        mentions.sort();
+        assert_eq!(
+            mentions,
+            vec![
+                // Sets the override for a child process; writes nothing itself.
+                "crates/augmentagent-cli/src/autopr_eval.rs",
+                "crates/augmentagent-cli/src/self_improve.rs",
+                // Test harnesses pointing the loop at a scratch file.
+                "crates/augmentagent-cli/src/self_improve_lifecycle_tests.rs",
+                "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
+                "docs/CODEX-FALLBACK.md",
+            ],
+            "something outside this crate names the opened-PR map: it must go through opened_prs"
+        );
+
+        let src = include_str!("self_improve.rs");
+        let production = &src[..src.find("\nmod tests {").expect("the test module")];
+        // The whole surface, and it is private: the resolver, the serializer and
+        // the path-taking forms (the last only compiled under `cfg(test)`).
+        let store_start = production.find("\nmod opened_prs {").expect("the store module");
+        let store = &production[store_start..];
+        assert!(store.contains("    fn path() -> PathBuf {"), "the resolver must stay private");
+        assert_eq!(
+            production.matches("to_vec_pretty(&map)").count(),
+            1,
+            "a second serializer of the opened-PR map would write it unserialized"
+        );
+        let writer = store.find("fn record_at(").expect("the recorder");
+        let reads_at = store.find("let mut map = read(path);").expect("the read");
+        assert!(
+            store[writer..reads_at].contains("lock(&lock_path(path))"),
+            "the writer must take the lock before it reads"
+        );
+
+        // And the call-site inventory: the two lanes that record, the sweep that
+        // reads, nothing else. Neither lane's arguments changed for #1533 — the
+        // serialization is entirely inside the store.
+        assert!(
+            production.contains(
+                "opened_prs::record(issue.number, pr, reviewed_head, \
+                 independent.recorded_verdict());"
+            ),
+            "the resume lane's arguments changed"
+        );
+        assert!(
+            production.contains("opened_prs::record(issue.number, n, published_head, verdict);"),
+            "the build lane's arguments changed"
+        );
+        assert_eq!(
+            production.matches("opened_prs::record(").count(),
+            2,
+            "a third writer of the opened-PR map appeared"
+        );
+        assert_eq!(
+            production.matches("opened_prs::get(").count(),
+            1,
+            "the sweep's read of the opened-PR map changed"
+        );
     }
 
     /// Codex: an extraction that is supposed to change nothing has to change
@@ -15414,21 +16239,50 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let gave_up: std::collections::HashSet<u64> = [12u64].into_iter().collect();
         // Unpinned: oldest eligible draft.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak"), 0),
             Some((100, 10, "agent-fix/issue-10".to_string()))
         );
         // Pinned to the red-main issue: that draft even though it is newer.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")),
+            resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak"), 0),
             Some((101, 11, "agent-fix/issue-11".to_string()))
         );
+        // #1532 — and a pinned draft ignores the rotation cursor entirely,
+        // in both directions: red-main's fix PR is not negotiable.
+        for cursor in [0, 100, 101, 999] {
+            assert_eq!(
+                resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak"), cursor),
+                Some((101, 11, "agent-fix/issue-11".to_string())),
+                "cursor {cursor}"
+            );
+        }
         // Pinned to an issue without an eligible draft: nothing, never a
         // fallback to some other PR.
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12), Some("nolanmak")), None);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12), Some("nolanmak"), 0), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99), Some("nolanmak"), 0), None);
         // The daily ledger still applies to the pinned draft.
         ledger.mark(100, 11);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak"), 0), None);
+    }
+
+    /// #1532, structural: the finder advances the persisted rotation cursor
+    /// only for an UNPINNED selection on a real run — and it advances at
+    /// selection time, so a resume that wedges cannot pin the rotation.
+    #[test]
+    fn only_an_unpinned_resume_moves_the_rotation_cursor() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn find_resumable_draft(").expect("finder");
+        let end = start + src[start..].find("\n}\n").expect("finder end");
+        let body = &src[start..end];
+        let bypass = body.find("if only.is_some() || dry_run {").expect("pinned bypass");
+        let reserve = body.find("reserve_next_draft(&fair_sched_path(), select)").expect("reservation");
+        assert!(bypass < reserve, "a pinned or dry run returns before reserving");
+        let r = src.find("fn reserve_next_draft(").expect("reserve_next_draft");
+        let reserver = &src[r..r + src[r..].find("\n}\n").expect("reserver end")];
+        let lock = reserver.find("FairSched::update_persist(").expect("locked");
+        let choose = reserver.find("select(f.resume_cursor)").expect("choice");
+        let advance = reserver.find("f.advance(*pr)").expect("cursor advance");
+        assert!(lock < choose && choose < advance, "read, choose and advance under one lock");
     }
 
     // --- #933 auto-rebase: the builder resolves a draft's merge conflict ---
@@ -17385,7 +18239,7 @@ else:
         for unknown in [None, Some(""), Some("   ")] {
             assert_eq!(head_is_ours(&ours, unknown), None, "{unknown:?}");
             assert_eq!(
-                resumable_from(&serde_json::json!([ours, fork]), &ledger, 100, &gave_up, None, unknown),
+                resumable_from(&serde_json::json!([ours, fork]), &ledger, 100, &gave_up, None, unknown, 0),
                 None,
                 "resume must fail closed on no evidence ({unknown:?})"
             );
@@ -17400,7 +18254,7 @@ else:
         let ours_flagged = pr_json_full(100, "agent-fix/issue-10", true, None, Some(false));
         let fork_flagged = pr_json_full(99, "agent-fix/issue-9", true, None, Some(true));
         assert_eq!(
-            resumable_from(&serde_json::json!([fork_flagged, ours_flagged]), &ledger, 100, &gave_up, None, None),
+            resumable_from(&serde_json::json!([fork_flagged, ours_flagged]), &ledger, 100, &gave_up, None, None, 0),
             Some((100, 10, "agent-fix/issue-10".to_string())),
             "the flag alone must skip the fork and still reach our draft"
         );
@@ -17422,16 +18276,16 @@ else:
         let ledger = AttemptLedger::default();
         let gave_up = std::collections::HashSet::new();
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak"), 0),
             Some((101, 11, "agent-fix/issue-11".to_string())),
             "the lower-numbered fork PR must not win the queue"
         );
         // Pinning to the fork's issue finds nothing rather than falling back.
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(10), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(10), Some("nolanmak"), 0), None);
         // With no fork in play, selection is unchanged.
         let ours = serde_json::json!([pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"))]);
         assert_eq!(
-            resumable_from(&ours, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            resumable_from(&ours, &ledger, 100, &gave_up, None, Some("nolanmak"), 0),
             Some((100, 10, "agent-fix/issue-10".to_string()))
         );
     }
@@ -17780,7 +18634,7 @@ else:
         let bind = body.find("track_review_history(").expect("history is bound");
         let ask = body.find("select_reviewer(").expect("the lane must ask before spending");
         assert!(bind < ask, "provenance is read after it is bound");
-        for spend in [r#""worktree", "add""#, r#""merge", "--no-edit""#, "verification_gate(", "call_revision("] {
+        for spend in [r#""worktree", "add""#, r#""merge", "--no-edit""#, "verification_gate(", "call_revision_with_storage("] {
             let at = body.find(spend).unwrap_or_else(|| panic!("{spend} is in the lane"));
             assert!(ask < at, "ask before {spend}");
         }
@@ -18286,7 +19140,7 @@ mod iterate_not_delete_tests {
             .find("match after_review(")
             .expect("the decision drives the loop");
         let rest = &body[lp..];
-        let rev = rest.find(".call_revision(").expect("a revision round");
+        let rev = rest.find(".call_revision_with_storage(").expect("a revision round");
         let qa = rest[rev..]
             .find("review_opts(")
             .expect("QA after the revision");

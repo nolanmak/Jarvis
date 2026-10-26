@@ -387,10 +387,17 @@ fn approval_embed_and_rows(
 
     // #927 — a merge card carries evidence, not a draft: nothing to redraft,
     // so Approve (which runs the merge) and Skip are the only verbs offered.
-    if email.kind == "identity_merge" || email.platform == "document-signing" {
+    // #1224 — an RSVP card carries a provider write, not a draft.
+    if email.kind == "identity_merge" || email.platform == "document-signing" || email.kind == "rsvp" {
         let row = CreateActionRow::Buttons(vec![
             CreateButton::new(CustomId::new(action_id, Verb::Approve).with_revision(draft).to_string())
-                .label(if email.platform == "document-signing" { "Approve & Sign" } else { "Approve & Merge" })
+                .label(if email.platform == "document-signing" {
+                    "Approve & Sign"
+                } else if email.kind == "rsvp" {
+                    "Send RSVP"
+                } else {
+                    "Approve & Merge"
+                })
                 .style(ButtonStyle::Success),
             CreateButton::new(CustomId::new(action_id, Verb::Skip).to_string())
                 .label("Skip")
@@ -649,6 +656,19 @@ pub fn scheduled_notice_message(
             .style(ButtonStyle::Danger),
     ]);
     CreateMessage::new().embed(embed).components(vec![buttons])
+}
+
+/// #1224 — the notice posted after calendar auto-accept answered an invite.
+/// Plain content (no embed) plus one Decline button keyed to the auto-RSVP's
+/// receipt row, so a wrong answer is one click to undo.
+pub fn auto_rsvp_notice_message(action_id: &str, text: &str) -> CreateMessage {
+    CreateMessage::new()
+        .content(truncate(text, 1900))
+        .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+            CustomId::new(action_id, Verb::CalendarDecline).to_string(),
+        )
+        .label("Decline")
+        .style(ButtonStyle::Danger)])])
 }
 
 /// #1203 — the single-button action row the #1199 recovery ephemeral carries

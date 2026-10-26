@@ -269,10 +269,10 @@ check "leaves the cache alone while a lane holds its lock" "$?" "1"
   || bad "debug/ survives while a build may be using it" "it was deleted under a live build"
 wait "$HOLDER" 2>/dev/null
 
-# Idle + over cap -> trimmed.
+# Idle + over cap + missing pruner must defer safely.
 trim_gate_cache_if_idle >/dev/null 2>&1
-check "trims when over cap and every lane is idle" "$?" "0"
-[ -d "$GATE_CACHE_DIR/debug" ] && bad "drops debug/ on trim" "still present" || ok "drops debug/ on trim"
+check "idle cleanup defers without a lease-aware pruner" "$?" "1"
+[ -d "$GATE_CACHE_DIR/debug" ] && ok "missing pruner preserves debug/" || bad "missing pruner preserves debug/"
 
 # Under cap -> untouched.
 mkdir -p "$GATE_CACHE_DIR/debug"; GATE_CACHE_MAX_MB=100000
@@ -280,6 +280,7 @@ trim_gate_cache_if_idle >/dev/null 2>&1
 check "leaves a cache under the cap alone" "$?" "1"
 
 # #1407 — tiered: a pruner that gets under the cap spares debug/.
+rm -f "$GATE_CACHE_DIR/debug/blob"
 GATE_CACHE_MAX_MB=2
 mkdir -p "$GATE_CACHE_DIR/debug/incremental" "$GATE_CACHE_DIR/debug/deps"
 dd if=/dev/zero of="$GATE_CACHE_DIR/debug/incremental/cold" bs=1M count=3 status=none
@@ -302,19 +303,19 @@ check "tiered: asks the pruner for this dir, cap and stale window" \
   || bad "tiered: warm artifacts survive (no cold rebuild)" "debug/ was wiped"
 case "$TRIM_LOG" in *"trimmed cold entries"*) ok "tiered: logs the cheap trim" ;; *) bad "tiered: logs the cheap trim" "$TRIM_LOG" ;; esac
 
-# A pruner that runs but cannot get under the cap -> the wipe is the backstop.
+# A busy or unsuccessful pruner must never be bypassed with an unlocked wipe.
 dd if=/dev/zero of="$GATE_CACHE_DIR/debug/deps/big" bs=1M count=3 status=none
 touch "$CACHE_DIR/pruner.noop"
 trim_gate_cache_if_idle >/dev/null 2>&1
-check "backstop: still trims when the pruner could not fit the cap" "$?" "0"
-[ -d "$GATE_CACHE_DIR/debug" ] && bad "backstop: drops debug/" "still present" || ok "backstop: drops debug/"
+check "busy pruner defers cleanup" "$?" "1"
+[ -d "$GATE_CACHE_DIR/debug" ] && ok "busy pruner preserves debug/" || bad "busy pruner preserves debug/" "deleted outside lease"
 
-# A binary that predates `disk prune` (clap exits 2) -> same backstop.
+# A binary that predates disk prune must defer safely.
 rm -f "$CACHE_DIR/pruner.noop"; touch "$CACHE_DIR/pruner.fail"
 mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob" bs=1M count=3 status=none
 trim_gate_cache_if_idle >/dev/null 2>&1
-[ -d "$GATE_CACHE_DIR/debug" ] && bad "backstop: an old binary falls back to the wipe" "still present" \
-  || ok "backstop: an old binary falls back to the wipe"
+[ -d "$GATE_CACHE_DIR/debug" ] && ok "old binary defers without an unlocked wipe" \
+  || bad "old binary defers without an unlocked wipe" "deleted outside lease"
 GATE_PRUNE_BIN=/nonexistent
 
 # #1407 — a cache under its cap on a volume under the gate's free-space floor
@@ -326,8 +327,8 @@ trim_gate_cache_if_idle >/dev/null 2>&1
 check "floor: plenty of free space leaves an under-cap cache alone" "$?" "1"
 _gate_free_mb() { echo 100; }
 FLOOR_LOG=$(trim_gate_cache_if_idle 2>&1); rc=$?
-check "floor: trims an under-cap cache when the volume is under the floor" "$rc" "0"
-[ -d "$GATE_CACHE_DIR/debug" ] && bad "floor: frees the space" "debug/ still present" || ok "floor: frees the space"
+check "floor: defers safely when the pruner is unavailable" "$rc" "1"
+[ -d "$GATE_CACHE_DIR/debug" ] && ok "floor: missing pruner never deletes outside lease" || bad "floor: missing pruner never deletes outside lease"
 AUGMENTAGENT_GATE_MIN_FREE_GB=0
 mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob" bs=1M count=3 status=none
 trim_gate_cache_if_idle >/dev/null 2>&1

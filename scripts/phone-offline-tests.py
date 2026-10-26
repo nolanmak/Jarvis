@@ -17,22 +17,31 @@ ROOT = Path(__file__).resolve().parents[1]
 # counts prevent silent deletion of the current required coverage.
 SUITES = [
     ("augmentagent-docs", "--test", "private_attachments", 2),
-    ("augmentagent-phone", "--lib", None, 11),
-    ("augmentagent-phone", "--test", "relay", 3),
-    ("augmentagent-phone", "--test", "service", 25),
+    ("augmentagent-phone", "--lib", None, 19),
+    ("augmentagent-phone", "--test", "relay", 24),
+    ("augmentagent-phone", "--test", "service", 52),
+    ("augmentagent-phone", "--test", "speech", 14),
+    ("augmentagent-phone", "--test", "fast", 30),
+    ("augmentagent-phone", "--test", "metrics", 4),
     ("augmentagent-phone", "--test", "recovery", 7),
     ("augmentagent-phone", "--test", "mcp", 2),
-    ("augmentagent-phone", "--test", "config", 1),
+    ("augmentagent-phone", "--test", "config", 7),
+    ("augmentagent-phone", "--test", "memory", 14),
+    ("augmentagent-phone", "--test", "silence", 12),
     ("augmentagent-phone", "--test", "runtime", 3),
+    ("augmentagent-phone", "--test", "proposals", 19),
+    ("augmentagent-proactive", "--test", "no_dial_path", 3),
     ("augmentagent-store", "--test", "phone_calls", 17),
-    ("augmentagent-store", "--test", "phone_migration", 1),
+    ("augmentagent-store", "--test", "phone_migration", 2),
+    ("augmentagent-store", "--test", "phone_turn_metrics", 4),
+    ("augmentagent-store", "--test", "phone_memory", 3),
     ("augmentagent-store", "--test", "local_chat", 3),
     ("augmentagent-store", "--test", "surface_owner", 18),
     ("augmentagent-store", "--test", "surface_delivery", 36),
     ("augmentagent-approval-discord", "--lib", None, 255),
     ("augmentagent-approval-discord", "--test", "phone_boundary", 2),
     ("augmentagent-approval-discord", "--test", "phone_delivery", 3),
-    ("augmentagent-channel-core", "--test", "phone_agent", 3),
+    ("augmentagent-channel-core", "--test", "phone_agent", 18),
     ("augmentagent-channel-core", "--test", "capability_inventory", 9),
     ("augmentagent-channel-core", "--test", "surface_turn", 10),
     ("augmentagent-channel-slack", "--test", "interactive_surface", 20),
@@ -76,7 +85,7 @@ def main():
     # These required CLI modules share a binary with unrelated, environment-
     # dependent tests. Only unrelated tests may be filtered; zero/ignored cases
     # or fewer than the required number still fail.
-    for module, minimum in [("wiki_question_stdin_tests::", 2), ("local_phone::tests::", 1), ("local_phone_transport::tests::", 5), ("notify_tests::", 17), ("phone_runtime::tests::", 4), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
+    for module, minimum in [("wiki_question_stdin_tests::", 2), ("local_phone::tests::", 1), ("phone_metrics::tests::", 2), ("local_phone_transport::tests::", 5), ("notify_tests::", 17), ("phone_runtime::tests::", 4), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
         jobs.append(("augmentagent-cli-" + module.rstrip(":").replace("::", "-"),
                      ["cargo", "test", "--locked", "-p", "augmentagent-cli", "--bin", "augmentagent", module, "--", "--test-threads=1"], minimum, True))
     # Captured iMessage/Notes files remain readable across the voice migration.

@@ -147,6 +147,10 @@ pub enum Route {
     DiscordTransport,
     /// Posts to Discord only, on purpose, with the reason.
     DiscordOnly(&'static str),
+    /// Call proposals (#1553): a yes/no question in the owner's private
+    /// control chat, through that chat adapter's durable phone outbox. The
+    /// answer must come back in the same chat, so it is never fanned out.
+    PhoneControlChat,
 }
 
 /// One registered posting site: `sites` occurrences of `marker` in `file`.
@@ -229,6 +233,8 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_channel_sink", "crates/augmentagent-cli/src/notify.rs", "send_message(&", 1, TRANSPORT, "Discord leg: bot channel / request channel"),
     p("discord_channel_sink", "crates/augmentagent-cli/src/notify.rs", "CreateMessage::new(", 1, TRANSPORT, "Discord leg: bot channel / request channel"),
     p("discord_webhook_sink", "crates/augmentagent-cli/src/notify.rs", "DISCORD_WEBHOOK_URL", 3, TRANSPORT, "Discord leg: webhook"),
+    act(p("calendar_rsvp", "crates/augmentagent-cli/src/calendar_rsvp.rs", "send_message(&", 1, BROKER, "calendar RSVP approval card")),
+    p("calendar_rsvp_layout", "crates/augmentagent-cli/src/calendar_rsvp.rs", "CreateMessage::new(", 1, TRANSPORT, "calendar RSVP receipt fallback"),
     // -- Approval surfaces (#1289) -------------------------------------------
     act(p("approval_broker", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 4, BROKER, "Discord approval broker: cards, flag notices, digests")),
     act(p("owner_alert_discord", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 1, BROKER, "critical owner alerts with acknowledgment controls")),
@@ -239,7 +245,7 @@ pub static PRODUCERS: &[Producer] = &[
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_digest(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_fan_out", "crates/augmentagent-approval-discord/src/sync.rs", ".post_flag_notice(", 1, BROKER, "MultiSurfaceBroker fan-out"),
     p("broker_default_notice", "crates/augmentagent-approval-discord/src/lib.rs", ".post_flag_notice(", 1, BROKER, "ApprovalBroker default notice"),
-    p("card_layout", "crates/augmentagent-approval-discord/src/layout.rs", "CreateMessage::new(", 4, TRANSPORT, "Discord card builders"),
+    p("card_layout", "crates/augmentagent-approval-discord/src/layout.rs", "CreateMessage::new(", 5, TRANSPORT, "Discord card builders"),
     p("code_mode_failure", "crates/augmentagent-channel-core/src/code_mode/failure.rs", ".post_flag_notice(", 1, BROKER, "code-mode failure notice"),
     p("engagement", "crates/augmentagent-channel-core/src/engagement.rs", ".post_digest(", 1, BROKER, "engagement digest"),
     p("engagement", "crates/augmentagent-channel-core/src/engagement.rs", ".post_flag_notice(", 2, BROKER, "engagement notices"),
@@ -260,7 +266,7 @@ pub static PRODUCERS: &[Producer] = &[
     p("whatsapp_flags", "crates/augmentagent-channel-whatsapp/src/channel.rs", ".post_flag_notice(", 1, BROKER, "WhatsApp flags"),
     p("imessage_outbox_failures", "crates/augmentagent-cli/src/imessage_send.rs", ".post_flag_notice(", 1, BROKER, "iMessage send failures"),
     p("owner_text_health", "crates/augmentagent-cli/src/imessage_send.rs", ".post_digest(", 2, BROKER, "owner text sender health and failed escalation notices"),
-    p("cli_broker_digests", CLI, ".post_digest(", 3, BROKER, "contacts sync, signature backfill and pending-review digests"),
+    p("cli_broker_digests", CLI, ".post_digest(", 4, BROKER, "contacts sync, signature backfill, pending-review and contact auto-merge digests"),
     p("cli_broker_notices", CLI, ".post_flag_notice(", 2, BROKER, "compose fan-out / family cards"),
     act(p("pr_awaiting_approval", "crates/augmentagent-cli/src/self_improve.rs", ".post_flag_notice(", 1, BROKER, "agent-coding PR awaiting approval")),
     p("heartbeat", "crates/augmentagent-heartbeat/src/runner.rs", ".post_flag_notice(", 2, BROKER, "heartbeat check-ins"),
@@ -278,6 +284,9 @@ pub static PRODUCERS: &[Producer] = &[
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "send_message(&", 6, REPLY, "Discord voice transcripts in the voice channel"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "CreateMessage::new(", 7, REPLY, "Discord voice transcripts in the voice channel"),
     p("cli_discord_posts", CLI, "send_message(&", 7, Route::DiscordOnly("explicit `--post` Discord commands (compose/propose cards, wiki ask --post) and Discord loop output"), "one-shot Discord posts"),
+    // -- Phone call proposals (#1553) ---------------------------------------
+    act(p("phone_call_proposal", "crates/augmentagent-phone/src/proposals.rs", "notify_owner(", 1, Route::PhoneControlChat, "agent-proposed call questions (yes/no) in the owner's private control chat")),
+    act(p("phone_call_proposal", "crates/augmentagent-phone/src/router.rs", "notify_owner(", 1, Route::PhoneControlChat, "per-platform routing of call proposal questions")),
     p("cli_discord_posts", CLI, "CreateMessage::new(", 4, Route::DiscordOnly("explicit `--post` Discord commands and Discord loop output"), "one-shot Discord posts"),
 ];
 // producer-scan: on

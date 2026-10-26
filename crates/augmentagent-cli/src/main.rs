@@ -6,8 +6,10 @@ mod document_signing;
 mod provider_migration_tests;
 mod model_tool;
 mod composio_auth_tool;
+mod calendar_rsvp;
 mod voice_tool;
 mod phone_runtime;
+mod phone_metrics;
 mod local_phone_transport;
 mod local_phone;
 mod discord_phone;
@@ -102,10 +104,14 @@ mod compute_tool;
 mod doc_cmd;
 mod db_compact;
 mod deploy_snapshot;
+mod snapshot_refs;
 mod disk;
+mod build_storage;
+mod storage_leases;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
+mod google_cmd;
 mod gdrive_query;
 mod repo_docs;
 mod finance;
@@ -191,7 +197,9 @@ enum Cmd {
     },
     /// Run the poll loop as a daemon.
     Serve {
-        #[arg(long, default_value_t = 120)]
+        /// Gmail inbound poll cadence. Env `AUGMENTAGENT_GMAIL_POLL_SECS`
+        /// overrides the default; the flag overrides both.
+        #[arg(long, default_value_t = default_gmail_poll_secs())]
         interval_secs: u64,
         /// Dry-run (default true). Flip with `--dry-run false` after Phase 2 cutover.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -289,6 +297,12 @@ enum Cmd {
     Gmail {
         #[command(subcommand)]
         op: GmailOp,
+    },
+    /// Connect Gmail mailboxes through your own Google OAuth client instead
+    /// of Composio (#1573): consent URL, code exchange, disconnect, status.
+    Google {
+        #[command(subcommand)]
+        op: google_cmd::GoogleOp,
     },
     /// Document text extraction (#939): pdftotext/pandoc first, then Mistral
     /// OCR for scanned (image-only) PDFs when MISTRAL_API_KEY is set. Same
@@ -718,6 +732,11 @@ enum Cmd {
     /// Internal owner-bound phone MCP facade.
     #[command(hide = true)]
     PhoneTool,
+    /// Owner phone call diagnostics (#1551 latency metrics).
+    Phone {
+        #[command(subcommand)]
+        op: PhoneOp,
+    },
     /// Reconcile one known phone call from provider evidence; never dials.
     PhoneReconcile {
         #[arg(long)]
@@ -922,6 +941,17 @@ enum DbOp {
 
 #[derive(Subcommand, Debug)]
 enum DeployOp {
+    /// Explicitly register a historical rollout directory. Initially pinned.
+    AdoptRollout {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value = "rollout")]
+        label: String,
+    },
+    /// Protect a snapshot until explicitly unpinned.
+    Pin { name: String, #[arg(long)] reason: String },
+    /// Allow normal retention again after checking rollback dependencies.
+    Unpin { name: String },
     /// Snapshot the database (consistent while the daemon runs, compressed)
     /// and the release binary into one dated dir. Prints the dir.
     Snapshot {
@@ -964,6 +994,29 @@ enum DeployOp {
 
 #[derive(Subcommand, Debug)]
 enum DiskOp {
+    /// Opt a dedicated parent into discovery of future Cargo cache children.
+    ManageParent { #[arg(long)] root: PathBuf },
+    /// Register an external Cargo target for automatic housekeeping.
+    Register {
+        #[arg(long)]
+        root: PathBuf,
+        /// Worktree that owns this cache; may name a removed worktree.
+        #[arg(long, conflicts_with = "persistent")]
+        worktree: Option<PathBuf>,
+        /// Shared cache: apply retention without deleting the whole root.
+        #[arg(long)]
+        persistent: bool,
+        /// Explicitly adopt an abandoned cache whose worktree is unknown.
+        #[arg(long, conflicts_with_all = ["persistent", "worktree"])]
+        abandoned: bool,
+    },
+    /// Run a build with automatic cleanup, reserved headroom, and exclusion.
+    Build {
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Remove cold build output: `incremental/` sessions idle 2 days,
     /// artifacts whose cargo unit has not been used for 7 (14 where the
     /// filesystem records no access times), and the whole `target/` of a
@@ -995,6 +1048,15 @@ enum DiskOp {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+#[derive(Subcommand)]
+enum PhoneOp {
+    /// Print nearest-rank p50/p95 per latency field for the last N calls.
+    /// Reads stored `phone_turn_metrics` only; no provider requests.
+    Metrics {
+        #[arg(long, default_value_t = 10)]
+        last: usize,
     },
 }
 #[derive(Subcommand)]
@@ -1389,6 +1451,38 @@ enum CalendarOp {
         /// Window length in days when --to is absent (clamped to 1-60)
         #[arg(long, default_value_t = 7)]
         days: i64,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// #1224 — answer a calendar invite. accepted/tentative run at once;
+    /// declined (visible to the organizer) only previews unless --post true
+    /// raises a Discord approval card. --post true cards any response.
+    Rsvp {
+        /// Event id from `calendar list-events --json true`
+        #[arg(long)]
+        event_id: String,
+        /// accepted | declined | tentative
+        #[arg(long)]
+        response: String,
+        /// Account the invite is on (default: whichever account has it)
+        #[arg(long)]
+        account: Option<String>,
+        /// Answer the whole recurring series, not just this occurrence
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        series: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post: bool,
+    },
+    /// #1224 — turn invite auto-accept on/off for one account, or for every
+    /// account without its own setting when --account is absent.
+    SetAutoAccept {
+        #[arg(long, action = clap::ArgAction::Set)]
+        on: bool,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// #1224 — per-account calendar settings (auto-accept and its source).
+    Status {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
@@ -2929,6 +3023,9 @@ async fn main() -> Result<()> {
         let mut out = std::io::stdout().lock();
         return match op {
             DeployOp::Snapshot { label } => {
+                // Snapshot allocation and builds must not spend the same
+                // measured filesystem reserve concurrently.
+                let _storage = build_storage::acquire().await?;
                 let db = cli
                     .db
                     .clone()
@@ -2952,6 +3049,12 @@ async fn main() -> Result<()> {
                 writeln!(out, "{}", dir.display())?;
                 Ok(())
             }
+            DeployOp::AdoptRollout { path, label } => {
+                println!("{}", deploy_snapshot::adopt_rollout(&root, path, label)?.display());
+                Ok(())
+            }
+            DeployOp::Pin { name, reason } => deploy_snapshot::set_pin(&root, name, Some(reason)),
+            DeployOp::Unpin { name } => deploy_snapshot::set_pin(&root, name, None),
             DeployOp::List => deploy_snapshot::run_list(&root, &mut out),
             DeployOp::Prune { dry_run, strays, yes, json } => deploy_snapshot::run_prune(
                 &root,
@@ -2974,6 +3077,28 @@ async fn main() -> Result<()> {
     if let Cmd::Disk { ref op } = cli.cmd {
         let repo_root = std::env::current_dir().context("current_dir")?;
         return match op {
+            DiskOp::ManageParent { root } => {
+                let mut lease = build_storage::acquire().await?;
+                std::fs::create_dir_all(root)?;
+                lease.protect_targets(std::slice::from_ref(root)).await?;
+                build_storage::manage_parent(&repo_root, root, &build_storage::state_dir()?)
+            }
+            DiskOp::Register { root, worktree, persistent, abandoned } => {
+                let mut lease = build_storage::acquire().await?;
+                std::fs::create_dir_all(root)?;
+                lease.protect_targets(std::slice::from_ref(root)).await?;
+                let owner = if *persistent { None } else { Some(worktree.as_deref().unwrap_or(&repo_root)) };
+                let record = if *abandoned {
+                    build_storage::register_abandoned(&repo_root, root, &build_storage::state_dir()?)?
+                } else { build_storage::register(&repo_root, root, owner, &build_storage::state_dir()?)? };
+                println!("{}", serde_json::to_string_pretty(&record)?);
+                Ok(())
+            }
+            DiskOp::Build { target_dir, command } => {
+                let lease = if build_storage::inherited_lease(target_dir)? { None }
+                    else { Some(build_storage::admit_session(&repo_root, target_dir).await?) };
+                build_storage::run_command(target_dir, command, lease.as_ref()).await
+            }
             DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
                 &repo_root,
                 &disk::Options {
@@ -3640,13 +3765,22 @@ async fn main() -> Result<()> {
                 let suppression = std::sync::Arc::new(
                     augmentagent_proactive::TableSuppression::new(Arc::clone(&store)),
                 );
-                let runner = augmentagent_proactive::runner::ProactiveRunner::new(
+                let mut runner = augmentagent_proactive::runner::ProactiveRunner::new(
                     Arc::clone(&store),
                     Arc::clone(&broker),
                     wiki_root,
                     augmentagent_proactive::rules::default_scans(),
                 )
                 .with_suppression(suppression);
+                // #1553 — opt-in: dispatched follow-ups may become a call
+                // proposal in the owner's private chat. Only the owner's
+                // `yes` there dials.
+                if std::env::var("AUGMENTAGENT_PHONE_PROPOSE_CALLS").as_deref() == Ok("1") {
+                    match phone.as_ref().and_then(|e| phone_runtime::PhoneCallProposer::new(e.service.clone())) {
+                        Some(proposer) => runner = runner.with_call_proposer(Arc::new(proposer)),
+                        None => warn!("AUGMENTAGENT_PHONE_PROPOSE_CALLS=1 ignored: phone calling is not running for a single owner"),
+                    }
+                }
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { runner.run(sd).await }));
             } else {
@@ -4316,6 +4450,7 @@ async fn main() -> Result<()> {
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
         Cmd::LogRotate { .. } => unreachable!("handled before database initialization"),
         Cmd::OpsArchive { .. } => unreachable!("handled before database initialization"),
+        Cmd::Google { ref op } => google_cmd::run(store, op.clone()).await,
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
@@ -4780,8 +4915,9 @@ async fn main() -> Result<()> {
             PersonOp::ProposeMerges => {
                 let wiki = cli.wiki_dir.as_deref().context("--wiki-dir is required")?;
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), false).await?;
-                let n = propose_high_confidence_merges(wiki, &store, broker.as_ref()).await?;
-                println!("{n} merge card(s) raised");
+                let auto = auto_merge_contacts_enabled();
+                let scan = run_merge_scan(wiki, &store, broker.as_ref(), auto).await?;
+                println!("{} merge card(s) raised, {} auto-merged", scan.raised, scan.merged.len());
                 Ok(())
             }
         },
@@ -4874,6 +5010,17 @@ async fn main() -> Result<()> {
                 .await?;
                 Ok(())
             }
+            CalendarOp::Rsvp {
+                event_id,
+                response,
+                account,
+                series,
+                post,
+            } => calendar_rsvp::run_rsvp(store, event_id, response, account, series, post).await,
+            CalendarOp::SetAutoAccept { on, account } => {
+                calendar_rsvp::run_set_auto_accept(store, on, account)
+            }
+            CalendarOp::Status { json } => calendar_rsvp::run_status(store, json),
         },
         Cmd::Voice { ref op } => match op {
             VoiceOp::Login { token } => run_voice_login(token.clone()),
@@ -5356,6 +5503,7 @@ async fn main() -> Result<()> {
         Cmd::ComposioAuthTool => composio_auth_tool::serve().await,
         Cmd::VoiceTool => voice_tool::serve(),
         Cmd::PhoneTool => Ok(augmentagent_phone::mcp::serve()?),
+        Cmd::Phone { op: PhoneOp::Metrics { last } } => phone_metrics::run(&store, last),
         Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
@@ -6364,8 +6512,10 @@ async fn upload_attach_if_given(
         bytes.len(),
         Sha256::digest(&bytes)
     );
+    // Keep the retained original as the deferred upload source. This lets a
+    // direct-Google mailbox send the same bytes without passing through Composio.
     let att = gmail
-        .upload_attachment_bytes("GMAIL_CREATE_EMAIL_DRAFT", name, bytes)
+        .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
         .await
         .context("attachment upload failed")?;
     println!("attached: {review}");
@@ -6379,19 +6529,8 @@ mod original_attachment_tests {
     #[tokio::test]
     async fn upload_preserves_binary_bytes_and_review_identifies_each_revision() {
         use sha2::{Digest, Sha256};
-        let mut server = mockito::Server::new_async().await;
         let bytes = b"%PDF-1.7\n\x00\xff original signed layout";
-        let upload = server
-            .mock("PUT", "/upload")
-            .match_body(bytes.to_vec())
-            .with_status(200)
-            .create_async()
-            .await;
-        let request = server.mock("POST", "/api/v3/files/upload/request")
-            .with_header("content-type", "application/json")
-            .with_body(serde_json::json!({"key": "original-key", "new_presigned_url": format!("{}/upload", server.url())}).to_string())
-            .create_async().await;
-        let client = ComposioClient::new("test".into()).with_base_url(server.url());
+        let client = ComposioClient::new("test".into());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aa-doc-1457-1.pdf");
         std::fs::write(&path, bytes).unwrap();
@@ -6399,7 +6538,9 @@ mod original_attachment_tests {
             .await
             .unwrap();
         let review = review.unwrap();
-        assert_eq!(attached.unwrap().s3key, "original-key");
+        let attached = attached.unwrap();
+        assert!(attached.s3key.is_empty());
+        assert_eq!(attached.path.as_deref(), Some(path.as_path()));
         assert!(review.contains("aa-doc-1457-1.pdf"));
         assert!(review.contains(&format!("SHA-256: {:x}", Sha256::digest(bytes))));
         let body = augmentagent_approval_discord::append_envelope_markers(
@@ -6410,19 +6551,9 @@ mod original_attachment_tests {
             Some(&review),
         );
         assert!(body.contains(&review));
-        request.assert_async().await;
-        upload.assert_async().await;
-        request.remove_async().await;
-        let reuse = server
-            .mock("POST", "/api/v3/files/upload/request")
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"key":"revision-key"}"#)
-            .create_async()
-            .await;
         std::fs::write(&path, b"corrected revision").unwrap();
         let (_, revised_review) = upload_attach_if_given(&client, Some(path)).await.unwrap();
         assert_ne!(Some(review), revised_review);
-        reuse.assert_async().await;
         assert!(
             upload_attach_if_given(&client, Some(dir.path().join("missing.pdf")))
                 .await
@@ -6624,6 +6755,31 @@ fn read_optional_body(
     }
 }
 
+/// #1579 — drop any line of a Gmail body that repeats internal prompt
+/// context (the #1060 notes hint, the wiki-hint preamble, a boundary tag).
+/// A body with no text left refuses the write — whether the scrub took it all
+/// or the body was blank to begin with, there is no message to send. The
+/// notice names the markers only: their text can carry the owner's own note
+/// titles, which is the material this guard exists to contain.
+fn body_without_internal_context(body: String) -> Result<String> {
+    let scrub = augmentagent_channel_core::outbound_scrub::scrub_internal_context(&body);
+    if !scrub.is_clean() {
+        eprintln!(
+            "note: dropped {} line(s) echoing internal context ({}) from the body (#1579)",
+            scrub.dropped_lines,
+            scrub.marker_summary()
+        );
+    }
+    if scrub.is_empty() {
+        let tail = if scrub.is_clean() { "" } else { " once its internal context was dropped" };
+        anyhow::bail!("the body has no message text to send{tail}");
+    }
+    if scrub.is_clean() {
+        return Ok(body);
+    }
+    Ok(scrub.body)
+}
+
 /// CLI adapter for [`body_without_leaked_subject`]: a body-level `Subject:`
 /// naming something other than `--subject` is a usage error, and one that
 /// merely repeats `--subject` is dropped with a note. `inbound` is the
@@ -6641,7 +6797,7 @@ fn body_for_gmail_write(body: String, subject: &str, inbound: Option<&str>) -> R
             if receipt {
                 eprintln!("note: checked and dropped the \"register:\" receipt line from the body (#994)");
             }
-            Ok(clean)
+            body_without_internal_context(clean)
         }
         Err(e) => anyhow::bail!("{e}; pass the intended subject as --subject"),
     }
@@ -8411,6 +8567,17 @@ fn auto_expire_days_from_env() -> Option<i64> {
 /// `AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS`; defaults to one
 /// hour. Clamped to a minimum of 1s so a fat-fingered `0` can't busy-loop
 /// the sweeper.
+/// `AUGMENTAGENT_GMAIL_POLL_SECS`, falling back to the channel default.
+/// Non-numeric or zero values fall back too — a typo must not turn the
+/// poller into a busy loop.
+fn default_gmail_poll_secs() -> u64 {
+    std::env::var("AUGMENTAGENT_GMAIL_POLL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(augmentagent_channel_email::DEFAULT_POLL_SECS)
+}
+
 fn auto_expire_interval_secs_from_env() -> u64 {
     std::env::var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS")
         .ok()
@@ -11852,9 +12019,10 @@ mod approval_body_tests {
 
     use super::strip_register_receipt;
     use super::{
-        body_without_leaked_subject, compose_card_identity, compose_pending_disposition,
-        revise_recipient, revise_subject, revised_subject, strip_approval_envelope_markers,
-        strip_leading_subject_line, subjects_agree, thread_for_revised_subject,
+        body_for_gmail_write, body_without_leaked_subject, compose_card_identity,
+        compose_pending_disposition, revise_recipient, revise_subject, revised_subject,
+        strip_approval_envelope_markers, strip_leading_subject_line,
+        subjects_agree, thread_for_revised_subject,
         thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
     };
 
@@ -12149,6 +12317,74 @@ mod approval_body_tests {
         assert!(
             body_without_leaked_subject("Subject: Hosting a PTE event\n", "Hosting a PTE event")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_body_echoing_the_notes_hint_loses_that_line_before_any_gmail_write() {
+        let hint = augmentagent_channel_core::prompt::notes_hint(&["Venue shortlist".into()]);
+        let clean = body_for_gmail_write(
+            format!("Hey Casey,\n\nThursday works.\n{hint}\n"),
+            "Re: Thursday's venue",
+            None,
+        )
+        .expect("the prose survives");
+        assert_eq!(clean, "Hey Casey,\n\nThursday works.\n");
+        assert!(!clean.contains("Venue shortlist"));
+    }
+
+    #[test]
+    fn a_body_that_is_nothing_but_internal_context_is_refused() {
+        let hint = augmentagent_channel_core::prompt::notes_hint(&["Venue shortlist".into()]);
+        let err = body_for_gmail_write(format!("{hint}\n"), "Re: Thursday's venue", None)
+            .expect_err("no message is left to send");
+        assert!(err.to_string().contains("internal context was dropped"), "{err}");
+        assert!(!err.to_string().contains("Venue shortlist"), "the refusal must not quote the dropped text: {err}");
+    }
+
+    #[test]
+    fn a_clean_body_passes_the_internal_context_gate_byte_identical() {
+        let body = "Hey Casey,\r\n\r\nThursday works.\r\n".to_string();
+        assert_eq!(
+            body_for_gmail_write(body.clone(), "Re: Thursday's venue", None).unwrap(),
+            body
+        );
+    }
+
+    /// #1579 discipline: the inventory of every Gmail draft write this binary
+    /// makes, each with the gate its enclosing fn reaches before writing. The
+    /// count assertion is what keeps the list exhaustive — a write path added
+    /// later fails here until it is gated and listed. The needles are built
+    /// with `concat!` so these literals are not themselves matched.
+    #[test]
+    fn internal_context_is_scrubbed_on_every_gmail_write_path() {
+        let src = include_str!("main.rs");
+        let reader_start = src.find("fn body_for_gmail_write(").expect("reader");
+        let reader = &src[reader_start..reader_start + src[reader_start..].find("\n}\n").expect("fn end")];
+        assert!(
+            reader.contains("body_without_internal_context("),
+            "body_for_gmail_write must carry the #1579 gate for its callers"
+        );
+
+        let create = concat!(".create_draft", "_with_attachment(");
+        let update = concat!(".update_draft", "_with_attachment(");
+        let paths = [
+            ("async fn run_gmail_compose(", "body_for_gmail_write("),
+            ("async fn run_gmail_update_draft(", "body_for_gmail_write("),
+            ("async fn run_gmail_send_now(", "body_for_gmail_write("),
+            (concat!("async fn ", "run_revise("), "scrub_internal_context(&redraft)"),
+        ];
+        for (f, gate) in paths {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let gate_at = body.find(gate).unwrap_or_else(|| panic!("{f}: no #1579 gate"));
+            let write = body.find(create).or_else(|| body.find(update)).expect("draft write");
+            assert!(gate_at < write, "{f}: the scrub must precede the draft write");
+        }
+        assert_eq!(
+            src.matches(create).count() + src.matches(update).count(),
+            paths.len(),
+            "a Gmail draft write path was added: gate it for #1579 and list it here"
         );
     }
 
@@ -13946,6 +14182,11 @@ impl ApprovalActionHandler for ReplyApprover {
         self.audited(action_id, "recompose", self.run_recompose(action_id)).await
     }
 
+    async fn calendar_decline(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.audited(action_id, "calendar_decline", self.run_calendar_decline(action_id))
+            .await
+    }
+
     async fn is_schedule_live(&self, action_id: &str) -> bool {
         match self.handle_load(action_id) {
             Some(a) => matches!(a.action.status.as_str(), "scheduled" | "sending"),
@@ -14045,6 +14286,9 @@ impl ReplyApprover {
         }
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.approve_socialapi(action_id, action).await;
+        }
+        if action.email.platform == "gcal" && action.email.kind == calendar_rsvp::RSVP_CARD_KIND {
+            return self.approve_gcal_rsvp(action_id, action).await;
         }
         if action.email.platform == "gcal" {
             return self.approve_gcal(action_id, action).await;
@@ -14286,10 +14530,8 @@ impl ReplyApprover {
                 let html_link =
                     Self::calendar_account_link(created.html_link.as_deref(), &action.email.from);
                 let link = html_link.clone().unwrap_or_else(|| event_id.clone());
-                let final_body = format!(
-                    "{}\ncreated: {link}\nevent ID: {event_id}",
-                    action.action.draft_body.clone().unwrap_or_default()
-                );
+                let base_body = action.action.draft_body.clone().unwrap_or_default();
+                let final_body = format!("{base_body}\ncreated: {link}\nevent ID: {event_id}");
                 if let Err(e) = self.store.update_action_status(
                     action_id,
                     ActionStatus::Sent,
@@ -14299,6 +14541,34 @@ impl ReplyApprover {
                     return ApprovalActionOutcome::Failed {
                         message: format!("calendar event {event_id} was created, but recording its receipt failed: {e}; check the calendar before retrying"),
                     };
+                }
+                // #1456 — creating is an implicit accept; never leave the
+                // organizer's own entry at needsAction. Runs only after the
+                // receipt is saved (the event exists either way), and its
+                // note goes BEFORE the terminal `created:`/`event ID:` lines
+                // recover_calendar_receipt parses.
+                let organizer_check = if draft.attendees.is_empty() {
+                    Ok(false) // no guest list ⇒ no attendee entry to answer
+                } else {
+                    augmentagent_channel_calendar::ensure_organizer_accepted(
+                        self.calendar.as_ref(),
+                        entity_id,
+                        "primary",
+                        &created,
+                    )
+                    .await
+                };
+                let organizer_note = match organizer_check {
+                    Ok(true) => "\norganizer RSVP: set to accepted",
+                    Ok(false) => "",
+                    Err(e) => {
+                        tracing::warn!(action_id, event_id, "organizer self-accept failed: {e}");
+                        "\norganizer RSVP: still needs action (self-accept failed)"
+                    }
+                };
+                if !organizer_note.is_empty() {
+                    let noted = format!("{base_body}{organizer_note}\ncreated: {link}\nevent ID: {event_id}");
+                    let _ = self.store.update_action_status(action_id, ActionStatus::Sent, Some(&noted), None);
                 }
                 let _ = self
                     .store
@@ -14669,6 +14939,44 @@ impl ReplyApprover {
                     message: format!("redraft carries its own subject line: {message}"),
                 };
             }
+        };
+        // #1579 — the redraft runs the same prompt as the first draft, so it
+        // can echo the internal context that prompt carries. Scrub before
+        // anything persists or sends it; a redraft with no text left — all
+        // context, or blank to begin with — goes to Error like the dispatch
+        // path's, rather than sitting on a card the owner could still approve.
+        let redraft = {
+            let scrub = augmentagent_channel_core::outbound_scrub::scrub_internal_context(&redraft);
+            if !scrub.is_clean() {
+                tracing::warn!(
+                    action_id,
+                    markers = %scrub.marker_summary(),
+                    dropped_lines = scrub.dropped_lines,
+                    "revise: redraft echoed internal prompt context; dropped those lines"
+                );
+            }
+            if scrub.is_empty() {
+                let message = "redraft had no sendable text";
+                // The row must not stay pending with a body the owner could
+                // still approve, so a failed status write is surfaced rather
+                // than swallowed: the outcome then says the action is still
+                // sitting there, which is the only honest report.
+                if let Err(e) = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(message),
+                ) {
+                    tracing::error!(action_id, "revise: could not fail the action: {e:#}");
+                    return ApprovalActionOutcome::Failed {
+                        message: format!("{message}, and it is still pending: {e}"),
+                    };
+                }
+                return ApprovalActionOutcome::Failed {
+                    message: message.into(),
+                };
+            }
+            scrub.body
         };
         let split = |v: &Option<String>| -> Vec<String> {
             v.as_deref()
@@ -16632,25 +16940,129 @@ fn high_confidence_merge_candidates(wiki_dir: &Path) -> Result<Vec<(String, Stri
 /// #927 — a first pass over a 1,300-page wiki must not bury the channel.
 const MAX_MERGE_CARDS_PER_SCAN: usize = 5;
 
+/// What one merge scan did: cards raised for the owner, and (auto mode only)
+/// the merges it applied itself, as `Stub → Target` lines.
+#[derive(Debug, Default)]
+struct MergeScan {
+    raised: usize,
+    merged: Vec<String>,
+}
+
+/// `AUGMENTAGENT_AUTO_MERGE_CONTACTS=true` — apply high-confidence merges
+/// without a card. Off by default: the card flow (#927) stays the baseline.
+fn auto_merge_contacts_enabled() -> bool {
+    std::env::var("AUGMENTAGENT_AUTO_MERGE_CONTACTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// A survivor named after a bare phone number (`15555550100`) would swallow
+/// the stub's better name, so that direction still goes to a human as a card.
+fn auto_merge_eligible(into: &str) -> bool {
+    !into.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// The digest lists at most this many merges; the rest are counted.
+const MAX_AUTO_MERGE_DIGEST_LINES: usize = 25;
+
 /// #927 — the unattended path, run after every iMessage poll (and by `person
 /// propose-merges`): suggest, then raise a card each. One bad pair must not
-/// swallow the scan.
+/// swallow the scan. With `auto`, eligible pairs are merged on the spot and
+/// summarised in ONE digest instead of a card each.
+async fn run_merge_scan(
+    wiki_dir: &Path,
+    store: &Store,
+    broker: &dyn ApprovalBroker,
+    auto: bool,
+) -> Result<MergeScan> {
+    let mut scan = MergeScan::default();
+    for (stub, canonical) in high_confidence_merge_candidates(wiki_dir)? {
+        if auto && auto_merge_eligible(&canonical) {
+            match auto_apply_identity_merge(wiki_dir, store, &stub, &canonical) {
+                Ok(Some(r)) => scan.merged.push(format!("{} → {}", r.stub_title, r.target_title)),
+                Ok(None) => {}
+                Err(e) => warn!(stub, canonical, "identity auto-merge failed: {e:#}"),
+            }
+            continue;
+        }
+        if scan.raised >= MAX_MERGE_CARDS_PER_SCAN {
+            continue;
+        }
+        match propose_identity_merge(wiki_dir, store, broker, &stub, &canonical).await {
+            Ok(posted) => scan.raised += usize::from(posted),
+            Err(e) => warn!(stub, canonical, "identity-merge proposal failed: {e:#}"),
+        }
+    }
+    if !scan.merged.is_empty() {
+        let mut body: Vec<String> = scan
+            .merged
+            .iter()
+            .take(MAX_AUTO_MERGE_DIGEST_LINES)
+            .map(|l| format!("• {l}"))
+            .collect();
+        if scan.merged.len() > MAX_AUTO_MERGE_DIGEST_LINES {
+            body.push(format!("…and {} more", scan.merged.len() - MAX_AUTO_MERGE_DIGEST_LINES));
+        }
+        body.push("Undo requires restoring the original wiki pages and the affected identity_phone database mappings from a pre-merge backup. There is no built-in auto-merge undo; restoring wiki files alone is insufficient.".into());
+        let title = format!("Contacts auto-merged ({})", scan.merged.len());
+        if let Err(e) = broker.post_digest(&title, &body.join("\n")).await {
+            warn!("post identity auto-merge digest: {e}");
+        }
+    }
+    Ok(scan)
+}
+
+/// The card path alone — what the daemon did before auto mode existed.
+#[cfg(test)]
 async fn propose_high_confidence_merges(
     wiki_dir: &Path,
     store: &Store,
     broker: &dyn ApprovalBroker,
 ) -> Result<usize> {
-    let mut raised = 0;
-    for (stub, canonical) in high_confidence_merge_candidates(wiki_dir)? {
-        if raised >= MAX_MERGE_CARDS_PER_SCAN {
-            break;
+    Ok(run_merge_scan(wiki_dir, store, broker, false).await?.raised)
+}
+
+/// Auto mode: merge one pair without asking, leaving the same `merge:` row a
+/// card would have (settled `sent`, source `auto`) so it is never re-raised.
+/// A pair the owner already decided is left alone; a card still pending is
+/// claimed exactly as an Approve click would, so a later click is a no-op.
+/// `None` when there was nothing to do.
+fn auto_apply_identity_merge(
+    wiki_dir: &Path,
+    store: &Store,
+    from: &str,
+    into: &str,
+) -> Result<Option<PersonMergeReport>> {
+    let message_id = format!("merge:{from}->{into}");
+    let prior = store.latest_action_for_message(&message_id)?;
+    let action_id = match prior {
+        Some((_, status, _)) if matches!(status.as_str(), "sent" | "rejected") => return Ok(None),
+        Some((id, status, _)) if status == "pending" => id,
+        _ => {
+            let report = execute_person_merge(Some(wiki_dir), store, from, into, false)?;
+            let (inbound, payload, draft) = build_identity_merge_card(&report);
+            record_identity_merge_proposal(store, &inbound, &payload, &draft)?
         }
-        match propose_identity_merge(wiki_dir, store, broker, &stub, &canonical).await {
-            Ok(posted) => raised += usize::from(posted),
-            Err(e) => warn!(stub, canonical, "identity-merge proposal failed: {e:#}"),
+    };
+    if !store.claim_action_for_send(&action_id, ActionStatus::Pending, "auto")? {
+        return Ok(None);
+    }
+    match execute_person_merge(Some(wiki_dir), store, from, into, true) {
+        Ok(report) => {
+            let summary = format!(
+                "auto-merged {} into {} (phone rows repointed: {})",
+                report.from, report.into, report.phone_rows_repointed,
+            );
+            store.update_action_status(&action_id, ActionStatus::Sent, Some(&summary), None)?;
+            info!(action_id, from, into, "identity auto-merged");
+            Ok(Some(report))
+        }
+        Err(e) => {
+            let msg = format!("auto-merge: {e:#}");
+            let _ = store.update_action_status(&action_id, ActionStatus::Error, None, Some(&msg));
+            Err(e)
         }
     }
-    Ok(raised)
 }
 
 /// #927 — raise one suggested merge as a card; `false` when the pair is already
@@ -16938,7 +17350,8 @@ async fn imessage_poll_loop(
         }
         // #927 — the stubs this sync leaves ARE what the merge scan proposes.
         if let Some(root) = &wiki_root {
-            if let Err(e) = propose_high_confidence_merges(root, &store, broker.as_ref()).await {
+            let auto = auto_merge_contacts_enabled();
+            if let Err(e) = run_merge_scan(root, &store, broker.as_ref(), auto).await {
                 warn!("identity-merge scan failed: {e:#}");
             }
         }
@@ -19878,6 +20291,8 @@ async fn run_calendar_poll_once(
     let api_key =
         std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gcal = Arc::new(ComposioCalendarClient::new(api_key));
+    let rsvp_api = Arc::clone(&gcal);
+    let rsvp_store = Arc::clone(&store);
     let reasoner = build_reasoner();
 
     // Wiki schema path defaults next to wiki_dir, mirroring gmail's wiring.
@@ -19917,8 +20332,18 @@ async fn run_calendar_poll_once(
         Some(sink) => channel = channel.with_alert_sink(sink),
         None => info!("calendar alerts: no notification surface is configured (Discord bot channel or Slack app); alert delivery disabled"),
     }
-    let outcome = channel.poll_once().await?;
-    println!("{:#?}", outcome);
+    let ingest = channel.poll_once().await;
+    if let Ok(outcome) = &ingest {
+        println!("{:#?}", outcome);
+    }
+    // #1224 — answer pending invites on auto-accept accounts. Isolated from
+    // the ingest result: a failure here is logged, never fails the poll.
+    let surface = calendar_rsvp::NoticeSurface::from_env();
+    match calendar_rsvp::auto_accept_pass(&rsvp_store, rsvp_api.as_ref(), &surface, dry_run).await {
+        Ok(report) => println!("{report:#?}"),
+        Err(e) => warn!("calendar auto-accept pass failed: {e:#}"),
+    }
+    ingest?;
     Ok(())
 }
 
@@ -20040,6 +20465,14 @@ async fn run_calendar_list_events(
         }
     }
 
+    // The owner's response, unless they organize it (organizers don't RSVP).
+    let my_response = |p: &MeetingPayload| -> Option<String> {
+        let me = p.attendees.iter().find(|a| a.is_self)?;
+        if me.is_organizer {
+            return None;
+        }
+        Some(me.response_status.clone().unwrap_or_else(|| "needsAction".into()))
+    };
     let attendee_line = |p: &MeetingPayload| -> String {
         let others: Vec<String> = p
             .attendees
@@ -20079,6 +20512,9 @@ async fn run_calendar_list_events(
                             "is_self": at.is_self,
                         })).collect::<Vec<_>>(),
                         "organizer_email": p.organizer_email,
+                        // #1224 — the owner's own answer; "needsAction" =
+                        // unanswered invite (`calendar rsvp` answers it).
+                        "my_response": my_response(p),
                         "conference_kind": p.conference_kind,
                         "virtual_meeting": p.virtual_meeting,
                         "recurring_event_id": p.recurring_event_id,
@@ -20135,14 +20571,21 @@ async fn run_calendar_list_events(
                         .as_deref()
                         .map(|k| format!(" [{k}]"))
                         .unwrap_or_default();
+                    let reply = match my_response(p).as_deref() {
+                        Some("needsAction") => " [invite: not answered]",
+                        Some("tentative") => " [you: maybe]",
+                        Some("declined") => " [you: declined]",
+                        _ => "",
+                    };
                     println!(
-                        "  - {} {}–{}  {}{}{}",
+                        "  - {} {}–{}  {}{}{}{}",
                         local_start.format("%a %Y-%m-%d"),
                         local_start.format("%H:%M"),
                         p.end.with_timezone(&Local).format("%H:%M"),
                         p.summary,
                         attendee_line(p),
-                        conf
+                        conf,
+                        reply
                     );
                 }
             }
@@ -22642,6 +23085,7 @@ mod identity_merge_tests {
     #[derive(Default)]
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<(String, String)>>,
+        digests: std::sync::Mutex<Vec<(String, String)>>,
         dead: bool,
     }
 
@@ -22657,6 +23101,11 @@ mod identity_merge_tests {
         }
 
         async fn post_flag_notice(&self, _e: &Email, _r: &str) -> Result<(), ApprovalError> {
+            Ok(())
+        }
+
+        async fn post_digest(&self, title: &str, body: &str) -> Result<(), ApprovalError> {
+            self.digests.lock().unwrap().push((title.to_string(), body.to_string()));
             Ok(())
         }
     }
@@ -22799,6 +23248,55 @@ mod identity_merge_tests {
         let row = store.lookup_person_by_phone(PHONE).unwrap().unwrap();
         assert_eq!(row.person_slug, TARGET, "future syncs hit the survivor");
         assert!(matches!(click(), ApprovalActionOutcome::AlreadyResolved { .. }));
+    }
+
+    /// Auto mode merges the pair with no card, says so in ONE digest, leaves a
+    /// settled row (so the next scan is a no-op), and claims a card that was
+    /// already up so a late Approve click cannot run it twice.
+    #[tokio::test]
+    async fn auto_mode_merges_without_a_card_and_posts_one_digest() {
+        let (store, _t, wiki) = seeded_env();
+        let stub = wiki.join("people").join(format!("{STUB}.md"));
+        let discord = RecordingBroker::default();
+        // A card raised before auto mode was switched on.
+        assert_eq!(run_merge_scan(&wiki, &store, &discord, false).await.unwrap().raised, 1);
+        let (card_id, _) = discord.posts.lock().unwrap().remove(0);
+
+        let scan = run_merge_scan(&wiki, &store, &discord, true).await.unwrap();
+        assert_eq!((scan.raised, scan.merged.len()), (0, 1));
+        assert!(discord.posts.lock().unwrap().is_empty(), "no card in auto mode");
+        assert!(!stub.exists(), "the merge ran");
+        let digests = discord.digests.lock().unwrap().clone();
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].0, "Contacts auto-merged (1)");
+        assert!(digests[0].1.contains("no built-in auto-merge undo"));
+        assert!(digests[0].1.contains("• Landlord Philly → Centra Associates"), "{digests:?}");
+        let row = store.get_action_with_email(&card_id).unwrap().unwrap();
+        assert_eq!(row.action.status, "sent", "the pending card was claimed");
+        let late_click = ReplyApprover::approve_identity_merge(&store, Some(&wiki), &card_id, row);
+        assert!(matches!(late_click, ApprovalActionOutcome::AlreadyResolved { .. }));
+
+        let again = run_merge_scan(&wiki, &store, &discord, true).await.unwrap();
+        assert_eq!((again.raised, again.merged.len()), (0, 0));
+        assert_eq!(discord.digests.lock().unwrap().len(), 1, "no empty digest");
+    }
+
+    /// A pair the owner rejected stays rejected, and a survivor named after a
+    /// bare phone number still goes to a human as a card.
+    #[tokio::test]
+    async fn auto_mode_respects_a_rejection_and_cards_phone_named_targets() {
+        let (store, _t, wiki) = seeded_env();
+        let discord = RecordingBroker::default();
+        run_merge_scan(&wiki, &store, &discord, false).await.unwrap();
+        let (card_id, _) = discord.posts.lock().unwrap().remove(0);
+        store.update_action_status(&card_id, ActionStatus::Rejected, None, None).unwrap();
+        let scan = run_merge_scan(&wiki, &store, &discord, true).await.unwrap();
+        assert_eq!((scan.raised, scan.merged.len()), (0, 0));
+        assert!(wiki.join("people").join(format!("{STUB}.md")).exists());
+
+        assert!(auto_merge_eligible("centra-associates"));
+        assert!(!auto_merge_eligible("15555550100"));
+        assert!(!auto_merge_eligible("1-555-555-0100"));
     }
 
     /// #968 — Discord hands `email.body` half of the embed's ~3.8K description,

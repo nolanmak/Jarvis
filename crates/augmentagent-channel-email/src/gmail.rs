@@ -22,6 +22,9 @@ pub enum GmailError {
     Http(#[from] reqwest::Error),
     #[error("composio: {message}")]
     Composio { message: String },
+    /// A Gmail REST / Google OAuth failure on the direct client (#1573).
+    #[error("google: {message}")]
+    Google { message: String },
     #[error("decode: {0}")]
     Decode(String),
     #[error("invalid input: {0}")]
@@ -38,6 +41,25 @@ pub enum GmailError {
 pub trait GmailApi: Send + Sync {
     /// Fetch unread emails for an entity. Returns up to `limit` messages.
     async fn fetch_unread(&self, entity_id: &str, limit: u32) -> Result<Vec<Email>, GmailError>;
+
+    /// Fetch unread emails that arrived at or after `since_ms` (epoch ms,
+    /// `None` = no lower bound). This is the poller's entry point: with a
+    /// cursor it only pages through mail newer than the previous successful
+    /// tick, so a mailbox carrying hundreds of old unread messages no longer
+    /// costs the full `limit / PAGE_SIZE` fetch calls every cycle.
+    ///
+    /// Default impl ignores the cursor and delegates to [`fetch_unread`] so
+    /// test fakes keep compiling; `ComposioClient` overrides it with an
+    /// `is:unread after:<epoch secs>` query (see [`unread_query`]).
+    async fn fetch_unread_since(
+        &self,
+        entity_id: &str,
+        since_ms: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        let _ = since_ms;
+        self.fetch_unread(entity_id, limit).await
+    }
 
     /// Fetch emails matching a Gmail search query (e.g. `from:jeremy@acme.example.com`,
     /// `subject:deadline after:2026/04/01`). Returns up to `limit` messages.
@@ -177,6 +199,12 @@ pub struct ComposioClient {
     api_key: String,
     rate_limit_store: Option<Arc<augmentagent_store::Store>>,
     call_origin: &'static str,
+    /// #1573 — the direct Google client, built on first use from
+    /// `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET`. Every method
+    /// on this type routes `google:<address>` entities here and leaves
+    /// Composio entities on the Composio path, so callers keep one client
+    /// type while mailboxes migrate one reconnect at a time.
+    google: std::sync::OnceLock<Result<Arc<crate::google::GoogleGmail>, String>>,
 }
 
 impl ComposioClient {
@@ -187,7 +215,37 @@ impl ComposioClient {
             api_key,
             rate_limit_store: None,
             call_origin: "unknown",
+            google: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Serve Google-connected entities through `google` instead of building
+    /// one from the environment (tests, or an embedding that already holds
+    /// a client).
+    pub fn with_google(self, google: Arc<crate::google::GoogleGmail>) -> Self {
+        let _ = self.google.set(Ok(google));
+        self
+    }
+
+    /// The direct client for `entity_id`, when it is a Google-connected
+    /// mailbox: `None` for a Composio entity, `Some(Err)` when the entity is
+    /// Google's but the operator's OAuth client is not configured.
+    fn google_route(
+        &self,
+        entity_id: &str,
+    ) -> Option<Result<(Arc<crate::google::GoogleGmail>, String), GmailError>> {
+        let email = crate::google::email_of(entity_id)?;
+        let built = self.google.get_or_init(|| {
+            crate::google::GoogleGmail::from_env()
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        });
+        Some(match built {
+            Ok(g) => Ok((Arc::clone(g), email.to_string())),
+            Err(msg) => Err(GmailError::Invalid(format!(
+                "{entity_id} is a Google-connected mailbox but the direct client is unavailable: {msg}"
+            ))),
+        })
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
@@ -262,7 +320,29 @@ impl ComposioClient {
                                     attempt: attempt as i64,
                                 });
                                 if action == "GMAIL_FETCH_EMAILS" {
+                                    // The background poller backs off through
+                                    // the persisted cooldown (the next call is
+                                    // short-circuited by reject_if_cooling_down),
+                                    // so a fetch throttle surfaces at once rather
+                                    // than being retried in-loop here.
                                     self.record_cooldown(entity_id, *retry_after_ms, Some(log_id))?;
+                                } else if attempt < MAX_ATTEMPTS {
+                                    // #1486 — Composio reports an upstream Gmail
+                                    // throttle as an HTTP 200 envelope with
+                                    // `successful:false`, so the write/profile
+                                    // paths never reached the HTTP-429 backoff
+                                    // below and failed on the first refusal.
+                                    // Treat an envelope throttle like a 429: back
+                                    // off and retry so a transient spike doesn't
+                                    // lose a compose. If every attempt is refused
+                                    // the parsed retry_after still rides the final
+                                    // error, so the caller learns when to retry.
+                                    tracing::warn!(
+                                        action, attempt, retry_after = %retry_after,
+                                        "composio envelope rate limit; backing off"
+                                    );
+                                    backoff(attempt).await;
+                                    continue;
                                 }
                             }
                             Ok(_) if action == "GMAIL_FETCH_EMAILS" => {
@@ -372,6 +452,10 @@ impl ComposioClient {
     /// lands at `data.response_data.emailAddress`; `find_string_field` walks
     /// to it regardless of the exact nesting.
     pub async fn get_profile_email(&self, entity_id: &str) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.profile_email(&email).await;
+        }
         let v = self
             .execute("GMAIL_GET_PROFILE", entity_id, serde_json::json!({}))
             .await?;
@@ -406,6 +490,10 @@ impl ComposioClient {
         entity_id: &str,
         message_id: &str,
     ) -> Result<Vec<AttachmentMeta>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.list_attachments(&email, message_id).await;
+        }
         // No inline `user_id` (see resolve_thread_id): account routing is the
         // execute() envelope's job.
         let args = serde_json::json!({
@@ -436,6 +524,33 @@ impl ComposioClient {
         });
         let v = self.execute("GMAIL_GET_ATTACHMENT", entity_id, args).await?;
         parse_attachment_file(&v)
+    }
+
+    /// The bytes of one attachment plus the MIME type the provider reported,
+    /// whichever transport the mailbox is on: Composio stages the file and
+    /// hands back a presigned URL to download; Google returns the bytes
+    /// inline from `messages.attachments.get` (#1573). `file_name` is only
+    /// needed by Composio, which names the staged object after it.
+    pub async fn fetch_attachment_bytes(
+        &self,
+        entity_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        file_name: &str,
+    ) -> Result<(Vec<u8>, Option<String>), GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            let bytes = g.attachment_bytes(&email, message_id, attachment_id).await?;
+            return Ok((bytes, None));
+        }
+        let file = self
+            .get_attachment_file(entity_id, message_id, attachment_id, file_name)
+            .await?;
+        let (bytes, content_type) = self.download_url(&file.s3url).await?;
+        let mime = Some(file.mimetype)
+            .filter(|m| !m.trim().is_empty())
+            .or(content_type);
+        Ok((bytes, mime))
     }
 
     /// GET a presigned URL (no Composio auth header — the signature IS the
@@ -471,6 +586,10 @@ impl ComposioClient {
         entity_id: &str,
         id: &str,
     ) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.resolve_thread_id(&email, id).await;
+        }
         // NOTE: no inline `user_id` in the arguments. The Gmail tools forward
         // it as the Gmail API `users/<user_id>/…` path segment, where only
         // 'me' or an email address is valid — a Composio entity id 403s with
@@ -510,6 +629,10 @@ impl ComposioClient {
         entity_id: &str,
         draft_id: &str,
     ) -> Result<Option<String>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.draft_thread_id(&email, draft_id).await;
+        }
         const MAX_PAGES: u32 = 5;
         let mut page_token: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -571,27 +694,50 @@ impl ComposioClient {
         tool_slug: &str,
         path: &std::path::Path,
     ) -> Result<Attachment, GmailError> {
-        let bytes = std::fs::read(path).map_err(|e| {
+        // Validate the file now (the operator gets the error before any
+        // draft exists) but defer the Composio upload to draft time, when the
+        // target mailbox — and therefore the transport — is known (#1573).
+        let meta = std::fs::metadata(path).map_err(|e| {
             GmailError::Decode(format!("read attachment {}: {e}", path.display()))
         })?;
+        if !meta.is_file() {
+            return Err(GmailError::Invalid(format!(
+                "attachment {} is not a regular file",
+                path.display()
+            )));
+        }
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("attachment")
             .to_string();
-        self.upload_attachment_bytes(tool_slug, &name, bytes).await
+        let mimetype = guess_mimetype(&name).to_string();
+        Ok(Attachment {
+            name,
+            mimetype,
+            s3key: String::new(),
+            path: Some(path.to_path_buf()),
+            tool_slug: tool_slug.to_string(),
+        })
     }
 
-    /// Upload the exact snapshot used by the caller's attachment review details.
-    pub async fn upload_attachment_bytes(
-        &self,
-        tool_slug: &str,
-        name: &str,
-        bytes: Vec<u8>,
-    ) -> Result<Attachment, GmailError> {
+    /// Composio-path half of the attachment flow: upload the file behind
+    /// `att` into Composio's object store unless that already happened.
+    async fn ensure_uploaded(&self, att: &Attachment) -> Result<Attachment, GmailError> {
         use md5::{Digest, Md5};
-        let name = name.to_string();
-        let mimetype = guess_mimetype(&name).to_string();
+
+        if !att.s3key.is_empty() {
+            return Ok(att.clone());
+        }
+        let path = att.path.as_deref().ok_or_else(|| {
+            GmailError::Invalid(format!("attachment {} has neither an upload key nor a source path", att.name))
+        })?;
+        let tool_slug = att.tool_slug.as_str();
+        let bytes = std::fs::read(path).map_err(|e| {
+            GmailError::Decode(format!("read attachment {}: {e}", path.display()))
+        })?;
+        let name = att.name.clone();
+        let mimetype = att.mimetype.clone();
         let md5_hex = format!("{:x}", Md5::digest(&bytes));
 
         let url = format!("{}/api/v3/files/upload/request", self.base_url);
@@ -648,6 +794,8 @@ impl ComposioClient {
             name,
             mimetype,
             s3key: key,
+            path: att.path.clone(),
+            tool_slug: att.tool_slug.clone(),
         })
     }
 
@@ -674,6 +822,27 @@ impl ComposioClient {
         cc: &[String],
         bcc: &[String],
     ) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            let local = match attachment {
+                Some(att) => Some(local_attachment(att)?),
+                None => None,
+            };
+            return g
+                .create_draft(
+                    &email,
+                    crate::google::DraftSpec {
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        body,
+                        thread_id,
+                        attachment: local.as_ref(),
+                    },
+                )
+                .await;
+        }
         let recipients = split_recipients(to);
         let (first, rest) = recipients
             .split_first()
@@ -698,6 +867,7 @@ impl ComposioClient {
             args["thread_id"] = serde_json::Value::String(t.to_string());
         }
         if let Some(att) = attachment {
+            let att = self.ensure_uploaded(att).await?;
             args["attachment"] = serde_json::json!({
                 "name": att.name,
                 "mimetype": att.mimetype,
@@ -731,6 +901,28 @@ impl ComposioClient {
         cc: &[String],
         bcc: &[String],
     ) -> Result<String, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            let local = match attachment {
+                Some(att) => Some(local_attachment(att)?),
+                None => None,
+            };
+            return g
+                .update_draft(
+                    &email,
+                    draft_id,
+                    crate::google::DraftSpec {
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        body,
+                        thread_id,
+                        attachment: local.as_ref(),
+                    },
+                )
+                .await;
+        }
         let new_id = self
             .create_draft_with_attachment(
                 entity_id, to, subject, body, thread_id, attachment, cc, bcc,
@@ -863,6 +1055,26 @@ impl ComposioClient {
     }
 }
 
+/// Slack subtracted from the inbound cursor before it becomes a Gmail
+/// `after:` bound. Gmail matches `after:` against the message's internal
+/// date, which can trail our wall-clock by delivery latency, and the cursor
+/// itself is stamped *after* the fetch returns; an hour covers both with
+/// margin while keeping each tick's page count proportional to one hour of
+/// mail rather than the whole unread backlog.
+pub(crate) const UNREAD_CURSOR_SLACK_MS: i64 = 60 * 60 * 1000;
+
+/// Build the inbound poll query. `after:` accepts epoch *seconds*, which is
+/// second-granular (unlike the `YYYY/MM/DD` form the sent-mail observer uses).
+pub(crate) fn unread_query(since_ms: Option<i64>) -> String {
+    match since_ms {
+        Some(ms) => {
+            let secs = (ms - UNREAD_CURSOR_SLACK_MS).max(0) / 1000;
+            format!("is:unread after:{secs}")
+        }
+        None => "is:unread".to_string(),
+    }
+}
+
 fn is_transient_reqwest(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
 }
@@ -873,7 +1085,29 @@ fn is_transient_reqwest(e: &reqwest::Error) -> bool {
 pub struct Attachment {
     pub name: String,
     pub mimetype: String,
+    /// Composio object key. Empty until [`ComposioClient::ensure_uploaded`]
+    /// runs — the upload is deferred to draft time so a Google-connected
+    /// mailbox (#1573), which sends the bytes inline, never touches
+    /// Composio's object store.
     pub s3key: String,
+    /// Local source file, read at draft time.
+    pub path: Option<std::path::PathBuf>,
+    /// Composio tool the upload is bound to (`GMAIL_CREATE_EMAIL_DRAFT`).
+    pub tool_slug: String,
+}
+
+/// The inline form of a staged attachment for the direct Google client.
+fn local_attachment(att: &Attachment) -> Result<crate::google::LocalAttachment, GmailError> {
+    let path = att.path.as_deref().ok_or_else(|| {
+        GmailError::Invalid(format!(
+            "attachment {} was staged for Composio only and has no local source to send through Google",
+            att.name
+        ))
+    })?;
+    let mut local = crate::google::LocalAttachment::read(path)?;
+    local.name = att.name.clone();
+    local.mimetype = att.mimetype.clone();
+    Ok(local)
 }
 
 /// Best-effort mimetype from the filename extension. Composio requires one
@@ -1122,6 +1356,17 @@ mod tests {
     }
 
     #[test]
+    fn unread_query_bounds_by_cursor_with_slack() {
+        assert_eq!(unread_query(None), "is:unread");
+        // 2026-10-24T14:00:00Z = 1_792_850_400_000 ms; minus one hour of
+        // slack and converted to whole seconds.
+        let q = unread_query(Some(1_792_850_400_000));
+        assert_eq!(q, "is:unread after:1792846800");
+        // A cursor inside the slack window clamps at the epoch, never negative.
+        assert_eq!(unread_query(Some(1_000)), "is:unread after:0");
+    }
+
+    #[test]
     fn parses_composio_rate_limit_retry_timestamp() {
         assert_eq!(
             parse_rate_limit_retry_after(
@@ -1130,6 +1375,134 @@ mod tests {
             Some((4_070_908_800_000, "2099-01-01T00:00:00Z".to_string()))
         );
         assert!(parse_rate_limit_retry_after("invalid credentials").is_none());
+    }
+
+    // ---- #1486: throttle classification is action-agnostic ----
+
+    #[test]
+    fn rate_limit_classifier_matches_throttles_and_spares_other_errors() {
+        // The draft path's live symptom, plus the wordings Gmail/Composio use.
+        for throttle in [
+            "Failed to fetch user profile: 429",
+            "User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z",
+            "rateLimitExceeded",
+            "userRateLimitExceeded",
+            "Quota exceeded for quota metric 'Queries'",
+            "429 Too Many Requests",
+        ] {
+            assert!(looks_like_rate_limit(throttle), "should be a throttle: {throttle:?}");
+        }
+        // Auth / not-found / validation envelopes must NOT read as throttles,
+        // or they'd be retried and mislabelled (#164, delete/send tests).
+        for other in [
+            "Requested entity was not found.",
+            "Invalid delete request",
+            "Invalid API key: ak_637S7*",
+            "internal error 14295",
+            "draft 4290 not found",
+        ] {
+            assert!(!looks_like_rate_limit(other), "should NOT be a throttle: {other:?}");
+        }
+    }
+
+    #[test]
+    fn mentions_status_429_requires_a_standalone_token() {
+        assert!(mentions_status_429("profile: 429"));
+        assert!(mentions_status_429("429"));
+        assert!(mentions_status_429("(429)"));
+        // Embedded in a longer number — not a status code.
+        assert!(!mentions_status_429("14295"));
+        assert!(!mentions_status_429("4290"));
+        assert!(!mentions_status_429("no code here"));
+    }
+
+    #[test]
+    fn parse_rate_limit_retry_after_reads_delta_seconds() {
+        let before = wallclock_ms();
+        let (ms, raw) = parse_rate_limit_retry_after("rate limit exceeded, retry after 30")
+            .expect("a bare delta-seconds boundary must parse");
+        let after = wallclock_ms();
+        assert_eq!(raw, "30");
+        assert!(
+            (before + 30_000..=after + 30_000).contains(&ms),
+            "delta-seconds boundary off: {ms} not in [{}, {}]",
+            before + 30_000,
+            after + 30_000
+        );
+    }
+
+    #[test]
+    fn retry_after_overflow_is_ignored() {
+        assert!(parse_rate_limit_retry_after("retry after 9223372036854775807").is_none());
+    }
+
+    // The draft-creation path is exactly what #1486 is about: Composio returns
+    // the upstream throttle in an HTTP 200 `successful:false` envelope, which
+    // never reached the HTTP-429 backoff. A transient throttle must now be
+    // retried, not lost on the first refusal.
+    #[tokio::test]
+    async fn create_draft_retries_envelope_throttle_then_succeeds() {
+        let throttle = r#"{"successful":false,"error":"Failed to fetch user profile: 429","log_id":"lg1"}"#;
+        let success = r#"{"successful":true,"data":{"response_data":{"id":"r-draft-1"}}}"#;
+        let addr = spawn_sequence_http(vec![(200, throttle), (200, success)]).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let id = client
+            .create_draft("entity-x", "to@example.com", "subj", "body", None)
+            .await
+            .expect("an envelope throttle must be retried, not surfaced on the first refusal");
+        assert_eq!(id, "r-draft-1");
+    }
+
+    // The asymmetry the issue calls out: the search path reports a retry-after,
+    // the draft path did not. A persistent throttle on the draft path must now
+    // surface the SAME typed RateLimited carrying the provider's boundary.
+    #[tokio::test]
+    async fn create_draft_surfaces_retry_after_from_envelope_like_search() {
+        let body = r#"{"successful":false,"error":"User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z","log_id":"lg2"}"#;
+        let addr = spawn_repeating_http(200, body, "").await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let err = client
+            .create_draft("entity-x", "to@example.com", "subj", "body", None)
+            .await
+            .expect_err("a persistent throttle must surface after the retries");
+        assert!(
+            matches!(&err, GmailError::RateLimited { retry_after_ms, .. } if *retry_after_ms == 4_070_908_800_000),
+            "draft path must raise RateLimited with the provider boundary, got: {err}"
+        );
+        let display = format!("{err}");
+        assert!(
+            display.contains("2099-01-01T00:00:00Z"),
+            "the retry-after must ride the draft-path error the way the search path's does: {display}"
+        );
+    }
+
+    // The exact live symptom — a bare "… 429" that names no boundary — is now a
+    // throttle, and the caller is handed a default retry-after window to act on
+    // rather than an opaque Composio error.
+    #[tokio::test]
+    async fn create_draft_classifies_bare_429_profile_message() {
+        let body = r#"{"successful":false,"error":"Failed to fetch user profile: 429","log_id":"lg3"}"#;
+        let addr = spawn_repeating_http(200, body, "").await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let before = wallclock_ms();
+        let err = client
+            .create_draft("entity-x", "to@example.com", "subj", "body", None)
+            .await
+            .expect_err("a bare 429 is a throttle, not a generic error");
+        match err {
+            GmailError::RateLimited { retry_after_ms, retry_after, log_id } => {
+                assert_eq!(log_id, "lg3");
+                assert!(
+                    retry_after_ms >= before + DEFAULT_ENVELOPE_RATE_LIMIT_MS,
+                    "an unspecified boundary must fall back to the default window: {retry_after_ms}"
+                );
+                assert!(!retry_after.is_empty(), "a retry-after string must be surfaced");
+            }
+            other => panic!("expected RateLimited, got: {other}"),
+        }
     }
 
     // ---- #629: To/Cc recovery from the fetch payload ----
@@ -1501,6 +1874,40 @@ mod tests {
                         "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\n{extra_headers}Connection: close\r\n\r\n{body}",
                         len = body.len(),
                         body = body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A mock that serves `responses` in request order (one entry per request,
+    /// each on a fresh `Connection: close` socket); once the list is exhausted
+    /// every further request repeats the LAST entry. Drives the `execute` retry
+    /// loop through a throttle-then-recover sequence (#1486).
+    async fn spawn_sequence_http(responses: Vec<(u16, &'static str)>) -> SocketAddr {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = Arc::new(responses);
+        let seen = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = Arc::clone(&responses);
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let idx = seen.fetch_add(1, Ordering::SeqCst).min(responses.len() - 1);
+                    let (status, body) = responses[idx];
+                    let resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                        len = body.len(),
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
                     let _ = socket.shutdown().await;
@@ -2103,8 +2510,14 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".pdf").unwrap();
         std::fs::write(tmp.path(), b"%PDF-1.4 fake resume bytes").unwrap();
 
-        let att = client
+        let staged = client
             .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", tmp.path())
+            .await
+            .expect("staging should succeed");
+        // #1573 — staging is local; the Composio upload runs at draft time.
+        assert!(staged.s3key.is_empty());
+        let att = client
+            .ensure_uploaded(&staged)
             .await
             .expect("upload should succeed");
         assert!(att.name.ends_with(".pdf"));
@@ -2158,7 +2571,8 @@ mod tests {
         pdf.extend_from_slice(b"\n%%EOF\n");
         std::fs::write(&file, &pdf).unwrap();
 
-        client.upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &file).await.unwrap();
+        let staged = client.upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &file).await.unwrap();
+        client.ensure_uploaded(&staged).await.unwrap();
         let request: serde_json::Value = serde_json::from_slice(&req_body.await.unwrap()).unwrap();
         assert_eq!(request["md5"], format!("{:x}", Md5::digest(&pdf)));
         assert_eq!(request["filename"], "letter-signed.pdf");
@@ -2176,8 +2590,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         std::fs::write(tmp.path(), b"hello").unwrap();
 
-        let att = client
+        let staged = client
             .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", tmp.path())
+            .await
+            .unwrap();
+        let att = client
+            .ensure_uploaded(&staged)
             .await
             .expect("existing object should be reused");
         assert_eq!(att.s3key, "existing/key/xyz");
@@ -2297,14 +2715,22 @@ fn check_envelope(
         .get("log_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
-    if action == "GMAIL_FETCH_EMAILS" {
-        if let Some((retry_after_ms, retry_after)) = parse_rate_limit_retry_after(err_text) {
-            return Err(GmailError::RateLimited {
-                retry_after_ms,
-                retry_after,
-                log_id: log_id.to_string(),
-            });
-        }
+    // #1486 — Composio surfaces an upstream Gmail throttle inside a
+    // `successful:false` envelope (HTTP 200), not as a 429 status. Classify it
+    // for EVERY action, not just the search path: the draft/profile/send paths
+    // must raise the same typed `RateLimited` (carrying a retry-after) that the
+    // search path already does, instead of an opaque Composio error the caller
+    // can't act on. The live symptom was `Failed to fetch user profile: 429`
+    // from the draft path — Composio's own error while fetching the sender's
+    // profile to set the From header — which named no retry-after at all.
+    if looks_like_rate_limit(err_text) {
+        let (retry_after_ms, retry_after) =
+            parse_rate_limit_retry_after(err_text).unwrap_or_else(default_envelope_retry_after);
+        return Err(GmailError::RateLimited {
+            retry_after_ms,
+            retry_after,
+            log_id: log_id.to_string(),
+        });
     }
     Err(GmailError::Composio {
         message: format!(
@@ -2314,22 +2740,84 @@ fn check_envelope(
     })
 }
 
-/// Composio reports Gmail user limits in a successful JSON envelope rather
-/// than a 429. The only reliable scheduling boundary it gives us is the
-/// RFC3339 timestamp following `Retry after`.
-fn parse_rate_limit_retry_after(error: &str) -> Option<(i64, String)> {
-    if !error.to_ascii_lowercase().contains("rate limit") {
-        return None;
+/// Default backoff window for a rate-limit envelope that names no retry-after
+/// (e.g. a bare `… 429`). Composio gives us nothing to schedule against, so we
+/// pick a short window: long enough to clear a transient spike, short enough
+/// that a caller acting on it isn't stalled. A provider-sent boundary always
+/// wins — see [`parse_rate_limit_retry_after`].
+const DEFAULT_ENVELOPE_RATE_LIMIT_MS: i64 = 60_000;
+
+/// Does a Composio `successful:false` envelope describe an upstream rate limit
+/// / quota throttle (vs. a 4xx like a bad request or revoked auth)? Broad on
+/// the throttle side — the draft path's live symptom (#1486) was a bare
+/// `Failed to fetch user profile: 429` with none of the "rate limit" wording
+/// the search path emits — but narrow enough that auth/not-found envelopes
+/// (#164, the delete/send tests) still surface as plain Composio errors.
+fn looks_like_rate_limit(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("ratelimit") // rateLimitExceeded, userRateLimitExceeded
+        || lower.contains("quota exceeded")
+        || lower.contains("quotaexceeded")
+        || lower.contains("too many requests")
+        || mentions_status_429(error)
+}
+
+/// `true` when `error` contains the token `429` not embedded in a longer run
+/// of digits (so `14295` / `4290` don't count). The draft path reports the
+/// throttle only as a trailing `: 429`, so this is often the single signal.
+fn mentions_status_429(error: &str) -> bool {
+    let bytes = error.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = error[from..].find("429") {
+        let start = from + rel;
+        let end = start + 3;
+        let left_clear = start == 0 || !bytes[start - 1].is_ascii_digit();
+        let right_clear = end == bytes.len() || !bytes[end].is_ascii_digit();
+        if left_clear && right_clear {
+            return true;
+        }
+        from = start + 1;
     }
-    let marker = "retry after";
-    let start = error.to_ascii_lowercase().find(marker)? + marker.len();
-    let retry_after = error[start..]
-        .trim_start()
+    false
+}
+
+/// Fallback `(retry_after_ms, raw)` for a throttle envelope that names no
+/// boundary — a window of [`DEFAULT_ENVELOPE_RATE_LIMIT_MS`] from now.
+fn default_envelope_retry_after() -> (i64, String) {
+    let ms = wallclock_ms() + DEFAULT_ENVELOPE_RATE_LIMIT_MS;
+    let raw = DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| ms.to_string());
+    (ms, raw)
+}
+
+/// Extract an explicit retry-after boundary from a Composio throttle envelope.
+/// Composio reports Gmail user limits in a successful JSON envelope rather than
+/// a 429, and the only scheduling boundary it gives us is the token following
+/// `retry after` / `retry-after` — an RFC3339 instant (absolute) or, less
+/// often, a bare integer (delta-seconds from now, per RFC 9110). Returns the
+/// absolute boundary in epoch-ms plus the raw token, or `None` when the
+/// envelope names none (a bare `… 429`), in which case the caller falls back
+/// to [`default_envelope_retry_after`].
+fn parse_rate_limit_retry_after(error: &str) -> Option<(i64, String)> {
+    let lower = error.to_ascii_lowercase();
+    let start = ["retry after", "retry-after"]
+        .iter()
+        .find_map(|marker| lower.find(marker).map(|at| at + marker.len()))?;
+    let token = error[start..]
+        .trim_start_matches([' ', ':'])
         .split_whitespace()
         .next()?
         .trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ')' | ']'));
-    let retry_after_ms = DateTime::parse_from_rfc3339(retry_after).ok()?.timestamp_millis();
-    Some((retry_after_ms, retry_after.to_string()))
+    if let Ok(dt) = DateTime::parse_from_rfc3339(token) {
+        return Some((dt.timestamp_millis(), token.to_string()));
+    }
+    // A bare non-negative integer is delta-seconds from now.
+    match token.parse::<i64>() {
+        Ok(secs) if secs >= 0 => Some((wallclock_ms().checked_add(secs.checked_mul(1_000)?)?, token.to_string())),
+        _ => None,
+    }
 }
 
 /// Collect the rate-limit headers from a 429 response, plus the parsed
@@ -2805,12 +3293,26 @@ impl GmailApi for ComposioClient {
             .await
     }
 
+    async fn fetch_unread_since(
+        &self,
+        entity_id: &str,
+        since_ms: Option<i64>,
+        max_total: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        let query = unread_query(since_ms);
+        self.fetch_with_query(entity_id, &query, max_total).await
+    }
+
     async fn fetch_with_query(
         &self,
         entity_id: &str,
         query: &str,
         max_total: u32,
     ) -> Result<Vec<Email>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.search(&email, query, max_total).await;
+        }
         // Composio caps response payload size (seen 413 above ~40 KB of bodies),
         // so `fetch_paged` walks 20-email pages up to `max_total`. 10-page
         // safety cap, no inter-page delay for the interactive path.
@@ -2828,6 +3330,10 @@ impl GmailApi for ComposioClient {
         if let Some(d) = since_iso {
             query.push_str(" after:");
             query.push_str(d);
+        }
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.search(&email, &query, max_total).await;
         }
         // Higher page cap (25 = 500/20) so the backfill can pull ~500 messages
         // in one shot; a 200ms inter-page sleep stays under the observed
@@ -2848,6 +3354,10 @@ impl GmailApi for ComposioClient {
         thread_id: &str,
         max: u32,
     ) -> Result<Vec<Email>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.thread_messages(&email, thread_id, max).await;
+        }
         // Composio's GMAIL_FETCH_MESSAGE_BY_THREAD_ID returns every message in
         // the thread in one shot (a thread is small relative to the inbox, so
         // no pagination is needed). We trim to the last `max` here and let the
@@ -2913,6 +3423,10 @@ impl GmailApi for ComposioClient {
         entity_id: &str,
         draft_id: &str,
     ) -> Result<Option<String>, GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.send_draft(&email, draft_id).await;
+        }
         let args = serde_json::json!({ "draft_id": draft_id });
         let v = self.execute("GMAIL_SEND_DRAFT", entity_id, args).await?;
         // Gmail's drafts.send returns the resulting Message resource, so `id`
@@ -2934,8 +3448,29 @@ impl GmailApi for ComposioClient {
     }
 
     async fn delete_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.delete_draft(&email, draft_id).await;
+        }
         let args = serde_json::json!({ "draft_id": draft_id });
         self.execute("GMAIL_DELETE_DRAFT", entity_id, args).await?;
         Ok(())
+    }
+
+    async fn update_draft(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+    ) -> Result<String, GmailError> {
+        // Google has a real `drafts.update`; Composio keeps the trait's
+        // create-then-delete default. Both land in the inherent variant.
+        self.update_draft_with_attachment(
+            entity_id, draft_id, to, subject, body, thread_id, None, &[], &[],
+        )
+        .await
     }
 }

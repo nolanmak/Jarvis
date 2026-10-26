@@ -1,6 +1,7 @@
 import { Router } from "express";
 import crypto from "crypto";
 import type Composio from "@composio/client";
+import type { GoogleAttempt, GoogleAuthFlow } from "./googleAuthRoutes";
 
 const toolkits = { gmail: "gmail", calendar: "googlecalendar", googledrive: "googledrive", slack: "slack" } as const;
 type Provider = keyof typeof toolkits;
@@ -19,9 +20,26 @@ interface Dependencies {
   setConfig(key: string, value: string): void;
   getActiveGmailAccounts(): { entityId: string; email?: string | null; label?: string | null }[];
   persist(provider: Provider, connectionId: string, entityId: string, account: Account): Promise<void>;
+  /**
+   * #1573 — when the operator's own Google OAuth client is configured, a
+   * Gmail `start` goes to Google directly (no Composio link) and its
+   * attempt is tracked by this flow instead of a Composio connection.
+   */
+  google?: Pick<GoogleAuthFlow, "configured" | "start" | "status">;
 }
 class InputError extends Error {}
 const attemptKey = (id: string) => `composio_auth_attempt_${id}`;
+
+function googleAttemptView(attempt: GoogleAttempt) {
+  const status = attempt.status === "connected" ? "ACTIVE" : attempt.status === "failed" ? "FAILED" : "PENDING";
+  return {
+    attempt_id: attempt.attempt_id, provider: "gmail", transport: "google", status,
+    connected: attempt.status === "connected",
+    ...(attempt.email ? { email: attempt.email } : {}),
+    ...(attempt.entity_id ? { entity_id: attempt.entity_id } : {}),
+    ...(attempt.error ? { error: attempt.error } : {}),
+  };
+}
 
 // Mounted behind the dashboard's authentication middleware. No provider tokens
 // or API keys are returned, and no public callback can finalize these attempts.
@@ -65,6 +83,19 @@ export function createComposioAuthRouter(deps: Dependencies): Router {
         } else if (body.entity_id !== undefined) {
           throw new InputError("entity_id is only supported for calendar");
         }
+        if (provider === "gmail" && deps.google?.configured()) {
+          const started = await deps.google.start();
+          res.status(201).json({
+            provider, transport: "google", attempt_id: started.attempt_id, auth_url: started.auth_url,
+            expires_at: started.expires_at,
+            // Google redirects to the dashboard's registered callback, so the
+            // consent must finish in a browser that can reach it.
+            note: process.env.AUGMENTAGENT_PUBLIC_URL?.trim()
+              ? "Open auth_url on any device that can reach the dashboard's public URL (e.g. one on the same tailnet). The mailbox is saved automatically when the callback lands; poll auth_status until connected."
+              : "Open auth_url in a browser on the dashboard host (no public URL is configured, so Google redirects to localhost). The mailbox is saved automatically when the callback lands; poll auth_status until connected.",
+          });
+          return;
+        }
         const client = deps.getClient();
         if (!client) throw new InputError("Composio API key not configured");
         const authConfig = await deps.getAuthConfig(client, toolkits[provider]);
@@ -85,6 +116,14 @@ export function createComposioAuthRouter(deps: Dependencies): Router {
       }
       if (typeof body.attempt_id !== "string" || !/^[0-9a-f-]{36}$/.test(body.attempt_id)) {
         throw new InputError("attempt_id must be the identifier returned by start_auth");
+      }
+      const google = deps.google?.status(body.attempt_id);
+      if (google) {
+        if (operation === "complete" && google.status !== "connected") {
+          res.status(409).json({ error: "Consent is not active", ...googleAttemptView(google) }); return;
+        }
+        res.json(googleAttemptView(google));
+        return;
       }
       const key = attemptKey(body.attempt_id);
       const raw = deps.getConfig(key);
@@ -123,8 +162,9 @@ export function createComposioAuthRouter(deps: Dependencies): Router {
     } catch (error) {
       // SDK errors can include credentials, response bodies, or consent URLs.
       // Keep them out of model-visible errors.
-      res.status(error instanceof InputError ? 400 : 502).json({
-        error: error instanceof InputError ? error.message : "Composio authentication service failed; retry the operation",
+      const input = error instanceof InputError || (error as Error)?.name === "GoogleAuthInputError";
+      res.status(input ? 400 : 502).json({
+        error: input ? (error as Error).message : "Authentication service failed; retry the operation",
       });
     }
   });

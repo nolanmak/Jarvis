@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use augmentagent_phone::{
+    relay::{BargeIn, DEFAULT_BACKCHANNELS},
     Clock, DialRequest, OwnerLink, PhoneConfig, PhoneService, ProviderError, Telephony,
 };
 use augmentagent_store::{
@@ -63,6 +64,23 @@ struct Fixture {
     conversation: SurfaceConversationRef,
 }
 fn fixture(platform: &str, enabled: bool, private: bool, uncertain: bool) -> Fixture {
+    fixture_with_voice(
+        platform,
+        enabled,
+        private,
+        uncertain,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        None,
+    )
+}
+fn fixture_with_voice(
+    platform: &str,
+    enabled: bool,
+    private: bool,
+    uncertain: bool,
+    voice: augmentagent_phone::voice::VoiceConfig,
+    owner_first_name: Option<&str>,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("test.db")).unwrap());
     let account =
@@ -98,7 +116,9 @@ fn fixture(platform: &str, enabled: bool, private: bool, uncertain: bool) -> Fix
             owner_id: "canonical-owner".into(),
         }],
     )
-    .unwrap();
+    .unwrap()
+    .with_voice(voice)
+    .with_owner_first_name(owner_first_name.map(str::to_owned));
     let service = PhoneService::new(store.clone(), provider.clone(), clock.clone(), config);
     Fixture {
         _dir: dir,
@@ -1769,15 +1789,48 @@ async fn relay_startup_bounds_control_frames_and_keeps_one_deadline() {
 
 #[tokio::test]
 async fn owner_requested_call_connects_directly_with_female_voice() {
-    use augmentagent_phone::webhook::WebhookAuth;
     let f = fixture("discord", true, true, false);
+    let (id, reply) = start_owner_call(&f).await;
+    assert!(reply.contains("ConversationRelay"));
+    assert!(!reply.contains("Gather"));
+    let relay = relay_attributes(&reply);
+    assert_eq!(relay["language"], "en-US");
+    assert_eq!(
+        f.store
+            .phone_call("canonical-owner", &id)
+            .unwrap()
+            .state
+            .as_str(),
+        "connected"
+    );
+    let fields = vec![
+        ("AccountSid".into(), "AC-test".into()),
+        ("CallSid".into(), "CA-test".into()),
+    ];
+    let auth = augmentagent_phone::webhook::WebhookAuth::new("AC-test", "secret");
+    let sig = signed(
+        "secret",
+        &format!("https://phone.example.test/phone/start/{id}"),
+        &fields,
+    );
+    assert!(f
+        .service
+        .start_callback(&auth, &id, &fields, &sig)
+        .unwrap()
+        .contains("Hangup"));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+/// Signed owner start callback; returns the call ID and the TwiML reply.
+async fn start_owner_call(f: &Fixture) -> (String, String) {
+    use augmentagent_phone::webhook::WebhookAuth;
     let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
     let call = f
         .service
         .tool(&grant, "call_owner", json!({"request_id":"direct-answer"}))
         .await
         .unwrap();
-    let id = call["id"].as_str().unwrap();
+    let id = call["id"].as_str().unwrap().to_owned();
     let fields = vec![
         ("AccountSid".into(), "AC-test".into()),
         ("CallSid".into(), "CA-test".into()),
@@ -1788,30 +1841,238 @@ async fn owner_requested_call_connects_directly_with_female_voice() {
         &format!("https://phone.example.test/phone/start/{id}"),
         &fields,
     );
-    let reply = f.service.start_callback(&auth, id, &fields, &sig).unwrap();
-    assert!(reply.contains("ConversationRelay"));
-    assert!(!reply.contains("Gather"));
-    for attr in [
-        "ttsProvider=\"Amazon\"",
-        "voice=\"Joanna\"",
-        "language=\"en-US\"",
-    ] {
-        assert!(reply.contains(attr), "{reply}");
-    }
+    let reply = f.service.start_callback(&auth, &id, &fields, &sig).unwrap();
+    (id, reply)
+}
+/// Parses the TwiML as XML (not substring matching) and returns the decoded
+/// attributes of the single ConversationRelay element.
+fn relay_attributes(twiml: &str) -> std::collections::BTreeMap<String, String> {
+    let doc = roxmltree::Document::parse(twiml).expect("TwiML must be well-formed XML");
+    let mut relays = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("ConversationRelay"));
+    let relay = relays.next().expect("one ConversationRelay element");
+    assert!(relays.next().is_none(), "exactly one ConversationRelay");
+    relay
+        .attributes()
+        .map(|a| (a.name().to_owned(), a.value().to_owned()))
+        .collect()
+}
+fn voice_from(pairs: &[(&str, &str)]) -> augmentagent_phone::voice::VoiceConfig {
+    let env: std::collections::HashMap<&str, String> = pairs
+        .iter()
+        .map(|(k, v)| (*k, (*v).to_owned()))
+        .collect();
+    augmentagent_phone::voice::VoiceConfig::from_lookup(|k| env.get(k).cloned()).unwrap()
+}
+const DEFAULT_HINTS: &str = "Jarvis, Discord, WhatsApp, Slack, Linear, Notion";
+
+#[tokio::test]
+async fn ac01_default_twiml_pins_deepgram_nova3_and_elevenlabs_flash() {
+    let f = fixture("discord", true, true, false);
+    let (_, reply) = start_owner_call(&f).await;
+    let relay = relay_attributes(&reply);
+    assert_eq!(relay["transcriptionProvider"], "Deepgram");
+    assert_eq!(relay["speechModel"], "nova-3-general");
+    assert_eq!(relay["ttsProvider"], "ElevenLabs");
+    assert_eq!(relay["voice"], "UgBBYS2sOqTuMpoF3BR0-flash_v2_5");
+    assert_eq!(relay["language"], "en-US");
+    assert_eq!(relay["elevenlabsTextNormalization"], "on");
+    assert_eq!(relay["hints"], DEFAULT_HINTS);
+    // Still an owner-authorized direct connect with the existing turn contract.
+    assert_eq!(relay["interruptible"], "any");
+    assert_eq!(relay["partialPrompts"], "false");
     assert_eq!(
-        f.store
-            .phone_call("canonical-owner", id)
-            .unwrap()
-            .state
-            .as_str(),
-        "connected"
+        relay["url"],
+        format!(
+            "wss://phone.example.test/phone/relay/{}",
+            f.store.phone_active_calls().unwrap()[0].id
+        )
     );
-    assert!(f
-        .service
-        .start_callback(&auth, id, &fields, &sig)
-        .unwrap()
-        .contains("Hangup"));
-    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ac02_each_provider_variable_changes_only_its_own_attribute() {
+    let defaults = fixture("discord", true, true, false);
+    let (_, reply) = start_owner_call(&defaults).await;
+    let baseline = relay_attributes(&reply);
+    // (env overrides, expected attribute differences from the baseline; None = absent)
+    type Overrides<'a> = Vec<(&'a str, &'a str)>;
+    type Expected<'a> = Vec<(&'a str, Option<&'a str>)>;
+    let matrix: Vec<(Overrides, Expected)> = vec![
+        (
+            vec![("AUGMENTAGENT_PHONE_STT_MODEL", "nova-2-phonecall")],
+            vec![("speechModel", Some("nova-2-phonecall"))],
+        ),
+        (
+            vec![("AUGMENTAGENT_PHONE_STT_PROVIDER", "Google")],
+            vec![
+                ("transcriptionProvider", Some("Google")),
+                ("speechModel", Some("telephony")),
+            ],
+        ),
+        (
+            vec![
+                ("AUGMENTAGENT_PHONE_STT_PROVIDER", "Google"),
+                ("AUGMENTAGENT_PHONE_STT_MODEL", "long"),
+            ],
+            vec![
+                ("transcriptionProvider", Some("Google")),
+                ("speechModel", Some("long")),
+            ],
+        ),
+        (
+            vec![("AUGMENTAGENT_PHONE_TTS_VOICE", "UgBBYS2sOqTuMpoF3BR0-flash_v2_5-1.0_0.5_0.75")],
+            vec![("voice", Some("UgBBYS2sOqTuMpoF3BR0-flash_v2_5-1.0_0.5_0.75"))],
+        ),
+        (
+            vec![("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Amazon")],
+            vec![
+                ("ttsProvider", Some("Amazon")),
+                ("voice", Some("Joanna")),
+                ("elevenlabsTextNormalization", None),
+            ],
+        ),
+        (
+            vec![
+                ("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Amazon"),
+                ("AUGMENTAGENT_PHONE_TTS_VOICE", "Matthew-Generative"),
+            ],
+            vec![
+                ("ttsProvider", Some("Amazon")),
+                ("voice", Some("Matthew-Generative")),
+                ("elevenlabsTextNormalization", None),
+            ],
+        ),
+    ];
+    assert_eq!(matrix.len(), 6);
+    for (env, expected) in matrix {
+        let f = fixture_with_voice("discord", true, true, false, voice_from(&env), None);
+        let (_, reply) = start_owner_call(&f).await;
+        let relay = relay_attributes(&reply);
+        let mut want = baseline.clone();
+        for (name, value) in &expected {
+            match value {
+                Some(v) => {
+                    want.insert((*name).to_owned(), (*v).to_owned());
+                }
+                None => {
+                    want.remove(*name);
+                }
+            }
+        }
+        // Call IDs differ per fixture; everything else must match exactly.
+        want.remove("url");
+        let mut got = relay.clone();
+        got.remove("url");
+        assert_eq!(got, want, "overrides {env:?}");
+    }
+}
+
+#[test]
+fn ac04_relay_twiml_reads_only_startup_configuration() {
+    // Source-level guard: the TwiML builder may read `self.config` and the
+    // call ID only. Chat text, provider fields, tool arguments and model output
+    // never reach it, so no attribute can be influenced by them.
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/webhook.rs"
+    ))
+    .unwrap();
+    let start = source
+        .find("fn relay_twiml(&self, id: &str) -> String {")
+        .expect("relay_twiml signature unchanged");
+    let body = &source[start..];
+    let end = body.find("\n    }\n").expect("end of relay_twiml") + 7;
+    let body = &body[..end];
+    assert!(body.contains("ConversationRelay"), "{body}");
+    for forbidden in [
+        "fields",
+        "args",
+        "call.",
+        "store",
+        "Value",
+        "serde_json",
+        "std::env",
+        "env::var",
+        "prompt",
+        "text",
+    ] {
+        assert!(!body.contains(forbidden), "relay_twiml must not read {forbidden}: {body}");
+    }
+    let mut cursor = body;
+    let mut reads = 0;
+    while let Some(i) = cursor.find("self.") {
+        assert!(
+            cursor[i..].starts_with("self.config."),
+            "relay_twiml reads something other than self.config: {body}"
+        );
+        reads += 1;
+        cursor = &cursor[i + 5..];
+    }
+    assert!(reads >= 4, "expected provider reads through self.config");
+    // The only other binding read is the call identifier parameter.
+    let other_user = source.contains("fn relay_twiml(&self, id: &str)");
+    assert!(other_user);
+}
+
+#[tokio::test]
+async fn ac05_hints_include_stored_first_name_only_when_present_and_are_escaped_and_capped() {
+    let plain = fixture_with_voice(
+        "discord",
+        true,
+        true,
+        false,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        None,
+    );
+    let (_, reply) = start_owner_call(&plain).await;
+    assert_eq!(relay_attributes(&reply)["hints"], DEFAULT_HINTS);
+
+    let named = fixture_with_voice(
+        "discord",
+        true,
+        true,
+        false,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        Some("Nolan"),
+    );
+    let (_, reply) = start_owner_call(&named).await;
+    assert_eq!(
+        relay_attributes(&reply)["hints"],
+        format!("Nolan, {DEFAULT_HINTS}")
+    );
+
+    // Markup in a stored name is removed before emission, apostrophes survive
+    // through XML escaping, and the raw characters never appear in the TwiML.
+    let hostile = fixture_with_voice(
+        "discord",
+        true,
+        true,
+        false,
+        augmentagent_phone::voice::VoiceConfig::default(),
+        Some("D'Arcy <b>&amp;\" x=\"y"),
+    );
+    let (_, reply) = start_owner_call(&hostile).await;
+    assert!(!reply.contains("<b>"));
+    assert!(!reply.contains("x=\"y"));
+    assert_eq!(
+        relay_attributes(&reply)["hints"],
+        format!("D'Arcy bamp xy, {DEFAULT_HINTS}")
+    );
+    assert_eq!(
+        augmentagent_phone::voice::hints(Some("O'Brien")),
+        format!("O'Brien, {DEFAULT_HINTS}")
+    );
+    assert_eq!(augmentagent_phone::voice::hints(Some("   ")), DEFAULT_HINTS);
+    // Oversized names are dropped rather than truncated mid-word, and the
+    // whole attribute is capped at 500 characters.
+    assert_eq!(
+        augmentagent_phone::voice::hints(Some(&"N".repeat(65))),
+        DEFAULT_HINTS
+    );
+    assert!(augmentagent_phone::voice::hints(Some(&"N".repeat(64))).chars().count() <= 500);
+    const { assert!(augmentagent_phone::voice::HINTS_MAX_CHARS == 500) };
 }
 
 struct SlowPhoneAgent {
@@ -1941,4 +2202,1347 @@ async fn slow_work_acknowledges_and_slow_interruption_mirror_does_not_hang_up() 
             .stop_requested
     );
     server.abort();
+}
+
+#[test]
+fn ac06_twiml_debug_attribute_present_iff_debug_events_enabled() {
+    use augmentagent_phone::webhook::WebhookAuth;
+    for debug in [false, true] {
+        let f = fixture("discord", true, true, false);
+        let config = PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "test-secret-for-verification-32bytes",
+            vec![OwnerLink {
+                surface_owner: f.owner.clone(),
+                owner_id: "canonical-owner".into(),
+            }],
+        )
+        .unwrap()
+        .with_debug_events(debug);
+        let service = PhoneService::new(f.store.clone(), f.provider.clone(), f.clock.clone(), config);
+        assert_eq!(service.debug_events(), debug);
+        let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+        let call = futures::executor::block_on(service.tool(&grant, "call_owner", json!({"request_id":"debug"}))).unwrap();
+        let id = call["id"].as_str().unwrap();
+        let fields = vec![
+            ("AccountSid".into(), "AC-test".into()),
+            ("CallSid".into(), "CA-test".into()),
+        ];
+        let auth = WebhookAuth::new("AC-test", "secret");
+        let sig = signed("secret", &format!("https://phone.example.test/phone/start/{id}"), &fields);
+        let reply = service.start_callback(&auth, id, &fields, &sig).unwrap();
+        assert!(reply.contains("<ConversationRelay "), "{reply}");
+        assert_eq!(
+            reply.contains(r#" debug="debugging tokens-played speaker-events""#),
+            debug,
+            "{reply}"
+        );
+    }
+}
+
+// #1555 AC1: partialPrompts is "true" only with preemptive generation on the
+// fast layer; every other combination keeps the existing "false" (XML-parsed).
+#[test]
+fn preemptive_twiml_requests_partial_prompts_only_on_the_fast_layer() {
+    use augmentagent_phone::{fast::FastLayerConfig, webhook::WebhookAuth};
+    for (fast, preemptive, expected) in [
+        (false, false, "false"),
+        (false, true, "false"),
+        (true, false, "false"),
+        (true, true, "true"),
+    ] {
+        let f = fixture("discord", true, true, false);
+        let config = PhoneConfig::new(
+            true,
+            "https://phone.example.test",
+            "test-secret-for-verification-32bytes",
+            vec![OwnerLink {
+                surface_owner: f.owner.clone(),
+                owner_id: "canonical-owner".into(),
+            }],
+        )
+        .unwrap()
+        .with_fast_layer(fast.then(FastLayerConfig::default))
+        .with_preemptive(preemptive);
+        let service = PhoneService::new(f.store.clone(), f.provider.clone(), f.clock.clone(), config);
+        assert_eq!(service.preemptive(), expected == "true");
+        let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+        let call = futures::executor::block_on(service.tool(&grant, "call_owner", json!({"request_id":"partial"}))).unwrap();
+        let id = call["id"].as_str().unwrap();
+        let fields = vec![
+            ("AccountSid".into(), "AC-test".into()),
+            ("CallSid".into(), "CA-test".into()),
+        ];
+        let auth = WebhookAuth::new("AC-test", "secret");
+        let sig = signed("secret", &format!("https://phone.example.test/phone/start/{id}"), &fields);
+        let reply = service.start_callback(&auth, id, &fields, &sig).unwrap();
+        let relay = relay_attributes(&reply);
+        assert_eq!(relay["partialPrompts"], expected, "fast={fast} preemptive={preemptive}");
+        assert_eq!(relay["interruptible"], "any");
+    }
+}
+
+/// Captures every tracing event so #1551 tests can count `phone.turn` records
+/// and prove raw debug frame bodies never reach the logs.
+mod capture {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
+    use tracing_subscriber::layer::SubscriberExt;
+    #[derive(Default)]
+    pub struct Captured {
+        pub events: Mutex<Vec<(String, BTreeMap<String, String>)>>,
+    }
+    struct Layer(Arc<Captured>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Layer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0
+                .events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((event.metadata().target().into(), fields.0));
+        }
+    }
+    static CAPTURED: OnceLock<Arc<Captured>> = OnceLock::new();
+    pub fn install() -> Arc<Captured> {
+        CAPTURED
+            .get_or_init(|| {
+                let captured = Arc::new(Captured::default());
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(Layer(captured.clone())),
+                )
+                .expect("only this module installs a global subscriber");
+                captured
+            })
+            .clone()
+    }
+}
+
+struct MixedOutcomeAgent {
+    release: tokio::sync::Semaphore,
+}
+#[async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for MixedOutcomeAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        text: &str,
+        speech: augmentagent_phone::ingress::SpeechSender,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        match text {
+            "fail please" => Err(augmentagent_phone::ingress::AgentError),
+            "slow lookup" => tokio::select! {
+                _ = cancel.cancelled() => Err(augmentagent_phone::ingress::AgentError),
+                permit = self.release.acquire() => { permit.unwrap().forget(); Ok("Late result.".into()) }
+            },
+            _ => {
+                speech.note_tool_time(std::time::Duration::from_millis(40));
+                Ok(format!("Answer to: {text}"))
+            }
+        }
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn ac01_every_turn_records_one_metrics_row_and_event_with_debug_played_timing() {
+    use augmentagent_store::phone::{CallState, TurnOutcome};
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let captured = capture::install();
+    let agent = Arc::new(MixedOutcomeAgent {
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let f = fixture("discord", true, true, false);
+    let config = PhoneConfig::new(
+        true,
+        "https://phone.example.test",
+        "test-secret-for-verification-32bytes",
+        vec![OwnerLink {
+            surface_owner: f.owner.clone(),
+            owner_id: "canonical-owner".into(),
+        }],
+    )
+    .unwrap()
+    .with_debug_events(true);
+    let service = Arc::new(PhoneService::new(
+        f.store.clone(),
+        f.provider.clone(),
+        f.clock.clone(),
+        config,
+    ));
+    let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = service
+        .tool(&grant, "call_owner", json!({"request_id":"metrics"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        service,
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    // One talk cycle: streamed tokens up to and including the last:true frame.
+    async fn next_text(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> String {
+        let mut spoken = String::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .expect("reply")
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            spoken.push_str(frame["token"].as_str().unwrap());
+            if frame["last"] == true {
+                return spoken;
+            }
+        }
+    }
+    // Turn 1: answered, then provider reports tokens played (debug events).
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"hello","last":true}).to_string().into())).await.unwrap();
+    assert!(next_text(&mut socket).await.contains("Answer to: hello"));
+    socket.send(Message::Text(json!({"type":"info","name":"tokensPlayed","value":"raw-debug-marker-one","last":false}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"info","name":"tokensPlayed","value":"raw-debug-marker-two","last":true}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"info","name":"speakerEvent","value":"raw-debug-marker-three"}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"unknownFutureFrame","body":"raw-debug-marker-four"}).to_string().into())).await.unwrap();
+    // Turn 2: the agent fails; the spoken failure notice closes the turn.
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"fail please","last":true}).to_string().into())).await.unwrap();
+    assert!(next_text(&mut socket).await.contains("Sorry"));
+    // Turn 3: interrupted while the agent is still working (after the ack).
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"slow lookup","last":true}).to_string().into())).await.unwrap();
+    assert!(next_text(&mut socket).await.contains("Got it"));
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"Got it","durationUntilInterruptMs":100}).to_string().into())).await.unwrap();
+    // Turn 4: answered after the stalled turn releases.
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"hello again","last":true}).to_string().into())).await.unwrap();
+    // The ack proves the interrupt and new prompt were processed before the
+    // stalled turn is released; its late output is suppressed, not spoken.
+    assert!(next_text(&mut socket).await.contains("Got it"));
+    agent.release.add_permits(1);
+    let reply = next_text(&mut socket).await;
+    assert!(reply.contains("Answer to: hello again"), "{reply}");
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if f.store.phone_call("canonical-owner", &id).unwrap().state.terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+
+    let rows = f.store.phone_turn_metrics(&id).unwrap();
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    let outcomes: Vec<_> = rows.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        outcomes,
+        [
+            TurnOutcome::Answered,
+            TurnOutcome::Failed,
+            TurnOutcome::Interrupted,
+            TurnOutcome::Answered
+        ]
+    );
+    assert!(rows.iter().all(|r| r.turn_id.starts_with(&format!("phone:{id}:"))));
+    // Debug on: the played turn carries audible timing; others have speech only.
+    let first = &rows[0];
+    assert!(first.t_first_speech_ms.is_some() && first.t_last_speech_ms.is_some());
+    assert!(first.t_first_played_ms.is_some(), "{first:?}");
+    assert!(first.t_last_played_ms >= first.t_first_played_ms);
+    assert_eq!(
+        first.audible_delta_ms,
+        Some(first.t_first_played_ms.unwrap() - first.t_first_speech_ms.unwrap())
+    );
+    assert_eq!(first.tool_ms, Some(40));
+    assert!(first.queue_wait_ms.is_some() && first.t_first_token_ms.is_some());
+    assert!(rows[1].t_first_speech_ms.is_some() && rows[1].t_first_played_ms.is_none());
+    assert!(rows[2].t_first_speech_ms.is_none(), "{:?}", rows[2]);
+    assert!(rows[3].t_first_speech_ms.is_some());
+    assert!(rows[3].queue_wait_ms.unwrap() >= rows[0].queue_wait_ms.unwrap());
+    // Exactly one structured event per turn, and no raw debug bodies anywhere.
+    let events = captured
+        .events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let turn_events: Vec<_> = events
+        .iter()
+        .filter(|(target, fields)| target == "phone.turn" && fields.get("call_id").is_some_and(|c| c.contains(&id)))
+        .collect();
+    assert_eq!(turn_events.len(), 4, "{turn_events:?}");
+    for (_, fields) in &turn_events {
+        assert!(fields.contains_key("outcome") && fields.contains_key("turn_id"), "{fields:?}");
+    }
+    // Absent (null) fields are omitted by tracing; the played turn carries all of them.
+    let played = &turn_events[0].1;
+    for key in ["t_first_speech_ms", "t_last_speech_ms", "t_first_played_ms", "audible_delta_ms", "tool_ms", "queue_wait_ms"] {
+        assert!(played.contains_key(key), "{key} missing from {played:?}");
+    }
+    let everything = format!("{events:?}");
+    for private in ["raw-debug-marker", "hello again", "fail please", "voicePrompt"] {
+        assert!(!everything.contains(private), "{private} leaked into logs");
+    }
+}
+
+#[tokio::test]
+async fn ac06_without_debug_events_played_fields_are_null_and_others_unchanged() {
+    use augmentagent_store::phone::{CallState, TurnOutcome};
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"metrics-off"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    assert!(!f.service.debug_events());
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        Arc::new(ScriptedAgent),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"hello","last":true}).to_string().into())).await.unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(reply.into_text().unwrap().contains("Answer to: hello"));
+    // Info frames are tolerated but attach no played timing when debug is off.
+    socket.send(Message::Text(json!({"type":"info","name":"tokensPlayed","value":"x","last":true}).to_string().into())).await.unwrap();
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if f.store.phone_call("canonical-owner", &id).unwrap().state.terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let rows = f.store.phone_turn_metrics(&id).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, TurnOutcome::Answered);
+    assert!(rows[0].t_first_speech_ms.is_some() && rows[0].t_last_speech_ms.is_some());
+    assert!(rows[0].queue_wait_ms.is_some() && rows[0].t_first_token_ms.is_some());
+    assert_eq!(rows[0].t_first_played_ms, None);
+    assert_eq!(rows[0].t_last_played_ms, None);
+    assert_eq!(rows[0].audible_delta_ms, None);
+}
+
+/// Streams sentences on a schedule; `gate` permits release later sentences.
+struct StreamingAgent {
+    gate: tokio::sync::Semaphore,
+    first_after: std::time::Duration,
+    finish_after: std::time::Duration,
+    completed: std::sync::atomic::AtomicBool,
+    interrupted: tokio::sync::Notify,
+}
+#[async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for StreamingAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        _: &str,
+        speech: augmentagent_phone::ingress::SpeechSender,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        let started = tokio::time::Instant::now();
+        tokio::time::sleep(self.first_after).await;
+        speech.speak_partial("First sentence here. ").await?;
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return Err(augmentagent_phone::ingress::AgentError),
+            permit = self.gate.acquire() => permit.unwrap(),
+        };
+        permit.forget();
+        speech.speak_partial("**Second** one with [a link](https://example.com/x). ").await?;
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(augmentagent_phone::ingress::AgentError),
+            _ = tokio::time::sleep_until(started + self.finish_after) => {}
+        }
+        speech.speak_partial("Third and last").await?;
+        speech.finish().await?;
+        self.completed.store(true, Ordering::SeqCst);
+        Ok("First sentence here. Second one with a link. Third and last".into())
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        self.interrupted.notify_one();
+        Ok(())
+    }
+}
+
+async fn streaming_socket(
+    agent: Arc<StreamingAgent>,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (socket, server, _, _) = streaming_socket_with(agent, BargeIn::default()).await;
+    (socket, server)
+}
+
+/// A connected relay socket whose service uses `barge`; also returns the store
+/// and call ID for metrics assertions.
+async fn streaming_socket_with(
+    agent: Arc<StreamingAgent>,
+    barge: BargeIn,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio::task::JoinHandle<()>,
+    Arc<Store>,
+    String,
+) {
+    use augmentagent_store::phone::CallState;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"r1"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let config = PhoneConfig::new(
+        true,
+        "https://phone.example.test",
+        "test-secret-for-verification-32bytes",
+        vec![OwnerLink {
+            surface_owner: f.owner.clone(),
+            owner_id: "canonical-owner".into(),
+        }],
+    )
+    .unwrap()
+    .with_barge_in(barge);
+    let service = PhoneService::new(f.store.clone(), f.provider.clone(), f.clock.clone(), config);
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let store = f.store.clone();
+    let server = tokio::spawn(async move {
+        let _keep = f._dir;
+        axum::serve(listener, router).await.unwrap()
+    });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    (socket, server, store, id)
+}
+
+async fn next_frame<S>(socket: &mut S, within: std::time::Duration) -> Option<serde_json::Value>
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures::StreamExt;
+    let frame = tokio::time::timeout(within, socket.next()).await.ok()??.ok()?;
+    serde_json::from_str(frame.to_text().ok()?).ok()
+}
+
+// AC1 + AC5 over a real WebSocket: the first sentence (t=100 ms) is on the
+// wire before t=200 ms and long before the agent future completes (t=5 s);
+// frames arrive in order with increasing timestamps; exactly one last:true.
+#[tokio::test]
+async fn ac05_real_websocket_streams_first_sentence_before_the_agent_completes() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = Arc::new(StreamingAgent {
+        gate: tokio::sync::Semaphore::new(1),
+        first_after: std::time::Duration::from_millis(100),
+        finish_after: std::time::Duration::from_secs(5),
+        completed: std::sync::atomic::AtomicBool::new(false),
+        interrupted: tokio::sync::Notify::new(),
+    });
+    let (mut socket, server) = streaming_socket(agent.clone()).await;
+    let sent = tokio::time::Instant::now();
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"tell me","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    loop {
+        let frame = next_frame(&mut socket, std::time::Duration::from_secs(7))
+            .await
+            .expect("stream frame");
+        let last = frame["last"].as_bool().unwrap();
+        frames.push((tokio::time::Instant::now(), frame));
+        if last {
+            break;
+        }
+    }
+    let first_at = frames[0].0 - sent;
+    assert!(
+        first_at < std::time::Duration::from_millis(200),
+        "first frame after {first_at:?}"
+    );
+    assert_eq!(frames[0].1["token"], "First sentence here. ");
+    assert!(
+        !agent.completed.load(Ordering::SeqCst) || frames[0].0 - sent < std::time::Duration::from_secs(5),
+        "first frame must not wait for the agent future"
+    );
+    assert!(frames.windows(2).all(|w| w[0].0 <= w[1].0));
+    let last_at = frames.last().unwrap().0 - sent;
+    assert!(last_at >= std::time::Duration::from_secs(5), "finish at t=5 s, got {last_at:?}");
+    assert!(agent.completed.load(Ordering::SeqCst));
+    let flags: Vec<bool> = frames.iter().map(|(_, f)| f["last"].as_bool().unwrap()).collect();
+    assert_eq!(flags.iter().filter(|l| **l).count(), 1);
+    assert!(!flags[..flags.len() - 1].iter().any(|l| *l));
+    assert!(frames.iter().all(|(_, f)| f["type"] == "text" && f["interruptible"] == true));
+    let spoken: String = frames.iter().map(|(_, f)| f["token"].as_str().unwrap()).collect();
+    assert_eq!(spoken, "First sentence here. Second one with a link. Third and last");
+    // The automatic final answer was suppressed: nothing else arrives.
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    server.abort();
+}
+
+// AC4 over a real WebSocket: after `interrupt`, the stale generation's
+// remaining partials and finish produce no frames within 500 ms; the next
+// prompt streams normally.
+#[tokio::test]
+async fn ac04_real_websocket_interrupt_silences_the_stale_stream_until_the_next_turn() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = Arc::new(StreamingAgent {
+        gate: tokio::sync::Semaphore::new(0),
+        first_after: std::time::Duration::from_millis(10),
+        finish_after: std::time::Duration::from_millis(20),
+        completed: std::sync::atomic::AtomicBool::new(false),
+        interrupted: tokio::sync::Notify::new(),
+    });
+    // Immediate invalidation is the unfiltered (min words 1) contract.
+    let (mut socket, server, _, _) = streaming_socket_with(agent.clone(), unfiltered()).await;
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"first question","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let first = next_frame(&mut socket, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(first["token"], "First sentence here. ");
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    // The relay has bumped its generation once the interruption mirror runs.
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.interrupted.notified())
+        .await
+        .unwrap();
+    agent.gate.add_permits(1);
+    assert!(
+        next_frame(&mut socket, std::time::Duration::from_millis(500)).await.is_none(),
+        "interrupted generation emitted a frame"
+    );
+    assert!(agent.completed.load(Ordering::SeqCst));
+    socket
+        .send(Message::Text(
+            json!({"type":"prompt","voicePrompt":"second question","last":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let fresh = next_frame(&mut socket, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(fresh["token"], "First sentence here. ");
+    assert_eq!(fresh["last"], false);
+    agent.gate.add_permits(1);
+    let mut tokens = vec![fresh["token"].as_str().unwrap().to_string()];
+    loop {
+        let frame = next_frame(&mut socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        tokens.push(frame["token"].as_str().unwrap().to_string());
+        if frame["last"] == true {
+            break;
+        }
+    }
+    assert_eq!(tokens.concat(), "First sentence here. Second one with a link. Third and last");
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    server.abort();
+}
+
+/// #1555 agent: speculations echo their interim text; normal answers echo the
+/// final text, so the wire shows which path produced the words.
+#[derive(Default)]
+struct SpeculatingAgent {
+    speculations: std::sync::atomic::AtomicUsize,
+    committed: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for SpeculatingAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        text: &str,
+        _: augmentagent_phone::ingress::SpeechSender,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        Ok(format!("Answer to: {text}"))
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        Ok(())
+    }
+    fn speculate(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        text: &str,
+    ) -> Option<augmentagent_phone::speculation::Speculative> {
+        self.speculations.fetch_add(1, Ordering::SeqCst);
+        let reply = format!("Speculated: {text}");
+        Some(augmentagent_phone::speculation::Speculative::spawn(
+            text,
+            move |sink| async move {
+                sink.token(reply).await;
+            },
+        ))
+    }
+    async fn answer_speculated(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        _: &str,
+        speech: augmentagent_phone::ingress::SpeechSender,
+        _: tokio_util::sync::CancellationToken,
+        mut speculation: augmentagent_phone::speculation::Speculative,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+        let mut said = String::new();
+        while let Some(token) = speculation.next_token().await {
+            speech.speak_partial(&token).await?;
+            said.push_str(&token);
+        }
+        speech.finish().await?;
+        Ok(said)
+    }
+}
+
+// #1555 AC3 + AC6 over a real WebSocket: interim prompts start a speculation
+// whose words never reach the wire before the final prompt; a matching final
+// speaks them, a mismatched one is answered normally; each turn's metrics row
+// carries the speculation fields.
+#[tokio::test]
+async fn preemptive_real_websocket_commits_matching_finals_and_cancels_others() {
+    use augmentagent_store::phone::CallState;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let agent = Arc::new(SpeculatingAgent::default());
+    let f = fixture("discord", true, true, false);
+    let config = PhoneConfig::new(
+        true,
+        "https://phone.example.test",
+        "test-secret-for-verification-32bytes",
+        vec![OwnerLink {
+            surface_owner: f.owner.clone(),
+            owner_id: "canonical-owner".into(),
+        }],
+    )
+    .unwrap()
+    .with_fast_layer(Some(augmentagent_phone::fast::FastLayerConfig::default()))
+    .with_preemptive(true);
+    let service = Arc::new(PhoneService::new(
+        f.store.clone(),
+        f.provider.clone(),
+        f.clock.clone(),
+        config,
+    ));
+    let grant = service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = service
+        .tool(&grant, "call_owner", json!({"request_id":"preemptive"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        service,
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.send(Message::Text(json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"}).to_string().into())).await.unwrap();
+    let prompt = |text: &str, last: bool| {
+        Message::Text(json!({"type":"prompt","voicePrompt":text,"last":last}).to_string().into())
+    };
+    async fn talk_cycle<S>(socket: &mut S) -> String
+    where
+        S: futures::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let mut spoken = String::new();
+        loop {
+            let frame = next_frame(socket, std::time::Duration::from_secs(3))
+                .await
+                .expect("talk cycle frame");
+            spoken.push_str(frame["token"].as_str().unwrap());
+            if frame["last"] == true {
+                return spoken;
+            }
+        }
+    }
+
+    // Utterance 1: speculation on the interim text, committed by the final.
+    socket.send(prompt("what's on my", false)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    socket.send(prompt("what's on my calendar tomorrow", false)).await.unwrap();
+    assert!(
+        next_frame(&mut socket, std::time::Duration::from_millis(400)).await.is_none(),
+        "speculative words reached the wire before commit"
+    );
+    assert_eq!(agent.speculations.load(Ordering::SeqCst), 1);
+    socket.send(prompt("What's on my calendar tomorrow?", true)).await.unwrap();
+    assert_eq!(
+        talk_cycle(&mut socket).await,
+        "Speculated: what's on my calendar tomorrow"
+    );
+    assert_eq!(agent.committed.load(Ordering::SeqCst), 1);
+
+    // Utterance 2: the final changes a word; the speculation is dropped.
+    socket.send(prompt("remind me", false)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    socket.send(prompt("remind me to call the plumber", false)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(agent.speculations.load(Ordering::SeqCst), 2);
+    socket.send(prompt("remind me to email the plumber", true)).await.unwrap();
+    assert_eq!(
+        talk_cycle(&mut socket).await,
+        "Answer to: remind me to email the plumber"
+    );
+    assert_eq!(agent.committed.load(Ordering::SeqCst), 1);
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+
+    // Closing the socket records both turns.
+    socket.close(None).await.unwrap();
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let rows = f.store.phone_turn_metrics(&id).unwrap();
+            if rows.len() == 2 {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("two metrics rows");
+    assert!(rows[0].speculated && rows[0].speculation_committed);
+    assert!(rows[0].speculation_saved_ms.is_some_and(|ms| ms >= 100), "{:?}", rows[0]);
+    assert!(rows[1].speculated && !rows[1].speculation_committed);
+    assert_eq!(rows[1].speculation_saved_ms, None);
+    server.abort();
+}
+
+// ---- #1550 barge-in over a real WebSocket ----
+
+fn barge(min_words: usize, timeout_ms: u64, resume: bool) -> BargeIn {
+    let phrases = DEFAULT_BACKCHANNELS.iter().map(|s| (*s).into()).collect();
+    BargeIn::new(min_words, phrases, timeout_ms, resume).unwrap()
+}
+fn unfiltered() -> BargeIn {
+    barge(1, 2_000, true)
+}
+fn streaming_agent() -> Arc<StreamingAgent> {
+    Arc::new(StreamingAgent {
+        gate: tokio::sync::Semaphore::new(0),
+        first_after: std::time::Duration::from_millis(10),
+        finish_after: std::time::Duration::from_millis(20),
+        completed: std::sync::atomic::AtomicBool::new(false),
+        interrupted: tokio::sync::Notify::new(),
+    })
+}
+async fn rest_of_cycle<S>(socket: &mut S) -> String
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    let mut spoken = String::new();
+    loop {
+        let frame = next_frame(socket, std::time::Duration::from_secs(2)).await.expect("frame");
+        spoken.push_str(frame["token"].as_str().unwrap());
+        if frame["last"] == true {
+            return spoken;
+        }
+    }
+}
+async fn turn_outcomes(
+    store: &Store,
+    id: &str,
+) -> Vec<augmentagent_store::phone::TurnOutcome> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if store.phone_call("canonical-owner", id).unwrap().state.terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    store.phone_turn_metrics(id).unwrap().iter().map(|r| r.outcome).collect()
+}
+
+// AC1 + #1551 over the wire: "mm-hm" during an answer resumes it from the
+// unspoken remainder; the answer then finishes; the turn is recorded as
+// answered and no interrupted-playback marker is persisted.
+#[tokio::test]
+async fn ac1_real_websocket_backchannel_resumes_and_is_not_recorded_as_interrupted() {
+    use augmentagent_store::phone::TurnOutcome;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = streaming_agent();
+    let (mut socket, server, store, id) =
+        streaming_socket_with(agent.clone(), BargeIn::default()).await;
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"tell me","last":true}).to_string().into())).await.unwrap();
+    let first = next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    assert_eq!(first["token"], "First sentence here. ");
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"Mm-hm.","last":true}).to_string().into())).await.unwrap();
+    let resumed = next_frame(&mut socket, std::time::Duration::from_secs(1)).await.expect("resume");
+    assert_eq!(resumed["token"], "sentence here. ");
+    assert_eq!(resumed["last"], false);
+    agent.gate.add_permits(1);
+    assert_eq!(rest_of_cycle(&mut socket).await, "Second one with a link. Third and last");
+    assert!(next_frame(&mut socket, std::time::Duration::from_millis(300)).await.is_none());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), agent.interrupted.notified())
+            .await
+            .is_err(),
+        "a backchannel must not persist an interruption"
+    );
+    socket.close(None).await.unwrap();
+    assert_eq!(turn_outcomes(&store, &id).await, [TurnOutcome::Answered]);
+    server.abort();
+}
+
+// AC3 over the wire: with no prompt after `interrupt`, the ingress resumes the
+// remainder on its own at the configured timeout (500 ms; real clock, so the
+// bounds are loose; the paused-clock relay test pins ±50 ms).
+#[tokio::test]
+async fn ac3_real_websocket_silence_resumes_at_the_configured_timeout() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = streaming_agent();
+    let (mut socket, server, _, _) = streaming_socket_with(agent.clone(), barge(3, 500, true)).await;
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"tell me","last":true}).to_string().into())).await.unwrap();
+    next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    let sent = tokio::time::Instant::now();
+    let resumed = next_frame(&mut socket, std::time::Duration::from_secs(2)).await.expect("resume");
+    let elapsed = sent.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(400) && elapsed < std::time::Duration::from_millis(1_500),
+        "resumed after {elapsed:?}"
+    );
+    assert_eq!(resumed["token"], "sentence here. ");
+    agent.gate.add_permits(1);
+    assert_eq!(rest_of_cycle(&mut socket).await, "Second one with a link. Third and last");
+    server.abort();
+}
+
+// AC7 over the wire: resume off, silence past the timeout discards the rest
+// of the answer (zero frames, recorded as interrupted) and the next prompt is
+// answered normally.
+#[tokio::test]
+async fn ac7_real_websocket_resume_off_discards_the_remainder_and_answers_the_next_prompt() {
+    use augmentagent_store::phone::TurnOutcome;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let agent = streaming_agent();
+    let (mut socket, server, store, id) =
+        streaming_socket_with(agent.clone(), barge(3, 500, false)).await;
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"tell me","last":true}).to_string().into())).await.unwrap();
+    next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    socket.send(Message::Text(json!({"type":"interrupt","utteranceUntilInterrupt":"First","durationUntilInterruptMs":300}).to_string().into())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.interrupted.notified())
+        .await
+        .expect("discarded remainder is persisted as an interruption");
+    agent.gate.add_permits(1);
+    assert!(
+        next_frame(&mut socket, std::time::Duration::from_millis(500)).await.is_none(),
+        "discarded remainder was spoken"
+    );
+    socket.send(Message::Text(json!({"type":"prompt","voicePrompt":"what next","last":true}).to_string().into())).await.unwrap();
+    let fresh = next_frame(&mut socket, std::time::Duration::from_secs(2)).await.unwrap();
+    assert_eq!(fresh["token"], "First sentence here. ");
+    agent.gate.add_permits(1);
+    assert_eq!(rest_of_cycle(&mut socket).await, "Second one with a link. Third and last");
+    socket.close(None).await.unwrap();
+    assert_eq!(
+        turn_outcomes(&store, &id).await,
+        [TurnOutcome::Interrupted, TurnOutcome::Answered]
+    );
+    server.abort();
+}
+
+// ---- #1549: recoverable conditions never close the relay socket ----
+
+/// Answers `Answer to: <text>` once a permit is available, so turns can be
+/// held in the queue deterministically.
+struct GatedAgent {
+    permits: tokio::sync::Semaphore,
+    entered: tokio::sync::Notify,
+}
+#[async_trait]
+impl augmentagent_phone::ingress::ConversationAgent for GatedAgent {
+    async fn answer(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+        text: &str,
+        _: augmentagent_phone::ingress::SpeechSender,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, augmentagent_phone::ingress::AgentError> {
+        self.entered.notify_one();
+        tokio::select! {
+            _ = cancel.cancelled() => Err(augmentagent_phone::ingress::AgentError),
+            permit = self.permits.acquire() => { permit.unwrap().forget(); Ok(format!("Answer to: {text}")) }
+        }
+    }
+    async fn interrupted(
+        &self,
+        _: &augmentagent_store::phone::PhoneCall,
+        _: &str,
+    ) -> Result<(), augmentagent_phone::ingress::AgentError> {
+        Ok(())
+    }
+}
+
+type RelaySocket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+struct RelayHarness {
+    _dir: tempfile::TempDir,
+    store: Arc<Store>,
+    provider: Arc<FakeProvider>,
+    id: String,
+    socket: RelaySocket,
+    server: tokio::task::JoinHandle<()>,
+}
+/// Signed upgrade plus accepted setup on a connected owner call.
+async fn connect_relay(
+    agent: Arc<dyn augmentagent_phone::ingress::ConversationAgent>,
+) -> RelayHarness {
+    use augmentagent_store::phone::CallState;
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"r1"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap().to_string();
+    f.store
+        .phone_provider_event(&id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    f.store.phone_accept(&id, "CA-test", 101).unwrap();
+    let router = augmentagent_phone::ingress::router(
+        Arc::new(f.service),
+        Arc::new(augmentagent_phone::webhook::WebhookAuth::new(
+            "AC-test",
+            "callback-secret",
+        )),
+        agent,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut request = format!("ws://{addr}/phone/relay/{id}")
+        .into_client_request()
+        .unwrap();
+    let signature = signed(
+        "callback-secret",
+        &format!("wss://phone.example.test/phone/relay/{id}"),
+        &[],
+    );
+    request
+        .headers_mut()
+        .insert("x-twilio-signature", signature.parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"setup","accountSid":"AC-test","callSid":"CA-test","sessionId":"VX-test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    RelayHarness {
+        _dir: f._dir,
+        store: f.store,
+        provider: f.provider,
+        id,
+        socket,
+        server,
+    }
+}
+fn prompt(text: &str) -> tokio_tungstenite::tungstenite::Message {
+    tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type":"prompt","voicePrompt":text,"last":true})
+            .to_string()
+            .into(),
+    )
+}
+/// Reads text frames until one carries `token` with `last:true`, returning
+/// every token seen on the way. Panics on close or timeout.
+async fn read_until_answer(socket: &mut RelaySocket, token: &str, context: &str) -> Vec<String> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut seen = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if body["type"] == "end" {
+                        panic!("{context}: relay sent end before answering");
+                    }
+                    let spoken = body["token"].as_str().unwrap().to_string();
+                    let last = body["last"] == true;
+                    seen.push(spoken.clone());
+                    if spoken == token {
+                        assert!(last, "{context}: answer must be a final text frame");
+                        return;
+                    }
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => panic!("{context}: socket closed before answer: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{context}: no answer within deadline"));
+    seen
+}
+
+#[tokio::test]
+async fn ac01_recoverable_frames_keep_relay_open_and_next_prompt_is_answered() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let scenarios: [(&str, Message); 5] = [
+        ("binary", Message::Binary(vec![0xde, 0xad].into())),
+        ("malformed", Message::Text("{not json".into())),
+        (
+            "unknown_type",
+            Message::Text(json!({"type":"mystery","payload":"x"}).to_string().into()),
+        ),
+        (
+            "provider_64107",
+            Message::Text(
+                json!({"type":"error","code":64107,"description":"invalid message"})
+                    .to_string()
+                    .into(),
+            ),
+        ),
+        (
+            "provider_unknown",
+            Message::Text(
+                json!({"type":"error","code":64199,"description":"unknown"})
+                    .to_string()
+                    .into(),
+            ),
+        ),
+    ];
+    for (name, frame) in scenarios {
+        let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
+        relay.socket.send(prompt("before")).await.unwrap();
+        read_until_answer(&mut relay.socket, "Answer to: before", name).await;
+        relay.socket.send(frame).await.unwrap();
+        relay.socket.send(prompt("after")).await.unwrap();
+        read_until_answer(&mut relay.socket, "Answer to: after", name).await;
+        assert!(
+            !relay
+                .store
+                .phone_call("canonical-owner", &relay.id)
+                .unwrap()
+                .stop_requested,
+            "{name}: recoverable condition must not request a stop"
+        );
+        assert!(relay.provider.stops.lock().unwrap().is_empty(), "{name}");
+        relay.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn ac02_queue_overflow_drops_oldest_turn_speaks_recovery_once_and_answers_newest() {
+    use futures::SinkExt;
+    let agent = Arc::new(GatedAgent {
+        permits: tokio::sync::Semaphore::new(0),
+        entered: tokio::sync::Notify::new(),
+    });
+    let mut relay = connect_relay(agent.clone()).await;
+    // Turn one is in progress; four queue; the sixth overflows the queue.
+    relay.socket.send(prompt("one")).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.entered.notified())
+        .await
+        .unwrap();
+    for text in ["two", "three", "four", "five", "six"] {
+        relay.socket.send(prompt(text)).await.unwrap();
+    }
+    agent.permits.add_permits(6);
+    let seen = read_until_answer(&mut relay.socket, "Answer to: six", "overflow").await;
+    let recovery = seen
+        .iter()
+        .filter(|t| t.as_str() == "Sorry, say that again?")
+        .count();
+    assert_eq!(recovery, 1, "exactly one recovery line: {seen:?}");
+    for answered in ["one", "three", "four", "five", "six"] {
+        assert!(
+            seen.iter().any(|t| t == &format!("Answer to: {answered}")),
+            "{answered} must still be answered: {seen:?}"
+        );
+    }
+    assert!(
+        !seen.iter().any(|t| t == "Answer to: two"),
+        "the oldest queued turn is dropped: {seen:?}"
+    );
+    assert!(
+        !relay
+            .store
+            .phone_call("canonical-owner", &relay.id)
+            .unwrap()
+            .stop_requested
+    );
+    relay.server.abort();
+}
+
+#[tokio::test]
+async fn ac03_ten_consecutive_invalid_frames_send_end_then_close_and_a_valid_frame_resets() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let malformed = || Message::Text("{bad".into());
+    // Exactly ten in a row: one `end` frame, then the socket closes.
+    let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
+    for _ in 0..10 {
+        relay.socket.send(malformed()).await.unwrap();
+    }
+    let mut ends = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match relay.socket.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(body["type"], "end", "only an end frame may follow: {text}");
+                    ends += 1;
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("socket must close after the invalid frame limit");
+    assert_eq!(ends, 1, "exactly one end frame");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !relay.store.phone_provider_call(&relay.id).unwrap().state.terminal() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    relay.server.abort();
+    // Nine, one valid frame, nine more: the counter reset keeps the socket open.
+    let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
+    for _ in 0..9 {
+        relay.socket.send(malformed()).await.unwrap();
+    }
+    relay.socket.send(prompt("reset")).await.unwrap();
+    read_until_answer(&mut relay.socket, "Answer to: reset", "reset").await;
+    for _ in 0..9 {
+        relay.socket.send(malformed()).await.unwrap();
+    }
+    relay.socket.send(prompt("still open")).await.unwrap();
+    read_until_answer(&mut relay.socket, "Answer to: still open", "still open").await;
+    assert!(
+        !relay
+            .store
+            .phone_call("canonical-owner", &relay.id)
+            .unwrap()
+            .stop_requested
+    );
+    relay.server.abort();
+}
+
+#[test]
+fn ac04_terminal_end_reasons_are_exactly_the_documented_set() {
+    use augmentagent_phone::ingress::EndReason;
+    // A wildcard-free match fails to compile if a variant is added or removed.
+    let name = |reason: EndReason| match reason {
+        EndReason::PeerClosed => "peer_closed",
+        EndReason::TransportError => "transport_error",
+        EndReason::OwnerHangup => "owner_hangup",
+        EndReason::Revoked => "revoked",
+        EndReason::DurationLimit => "duration_limit",
+        EndReason::WorkerFailed => "worker_failed",
+        EndReason::InvalidFrameLimit => "invalid_frame_limit",
+        EndReason::AgentEnd => "agent_end",
+        EndReason::Silence => "silence",
+    };
+    assert_eq!(EndReason::ALL.len(), 9);
+    let mut names: Vec<&str> = EndReason::ALL.iter().map(|r| r.as_str()).collect();
+    names.sort_unstable();
+    let mut expected = vec![
+        "peer_closed",
+        "transport_error",
+        "owner_hangup",
+        "revoked",
+        "duration_limit",
+        "worker_failed",
+        "invalid_frame_limit",
+        "agent_end",
+        "silence",
+    ];
+    expected.sort_unstable();
+    assert_eq!(names, expected);
+    for reason in EndReason::ALL {
+        assert_eq!(reason.as_str(), name(reason));
+    }
 }

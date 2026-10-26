@@ -15,6 +15,10 @@
 # - On build failure we DO NOT restart, so a broken push doesn't take the
 #   daemon down — it keeps running on the old binary until next pull fixes.
 # - All output goes to a per-platform log dir for post-mortem.
+# - #1571: a restart only counts when the unit comes back on
+#   target/release/augmentagent. A systemd drop-in that overrides ExecStart
+#   (never do that to pin a rollout) is reported as DEPLOY PINNED, alerted
+#   once, and the restart is skipped until the override is retired.
 #
 # Build stamp (idempotency fix):
 #   Idempotency used to be keyed purely on `HEAD == origin/main`. If the
@@ -63,6 +67,49 @@ notify_owner() {
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
 
+# #1571 — the unit no longer runs what this script builds. A drop-in that
+# overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
+# daemon) turns every tick into pull + rebuild + a verified bounce back onto
+# the OLD binary. Say exactly that, once per distinct cause (the tick is five
+# minutes; the key holds only stable facts, never systemd's pid/status
+# fields), count it as a restart failure so the stamp stays honest, and do
+# NOT restart while it holds: the bounce only relaunches the frozen binary
+# and kills whatever the auto-PR loop was building. Checked before the
+# deferral gates — it is a read-only `systemctl show`, safe under a live build.
+DAEMON_LAUNCHER="$REPO_ROOT/scripts/run-rs.sh"
+DAEMON_BINARY="$REPO_ROOT/target/release/augmentagent"
+PINNED_ALERT_STAMP="$LOG_DIR/deploy-pinned-alerted"
+report_pinned_deploy() {
+  local cause="$1" dropins msg
+  dropins=$(unit_exec_dropins "$SYSTEMD_UNIT") || dropins=""
+  msg="DEPLOY PINNED: $SYSTEMD_UNIT $cause. ExecStart drop-ins: ${dropins:-none}. \
+Merges to main are built but never run until the override is retired: move \
+the drop-in out of ~/.config/systemd/user/$SYSTEMD_UNIT.d/, then \
+systemctl --user daemon-reload && systemctl --user restart $SYSTEMD_UNIT (#1571)."
+  log "$msg"
+  if [ "$(cat "$PINNED_ALERT_STAMP" 2>/dev/null)" != "$cause|$dropins" ]; then
+    printf '%s' "$cause|$dropins" > "$PINNED_ALERT_STAMP"
+    notify_owner "$msg"
+  fi
+}
+# 0 = the unit will not come back on our binary; reported, do not restart.
+deploy_pinned_elsewhere() {
+  if unit_exec_pinned "$SYSTEMD_UNIT" "$DAEMON_LAUNCHER"; then
+    report_pinned_deploy "has ExecStart overridden to $(unit_exec_path "$SYSTEMD_UNIT") \
+instead of $DAEMON_LAUNCHER; not restarting"
+    return 0
+  fi
+  # A canonical ExecStart whose process still is not our binary (a launcher
+  # that execs elsewhere, a relinked target/) is just as deterministic: the
+  # last bounce proved it, restarting again proves it again at the loop's cost.
+  if ! unit_runs_binary "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+    report_pinned_deploy "is running $SR_LAST_EXE instead of $DAEMON_BINARY; \
+not restarting"
+    return 0
+  fi
+  return 1
+}
+
 # Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
 # restart the corresponding services. On Rust build failure we exit non-zero
 # WITHOUT restarting and WITHOUT advancing the stamp, so the daemon keeps
@@ -95,7 +142,15 @@ apply_update() {
     #
     # If a new binary is ever referenced from production code, add it here.
     # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
-    if ! cargo build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
+    # Once available, the deployed binary coordinates release builds with
+    # gates/pruning too. Bootstrap installs still build directly.
+    # Keep this array nonempty: macOS Bash 3.2 treats expansion of an empty
+    # array as an unbound variable under set -u.
+    local build_driver=(cargo)
+    if "$DAEMON_BINARY" disk build --help >/dev/null 2>&1; then
+      build_driver=("$DAEMON_BINARY" disk build --target-dir "$REPO_ROOT/target" -- cargo)
+    fi
+    if ! "${build_driver[@]}" build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
       log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
       exit 1
     fi
@@ -219,7 +274,10 @@ apply_update() {
         # restart kills it unrecorded. Deferring counts as a restart failure,
         # so the stamp is withheld (#826) and the next tick retries — the
         # binary is already built, so the retry is cheap.
-        if maybe_defer_restart; then
+        if deploy_pinned_elsewhere; then
+          # #1571 — reported above; a restart would relaunch the frozen binary.
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        elif maybe_defer_restart; then
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         elif ! memory_pressure_ok || ! restart_budget_ok; then
           # #903 — same deferral semantics as #844: counts as a restart
@@ -227,9 +285,13 @@ apply_update() {
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
         else
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
-          if restart_unit "$SYSTEMD_UNIT"; then
+          # #1571 — proof now includes "and it is running the binary we
+          # built"; a bounce onto anything else is a pinned deploy.
+          if restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
             record_restart
           else
+            [ -n "$SR_LAST_EXE" ] && report_pinned_deploy "came back running \
+$SR_LAST_EXE instead of $DAEMON_BINARY"
             RESTART_FAILURES=$((RESTART_FAILURES + 1))
           fi
         fi
@@ -282,6 +344,9 @@ will retry via the build-stamp mismatch path."
   fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
+  # #1571 — a verified deploy on our own binary closes any pinned-deploy
+  # alert; the next pin is a new incident and gets a new Discord message.
+  rm -f "$PINNED_ALERT_STAMP"
   # #1410 — a verified deploy is the moment older rollback material stops
   # mattering: keep the newest snapshots and rollback binaries, drop the rest.
   # Housekeeping only; it can never fail the update.

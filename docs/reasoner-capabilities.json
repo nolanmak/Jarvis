@@ -674,6 +674,17 @@
         "whatsapp_phone_session_tests::whatsapp_text_phone_text_preserves_native_session_and_tools"
       ],
       "provider_conformance": "unverified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/phone_agent.rs::summary_opts",
+      "permission_profile": "text",
+      "output_contract": "One JSON object: a call summary of at most 800 characters and at most 10 owner profile facts; validated and written by the phone crate, never by the model",
+      "model_tier": "quality",
+      "tier_rationale": "Post-call memory (#1552) runs once per call in the background; summary and fact quality matter more than latency.",
+      "conformance": [
+        "phone_agent::fast::summarization_runs_the_heavy_agent_once_with_no_tools"
+      ],
+      "provider_conformance": "unverified"
     }
   ]
 }

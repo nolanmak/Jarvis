@@ -126,6 +126,8 @@ pub fn production_state_vars() -> &'static [(&'static str, &'static str)] {
         ("AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE", "attempted.json"),
         ("AUGMENTAGENT_AUTOPR_BASELINE_FILE", "baseline.json"),
         ("AUGMENTAGENT_AUTOPR_COUNTER_FILE", "counter.json"),
+        // #1532 — the draft rotation cursor and the resume/build debt.
+        ("AUGMENTAGENT_AUTOPR_FAIR_FILE", "fair.json"),
         ("AUGMENTAGENT_AUTOPR_HISTORY_FILE", "history.json"),
         // #1029 — the record of PRs this box opened. Added because the test
         // below rediscovered it from `self_improve.rs` and failed until the

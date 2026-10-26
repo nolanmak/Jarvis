@@ -59,9 +59,12 @@ unit_main_pid() {
   printf '%s' "${pid:-0}"
 }
 
-# Restart `$1` and verify it actually bounced. 0 only on proof.
+# Restart `$1` and verify it actually bounced. 0 only on proof. With `$2`
+# (#1571) the proof also requires the new main process to be running that
+# binary: a bounce onto a frozen copy is a failed restart, not a deploy.
 restart_unit() {
-  local unit="$1" before after
+  local unit="$1" expected="${2:-}" before after
+  SR_LAST_EXE=""
   unit_is_registered "$unit" || return 1
 
   before=$(unit_main_pid "$unit")
@@ -82,6 +85,11 @@ restart_unit() {
 
   if ! systemctl --user is-active --quiet "$unit"; then
     _sr_log "unit $unit is not active after restart"
+    return 1
+  fi
+
+  if [ -n "$expected" ] && ! unit_runs_binary "$unit" "$expected"; then
+    _sr_log "restart of $unit came back running $SR_LAST_EXE, not $expected"
     return 1
   fi
 
@@ -136,6 +144,103 @@ restart_agent() {
   fi
   _sr_log "restarted $label (pid $before -> $after)"
   return 0
+}
+
+# --- #1571: the unit must launch the binary the updater built ---------------
+#
+# 2026-10-20 → 10-24: a rollout session installed a systemd drop-in that
+# replaced ExecStart with a wrapper exec'ing a frozen COPY of the daemon.
+# Every tick the updater pulled, rebuilt and verifiably bounced the unit — and
+# the unit came back on the copy. The stamp was rightly withheld, but the only
+# signal was "restart could not be verified" every five minutes for four days,
+# while each forced restart killed whatever the auto-PR loop was building.
+#
+# Every reader here fails OPEN when the evidence cannot be read (launchd, no
+# /proc, systemd unreachable, a stub): a missing answer is not a pinned
+# deploy. Under `set -e` none of them may fail either, so each pipeline
+# swallows its own systemctl error.
+#   unit_exec_pinned  — ExecStart's `path=` is not the repo launcher.
+#   unit_runs_binary  — the main process's executable is not the binary we
+#                       built. A Type=simple unit's MainPID is the launcher
+#                       shell until it execs the daemon (run-rs.sh mounts the
+#                       vault and runs a PDF preflight first), so a fresh
+#                       restart is polled until it settles before it is judged.
+
+# Effective ExecStart of `$1` as systemd prints it: `{ path=/x ; argv[]=… }`.
+unit_exec_start() {
+  { systemctl --user show "$1" -p ExecStart --value 2>/dev/null || true; } | head -n1
+}
+
+# Drop-ins layered on `$1`, space-separated; empty when there are none.
+unit_dropins() {
+  { systemctl --user show "$1" -p DropInPaths --value 2>/dev/null || true; } | head -n1
+}
+
+# Only the drop-ins on `$1` that override ExecStart. An `Environment=` file
+# (Discord credentials, say) is legitimate and must not be named for removal.
+unit_exec_dropins() {
+  local f out=""
+  for f in $(unit_dropins "$1"); do
+    grep -q '^ExecStart=' "$f" 2>/dev/null && out="$out${out:+ }$f"
+  done
+  printf '%s' "$out"
+}
+
+# The resolved `path=` of `$1`'s effective ExecStart; empty when unreadable.
+# Only a real `{ path=… ; … }` answer counts — anything else is no evidence.
+unit_exec_path() {
+  local line p
+  line=$(unit_exec_start "$1")
+  case "$line" in *path=*) ;; *) return 0 ;; esac
+  p=${line#*path=}
+  p=${p%% ;*}
+  p=${p%% \}*}
+  [ -n "$p" ] || return 0
+  readlink -f "$p" 2>/dev/null || printf '%s' "$p"
+}
+
+# 0 when `$1`'s ExecStart verifiably does not run the launcher `$2` (compared
+# as resolved paths, so a frozen copy of the whole checkout — whose wrapper
+# is also called scripts/run-rs.sh — still reads as pinned).
+unit_exec_pinned() {
+  local got want
+  got=$(unit_exec_path "$1")
+  [ -n "$got" ] || return 1
+  want=$(readlink -f "$2" 2>/dev/null) || want="$2"
+  [ "$got" != "$want" ]
+}
+
+# Resolved executable of `$1`'s MainPID, or empty when it cannot be read.
+# Linux only (/proc); AUGMENTAGENT_PROC_ROOT lets tests fake the tree. A
+# binary rebuilt under a running process reads as `/path (deleted)` — that is
+# a pending restart, not a different binary, so the suffix is dropped.
+unit_exe_path() {
+  local pid exe
+  pid=$(unit_main_pid "$1")
+  [ "$pid" != 0 ] || return 0
+  exe=$(readlink "${AUGMENTAGENT_PROC_ROOT:-/proc}/$pid/exe" 2>/dev/null) || return 0
+  printf '%s' "${exe% (deleted)}"
+}
+
+# Does `$1`'s main process run `$2`? 0 = yes, or the answer cannot be read;
+# 1 = it verifiably runs something else, which is left in SR_LAST_EXE for the
+# caller's report (empty on every other outcome). Polls for up to
+# AUGMENTAGENT_EXE_SETTLE_SECS so a launcher mid-exec is not misjudged.
+SR_LAST_EXE=""
+unit_runs_binary() {
+  local unit="$1" expected="$2" exe want deadline
+  SR_LAST_EXE=""
+  want=$(readlink -f "$expected" 2>/dev/null) || want="$expected"
+  deadline=$(( $(date +%s) + ${AUGMENTAGENT_EXE_SETTLE_SECS:-15} ))
+  while :; do
+    exe=$(unit_exe_path "$unit")
+    [ -n "$exe" ] || return 0
+    [ "$exe" = "$want" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep "${AUGMENTAGENT_RESTART_POLL_SECS:-0.5}"
+  done
+  SR_LAST_EXE="$exe"
+  return 1
 }
 
 # May the build stamp be advanced? Only when no required restart failed.
@@ -340,9 +445,8 @@ _gate_min_free_mb() {
 #
 # #1407 — in tiers, cheapest loss first: `incremental/`, then artifacts no
 # compile has needed for GATE_CACHE_STALE_DAYS, and only then the whole
-# `debug/`. The wipe used to be the only step, and it costs the next gate a
-# cold rebuild; it is now the backstop for a binary that predates
-# `disk prune`, fails, or cannot get under the cap.
+# `debug/`, under the pruner's storage lease. An old, failed, or busy pruner
+# defers cleanup; the updater never bypasses exclusion with its own wipe.
 #
 # Every tier keeps the idle-only rule. Cargo takes its build lock per
 # profile dir, but nothing stops a compile from reading an `incremental/`
@@ -376,7 +480,8 @@ trim_gate_cache_if_idle() {
     fi
     sz=$after
   fi
-  _sr_log "gate cache ${sz}MB over ${cap}MB cap and lanes idle; dropping debug/ (next gate cold-rebuilds once)"
-  rm -rf "$GATE_CACHE_DIR/debug"
-  return 0
+  # An old/missing/failed pruner cannot participate in the storage lease.
+  # Never fall back to an uncoordinated rm beneath a newly admitted build.
+  _sr_log "gate cache cleanup deferred: pruner unavailable, busy, or unable to reach ${cap}MB; retrying next tick"
+  return 1
 }

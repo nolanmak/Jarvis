@@ -139,3 +139,37 @@ test('dashboard persistence adapters save the correct provider and propagate fai
   assert.equal(slack[1].connectionId,'slack-id'); assert.equal(slack[1].entityId,'owner');
   await deps.persist('calendar','calendar-id','owner',{}); assert.equal(context.calendarStatusCache,null);
 });
+
+test('gmail start goes to the operator\'s own Google client when configured and is saved by the callback', async t => {
+  const f = await fixture(t);
+  const attempts = new Map();
+  let configured = true;
+  f.deps.google = {
+    configured: () => configured,
+    start: async () => {
+      const attempt_id = 'aaaaaaaa-0000-4000-8000-00000000000a';
+      attempts.set(attempt_id, {attempt_id, status: 'pending'});
+      return {attempt_id, auth_url: 'https://accounts.google.com/o/oauth2/v2/auth?state=' + attempt_id, expires_at: new Date(Date.now() + 600000).toISOString()};
+    },
+    status: id => attempts.get(id) ?? null,
+  };
+  const start = await f.post('start', {provider: 'gmail'});
+  assert.equal(start.status, 201);
+  assert.equal(start.body.transport, 'google');
+  assert.match(start.body.auth_url, /^https:\/\/accounts\.google\.com\//);
+  assert.equal(f.links.length, 0, 'no Composio link is created for a Google connect');
+  const {attempt_id} = start.body;
+  const pending = await f.post('status', {attempt_id});
+  assert.equal(pending.body.status, 'PENDING'); assert.equal(pending.body.connected, false);
+  assert.equal((await f.post('complete', {attempt_id})).status, 409);
+  attempts.set(attempt_id, {attempt_id, status: 'connected', email: 'owner@example.com', entity_id: 'google:owner@example.com'});
+  const done = await f.post('complete', {attempt_id});
+  assert.equal(done.status, 200); assert.equal(done.body.connected, true); assert.equal(done.body.entity_id, 'google:owner@example.com');
+  attempts.set(attempt_id, {attempt_id, status: 'failed', error: 'access_denied'});
+  const failed = await f.post('status', {attempt_id});
+  assert.equal(failed.body.status, 'FAILED'); assert.equal(failed.body.error, 'access_denied');
+  // Other providers, and Gmail without a Google client, still use Composio.
+  configured = false;
+  const composio = await f.post('start', {provider: 'gmail'});
+  assert.equal(composio.status, 201); assert.equal(composio.body.transport, undefined); assert.equal(f.links.length, 1);
+});

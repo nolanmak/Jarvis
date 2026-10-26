@@ -28,6 +28,7 @@ pub mod images;
 pub mod ingest;
 pub mod mcp;
 pub mod memory_nudge;
+pub mod outbound_scrub;
 pub mod prompt;
 pub mod providers;
 pub mod public_report;
@@ -95,3 +96,4 @@ pub mod surface_conformance;
 pub mod surface_turn;
 
 pub mod phone_agent;
+pub mod phone_fast;

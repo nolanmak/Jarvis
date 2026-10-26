@@ -142,3 +142,50 @@ fn adding_phone_tables_preserves_sessions_history_and_pending_approvals() {
         }
     }
 }
+
+// #1556: a database whose end-reason table was created by #1557 (before
+// 'silence' was allowed) is rebuilt on open, keeping its rows.
+#[test]
+fn end_reason_table_from_1557_is_rebuilt_to_allow_silence_and_keeps_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgrade.db");
+    drop(Store::open(&path).unwrap());
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE phone_call_end_notices;
+             DROP TABLE phone_call_end_reasons;
+             CREATE TABLE phone_call_end_reasons (
+                 call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+                 reason TEXT NOT NULL CHECK(reason IN ('owner_goodbye','task_complete','owner_request','relay_ended_unknown')),
+                 recorded_ms INTEGER NOT NULL
+             );
+             INSERT INTO phone_calls(id,owner,request_id,conversation,destination,state,created_ms,ended_ms,max_duration_seconds)
+                 VALUES('call-old','owner','r1','chat','synthetic','completed',1,4,60),
+                       ('call-new','owner','r2','chat','synthetic','connected',2,NULL,60);
+             INSERT INTO phone_call_end_reasons VALUES('call-old','owner_goodbye',5);",
+        )
+        .unwrap();
+        assert!(conn
+            .execute("INSERT INTO phone_call_end_reasons VALUES('call-new','silence',6)", [])
+            .is_err());
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.phone_end_reason("call-old").unwrap().as_deref(),
+        Some("owner_goodbye")
+    );
+    assert!(store
+        .phone_record_end_with_notice("call-new", "silence", 7)
+        .unwrap());
+    assert_eq!(
+        store.phone_end_reason("call-new").unwrap().as_deref(),
+        Some("silence")
+    );
+    // The rebuild runs once; reopening keeps everything.
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.phone_end_notices_due(10).unwrap().len(), 1);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(rows(&conn, "phone_call_end_reasons").len(), 2);
+}

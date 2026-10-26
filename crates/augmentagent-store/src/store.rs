@@ -1639,6 +1639,18 @@ impl Store {
                 [],
             )?;
         }
+        // Inbound fetch cursor: the wall-clock of the last *successful*
+        // unread fetch for the entity. `lastPolledAt` is overwritten by
+        // failed polls too, so it can't serve as a cursor. The poller turns
+        // this into a Gmail `after:` filter so each tick only pages through
+        // mail that arrived since the previous tick instead of re-reading
+        // the whole unread backlog every cycle.
+        if !column_exists(conn, "gmail_accounts", "lastOkPolledAt")? {
+            conn.execute(
+                "ALTER TABLE gmail_accounts ADD COLUMN lastOkPolledAt INTEGER",
+                [],
+            )?;
+        }
 
         // #797 — Composio returns Gmail user rate limits in an HTTP-success
         // envelope. This is intentionally separate from account liveness: a
@@ -2587,6 +2599,8 @@ impl Store {
         // #1101 — handle → person cache derived from the wiki identity index
         // (rebuildable any time via `augmentagent messages resolve-people`),
         // plus a participants view joining it onto the message index.
+        // `message_person_links` mirrors `household:` front matter (#1539),
+        // both directions, so a two-name query can narrow to a documented pair.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message_people (\
                  handle     TEXT PRIMARY KEY,\
@@ -2599,6 +2613,11 @@ impl Store {
                  PRIMARY KEY (person_key, name)\
              );\
              CREATE INDEX IF NOT EXISTS idx_message_person_names_name ON message_person_names(name);\
+             CREATE TABLE IF NOT EXISTS message_person_links (\
+                 person_key TEXT NOT NULL,\
+                 other_key  TEXT NOT NULL,\
+                 PRIMARY KEY (person_key, other_key)\
+             );\
              CREATE TABLE IF NOT EXISTS message_people_meta (\
                  key   TEXT PRIMARY KEY,\
                  value TEXT NOT NULL\
@@ -3340,12 +3359,84 @@ impl Store {
         at_ms: i64,
     ) -> StoreResult<()> {
         let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
-            "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = ?2 \
-             WHERE entityId = ?3",
-            rusqlite::params![at_ms, if ok { 1 } else { 0 }, entity_id],
-        )?;
+        if ok {
+            guard.execute(
+                "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = 1, \
+                 lastOkPolledAt = ?1 WHERE entityId = ?2",
+                rusqlite::params![at_ms, entity_id],
+            )?;
+        } else {
+            guard.execute(
+                "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = 0 \
+                 WHERE entityId = ?2",
+                rusqlite::params![at_ms, entity_id],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Wall-clock (epoch ms) of the last successful unread fetch for a Gmail
+    /// entity, or `None` when it has never completed one (fresh connection,
+    /// or a store predating the column). The inbound poller uses it to bound
+    /// the `is:unread` query so a mailbox with hundreds of old unread
+    /// messages costs one small page per tick, not the full backlog.
+    pub fn gmail_inbound_cursor_ms(&self, entity_id: &str) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<Option<i64>> = guard
+            .query_row(
+                "SELECT lastOkPolledAt FROM gmail_accounts WHERE entityId = ?1",
+                params![entity_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(row.flatten())
+    }
+
+    /// #1573 — register (or re-activate) a mailbox connected through the
+    /// operator's own Google OAuth client. Keyed by address, so a reconnect
+    /// is idempotent. Any OTHER active row for the same address — a Composio
+    /// connection to the same inbox — is deactivated so exactly one
+    /// transport polls it. Returns the `google:<address>` entity id.
+    pub fn upsert_google_gmail_account(&self, email: &str) -> StoreResult<String> {
+        let email = email.trim().to_ascii_lowercase();
+        let entity_id = format!("google:{email}");
+        let id = format!("google-{email}");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE gmail_accounts SET active = 0 \
+             WHERE lower(email) = ?1 AND entityId <> ?2 AND active = 1",
+            params![email, entity_id],
+        )?;
+        let updated = tx.execute(
+            "UPDATE gmail_accounts SET active = 1, email = ?2, connectionId = 'google-oauth' \
+             WHERE entityId = ?1",
+            params![entity_id, email],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO gmail_accounts (id, connectionId, email, label, entityId, active, createdAt) \
+                 VALUES (?1, 'google-oauth', ?2, ?2, ?3, 1, ?4)",
+                params![id, email, entity_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(entity_id)
+    }
+
+    /// #1573 — stop polling a mailbox (Disconnect). The row stays for the
+    /// ledgers that reference it; returns whether it was active.
+    pub fn deactivate_gmail_account(&self, entity_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE gmail_accounts SET active = 0 WHERE entityId = ?1 AND active = 1",
+            params![entity_id],
+        )?;
+        Ok(n > 0)
     }
 
     /// #797 — persist Composio's per-entity Gmail fetch cooldown so polling,
@@ -8164,6 +8255,18 @@ impl Store {
         }
     }
 
+    /// Upsert one `config` row — the same table and shape the dashboard's
+    /// `setConfig` writes, so values set from the CLI show up there too.
+    pub fn set_config(&self, key: &str, value: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO config (key, value, updatedAt) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt",
+            params![key, value, now_millis()],
+        )?;
+        Ok(())
+    }
+
     /// Account handles of every registered SocialAPI.ai account, lowercased
     /// and stripped of a leading `@`. This is the set of identities that count
     /// as "us" when deciding whether an inbound-looking DM is really our own
@@ -9115,6 +9218,94 @@ mod tests {
             None,
             "expired cooldowns must stop blocking requests"
         );
+    }
+
+    /// The inbound cursor only moves on a *successful* fetch, so a run of
+    /// rate-limited ticks can never advance it past mail we have not read.
+    #[test]
+    fn gmail_inbound_cursor_tracks_only_successful_polls() {
+        let (store, _file) = fresh_store();
+        let sql = |q: &str| store.conn.lock().unwrap().execute(q, []).unwrap();
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g1', 'c1', 'owner@example.com', 'acct-a', 1, 0)");
+
+        assert_eq!(store.gmail_inbound_cursor_ms("acct-a").unwrap(), None);
+        assert_eq!(store.gmail_inbound_cursor_ms("unknown").unwrap(), None);
+
+        store.set_gmail_account_poll_outcome("acct-a", true, 1_000).unwrap();
+        assert_eq!(store.gmail_inbound_cursor_ms("acct-a").unwrap(), Some(1_000));
+
+        store.set_gmail_account_poll_outcome("acct-a", false, 2_000).unwrap();
+        assert_eq!(
+            store.gmail_inbound_cursor_ms("acct-a").unwrap(),
+            Some(1_000),
+            "a failed poll must not advance the cursor"
+        );
+        let (polled, ok): (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT lastPolledAt, lastPollOk FROM gmail_accounts WHERE entityId = 'acct-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((polled, ok), (2_000, 0), "liveness columns still track every poll");
+
+        store.set_gmail_account_poll_outcome("acct-a", true, 3_000).unwrap();
+        assert_eq!(store.gmail_inbound_cursor_ms("acct-a").unwrap(), Some(3_000));
+    }
+
+    /// #1573 — connecting a mailbox through Google registers one active row
+    /// per address, retires a Composio row for the same inbox, and is
+    /// idempotent across reconnects.
+    #[test]
+    fn google_gmail_account_upsert_dedupes_by_address_and_retires_the_composio_row() {
+        let (store, _file) = fresh_store();
+        let sql = |q: &str| store.conn.lock().unwrap().execute(q, []).unwrap();
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g1', 'c1', 'Owner@Example.com', 'augmentagent-1', 1, 0)");
+        sql("INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+             VALUES ('g2', 'c2', 'other@example.com', 'augmentagent-2', 1, 0)");
+
+        let entity = store.upsert_google_gmail_account("Owner@Example.com").unwrap();
+        assert_eq!(entity, "google:owner@example.com");
+        let active: Vec<(String, String)> = store
+            .get_active_gmail_accounts()
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.entity_id, a.email))
+            .collect();
+        assert!(active.contains(&("google:owner@example.com".into(), "owner@example.com".into())));
+        assert!(active.contains(&("augmentagent-2".into(), "other@example.com".into())));
+        assert!(
+            !active.iter().any(|(e, _)| e == "augmentagent-1"),
+            "the Composio row for the same inbox must stop polling: {active:?}"
+        );
+
+        // Reconnect: same row, still exactly one active row for the address.
+        assert_eq!(store.upsert_google_gmail_account("owner@example.com").unwrap(), entity);
+        let n: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM gmail_accounts WHERE lower(email) = 'owner@example.com' AND active = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Disconnect stops polling but keeps the row; a second call is a no-op.
+        assert!(store.deactivate_gmail_account(&entity).unwrap());
+        assert!(!store.deactivate_gmail_account(&entity).unwrap());
+        assert!(!store
+            .get_active_gmail_accounts()
+            .unwrap()
+            .iter()
+            .any(|a| a.entity_id == entity));
     }
 
     /// Round-trip plus the two things the read path depends on: rows outside
@@ -12200,6 +12391,15 @@ mod tests {
     /// #525 — the dashboard's paste-your-key card writes here; the daemon has
     /// to be able to read it back or the documented primary setup flow leaves
     /// the channel dead.
+    #[test]
+    fn set_config_upserts_and_round_trips() {
+        let (s, _f) = fresh_store();
+        s.set_config("calendar_auto_accept", "on").unwrap();
+        assert_eq!(s.get_config("calendar_auto_accept").unwrap().as_deref(), Some("on"));
+        s.set_config("calendar_auto_accept", "off").unwrap();
+        assert_eq!(s.get_config("calendar_auto_accept").unwrap().as_deref(), Some("off"));
+    }
+
     #[test]
     fn get_config_reads_dashboard_written_keys() {
         let (s, _f) = fresh_store();

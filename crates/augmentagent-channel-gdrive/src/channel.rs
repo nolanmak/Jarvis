@@ -4,7 +4,7 @@ use std::time::Duration;
 use augmentagent_approval_discord::ApprovalBroker;
 use augmentagent_store::{Email, Store};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::composio::ComposioClient;
 use crate::drive::{get_start_page_token, list_changes};
@@ -15,6 +15,15 @@ pub const DEFAULT_POLL_SECS: u64 = 30 * 60;
 /// Safety cap on pages walked per account per tick (avoids an unbounded
 /// backlog walk pinning a tick).
 const MAX_PAGES: usize = 20;
+
+/// Composio rejects some perfectly valid Drive changes cursors at its own
+/// request-validation layer (observed 2026-10: "Invalid request data provided
+/// - Value error, pageToken '52' appears to be an invalid simple number ... on
+/// parameter `pageToken`"). Match on the shape, not the exact wording.
+pub(crate) fn is_rejected_page_token(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("pagetoken") && (m.contains("invalid request data") || m.contains("invalid simple number"))
+}
 
 pub struct GDriveChannelConfig {
     pub poll_interval: Duration,
@@ -123,6 +132,30 @@ impl GDriveChannel {
             loop {
                 let page = match list_changes(&self.composio, entity, &cursor).await {
                     Ok(p) => p,
+                    Err(e) if is_rejected_page_token(&e.to_string()) => {
+                        // Composio's request validator sometimes refuses a
+                        // short numeric changes cursor ("pageToken '52'
+                        // appears to be an invalid simple number") even
+                        // though Drive issued it. Retrying the same token
+                        // every tick burns a tool call for nothing, so
+                        // re-baseline from a fresh start token instead.
+                        match get_start_page_token(&self.composio, entity).await {
+                            Ok(t) => {
+                                if self.config.dry_run {
+                                    info!(account = %label, "gdrive dry-run: would re-baseline at {t} after rejected cursor {cursor}");
+                                } else {
+                                    self.store.set_drive_sync_token(entity, &t)?;
+                                    warn!(account = %label, "gdrive: cursor {cursor} rejected by composio; re-baselined at {t}: {e:#}");
+                                }
+                                outcome.baselined += 1;
+                            }
+                            Err(e2) => {
+                                error!(account = %label, "gdrive re-baseline after rejected cursor {cursor} failed: {e2:#} (original: {e:#})");
+                                outcome.errors += 1;
+                            }
+                        }
+                        break;
+                    }
                     Err(e) => {
                         error!(account = %label, "gdrive list_changes failed: {e:#}");
                         outcome.errors += 1;
@@ -224,6 +257,15 @@ fn render_change(name: &str, link: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_page_token_matches_composio_validator_wording() {
+        assert!(is_rejected_page_token(
+            "composio: GOOGLEDRIVE_LIST_CHANGES failed: \"Invalid request data provided\n- Value error, pageToken '52' appears to be an invalid simple number. Valid tokens must be obtained from GET_CHANGES_START_PAGE_TOKEN ... on parameter `pageToken`\""
+        ));
+        assert!(!is_rejected_page_token("composio: GOOGLEDRIVE_LIST_CHANGES → 500: upstream"));
+        assert!(!is_rejected_page_token("http: connection reset"));
+    }
+
     use super::*;
 
     #[test]

@@ -247,6 +247,13 @@ impl SkillPrompt {
 /// Max note titles named in a triage/draft hint (#1060).
 pub const NOTES_HINT_MAX: usize = 3;
 
+/// The two halves of the [`notes_hint`] sentence. They exist as constants so
+/// [`crate::outbound_scrub`] can recognise an echo of the hint in a generated
+/// body without a retyped copy that could drift from the generator (#1579).
+pub const NOTES_HINT_PREFIX: &str = "The owner keeps notes of their own on this topic:";
+/// See [`NOTES_HINT_PREFIX`].
+pub const NOTES_HINT_SUFFIX: &str = "Treat it as a topic they are actively tracking.";
+
 /// A hint line naming the owner's own notes that look related to an inbound
 /// message. Empty string when nothing matched — callers append this to the
 /// wiki hint, and an empty section is worse than none.
@@ -264,7 +271,7 @@ pub fn notes_hint(titles: &[String]) -> String {
         .map(|t| format!("\"{}\"", sanitize_untrusted(t)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("- The owner keeps notes of their own on this topic: {listed}. Treat it as a topic they are actively tracking.")
+    format!("- {NOTES_HINT_PREFIX} {listed}. {NOTES_HINT_SUFFIX}")
 }
 
 /// Build the triage user message. Minimal — just the email + any learned
