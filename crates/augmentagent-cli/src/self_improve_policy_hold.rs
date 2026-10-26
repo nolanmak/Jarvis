@@ -133,6 +133,10 @@ pub(super) async fn filter(repo: &Path, candidates: &mut Vec<adoption::AdoptedPr
     };
     let mut eligible = Vec::with_capacity(candidates.len());
     for candidate in candidates.drain(..) {
+        if let Some(blocker) = adjudicated_dependency(repo, &candidate).await {
+            if let Some(conn) = &status { let _ = observe(conn, &candidate.repository, candidate.pr, &candidate.head, Some(blocker), chrono::Utc::now().timestamp_millis()); }
+            continue;
+        }
         let Some(issue) = candidate.source_issue else {
             eligible.push(candidate);
             continue;
@@ -440,4 +444,32 @@ else: sys.exit(2)
             .unwrap();
         assert_eq!(count, 0);
     }
+}
+
+
+/// Genuine requirement/evidence dependencies are free on unchanged inputs.
+/// A remote head, PR request, or linked issue request change reopens repair.
+async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr) -> Option<&'static str> {
+    let store = crate::autoship_workflow::WorkflowStore::open(&workflow::path()).ok()?;
+    let id = store.resolve_pr(&candidate.repository, candidate.pr).ok()??;
+    let snapshot = store.snapshot(&id).ok()??;
+    let reason = match snapshot.checkpoint.next.action.as_str() {
+        "dependency_owner_requirement_decision" => "owner-requirement-conflict",
+        "dependency_new_adjudication_evidence" => "new-adjudication-evidence-required",
+        _ => return None,
+    };
+    let marker = snapshot.checkpoint.evidence.iter().filter_map(|item|serde_json::from_str::<serde_json::Value>(item).ok())
+        .find(|value|value["kind"] == "adjudicated_dependency");
+    let Some(marker) = marker else { return (snapshot.checkpoint.binding.head == candidate.head).then_some(reason); };
+    if marker["remote_head"].as_str() != Some(candidate.head.as_str()) { return None; }
+    let digest = crate::autoship_review::digest(candidate.body.as_bytes());
+    if marker["pr_body_hash"].as_str() != Some(digest.as_str()) { return None; }
+    if let (Some(issue), Some(expected)) = (candidate.source_issue,marker["request_hash"].as_str()) {
+        match run("gh", &["issue", "view", &issue.to_string(), "--json", "title,body"], repo).await {
+            Ok((true, current, _)) if crate::autoship_review::digest(current.as_bytes()) != expected => return None,
+            Ok((true, _, _)) => (),
+            _ => return Some("dependency-evidence-unavailable"),
+        }
+    }
+    Some(reason)
 }

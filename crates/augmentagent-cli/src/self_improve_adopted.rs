@@ -206,7 +206,7 @@ async fn execute(
             recovery::commit_candidate_named(worktree, "autoship: reconcile PR upstream").await?;
         }
     }
-    let criteria: Vec<String> = prepared
+    let mut criteria: Vec<String> = prepared
         .proposal
         .contract
         .criteria
@@ -218,9 +218,22 @@ async fn execute(
     let mut native_sessions = None;
     loop {
         let receipt = acceptance::verify_with_repair_for(
-            reasoner, source, &pr.title, worktree, &mut prepared, &control, guard,
+            reasoner,
+            source,
+            &pr.title,
+            worktree,
+            &mut prepared,
+            &control,
+            guard,
         )
         .await?;
+        criteria = prepared
+            .proposal
+            .contract
+            .criteria
+            .iter()
+            .map(|criterion| criterion.requirement.clone())
+            .collect();
         verification_gate(worktree).await?;
         guard
             .transition(Stage::Review, "adopted_review", "collect_reviews", 0)
@@ -246,6 +259,28 @@ async fn execute(
         )
         .await;
         if let Some(structured) = &review.structured {
+            if acceptance::apply_adjudicated_amendment(
+                reasoner,
+                source,
+                &pr.title,
+                worktree,
+                &mut prepared,
+                &control,
+                structured,
+                guard,
+            )
+            .await?
+            {
+                previous = None;
+                criteria = prepared
+                    .proposal
+                    .contract
+                    .criteria
+                    .iter()
+                    .map(|criterion| criterion.requirement.clone())
+                    .collect();
+                continue;
+            }
             previous = Some(structured.clone());
         }
         if let Some(verdict) = review.recorded_verdict() {
@@ -366,10 +401,13 @@ async fn execute(
             }
             guard.validate_binding(&binding).await?;
             let intent = guard.intent(OperationKind::MergePr)?;
-            let mutation=publication::merge_exact(repo,&pr.repository,pr.pr,&binding.head,&intent).await;
-            if let Ok(Some(receipt))=&mutation { guard.record_merge_mutation(&intent,&serde_json::to_value(receipt)?)?; }
-            let ok=mutation.is_ok();
-            let error=mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
+            let mutation =
+                publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent).await;
+            if let Ok(Some(receipt)) = &mutation {
+                guard.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
+            }
+            let ok = mutation.is_ok();
+            let error = mutation.err().map(|e| format!("{e:#}")).unwrap_or_default();
             anyhow::ensure!(
                 sweep_merged_exact(repo, pr.pr, &binding.head).await,
                 "merge not observed (command={ok}): {error}"
@@ -414,7 +452,9 @@ async fn execute(
         if !review.available || round >= revise_rounds() {
             break;
         }
-        let episode_dispatch = strategy.as_ref().map(|session| (session.epoch.clone(), session.action.clone()));
+        let episode_dispatch = strategy
+            .as_ref()
+            .map(|session| (session.epoch.clone(), session.action.clone()));
         let (opts,prompt) = match strategy {
             Some(session) => (session.opts,session.prompt),
             None => (fix_opts(worktree.to_path_buf()),format!("Address verified review findings for this PR. Preserve pinned acceptance; do not weaken verifiers.\n{request}\n{}",review.notes)),
@@ -525,9 +565,14 @@ pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
         }
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
         let intent = lease.merge_intent()?;
-        let mutation=publication::merge_exact(repo,&pr.repository,pr.pr,&pr.head,&intent).await;
-        if let Ok(Some(receipt))=&mutation { lease.record_merge_mutation(&intent,&serde_json::to_value(receipt)?)?; }
-        if let Err(error)=&mutation { warn!(pr=pr.pr,"adopted merge awaits reconciliation: {error:#}"); }
+        let mutation =
+            publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent).await;
+        if let Ok(Some(receipt)) = &mutation {
+            lease.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
+        }
+        if let Err(error) = &mutation {
+            warn!(pr = pr.pr, "adopted merge awaits reconciliation: {error:#}");
+        }
         if sweep_merged_exact(repo, pr.pr, &pr.head).await {
             lease.merged(&intent, pr.pr)?;
             merged += 1;

@@ -179,7 +179,10 @@ pub(super) fn episode_retries(
             && snapshot.checkpoint.next.eligible_at_ms <= now
             && matches!(
                 snapshot.checkpoint.next.action.as_str(),
-                "rescope_remaining_findings" | "complete_review_or_adjudication"
+                "rescope_remaining_findings"
+                    | "complete_review_or_adjudication"
+                    | "retry_adjudicated_amendment"
+                    | "verify_new_revision"
             )
         {
             result.insert(candidate.pr);
@@ -283,13 +286,19 @@ pub(super) async fn origin_for_candidate(
     let fresh = || -> Result<ReviewOrigin> {
         let binding = workflow.binding();
         Ok(ReviewOrigin::FreshSession {
-            workflow_id: workflow.id().to_owned(), candidate_head: binding.head.clone(),
-            contract_hash: binding.contract.clone(), evidence_hash: binding.evidence_hash.clone(),
+            workflow_id: workflow.id().to_owned(),
+            candidate_head: binding.head.clone(),
+            contract_hash: binding.contract.clone(),
+            evidence_hash: binding.evidence_hash.clone(),
             receipt: workflow.fresh_review_origin_receipt()?,
         })
     };
-    let Some(pr) = workflow.pr()? else { return fresh(); };
-    let Some(owned) = lookup(&workflow::path(), workflow.repository(), pr)? else { return fresh(); };
+    let Some(pr) = workflow.pr()? else {
+        return fresh();
+    };
+    let Some(owned) = lookup(&workflow::path(), workflow.repository(), pr)? else {
+        return fresh();
+    };
     anyhow::ensure!(
         owned.ready_for_review(),
         "adopted PR requires parent/base reconciliation"

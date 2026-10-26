@@ -157,6 +157,27 @@ pub(crate) async fn apply(
         bound.len() <= 2 * 1024 * 1024,
         "adjudicated amendment evidence exceeds bound"
     );
+    // Preserve the exact final authority before any contract mutation; resumed
+    // loops discard in-memory review state after the revision changes.
+    let artifact = control.join(format!(
+        "adjudicated-contract-{}.json",
+        amendment::digest(bound.as_bytes())
+    ));
+    if artifact.exists() {
+        ensure!(
+            std::fs::read(&artifact)? == bound.as_bytes(),
+            "final adjudication artifact changed"
+        );
+    } else {
+        use std::io::Write;
+        let mut staged = tempfile::NamedTempFile::new_in(control)?;
+        staged.write_all(bound.as_bytes())?;
+        staged.as_file().sync_all()?;
+        staged
+            .persist_noclobber(&artifact)
+            .map_err(|error| error.error)?;
+        std::fs::File::open(control)?.sync_all()?;
+    }
     let result = amendment::try_amend(
         reasoner,
         source,
@@ -202,13 +223,46 @@ pub(crate) async fn apply(
             } else {
                 ("adjudicated_amendment_retry", "retry_adjudicated_amendment")
             };
+            let mut evidence = vec![detail.clone()];
+            if action.starts_with("dependency_") {
+                if let Some(pr) = workflow.pr()? {
+                    if let Ok((true, raw, _)) = run(
+                        "gh",
+                        &["pr", "view", &pr.to_string(), "--json", "headRefOid,body"],
+                        worktree,
+                    )
+                    .await
+                    {
+                        if let Ok(remote) = serde_json::from_str::<serde_json::Value>(&raw) {
+                            let request_hash = if let AcceptanceSource::Issue(issue) = source {
+                                match run(
+                                    "gh",
+                                    &["issue", "view", &issue.to_string(), "--json", "title,body"],
+                                    worktree,
+                                )
+                                .await
+                                {
+                                    Ok((true, request, _)) => {
+                                        Some(amendment::digest(request.as_bytes()))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            evidence.push(serde_json::json!({"kind":"adjudicated_dependency","remote_head":remote["headRefOid"],
+                                "pr_body_hash":amendment::digest(remote["body"].as_str().unwrap_or("").as_bytes()),"request_hash":request_hash}).to_string());
+                        }
+                    }
+                }
+            }
             workflow
                 .checkpoint(
                     crate::autoship_workflow::Stage::Scope,
                     outcome,
                     action,
                     chrono::Utc::now().timestamp_millis() + 300_000,
-                    &[detail.clone()],
+                    &evidence,
                 )
                 .await?;
             Err(error).context(format!("final contract ruling action: {action}"))

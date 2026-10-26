@@ -7034,6 +7034,7 @@ async fn resume_draft_pr(
 
         let acceptance_receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
             &mut prepared_acceptance, &acceptance_control, &mut workflow).await?;
+        resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
         workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
@@ -7070,6 +7071,13 @@ async fn resume_draft_pr(
             &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
             0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
         if let Some(structured) = &independent.structured {
+            if acceptance::apply_adjudicated_amendment(reasoner, crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+                &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
+                previous_review = None; prior_qa = None; prior_notes = None;
+                resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                verification_gate(&worktree).await?;
+                continue;
+            }
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
                 &serde_json::to_string(structured)?)?;
             previous_review = Some(structured.clone());
@@ -8560,6 +8568,39 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         let mut episode_rescoped = false;
         let mut episode_native_sessions = None;
         loop {
+            // A final derived-contract amendment invalidates every previous
+            // receipt/review. Re-enter all verification and review stages before
+            // the episode controller may consume the new revision.
+            let adjudicated = independent.as_ref().and_then(|review| review.structured.clone());
+            if let Some(review) = adjudicated {
+                if acceptance::apply_adjudicated_amendment(reasoner.as_ref(), crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+                    &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, &review, &mut workflow_guard).await? {
+                    independent = None; acceptance_receipt = None; qa_ok = false;
+                    review_notes.clear(); findings_override = None; pending_guard = None;
+                    criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                    acceptance_receipt = Some(acceptance::verify_with_repair(reasoner.as_ref(), &issue, &worktree,
+                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+                    criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                    verification_gate(&worktree).await?;
+                    let (ok, revised_diff, error) = run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
+                    anyhow::ensure!(ok, "amended candidate diff unavailable: {error}");
+                    lines = diff_line_count(&revised_diff); full_diff = revised_diff;
+                    let (_, amended_stat, _) = run("git", &["diff", "--stat", "origin/main...HEAD"], &worktree).await?;
+                    diff = amended_stat;
+                    if lines > MAX_DIFF_LINES {
+                        findings_override = Some(shrink_findings(lines));
+                        pending_guard = Some(ParkReason::Oversize(lines));
+                        continue;
+                    }
+                    let qa = reasoner.call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None)).await?;
+                    (qa_ok, review_notes) = parse_review_output(&qa);
+                    workflow_guard.transition(crate::autoship_workflow::Stage::Review, "amended_candidate_verified", "review", 0).await?;
+                    independent = Some(independent_review_with_context(reasoner.as_ref(), &issue, worktree.clone(), &criteria,
+                        qa_ok, &review_notes, round, None, 0, Some(&workflow_guard),
+                        acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
+                    continue;
+                }
+            }
             let mut episode_session = None;
             if findings_override.is_none() {
                 if let Some(review) = independent.as_ref() {
