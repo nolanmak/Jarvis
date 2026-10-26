@@ -26,6 +26,7 @@ pub(super) fn migrate(conn: &Connection) -> StoreResult<()> {
         answer TEXT, state TEXT NOT NULL, error TEXT, updated_at_ms INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_loop_occurrence_time ON loop_occurrences(updated_at_ms);
         CREATE TABLE IF NOT EXISTS loop_execution_prompts (request_id TEXT PRIMARY KEY, prompt TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS loop_delivery_answers (request_id TEXT PRIMARY KEY, answer TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS loop_coverage (
         loop_id TEXT NOT NULL, fingerprint TEXT NOT NULL, finding TEXT NOT NULL,
         evidence TEXT NOT NULL, request_id TEXT NOT NULL, completed_at_ms INTEGER NOT NULL,
@@ -86,20 +87,29 @@ impl Store {
         let delay=60_000_i64.saturating_mul(1_i64 << count.saturating_sub(1).clamp(0,6)).min(3_600_000);
         Ok(last.is_none_or(|last|now_ms>=last.saturating_add(delay)))
     }
+    /// Private delivery bytes; never used by digest/history APIs. Older rows
+    /// lack an original snapshot, so retain their existing persisted payload
+    /// rather than re-executing the model or pretending lost bytes are recoverable.
+    pub fn loop_delivery_answer(&self,request_id:&str)->StoreResult<Option<String>> {
+        let conn=self.conn.lock().expect("store mutex poisoned");
+        Ok(conn.query_row("SELECT COALESCE((SELECT answer FROM loop_delivery_answers WHERE request_id=?1),answer) FROM loop_occurrences WHERE request_id=?1",params![request_id],|r|r.get(0))?)
+    }
     pub fn save_loop_answer(&self, request_id: &str, answer: &str) -> StoreResult<()> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let answer = redact::mask(answer);
-        let prior: Option<String> = conn.query_row(
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx=conn.transaction()?;
+        let masked = redact::mask(answer);
+        let prior: Option<String> = tx.query_row(
             "SELECT answer FROM loop_occurrences WHERE request_id=?1",
             params![request_id],
             |r| r.get(0),
         )?;
-        if prior.as_deref().is_some_and(|p| p != answer.as_ref()) {
-            return Err(StoreError::InvalidInput(
-                "loop occurrence answer is immutable".into(),
-            ));
+        let original:Option<String>=tx.query_row("SELECT answer FROM loop_delivery_answers WHERE request_id=?1",params![request_id],|r|r.get(0)).optional()?;
+        if prior.as_deref().is_some_and(|p| p != masked.as_ref()) || original.as_deref().is_some_and(|p| p!=answer) {
+            return Err(StoreError::InvalidInput("loop occurrence answer is immutable".into()));
         }
-        conn.execute("UPDATE loop_occurrences SET answer=?2,state='answered',updated_at_ms=?3 WHERE request_id=?1 AND state!='delivered'",params![request_id,answer,now_millis()])?;
+        tx.execute("INSERT OR IGNORE INTO loop_delivery_answers VALUES (?1,?2)",params![request_id,answer])?;
+        tx.execute("UPDATE loop_occurrences SET answer=?2,state='answered',updated_at_ms=?3 WHERE request_id=?1 AND state!='delivered'",params![request_id,masked,now_millis()])?;
+        tx.commit()?;
         Ok(())
     }
     pub fn loop_coverage(&self, loop_id: &str, limit: usize) -> StoreResult<Vec<LoopFinding>> {
@@ -280,4 +290,17 @@ mod tests {
         assert!(store.loop_delivery_retry_ready("occurrence",last+3_600_000).unwrap());
         assert_eq!(store.prepare_loop_occurrence("loop","occurrence","prompt").unwrap().answer.as_deref(),Some("answer"));
     }
+    #[test]
+    fn private_delivery_bytes_are_immutable_even_when_redaction_is_identical() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("db");
+        let store=Store::open(&path).unwrap();
+        store.prepare_loop_occurrence("loop","occurrence","prompt").unwrap();
+        let first=r#"{"password":"synthetic-first"}"#;
+        store.save_loop_answer("occurrence",first).unwrap();
+        assert!(store.save_loop_answer("occurrence",r#"{"password":"synthetic-second"}"#).is_err());
+        drop(store);let store=Store::open(&path).unwrap();
+        assert_eq!(store.loop_delivery_answer("occurrence").unwrap().as_deref(),Some(first));
+        assert!(!store.loop_occurrences_since(0,10).unwrap()[0].answer.as_deref().unwrap().contains("synthetic-first"));
+    }
+
 }

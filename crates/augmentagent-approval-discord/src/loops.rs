@@ -738,9 +738,10 @@ impl LoopScheduler {
             Ok(true)=>{}, Ok(false)=>return,
             Err(error)=>{warn!(loop_id=%l.id,"delivery retry journal unavailable: {error}");return;}
         }
-        let result = match occurrence.answer {
-            Some(answer) => Ok(answer),
-            None => match self.store.loop_execution_prompt(&request_id) {
+        let result = match self.store.loop_delivery_answer(&request_id) {
+            Err(error)=>Err(error.into()),
+            Ok(Some(answer)) => Ok(answer),
+            Ok(None) => match self.store.loop_execution_prompt(&request_id) {
                 Ok(prompt)=>self.runner.run_prompt(&request_id, &l.owner, &prompt, l.model_profile.as_deref()).await,
                 Err(error)=>Err(error.into()),
             },
@@ -1217,6 +1218,34 @@ mod tests {
         assert_eq!(failures.len(), 1, "later success must not erase the failed delivery audit");
         assert_eq!(failures[0].0, "delivery");
         assert!(failures[0].1.contains("synthetic lost delivery"));
+    }
+
+    #[tokio::test]
+    async fn delivery_retry_preserves_exact_secret_shaped_literal_after_restart() {
+        struct RecordingPoster { attempts:std::sync::Mutex<Vec<String>> }
+        #[async_trait]
+        impl LoopPoster for RecordingPoster {
+            async fn post_to(&self,_:&str,body:&str)->anyhow::Result<()> {
+                let mut attempts=self.attempts.lock().unwrap();attempts.push(body.into());
+                if attempts.len()==1 {anyhow::bail!("synthetic delivery failure");} Ok(())
+            }
+        }
+        let (store,file)=tmp_store();
+        store.create_user_loop_with_model("owner","discord","channel",60,"Report fixture",None,None,None,None,false).unwrap();
+        let raw=r#"Literal fixture: {"password":"synthetic-delivery-literal"}"#;
+        let runner=Arc::new(CoverageRunner { replies:std::sync::Mutex::new(std::collections::VecDeque::from([raw.into()])),prompts:std::sync::Mutex::new(vec![]) });
+        let poster=Arc::new(RecordingPoster {attempts:std::sync::Mutex::new(vec![])});
+        {let row=store.list_active_user_loops().unwrap().remove(0);LoopScheduler::new(Arc::new(store),runner.clone(),poster.clone()).run_one(&row,0).await;}
+        let store=Arc::new(Store::open(file.path()).unwrap());
+        store.with_conn(|conn|{conn.execute("UPDATE loop_occurrence_failures SET observed_at_ms=observed_at_ms-60001",[])?;Ok(())}).unwrap();
+        let row=store.list_active_user_loops().unwrap().remove(0);
+        LoopScheduler::new(store.clone(),runner.clone(),poster.clone()).run_one(&row,0).await;
+        let attempts=poster.attempts.lock().unwrap();
+        assert_eq!(attempts.len(),2);
+        assert_eq!(attempts[0],attempts[1]);
+        assert!(attempts[1].contains(raw));
+        assert_eq!(runner.prompts.lock().unwrap().len(),1);
+        assert!(!store.loop_occurrences_since(0,10).unwrap()[0].answer.as_deref().unwrap().contains("synthetic-delivery-literal"));
     }
 
     #[test]
