@@ -110,7 +110,8 @@
       "evidence": [
         "Common required native VM launcher, minimal manifest-verified runtime, no guest NIC, declared credential import, guarded MCP relay and exact provider gateway policy are implemented. This supersedes the earlier unimplemented transport-boundary note; authenticated provider acceptance is still pending.",
         "Real synthetic VM streaming/quiescence stress proof passed at 12b93e3e (service autoship-native-vm-io-proof5, invocation 978329b99e3e41ad81ceae2e7d7bdaf1). This does not prove authenticated provider inference or every fallback.",
-        "Durable native-owner retirement outbox integrated at 8d50b960; Rust crash/reopen regressions and independent review pending."
+        "Durable native-owner retirement outbox integrated at 8d50b960; Rust crash/reopen regressions and independent review pending.",
+        "Direct Codex authenticated inference and observed-session continuation passed in a real no-NIC VM at8c18caa7 after fixing lost export tail. Host-observed TLS Responses receipts and unchanged auth source retained. Full guarded MCP and other provider/fallback acceptance still pending."
       ],
       "remaining_acceptance": [
         "Implement and validate authenticated streaming native provider calls inside no-NIC VM with declared credentials and guarded MCP relay.",
@@ -817,6 +818,32 @@
       "reviewer": "independent review agent",
       "conclusion": "LGTM",
       "scope": "First failure journal transaction and original cohort snapshot; newly errored actions without decision snapshots remain explicitly unknown."
+    },
+    "authenticated_codex_vm_8c18caa7": {
+      "revision": "8c18caa7",
+      "conclusion": "success",
+      "turns": 2,
+      "resume_proven": true,
+      "auth_source_unchanged": true,
+      "evidence": "/tmp/autoship-native-codex-auth-dfunmr6x/inference-proof12",
+      "scope": "Real fixed-prompt Codex inference inside no-NIC VM with host-observed authenticated TLS Responses exchanges, exact reply, same native session continuation, quiescent complete runtime export. Does not prove MCP tools, other providers, OAuth refresh or full Autoship shipping."
+    },
+    "native_export_tail_red_green": {
+      "revision": "8c18caa7",
+      "conclusion": "success",
+      "invocation": "1c6e597533494c6b8b151d98e19486bb",
+      "scope": "Actual no-auth synthetic VM,64files/4MiB,host fsync delayed80ms. Before ACK: only40files received,partial export,no completion. After ACK:64files byte-exact and complete after shutdown. Guest ACK waits only for completion progress, not productive model duration."
+    },
+    "hosted_rust_4ba07097": {
+      "revision": "4ba07097",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40360321844",
+      "conclusion": "success",
+      "cli_passed": 1254,
+      "cli_ignored": 21,
+      "core_passed": 639,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-4ba07097-rust.log",
+      "scope": "Corrected auth and low-disk fixtures pass. Later guest diagnostics,FIFO and export ACK require separate validation."
     }
   },
   "remaining_cross_cutting_acceptance": [
