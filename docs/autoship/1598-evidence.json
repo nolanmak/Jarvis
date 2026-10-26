@@ -251,7 +251,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "One managed Rust build/test at a time. Core recovery passed; CLI recovery suite remains pending at this evidence revision.",
+    "latest_rust_admission": "One managed Rust build/test at a time; latest completed workflow and foundation suites passed on ad29b3e7.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -301,12 +301,12 @@
       "execution": "Compiled managed test binary in isolated delegated transient service; live descendants refused, removed subtree accepted, foreign host rejected."
     },
     "self_improve_recovery": {
-      "revision": "1848f669",
-      "passed": 399,
+      "revision": "ad29b3e7",
+      "passed": 409,
       "failed": 0,
-      "ignored": 8,
-      "log": "/tmp/autoship-1598-tests-1848f669.log",
-      "note": "Later resource and audit-generation integration is under central validation; this is not latest-head proof."
+      "ignored": 9,
+      "log": "/tmp/autoship-1598-complete-inventory.log",
+      "note": "Includes repository-only 1501-item pagination, audit recovery, fresh capacity admission, and corrected protected fixtures. Does not prove paid native review success."
     },
     "behavior_oracles": {
       "passed": 21,
@@ -314,15 +314,23 @@
       "log": "/tmp/autoship-1598-behavior-oracles.log"
     },
     "foundation_observations": {
-      "revision": "5d7aa6cf",
-      "passed": 76,
+      "revision": "ad29b3e7",
+      "passed": 77,
       "failed": 0,
-      "log": "/tmp/autoship-1598-foundation-observations.log"
+      "log": "/tmp/autoship-1598-foundation-recovery.log"
     },
     "full_native_probe": {
+      "revision": "ae11702b",
       "passed": false,
-      "log": "/tmp/autoship-1598-native-probe.log",
-      "result": "Initial run stopped at alignment with ProvenanceUnknown. Harness provenance correction implemented; successful rerun still required."
+      "log": "/tmp/autoship-1598-native-probe-resource.log",
+      "result": "Real scoper, builder, executable verifier and alignment succeeded. Independent review rejected before admission because evidence-only fresh session received tool-enabled options; adapter fix in progress."
+    },
+    "real_cancelled_workflow_recovery": {
+      "revision": "ae11702b",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-real-workflow-recovery.log",
+      "note": "Real supervised worker cancelled and reaped in isolated delegated service; new fenced audit generation executes a new guarded command; old failed audit retained."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -339,7 +347,7 @@
     {
       "severity": "P1",
       "gap": "Source-less PR selection can starve newer PRs and reserved new-issue slots",
-      "status": "fair_selection_fixed_and_targeted_tests_passed; whole_inventory_pagination_under_review"
+      "status": "fair_selection_and_repository_inventory_fixed; 1501_item_regression_passed; nested_issue_comment_pagination_followup_in_progress"
     },
     {
       "severity": "P1",
@@ -355,7 +363,12 @@
     {
       "severity": "P1",
       "gap": "Interrupted audit generations can permanently block retry or resurrect prior approval after binding recalculation",
-      "status": "sealed_generation_recovery_integrated; approval_invalidation_followup_and_CLI_validation_in_progress"
+      "status": "fixed; central_workflow_and_foundation_regressions_and_real_cancelled_worker_recovery_passed"
+    },
+    {
+      "severity": "P1",
+      "gap": "Fresh native review is rejected before admission because adapter retains tool-enabled options",
+      "status": "confirmed_in_paid_native_probe; adapter_fix_in_progress"
     }
   ]
 }
