@@ -11,7 +11,7 @@ use crate::surface::{SurfaceConversationRef, SurfaceTurnRef};
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, EmailRetryFailure, FriendWatch, GmailRateRefusal, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SocialapiAccount,
     SocialapiWebhookEvent, SubscriptionMode, TelegramBot,
@@ -1221,6 +1221,15 @@ impl Store {
                 [],
             )?;
         }
+        // #472: NULL means legacy guard evidence must be fetched again.
+        if !column_exists(conn, "emails", "retryGuardContext")? {
+            conn.execute("ALTER TABLE emails ADD COLUMN retryGuardContext TEXT", [])?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS email_retry_failures (
+            id INTEGER PRIMARY KEY, action_id TEXT NOT NULL, message_id TEXT NOT NULL,
+            attempt_n INTEGER NOT NULL, failure_class TEXT NOT NULL, guard TEXT NOT NULL,
+            detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_email_retry_failures_time ON email_retry_failures(observed_at_ms);")?;
         // Issue #27: per-channel subscription registry (platform-agnostic).
         // Rows control which Discord/Slack/etc channels the poller watches and
         // which mode (priority / digest / store_only) they route through.
@@ -2665,6 +2674,8 @@ impl Store {
         // the persisted copy is masked.
         let body_masked = redact::mask(&email.body);
         let body_param: &str = &body_masked;
+        let context = serde_json::to_string(&(email.to.clone(), email.cc.clone(), email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
         if existed.is_some() {
             guard.execute(
                 "UPDATE emails SET threadId = ?2, fromEmail = ?3, subject = ?4, body = ?5, receivedAt = ?6 WHERE messageId = ?1",
@@ -2677,6 +2688,7 @@ impl Store {
                     email.date,
                 ],
             )?;
+            guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
             Ok(false)
         } else {
             let now = now_millis();
@@ -2696,8 +2708,34 @@ impl Store {
                     email.kind,
                 ],
             )?;
+            guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
             Ok(true)
         }
+    }
+
+    /// Complete persisted recipient/attachment evidence, or None for legacy rows.
+    pub fn email_retry_guard_context(&self, message_id: &str) -> StoreResult<Option<(String, String, Vec<String>)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let raw: Option<String> = guard.query_row("SELECT retryGuardContext FROM emails WHERE messageId = ?1",
+            params![message_id], |r| r.get(0)).optional()?.flatten();
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|e| StoreError::InvalidInput(e.to_string()))).transpose()
+    }
+
+    pub fn record_email_retry_failure(&self, failure: &EmailRetryFailure) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute("INSERT INTO email_retry_failures(action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![failure.action_id, failure.message_id, failure.attempt_n, redact::mask(&failure.failure_class), failure.guard, redact::mask(&failure.detail), failure.observed_at_ms])?;
+        Ok(())
+    }
+
+    /// Digest seam: durable retry failures, newest first, with an explicit limit.
+    pub fn email_retry_failures_since(&self, since_ms: i64, limit: usize) -> StoreResult<Vec<EmailRetryFailure>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare("SELECT action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms FROM email_retry_failures WHERE observed_at_ms >= ?1 ORDER BY observed_at_ms DESC,id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![since_ms, limit as i64], |r| Ok(EmailRetryFailure {
+            action_id:r.get(0)?, message_id:r.get(1)?, attempt_n:r.get(2)?, failure_class:r.get(3)?, guard:r.get(4)?, detail:r.get(5)?, observed_at_ms:r.get(6)?
+        }))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// [`upsert_email`] variant for historical imports (#886): a *new* row's
@@ -2979,6 +3017,13 @@ impl Store {
             )
             .optional()?;
         Ok(row.is_some())
+    }
+
+    /// A retry may re-enter for its own action, never bypass a sibling action.
+    pub fn has_other_open_action(&self, message_id: &str, action_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row("SELECT EXISTS(SELECT 1 FROM actions WHERE messageId = ?1 AND id != ?2 AND status IN ('pending','error','scheduled','sending'))",
+            params![message_id, action_id], |r| r.get(0))?)
     }
 
     #[allow(clippy::too_many_arguments)]

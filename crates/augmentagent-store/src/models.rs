@@ -7,8 +7,8 @@ pub struct Email {
     pub from: String,
     /// Raw `To:` header of the message — comma-joined, display names preserved
     /// (`Jane <jane@example.com>, bo@example.com`). Empty = unknown: rows persisted before
-    /// #629, platforms without recipient headers, and DB round-trips (the
-    /// emails table doesn't store it; only live fetches populate it). #629
+    /// #629 or platforms without recipient headers. Guarded retries restore
+    /// these headers from saved context or hydrate legacy rows from Gmail. #629
     /// reply-all reads this to enumerate thread participants.
     #[serde(default)]
     pub to: String,
@@ -16,9 +16,8 @@ pub struct Email {
     #[serde(default)]
     pub cc: String,
     /// Display labels for the message's attachments, e.g. `resume.pdf
-    /// (application/pdf)`. Same caveat as `to`/`cc`: the emails table doesn't
-    /// store it, so only live fetches populate it and DB round-trips yield
-    /// empty. #811 — triage/draft prompts read this so the drafter stops
+    /// (application/pdf)`. Saved alongside recipient headers for guarded retries.
+    /// Legacy rows require hydration before retry. #811 — prompts read this so the drafter stops
     /// asserting "no attachment" on attachment-bearing mail.
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -135,6 +134,18 @@ pub struct ActionRecord {
     pub error_message: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// #472: append-only failure memory for guarded email retry attempts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailRetryFailure {
+    pub action_id: String,
+    pub message_id: String,
+    pub attempt_n: i64,
+    pub failure_class: String,
+    pub guard: String,
+    pub detail: String,
+    pub observed_at_ms: i64,
 }
 
 /// #1384 — one append-only row per provider rate-limit refusal of a Gmail

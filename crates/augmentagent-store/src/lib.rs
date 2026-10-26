@@ -43,7 +43,7 @@ pub use surface::{
 
 pub use models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, EmailRetryFailure, FriendWatch, GmailRateRefusal, LearnedPattern,
     LinkedInConnectionSync,
     OwnPost, PhoneIdentity, RateAuditRow, RateEvent, RateHalt, RateWarmup, ScheduledPost,
     ScheduledPostStatus, SlackWorkspace, SocialapiAccount, SocialapiWebhookEvent, SubscriptionMode,
