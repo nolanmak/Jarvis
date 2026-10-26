@@ -43,6 +43,8 @@ def generate(root=ROOT):
                     if '${{' in body:raise ValueError('unresolved expression in '+identifier)
                     if identifier in commands:raise ValueError('duplicate workflow stem '+source.stem)
                     commands[identifier]={'body':body,'shell':step.get('shell',job.get('defaults',{}).get('run',{}).get('shell',data.get('defaults',{}).get('run',{}).get('shell','bash')))}
+                    if previous and 'vm_provisioning' in old['commands'][previous.group(1)]:
+                        commands[identifier]['vm_provisioning']=old['commands'][previous.group(1)]['vm_provisioning']
                     wrapper=f'python3 "${{{{ github.workspace }}}}/scripts/ci-contract.py" step --hosted --id {identifier}'
                     if '${CI_CONTRACT_BASE}' in body:wrapper+=' --input-base "${{ github.event.pull_request.base.sha }}" --input-head "${{ github.event.pull_request.head.sha }}"'
                     replacement=json.dumps(wrapper)+('' if raw[run_node.end_mark.index:run_node.end_mark.index+1]=='\n' else '\n')

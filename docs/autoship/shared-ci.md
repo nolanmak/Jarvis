@@ -132,3 +132,16 @@ This exercises a real guest plan and the pinned Linux Python installer fixture,
 with actual managed global/target descriptors and required resource admission.
 Its explicit diagnostic path selection does not certify complete branch CI,
 macOS checks, a full issue-to-main run, or deployment readiness.
+
+The pinned command catalog also declares `vm_provisioning` requirements for
+specific unsupported commands and their actual consumers. These currently keep
+browser-sidecar PyPI/Playwright setup and smoke, PDF runtime setup/check/render
+consumers, Docker image/compose probes, global Codex setup and its real redirect
+probe, browser downloads/browser tests, and gitleaks scanning as hosted
+obligations. No general outbound route is added. The local VM has only the
+registry broker and resets guest HOME between steps; it cannot honestly claim
+those environments are installed. Their independent mocked/unit/installer tests
+remain local, including PDF runtime/updater fixtures and Codex redirect unit
+tests. A future provisioner must supply pinned artifacts plus persistent private
+job paths and verification before removing these explicit requirements. Direct
+VM step invocation also rejects an unmet declaration before running its body.

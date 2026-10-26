@@ -36,6 +36,16 @@ class AdapterTests(unittest.TestCase):
    root=Path(d);request=self.fixture(root);lease=adapter.InheritedStorage(request['storage'],root/'scratch');lease.check()
    fcntl.flock(lease.fd,fcntl.LOCK_UN)
    with self.assertRaisesRegex(vm.Unavailable,'not held'):adapter.InheritedStorage(request['storage'],root/'scratch')
+ def test_rust_shaped_group_writable_data_directory_is_not_lock_authority(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);request=self.fixture(root);target=root/'target';target.mkdir(mode=0o775);target.chmod(0o775)
+   fd=os.open(target,os.O_RDONLY|os.O_DIRECTORY);self.addCleanup(os.close,fd)
+   request['storage']['fds'].append(fd)
+   adapter.InheritedStorage(request['storage'],root/'scratch').check()
+   target.chmod(0o777)
+   with self.assertRaisesRegex(vm.Unavailable,'target lease'):adapter.InheritedStorage(request['storage'],root/'scratch')
+   target.chmod(0o775);os.fchmod(request['storage']['fd'],0o664)
+   with self.assertRaisesRegex(vm.Unavailable,'target lease'):adapter.InheritedStorage(request['storage'],root/'scratch')
  def test_step_exit_is_not_fabricated_from_output_and_requires_managed_cache(self):
   with tempfile.TemporaryDirectory() as d:
    request=self.fixture(Path(d));request.update(operation='step',id='test/job/1')

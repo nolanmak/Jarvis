@@ -58,11 +58,17 @@
     },
     "browser-sidecar/synthetic-page/2": {
       "body": "bash sidecars/browser/setup.sh",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "python-browser-runtime"
+      ]
     },
     "browser-sidecar/synthetic-page/3": {
       "body": "sidecars/browser/.venv/bin/python -m unittest sidecars.browser.test_smoke -v",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "python-browser-runtime"
+      ]
     },
     "code-mode/deterministic/4": {
       "body": "sudo apt-get -o Acquire::Retries=3 update\nsudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends python3-packaging\n",
@@ -86,11 +92,17 @@
     },
     "computer-use/browser/3": {
       "body": "npx playwright install --with-deps chrome",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "browser-binary-runtime"
+      ]
     },
     "computer-use/browser/4": {
       "body": "npx playwright install chrome",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "browser-binary-runtime"
+      ]
     },
     "computer-use/browser/5": {
       "body": "uname -srm && node --version && npm --version && python3 --version",
@@ -98,11 +110,17 @@
     },
     "computer-use/browser/6": {
       "body": "npm test",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "browser-binary-runtime"
+      ]
     },
     "computer-use/browser/7": {
       "body": "node --test --test-concurrency=1 test/*.test.mjs",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "browser-binary-runtime"
+      ]
     },
     "computer-use/browser/8": {
       "body": "bash scripts/tests/computer-use-launchd.test.sh",
@@ -134,7 +152,10 @@
     },
     "discord-voice/rust/5": {
       "body": "python3 scripts/pdf-runtime.py",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
     },
     "discord-voice/rust/6": {
       "body": "cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked",
@@ -142,7 +163,10 @@
     },
     "discord-voice/rust/7": {
       "body": "cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
     },
     "discord-voice/sidecar/2": {
       "body": "npm ci",
@@ -206,7 +230,10 @@
     },
     "model-router/adapter-compose/1": {
       "body": "python3 scripts/runpod-adapter/test_compose_deployment.py",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "docker-daemon-images"
+      ]
     },
     "model-router/adapters/3": {
       "body": "cargo test -p augmentagent-channel-core --lib",
@@ -230,7 +257,10 @@
     },
     "model-router/codex-redirect/2": {
       "body": "npm install --global @openai/codex@0.154.0",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "codex-global-runtime"
+      ]
     },
     "model-router/codex-redirect/3": {
       "body": "python3 -m unittest discover -s scripts/tests -p test_verify_codex_redirect.py",
@@ -238,7 +268,10 @@
     },
     "model-router/codex-redirect/4": {
       "body": "python3 scripts/tests/verify_codex_redirect.py",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "codex-global-runtime"
+      ]
     },
     "model-router/dashboard/2": {
       "body": "npm ci",
@@ -302,11 +335,17 @@
     },
     "model-router/pinned-gateway/1": {
       "body": "bash scripts/build-model-router-image.sh",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "docker-daemon-images"
+      ]
     },
     "model-router/pinned-gateway/2": {
       "body": "python3 scripts/tests/run_model_router_image_fixture.py",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "docker-daemon-images"
+      ]
     },
     "no-gmail-authors/check/1": {
       "body": "range=\"${CI_CONTRACT_BASE}..${CI_CONTRACT_HEAD}\"\nbad=$(git log --format='%ae %ce' \"$range\" | tr ' ' '\\n' | grep -iE 'gmail\\.com' | sort -u || true)\nif [ -n \"$bad\" ]; then\n  echo \"::error::Commit(s) in this PR use a personal gmail author/committer address:\"\n  echo \"$bad\"\n  echo \"Commit as the nolanmak GitHub noreply instead \u2014 see docs/PUBLISH.md.\"\n  exit 1\nfi\necho \"OK: no gmail author/committer emails in this PR's commits.\"\n",
@@ -314,11 +353,17 @@
     },
     "pdf-generation/pdf/10": {
       "body": "~/.local/share/augmentagent/pdf-runtime/bin/python3 -m unittest discover -s crates/augmentagent-docs/python -v",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
     },
     "pdf-generation/pdf/11": {
       "body": "cargo test --locked -p augmentagent-docs",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
     },
     "pdf-generation/pdf/12": {
       "body": "cargo test --locked -p augmentagent-cli --bin augmentagent document_signing::tests",
@@ -330,7 +375,10 @@
     },
     "pdf-generation/pdf/14": {
       "body": "cargo test --locked -p augmentagent-cli --test pdf_generation",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
     },
     "pdf-generation/pdf/15": {
       "body": "cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib",
@@ -350,11 +398,17 @@
     },
     "pdf-generation/pdf/5": {
       "body": "python3 scripts/pdf-runtime.py",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
     },
     "pdf-generation/pdf/6": {
       "body": "python3 scripts/pdf-runtime.py --check",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
     },
     "pdf-generation/pdf/7": {
       "body": "python3 -m unittest discover -s scripts/tests -p pdf_runtime_test.py -v",
@@ -518,7 +572,10 @@
     },
     "platform/platform/36": {
       "body": "npm ci\nnode --input-type=module -e \"import('@remotion/renderer').then(m => m.ensureBrowser())\"\ncd ../..\npython3 -m unittest sidecars.renderer.test_smoke -v\n",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "browser-binary-runtime"
+      ]
     },
     "platform/platform/4": {
       "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\nbash scripts/tests/service-restart.test.sh\n",
@@ -570,11 +627,17 @@
     },
     "privacy/privacy/3": {
       "body": "set -euo pipefail\nurl=https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz\ncurl --fail --location --silent --show-error \"$url\" -o \"$RUNNER_TEMP/gitleaks.tar.gz\"\necho \"551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz\" | sha256sum --check\ntar -xzf \"$RUNNER_TEMP/gitleaks.tar.gz\" -C \"$RUNNER_TEMP\" gitleaks\n",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "gitleaks-release"
+      ]
     },
     "privacy/privacy/4": {
       "body": "set -euo pipefail\nmkdir \"$RUNNER_TEMP/release-source\"\ngit archive HEAD | tar -x -C \"$RUNNER_TEMP/release-source\"\n\"$RUNNER_TEMP/gitleaks\" dir \"$RUNNER_TEMP/release-source\" --redact=100 --no-banner\n",
-      "shell": "bash"
+      "shell": "bash",
+      "vm_provisioning": [
+        "gitleaks-release"
+      ]
     },
     "whatsapp-history/history/4": {
       "body": "python3 -m unittest discover -s scripts/whatsapp/tests -v",

@@ -13,6 +13,21 @@ class ContractTests(unittest.TestCase):
   return {'version':1,'commands':{'test/check/0':{'body':body,'shell':'bash'}},'workflows':{'.github/workflows/test.yml':{'role':'validation','sha256':hashlib.sha256(b'fixture').hexdigest(),'events':{'pull_request':{'paths':['src/**']}},'env':{},'jobs':{'check':job}}}}
  def args(self,root,**changes):
   return argparse.Namespace(**dict({'root':str(root),'head':'head','base':'base','platform':'linux','changed_file':['src/a.rs'],'probe_prerequisites':False},**changes))
+ def test_vm_provisioning_is_exact_and_does_not_skip_unrelated_tests(self):
+  c=json.loads((ROOT/'scripts/ci-contract.json').read_text())
+  with patch.object(ci,'prerequisite_check',return_value=[]):
+   plan=ci.plan(c,self.args(ROOT,changed_file=['scripts/ci-contract.json'],probe_prerequisites=True,vm_runtime=True))
+  rows={row['command_id']:row for row in plan['checks'] if row.get('platform')=='linux' and 'command_id' in row}
+  for identifier in ['browser-sidecar/synthetic-page/2','browser-sidecar/synthetic-page/3','pdf-generation/pdf/5','pdf-generation/pdf/6','pdf-generation/pdf/10','pdf-generation/pdf/14','model-router/adapter-compose/1','model-router/pinned-gateway/2','model-router/codex-redirect/2','model-router/codex-redirect/4','computer-use/browser/6','platform/platform/36','privacy/privacy/4']:
+   self.assertEqual(rows[identifier]['status'],'remote_required',identifier)
+  for identifier in ['pdf-generation/pdf/7','pdf-generation/pdf/8','pdf-generation/pdf/9','model-router/codex-redirect/3','model-router/installer/3','computer-use/browser/8']:
+   self.assertEqual(rows[identifier]['status'],'ready',identifier)
+  with self.assertRaisesRegex(ValueError,'unsupported CI provisioning'):ci.vm_provisioning({'vm_provisioning':['invented-exemption']})
+ def test_vm_step_refuses_unprovisioned_dependency_before_execution(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);c=self.fixture(root,body='touch must-not-run');c['commands']['test/check/0']['vm_provisioning']=['pdf-python-runtime']
+   result=subprocess.run([sys.executable,str(ROOT/'scripts/ci-contract.py'),'--contract-json',json.dumps(c),'step','--vm-runtime','--id','test/check/0'],cwd=root,capture_output=True,text=True)
+   self.assertEqual(result.returncode,2);self.assertIn('shared CI prerequisite unavailable',result.stderr);self.assertFalse((root/'must-not-run').exists())
  def test_inventory_all_workflows_and_command_wrappers_match(self):
   c=json.loads((ROOT/'scripts/ci-contract.json').read_text());self.assertEqual(ci.verify(c,ROOT),[])
   self.assertEqual(len(c['workflows']),len(list((ROOT/'.github/workflows').glob('*.yml'))))

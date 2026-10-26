@@ -9,6 +9,20 @@ RUNNER=Path(globals().get('__file__','scripts/ci-contract.py')).resolve()
 DEFAULT=RUNNER.with_name('ci-contract.json')
 
 
+VM_PROVISIONING = {
+ 'python-browser-runtime':'PyPI virtualenv and pinned Playwright browser, persisted across job steps',
+ 'pdf-python-runtime':'PyPI PDF runtime in persistent private job HOME',
+ 'docker-daemon-images':'isolated Docker daemon and pinned image provisioning',
+ 'codex-global-runtime':'pinned Codex CLI in persistent writable job prefix',
+ 'browser-binary-runtime':'pinned browser binary provisioning outside registry-only transport',
+ 'gitleaks-release':'hash-pinned gitleaks release artifact provisioning',
+}
+def vm_provisioning(command):
+    requirements=command.get('vm_provisioning',[])
+    if not isinstance(requirements,list) or any(not isinstance(item,str) or item not in VM_PROVISIONING for item in requirements):
+        raise ValueError('unsupported CI provisioning declaration')
+    return [VM_PROVISIONING[item] for item in requirements]
+
 def digest(value):return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 def load(args):
     raw=args.contract_json if args.contract_json else Path(args.contract or DEFAULT).read_text()
@@ -168,7 +182,7 @@ def plan(contract,args):
                         if not applies or not condition(job.get('if'),target) or not condition(step.get('if'),target):status='not_applicable';reason='workflow paths or declared condition'
                         elif target!=args.platform:status='remote_required';reason='requires '+runner
                         elif host_setup(command['body']):status='remote_required';reason='host provisioning is never executed from candidate CI'
-                        elif getattr(args,'vm_runtime',False) and any('https://github.com/gitleaks/gitleaks/releases/' in contract['commands'].get(s.get('command_id'),{}).get('body','') for s in job['steps'][:index+1]):status='remote_required';reason='pinned gitleaks release artifact requires controller provisioning'
+                        elif getattr(args,'vm_runtime',False) and vm_provisioning(command):status='remote_required';reason='controller provisioning required: '+'; '.join(vm_provisioning(command))
                         elif missing:status='remote_required' if getattr(args,'vm_runtime',False) else 'prerequisite_hold';reason='runtime prerequisites: '+'; '.join(missing)
                         elif requirements and not args.probe_prerequisites:status='prerequisite_hold';reason='prerequisites not measured'
                     except ValueError as error:status='remote_required';reason=str(error)
@@ -183,7 +197,7 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--contract');parser.add_argument('--contract-json')
     sub=parser.add_subparsers(dest='operation',required=True)
     p=sub.add_parser('plan');p.add_argument('--head',required=True);p.add_argument('--base',required=True);p.add_argument('--platform',choices=['linux','darwin'],default=sys.platform);p.add_argument('--root',default='.');p.add_argument('--changed-file',action='append',default=[]);p.add_argument('--probe-prerequisites',action='store_true');p.add_argument('--vm-runtime',action='store_true')
-    p=sub.add_parser('step');p.add_argument('--id',required=True);p.add_argument('--input-base');p.add_argument('--input-head');p.add_argument('--hosted',action='store_true');p.add_argument('--state-dir',type=Path)
+    p=sub.add_parser('step');p.add_argument('--id',required=True);p.add_argument('--input-base');p.add_argument('--input-head');p.add_argument('--hosted',action='store_true');p.add_argument('--vm-runtime',action='store_true');p.add_argument('--state-dir',type=Path)
     p=sub.add_parser('verify');p.add_argument('--root',default='.')
     args=parser.parse_args();contract=load(args)
     if args.operation=='plan':print(json.dumps(plan(contract,args),sort_keys=True));return 0
@@ -202,6 +216,7 @@ def main():
         runner=resolve(job['runs-on'],context);host='darwin' if runner.startswith('macos-') else 'linux' if runner.startswith('ubuntu-') else 'unsupported'
         if host!=sys.platform or not condition(job.get('if'),sys.platform) or not condition(step.get('if'),sys.platform):raise ValueError('shared CI prerequisite unavailable: platform or condition')
         requirements=tool_prerequisites([{**s,'_body':contract['commands'].get(s.get('command_id'),{}).get('body','')} for s in job['steps'][:int(step_index)+1]],host)
+        if args.vm_runtime and vm_provisioning(command):raise ValueError('shared CI prerequisite unavailable: '+'; '.join(vm_provisioning(command)))
         missing=prerequisite_check(requirements,root)
         if missing:raise ValueError('shared CI prerequisite unavailable: '+'; '.join(missing))
         if host_setup(command['body']):raise ValueError('shared CI prerequisite unavailable: host setup cannot execute locally')

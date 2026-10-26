@@ -28,7 +28,7 @@ class InheritedStorage:
         self.identities={}
         for fd in self.fds:
             info=os.fstat(fd)
-            if info.st_uid!=os.getuid() or info.st_mode&0o022 or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):raise vm.Unavailable('invalid inherited target lease')
+            if info.st_uid!=os.getuid() or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)) or info.st_mode&(0o002 if stat.S_ISDIR(info.st_mode) else 0o022):raise vm.Unavailable('invalid inherited target lease')
             self.identities[fd]=(info.st_dev,info.st_ino)
         self.path=Path(policy['path']);self.identity=(policy['device'],policy['inode']);self.floor=policy['floor_bytes'];self.scratch=Path(scratch)
         if self.fd<=2 or not self.path.is_absolute() or self.path.name!='disk-build.lock' or self.path.resolve()!=self.path:raise vm.Unavailable('invalid inherited storage lease')
@@ -171,7 +171,7 @@ def execute(request,run=vm.run,progress=None):
         if request['operation']=='step':
             identifier=request.get('id')
             if not isinstance(identifier,str) or len(identifier)>4096 or '\0' in identifier:raise vm.Unavailable('invalid CI command identity')
-            command+=['step','--id',identifier,'--input-head',request['head'],'--input-base',request['base'],'--state-dir','/ci-runtime']
+            command+=['step','--vm-runtime','--id',identifier,'--input-head',request['head'],'--input-base',request['base'],'--state-dir','/ci-runtime']
         elif request['operation']=='repository':
             command=['/bin/bash','--noprofile','--norc','-o','pipefail','-c',request['command']]
         else:
