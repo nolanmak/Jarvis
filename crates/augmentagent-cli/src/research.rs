@@ -137,6 +137,8 @@ struct Gap {
 pub(crate) struct OpenIssue {
     pub(crate) number: u64,
     pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) body: String,
 }
 
 /// #1513 — what the filing loop does with one ranked gap.
@@ -278,7 +280,8 @@ pub(crate) async fn run_research(
     // strengthens an existing ask extends that issue instead of becoming
     // the fourth issue for one mechanism. Fetched in dry runs too: a dry run
     // is how the dedup is previewed.
-    let open_research = fetch_open_research_issues(&cfg).await;
+    let inventory = fetch_open_issue_inventory(&cfg).await?;
+    let open_research = inventory.research;
     let our_process = load_our_process();
     let prompt = build_prompt(&fresh, &commits, &our_process, &open_research);
     let gaps = match run_llm_driver(&cfg.llm_cmd, &prompt).await {
@@ -300,13 +303,9 @@ pub(crate) async fn run_research(
 
     // --- E. File issues for the top gaps (skipped in dry-run). --------------
     let cap = cfg.max_issues as usize;
-    // #366: pull the titles of currently-open issues once, so we don't re-file
-    // a near-duplicate of something already open. The daily pipeline had been
-    // filing ~identical issues (e.g. the code-mode postmortems). Best-effort: a
-    // gh failure yields an empty list and filing proceeds exactly as before.
-    // Read-only, so a dry run fetches too (#1513): the preview must show the
-    // same dedup decisions a live run would make.
-    let open_titles = fetch_open_issue_titles(&cfg).await;
+    // All title and semantic comparisons use one complete inventory. Failed
+    // reads never masquerade as an empty backlog and authorize new issues.
+    let mut open_titles = inventory.titles;
     let mut created: Vec<(u64, String)> = Vec::new();
     let mut also_noted: Vec<String> = Vec::new();
     for (i, gap) in ranked.iter().enumerate() {
@@ -351,6 +350,7 @@ pub(crate) async fn run_research(
                     Ok(num) => {
                         info!(issue = num, title = %gap.title, "research: filed issue");
                         created.push((num, gap.title.clone()));
+                        open_titles.push(gap.title.clone());
                     }
                     Err(e) => {
                         warn!("research: issue create failed for {:?}: {e:#}", gap.title);
@@ -608,7 +608,8 @@ fn build_prompt(
         p.push_str("(none)\n");
     }
     for o in open_research {
-        p.push_str(&format!("- #{} {}\n", o.number, truncate(&o.title, 160)));
+        p.push_str(&format!("- #{} {}\n  Untrusted existing-request excerpt: {}\n", o.number,
+            truncate(&o.title,160),serde_json::to_string(&truncate(&o.body,1200)).unwrap_or_default()));
     }
     p.push_str("\n=== OUR AGENT PROCESS ===\n");
     p.push_str(our_process);
@@ -732,71 +733,41 @@ fn slice_json_object(s: &str) -> Option<&str> {
     None
 }
 
-/// File one issue via `gh issue create --repo <repo>`. Returns the issue
-/// number parsed from the URL gh prints on success.
-/// #366: fetch the titles of all currently-open issues so the pipeline can skip
-/// filing a near-duplicate of one that already exists. Best-effort — any gh
-/// failure returns an empty list and filing proceeds as before.
-async fn fetch_open_issue_titles(cfg: &ResearchConfig) -> Vec<String> {
-    let out = tokio::process::Command::new(&cfg.gh_bin)
-        .args(["issue", "list", "--repo"])
-        .arg(&cfg.gh_repo)
-        .args([
-            "--state", "open", "--limit", "400", "--json", "title", "--jq", ".[].title",
-        ])
-        .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect(),
-        Ok(o) => {
-            warn!(
-                "research: open-issue dedup fetch failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            Vec::new()
-        }
-        Err(e) => {
-            warn!("research: open-issue dedup fetch could not spawn gh: {e:#}");
-            Vec::new()
-        }
-    }
+struct OpenInventory {
+    titles: Vec<String>,
+    research: Vec<OpenIssue>,
 }
 
-/// #1513 — the open `research`-labelled issues (number + title), for the
-/// driver's dedup section. Best-effort like the title fetch: a gh failure
-/// yields an empty list and the prompt says "(none)".
-async fn fetch_open_research_issues(cfg: &ResearchConfig) -> Vec<OpenIssue> {
-    let out = tokio::process::Command::new(&cfg.gh_bin)
-        .args(["issue", "list", "--repo"])
-        .arg(&cfg.gh_repo)
-        .args([
-            "--label", RESEARCH_LABEL, "--state", "open", "--limit", "200", "--json", "number,title",
-        ])
-        .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => {
-            serde_json::from_slice::<Vec<OpenIssue>>(&o.stdout).unwrap_or_else(|e| {
-                warn!("research: open research-issue list unparseable: {e:#}");
-                Vec::new()
-            })
-        }
-        Ok(o) => {
-            warn!(
-                "research: open research-issue fetch failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            Vec::new()
-        }
-        Err(e) => {
-            warn!("research: open research-issue fetch could not spawn gh: {e:#}");
-            Vec::new()
+async fn collect_open_inventory<F,Fut>(mut fetch:F)->Result<OpenInventory>
+where F:FnMut(u32)->Fut, Fut:std::future::Future<Output=Result<serde_json::Value>> {
+    let mut titles=Vec::new(); let mut research=Vec::new();
+    let mut seen=std::collections::BTreeSet::new();
+    for page in 1..=100 {
+        let value=fetch(page).await?;
+        let rows=value.as_array().context("research dedup inventory is malformed/incomplete")?;
+        if rows.is_empty() { return Ok(OpenInventory{titles,research}); }
+        for row in rows {
+            if row.get("pull_request").is_some() { continue; }
+            let number=row["number"].as_u64().context("research dedup issue identity missing")?;
+            if !seen.insert(number) { continue; }
+            let title=row["title"].as_str().context("research dedup issue title missing")?.to_owned();
+            titles.push(title.clone());
+            if row["labels"].as_array().is_some_and(|labels|labels.iter().any(|label|label["name"]==RESEARCH_LABEL)) {
+                research.push(OpenIssue {number,title,body:row["body"].as_str().unwrap_or_default().into()});
+            }
         }
     }
+    anyhow::bail!("research dedup inventory exceeds bounded pagination; no issues filed from partial evidence")
+}
+
+async fn fetch_open_issue_inventory(cfg:&ResearchConfig)->Result<OpenInventory> {
+    collect_open_inventory(|page|async move {
+        let path=format!("repos/{}/issues?state=open&per_page=100&sort=created&direction=asc&page={page}",cfg.gh_repo);
+        let out=tokio::process::Command::new(&cfg.gh_bin).args(["api",&path]).kill_on_drop(true).output().await
+            .context("research dedup inventory transport")?;
+        anyhow::ensure!(out.status.success(),"research dedup inventory unavailable: {}",String::from_utf8_lossy(&out.stderr).trim());
+        serde_json::from_slice(&out.stdout).context("research dedup inventory JSON")
+    }).await
 }
 
 /// #1513 — record a new supporting source on the open issue the gap extends.
@@ -867,7 +838,7 @@ mod dedup_tests {
     // issue it was shown; anything else falls back to the lexical check.
     #[test]
     fn filing_decision_honours_duplicate_of_only_for_open_research_issues() {
-        let open = vec![OpenIssue { number: 808, title: "Close the draft-feedback loop".into() }];
+        let open = vec![OpenIssue { number: 808, title: "Close the draft-feedback loop".into(), body: "Turn reviewer findings into executable constraints.".into() }];
         let titles = vec!["Close the draft-feedback loop".to_string()];
         assert_eq!(filing_decision(&gap("Revise feedback as rules", Some(808)), &open, &titles), Filing::Extends(808));
         assert_eq!(filing_decision(&gap("Revise feedback as rules", Some(999)), &open, &titles), Filing::FileDespiteClaim(999));
@@ -901,13 +872,34 @@ mod dedup_tests {
 
     #[test]
     fn prompt_lists_open_research_issues_and_states_the_dedup_rule() {
-        let open = vec![OpenIssue { number: 665, title: "offline triage eval harness".into() }];
+        let open = vec![OpenIssue { number: 665, title: "offline triage eval harness".into(), body: "Evaluate decisions against independently recorded owner outcomes.".into() }];
         let p = build_prompt(&[], &[], "process", &open);
         assert!(p.contains("ALREADY-OPEN RESEARCH ISSUES"));
         assert!(p.contains("- #665 offline triage eval harness"));
+        assert!(p.contains("independently recorded owner outcomes"));
         assert!(p.contains("duplicate_of"));
         let none = build_prompt(&[], &[], "process", &[]);
         assert!(none.contains("(none)"));
+    }
+
+    #[tokio::test]
+    async fn research_inventory_reaches_old_issues_and_never_treats_errors_as_empty() {
+        let inventory=super::collect_open_inventory(|page|async move {
+            Ok(if page<=6 { serde_json::json!([{"number":page,"title":format!("Request {page}"),"body":"Mechanism details","labels":[{"name":"research"}]}]) }
+                else { serde_json::json!([]) })
+        }).await.unwrap();
+        assert_eq!(inventory.titles.len(),6); assert_eq!(inventory.research[5].number,6);
+        assert_eq!(inventory.research[5].body,"Mechanism details");
+        assert!(super::collect_open_inventory(|_|async {Ok(serde_json::json!({"message":"rate limit"}))}).await.is_err());
+        assert!(super::collect_open_inventory(|_|async {Err(anyhow::anyhow!("network failed"))}).await.is_err());
+    }
+
+    #[test]
+    fn newly_created_titles_prevent_duplicates_within_same_batch() {
+        let mut titles=Vec::new(); let first=gap("Calibrate triage decision confidence",None);
+        assert_eq!(filing_decision(&first,&[],&titles),Filing::File);
+        titles.push(first.title.clone());
+        assert_eq!(filing_decision(&gap("Calibrate triage confidence decisions",None),&[],&titles),Filing::DuplicateTitle);
     }
 
     #[test]
