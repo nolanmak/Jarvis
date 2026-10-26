@@ -253,6 +253,29 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     Ok(())
 }
 
+fn synthetic_contradiction_findings(binding: &crate::autoship_review::ReviewBinding) -> Vec<crate::autoship_review::Finding> {
+    use crate::autoship_review as review;
+    vec![review::Finding{id:"F1".into(),criterion_id:"SUM".into(),evidence_hash:binding.evidence_hash.clone(),claim:"SYNTHETIC: actual add(2,3)=4 violates the owner criterion requiring 5.".into(),requested_change:"Return a + b and verify add(2,3)=5.".into(),conflicts_with:BTreeSet::from(["F2".into()]),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["arithmetic.py".into()]) }), repair_rounds: 2},review::Finding{id:"F2".into(),criterion_id:"SUM".into(),evidence_hash:binding.evidence_hash.clone(),claim:"SYNTHETIC opposing claim: the owner requires add(2,3)=4.".into(),requested_change:"Preserve the subtraction of one.".into(),conflicts_with:BTreeSet::from(["F1".into()]),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["arithmetic.py".into()]) }), repair_rounds: 2}]
+}
+
+#[test]
+fn synthetic_contradiction_targets_only_supplied_arithmetic_source() {
+    use crate::autoship_review::{ReviewBinding, RepairTarget};
+    let source = BTreeMap::from([("arithmetic.py", "def add(a, b):\n    return a + b - 1\n")]);
+    let binding = ReviewBinding { head:"fixture-head".into(),base:"fixture-base".into(),environment_id:"fixture".into(),contract_hash:"fixture-contract".into(),evidence_hash:"fixture-evidence".into() };
+    let findings = synthetic_contradiction_findings(&binding);
+    assert_eq!(findings.len(), 2);
+    for finding in &findings {
+        let Some(RepairTarget::Candidate { paths }) = &finding.repair_target else { panic!("candidate target required") };
+        assert!(!paths.is_empty());
+        for path in paths { assert!(source.contains_key(path.as_str()), "repair target {path} has no supplied source"); }
+        assert_eq!(finding.evidence_hash, binding.evidence_hash);
+        assert_eq!(finding.criterion_id, "SUM");
+    }
+    assert!(findings[0].conflicts_with.contains(&findings[1].id));
+    assert!(findings[1].conflicts_with.contains(&findings[0].id));
+}
+
 #[tokio::test]
 #[ignore = "paid native final Codex contradiction probe; central explicit run only"]
 async fn live_native_final_adjudicator_resolves_synthetic_contradiction() -> Result<()> {
@@ -282,7 +305,7 @@ async fn live_native_final_adjudicator_resolves_synthetic_contradiction() -> Res
     let criteria=BTreeMap::from([("SUM".to_owned(),"Adding two integer inputs returns their arithmetic sum.".to_owned())]);
     let evidence=serde_json::json!({"fixture":"SYNTHETIC contradictory findings; no reviewer passes or approval are asserted", "head":head,"source":{"arithmetic.py":source},"controller_observation":{"input":[2,3],"actual":4,"required":5}}).to_string();
     let binding=review::ReviewBinding { head:head.clone(),base:head,environment_id:"disposable-python".into(),contract_hash:review::digest(serde_json::to_string(&criteria)?.as_bytes()),evidence_hash:review::digest(evidence.as_bytes()) };
-    let findings=vec![review::Finding{id:"F1".into(),criterion_id:"SUM".into(),evidence_hash:binding.evidence_hash.clone(),claim:"SYNTHETIC: actual add(2,3)=4 violates the owner criterion requiring 5.".into(),requested_change:"Return a + b and verify add(2,3)=5.".into(),conflicts_with:BTreeSet::from(["F2".into()]),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 2},review::Finding{id:"F2".into(),criterion_id:"SUM".into(),evidence_hash:binding.evidence_hash.clone(),claim:"SYNTHETIC opposing claim: the owner requires add(2,3)=4.".into(),requested_change:"Preserve the subtraction of one.".into(),conflicts_with:BTreeSet::from(["F1".into()]),repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 2}];
+    let findings=synthetic_contradiction_findings(&binding);
     let origin=review::ReviewOrigin::DiagnosticCanary { origin:Box::new(adoption::origin_for_candidate(root,Some(&guard)).await?) };
     let mut sessions=BTreeSet::new();
     for _ in 0..2 {
@@ -291,6 +314,10 @@ async fn live_native_final_adjudicator_resolves_synthetic_contradiction() -> Res
         let mut opts=codex_review_opts(root.to_owned(),"Final synthetic contradiction adjudication");
         opts.audit_logger=Some(guard.audit_logger());
         let receipt=review::adjudicate_native_with_origin(&[],opts,binding.clone(),&criteria,&findings,&evidence,attempt,&origin).await?;
+        // Retain the actual authority output before any acceptance assertion,
+        // including failed probes whose ephemeral native session is retired.
+        guard.audit_health().await?;
+        guard.audit_logger().record_controller(serde_json::json!({"kind":"synthetic_contradiction_native_adjudication_observed","receipt":receipt,"findings":findings,"no_reviewer_passes":true,"no_remote_publication":true}))?;
         assert_eq!(receipt.binding,binding);
         for finding in &findings { assert_eq!(receipt.finding_fingerprints.get(&finding.id),Some(&finding.fingerprint()?)); }
         assert!(!receipt.prompt_hash.is_empty() && !receipt.response_hash.is_empty());
@@ -298,8 +325,8 @@ async fn live_native_final_adjudicator_resolves_synthetic_contradiction() -> Res
         assert_eq!(receipt.actor.backend,"native");
         assert!(!receipt.actor.session_id.starts_with("autoship-adjudicate:"));
         assert!(sessions.insert(receipt.actor.session_id.clone()),"each actual adjudicator must have a distinct native session");
-        assert!(matches!(receipt.rulings["F1"],review::Ruling::Uphold{..}));
-        assert!(matches!(receipt.rulings["F2"],review::Ruling::Dismiss{..}));
+        assert!(matches!(receipt.rulings["F1"],review::Ruling::Uphold{..}), "grounded arithmetic defect was not upheld: {}", serde_json::to_string(&receipt.rulings)?);
+        assert!(matches!(receipt.rulings["F2"],review::Ruling::Dismiss{..}), "contradictory owner claim was not dismissed: {}", serde_json::to_string(&receipt.rulings)?);
         let mut mandatory=review::MandatoryChecks { binding:binding.clone(),authorized:true,required_ci_green:false,verifier_integrity:true,scope_valid:true,mergeable:true };
         assert!(review::merge_authority(&binding,&[],&[],&mandatory,Some(&receipt)).unwrap_err().to_string().contains("mandatory merge checks"));
         mandatory.required_ci_green=true;
