@@ -7744,6 +7744,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .join(".self-improve-worktrees")
         .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
     recovery::prepare(repo_root, &worktree, &branch).await?;
+    let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
+    anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
+    let candidate_base = candidate_base.trim();
 
     // Failed stages retain committed and unfinished work. Publication alone is
     // not permission to erase the only local recovery copy.
@@ -8018,7 +8021,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // Staging here is idempotent with the commit step's own `git add -A`.
     let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
-    let (_ok, mut diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+    let (_ok, mut diff, _) = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?;
     // Every revision call this run makes — the no-change follow-up, the
     // initial shrink, gate repairs, review rounds — comes out of one budget.
     let mut spent = 0u32;
@@ -8037,7 +8040,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 Ok(text) => {
                     dropped.extend(drop_root_scratch(&worktree).await);
                     let _ = run("git", &["add", "-A"], &worktree).await?;
-                    diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+                    diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
                     summary = format!("{summary}\n\nNo-change follow-up: {}", truncate(&text, 300));
                     reply = parse_no_change_reply(&text);
                 }
@@ -8107,12 +8110,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // `main` deterministically and nothing else changes; if the result still
     // trips the guard (or nothing would be left), the refusal below runs
     // exactly as before. The guard itself is untouched.
-    let (_ok, mut full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
+    let (_ok, mut full_diff, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
     if let Some((pattern, _)) = blast_radius_hit_in_diff(&full_diff) {
         if let Some(clean) = narrow_guarded_paths(&worktree, "origin/main", &full_diff).await? {
             info!(issue = issue.number, pattern, "narrowing reverted the guarded paths");
             full_diff = clean;
-            diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+            diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
             summary = format!("{summary}\n\nNarrowed: reverted changes to `{pattern}` paths.");
         }
     }
@@ -8169,7 +8172,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #823 — does this diff touch a path the PR-verify hook guards? Computed
     // next to the other diff-derived facts; it withholds auto-merge below
     // rather than refusing the work.
-    let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+    let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?;
     let mut gated = touches_verify_gated_path(&staged_names);
     let mut lines = diff_line_count(&full_diff);
     if lines > MAX_DIFF_LINES && spent < revise_rounds() {
@@ -8192,7 +8195,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             Ok(rs) => {
                 let _ = drop_root_scratch(&worktree).await;
                 let _ = run("git", &["add", "-A"], &worktree).await?;
-                let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                let (_ok, d2, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
                 // Shrinking must not smuggle in a guarded path — and the tree it
                 // left must not ship either, so put the guarded-clean one back.
                 if blast_radius_hit_in_diff(&d2).is_none() {
@@ -8210,8 +8213,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 restore_tree(&worktree, &snapshot).await?;
             }
         }
-        diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
-        let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+        diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
+        let names = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?.1;
         gated = touches_verify_gated_path(&names);
     }
 
@@ -8313,7 +8316,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 Ok(rs) => {
                     let _ = drop_root_scratch(&worktree).await;
                     let _ = run("git", &["add", "-A"], &worktree).await?;
-                    let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                    let (_ok, d2, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
                     // A repair may not smuggle in a guarded path or blow the cap:
                     // the red verdict stands on the tree before the repair.
                     if blast_radius_hit_in_diff(&d2).is_some() || diff_line_count(&d2) > MAX_DIFF_LINES {
@@ -8323,8 +8326,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     }
                     lines = diff_line_count(&d2);
                     full_diff = d2;
-                    diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
-                    let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+                    diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
+                    let names = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?.1;
                     gated = touches_verify_gated_path(&names);
                     summary = format!("{summary}\n\nGate repair {round}: {}", truncate(&rs, 200));
                     gate_result = verification_gate(&worktree).await;
@@ -8488,7 +8491,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 Ok(rev_summary) => {
                     dropped.extend(drop_root_scratch(&worktree).await);
                     let _ = run("git", &["add", "-A"], &worktree).await?;
-                    let (_ok, mut diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                    let (_ok, mut diff2, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
                     if blast_radius_hit_in_diff(&diff2).is_some() {
                         // #1490 AC6 — the same deterministic narrowing the
                         // initial diff gets.
@@ -8560,7 +8563,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         break 'stages Some(ParkReason::Oversize(lines2));
                     }
                     let (_ok, names2, _) =
-                        run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+                        run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?;
                     if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
                         warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
                         // #873 — a red gate gets a repair round while budget
@@ -8649,7 +8652,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // The loop stopped (a revision call errored) on a tree that is
             // still oversized or red: that is why it parks, not the reviews
             // of an earlier tree. One attempt, with the right kind.
-            let (_ok, full_pending, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            let (_ok, full_pending, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
             let paths = diff_touched_paths(&full_pending);
             let n = diff_line_count(&full_pending);
             let record = match &pending {
@@ -8688,13 +8691,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // Revisions changed the worktree: refresh what the final-gate and
             // publish records below describe (the outer `diff`/`lines` are the
             // pre-revision snapshot).
-            let (_ok, stat_after, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
-            let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            let (_ok, stat_after, _) = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?;
+            let (_ok, full_after, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
             diff = stat_after;
             lines = diff_line_count(&full_after);
         }
         // What the stages ended on — the revised tree when there were rounds.
-        let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
+        let (_ok, full_after, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
         if !qa_ok {
             // #1488 — QA still rejects with the budget spent: one attempt for
             // the run (#852), and the work parks with QA's notes on the PR.
@@ -8808,7 +8811,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         "-m",
         &commit_msg,
     ];
-    let (mut ok, mut _o, mut e) = run("git", &commit_args, &worktree).await?;
+    // A recovered candidate can already be committed. Review the complete
+    // baseline-to-index patch above, then avoid an empty commit failure.
+    let (already_committed, _, _) = run("git", &["diff", "--cached", "--quiet", "HEAD"], &worktree).await?;
+    let (mut ok, mut _o, mut e) = if already_committed {
+        (true, String::new(), String::new())
+    } else {
+        run("git", &commit_args, &worktree).await?
+    };
     // PR #973 — a commit refused by the personal-data guard is a fixable
     // literal, not a failed run: let the builder correct exactly the lines
     // the guard named and try the commit once more. Anything else (a merge
