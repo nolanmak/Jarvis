@@ -8914,6 +8914,22 @@ async fn run_digest(
             ctx.push_str(&format!("- {status}: {n}\n"));
         }
     }
+    let triage_outcomes = store.triage_outcome_report(since_ms, 25)?;
+    ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
+    for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending)] {
+        ctx.push_str(&format!("- {cohort}: approved {}, revised {}, skipped {}, aged out {}, unresolved {}\n",
+            counts.approved, counts.revised, counts.skipped, counts.aged_out, counts.unresolved));
+    }
+    match triage_outcomes.flag_precision {
+        Some(precision) => ctx.push_str(&format!("- Flag precision among {} observed owner resolutions: {:.1}% (aged-out and unresolved excluded)\n",
+            triage_outcomes.observed_owner_resolutions, precision * 100.0)),
+        None => ctx.push_str("- Flag precision unavailable: no observed owner resolutions.\n"),
+    }
+    ctx.push_str(&format!("- Flagged then aged out: {}.\n", triage_outcomes.flagged_then_aged_out));
+    for case in &triage_outcomes.disagreement_review_set {
+        ctx.push_str(&format!("- Disagreement review case {}: {:?}; {}. Review only; no automatic policy change.\n",
+            case.action_id, case.owner_outcome, case.evidence));
+    }
     ctx.push_str("\n## Retry failure memory (latest 25; full history retained)\n");
     for failure in store.email_retry_failures_since(since_ms, 25)? {
         ctx.push_str(&format!("- action {} / message {}: attempt {}, guard {}, failure {}\n",

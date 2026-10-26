@@ -3637,13 +3637,12 @@ Where: Microsoft Teams
             // first-pass triage + draft
             r#"{"decision":"reply","reason":"actionable"}"#,
             "Thursday 3pm works.",
-            r#"{"decision":"reply","reason":"still actionable after retry"}"#,
         ]));
         let broker = Arc::new(RecordingBroker::default());
         let ch = GmailChannel::new(
             store.clone(),
             gmail,
-            reasoner,
+            reasoner.clone(),
             broker.clone(),
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
@@ -3663,6 +3662,9 @@ Where: Microsoft Teams
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
 
         // Retry tick: create_draft now succeeds, approval card posted.
+        // First-pass code generation/self-repair can consume multiple replies.
+        // Queue the retry's fresh triage response only once that pass has ended.
+        reasoner.responses.lock().unwrap().push_back(r#"{"decision":"reply","reason":"still actionable after retry"}"#.into());
         let retried = ch.retry_once().await.unwrap();
         assert_eq!(retried, 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
@@ -4029,7 +4031,6 @@ Where: Microsoft Teams
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"actionable"}"#,
             "Friday 2pm works.",
-            r#"{"decision":"reply","reason":"still actionable after retry"}"#,
         ]));
         let broker = Arc::new(FlakyBroker {
             posts: std::sync::Mutex::new(Vec::new()),
@@ -4038,7 +4039,7 @@ Where: Microsoft Teams
         let ch = GmailChannel::new(
             store.clone(),
             gmail.clone(),
-            reasoner,
+            reasoner.clone(),
             broker.clone(),
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
@@ -4059,6 +4060,9 @@ Where: Microsoft Teams
 
         // Retry tick: post_approval succeeds. create_draft must NOT be called
         // a second time — the action already has a draftId from the first pass.
+        // First-pass code generation/self-repair can consume multiple replies.
+        // Queue the retry's fresh triage response only once that pass has ended.
+        reasoner.responses.lock().unwrap().push_back(r#"{"decision":"reply","reason":"still actionable after retry"}"#.into());
         let retried = ch.retry_once().await.unwrap();
         assert_eq!(retried, 1);
         assert_eq!(
