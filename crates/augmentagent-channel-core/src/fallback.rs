@@ -144,6 +144,7 @@ pub struct FallbackReasoner {
     profile_enabled: fn(ProviderKind) -> bool,
     /// Adapters registered only for dashboard routing; direct mode excludes them.
     gateway_only: Vec<ProviderKind>,
+    workflow_native_only: bool,
     latch: CooldownLatch,
     /// #803 — resource accounting for this instance: `(provider, calls
     /// attempted, calls that returned Ok)`, in chain order of first use. The
@@ -153,6 +154,7 @@ pub struct FallbackReasoner {
     mutation_providers: std::sync::Mutex<Vec<ProviderKind>>,
     review_history: std::sync::Mutex<ReviewLifecycle>,
     handoff_root: Option<std::path::PathBuf>,
+    workflow_audit: std::sync::Mutex<Option<std::sync::Arc<crate::tool_audit::AuditLogger>>>,
 }
 
 /// Why `kind` cannot serve calls on this box (binary absent, no resolvable
@@ -210,6 +212,27 @@ pub fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
     }
 }
 
+/// Native reviewer eligibility inside an explicitly required workflow only.
+pub fn workflow_native_ineligible_reason(kind:ProviderKind)->Option<String> {
+    if !matches!(kind,ProviderKind::Codex|ProviderKind::Claude) {return Some("provider has no declared native VM identity".into());}
+    if let Some(reason)=gateway_ineligible_reason(kind){return Some(reason);}
+    match crate::native_vm::declared_native_auth(kind.name()) {
+        Ok(true)=>None,
+        _=>Some("required native VM provider credential is not declared or valid".into()),
+    }
+}
+fn workflow_route_auth(kind: ProviderKind, routed: bool) -> bool {
+    if routed { crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false) }
+    else { crate::native_vm::declared_native_auth(kind.name()).unwrap_or(false) }
+}
+
+fn workflow_entry_for(kind:ProviderKind)->Option<Entry> {
+    workflow_native_ineligible_reason(kind).is_none().then(||unchecked_entry(kind))
+}
+fn workflow_gateway_entry_for(kind:ProviderKind)->Option<Entry> {
+    (gateway_ineligible_reason(kind).is_none() && crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false)).then(||unchecked_entry(kind))
+}
+
 /// Construct the entry for one provider, or `None` when it is not eligible.
 fn entry_for(kind: ProviderKind) -> Option<Entry> {
     if let Some(reason) = native_ineligible_reason(kind) {
@@ -251,7 +274,11 @@ fn unchecked_entry(kind: ProviderKind) -> Entry {
 /// Eligibility is checked once per construction: a fallback CLI that is not
 /// installed (or has no resolvable auth) is dropped from the chain with one
 /// log line instead of erroring on every call.
-pub fn build_reasoner() -> Arc<FallbackReasoner> {
+pub fn build_reasoner() -> Arc<FallbackReasoner> { build_reasoner_inner(false) }
+pub fn build_workflow_reasoner()->Arc<FallbackReasoner> {build_reasoner_inner(true)}
+fn build_reasoner_inner(workflow:bool)->Arc<FallbackReasoner> {
+    let entry_for=if workflow {workflow_entry_for} else {entry_for};
+    let gateway_entry_for=if workflow {workflow_gateway_entry_for} else {gateway_entry_for};
     let mut entries: Vec<Entry> = chain_from_env().into_iter().filter_map(entry_for).collect();
     let mut gateway_only = Vec::new();
     // Pre-register gateway adapters while configured, even in direct mode,
@@ -273,7 +300,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
             }
         }
     }
-    if entries.is_empty() {
+    if entries.is_empty() && !workflow {
         // Unreachable via chain_from_env (it always yields claude), but keep
         // the invariant explicit: the composite always has a primary.
         entries.push(Entry {
@@ -292,6 +319,8 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
         mutation_providers: std::sync::Mutex::new(Vec::new()),
+        workflow_native_only: workflow,
+        workflow_audit: std::sync::Mutex::new(None),
         review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
         handoff_root: crate::handoff::system_root(),
     })
@@ -308,10 +337,13 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
 /// Deliberately returns `None` rather than falling back: a caller that
 /// cannot get the provider it asked for must be able to tell, and must fail
 /// closed. There is no chain here, so failover cannot silently occur either.
-pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
-    let native = entry_for(kind);
+pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> { build_pinned_inner(kind,false) }
+pub fn build_workflow_pinned(kind:ProviderKind)->Option<Arc<FallbackReasoner>> {build_pinned_inner(kind,true)}
+fn build_pinned_inner(kind:ProviderKind,workflow:bool)->Option<Arc<FallbackReasoner>> {
+    let native = if workflow {workflow_entry_for(kind)} else {entry_for(kind)};
     let gateway_only = if native.is_none() { vec![kind] } else { Vec::new() };
     native.or_else(|| {
+        if workflow {return None;}
         let config = crate::model_router::load().ok().flatten()?;
         (config.enabled() && config.allows(kind)).then(|| gateway_entry_for(kind)).flatten()
     }).map(|entry| {
@@ -322,6 +354,8 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_native_only: workflow,
+            workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
         })
@@ -356,6 +390,8 @@ impl FallbackReasoner {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_native_only: false,
+            workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
         }
@@ -376,6 +412,8 @@ impl FallbackReasoner {
             latch,
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_native_only: false,
+            workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: None,
         }
@@ -396,7 +434,8 @@ impl FallbackReasoner {
     ) -> LaneAvailability {
         let Ok(selected) = crate::model_selection::current() else { return LaneAvailability::NoEligibleProvider; };
         let Ok(config) = crate::model_router::current() else { return LaneAvailability::NoEligibleProvider; };
-        let Ok(routing) = crate::model_router::select_profile(config, selected) else { return LaneAvailability::NoEligibleProvider; };
+        let required=self.workflow_native_only || self.workflow_audit.lock().ok().and_then(|logger|logger.clone()).is_some_and(|logger|logger.run_resources_required());
+        let Ok(routing) = crate::model_router::select_profile_for_workflow(config, selected, required) else { return LaneAvailability::NoEligibleProvider; };
         let mut latched = Vec::new();
         let mut eligible = 0usize;
         for entry in &self.entries {
@@ -404,6 +443,10 @@ impl FallbackReasoner {
             if !(self.profile_enabled)(entry.kind) { continue; }
             if routing.as_ref().is_some_and(|r| !r.allows(entry.kind))
                 || (selected.is_none() && !routing.as_ref().is_some_and(|r| r.enabled()) && self.gateway_only.contains(&entry.kind)) {
+                continue;
+            }
+            if required && (self.workflow_native_only || entry.reasoner.defers_model_admission())
+                && !workflow_route_auth(entry.kind, routing.as_ref().is_some_and(|r| r.enabled())) {
                 continue;
             }
             if !allowed_for(entry.kind, class) {
@@ -536,6 +579,21 @@ impl FallbackReasoner {
             .join(", ")
     }
 
+    /// Harness-owned workflow sink overrides global preset logging without
+    /// changing which provider actually serves or is attributed to the call.
+    pub fn set_workflow_audit(&self, logger: std::sync::Arc<crate::tool_audit::AuditLogger>) -> anyhow::Result<()> {
+        logger.protected_health()?;
+        *self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))? = Some(logger);
+        Ok(())
+    }
+
+    pub fn uses_isolated_command_storage(&self,opts:&ReasonerOpts)->anyhow::Result<bool> {
+        let mut effective=opts.clone();
+        effective.audit_logger=self.workflow_audit.lock().map_err(|_|anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone()
+            .or_else(||opts.audit_logger.clone());
+        Ok(crate::codex_tools::isolated_command_storage(&effective))
+    }
+
     async fn dispatch(
         &self,
         opts: &ReasonerOpts,
@@ -543,6 +601,16 @@ impl FallbackReasoner {
         transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
+        let logger = self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone()
+            .or_else(|| opts.audit_logger.clone());
+        let mut effective_opts = opts.clone();
+        if let Some(logger) = &logger {
+            logger.drain_checked().await?;
+            effective_opts.audit_logger = Some(logger.clone());
+        }
+        let opts = &effective_opts;
+        let required=opts.audit_logger.as_ref().is_some_and(|logger|logger.run_resources_required());
+        anyhow::ensure!(!self.workflow_native_only || required,"workflow-native reasoner requires protected workflow policy");
         // Respect a caller-pinned routing snapshot (including native phone turns).
         // Unscoped dispatch still reloads configuration for the next request.
         let config = crate::model_router::current().map_err(|_| ReasonerError::Local {
@@ -552,12 +620,14 @@ impl FallbackReasoner {
         // call. Unscoped callers can change the selection file after this
         // read; dispatch_snapshot must not pick up their newer model.
         let selected = crate::model_selection::current()?;
-        let config = crate::model_router::select_profile(config, selected)?;
+        let config = crate::model_router::select_profile_for_workflow(config, selected, required)?;
         #[cfg(test)]
         let _ = AFTER_ROUTE_SELECTION.try_with(|hook| hook());
-        crate::model_selection::SELECTED_PROFILE.scope(selected,
+        let outcome = crate::model_selection::SELECTED_PROFILE.scope(selected,
             crate::model_router::SNAPSHOT.scope(config,
-                self.dispatch_snapshot(opts, user_message, transcript, revision_authors))).await
+                self.dispatch_snapshot(opts, user_message, transcript, revision_authors))).await;
+        if let Some(logger) = logger { logger.drain_checked().await?; }
+        outcome
     }
 
     async fn dispatch_snapshot(
@@ -577,7 +647,15 @@ impl FallbackReasoner {
         // retrofit a history that misses an earlier mutating dispatch.
         self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
         let class = classify(opts);
-        let mutating = matches!(class,
+        // restrict_env selects a strong transport capability, not permission to
+        // mutate. A supplied-evidence fresh review must never gain a journal
+        // (and its previous conversation) merely because its env is restricted.
+        let fresh_review = crate::native_session::is_fresh_review();
+        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
+            return Err(ReasonerError::Local { message:
+                "fresh review requires supplied evidence without tools, settings or handoff history".into() }.into());
+        }
+        let mutating = !fresh_review && matches!(class,
             crate::providers::CapabilityClass::WriteTools | crate::providers::CapabilityClass::FullAgentic);
         let mut request_opts = opts.clone();
         if request_opts.handoff_path.is_none() && mutating {
@@ -630,6 +708,12 @@ impl FallbackReasoner {
             // Account cooldowns belong to 9Router. Native-login cooldowns must
             // neither block a fresh account pool nor be cleared by its success.
             let routed = routing.as_ref().is_some_and(|r| r.enabled());
+            if opts.audit_logger.as_ref().is_some_and(|logger| logger.run_resources_required())
+                && (self.workflow_native_only || entry.reasoner.defers_model_admission())
+                && !workflow_route_auth(entry.kind, routed) {
+                diagnostics.push(format!("{name}: selected route lacks declared workflow credentials"));
+                continue;
+            }
             if revision_authors.is_some_and(|authors| !authors.contains(&entry.kind)) {
                 diagnostics.push(format!("{name}: reserved for independent review"));
                 continue;
@@ -644,10 +728,14 @@ impl FallbackReasoner {
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
                 continue;
             }
-            let resumed_message = match &opts.handoff_path {
+            let mut resumed_message = match &opts.handoff_path {
                 Some(path) => crate::handoff::resume_message(path, user_message)?,
                 None => user_message.to_string(),
             };
+            let calibrated_model = crate::triage_capture::append(entry.kind == ProviderKind::Claude && !routed, &mut resumed_message);
+            let mut entry_opts = opts.clone();
+            if let Some(model) = calibrated_model { entry_opts.model=Some(model); }
+            let opts=&entry_opts;
             if mutating {
                 let (history, branch_record) = {
                     let bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
@@ -665,12 +753,18 @@ impl FallbackReasoner {
                 let mut authors = self.mutation_providers.lock().unwrap_or_else(|e| e.into_inner());
                 if !authors.contains(&entry.kind) { authors.push(entry.kind); }
             }
+            if !entry.reasoner.defers_model_admission() {
+                if let Some(logger) = &opts.audit_logger { logger.model_call_admitted(name)?; }
+            }
             self.note_call(name);
             let res = if transcript {
                 entry.reasoner.call_transcript(opts, &resumed_message).await
             } else {
                 entry.reasoner.call(opts, &resumed_message).await
             };
+            if opts.audit_logger.as_ref().is_some_and(|logger|logger.resource_capacity_seen()) {
+                return Err(ReasonerError::ResourceCapacity {provider:name.into(),message:"shared run capacity requires reconciliation before retry".into()}.into());
+            }
             match res {
                 Ok(text) => {
                     self.note_ok(name);
@@ -826,6 +920,10 @@ impl FallbackReasoner {
 
 #[async_trait]
 impl Reasoner for FallbackReasoner {
+    async fn call_calibrated(&self,opts:&ReasonerOpts,user_message:&str,supplement:&str,serving_model:&str)->anyhow::Result<String>{
+        crate::triage_capture::with_supplement(supplement,serving_model,self.dispatch(opts,user_message,false,None)).await
+    }
+
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         self.dispatch(opts, user_message, false, None).await
     }
@@ -1334,6 +1432,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_audit_overrides_presets_and_drains_actual_provider_writes() {
+        struct AuditedProvider;
+        #[async_trait]
+        impl Reasoner for AuditedProvider {
+            async fn call(&self, opts: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                let logger = opts.audit_logger.clone().expect("injected workflow audit");
+                let ticket = logger.begin_write()?;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let record = crate::tool_audit::build_audit_record(ProviderKind::Claude,
+                        "synthetic-time".into(), "actual-claude-session".into(), "Read".into(),
+                        serde_json::json!({"file_path":"synthetic.txt"}), "synthetic", false);
+                    logger.record(&record).await;
+                    ticket.complete();
+                });
+                Ok("completed".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::create_dir(dir.path().join("anchors")).unwrap();
+        let logger = Arc::new(crate::tool_audit::AuditLogger::protected(dir.path().join("logs/workflow.log"),
+            dir.path().join("anchors/workflow.json"), &[]).unwrap());
+        let fallback = FallbackReasoner::for_tests(vec![(ProviderKind::Claude, Arc::new(AuditedProvider))], latch_in(&dir));
+        fallback.set_workflow_audit(logger.clone()).unwrap();
+        crate::model_router::native_reviewer_scope(ProviderKind::Claude,
+            fallback.call(&text_only_opts(), "synthetic")).await.unwrap();
+        let rows = std::fs::read_to_string(logger.path()).unwrap();
+        assert!(rows.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|row| row.get("provider").and_then(|v|v.as_str()) == Some("claude")
+                && row.get("session_id").and_then(|v|v.as_str()) == Some("actual-claude-session")));
+        logger.protected_health().unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_native_review_uses_declared_credential_without_host_login() {
+        if std::env::var_os("AUTOSHIP_DECLARED_AUTH_FIXTURE").is_none() {
+            let home=tempfile::tempdir().unwrap();
+            let auth=home.path().join("service-auth.json");
+            std::fs::write(&auth,r#"{"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}"#).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let policy=home.path().join("policy.json");
+            std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":"/declared/state","memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+                "providers":{"codex":{"gateway":{},"auth_file":auth,"auth_relative":".codex/auth.json","environment":[]}}})).unwrap()).unwrap();
+            std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let status=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","fallback::tests::required_native_review_uses_declared_credential_without_host_login","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",home.path())
+                .env("XDG_STATE_HOME",home.path().join("state")).env("CODEX_CLI","/usr/bin/true")
+                .env("AUGMENTAGENT_NATIVE_VM_POLICY",policy).env("AUTOSHIP_DECLARED_AUTH_FIXTURE","1")
+                .status().unwrap();
+            assert!(status.success());return;
+        }
+        assert!(!crate::codex::codex_auth_available());
+        assert!(build_pinned(ProviderKind::Codex).is_none());
+        assert!(build_workflow_pinned(ProviderKind::Codex).is_some());
+        let temp=tempfile::Builder::new().prefix("native-auth-fixture-").tempdir_in("/tmp").unwrap();
+        let logs=temp.path().join("logs");let anchors=temp.path().join("anchors");
+        std::fs::create_dir(&logs).unwrap();std::fs::create_dir(&anchors).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&logs,&anchors] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("audit"),anchors.join("anchor"),&[]).unwrap());
+        logger.require_run_resources().unwrap();
+        let scripted=Scripted::ok("supplied-evidence fixture");
+        let mut chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,scripted.clone())],latch_in(&temp));
+        chain.workflow_native_only=true;
+        let mut opts=text_only_opts();opts.audit_logger=Some(logger.clone());
+        chain.set_workflow_audit(logger.clone()).unwrap();
+        let routed=crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        crate::model_router::SNAPSHOT.scope(Some(routed), async {
+            assert!(matches!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly), LaneAvailability::NoEligibleProvider));
+            assert!(chain.call(&opts,"must not dispatch routed call").await.is_err());
+            assert_eq!(scripted.count(),0,"native credentials cannot authorize the selected router route");
+        }).await;
+        let result=crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.unwrap();
+        assert_eq!(result,"supplied-evidence fixture");
+        assert_eq!(scripted.count(),1);
+        opts.audit_logger=None;
+        chain.workflow_native_only=false;
+        *chain.workflow_audit.lock().unwrap()=None;
+        assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.is_err());
+        assert_eq!(scripted.count(),1,"interactive native eligibility must not borrow service credentials");
+    }
+
+    #[tokio::test]
+    async fn restricted_fresh_review_never_inherits_mutation_journal() {
+        // Run the scripted dispatch in an authless child even on logged-in
+        // developer hosts. Never mutate HOME/auth vars in the shared test process.
+        if std::env::var_os("AUTOSHIP_AUTHLESS_REVIEW_FIXTURE").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fallback::tests::restricted_fresh_review_never_inherits_mutation_journal", "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin")
+                .env("HOME", home.path()).env("CODEX_HOME", home.path().join("codex"))
+                .env("XDG_STATE_HOME", home.path().join("state"))
+                .env("AUTOSHIP_AUTHLESS_REVIEW_FIXTURE", "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        assert!(!crate::codex::codex_auth_available());
+        struct SuppliedEvidence;
+        #[async_trait]
+        impl Reasoner for SuppliedEvidence {
+            async fn call(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+                assert!(opts.restrict_env);
+                assert!(opts.allowed_tools.is_empty());
+                assert!(opts.handoff_path.is_none(), "environment restriction injected old history");
+                assert_eq!(message, "supplied candidate");
+                Ok("review completed".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut fallback = FallbackReasoner::for_tests(
+            vec![(ProviderKind::Codex, Arc::new(SuppliedEvidence))], latch_in(&dir));
+        fallback.handoff_root = Some(dir.path().join("handoffs"));
+        let mut opts = text_only_opts();
+        opts.restrict_env = true;
+        let output = crate::native_session::FRESH_REVIEW.scope(true,
+            crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::without_router(
+                    fallback.dispatch_snapshot(&opts, "supplied candidate", false, None)))).await.unwrap();
+        assert_eq!(output, "review completed");
+        assert!(!dir.path().join("handoffs").exists());
+        assert!(fallback.mutation_providers().is_empty());
+        opts.allowed_tools = vec!["Write".into()];
+        assert!(crate::native_session::FRESH_REVIEW.scope(true,
+            crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::without_router(
+                    fallback.dispatch_snapshot(&opts, "supplied candidate", false, None)))).await.is_err());
+        assert_eq!(fallback.calls(), 1, "invalid fresh-review capability never dispatches");
+        assert!(latch_in(&dir).latched_until("codex").is_none());
+    }
+
+    #[tokio::test]
     async fn fallback_receives_primary_receipts_and_same_journal() {
         struct CheckpointProvider { primary: bool, expected: std::path::PathBuf }
         #[async_trait]
@@ -1653,6 +1887,18 @@ mod tests {
         let err = fb.call(&text_only_opts(), "hi").await.unwrap_err();
         assert!(ReasonerError::find_in(&err).is_none());
         assert_eq!(b.count(), 0, "untyped errors must not trigger failover");
+    }
+
+    #[tokio::test]
+    async fn run_capacity_exhaustion_never_fans_out_or_latches_provider() {
+        let dir=tempfile::tempdir().unwrap();let latch=latch_in(&dir);
+        let primary=Scripted::err(||ReasonerError::ResourceCapacity {provider:"codex".into(),message:"synthetic PID ceiling".into()}.into());
+        let fallback=Scripted::ok("must not run");
+        let chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,primary),(ProviderKind::Claude,fallback.clone())],latch.clone());
+        let error=chain.call(&text_only_opts(),"request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error),Some(ReasonerError::ResourceCapacity {..})));
+        assert_eq!(fallback.count(),0);
+        assert!(latch.latched_until("codex").is_none());
     }
 
     #[tokio::test]

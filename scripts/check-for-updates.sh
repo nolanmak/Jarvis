@@ -287,7 +287,18 @@ apply_update() {
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
           # #1571 — proof now includes "and it is running the binary we
           # built"; a bounce onto anything else is a pinned deploy.
-          if restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+          resource_status=0
+          if [ -x "$REPO_ROOT/scripts/configure-run-resources.sh" ]; then
+            AUGMENTAGENT_RESOURCE_UNIT="$SYSTEMD_UNIT" "$REPO_ROOT/scripts/configure-run-resources.sh" --install >> "$LOG" 2>&1 || resource_status=$?
+          fi
+          if [ "$resource_status" -eq 3 ]; then
+            log "run-resource delegation unsupported; required Autoship stays disabled while unrelated service updates continue"
+            notify_owner "Run-resource delegation unavailable for $SYSTEMD_UNIT; required Autoship remains disabled. Other daemon services continue updating."
+          fi
+          if [ "$resource_status" -ne 0 ] && [ "$resource_status" -ne 3 ]; then
+            log "resource delegation setup failed; keeping daemon and withholding build stamp"
+            RESTART_FAILURES=$((RESTART_FAILURES + 1))
+          elif restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
             record_restart
           else
             [ -n "$SR_LAST_EXE" ] && report_pinned_deploy "came back running \
@@ -489,7 +500,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi

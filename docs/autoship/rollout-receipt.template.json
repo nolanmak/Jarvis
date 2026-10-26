@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "status": "not_executed",
+  "prepared_against": "9b0c6ab5",
+  "deployed_head": null,
+  "snapshot": {
+    "id": null,
+    "manifest_sha256": null,
+    "pin_reason": null
+  },
+  "acceptance": {
+    "final_ci": null,
+    "independent_review": null,
+    "full_fresh_issue_pipeline": null,
+    "seeded_defect_rejection": null,
+    "adopted_pr_recovery": null,
+    "codex_contradiction_authority": null,
+    "transport_proofs": [],
+    "distinct_session_after_credential_rotation": null
+  },
+  "before": {
+    "unit": null,
+    "pid": null,
+    "exec_start": null,
+    "executable_sha256": null,
+    "dropin_hashes": {},
+    "memory_max": null,
+    "tasks_max": null,
+    "cpu_quota": null
+  },
+  "staged": {
+    "policy_path": null,
+    "policy_sha256": null,
+    "stable_state_root": null,
+    "runtime_manifest_sha256": null,
+    "provider_executable_hashes": {},
+    "auth_grants": []
+  },
+  "protection": {
+    "ruleset_before_sha256": null,
+    "ruleset_after_sha256": null,
+    "legacy_policy_sha256": null,
+    "strict": null,
+    "enforce_admins": null,
+    "required_contexts": [],
+    "external_review_required": null
+  },
+  "updater": {
+    "unit": null,
+    "invocation_id": null,
+    "log_artifact": null,
+    "build_stamp": null,
+    "artifact_sha256": null,
+    "running_executable_sha256": null,
+    "new_pid": null,
+    "restart_verified": null
+  },
+  "resource_readback": {
+    "delegate": null,
+    "delegate_subgroup": null,
+    "memory_max": null,
+    "tasks_max": null,
+    "cpu_quota": null,
+    "resources_enabled": null,
+    "native_policy_matches": null,
+    "admission_receipt_sha256": null,
+    "limits_verified": null,
+    "protected_audit_health": null,
+    "cleanup_receipt_sha256": null,
+    "pre_dispatch_refusal_unbilled": null
+  },
+  "long_window": {
+    "daily_issue_to_main": "pending",
+    "backlog_drain": "pending",
+    "scheduled_email_restart_retry": "pending"
+  }
+}

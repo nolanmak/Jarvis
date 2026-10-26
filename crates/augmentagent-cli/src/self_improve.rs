@@ -26,6 +26,9 @@
 //! This module shells out to `gh` and `git`; it does not depend on the
 //! GitHub channel crate (different concern — that's inbound notifications).
 
+#[path = "triage_calibration.rs"]
+pub(crate) mod triage_calibration;
+
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -35,7 +38,62 @@ use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
+use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, FallbackReasoner, Reasoner};
+
+#[path = "self_improve_episode.rs"]
+mod episode;
+#[cfg(test)]
+#[path = "self_improve_adoption_acceptance.rs"]
+mod adoption_acceptance;
+#[path = "self_improve_adopted.rs"]
+mod adopted_execution;
+#[path = "self_improve_adoption.rs"]
+mod adoption;
+#[path = "self_improve_policy_hold.rs"]
+mod policy_hold;
+#[path = "self_improve_legacy_readmission.rs"]
+mod legacy_readmission;
+#[path = "self_improve_slicing.rs"]
+mod slicing;
+
+pub(crate) fn readiness_summary()->Result<String> { acceptance::readiness::summary() }
+
+pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
+    policy_hold::statuses()
+}
+#[path = "self_improve_source.rs"]
+mod source_reconcile;
+#[path = "self_improve_workflow.rs"]
+mod workflow;
+#[path = "self_improve_recovery.rs"]
+mod recovery;
+#[path = "self_improve_contract.rs"]
+mod acceptance;
+#[path = "self_improve_alignment.rs"]
+mod alignment;
+#[path = "self_improve_publication.rs"]
+mod publication;
+#[path = "self_improve_review.rs"]
+mod aligned_review;
+#[path = "self_improve_review_canary.rs"]
+mod review_canary;
+#[path = "self_improve_review_calibration.rs"]
+mod review_calibration;
+#[cfg(test)]
+#[path = "self_improve_native_acceptance.rs"]
+mod native_acceptance;
+#[cfg(test)]
+#[path = "self_improve_native_route_acceptance.rs"]
+mod native_route_acceptance;
+
+pub(crate) async fn review_canary_if_due() -> Result<Option<review_canary::Report>> {
+    let canary = review_canary::run_if_due().await;
+    if let Err(error) = review_calibration::run_if_due().await {
+        warn!(%error, "review calibration retained previous rubric");
+    }
+    canary
+}
+pub(crate) fn review_canary_summary() -> Result<String> { review_canary::summary() }
 
 /// Branch/worktree prefix so the dedup guard can recognize agent PRs.
 const BRANCH_PREFIX: &str = "agent-fix/issue-";
@@ -472,6 +530,11 @@ pub fn diff_line_count(diff: &str) -> usize {
         .count()
 }
 
+struct CommandGroup(u32);
+impl Drop for CommandGroup {
+    fn drop(&mut self) { unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) }; }
+}
+
 async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, String)> {
     // All maintenance issue/PR writes flow through this runner. Return a normal
     // failed-command result so callers still clean up their worktree and record
@@ -490,13 +553,12 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
             return Ok((false, String::new(), error));
         }
     }
-    let out = Command::new(cmd)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("spawn {cmd} {args:?}"))?;
+    let mut command = Command::new(cmd);
+    command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).process_group(0);
+    let child = command.spawn().with_context(|| format!("spawn {cmd}"))?;
+    let _group = CommandGroup(child.id().context("command has no process id")?);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), child.wait_with_output())
+        .await.context("metadata/publication command timed out; reconcile durable intent before retry")??;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -659,13 +721,32 @@ pub(crate) fn env_name_is_secret(name: &str) -> bool {
 //     path operates on an ephemeral throwaway clone. Secret-stripping is the
 //     defense-in-depth control for the honest-fix path, not the sole barrier
 //     against a hostile author.
+fn standalone_resource_audit(root: &Path) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    let audit = workflow::workflow_audit(&workflow::path(), &format!("verification-{}", uuid::Uuid::new_v4()), Some(root))?;
+    audit.require_run_resources()?;
+    Ok(audit)
+}
+
+// Explicit fixture-only opt-out; production/live probes use required loggers.
+#[cfg(test)]
+fn test_resource_audit(control: &Path) -> Arc<augmentagent_channel_core::AuditLogger> {
+    workflow::workflow_audit(&control.join("fixture-audit-state"), &format!("fixture-{}", uuid::Uuid::new_v4()), None).unwrap()
+}
+
 async fn run_sandboxed(
     cmd: &str,
     args: &[&str],
     cwd: &Path,
     env: &[(String, String)],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<(bool, String, String)> {
-    let child = Command::new(cmd)
+    run_sandboxed_bounded(cmd, args, cwd, env, augmentagent_channel_core::reasoner::reasoner_timeout() * 2, audit).await
+}
+
+async fn run_sandboxed_bounded(cmd: &str, args: &[&str], cwd: &Path, env: &[(String, String)],
+    budget: std::time::Duration, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<(bool, String, String)> {
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -674,24 +755,24 @@ async fn run_sandboxed(
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .kill_on_drop(true)
-        .process_group(0)
-        .spawn()
+        .process_group(0);
+    let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&command, Some(audit))
         .with_context(|| format!("spawn (sandboxed) {cmd} {args:?}"))?;
-    // Kill the whole process group on cancellation/pressure, including cargo
-    // underneath the shell pipeline. A dropped output future alone only kills
-    // the shell and can leave a writer alive after its storage lease drops.
-    struct Group(u32);
-    impl Drop for Group {
-        fn drop(&mut self) { unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) }; }
-    }
-    let _group = Group(child.id().context("spawned gate has no pid")?);
+    resources.admit("build_gate", Some(audit)).await?;
+    drop(child.stdin.take());
+    // The resource guard owns the supervised tree, including descendants that
+    // detach from the shell group. Keep it alive through output collection.
     let env_path = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, value)| {
         let path = PathBuf::from(value); if path.is_absolute() { path } else { cwd.join(path) }
     });
     let target = env_path("CARGO_TARGET_DIR");
     let temp = env_path("TMPDIR");
     let output = async { Ok::<_, anyhow::Error>(child.wait_with_output().await?) };
-    let out = crate::build_storage::watch_reserve_roots(target.as_deref(), temp.as_deref(), output).await?;
+    let out = tokio::time::timeout(budget,
+        crate::build_storage::watch_reserve_roots(target.as_deref(), temp.as_deref(), output))
+        .await.context("verification invocation timed out; preserve candidate and retry stage")?;
+    resources.record_outcome("build_gate", Some(audit))?;
+    let out = out?;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -787,19 +868,16 @@ fn author_is_trusted(login: &str, association: &str, allowlist: &[String]) -> bo
 
 /// #1517 — issues per REST page (GitHub's maximum).
 const ISSUES_PER_PAGE: u32 = 100;
-/// #1517 — how many pages of open issues the picker walks before it settles
-/// for what it has. A bound, not a guess at the backlog: without one a repo
-/// with thousands of open issues would spend a tick listing them.
-const MAX_ISSUE_PAGES: u32 = 5;
+/// Bound inventory work at 10,000 rows. Hitting it is an explicit dependency,
+/// never evidence that an older repair issue or child does not exist.
+const MAX_ISSUE_PAGES: u32 = 100;
 
 /// #1517 — walk `fetch` over pages 1.. and merge the rows into one REST
 /// issues array, preserving the newest-first order the pages arrive in.
 ///
-/// Stops on an empty page, on a body that is not an array (a rate-limit
-/// object — the single-page call always tolerated that shape) or at
-/// [`MAX_ISSUE_PAGES`]. Rows are deduped by `number`: an issue filed
-/// mid-walk shifts every later row one position down, so the same issue can
-/// land on two pages.
+/// Completes on an empty page. Malformed responses and bound exhaustion fail
+/// closed; partial inventories cannot prove absence. Deduplicate rows shifted
+/// between pages by concurrent issue creation.
 async fn fetch_issue_pages<F, Fut>(mut fetch: F) -> Result<serde_json::Value>
 where
     F: FnMut(u32) -> Fut,
@@ -809,9 +887,9 @@ where
     let mut seen = std::collections::HashSet::new();
     for page in 1..=MAX_ISSUE_PAGES {
         let body = fetch(page).await?;
-        let Some(rows) = body.as_array() else { break };
+        let rows = body.as_array().context("issue inventory is not a complete array")?;
         if rows.is_empty() {
-            break;
+            return Ok(serde_json::Value::Array(merged));
         }
         for row in rows {
             let fresh = match row.get("number").and_then(serde_json::Value::as_u64) {
@@ -823,7 +901,7 @@ where
             }
         }
     }
-    Ok(serde_json::Value::Array(merged))
+    bail!("issue inventory exceeded safe pagination bound; refusing partial selection")
 }
 
 /// Pick the first `agent-fixable` issue that isn't already claimed (open agent
@@ -934,14 +1012,12 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
                 "untrusted issue author — requires owner approval before any build/push"
             );
         }
-        return Ok(Some(Issue {
-            number,
-            title,
-            body,
-            author,
-            author_trusted,
-            research_filed,
-        }));
+        let candidate=Issue {number,title,body,author,author_trusted,research_filed};
+        if acceptance::readiness::blocked(repo_root,&candidate).await? {
+            info!(issue=number,"unchanged material readiness dependency; free reconciliation");
+            continue;
+        }
+        return Ok(Some(candidate));
     }
     // #955 — nothing to build, so this is the tick that can afford to give
     // back the issues a not-fixable verdict labelled out on evidence that does
@@ -959,6 +1035,7 @@ async fn pick_issue(repo_root: &Path, dry_run: bool) -> Result<Option<Issue>> {
 /// Dedup guard: is there already an open PR whose head branch matches our
 /// per-issue convention?
 async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
+    if publication::pending_issue(repo_root,issue).await? { return Ok(true); }
     let gh = gh_bin();
     let branch = format!("{BRANCH_PREFIX}{issue}");
     let (ok, stdout, _) = run(
@@ -1099,8 +1176,8 @@ author. Keep each under 200 characters.\n\
 \n\
 For fixable issues, after the header produce the spec:\n\
 - Interpretation: what the issue is actually asking for, resolving any \
-ambiguity with the most reasonable reading of the code and stating the \
-assumption you made.\n\
+routine gaps using the grounded readiness decision and repository evidence. \
+Never invent a material owner decision or silently choose an unsupported surface.\n\
 - Files to touch: concrete paths, with what changes in each and which \
 existing functions/patterns to reuse.\n\
 - The smallest correct approach, and one sentence on why not the \
@@ -1482,38 +1559,33 @@ async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
 /// justification is that it finishes work already approved, and acting on a
 /// guess would make it something else.
 async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
-    let gh = gh_bin();
-    let (ok, out, _) = match run(
-        &gh,
-        &[
-            // Include ready PRs too: a failed merge or a crash after marking
-            // ready must not remove a managed PR from every recovery lane.
-            // Provenance and head-bound review checks below still apply.
-            "pr", "list", "--state", "open", "--limit", "1000",
-            "--search", "sort:created-asc",
-            "--json",
-            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
-        ],
-        repo_root,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("merge sweep: could not list PRs: {e:#}");
-            return 0;
+    if !dry_run {
+        if let Err(error)=workflow::reconcile_runtime_retirements() {
+            warn!("native runtime retirement reconciliation unavailable: {error:#}");
         }
-    };
-    if !ok {
-        return 0;
     }
+    if let Err(error)=publication::reconcile_pending(repo_root,dry_run).await {
+        warn!("pending publication reconciliation unavailable: {error:#}");
+    }
+    let gh = gh_bin();
+    // Repository connection pagination includes ready and draft PRs. Sort
+    // locally only after the complete pool is known, then apply fair windows.
+    let out = match complete_repository_inventory(repo_root, "pr", None,
+        "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body").await {
+        Ok(out) => out,
+        Err(error) => { warn!("merge sweep inventory unavailable: {error:#}"); return 0; }
+    };
     let prs: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
     let Some(rows) = prs.as_array() else {
         return 0;
     };
-    let owner = repo_owner_from_remote(repo_root).await;
+    let repository = match workflow::canonical_repository(repo_root).await {
+        Ok(repository) => repository,
+        Err(error) => { warn!("merge sweep repository identity unavailable: {error:#}"); return 0; }
+    };
+    let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
-    let mut merged = 0usize;
+    let mut merged = adopted_execution::sweep(repo_root, dry_run).await.unwrap_or_else(|error| { warn!("adopted merge reconciliation failed: {error:#}"); 0 });
 
     let mut examined = 0usize;
     // Start where the last tick left off, so a wall of ineligible drafts at
@@ -1532,9 +1604,15 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
             .get("headRefName")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let Some(issue) = issue_from_branch(branch) else {
+        let adopted = adoption::lookup(&workflow::path(), &repository, pr).ok().flatten()
+            .filter(|owned| owned.branch == branch && owned.ready_for_review());
+        let Some(issue) = issue_from_branch(branch).or_else(|| adopted.as_ref().and_then(|owned| owned.source_issue)) else {
             continue;
         };
+        if source_reconcile::reconcile(repo_root, pr, issue, dry_run).await
+            != source_reconcile::SourceAction::Continue {
+            continue;
+        }
         let body = row
             .get("body")
             .and_then(serde_json::Value::as_str)
@@ -1566,7 +1644,7 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 pr,
                 head_sha.as_deref(),
                 record.as_ref(),
-            ),
+            ) || adopted.as_ref().is_some_and(|owned| owned.source_issue == Some(issue)),
             mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
                 Some("MERGEABLE") => Some(true),
                 Some("CONFLICTING") => Some(false),
@@ -1626,6 +1704,16 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                     );
                     continue;
                 }
+                let head = candidate_head.clone().unwrap_or_default();
+                let recorded = match serde_json::to_string(&record) { Ok(value) => value, Err(_) => continue };
+                let sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, &head, &recorded).await {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => { info!(pr, "merge sweep: workflow busy or approval evidence changed"); continue; }
+                    Err(error) => { warn!(pr, "merge sweep lease unavailable: {error:#}"); continue; }
+                };
+                if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
+                    warn!(pr, "merge sweep cannot ready stale or unowned candidate: {error:#}"); continue;
+                }
                 // Preserve the original state when a merge must be retried.
                 let Some(readied) = ready_for_merge(repo_root, pr,
                     row.get("isDraft").and_then(serde_json::Value::as_bool)).await else {
@@ -1638,10 +1726,15 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 // readying and immediately before merging.
                 if checks_green(repo_root, pr).await != Some(true) {
                     warn!(pr, "merge sweep: checks are no longer green; leaving it alone");
-                    if readied {
+                    if readied && sweep_lease.validate_remote(repo_root, pr, &head).await.is_ok() {
                         let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
                             .await;
                     }
+                    continue;
+                }
+
+                if source_reconcile::reconcile(repo_root, pr, issue, false).await
+                    != source_reconcile::SourceAction::Continue {
                     continue;
                 }
 
@@ -1651,18 +1744,21 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 // `--match-head-commit` makes GitHub refuse instead, which
                 // turns a silent TOCTOU into a failed merge — and a failed
                 // merge restores the draft below.
-                let head = candidate_head.clone().unwrap_or_default();
-                let (ok, _o, e) = run(
-                    &gh,
-                    &[
-                        "pr", "merge", &pr.to_string(), "--squash", "--delete-branch",
-                        "--match-head-commit", &head,
-                    ],
-                    repo_root,
-                )
-                .await
-                .unwrap_or((false, String::new(), "spawn failed".into()));
-                if !ok && readied {
+                let merge_intent = match sweep_lease.merge_intent() { Ok(intent) => intent, Err(_) => continue };
+                if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
+                    warn!(pr, "merge sweep ownership/head changed before merge: {error:#}"); continue;
+                }
+                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent).await;
+                if let Ok(Some(receipt)) = &mutation {
+                    if let Err(error) = sweep_lease.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt).expect("serializable mutation receipt")) {
+                        warn!(pr,"merge response could not be recorded; retain intent: {error:#}");
+                        continue;
+                    }
+                }
+                let ok = mutation.is_ok();
+                let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
+                let observed = sweep_merged_exact(repo_root, pr, &head).await;
+                if !observed && readied && sweep_lease.validate_remote(repo_root, pr, &head).await.is_ok() {
                     let (undone, ..) =
                         run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
                             .await
@@ -1675,7 +1771,10 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                         );
                     }
                 }
-                if ok {
+                if observed {
+                    if let Err(error) = sweep_lease.merged(&merge_intent, pr) {
+                        warn!(pr, "remote merge observed but receipt needs reconciliation: {error:#}");
+                    }
                     merged += 1;
                     info!(
                         pr = candidate.pr,
@@ -1688,12 +1787,21 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                     ))
                     .await;
                 } else {
-                    warn!(pr, "merge sweep: merge failed, left open: {}", truncate(&e, 200));
+                    warn!(pr, command_ok=ok, "merge sweep: merge not observed, retained intent: {}", truncate(&e, 200));
                 }
             }
         }
     }
     merged
+}
+
+async fn sweep_merged_exact(repo_root: &Path, pr: u64, expected: &str) -> bool {
+    match run(&gh_bin(), &["pr", "view", &pr.to_string(), "--json", "state,headRefOid"], repo_root).await {
+        Ok((true, out, _)) => serde_json::from_str::<serde_json::Value>(&out).ok().is_some_and(|v|
+            v.get("state").and_then(|s| s.as_str()) == Some("MERGED") &&
+            v.get("headRefOid").and_then(|s| s.as_str()) == Some(expected)),
+        _ => false,
+    }
 }
 
 /// Return whether this attempt changed a draft to ready. Unknown state or a
@@ -1710,24 +1818,27 @@ async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>) -> Opti
 
 /// Are every one of this PR's checks green? `None` when that cannot be
 /// determined, which the sweep treats as "do not merge".
+#[path = "self_improve_optional_checks.rs"]
+mod optional_checks;
+
 async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
     // gh can return nonzero with valid JSON when an optional check is pending
     // or failing. Decide from individual checks, not its aggregate exit code.
     let (_, out, _) = run(&gh_bin(),
-        &["pr", "checks", &pr.to_string(), "--json", "name,state"], repo_root).await.ok()?;
-    ci_checks_green(&out)
+        &["pr", "checks", &pr.to_string(), "--json", "name,state,link"], repo_root).await.ok()?;
+    ci_checks_green(&optional_checks::classify(repo_root,pr,&out).await)
 }
 
 fn is_optional_review_check(row: &serde_json::Value) -> bool {
-    row.get("name").and_then(serde_json::Value::as_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("CodeRabbit"))
+    row["autoship_required_context"] != true && (row["autoship_optional_workflow"] == true || row.get("name").and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("CodeRabbit")))
 }
 
 fn ci_checks_green(raw: &str) -> Option<bool> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
     let required: Vec<_> = rows.iter().filter(|r| !is_optional_review_check(r)).collect();
     if required.is_empty() { return None; }
-    Some(required.iter().all(|r| matches!(
+    Some(required.iter().all(|r| r["autoship_advisory_identity_unknown"] != true && matches!(
         r.get("state").and_then(serde_json::Value::as_str),
         Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
     )))
@@ -1737,7 +1848,7 @@ fn ci_checks_green(raw: &str) -> Option<bool> {
 /// not findings, and a failed GitHub read never becomes an approval.
 fn failed_ci_checks(raw: &str) -> Vec<(String, Option<u64>)> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap_or_default();
-    rows.iter().filter(|r| r["bucket"] == "fail" && !is_optional_review_check(r)).take(5).map(|r| {
+    rows.iter().filter(|r| r["bucket"] == "fail" && r["autoship_advisory_identity_unknown"] != true && !is_optional_review_check(r)).take(5).map(|r| {
         let name = r["name"].as_str().unwrap_or("unnamed check").to_string();
         let job = r["link"].as_str().and_then(|link| link.split_once("/job/"))
             .and_then(|(_, id)| id.parse::<u64>().ok());
@@ -1749,7 +1860,7 @@ async fn failed_ci_findings(repo_root: &Path, pr: u64) -> Option<String> {
     // gh returns nonzero for red/pending checks, with valid JSON on stdout.
     let (_, out, _) = run(&gh_bin(), &["pr", "checks", &pr.to_string(),
         "--json", "name,bucket,link"], repo_root).await.ok()?;
-    let failed = failed_ci_checks(&out);
+    let failed = failed_ci_checks(&optional_checks::classify(repo_root,pr,&out).await);
     if failed.is_empty() { return None; }
     let mut findings = String::from(
         "GitHub CI failed on the previously pushed PR head. Reproduce these failures \
@@ -1846,6 +1957,9 @@ struct RecordedVerdict {
     model: String,
     diff_ok: bool,
     system_ok: bool,
+    /// Explicit adjudication authority; legacy records deserialize without it.
+    #[serde(default)]
+    structured: Option<crate::autoship_review::ReviewEvidence>,
 }
 
 /// #1076 — what a verdict approves.
@@ -1865,12 +1979,20 @@ struct Approval {
 /// Claude approval satisfied the Codex-only overrides, and the body also
 /// carries model output that can say anything.
 fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
-    match verdict {
-        Some(v) if v.diff_ok && v.system_ok && v.backend == "native" && !v.model.is_empty() => Approval {
-            reviewed: true,
-            codex: v.provider == augmentagent_channel_core::ProviderKind::Codex.name(),
-        },
-        _ => Approval::default(),
+    let Some(v) = verdict.filter(|v| v.backend == "native" && !v.model.is_empty()) else {
+        return Approval::default();
+    };
+    if let Some(evidence) = &v.structured {
+        return Approval {
+            reviewed: evidence.authority().is_ok(),
+            codex: evidence.authority().is_ok() && evidence.passes.iter()
+                .filter(|p| p.role != crate::autoship_review::ReviewRole::Qa)
+                .all(|p| p.actor.provider == "codex" && p.actor.backend == "native"),
+        };
+    }
+    Approval {
+        reviewed: v.diff_ok && v.system_ok,
+        codex: v.diff_ok && v.system_ok && v.provider == augmentagent_channel_core::ProviderKind::Codex.name(),
     }
 }
 
@@ -1879,7 +2001,9 @@ fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
 /// another PR, or a head that has moved since the review, approves nothing.
 fn recorded_approval(record: Option<&OpenedPr>, pr: u64, head: Option<&str>) -> Approval {
     let reviewed_here =
-        record.filter(|r| r.pr == pr && head.is_some_and(|h| !h.is_empty() && h == r.head));
+        record.filter(|r| r.pr == pr && head.is_some_and(|h| !h.is_empty() && h == r.head)
+            && r.verdict.as_ref().and_then(|v| v.structured.as_ref())
+                .is_none_or(|evidence| evidence.binding.head == r.head));
     approval_of(reviewed_here.and_then(|r| r.verdict.as_ref()))
 }
 
@@ -2177,29 +2301,35 @@ struct MergePolicy {
 
 /// May this change auto-merge? The single answer both paths use.
 fn may_automerge(p: &MergePolicy) -> bool {
-    if !p.automerge_enabled || !p.reviews_approved || p.research_filed {
-        return false;
-    }
+    merge_policy_blocker(p).is_none()
+}
+
+/// Named policy dependencies shared by merge and free resume admission.
+fn merge_policy_blocker(p: &MergePolicy) -> Option<&'static str> {
+    if !p.automerge_enabled { return Some("automerge-disabled"); }
+    if !p.reviews_approved { return Some("review-required"); }
+    if p.research_filed { return Some("research-authorization-required"); }
     // #828 — an independent LGTM is REQUIRED, and with the override set it
     // also releases the `hard` band: two independent reviewers is a real
     // answer to blast radius where one model grading its own family's work
     // was not.
     let complexity_ok = p.complexity.auto_mergeable() || (p.codex_approved && codex_unlocks_hard());
     if !complexity_ok {
-        return false;
+        return Some("complexity-authorization-required");
     }
     if !automerge_receipt_ok(
         p.receipt_gated_file.as_deref(),
         p.codex_approved,
         p.lgtm_overrides_receipt.as_deref(),
     ) {
-        return false;
+        return Some("receipt-required");
     }
-    automerge_eligible(
+    if !automerge_eligible(
         &p.issue_author,
         p.repo_owner.as_deref(),
         p.automerge_authors.as_deref(),
-    )
+    ) { return Some("author-authorization-required"); }
+    None
 }
 
 /// #1029 — one open draft, as the sweep sees it through `gh`.
@@ -2605,7 +2735,7 @@ fn merged_since_section(subjects: &[String]) -> String {
 // =====================================================================
 
 /// One child issue the slice planner proposed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Slice {
     pub(crate) title: String,
     pub(crate) body: String,
@@ -2736,83 +2866,10 @@ async fn ensure_label(repo_root: &Path, name: &str, color: &str, description: &s
     .await;
 }
 
-/// File the children, comment the list on the parent, label the parent
-/// [`SLICED_LABEL`]. Returns the child numbers filed. A child that fails to
-/// file is skipped; the parent is labelled only if at least one was filed,
-/// so a run that filed nothing leaves no trace and the refusal proceeds.
-async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice]) -> Result<Vec<u64>> {
-    let gh = gh_bin();
-    let total = plan.len();
-    // Labels first: `gh issue create --label` fails outright on a label the
-    // repo never had, and a fresh deployment has neither.
-    ensure_label(repo_root, FIXABLE_LABEL, "0E8A16", "Eligible for the auto-PR pipeline").await;
-    ensure_label(
-        repo_root,
-        SLICED_LABEL,
-        "BFD4F2",
-        "Parent issue split into child issues by the auto-PR pipeline; the picker skips it",
-    )
-    .await;
-    let mut labels = vec![FIXABLE_LABEL.to_string()];
-    if issue.research_filed {
-        ensure_label(repo_root, RESEARCH_LABEL, "D4C5F9", "Filed by the daily research pipeline").await;
-        labels.push(RESEARCH_LABEL.to_string());
-    }
-    let labels = labels.join(",");
-    let mut children: Vec<(u64, String)> = Vec::new();
-    for (i, slice) in plan.iter().enumerate() {
-        let body = slice_issue_body(issue.number, i + 1, total, &slice.body, issue.research_filed);
-        if let Err(e) = augmentagent_channel_core::public_report::validate(&slice.title, &body) {
-            warn!(issue = issue.number, slice = i + 1, "slice failed the public-output check: {e:#}");
-            continue;
-        }
-        let (ok, out, err) = run(
-            &gh,
-            &["issue", "create", "--title", &slice.title, "--body", &body, "--label", &labels],
-            repo_root,
-        )
-        .await?;
-        if !ok {
-            warn!(issue = issue.number, slice = i + 1, "gh issue create failed: {}", truncate(&err, 300));
-            continue;
-        }
-        match out.trim().rsplit('/').find_map(|s| s.parse::<u64>().ok()) {
-            Some(n) => children.push((n, slice.title.clone())),
-            None => warn!(issue = issue.number, "gh stdout has no issue number: {}", truncate(&out, 200)),
-        }
-    }
-    if children.is_empty() {
-        return Ok(Vec::new());
-    }
-    let list = children
-        .iter()
-        .map(|(n, t)| format!("- #{n} — {t}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    backoff_comment(
-        repo_root,
-        issue.number,
-        &format!(
-            "Auto-fix triage: the scoping pass estimates this issue is larger than \
-             one unattended change (the pipeline caps a diff at {MAX_DIFF_LINES} \
-             lines), so it was split into child issues the pipeline will pick up \
-             in order:\n\n{list}\n\nThis parent is labelled `{SLICED_LABEL}` and \
-             will not be built as a whole. Close it once the parts have landed, or \
-             remove the label to have it re-scoped."
-        ),
-    )
-    .await
-    .ok();
-    let (ok, _o, err) = run(
-        &gh,
-        &["issue", "edit", &issue.number.to_string(), "--add-label", SLICED_LABEL],
-        repo_root,
-    )
-    .await?;
-    if !ok {
-        bail!("labelling #{} `{SLICED_LABEL}` failed: {}", issue.number, truncate(&err, 300));
-    }
-    Ok(children.into_iter().map(|(n, _)| n).collect())
+/// Reconcile the immutable admitted plan across retries; label the parent
+/// only after every child has a remotely confirmed identity.
+async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice], guard: &workflow::WorkflowGuard) -> Result<Vec<u64>> {
+    slicing::file(repo_root,issue,plan,guard).await
 }
 
 /// Stage 3 (#653): read-only QA review of the builder's diff, on the same
@@ -2820,7 +2877,7 @@ async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice]) -> Result<
 /// a failed attempt, exactly like a red verification gate.
 fn review_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
-        system_prompt: REVIEW_SYSTEM.to_string(),
+        system_prompt: format!("{}{}", REVIEW_SYSTEM, review_calibration::active().map(|r| r.prompt()).unwrap_or_default()),
         model: Some(scope_model()),
         allowed_tools: vec![
             "Read".into(),
@@ -3550,93 +3607,45 @@ async fn find_resumable_draft(
     only: Option<u64>,
     dry_run: bool,
 ) -> Option<(u64, u64, String)> {
-    let gh = gh_bin();
-    let (ok, stdout, _) = run(
-        &gh,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "1000",
-            "--search",
-            "sort:created-asc",
-            "--json",
-            "number,isDraft,headRefName,isCrossRepository,headRepositoryOwner",
-        ],
-        repo_root,
-    )
-    .await
-    .ok()?;
-    if !ok {
-        return None;
-    }
+    let stdout = complete_repository_inventory(repo_root, "pr", None,
+        "number,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,headRepositoryOwner,author,title,body,closingIssuesReferences")
+        .await.ok()?;
     let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-
-    // #880 — a PR whose issue carries the gave-up label is NOT resumable.
-    // Without this, the daily ledger reset made a never-converging PR an
-    // annuity: #853 burned two full resume cycles (7 revision rounds, 8
-    // focused rejections) in one day, and nothing would have stopped a third
-    // tomorrow. The gave-up label is the existing "needs a human" bit — the
-    // resume path just never read it.
-    let (ok, labeled, _) = run(
-        &gh,
-        &[
-            "issue",
-            "list",
-            "--state",
-            "open",
-            "--label",
-            GAVE_UP_LABEL,
-            "--limit",
-            "200",
-            "--json",
-            "number",
-        ],
-        repo_root,
-    )
-    .await
-    .ok()?;
-    let gave_up: std::collections::HashSet<u64> = if ok {
-        serde_json::from_str::<serde_json::Value>(&labeled)
-            .ok()
-            .and_then(|v| {
-                v.as_array()
-                    .map(|a| a.iter().filter_map(|i| i.get("number")?.as_u64()).collect())
-            })
-            .unwrap_or_default()
-    } else {
-        // Can't tell — resume nothing rather than resume a labeled-out PR.
-        return None;
-    };
+    // Never treat a capped/malformed issue listing as absence of a hold.
+    let labelled = complete_labelled_issues(repo_root, "number,labels").await.ok()?;
+    let gave_up: std::collections::HashSet<u64> = labelled.iter()
+        .filter_map(|row| row.get("number")?.as_u64()).collect();
 
     // #1006 — resolved once here because the closing sweep below needs it
     // too: closing a PR is a write, and the loop must not perform one on a
     // pull request it cannot prove is its own.
-    let owner = repo_owner_from_remote(repo_root).await;
-
-    // #934 — a draft whose issue already gave up is closed on sight (branch
-    // kept, revival instructions in the comment) so `gh pr list` shows only
-    // work that is actually in play.
+    let repository = workflow::canonical_repository(repo_root).await.ok()?;
+    let owner = repository.split('/').next().map(str::to_string);
+    let mut allowed = trusted_authors(repo_root).await;
+    if let Some(owner) = &owner { if !allowed.contains(owner) { allowed.push(owner.clone()); } }
+    let mut adopted = adoption::authorized(&prs, &repository, &allowed);
     if !dry_run {
-        // #1037 L2 — a draft the loop stood down on for a review reason is
-        // closed again with that reason, not with an attempt count.
-        let held = read_unreviewable(&unreviewable_path());
-        for (pr, issue) in drafts_to_close(&prs, &gave_up, owner.as_deref()) {
-            close_gave_up_pr(
-                repo_root,
-                pr,
-                issue,
-                &swept_close_comment(pr, issue, held.get(&pr.to_string())),
-            )
-            .await;
+        if let Err(error) = adoption::persist(&workflow::path(), &adopted) {
+            warn!("cannot persist adopted PR ownership: {error:#}");
+            return None;
+        }
+    }
+    for candidate in &adopted {
+        if !candidate.ready_for_review() {
+            info!(pr=candidate.pr, dependency=?candidate.dependency, "adopted PR awaits parent/base reconciliation");
+        } else if candidate.source_issue.is_none() {
+            info!(pr=candidate.pr, "adopted source-less PR requires PR-scoped acceptance context");
         }
     }
 
+    // Review exhaustion does not retire paid work. Source closure is handled
+    // separately by source_reconcile; authorized adopted PRs remain queued.
+    // Re-evaluate policy freely before reserving any billed resume attempt.
+    policy_hold::filter(repo_root, &mut adopted, dry_run).await;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
+    let retries = adoption::episode_retries(&workflow::path(), &adopted, chrono::Utc::now().timestamp_millis()).unwrap_or_default();
     let select = |cursor| {
-        resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref(), cursor)
+        adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
     // #1532 — a pinned red-main fix neither consults nor moves the rotation,
     // and a dry run reserves nothing.
@@ -3663,6 +3672,7 @@ fn reserve_next_draft(
         chosen = select(f.resume_cursor);
         if let Some((pr, _, _)) = &chosen {
             f.advance(*pr);
+            f.reserve_resume();
         }
     });
     chosen
@@ -3767,6 +3777,8 @@ struct IndependentReview {
     notes: String,
     /// #1037 — why `available` is false. `None` whenever a reviewer ran.
     why_unavailable: Option<ReviewUnavailable>,
+    /// Harness-owned review passes and any binding final adjudication.
+    structured: Option<crate::autoship_review::ReviewEvidence>,
 }
 
 /// #1037 — the independent stage's result as the three things a caller can do
@@ -3807,6 +3819,9 @@ enum ReviewUnavailable {
         reviewers: Vec<augmentagent_channel_core::ProviderKind>,
         detail: String,
     },
+    /// Controller evidence exceeds a bounded request/collection budget. This is
+    /// incomplete evidence, not a provider outage or a code rejection.
+    EvidenceBudget { detail: String },
     /// Every independent reviewer is on a quota cooldown: `(provider, reset)`.
     Latched {
         until: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>,
@@ -3847,6 +3862,15 @@ impl IndependentReview {
                 None => "unavailable".into(),
             };
         }
+        if let Some(evidence) = &self.structured {
+            return match evidence.authority() {
+                Ok(crate::autoship_review::MergeAuthority::AdjudicatedApproval) =>
+                    "approved by final adjudication (original reviewer findings retained)".into(),
+                Ok(crate::autoship_review::MergeAuthority::IndependentApproval) =>
+                    "lgtm (complete QA + independent diff/system)".into(),
+                Err(error) => format!("changes requested ({error})"),
+            };
+        }
         match (self.diff_ok, self.system_ok) {
             (true, true) => "lgtm (diff + system)".into(),
             (true, false) => "changes requested on system interaction".into(),
@@ -3866,6 +3890,7 @@ impl IndependentReview {
             system_ok: false,
             notes: format!("Independent review not run: {reason}."),
             why_unavailable: None,
+            structured: None,
         }
     }
 
@@ -3881,6 +3906,7 @@ impl IndependentReview {
                 why.headline()
             ),
             why_unavailable: Some(why),
+            structured: None,
         }
     }
 
@@ -3895,6 +3921,7 @@ impl IndependentReview {
             model: self.model.clone()?,
             diff_ok: self.diff_ok,
             system_ok: self.system_ok,
+            structured: self.structured.clone(),
         })
     }
 
@@ -3924,6 +3951,7 @@ impl ReviewUnavailable {
             Self::ProvenanceUnknown | Self::ProvenanceUnverifiable { .. } => "provenance-unknown",
             Self::AllReviewersBuiltIt | Self::NoCapacity { .. } => "no-reviewer-capacity",
             Self::Latched { .. } => "reviewer-latched",
+            Self::EvidenceBudget { .. } => "review-evidence-budget",
         }
     }
 
@@ -3960,6 +3988,7 @@ impl ReviewUnavailable {
                 "no reviewer capacity: no independent reviewer ({}) is configured and able to serve",
                 names(reviewers)
             ),
+            Self::EvidenceBudget { .. } => "complete caller evidence exceeds the bounded review budget".into(),
             Self::Latched { until } => {
                 // Soonest reset first: that is when the draft can move again.
                 let mut until = until.clone();
@@ -3986,7 +4015,7 @@ impl ReviewUnavailable {
     fn log_line(&self) -> String {
         match self {
             Self::ProvenanceUnverifiable { error } => format!("{} ({error})", self.headline()),
-            Self::NoCapacity { detail, .. } if !detail.is_empty() => {
+            Self::NoCapacity { detail, .. } | Self::EvidenceBudget { detail } if !detail.is_empty() => {
                 format!("{} ({detail})", self.headline())
             }
             _ => self.headline(),
@@ -4004,7 +4033,7 @@ fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerSta
     // 9Router's account label cannot attest to its underlying model. An
     // author model could appear again as `cx/...` or `cc/...` and falsely
     // approve its own work. Automated review uses native identities only.
-    if let Some(why) = augmentagent_channel_core::fallback::native_ineligible_reason(kind) {
+    if let Some(why) = augmentagent_channel_core::fallback::workflow_native_ineligible_reason(kind) {
         return ReviewerStatus::NotConfigured(why);
     }
     match augmentagent_channel_core::CooldownLatch::system().latched_until(kind.name()) {
@@ -4051,6 +4080,30 @@ fn select_reviewer(
         })
     } else {
         Err(ReviewUnavailable::Latched { until: latched })
+    }
+}
+
+/// Provider diversity is preferred, while a protected fresh-session origin
+/// permits native Codex to review work whose provider history includes Codex.
+/// This selects capacity only; approval still requires the controller receipt.
+fn select_session_isolated_reviewer(
+    pool: &[augmentagent_channel_core::ProviderKind],
+    authors: std::result::Result<Option<Vec<augmentagent_channel_core::ProviderKind>>, String>,
+    status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
+) -> std::result::Result<augmentagent_channel_core::ProviderKind, ReviewUnavailable> {
+    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+    let authors = match authors {
+        Ok(Some(authors)) if !authors.is_empty() => authors,
+        Ok(_) => return Err(ReviewUnavailable::ProvenanceUnknown),
+        Err(error) => return Err(ReviewUnavailable::ProvenanceUnverifiable { error }),
+    };
+    let native: Vec<_> = pool.iter().copied().filter(|provider| matches!(provider, Claude | Codex)).collect();
+    match select_reviewer(&native, Ok(Some(authors)), &status) {
+        Ok(provider) => Ok(provider),
+        Err(prior) => {
+            if native.contains(&Codex) && matches!(status(Codex), ReviewerStatus::Ready) { Ok(Codex) }
+            else { Err(prior) }
+        }
     }
 }
 
@@ -4114,142 +4167,60 @@ fn reviewer_pool_from(configured: Option<&str>) -> Vec<augmentagent_channel_core
 async fn independent_review(
     builder: &augmentagent_channel_core::FallbackReasoner,
     issue: &Issue,
-    summary: &str,
-    diff: &str,
+    _summary: &str,
+    _diff: &str,
     worktree: PathBuf,
-    prior_findings: Option<&str>,
+    _prior_findings: Option<&str>,
     criteria: &[String],
 ) -> IndependentReview {
-    // #1037 — the same selection the resume lane's preflight makes, so the
-    // two can never disagree about whether this draft is reviewable, or why.
-    let provider = match select_reviewer(
-        &reviewer_pool(),
-        builder.review_authors().map_err(|e| format!("{e:#}")),
-        reviewer_status,
-    ) {
-        Ok(provider) => provider,
-        Err(why) => return IndependentReview::unavailable(why),
-    };
-    let Some(reasoner) = augmentagent_channel_core::build_pinned(provider) else {
-        // Eligible a moment ago; a race, not a verdict.
-        return IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
-            reviewers: vec![provider],
-            detail: format!("{} could not be constructed", provider.name()),
-        });
-    };
-
-    // #889 — on revision rounds the reviewer sees its own prior findings, so
-    // it can converge (were they addressed?) instead of re-scoping from
-    // scratch and finding one smaller thing per round forever.
-    let prior_section = prior_findings
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| {
-            format!(
-                "\n\n## Your prior findings on the previous revision\n\
-                 The builder revised specifically against these. Judge \
-                 whether each was addressed or soundly rebutted.\n{}",
-                truncate(p, 3000)
-            )
-        })
-        .unwrap_or_default();
-    let context = format!(
-        "GitHub issue #{}: {}\n\n{}\n\nThe author model's own summary of its \
-         change:\n{}\n\nThe complete staged diff follows. The full repository \
-         is NOT browsable from here — work from what is quoted below.\n\n\
-         ```diff\n{}\n```",
-        issue.number,
-        issue.title,
-        truncate(&issue.body, 4000),
-        truncate(summary, 2000),
-        truncate(diff, 60_000),
-    );
-    let context = format!(
-        "{context}{}{prior_section}",
-        criteria_review_section(criteria)
-    );
-
-    let mut out = IndependentReview {
-        provider: Some(provider),
-        model: None,
-        available: true,
-        diff_ok: false,
-        system_ok: false,
-        notes: String::new(),
-        why_unavailable: None,
-    };
-
-    let evidence = caller_evidence(&worktree, diff).await;
-    let system_context = format!(
-        "{context}\n\n## Pre-computed call sites\n{evidence}"
-    );
-
-    let diff_system = review_system(CODEX_DIFF_REVIEW_SYSTEM, criteria);
-    let sys_system = review_system(CODEX_SYSTEM_REVIEW_SYSTEM, criteria);
-    let passes = [
-        ("focused diff review", diff_system.as_str(), &context),
-        ("system-interaction review", sys_system.as_str(), &system_context),
-    ];
-    let mut sections: Vec<String> = Vec::new();
-    for (label, system, prompt) in passes {
-        let mut opts = codex_review_opts(worktree.clone(), system);
-        if provider == augmentagent_channel_core::ProviderKind::Claude {
-            opts.model = Some(build_model());
-        }
-        let requested_model = if provider == augmentagent_channel_core::ProviderKind::Codex {
-            augmentagent_channel_core::providers::model_for(
-                provider, augmentagent_channel_core::providers::tier_of(&opts))
-        } else {
-            opts.model.clone().unwrap_or_default()
-        };
-        if requested_model.is_empty() || out.model.as_ref().is_some_and(|prior| prior != &requested_model) {
-            return IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
-                reviewers: vec![provider],
-                detail: "independent reviewer model identity changed between passes".into(),
-            });
-        }
-        out.model = Some(requested_model);
-        let review = augmentagent_channel_core::model_router::native_reviewer_scope(
-            provider, reasoner.call(&opts, prompt)).await;
-        match review {
-            Ok(raw) => {
-                let (ok, notes) = parse_codex_review(&raw);
-                info!(issue = issue.number, provider = provider.name(), pass = label, approved = ok, "independent review");
-                if label.starts_with("focused") {
-                    out.diff_ok = ok;
-                } else {
-                    out.system_ok = ok;
-                }
-                sections.push(format!("### {} — {label}\n{}", provider.name(), truncate(&notes, 1500)));
-            }
-            Err(e) => {
-                // Provider-side failure is "no independent review", never an
-                // approval and never a rejection of the diff.
-                warn!(issue = issue.number, provider = provider.name(), pass = label, "independent review failed: {e:#}");
-                // #1037 — a quota refusal latches the reviewer, and then the
-                // honest reason is "latched until <reset>", not "no capacity".
-                let why = match reviewer_status(provider) {
-                    ReviewerStatus::Latched(until) => ReviewUnavailable::Latched {
-                        until: vec![(provider.name().to_string(), until)],
-                    },
-                    _ => ReviewUnavailable::NoCapacity {
-                        reviewers: vec![provider],
-                        detail: format!("{} {label} failed: {e:#}", provider.name()),
-                    },
-                };
-                return IndependentReview::unavailable(why);
-            }
-        }
-    }
-    out.notes = sections.join("\n\n");
-    out
+    independent_review_with_context(builder, issue, worktree, criteria, true, "", 0, None, 0, None, None).await
 }
 
-/// Build the stage-2 prompt: the issue plus (when the scoping pass produced
-/// one) the implementation spec.
-/// #1012 — the builder is told what "done" means before it writes anything,
-/// and asked to name the test that proves each. An empty list delegates to
-/// [`build_fix_prompt`] verbatim, so a scoper that emits no criteria leaves
-/// this prompt byte-identical to what it was.
+/// Parent lanes pass real QA/round state; legacy callers above start a fresh
+/// aligned review, never parse approval or history from model-written prose.
+async fn independent_review_with_context(
+    builder: &augmentagent_channel_core::FallbackReasoner,
+    issue: &Issue,
+    worktree: PathBuf,
+    criteria: &[String],
+    qa_ok: bool,
+    qa_notes: &str,
+    repair_round: u32,
+    previous: Option<&crate::autoship_review::ReviewEvidence>,
+    adjudication_attempts_already_made: u32,
+    workflow: Option<&workflow::WorkflowGuard>,
+    acceptance_evidence: Option<(&acceptance::PreparedAcceptance, &acceptance::CandidateReceiptReference)>,
+) -> IndependentReview {
+    // Unknown origins need a protected workflow/adoption context before any
+    // environment or provider access. Ownership is never inferred from prose.
+    if workflow.is_none() {
+        match builder.review_authors() {
+            Ok(None) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnknown),
+            Err(error) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnverifiable { error: format!("{error:#}") }),
+            Ok(Some(_)) => {}
+        }
+    }
+    let (compiler_ok, compiler, _) = match run("rustc", &["-vV"], &worktree).await {
+        Ok(result) => result,
+        Err(error) => return IndependentReview::not_run(format!("review environment unavailable: {error:#}")),
+    };
+    if !compiler_ok {
+        return IndependentReview::not_run("review environment compiler identity unavailable".into());
+    }
+    let lock = match std::fs::read(worktree.join("Cargo.lock")) {
+        Ok(bytes) => bytes,
+        Err(error) => return IndependentReview::not_run(format!("review dependency identity unavailable: {error}")),
+    };
+    let environment_id = crate::autoship_review::digest(&serde_json::to_vec(&(
+        compiler, crate::autoship_review::digest(&lock), std::env::consts::OS,
+        std::env::consts::ARCH,
+    )).expect("environment identity consists only of serializable strings"));
+    aligned_review::run(builder, issue, worktree, criteria, aligned_review::ReviewContext {
+        qa_ok, qa_notes, repair_round, previous, environment_id: &environment_id,
+        adjudication_attempts_already_made, workflow, acceptance_evidence,
+    }).await
+}
+
 fn build_fix_prompt_with_criteria(
     issue: &Issue,
     plan: Option<&str>,
@@ -4310,7 +4281,7 @@ pub(crate) fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
         issue.title,
         issue.body,
         prior_attempts_section(prior)
-    )
+    ) + "\n" + acceptance::CONTRACT_PROMPT
 }
 
 fn prior_attempts_section(prior: Option<&str>) -> String {
@@ -4407,6 +4378,13 @@ trait StorageCalls {
 impl StorageCalls for augmentagent_channel_core::FallbackReasoner {
     async fn call_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
         let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        if self.uses_isolated_command_storage(opts)? {
+            // Required VM builds own private scratch, never the shared host
+            // gate target. The bridge admits each actual command and carries
+            // its lease through the descendant supervisor until cleanup.
+            let scratch=augmentagent_channel_core::build_scratch::scratch_dir();
+            return crate::build_storage::watch_reserve_roots(Some(cwd),Some(&scratch),self.call(opts,prompt)).await;
+        }
         let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
         let mut opts = opts.clone();
         opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));
@@ -4414,6 +4392,13 @@ impl StorageCalls for augmentagent_channel_core::FallbackReasoner {
     }
     async fn call_revision_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
         let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        if self.uses_isolated_command_storage(opts)? {
+            // Required VM builds own private scratch, never the shared host
+            // gate target. The bridge admits each actual command and carries
+            // its lease through the descendant supervisor until cleanup.
+            let scratch=augmentagent_channel_core::build_scratch::scratch_dir();
+            return crate::build_storage::watch_reserve_roots(Some(cwd),Some(&scratch),self.call_revision(opts,prompt)).await;
+        }
         let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
         let mut opts = opts.clone();
         opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));
@@ -4431,6 +4416,7 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         // system /tmp: the gate was contained (#878) but the builder's own
         // test runs re-leaked 4 GB / 4,500 files within two hours.
         env: vec![
+            (augmentagent_channel_core::autoship_scope::SCOPE_ENV.into(), "1".into()),
             ("CARGO_TARGET_DIR".into(), gate_target_dir()),
             ("CARGO_PROFILE_DEV_DEBUG".into(), "0".into()),
             ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
@@ -4576,7 +4562,7 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// 30+ untouched crates after every round — ~20 of the 49 minutes of a
 /// three-round run. The FULL gate still runs exactly once before anything is
 /// pushed or merged; this trims the redundancy, not the bar.
-async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
+async fn verification_gate_targeted(worktree: &Path, crates: &[String], audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     gate_disk_guard()?;
     let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
     let mut env = gate_env();
@@ -4592,6 +4578,7 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
         &["-lc", &gate_sh(&format!("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4605,6 +4592,7 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
         ))],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4615,14 +4603,14 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
 
 /// Gate for an intermediate revision round: targeted when the diff stays
 /// inside `crates/`, full otherwise.
-async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
+async fn gate_for_round(worktree: &Path, changed_paths: &str, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     match changed_crates(changed_paths) {
-        Some(crates) => verification_gate_targeted(worktree, &crates).await,
-        None => verification_gate(worktree).await,
+        Some(crates) => verification_gate_targeted(worktree, &crates, audit).await,
+        None => verification_gate(worktree, audit).await,
     }
 }
 
-async fn verification_gate(worktree: &Path) -> Result<()> {
+async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     gate_disk_guard()?;
     let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
     // #300 — Strip provider secrets from the gate's child env. `cargo
@@ -4637,6 +4625,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
         &["-lc", &gate_sh("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4648,6 +4637,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
         &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace -- --test-threads=1 2>&1 | tail -40")],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4666,13 +4656,14 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
             &["-lc", &gate_sh("npm ci --no-audit --no-fund 2>&1 | tail -5")],
             worktree,
             &env,
+            audit,
         )
         .await?;
         if !ok {
             bail!("npm ci failed:\n{o}{e}", o = _o.trim());
         }
         let (ok, _o, e) =
-            run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env)
+            run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env, audit)
                 .await?;
         if !ok {
             bail!("npm run build failed:\n{o}{e}", o = _o.trim());
@@ -4944,6 +4935,7 @@ async fn baseline_failures(
     repo_root: &Path,
     pkgs: &[String],
     tests: &[String],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<String>> {
     if pkgs.is_empty() || tests.is_empty() {
         bail!("baseline: no package or test names to target");
@@ -4988,6 +4980,7 @@ async fn baseline_failures(
         ))],
         &worktree,
         &env,
+        audit,
     )
     .await;
     reclaim_worktree(repo_root, &worktree, &branch).await;
@@ -5006,7 +4999,7 @@ async fn baseline_failures(
 /// `None` when there is nothing to compare (compile error, unparsable
 /// output, no `origin/main`, baseline could not run) — the caller then
 /// treats the failure as the diff's, exactly as before #931.
-async fn preexisting_on_main(repo_root: &Path, gate_err: &str) -> Option<BaselineVerdict> {
+async fn preexisting_on_main(repo_root: &Path, gate_err: &str, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Option<BaselineVerdict> {
     let worktree_red = failing_tests(gate_err);
     if worktree_red.is_empty() {
         return None;
@@ -5017,7 +5010,7 @@ async fn preexisting_on_main(repo_root: &Path, gate_err: &str) -> Option<Baselin
     let mut cache = BaselineCache::load(&path);
     let missing = cache.unchecked(&sha, &worktree_red);
     if !missing.is_empty() {
-        match baseline_failures(repo_root, &pkgs, &missing).await {
+        match baseline_failures(repo_root, &pkgs, &missing, audit).await {
             Ok(red) => {
                 cache.record(&sha, &missing, &red);
                 cache.save(&path);
@@ -5146,7 +5139,7 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
     if !ok {
         bail!("baseline: worktree add from origin/main failed: {e}");
     }
-    let verdict = verification_gate(&worktree).await;
+    let verdict = verification_gate(&worktree, &standalone_resource_audit(&worktree)?).await;
     reclaim_worktree(repo_root, &worktree, &branch).await;
     Ok(verdict)
 }
@@ -5319,18 +5312,18 @@ enum RedMainPlan {
 async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
     let title = red_main_title(red);
     let gh = gh_bin();
-    let listing = run(
-        &gh,
-        &[
-            "api",
-            "repos/{owner}/{repo}/issues?state=open&per_page=100&sort=created&direction=desc",
-        ],
-        repo_root,
-    )
-    .await;
-    let json: serde_json::Value = match listing {
-        Ok((true, out, _)) => serde_json::from_str(&out).unwrap_or(serde_json::Value::Null),
-        _ => return RedMainPlan::Hold("could not list open issues".into()),
+    let listing = fetch_issue_pages(|page| {
+        let gh=gh.clone();
+        async move {
+            let path=format!("repos/{{owner}}/{{repo}}/issues?state=open&per_page=100&sort=created&direction=desc&page={page}");
+            let (ok,out,error)=run(&gh,&["api",&path],repo_root).await?;
+            anyhow::ensure!(ok,"red-main issue lookup failed: {error}");
+            serde_json::from_str(&out).context("red-main issue inventory malformed")
+        }
+    }).await;
+    let json=match listing {
+        Ok(json)=>json,
+        Err(error)=>return RedMainPlan::Hold(format!("could not completely list open issues: {error:#}")),
     };
     let number = match red_main_issue_lookup(&json, &title) {
         Some((n, true)) => {
@@ -5865,6 +5858,9 @@ fn unreviewable_plan(
         };
     }
     let advice = match why {
+        ReviewUnavailable::EvidenceBudget { .. } => {
+            "The candidate needs bounded evidence decomposition before independent review can finish. No approval or code rejection has been recorded."
+        }
         ReviewUnavailable::Latched { .. } => {
             "Nothing needs doing: the loop tries again on its next pass after the reset (at \
              most once a UTC day)."
@@ -6440,6 +6436,11 @@ async fn resume_draft_pr(
     note_current_issue(issue_no);
     info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
 
+    let source = source_reconcile::reconcile(repo_root, pr, issue_no, dry_run).await;
+    if source != source_reconcile::SourceAction::Continue {
+        return Ok(RunReport::held(format!("PR #{pr}: source reconciliation {source:?}")));
+    }
+
     // #1006 — before anything else, and specifically BEFORE the ledger mark
     // below. The head may not be in this repository at all (a fork), or may
     // have been deleted after a merge; either way there is nothing to check
@@ -6515,7 +6516,7 @@ async fn resume_draft_pr(
     // #1012 — the PR body is the durable store, exactly as it already is for
     // complexity. A resumed run must be graded against the criteria the
     // original scoping pass wrote, not a fresh set nobody agreed to.
-    let resumed_criteria = criteria_from_pr_body(&pr_body);
+    let mut resumed_criteria = criteria_from_pr_body(&pr_body);
     // #1488 — a draft a fresh run parked carries QA's findings in a marked
     // comment; they seed this run's first QA pass so it judges convergence.
     let prior_comments: Vec<String> = match run(
@@ -6550,7 +6551,11 @@ async fn resume_draft_pr(
     // merged `main`, ran the full gate and only then discovered there was
     // nobody to review it — then billed the run and blamed "capacity" for
     // what was usually unknown provenance, every day, forever.
-    if let Err(why) = select_reviewer(&reviewer_pool(), authors, reviewer_status) {
+    let imported = adoption::preflight(repo_root, pr, branch).await?;
+    if imported { prior_qa = None; prior_notes = None; }
+    let reviewer = if imported && authors.is_ok() { adoption::imported_reviewer() }
+        else { select_session_isolated_reviewer(&reviewer_pool(), authors, reviewer_status) };
+    if let Err(why) = reviewer {
         return Ok(hold_unreviewable(
             repo_root,
             pr,
@@ -6562,30 +6567,50 @@ async fn resume_draft_pr(
         .await);
     }
 
-    // Worktree from the PR's branch, brought up to date with main. A merge
-    // conflict is a human's job — say so on the PR and move on.
-    let worktree = repo_root
-        .join(".self-improve-worktrees")
-        .join(lane_from_env().worktree_name());
-    reclaim_worktree(repo_root, &worktree, branch).await;
-    let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
-    let (ok, _o, e) = run(
-        "git",
-        &[
-            "worktree", "add", "-b", branch,
-            &worktree.to_string_lossy(),
-            &format!("origin/{branch}"),
-        ],
-        repo_root,
-    )
-    .await?;
-    if !ok {
-        bail!("resume: worktree add from origin/{branch} failed: {e}");
+    use crate::autoship_workflow::{OperationKind, Stage};
+    if dry_run {
+        return Ok(RunReport::held(format!("PR #{pr}: DRY RUN — would resume preserved work")));
     }
-    let cleanup = |wt: PathBuf, br: String, root: PathBuf| async move {
-        let _ = run("git", &["worktree", "remove", "--force", &wt.to_string_lossy()], &root).await;
-        let _ = run("git", &["branch", "-D", &br], &root).await;
+    let lock_path = run_lock_path().with_file_name(format!("self-improve-pr-{pr}.lock"));
+    let Some(_pr_lock) = RunLock::try_acquire(&lock_path)? else {
+        return Ok(RunReport::held(format!("PR #{pr}: another worker owns its worktree")));
     };
+    let repository = workflow::canonical_repository(repo_root).await?;
+    let worktree = workflow::prepare_resume_worktree(repo_root, pr, branch).await?;
+    let contract = format!("{}\n{}\n{}", issue.title, issue.body, pr_body);
+    let (toolchain_ok, toolchain, _) = run("rustc", &["--version", "--verbose"], &worktree).await?;
+    anyhow::ensure!(toolchain_ok, "cannot identify verifier toolchain");
+    let environment = format!("resume-workspace-v1\n{}\n{}", std::env::consts::OS, toolchain);
+    let Some(mut workflow) = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root, worktree: &worktree, repository: &repository,
+        source_issue: Some(issue.number), pr: Some(pr), branch,
+        contract: &contract, environment: &environment,
+    }).await? else {
+        return Ok(RunReport::held(format!("PR #{pr}: durable workflow is leased or deferred")));
+    };
+    let capacity_accounting = workflow.capacity_accounting(true)?;
+    let outcome = async {
+    workflow.bind_reasoner(reasoner.as_ref())?;
+    let acceptance_control = acceptance::control_directories(&repository, workflow.id())?.workflow_acceptance;
+    let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
+    anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
+    let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
+    let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
+        issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria, &workflow).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            workflow.transition(Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            return Err(error).context("resume independent acceptance registration requires scoped retry");
+        }
+    };
+    for criterion in &prepared_acceptance.proposal.contract.criteria {
+        if !resumed_criteria.contains(&criterion.requirement) { resumed_criteria.push(criterion.requirement.clone()); }
+    }
+    workflow.bind_acceptance(&prepared_acceptance)?;
+    workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
+    // An interrupted edit is valuable recovery state. Never reset it implicitly.
+    let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
+    anyhow::ensure!(status_ok, "cannot inspect preserved worktree");
     let git_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
         .unwrap_or_else(|_| "AugmentAgent".to_string());
     let git_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
@@ -6593,6 +6618,39 @@ async fn resume_draft_pr(
     let name_arg = format!("user.name={git_name}");
     let email_arg = format!("user.email={git_email}");
 
+    if !status.trim().is_empty() {
+        workflow.transition(Stage::Build, "recovering_interrupted_edits", "checkpoint_revision", 0).await?;
+        let files = conflicted_files(&status);
+        if !files.is_empty() {
+            let (_, hunks, _) = run("git", &["diff"], &worktree).await?;
+            adoption::revise(reasoner, &workflow, &fix_opts(worktree.clone()),
+                &build_conflict_prompt(&issue, &pr_body, &files, &hunks)).await?;
+        }
+        let (staged, _, error) = run("git", &["add", "-A"], &worktree).await?;
+        anyhow::ensure!(staged, "cannot stage recovered edits: {error}");
+        let (diff_ok, recovered_diff, _) = run("git", &["diff", "--cached", "origin/main"], &worktree).await?;
+        anyhow::ensure!(diff_ok, "cannot inspect recovered edits");
+        anyhow::ensure!(blast_radius_hit_in_diff(&recovered_diff).is_none(), "recovered edits touch a guarded path");
+        let (_, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+        for file in staged_names.lines() {
+            if let Ok(contents) = tokio::fs::read_to_string(worktree.join(file)).await {
+                anyhow::ensure!(!has_conflict_markers(&contents), "recovered edits retain conflict markers");
+            }
+        }
+        let (has_changes, _, _) = run("git", &["diff", "--cached", "--quiet"], &worktree).await?;
+        if !has_changes {
+            let (committed, _, error) = run("git", &["-c", &name_arg, "-c", &email_arg,
+                "commit", "-m", "autoship: checkpoint interrupted revision"], &worktree).await?;
+            anyhow::ensure!(committed, "cannot checkpoint recovered edits: {error}");
+        }
+        workflow.transition(Stage::Verify, "interrupted_edits_checkpointed", "verify_recovered_revision", 0).await?;
+    }
+    // Integrate intervening remote updates without dropping recovered local commits.
+    let (remote_ok, _, remote_error) = run("git", &["merge", "--no-edit", &format!("origin/{branch}")], &worktree).await?;
+    if !remote_ok {
+        workflow.transition(Stage::Reconcile, "remote_branch_conflict", "recover_conflict", 0).await?;
+        bail!("remote branch reconciliation needs recovery: {remote_error}");
+    }
     let (ok, _o, _e) = run("git", &["merge", "--no-edit", "origin/main"], &worktree).await?;
     let mut conflict_note: Option<String> = None;
     if !ok {
@@ -6609,8 +6667,7 @@ async fn resume_draft_pr(
             ConflictPlan::Resolve => {
                 let (_ok, hunks, _) = run("git", &["diff"], &worktree).await?;
                 builder_ran = true;
-                match reasoner
-                    .call_revision_with_storage(
+                match adoption::revise(reasoner, &workflow,
                         &fix_opts(worktree.clone()),
                         &build_conflict_prompt(&issue, &pr_body, &files, &hunks),
                     )
@@ -6662,6 +6719,7 @@ async fn resume_draft_pr(
                         }
                     }
                     Err(e) => {
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         record_reasoner_error(
                             issue.number,
                             failure_record(reasoner, FailureKind::ReasonerError, "resume:conflict", &format!("{e:#}")),
@@ -6678,8 +6736,7 @@ async fn resume_draft_pr(
                     files.join(", "),
                     truncate(&rs, 600)
                 );
-                publish_round(
-                    &worktree,
+                workflow.publish_round(
                     branch,
                     repo_root,
                     pr,
@@ -6687,13 +6744,12 @@ async fn resume_draft_pr(
                     "conflict resolution",
                     &findings,
                     dry_run,
-                )
-                .await;
+                ).await?;
                 conflict_note = Some(format!("Conflict resolution: {}", truncate(&rs, 200)));
             }
             Err(why) => {
                 let _ = run("git", &["merge", "--abort"], &worktree).await;
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 let _ = run(
                     &gh,
                     &[
@@ -6711,10 +6767,11 @@ async fn resume_draft_pr(
                     repo_root,
                 )
                 .await;
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
                     label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                    close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &why)).await;
+                // Preserve the draft and committed candidates for episode recovery.
                 }
                 let message = format!(
                     "PR #{pr}: merge conflict with main not resolved ({why}); attempt {attempts}"
@@ -6728,7 +6785,12 @@ async fn resume_draft_pr(
         }
     }
 
+    let mut previous_review: Option<crate::autoship_review::ReviewEvidence> = workflow
+        .latest_review_receipt("resume-structured-")?
+        .map(|receipt| serde_json::from_str(&receipt)).transpose()?;
     let mut rounds_done = 0u32;
+    let mut episode_native_sessions = None;
+    let mut episode_rescoped = false;
     // Carry remote failures into the revision loop, not only the local gate.
     // Consume this snapshot once: after a push it describes the previous head.
     let mut ci_findings = failed_ci_findings(repo_root, pr).await;
@@ -6754,7 +6816,7 @@ async fn resume_draft_pr(
             // did exactly that on 2026-09-13 and -14 over `Cargo.lock`. Stand
             // down for good instead: unbilled, attempt recorded, labelled and
             // closed, with the way back spelled out on the PR.
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             let reason = format!("the diff touches the guarded path `{pattern}`");
             let _ = run(
                 &gh,
@@ -6770,6 +6832,7 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -6783,7 +6846,7 @@ async fn resume_draft_pr(
             .await
             .unwrap_or_else(|_| Tally::uncounted());
             label_gave_up(repo_root, issue.number, "guard:blast-radius-diff").await.ok();
-            close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &reason)).await;
+                // Preserve the draft and committed candidates for episode recovery.
             return Ok(RunReport::triage(format!(
                 "PR #{pr}: resume refused — blast radius on `{pattern}`; stood down"
             )));
@@ -6795,7 +6858,7 @@ async fn resume_draft_pr(
             // of paid work on the live #839 resume. Codex is not consulted
             // on an oversized diff; the next round's only job is to cut.
             if rounds_done >= revise_rounds() {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 let _ = run(
                     &gh,
                     &["pr", "comment", &pr.to_string(), "--body",
@@ -6812,8 +6875,7 @@ async fn resume_draft_pr(
             }
             rounds_done += 1;
             info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
-            match reasoner
-                .call_revision_with_storage(
+            match adoption::revise(reasoner, &workflow,
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now, prior_attempts.as_deref()),
                 )
@@ -6829,17 +6891,18 @@ async fn resume_draft_pr(
                         &worktree,
                     )
                     .await?;
-                    publish_round(&worktree, branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await;
+                    workflow.publish_round(branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await?;
                     summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
                     continue;
                 }
                 Err(e) => {
                     warn!(pr, "resume shrink round failed: {e:#}");
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     record_reasoner_error(
                         issue.number,
                         failure_record(reasoner, FailureKind::ReasonerError, "resume:shrink", &format!("{e:#}")),
                     );
-                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     return Ok(RunReport::built(format!(
                         "PR #{pr}: resume refused — oversized, shrink errored"
                     )));
@@ -6849,20 +6912,22 @@ async fn resume_draft_pr(
         // Round 0 earns the FULL suite (first verification of an old branch
         // against today's main); later rounds verify the changed crates
         // (#870) — the full gate runs once more before any merge.
+        workflow.transition(Stage::Verify, "verification_started", "run_verifier", 0).await?;
         let gate_result = if rounds_done == 0 {
-            verification_gate(&worktree).await
+            verification_gate(&worktree, &workflow.audit_logger()).await
         } else {
             let (_ok, names, _) =
                 run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
-            gate_for_round(&worktree, &names).await
+            gate_for_round(&worktree, &names, &workflow.audit_logger()).await
         };
         if let Err(gate_err) = gate_result {
+            if workflow.audit_logger().resource_capacity_seen() { return Err(gate_err); }
             // #931 — a failure `main` already has is not this draft's; do
             // not spend a repair round on it or count an attempt. The
             // ledger mark at the top of this fn already moves the picker on.
-            let verdict = preexisting_on_main(repo_root, &gate_err.to_string()).await;
+            let verdict = preexisting_on_main(repo_root, &gate_err.to_string(), &workflow.audit_logger()).await;
             if let Some(v) = verdict.as_ref().filter(|v| v.introduced.is_empty()) {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::triage(format!(
                     "PR #{pr}: gate red on main too ({}); not charged",
                     v.preexisting.join(", ")
@@ -6892,8 +6957,7 @@ async fn resume_draft_pr(
                     round = rounds_done,
                     "resume: gate-repair round"
                 );
-                match reasoner
-                    .call_revision_with_storage(
+                match adoption::revise(reasoner, &workflow,
                         &fix_opts(worktree.clone()),
                         &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now, prior_attempts.as_deref()),
                     )
@@ -6910,7 +6974,7 @@ async fn resume_draft_pr(
                             &worktree,
                         )
                         .await?;
-                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run).await;
+                        workflow.publish_round(branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run).await?;
                         summary = format!(
                             "{summary}\nRound {rounds_done} (gate repair): {}",
                             truncate(&rs, 200)
@@ -6919,6 +6983,7 @@ async fn resume_draft_pr(
                     }
                     Err(e) => {
                         warn!(pr, "gate-repair round failed: {e:#}");
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         record_reasoner_error(
                             issue.number,
                             failure_record(reasoner, FailureKind::ReasonerError, "resume:gate-repair", &format!("{e:#}")),
@@ -6926,7 +6991,7 @@ async fn resume_draft_pr(
                     }
                 }
             }
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
@@ -6936,10 +7001,11 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &format!("{gate_err:#}"))).await;
+                // Preserve the draft and committed candidates for episode recovery.
             }
             return Ok(RunReport::built(format!(
                 "PR #{pr}: resume gate failed (attempt {attempts})"
@@ -6949,39 +7015,46 @@ async fn resume_draft_pr(
         if rounds_done < revise_rounds() {
             if let Some(findings) = ci_findings.take() {
                 rounds_done += 1;
-                let revised = reasoner.call_revision_with_storage(&fix_opts(worktree.clone()),
+                let revised = adoption::revise(reasoner, &workflow, &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref())).await;
                 match revised {
                     Ok(rs) => {
                         let _ = drop_root_scratch(&worktree).await;
                         let (staged, _, _) = run("git", &["add", "-A"], &worktree).await?;
                         if !staged {
-                            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                             bail!("resume: could not stage CI repair");
                         }
                         let msg = "auto-resume: repair GitHub CI findings";
                         let (committed, _, error) = run("git", &["-c", &name_arg, "-c", &email_arg,
                             "commit", "--allow-empty", "-m", &msg], &worktree).await?;
                         if !committed {
-                            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                             bail!("resume: could not commit CI repair: {error}");
                         }
-                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run).await;
+                        workflow.publish_round(branch, repo_root, pr, rounds_done, "CI repair", &findings, dry_run).await?;
                         summary = format!("{summary}\nCI repair: {}", truncate(&rs, 1000));
                         continue;
                     }
                     Err(e) => {
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         record_reasoner_error(issue.number, failure_record(reasoner,
                             FailureKind::ReasonerError, "resume:ci-repair", &format!("{e:#}")));
-                        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                        workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                         return Ok(RunReport::built(format!("PR #{pr}: CI repair unavailable; preserved for retry")));
                     }
                 }
             }
         }
 
+        let acceptance_receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
+            &mut prepared_acceptance, &acceptance_control, &mut workflow).await?;
+        resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
+        workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
+        let reviewed_binding = workflow.binding().clone();
+        let review_attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         let (qa_ok, qa_notes) = match reasoner
             .call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, prior_qa.as_deref()))
             .await
@@ -6989,14 +7062,15 @@ async fn resume_draft_pr(
             Ok(r) => parse_review_output(&r),
             Err(e) => {
                 warn!(pr, "resume QA review failed; keeping the draft: {e:#}");
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 record_reasoner_error(
                     issue.number,
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:qa-review", &format!("{e:#}")),
                 );
                 if !dry_run {
-                    let _ = run("git", &["push", "origin", branch], &worktree).await;
+                    workflow.push(branch).await?;
                 }
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 // Billed only when a builder round ran this tick (#1037).
                 let message = format!("PR #{pr}: resume QA review errored; draft kept");
                 return Ok(if rounds_done > 0 {
@@ -7007,21 +7081,31 @@ async fn resume_draft_pr(
             }
         };
         prior_qa = Some(qa_notes.clone());
-        // Stage 4 only reviews a diff QA approved.
-        let independent = if qa_ok {
-            independent_review(reasoner, &issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
-                .await
-        } else {
-            IndependentReview::not_run("QA requested changes".into())
-        };
-        if qa_ok && independent.available && !independent.notes.is_empty() {
+        // QA dissent is evidence for the independent final authority, not a
+        // reason to skip it and repeat the same repair debate indefinitely.
+        let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
+            &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
+            0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
+        if let Some(structured) = &independent.structured {
+            if acceptance::apply_adjudicated_amendment(reasoner, crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+                &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
+                previous_review = None; prior_qa = None; prior_notes = None;
+                resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                verification_gate(&worktree, &workflow.audit_logger()).await?;
+                continue;
+            }
+            workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
+                &serde_json::to_string(structured)?)?;
+            previous_review = Some(structured.clone());
+        }
+        if independent.available && !independent.notes.is_empty() {
             prior_notes = Some(independent.notes.clone());
             if !dry_run {
                 let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
                     &independent_findings_comment(&independent.notes)], repo_root).await;
             }
         }
-        if qa_ok {
+        {
             match independent.outcome() {
                 ReviewOutcome::Unavailable(why) => {
                     // Reachable only when the reviewer went away AFTER the
@@ -7031,13 +7115,9 @@ async fn resume_draft_pr(
                     // including whether this run is billed, which it is only if a
                     // builder call was actually made.
                     if !dry_run {
-                        let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
-                        if !ok {
-                            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                            bail!("resume: preserving draft failed: {error}");
-                        }
+                        workflow.push(branch).await?;
                     }
-                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     return Ok(hold_unreviewable(
                         repo_root,
                         pr,
@@ -7059,12 +7139,40 @@ async fn resume_draft_pr(
         }
         notes_log.push(format!("round {rounds_done}: QA {}; independent {}",
             if qa_ok { "approve" } else { "changes requested" }, independent.status()));
-        if resume_may_merge(qa_ok, independent.approved()) {
+        workflow.record_review(&format!("resume-qa-{rounds_done}-{review_attempt}"), qa_ok,
+            &serde_json::json!({"verdict": qa_ok, "notes": qa_notes}).to_string())?;
+        workflow.record_review(&format!("resume-independent-{rounds_done}-{review_attempt}"), independent.approved(),
+            &serde_json::json!({"verdict": independent.approved(), "notes": independent.notes}).to_string())?;
+        let evaluated = episode::evaluate(&mut workflow,&independent,
+            prepared_acceptance.proposal.contract.criteria.len(),lines_now).await?;
+        let episode_session = match &evaluated.decision {
+            crate::autoship_episode::Decision::FreshSession { .. } => {
+                let session = episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?;
+                if session.is_some() { rounds_done = 0; prior_qa = None; prior_notes = None; }
+                session
+            }
+            crate::autoship_episode::Decision::Rescope { .. } if !episode_rescoped => {
+                episode_rescoped = true; let session = episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?;
+                if session.is_some() { rounds_done = 0; prior_qa = None; prior_notes = None; }
+                session
+            }
+            crate::autoship_episode::Decision::Rescope { .. } => {
+                workflow.transition(Stage::Scope,"episode_rescope_pending","rescope_remaining_findings",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                return Ok(RunReport::built(format!("PR #{pr}: retained verified candidate for bounded rescoping")));
+            }
+            crate::autoship_episode::Decision::CompleteEvidence | crate::autoship_episode::Decision::RepairInfrastructure |
+            crate::autoship_episode::Decision::Adjudicate => {
+                workflow.transition(Stage::Review,"review_evidence_recovery","complete_review_or_adjudication",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                return Ok(RunReport::built(format!("PR #{pr}: review evidence recovery queued; candidate preserved")));
+            }
+            _ => None,
+        };
+        if independent.approved() {
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
                 // without the full suite passing once (#870).
-                if let Err(gate_err) = verification_gate(&worktree).await {
-                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                if let Err(gate_err) = verification_gate(&worktree, &workflow.audit_logger()).await {
+                    workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     let _ = run(
                         &gh,
                         &["pr", "comment", &pr.to_string(), "--body",
@@ -7080,6 +7188,7 @@ async fn resume_draft_pr(
                     )));
                 }
             }
+            workflow.validate_binding(&reviewed_binding).await?;
             // Use the same policy as fresh publication and the merge sweep.
             let (names_ok, names, _) = run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
             let policy_allows = names_ok && may_automerge(&MergePolicy {
@@ -7097,7 +7206,7 @@ async fn resume_draft_pr(
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             });
             if dry_run {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: DRY RUN — double LGTM after {rounds_done} revision round(s), would merge"
                 )));
@@ -7105,17 +7214,13 @@ async fn resume_draft_pr(
             // The local reviewed head is the only commit this approval covers.
             let (head_ok, reviewed_head, _) = run("git", &["rev-parse", "HEAD"], &worktree).await?;
             if !head_ok || reviewed_head.trim().is_empty() {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 bail!("resume: could not identify the reviewed commit");
             }
             let reviewed_head = reviewed_head.trim();
             // Push whatever the rounds committed (the merge-with-main commit
             // included), surface the verdicts, and merge per policy.
-            let (ok, _o, e) = run("git", &["push", "origin", branch], &worktree).await?;
-            if !ok {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                bail!("resume: push failed: {e}");
-            }
+            workflow.push(branch).await?;
             // A pending check or failed merge must not discard this LGTM.
             opened_prs::record(issue.number, pr, reviewed_head, independent.recorded_verdict());
             let _ = run(
@@ -7130,7 +7235,7 @@ async fn resume_draft_pr(
             )
             .await;
             if !policy_allows {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 notify_review(&format!(
                     "📝 resumed draft has double LGTM but needs a human merge: {} — PR #{pr}",
                     issue.title
@@ -7141,7 +7246,7 @@ async fn resume_draft_pr(
                 )));
             }
             if checks_green(repo_root, pr).await != Some(true) {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; awaiting CI, merge sweep will retry"
                 )));
@@ -7152,23 +7257,22 @@ async fn resume_draft_pr(
                 _ => None,
             };
             let Some(readied) = ready_for_merge(repo_root, pr, draft).await else {
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; ready state unavailable, merge sweep will retry"
                 )));
             };
-            // #893 — release the worktree BEFORE merging: gh's --delete-branch
-            // also deletes the local branch, which fails while a worktree
-            // holds it and turns a successful merge into a reported failure.
-            // Everything is pushed; nothing local is needed past this point.
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            let (ok, _o, e) = run(
-                &gh,
-                &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch", "--match-head-commit", reviewed_head],
-                repo_root,
-            )
-            .await.unwrap_or((false, String::new(), "spawn failed".into()));
-            if !ok && !pr_is_merged(repo_root, pr).await {
+            workflow.transition(Stage::Merge, "approval_and_checks_ready", "merge_exact_head", 0).await?;
+            anyhow::ensure!(workflow.binding().head == reviewed_head, "reviewed head changed before merge");
+            acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
+            let merge_intent = workflow.intent(OperationKind::MergePr)?;
+            workflow.validate_binding(&reviewed_binding).await?;
+            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent).await;
+            if let Ok(Some(receipt)) = &mutation {
+                workflow.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
+            }
+            let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
+            if !publication::merged_exact(repo_root,pr,reviewed_head).await {
                 if readied {
                     let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root).await;
                 }
@@ -7177,9 +7281,10 @@ async fn resume_draft_pr(
                     "PR #{pr}: double LGTM but merge FAILED (left open)"
                 )));
             }
-            if !ok {
-                warn!(pr, "gh pr merge exited non-zero but the PR is MERGED; treating as success: {e}");
-            }
+            workflow.observe_remote(&merge_intent, &format!("github:pr:{pr}:merged:{}", reviewed_head), Some(pr))?;
+            workflow.transition(Stage::Merged, "remote_merge_observed", "complete", 0).await?;
+            workflow.finish()?;
+            let _ = run("git", &["worktree", "remove", &worktree.to_string_lossy()], repo_root).await;
             notify_review(&format!(
                 "✅ resumed draft merged: {} — PR #{pr}",
                 issue.title
@@ -7192,7 +7297,7 @@ async fn resume_draft_pr(
         let open_notes = if qa_ok { independent.notes.clone() } else { qa_notes.clone() };
         if rounds_done >= revise_rounds() {
             // Out of rounds: publish the improved state + verdicts, stay draft.
-            let _ = run("git", &["push", "origin", branch], &worktree).await;
+            workflow.push(branch).await?;
             if !qa_ok {
                 let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", &qa_findings_comment(&qa_notes)], repo_root).await;
             }
@@ -7208,13 +7313,14 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &open_notes))).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &open_notes)).await;
+                // Preserve this PR for the durable adjudication/recovery path.
             }
             notify_review(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
@@ -7240,21 +7346,26 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
-        let rev_summary = match reasoner
-            .call_revision_with_storage(
-                &fix_opts(worktree.clone()),
-                &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
-            )
-            .await
+        if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+        let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
+        let (repair_opts,repair_prompt) = match episode_session {
+            Some(session) => (session.opts,session.prompt),
+            None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines_now,prior_attempts.as_deref())),
+        };
+        let call = adoption::revise(reasoner, &workflow,&repair_opts,&repair_prompt);
+        let revised = episode::dispatch(&workflow,episode_dispatch,async { match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await } }).await;
+        if let Some(sessions) = &episode_native_sessions { workflow.record_episode_sessions(sessions)?; }
+        let rev_summary = match revised
         {
             Ok(rs) => rs,
             Err(e) => {
                 warn!(pr, "resume revision failed; leaving draft as-is: {e:#}");
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 record_reasoner_error(
                     issue.number,
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:revise", &format!("{e:#}")),
                 );
-                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: resume revision errored; draft unchanged"
                 )));
@@ -7269,9 +7380,12 @@ async fn resume_draft_pr(
             &worktree,
         )
         .await?;
-        publish_round(&worktree, branch, repo_root, pr, rounds_done, kind, &findings, dry_run).await;
+        workflow.publish_round(branch, repo_root, pr, rounds_done, kind, &findings, dry_run).await?;
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
+    }.await;
+    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    outcome
 }
 
 /// Force the pipeline's fixed worktree path back to a usable state before a
@@ -7634,6 +7748,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 });
         }
     }
+    if red_main_issue.is_none() && lane != Lane::Build && !prefer_build {
+        if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
+            return adopted_execution::resume(repo_root, &build_reasoner(), candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
+        }
+    }
     if lane == Lane::Resume {
         return Ok(RunReport::idle());
     }
@@ -7663,6 +7782,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             r.resumed = true;
                             r
                         });
+                    }
+                    if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
+                        return adopted_execution::resume(repo_root, &build_reasoner(), candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
                     }
                 }
                 return Ok(RunReport::idle());
@@ -7717,43 +7839,34 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
     let reasoner = build_reasoner();
     reasoner.track_review_history(repo_root, &branch, false)?;
-    // #692 — a FIXED path, force-recreated per issue (the branch stays
-    // per-issue). Test binaries bake `env!("CARGO_MANIFEST_DIR")` at compile
-    // time; with the shared gate target cache, binaries compiled under a
-    // deleted per-issue path get reused from later runs and panic reading
-    // fixtures. A stable path keeps every baked path resolvable.
+    // Keep each issue's checkout stable across interruption. Other issues can
+    // advance without deleting this candidate or its compiler fixture paths.
     let worktree = repo_root
         .join(".self-improve-worktrees")
-        .join(lane_from_env().worktree_name());
+        .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
+    recovery::prepare(repo_root, &worktree, &branch).await?;
+    let repository = workflow::canonical_repository(repo_root).await?;
+    let environment = recovery::environment_identity(&worktree).await?;
+    let contract = serde_json::to_string(&(issue.number, &issue.title, &issue.body))?;
+    let Some(mut workflow_guard) = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root, worktree: &worktree, repository: &repository,
+        source_issue: Some(issue.number), pr: None, branch: &branch,
+        contract: &contract, environment: &environment,
+    }).await? else {
+        return Ok(RunReport::held(format!("issue #{}: workflow leased by another worker", issue.number)));
+    };
+    let capacity_accounting = workflow_guard.capacity_accounting(false)?;
+    let outcome = async {
+    workflow_guard.bind_reasoner(reasoner.as_ref())?;
+    workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
+    let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
+    anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
+    let candidate_base = candidate_base.trim();
 
-    // Clean any stale worktree from a crashed prior run.
-    reclaim_worktree(repo_root, &worktree, &branch).await;
-
-    let (ok, _o, e) = run(
-        "git",
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            &worktree.to_string_lossy(),
-            "origin/main",
-        ],
-        repo_root,
-    )
-    .await?;
-    if !ok {
-        bail!("git worktree add failed: {e}");
-    }
-
-    let cleanup = |wt: PathBuf, br: String, root: PathBuf| async move {
-        let _ = run(
-            "git",
-            &["worktree", "remove", "--force", &wt.to_string_lossy()],
-            &root,
-        )
-        .await;
-        let _ = run("git", &["branch", "-D", &br], &root).await;
+    // Failed stages retain committed and unfinished work. Publication alone is
+    // not permission to erase the only local recovery copy.
+    let cleanup = |wt: PathBuf, br: String, _root: PathBuf| async move {
+        info!(path=%wt.display(), branch=%br, "preserving autoship checkpoint for reconciliation");
     };
 
     // #803 — what earlier attempts on this issue already failed on, plus the
@@ -7790,6 +7903,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
             let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
             info!(issue = issue.number, "auto-PR held: {why}");
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Ok(RunReport::held(why));
         }
@@ -7798,6 +7913,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // preset at all, so waiting will never fix it — that is a
             // configuration or deployment fault and must stay loud, or a
             // misconfigured chain looks exactly like a quiet quota day.
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             bail!(
                 "no provider in the chain is cleared for a FullAgentic call; \
@@ -7807,15 +7924,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
 
+    let readiness=match acceptance::readiness::assess(&worktree,&issue,&mut workflow_guard).await? {
+        acceptance::readiness::Decision::Ready(evidence)=>evidence,
+        acceptance::readiness::Decision::Dependency(dependency)=>return Ok(RunReport::held(format!("issue #{}: material dependency; {}",issue.number,dependency))),
+    };
     let mut scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
+    scope_prompt.push_str(&format!("\nIndependent grounded readiness decisions (preserve these resolutions):\n{readiness}"));
     // #1515 — what landed on main since the issue was written, so the scoper
     // judges the issue against today's code rather than the code it
     // described. Empty when nothing merged or the date is unknown.
     scope_prompt.push_str(&merged_since_section(
         &merged_since_filed(repo_root, &worktree, issue.number).await,
     ));
-    let scope = match reasoner
-        .call(&scope_opts(worktree.clone()), &scope_prompt)
+    let mut scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {
         Ok(p) => Some(parse_scope_output(&p)),
@@ -7824,6 +7945,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 issue = issue.number,
                 "scoping pass failed; building without a spec: {e:#}"
             );
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             record_reasoner_error(
                 issue.number,
                 rec(FailureKind::ReasonerError, "scope", &format!("{e:#}"), "", 0),
@@ -7831,73 +7953,22 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             None
         }
     };
-    if let Some(s) = &scope {
-        // #1515 — main already delivers this. Hold it with the evidence for
-        // the owner to confirm and close; nothing is built, nothing billed,
-        // and the ledger mark keeps the picker off it for the day.
+    if let Some(s) = &mut scope {
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
-            backoff_comment(
-                repo_root,
-                issue.number,
-                &format!(
-                    "Auto-fix triage: the scoping pass found that main already \
-                     delivers this since the issue was filed, so nothing was \
-                     built.\n\n{}\n\nHeld for the owner to confirm and close — \
-                     it is not closed. Remove the `{GAVE_UP_LABEL}` label to \
-                     put it back in the pool.",
-                    truncate(&s.body, 1500)
-                ),
-            )
-            .await
-            .ok();
-            label_gave_up(repo_root, issue.number, GIVE_UP_OVERTAKEN).await.ok();
-            return Ok(RunReport::triage(format!(
-                "issue #{}: overtaken by main since filing — held for owner triage",
-                issue.number
-            )));
-        }
-        // #932 — a red-main issue is never labelled out: that would hold the
-        // loop until a human notices, which is the outage this exists to end.
-        if !s.fixable && !is_red_main_issue(&issue.body) {
-            if label_out_evidence(repo_root, issue.number)
-                .await
-                .is_some_and(|kinds| may_label_out(&kinds))
-            {
-                // #653 — the scoper judged this not agent-fixable (research
-                // ask, epic, owner decision, …). Label it out so it is scoped
-                // at most once, and leave the reason on the issue.
-                cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                backoff_comment(
-                    repo_root,
-                    issue.number,
-                    &format!(
-                        "Auto-fix triage: {SCOPE_GAVE_UP_MARKER}, so the \
-                         pipeline is leaving it for a human. Reason:\n\n{}\n\n\
-                         Remove the `{GAVE_UP_LABEL}` label to have it \
-                         re-triaged.",
-                        truncate(&s.body, 1200)
-                    ),
-                )
-                .await
-                .ok();
-                label_gave_up(repo_root, issue.number, GIVE_UP_SCOPER_NOT_FIXABLE).await.ok();
-                return Ok(RunReport::triage(format!(
-                    "issue #{}: scoped as not agent-fixable — labeled out",
-                    issue.number
-                )));
+            if acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
+                return Ok(RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; automatically re-evaluate on request/main change",issue.number)));
             }
-            // #955/#1514 — the evidence does not carry the verdict (see
-            // `may_label_out`; a first pass never does): the run falls
-            // through to the builder with the objection as context rather
-            // than spending the terminal label.
-            info!(
-                issue = issue.number,
-                "scoped as not agent-fixable on evidence that does not support \
-                 it — building anyway instead of labeling out"
-            );
-            prior_attempts = Some(overruled_scope_note(prior_attempts.as_deref(), &s.body));
+            // A model's relevance claim or an inadequate green test is never
+            // enough to retire useful work. Generate a fresh falsifier below.
+            s.relevance=Relevance::Current;
+            s.body=format!("{}\nPrevious relevance claim was not independently proven. Generate a new complete executable contract that reproduces the remaining owner requirement on original main; do not weaken requirements.",scope_prompt);
+        }
+        if !s.fixable && !is_red_main_issue(&issue.body) {
+            prior_attempts=Some(overruled_scope_note(prior_attempts.as_deref(),&s.body));
+            // Material external decisions were handled by independent
+            // readiness before this specification. A binary model objection
+            // cannot replace that authority with a routine human-only label.
+            s.fixable=true;
         }
     }
     // #843 — the scoper's own predictions, made binding. A refusal here has
@@ -7922,9 +7993,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         Vec::new()
                     });
                 if plan.len() >= MIN_SLICES {
-                    match file_slices(repo_root, &issue, &plan).await {
+                    match file_slices(repo_root, &issue, &plan, &workflow_guard).await {
                         Ok(children) if !children.is_empty() => {
-                            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::triage(format!(
                                 "issue #{}: oversized — sliced into {} child issues ({})",
                                 issue.number,
@@ -7937,6 +8010,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     }
                 }
             }
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             backoff_comment(
                 repo_root,
@@ -7967,15 +8042,37 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #1012 — written before any code exists, so they are the one target in
     // this pipeline the builder did not also author. Empty when the scoping
     // pass failed or emitted no block, which changes nothing downstream.
-    let criteria: Vec<String> = scope
+    let mut criteria: Vec<String> = scope
         .as_ref()
         .map(|s| s.criteria.clone())
         .unwrap_or_default();
 
+    let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
+    let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
+    let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
+        issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if error.downcast_ref::<acceptance::BaselineNotRed>().is_some() {
+                let children=acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await?;
+                if !children.is_empty() {return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children)));}
+            }
+
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            return Err(error).context("independent acceptance registration requires scoped retry");
+        }
+    };
+    for criterion in &prepared_acceptance.proposal.contract.criteria {
+        if !criteria.contains(&criterion.requirement) { criteria.push(criterion.requirement.clone()); }
+    }
+    workflow_guard.bind_acceptance(&prepared_acceptance)?;
+    workflow_guard.transition(crate::autoship_workflow::Stage::Build, "criteria_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
+
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt =
-        build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria);
+    let prompt = format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
+        build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria),
+        serde_json::to_string(prepared_acceptance.baseline.registration.contract())?);
     let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
@@ -7999,14 +8096,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     .lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic);
                 if let Some(report) = build_failure_hold(&err, &lane) {
                     info!(issue = issue.number, "auto-PR held: {report}");
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(report);
                 }
             }
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             record_reasoner_error(
                 issue.number,
                 rec(FailureKind::ReasonerError, "build", &format!("{err:#}"), "", 0),
             );
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Err(err).context("reasoner failed during self-improve");
         }
@@ -8023,14 +8123,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // Staging here is idempotent with the commit step's own `git add -A`.
     let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
-    let (_ok, mut diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+    let (_ok, mut diff, _) = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?;
     // Every revision call this run makes — the no-change follow-up, the
     // initial shrink, gate repairs, review rounds — comes out of one budget.
     let mut spent = 0u32;
     if diff.trim().is_empty() {
         // #1491 — an empty diff is asked once why: make the change now, or
-        // say the issue is already fixed or under-specified. Either answer is
-        // the owner's to verify, and neither is a failed attempt.
+        // say the issue is already fixed or under-specified. Neither claim
+        // authorizes completion: registered acceptance drives repair below.
         let mut reply = NoChange::Silent;
         if spent < revise_rounds() {
             spent += 1;
@@ -8042,7 +8142,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 Ok(text) => {
                     dropped.extend(drop_root_scratch(&worktree).await);
                     let _ = run("git", &["add", "-A"], &worktree).await?;
-                    diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+                    diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
                     summary = format!("{summary}\n\nNo-change follow-up: {}", truncate(&text, 300));
                     reply = parse_no_change_reply(&text);
                 }
@@ -8050,61 +8150,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             }
         }
         if diff.trim().is_empty() {
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            // #1491 — a no-change run is minutes, not a build: never billed
-            // against the daily cap. The ledger mark (record_attempt makes
-            // one too) keeps the picker off this issue for the rest of today.
-            AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
-            let held = match &reply {
-                NoChange::AlreadyFixed(why) => Some(("already fixed", why)),
-                NoChange::Underspecified(why) => Some(("under-specified", why)),
-                NoChange::Silent => None,
-            };
-            if let Some((what, why)) = held {
-                backoff_comment(
-                    repo_root,
-                    issue.number,
-                    &format!(
-                        "Auto-fix made no change: the builder reports this issue is \
-                         {what}.\n\n{}\n\nHeld for the owner to verify — it is not \
-                         closed. Remove the `{GAVE_UP_LABEL}` label to put it back \
-                         in the pool.",
-                        truncate(why, 1500)
-                    ),
-                )
-                .await
-                .ok();
-                label_gave_up(repo_root, issue.number, GIVE_UP_OWNER_TRIAGE).await.ok();
-                return Ok(RunReport::triage(format!(
-                    "issue #{}: no changes — builder reports it {what}; held for owner triage",
-                    issue.number
-                )));
-            }
-            let attempts = record_attempt(
-                repo_root,
-                issue.number,
-                Some(rec(FailureKind::NoChanges, "build", &truncate(&summary, 800), "", 0)),
-            )
-            .await
-            .unwrap_or_else(|_| Tally::uncounted());
-            if attempts.exhausted() {
-                backoff_comment(
-                    repo_root,
-                    issue.number,
-                    &format!(
-                        "Self-improve gave up after {attempts} attempts: the \
-                         reasoner produced no changes for this issue. Needs a \
-                         human (or a more concrete issue body)."
-                    ),
-                )
-                .await
-                .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-            }
-            return Ok(RunReport::triage(format!(
-                "issue #{}: reasoner made no changes; skipped (attempt {attempts}, not charged to the daily cap)",
-                issue.number
-            )));
+            if let Some(report)=capacity_accounting.report()? {return Ok(report);}
+            // A pinned independent baseline already exists. Its executable
+            // verifier, not a builder's already-fixed/underspecified claim,
+            // determines whether this candidate needs bounded repair.
+            summary.push_str(&format!("\nNo-change explanation (untrusted): {reply:?}; run registered acceptance and repair."));
         }
     }
 
@@ -8112,12 +8162,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // `main` deterministically and nothing else changes; if the result still
     // trips the guard (or nothing would be left), the refusal below runs
     // exactly as before. The guard itself is untouched.
-    let (_ok, mut full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
+    let (_ok, mut full_diff, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
     if let Some((pattern, _)) = blast_radius_hit_in_diff(&full_diff) {
         if let Some(clean) = narrow_guarded_paths(&worktree, "origin/main", &full_diff).await? {
             info!(issue = issue.number, pattern, "narrowing reverted the guarded paths");
             full_diff = clean;
-            diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
+            diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
             summary = format!("{summary}\n\nNarrowed: reverted changes to `{pattern}` paths.");
         }
     }
@@ -8128,7 +8178,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gave-up label pulls the issue from the pool — otherwise the unattended
     // loop would re-spend its whole daily cap on the same issue forever.
     if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_diff) {
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         let attempts = record_attempt(
             repo_root,
             issue.number,
@@ -8174,7 +8226,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #823 — does this diff touch a path the PR-verify hook guards? Computed
     // next to the other diff-derived facts; it withholds auto-merge below
     // rather than refusing the work.
-    let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+    let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?;
     let mut gated = touches_verify_gated_path(&staged_names);
     let mut lines = diff_line_count(&full_diff);
     if lines > MAX_DIFF_LINES && spent < revise_rounds() {
@@ -8197,7 +8249,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             Ok(rs) => {
                 let _ = drop_root_scratch(&worktree).await;
                 let _ = run("git", &["add", "-A"], &worktree).await?;
-                let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                let (_ok, d2, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
                 // Shrinking must not smuggle in a guarded path — and the tree it
                 // left must not ship either, so put the guarded-clean one back.
                 if blast_radius_hit_in_diff(&d2).is_none() {
@@ -8215,8 +8267,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 restore_tree(&worktree, &snapshot).await?;
             }
         }
-        diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
-        let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+        diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
+        let names = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?.1;
         gated = touches_verify_gated_path(&names);
     }
 
@@ -8225,6 +8277,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut qa_ok = false;
     let mut review_notes = String::new();
     let mut independent: Option<IndependentReview> = None;
+    let mut acceptance_receipt: Option<acceptance::CandidateReceiptReference> = None;
     let mut revision_note = String::new();
     // Gate repairs and review rounds continue the same budget.
     let mut round = spent;
@@ -8239,6 +8292,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // it. Only an exhausted issue (or a guard refusal) ends without a PR.
     let park: Option<ParkReason> = 'stages: {
         if lines > MAX_DIFF_LINES {
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -8253,6 +8307,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             .await
             .unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
                 backoff_comment(
                     repo_root,
@@ -8280,10 +8335,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // compiler/test output verbatim and repairs while budget remains. The
         // rounds come out of the same revise budget the review loop draws on,
         // so a run never spends more revision calls than it could before.
-        let mut gate_result = verification_gate(&worktree).await;
+        let mut gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await;
         while let Err(gate_err) = &gate_result {
+            if workflow_guard.audit_logger().resource_capacity_seen() { return Err(gate_result.unwrap_err()); }
             let gate_text = format!("{gate_err:#}");
-            let verdict = preexisting_on_main(repo_root, &gate_text).await;
+            let verdict = preexisting_on_main(repo_root, &gate_text, &workflow_guard.audit_logger()).await;
             let preexisting_only = verdict.as_ref().is_some_and(|v| v.introduced.is_empty())
                 && !is_red_main_issue(&issue.body);
             if !gate_repair_wanted(round, max_rounds, &gate_text, preexisting_only) {
@@ -8318,7 +8374,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 Ok(rs) => {
                     let _ = drop_root_scratch(&worktree).await;
                     let _ = run("git", &["add", "-A"], &worktree).await?;
-                    let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                    let (_ok, d2, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
                     // A repair may not smuggle in a guarded path or blow the cap:
                     // the red verdict stands on the tree before the repair.
                     if blast_radius_hit_in_diff(&d2).is_some() || diff_line_count(&d2) > MAX_DIFF_LINES {
@@ -8328,11 +8384,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     }
                     lines = diff_line_count(&d2);
                     full_diff = d2;
-                    diff = run("git", &["diff", "--cached", "--stat"], &worktree).await?.1;
-                    let names = run("git", &["diff", "--cached", "--name-only"], &worktree).await?.1;
+                    diff = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?.1;
+                    let names = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?.1;
                     gated = touches_verify_gated_path(&names);
                     summary = format!("{summary}\n\nGate repair {round}: {}", truncate(&rs, 200));
-                    gate_result = verification_gate(&worktree).await;
+                    gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await;
                 }
             }
         }
@@ -8344,12 +8400,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // #931 — a failure `main` already has is not this diff's. Leave
             // unbilled and unrecorded (no attempt, no comment); the ledger mark
             // alone keeps the picker from re-buying the same build this tick.
-            if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string()).await {
+            if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string(), &workflow_guard.audit_logger()).await {
                 // #932 — except for the red-main issue itself: those failures
                 // ARE its job, so a still-red gate is a real attempt that must
                 // accumulate toward gave-up instead of retrying daily forever.
                 if verdict.introduced.is_empty() && !is_red_main_issue(&issue.body) {
                     AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::triage(format!(
                         "issue #{}: gate red on main too ({}); not charged",
@@ -8358,6 +8415,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     )));
                 }
             }
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -8378,6 +8436,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 .await
                 .ok();
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
                     "issue #{}: verification gate failed (attempt {attempts}); no PR opened",
@@ -8386,6 +8445,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             }
             break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
         }
+
+        acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+            &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
 
         // Stage 3 (#653): QA review of the diff by the stronger tier. Since
         // #1488 a reject is not terminal: its notes drive revision rounds,
@@ -8399,10 +8461,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             Err(e) => {
                 // Transient reviewer failure (session limit etc.) — don't burn an
                 // attempt on infrastructure noise; the next tick retries whole.
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 record_reasoner_error(
                     issue.number,
                     rec(FailureKind::ReasonerError, "qa-review", &format!("{e:#}"), &diff, lines),
                 );
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Err(e).context("QA review pass failed during self-improve");
             }
@@ -8421,9 +8485,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // gate, and satisfied the author's own QA, so it opens as a draft PR
         // carrying both verdicts for a human. It does count as a failed attempt,
         // because a second opinion disagreeing is exactly what this stage is for.
-        if qa_ok {
-            let review =
-                independent_review(&reasoner, &issue, &summary, &full_diff, worktree.clone(), None, &criteria).await;
+        {
+            recovery::commit_candidate(&worktree, &issue).await?;
+            workflow_guard.transition(crate::autoship_workflow::Stage::Review, "candidate_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
+            let review = independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
+                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await;
             if review.available && !review.approved() {
                 warn!(
                     issue = issue.number,
@@ -8450,9 +8516,71 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // round revises against that instead of review notes, and no reviewer
         // is consulted on a diff that cannot ship anyway.
         let mut findings_override: Option<String> = None;
+        let mut episode_rescoped = false;
+        let mut episode_native_sessions = None;
         loop {
+            // A final derived-contract amendment invalidates every previous
+            // receipt/review. Re-enter all verification and review stages before
+            // the episode controller may consume the new revision.
+            let adjudicated = independent.as_ref().and_then(|review| review.structured.clone());
+            if let Some(review) = adjudicated {
+                if acceptance::apply_adjudicated_amendment(reasoner.as_ref(), crate::autoship_contract::AcceptanceSource::Issue(issue.number),
+                    &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, &review, &mut workflow_guard).await? {
+                    independent = None; acceptance_receipt = None; qa_ok = false;
+                    review_notes.clear(); findings_override = None; pending_guard = None;
+                    criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                    acceptance_receipt = Some(acceptance::verify_with_repair(reasoner.as_ref(), &issue, &worktree,
+                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+                    criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
+                    verification_gate(&worktree, &workflow_guard.audit_logger()).await?;
+                    let (ok, revised_diff, error) = run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
+                    anyhow::ensure!(ok, "amended candidate diff unavailable: {error}");
+                    lines = diff_line_count(&revised_diff); full_diff = revised_diff;
+                    let (_, amended_stat, _) = run("git", &["diff", "--stat", "origin/main...HEAD"], &worktree).await?;
+                    diff = amended_stat;
+                    if lines > MAX_DIFF_LINES {
+                        findings_override = Some(shrink_findings(lines));
+                        pending_guard = Some(ParkReason::Oversize(lines));
+                        continue;
+                    }
+                    let qa = reasoner.call(&review_opts(worktree.clone()), &qa_review_prompt(&issue, &summary, None)).await?;
+                    (qa_ok, review_notes) = parse_review_output(&qa);
+                    workflow_guard.transition(crate::autoship_workflow::Stage::Review, "amended_candidate_verified", "review", 0).await?;
+                    independent = Some(independent_review_with_context(reasoner.as_ref(), &issue, worktree.clone(), &criteria,
+                        qa_ok, &review_notes, round, None, 0, Some(&workflow_guard),
+                        acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
+                    continue;
+                }
+            }
+            let mut episode_session = None;
+            if findings_override.is_none() {
+                if let Some(review) = independent.as_ref() {
+                    let evaluated = episode::evaluate(&mut workflow_guard,review,
+                        prepared_acceptance.proposal.contract.criteria.len(),lines).await?;
+                    match &evaluated.decision {
+                        crate::autoship_episode::Decision::FreshSession { .. } => {
+                            episode_session = episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?;
+                            if episode_session.is_some() { round = 0; prior_attempts = None; }
+                        }
+                        crate::autoship_episode::Decision::Rescope { .. } if !episode_rescoped => {
+                            episode_rescoped = true; episode_session = episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?;
+                            if episode_session.is_some() { round = 0; prior_attempts = None; }
+                        }
+                        crate::autoship_episode::Decision::Rescope { .. } => {
+                            workflow_guard.transition(crate::autoship_workflow::Stage::Scope,"episode_rescope_pending","rescope_remaining_findings",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                            break;
+                        }
+                        crate::autoship_episode::Decision::CompleteEvidence | crate::autoship_episode::Decision::RepairInfrastructure |
+                        crate::autoship_episode::Decision::Adjudicate => {
+                            workflow_guard.transition(crate::autoship_workflow::Stage::Review,"review_evidence_recovery","complete_review_or_adjudication",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let source = match after_review(
-                qa_ok,
+                qa_ok || independent.as_ref().is_some_and(|r| r.approved()),
                 independent.as_ref().map(|r| (r.available, r.approved())),
                 round,
                 max_rounds,
@@ -8471,12 +8599,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             };
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
-            match reasoner
-                .call_revision_with_storage(
-                    &fix_opts(worktree.clone()),
-                    &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
-                )
-                .await
+            if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+            let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
+            let (repair_opts,repair_prompt) = match episode_session {
+                Some(session) => (session.opts,session.prompt),
+                None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines,prior_attempts.as_deref())),
+            };
+            let call = reasoner.call_revision_with_storage(&repair_opts,&repair_prompt);
+            let revised = episode::dispatch(&workflow_guard,episode_dispatch,async { match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await } }).await;
+            if let Some(sessions) = &episode_native_sessions { workflow_guard.record_episode_sessions(sessions)?; }
+            match revised
             {
                 Err(e) => {
                     // Provider trouble, not a verdict — keep the last outcome and
@@ -8493,7 +8625,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 Ok(rev_summary) => {
                     dropped.extend(drop_root_scratch(&worktree).await);
                     let _ = run("git", &["add", "-A"], &worktree).await?;
-                    let (_ok, mut diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                    let (_ok, mut diff2, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
                     if blast_radius_hit_in_diff(&diff2).is_some() {
                         // #1490 AC6 — the same deterministic narrowing the
                         // initial diff gets.
@@ -8503,6 +8635,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     }
                     if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
                         warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&diff2), diff_line_count(&diff2)))).await.unwrap_or_else(|_| Tally::uncounted());
                         backoff_comment(
                             repo_root,
@@ -8517,6 +8650,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         if attempts.exhausted() {
                             label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
                         }
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         cleanup(worktree, branch, repo_root.to_path_buf()).await;
                         return Ok(RunReport::built(format!(
                             "issue #{}: revision hit blast-radius guard on `{pattern}` (attempt {attempts})",
@@ -8542,6 +8676,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             ));
                             continue;
                         }
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff_touched_paths(&diff2), lines2))).await.unwrap_or_else(|_| Tally::uncounted());
                         if attempts.exhausted() {
                             backoff_comment(
@@ -8556,6 +8691,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             .await
                             .ok();
                             label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
                                 "issue #{}: revision oversized ({lines2} lines); gave up (attempt {attempts})",
@@ -8565,8 +8701,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         break 'stages Some(ParkReason::Oversize(lines2));
                     }
                     let (_ok, names2, _) =
-                        run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
-                    if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
+                        run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?;
+                    if let Err(gate_err) = gate_for_round(&worktree, &names2, &workflow_guard.audit_logger()).await {
                         warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
                         // #873 — a red gate gets a repair round while budget
                         // remains: red→fix is the other half of TDD, and a
@@ -8582,6 +8718,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             ));
                             continue;
                         }
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff_touched_paths(&diff2), lines2) })).await.unwrap_or_else(|_| Tally::uncounted());
                         if attempts.exhausted() {
                             backoff_comment(
@@ -8596,6 +8733,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             .await
                             .ok();
                             label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
                                 "issue #{}: post-revision gate red; gave up (attempt {attempts})",
@@ -8611,6 +8749,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     gated = touches_verify_gated_path(&names2);
                     lines = lines2;
                     summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
+                    acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
                     // #1488 AC2 — QA re-reviews every revised diff, with its
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();
@@ -8623,6 +8763,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             // The diff built and passed the gate; a reviewer
                             // outage is no reason to delete it. Park it
                             // unbilled and let resume QA it.
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             record_reasoner_error(
                                 issue.number,
                                 rec(FailureKind::ReasonerError, "revise:qa-review", &format!("{e:#}"), &diff_touched_paths(&diff2), lines),
@@ -8630,12 +8771,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             break 'stages Some(ParkReason::QaUnavailable(format!("{e:#}")));
                         }
                     }
-                    if qa_ok {
-                        let prior = independent.as_ref().map(|r| r.notes.clone());
-                        independent = Some(
-                            independent_review(&reasoner, &issue, &rev_summary, &diff2, worktree.clone(), prior.as_deref(), &criteria)
-                                .await,
-                        );
+                    {
+                        recovery::commit_candidate(&worktree, &issue).await?;
+                        workflow_guard.transition(crate::autoship_workflow::Stage::Review, "revision_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
+                        let previous = independent.as_ref().and_then(|r| r.structured.clone());
+                        independent = Some(independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
+                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
                     }
                     let verdict = match (qa_ok, independent.as_ref()) {
                         (false, _) => "QA changes requested".to_string(),
@@ -8654,7 +8795,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // The loop stopped (a revision call errored) on a tree that is
             // still oversized or red: that is why it parks, not the reviews
             // of an earlier tree. One attempt, with the right kind.
-            let (_ok, full_pending, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            let (_ok, full_pending, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
             let paths = diff_touched_paths(&full_pending);
             let n = diff_line_count(&full_pending);
             let record = match &pending {
@@ -8662,6 +8803,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 ParkReason::GateRed(out) => { let (kind, detail) = gate_outcome(out); rec(kind, "revise:gate", &detail, &paths, n) }
                 ParkReason::QaReject(_) | ParkReason::QaUnavailable(_) => unreachable!("only guards are pending"),
             };
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some(record)).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 backoff_comment(
@@ -8672,6 +8814,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 .await
                 .ok();
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
                     "issue #{}: revision stopped on a tree that {}; gave up (attempt {attempts})",
@@ -8693,16 +8836,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // Revisions changed the worktree: refresh what the final-gate and
             // publish records below describe (the outer `diff`/`lines` are the
             // pre-revision snapshot).
-            let (_ok, stat_after, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
-            let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            let (_ok, stat_after, _) = run("git", &["diff", "--cached", "--stat", candidate_base], &worktree).await?;
+            let (_ok, full_after, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
             diff = stat_after;
             lines = diff_line_count(&full_after);
         }
         // What the stages ended on — the revised tree when there were rounds.
-        let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
-        if !qa_ok {
+        let (_ok, full_after, _) = run("git", &["diff", "--cached", candidate_base], &worktree).await?;
+        if !qa_ok && !independent.as_ref().is_some_and(|r| r.approved()) {
             // #1488 — QA still rejects with the budget spent: one attempt for
             // the run (#852), and the work parks with QA's notes on the PR.
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -8722,6 +8866,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 .await
                 .ok();
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
                     "issue #{}: QA review rejected the diff; gave up (attempt {attempts})",
@@ -8734,8 +8879,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // Intermediate rounds ran the targeted gate (#870); everything that
             // ships — or even lands as a PR claiming workspace-pass — gets the
             // FULL suite exactly once here.
-            if let Err(gate_err) = verification_gate(&worktree).await {
+            if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {
                 warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
                     backoff_comment(
@@ -8750,6 +8896,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     .await
                     .ok();
                     label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
                         "issue #{}: final full gate red after {round} revision round(s); gave up",
@@ -8777,6 +8924,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     });
 
     if dry_run {
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::built(format!(
             "issue #{}: DRY RUN — {}, {lines}-line diff \
@@ -8813,7 +8961,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         "-m",
         &commit_msg,
     ];
-    let (mut ok, mut _o, mut e) = run("git", &commit_args, &worktree).await?;
+    // A recovered candidate can already be committed. Review the complete
+    // baseline-to-index patch above, then avoid an empty commit failure.
+    let (already_committed, _, _) = run("git", &["diff", "--cached", "--quiet", "HEAD"], &worktree).await?;
+    let (mut ok, mut _o, mut e) = if already_committed {
+        (true, String::new(), String::new())
+    } else {
+        run("git", &commit_args, &worktree).await?
+    };
     // PR #973 — a commit refused by the personal-data guard is a fixable
     // literal, not a failed run: let the builder correct exactly the lines
     // the guard named and try the commit once more. Anything else (a merge
@@ -8860,12 +9015,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         );
                         if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_now) {
                             warn!(issue = issue.number, pattern, %line, "personal-data repair hit the blast-radius guard");
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             let message = format!(
                                 "issue #{}: personal-data repair touched `{pattern}`; refused, no PR opened",
                                 issue.number
                             );
                             if !park_charged {
+                                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                                 let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "publish:pii-repair", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&full_now), lines))).await.unwrap_or_else(|_| Tally::uncounted());
                                 if attempts.exhausted() {
                                     label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
@@ -8889,42 +9046,22 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
     if !ok {
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         if park_charged {
             return Ok(RunReport::built(parked_publish_failed(issue.number, "git commit failed", &e)));
         }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }).await));
     }
-    // #815 — a run killed between the push and `gh pr create` leaves the
-    // remote branch behind with no PR. `has_open_agent_pr` only looks at
-    // PRs, so the issue is picked again, and this non-fast-forward push is
-    // where it dies — after three reasoner calls and a full workspace gate,
-    // every tick, forever. The `agent-fix/` namespace is pipeline-owned and
-    // this branch has already been shown to carry no open PR, so a fresh
-    // attempt is entitled to supersede the orphan. Force only in that
-    // narrow case, and say so in the log.
-    let (mut ok, _o, mut e) = run("git", &["push", "-u", "origin", &branch], &worktree).await?;
-    if !ok && remote_branch_exists(repo_root, &branch).await {
-        warn!(
-            issue = issue.number,
-            branch = %branch,
-            "orphaned remote branch from an interrupted run; superseding it"
-        );
-        let forced = run(
-            "git",
-            &["push", "--force", "-u", "origin", &branch],
-            &worktree,
-        )
-        .await?;
-        ok = forced.0;
-        e = forced.2;
-    }
-    if !ok {
-        cleanup(worktree, branch, repo_root.to_path_buf()).await;
+    // Compare-and-swap publication preserves concurrent remote work and
+    // reconciles successful pushes whose responses were lost.
+    if let Err(error) = workflow_guard.push(&branch).await {
+        let e = format!("{error:#}");
         if park_charged {
             return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
         }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git push", &detail, &diff, lines) }).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
+            rec(FailureKind::Infra, "publish:git push", &e, &diff, lines)).await));
     }
     // #1037 — the push landed, plainly or by superseding an orphan above, so
     // the remote branch is now exactly this attempt's work, built from `main`.
@@ -9064,26 +9201,40 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // remote head that another actor might push during PR creation.
     let (head_ok, published_head, _) = run("git", &["rev-parse", "HEAD"], &worktree).await?;
     let published_head = if head_ok { published_head.trim() } else { "" };
-    let (ok, stdout, e) = run(&gh, &args, &worktree).await?;
-    cleanup(worktree, branch.clone(), repo_root.to_path_buf()).await;
-    if !ok {
-        // #815 — the branch is pushed but has no PR. Left as an `Err` this
-        // re-picks the same issue next tick and dies at the push above.
-        if park_charged {
-            return Ok(RunReport::built(parked_publish_failed(issue.number, "gh pr create failed", &e)));
+    // Persist the already-earned review before the uncertain remote mutation.
+    if (qa_ok || independent.approved()) && park.is_none() && !repaired_after_review {
+        if let Some(receipt)=independent.recorded_verdict() {
+            workflow_guard.record_review("publication-review",independent.approved(),&serde_json::to_string(&receipt)?)?;
         }
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:gh pr create", &detail, &diff, lines) }).await));
+    }
+    let created = publication::publish(&workflow_guard, &worktree, &branch, published_head, issue.number, &args).await;
+    let (ok, stdout, e) = match created {
+        Ok(created) => (true, created.url, String::new()),
+        Err(error) => (false, String::new(), format!("{error:#}")),
+    };
+    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+    if !ok {
+        workflow_guard.transition(crate::autoship_workflow::Stage::Publish,
+            "remote_publication_unconfirmed","await_publication_reconcile",chrono::Utc::now().timestamp_millis()+60_000).await?;
+        workflow_guard.finish()?;
+        // Actual builder/reviewer resource charges remain paid. Remote visibility
+        // uncertainty is not a code failure and does not exhaust repair attempts.
+        return Ok(RunReport::built(format!("Autoship #{} awaiting free publication reconciliation; candidate and intent retained: {}",issue.number,truncate(&e,300))));
     }
     let pr_url = stdout.trim().to_string();
     let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
     // Record EVERY publication, including rejected and parked drafts. Those
     // return early below but still need to be recoverable by later ticks.
     if let Some(n) = pr_number {
-        let verdict = if qa_ok && park.is_none() && !repaired_after_review {
+        let verdict = if (qa_ok || independent.approved()) && park.is_none() && !repaired_after_review {
             independent.recorded_verdict()
         } else {
             None
         };
+        if let Some(ref receipt) = verdict {
+            workflow_guard.record_review("publication-review", independent.approved(), &serde_json::to_string(receipt)?)?;
+        }
         opened_prs::record(issue.number, n, published_head, verdict);
     }
     if independent.available && !independent.notes.is_empty() {
@@ -9111,6 +9262,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             reason.headline()
         ))
         .await;
+        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_parked", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: parked as draft PR ({}) — {pr_url}",
             issue.number,
@@ -9125,6 +9278,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             truncate(&merge_note, 300)
         ))
         .await;
+        workflow_guard.transition(crate::autoship_workflow::Stage::Reconcile, "draft_published", "resume", chrono::Utc::now().timestamp_millis()).await?;
+        workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",
             issue.number
@@ -9229,33 +9384,46 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         || head_sha != published_head
         || checks_green(repo_root, pr_number.unwrap()).await != Some(true)
     {
+        workflow_guard.transition(crate::autoship_workflow::Stage::AwaitChecks, "ci_pending", "reconcile_checks", chrono::Utc::now().timestamp_millis()).await?;
+        workflow_guard.finish()?;
         return Ok(RunReport::built(format!(
             "issue #{}: approved PR awaiting current-head CI; merge sweep will retry — {pr_url}",
             issue.number
         )));
     }
-    let (ok, _o, e) = run(
-        &gh,
-        &["pr", "merge", &branch, "--squash", "--delete-branch", "--match-head-commit", published_head],
-        repo_root,
-    )
-    .await?;
-    let merged_anyway = match pr_number {
-        Some(n) if !ok => pr_is_merged(repo_root, n).await,
-        _ => false,
-    };
-    if !ok && !merged_anyway {
-        warn!(issue = issue.number, "auto-merge failed; PR left open: {e}");
+    if source_reconcile::reconcile(repo_root, pr_number.unwrap(), issue.number, false).await
+        != source_reconcile::SourceAction::Continue {
+        return Ok(RunReport::built(format!("issue #{}: source changed before merge; reconciliation retained — {pr_url}", issue.number)));
+    }
+    workflow_guard.validate_binding(workflow_guard.binding()).await?;
+    acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
+        acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
+    let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
+    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent).await;
+    if let Ok(Some(receipt)) = &mutation {
+        workflow_guard.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
+    }
+    let ok = mutation.is_ok();
+    let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
+    let merged_observed = publication::merged_exact(repo_root, pr_number.unwrap(), published_head).await;
+    if !merged_observed {
+        warn!(issue = issue.number, command_ok=ok, "auto-merge not confirmed; preserving pending intent: {e}");
         return Ok(RunReport::built(format!(
             "issue #{}: PR opened but auto-merge FAILED (left open for review) — {pr_url}",
             issue.number
         )));
     }
+    workflow_guard.observe_remote(&merge_intent, &format!("github:pr:{}:merged:{}", pr_number.unwrap(), published_head), pr_number)?;
+    workflow_guard.transition(crate::autoship_workflow::Stage::Merged, "merge_observed", "complete", chrono::Utc::now().timestamp_millis()).await?;
+    workflow_guard.finish()?;
     notify_review(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
     Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
     )))
+    }.await;
+    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    outcome
 }
 
 /// The pipeline owns this untracked worktree. It must not make the deploy
@@ -9590,6 +9758,7 @@ fn gave_up_breakdown(labelled: &[(u64, Vec<String>)], history: &AttemptHistory) 
 }
 
 /// `gh issue list --json number,comments` → `(number, comment bodies)`.
+#[cfg(test)]
 fn parse_labelled(json: &str) -> Vec<(u64, Vec<String>)> {
     let Ok(serde_json::Value::Array(rows)) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
@@ -9607,9 +9776,103 @@ fn parse_labelled(json: &str) -> Vec<(u64, Vec<String>)> {
         .collect()
 }
 
-const LABELLED_LIST_ARGS: [&str; 10] = [
-    "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL, "--limit", "500", "--json", "number,comments",
-];
+/// Search-backed gh lists cap at 1000 even when --limit is larger. In
+/// particular PR --search/--label and issue --label switch CLI backends.
+/// Keep this fixed argument builder on repository connections; apply labels
+/// and fair ordering locally after all pages have been received.
+fn repository_inventory_args(kind: &str, repository: Option<&str>, fields: &str, limit: usize) -> Vec<String> {
+    let mut args = vec![kind.into(), "list".into(), "--state".into(), "open".into(),
+        "--limit".into(), limit.to_string(), "--json".into(), fields.into()];
+    if let Some(repository) = repository { args.extend(["--repo".into(), repository.into()]); }
+    args
+}
+fn completed_inventory(raw: &str, limit: usize) -> Result<Option<String>> {
+    let mut rows: Vec<serde_json::Value> = serde_json::from_str(raw).context("repository inventory malformed")?;
+    anyhow::ensure!(rows.len() <= limit, "repository inventory exceeds requested bound");
+    let mut seen = std::collections::HashSet::new();
+    for row in &rows {
+        let number = row.get("number").and_then(serde_json::Value::as_u64).filter(|n| *n > 0)
+            .context("repository inventory lacks a valid number")?;
+        anyhow::ensure!(seen.insert(number), "repository inventory contains duplicate rows");
+    }
+    if rows.len() == limit { return Ok(None); }
+    // Repository-scoped issue/PR numbers give stable oldest-first order,
+    // independent of gh's descending repository connection order.
+    rows.sort_by_key(|row| row["number"].as_u64().unwrap());
+    Ok(Some(serde_json::to_string(&rows)?))
+}
+/// gh paginates a repository connection internally up to --limit. A full
+/// response at the safety ceiling is an explicit error, never a partial pool.
+async fn complete_labelled_inventory<F,Fut>(mut fetch:F)->Result<String>
+where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
+    let max=(MAX_ISSUE_PAGES*ISSUES_PER_PAGE) as usize;
+    let mut limit=500usize;
+    loop {
+        let raw=fetch(limit).await?;
+        if let Some(complete) = completed_inventory(&raw, limit)? { return Ok(complete); }
+        anyhow::ensure!(limit<max,"repository inventory exceeds safe bound; refusing partial pool");
+        limit=(limit*2).min(max);
+    }
+}
+async fn complete_repository_inventory(repo_root:&Path, kind:&str, repository:Option<&str>, fields:&str)->Result<String> {
+    anyhow::ensure!(matches!(kind,"pr"|"issue"), "unsupported repository inventory");
+    complete_labelled_inventory(|limit| async move {
+        let args=repository_inventory_args(kind,repository,fields,limit);
+        let (ok,raw,error)=run(&gh_bin(),&args.iter().map(String::as_str).collect::<Vec<_>>(),repo_root).await?;
+        anyhow::ensure!(ok,"gh repository inventory failed: {}",truncate(&error,300));
+        Ok(raw)
+    }).await
+}
+fn filter_inventory_label(raw:&str,label:&str)->Result<Vec<serde_json::Value>> {
+    let rows:Vec<serde_json::Value>=serde_json::from_str(raw)?;
+    let mut selected=Vec::new();
+    for row in rows {
+        let labels=row.get("labels").and_then(serde_json::Value::as_array).context("issue inventory labels unavailable")?;
+        anyhow::ensure!(labels.iter().all(|l|l.get("name").and_then(serde_json::Value::as_str).is_some()),"issue inventory label malformed");
+        if labels.iter().any(|l|l["name"].as_str()==Some(label)) { selected.push(row); }
+    }
+    Ok(selected)
+}
+async fn complete_labelled_issues(repo_root:&Path,fields:&str)->Result<Vec<serde_json::Value>> {
+    let raw=complete_repository_inventory(repo_root,"issue",None,fields).await?;
+    filter_inventory_label(&raw,GAVE_UP_LABEL)
+}
+
+// `gh issue list --json comments` returns only the first 100 comments.
+// REST pagination retains the complete chronological reason/reset history.
+fn issue_comment_inventory_args(issue: u64, page: u32) -> Vec<String> {
+    vec!["api".into(),format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments?per_page=100&page={page}")]
+}
+fn append_comment_page(comments: &mut std::collections::BTreeMap<u64,String>, raw: &str, page: u32) -> Result<bool> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(raw).context("issue comment page malformed")?;
+    anyhow::ensure!(rows.len() <= 100,"issue comment page exceeds requested bound");
+    let complete = rows.len() < 100;
+    for comment in rows {
+        let id = comment["id"].as_u64().filter(|id|*id>0).context("comment identity unavailable")?;
+        let body = comment["body"].as_str().context("comment body unavailable")?.to_owned();
+        anyhow::ensure!(comments.insert(id,body).is_none(),"duplicate comment in paginated history");
+    }
+    anyhow::ensure!(complete || page < MAX_ISSUE_PAGES,"issue comment history exceeds safe bound; refusing partial evidence");
+    Ok(complete)
+}
+async fn collect_comment_inventory<F,Fut>(mut fetch: F) -> Result<Vec<String>>
+where F:FnMut(u32)->Fut,Fut:std::future::Future<Output=Result<String>> {
+    let mut comments = std::collections::BTreeMap::new();
+    for page in 1..=MAX_ISSUE_PAGES {
+        if append_comment_page(&mut comments,&fetch(page).await?,page)? {
+            return Ok(comments.into_values().collect());
+        }
+    }
+    bail!("issue comment history exceeds safe bound")
+}
+async fn complete_issue_comment_bodies(repo_root: &Path, issue: u64) -> Result<Vec<String>> {
+    collect_comment_inventory(|page|async move {
+        let args = issue_comment_inventory_args(issue,page);
+        let (ok,raw,error) = run(&gh_bin(), &args.iter().map(String::as_str).collect::<Vec<_>>(),repo_root).await?;
+        anyhow::ensure!(ok,"issue comment inventory failed: {}",truncate(&error,300));
+        Ok(raw)
+    }).await
+}
 
 /// #1214 — `augmentagent autopr readmit`: the labelled issues whose reason
 /// matches `wanted`. With `dry_run` nothing on GitHub changes; otherwise the
@@ -9627,13 +9890,14 @@ pub(crate) async fn readmit(
     reset_history: bool,
 ) -> Result<Vec<u64>> {
     let gh = gh_bin();
-    let (ok, stdout, stderr) = run(&gh, &LABELLED_LIST_ARGS, repo_root).await?;
-    if !ok {
-        bail!("gh issue list failed: {}", truncate(&stderr, 300));
+    let rows = complete_labelled_issues(repo_root,"number,labels").await?;
+    let mut labelled = Vec::new();
+    for row in rows {
+        let number = row["number"].as_u64().context("labelled issue identity missing")?;
+        labelled.push((number,complete_issue_comment_bodies(repo_root,number).await?));
     }
     let history = AttemptHistory::load(&attempt_history_path());
-    let matched: Vec<u64> = parse_labelled(&stdout)
-        .into_iter()
+    let matched: Vec<u64> = labelled.into_iter()
         .filter(|(n, comments)| {
             reason_matches(&gave_up_reason(comments, history.issues.get(n).map(Vec::as_slice)), wanted)
         })
@@ -9682,14 +9946,29 @@ pub(crate) async fn readmit(
 
 /// #1214 — the health watchdog's breakdown; `None` when `gh` cannot say.
 pub(crate) fn gave_up_breakdown_live(repo_root: &Path) -> Option<Vec<(String, u32)>> {
-    let out = std::process::Command::new(gh_bin())
-        .args(LABELLED_LIST_ARGS)
-        .current_dir(repo_root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let labelled = parse_labelled(&String::from_utf8_lossy(&out.stdout));
+    let mut limit=500usize;
+    let complete=loop {
+        let out=std::process::Command::new(gh_bin())
+            .args(repository_inventory_args("issue",None,"number,labels",limit))
+            .current_dir(repo_root).stdin(std::process::Stdio::null()).output().ok()
+            .filter(|o|o.status.success())?;
+        if let Some(complete)=completed_inventory(&String::from_utf8_lossy(&out.stdout),limit).ok()? { break complete; }
+        let max=(MAX_ISSUE_PAGES*ISSUES_PER_PAGE) as usize;
+        if limit>=max { return None; }
+        limit=(limit*2).min(max);
+    };
+    let mut labelled = Vec::new();
+    for row in filter_inventory_label(&complete,GAVE_UP_LABEL).ok()? {
+        let number = row["number"].as_u64()?;
+        let mut comments = std::collections::BTreeMap::new();
+        for page in 1..=MAX_ISSUE_PAGES {
+            let out = std::process::Command::new(gh_bin()).args(issue_comment_inventory_args(number,page))
+                .current_dir(repo_root).stdin(std::process::Stdio::null()).output().ok()
+                .filter(|out|out.status.success())?;
+            if append_comment_page(&mut comments,&String::from_utf8_lossy(&out.stdout),page).ok()? { break; }
+        }
+        labelled.push((number,comments.into_values().collect()));
+    }
     Some(gave_up_breakdown(&labelled, &AttemptHistory::load(&attempt_history_path())))
 }
 
@@ -9837,54 +10116,11 @@ fn stale_gave_up(fetched: &[(u64, String)]) -> Vec<u64> {
         .collect()
 }
 
-/// #955 — hand back the issues the not-fixable verdict labelled out although
-/// an earlier attempt had already built a diff for them. Removing the label
-/// is the whole re-triage: the next tick sees them as ordinary candidates
-/// again.
+/// Reconcile obsolete automatic model-only scope holds using authenticated
+/// timeline evidence. Manual/security holds remain outside this migration.
 async fn retriage_gave_up(repo_root: &Path, issues: &serde_json::Value) {
-    // #1517 — once per UTC day per process: the comment sets it reads do
-    // not change between idle ticks, and with the whole open set listed a
-    // per-tick sweep would be fifty GitHub reads every few minutes.
-    let today = utc_day_now();
-    if LAST_RETRIAGE_DAY.swap(today, std::sync::atomic::Ordering::SeqCst) == today {
-        return;
-    }
-    let gh = gh_bin();
-    let mut fetched = Vec::new();
-    // #1517 — the listing is now the whole open set, so bound the reads to
-    // the newest `MAX_RETRIAGE_READS` gave-up issues: one `gh issue view`
-    // each, on the idle path only.
-    for number in gave_up_numbers(issues).into_iter().take(MAX_RETRIAGE_READS) {
-        let n = number.to_string();
-        if let Ok((true, comments, _)) =
-            run(&gh, &["issue", "view", &n, "--json", "comments"], repo_root).await
-        {
-            fetched.push((number, comments));
-        }
-    }
-    for number in stale_gave_up(&fetched) {
-        let n = number.to_string();
-        if let Ok((true, _, _)) = run(
-            &gh,
-            &["issue", "edit", &n, "--remove-label", GAVE_UP_LABEL],
-            repo_root,
-        )
-        .await
-        {
-            info!(issue = number, "re-triage: removed `{GAVE_UP_LABEL}` (#955)");
-            backoff_comment(
-                repo_root,
-                number,
-                &format!(
-                    "Auto-fix triage: removing `{GAVE_UP_LABEL}` — an earlier \
-                     attempt already built a reviewable diff for this issue, \
-                     which #955 no longer squares with a not-agent-fixable \
-                     verdict."
-                ),
-            )
-            .await
-            .ok();
-        }
+    if let Err(error)=legacy_readmission::sweep(repo_root,Some(issues),false).await {
+        warn!("legacy hold readmission deferred: {error:#}");
     }
 }
 
@@ -10044,31 +10280,8 @@ async fn pick_issue_for_repo(
     repo_dir: &Path,
     store: &Store,
 ) -> Result<Option<Issue>> {
-    let gh = gh_bin();
-    let (ok, stdout, stderr) = run(
-        &gh,
-        &[
-            "issue",
-            "list",
-            "--repo",
-            &repo.full_name,
-            "--label",
-            FIXABLE_LABEL,
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,labels,author",
-            "--limit",
-            "50",
-        ],
-        repo_dir,
-    )
-    .await?;
-    if !ok {
-        bail!("gh issue list ({}) failed: {stderr}", repo.full_name);
-    }
-    let issues: serde_json::Value =
-        serde_json::from_str(&stdout).context("parse gh issue list")?;
+    let stdout = complete_repository_inventory(repo_dir,"issue",Some(&repo.full_name),"number,title,body,labels,author").await?;
+    let issues = serde_json::Value::Array(filter_inventory_label(&stdout,FIXABLE_LABEL)?);
     for iss in issues.as_array().cloned().unwrap_or_default() {
         let number = iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
         if number == 0 {
@@ -10180,7 +10393,7 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
     let _storage = crate::build_storage::admit(workspace, &crate::build_storage::effective_target(workspace)).await?;
     let mut env = gate_env();
     env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(workspace))?));
-    let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env).await?;
+    let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env, &standalone_resource_audit(workspace)?).await?;
     if !ok {
         bail!("build_cmd `{cmd}` failed:\n{}", truncate(&e, 1500));
     }
@@ -10262,7 +10475,8 @@ pub async fn run_multi_repo_once(
         .await
         .with_context(|| format!("mkdir {}", workroot.display()))?;
 
-    let reasoner = build_reasoner();
+    // This legacy approval-broker lane does not own an Autoship WorkflowGuard.
+    let reasoner = augmentagent_channel_core::build_reasoner();
     let mut report: Vec<String> = Vec::new();
 
     for repo in &repos {
@@ -10615,14 +10829,35 @@ struct DailyCounter {
     /// No new run starts before this instant (unix seconds): the spread gate.
     #[serde(default)]
     not_before: Option<i64>,
+    #[serde(default)]
+    history: std::collections::BTreeMap<u64, u32>,
+    #[serde(default)]
+    reservations: std::collections::BTreeMap<String, u64>,
 }
 
 impl DailyCounter {
     fn runs_today(&mut self, day: u64) -> u32 {
-        if day != self.day {
-            *self = Self { day, ..Self::default() };
+        if day > self.day {
+            let mut history = std::mem::take(&mut self.history);
+            history.insert(self.day, self.runs);
+            while history.len() > 32 { if let Some(first) = history.keys().next().copied() { history.remove(&first); } }
+            let reservations = std::mem::take(&mut self.reservations);
+            *self = Self { day, history, reservations, ..Self::default() };
         }
-        self.runs
+        if day == self.day { self.runs } else { self.history.get(&day).copied().unwrap_or(0) }
+    }
+
+    fn settle(&mut self, started: u64, completed: u64, billed: bool) {
+        let _ = self.runs_today(completed);
+        if !billed {
+            if started == self.day { self.runs = self.runs.saturating_sub(1); }
+            else if let Some(runs) = self.history.get_mut(&started) { *runs = runs.saturating_sub(1); }
+        } else if completed != started {
+            // A run spanning midnight used both days; retain the old debit and
+            // charge completion rather than resetting the new day's capacity.
+            self.record(completed);
+        }
+        self.not_before = None; // migrate obsolete calendar spacing away
     }
 
     /// #1215 — feed the current Claude latch, if any: `(reset, reason)`.
@@ -10650,7 +10885,8 @@ impl DailyCounter {
 
     fn record(&mut self, day: u64) {
         let _ = self.runs_today(day);
-        self.runs += 1;
+        if day == self.day { self.runs = self.runs.saturating_add(1); }
+        else { let count = self.history.entry(day).or_default(); *count = count.saturating_add(1); }
     }
 
     /// #814 — read the counter back from disk, defaulting to a fresh one.
@@ -10670,21 +10906,68 @@ impl DailyCounter {
             .unwrap_or_default()
     }
 
-    /// Best-effort persist. A write failure must never abort a run — it only
-    /// costs the cap its memory, which is where we already were.
-    fn save(&self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    /// Every lane reloads under a stable sibling-inode flock. Atomic rename
+    /// protects crashes; this lock additionally prevents lost cross-lane updates.
+    fn update<R>(path: &Path, mutation: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = path.parent().context("daily counter has no parent")?;
+        std::fs::create_dir_all(dir)?;
+        let lock = path.with_file_name(format!("{}.lock", path.file_name().context("counter filename")?.to_string_lossy()));
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(lock)?;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 { break; }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted { return Err(error.into()); }
         }
-        match serde_json::to_vec(self) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, bytes) {
-                    warn!(path = %path.display(), "could not persist auto-PR daily counter: {e}");
-                }
-            }
-            Err(e) => warn!("could not serialize auto-PR daily counter: {e}"),
+        let mut counter = Self::load_checked(path)?;
+        let result = mutation(&mut counter)?;
+        counter.persist(path)?;
+        Ok(result)
+    }
+
+    fn reserve(&mut self, day: u64, cap: u32, latch: Option<(i64, &str)>) -> Option<String> {
+        self.observe_claude_latch(day, latch);
+        let cap = self.cap_today(day, cap);
+        if self.runs_today(day) >= cap { return None; }
+        self.record(day);
+        let id = uuid::Uuid::new_v4().to_string();
+        self.reservations.insert(id.clone(), day);
+        Some(id)
+    }
+
+    fn settle_reservation(&mut self, id: &str, completed: u64, billed: bool) {
+        if let Some(started) = self.reservations.remove(id) {
+            self.settle(started, completed, billed);
         }
     }
+
+    fn load_checked(path: &Path) -> Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("daily accounting corrupt; refuse to reset resource budget"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Atomic reservation persistence must finish before any paid work starts.
+    fn persist(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+        let dir = path.parent().context("daily counter has no parent")?;
+        std::fs::create_dir_all(dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|error| error.error)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn save(&self, path: &Path) {
+        if let Err(error) = self.persist(path) { warn!(path=%path.display(), "could not persist daily accounting: {error:#}"); }
+    }
+
 }
 
 /// #851 — which issues were already attempted today, so the picker never
@@ -10800,6 +11083,9 @@ struct FairSched {
     /// Billed resumes since the last billed new-issue build.
     #[serde(default)]
     resumes_since_build: u32,
+    /// Admitted resume turns, including failures before a billable report.
+    #[serde(default)]
+    resume_reservations_since_build: u32,
 }
 
 impl FairSched {
@@ -10818,7 +11104,12 @@ impl FairSched {
     }
 
     /// One billed run: a resume adds to the debt, a build clears it.
+    fn reserve_resume(&mut self) {
+        self.resume_reservations_since_build = self.resume_reservations_since_build.saturating_add(1);
+    }
+
     fn record_billed(&mut self, resumed: bool) {
+        if !resumed { self.resume_reservations_since_build = 0; }
         self.resumes_since_build = if resumed {
             self.resumes_since_build.saturating_add(1)
         } else {
@@ -10911,7 +11202,7 @@ fn resume_per_build() -> u32 {
 /// combined lane interleaves: the explicit lanes keep their single purpose,
 /// and with resume-first off there is nothing to interleave against.
 fn prefer_build_now(lane: Lane, resume_first: bool, fair: &FairSched, per_build: u32) -> bool {
-    lane == Lane::Combined && resume_first && fair.resumes_since_build >= per_build
+    lane == Lane::Combined && resume_first && fair.resumes_since_build.max(fair.resume_reservations_since_build) >= per_build
 }
 
 /// Ledger path: `AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE` override (tests), else
@@ -11035,6 +11326,8 @@ impl AttemptRecord {
 /// charged; a failure `main` already has is handled by #931 instead.
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
+        ("resource capacity", "declared run resource capacity"),
+        ("resource_capacity", "declared run resource capacity"),
         ("no space left on device", "disk full"),
         // #1407 — the pre-gate free-space floor (`disk::LOW_DISK_REFUSAL`).
         ("gate refused: low disk", "disk low"),
@@ -11411,25 +11704,6 @@ fn is_quota_latch(reason: &str) -> bool {
     reason.contains("rate limit")
 }
 
-/// #1215 — how long to wait after an engaged run before starting the next:
-/// the rest of the UTC day split so the remaining runs cover it, never less
-/// than the tick interval. Without this every run started back to back at
-/// 00:00 UTC and the loop idled for the other ~19 hours.
-fn next_tick_delay(
-    now: chrono::DateTime<chrono::Utc>,
-    cap: u32,
-    runs_so_far: u32,
-    interval: std::time::Duration,
-) -> std::time::Duration {
-    let left = cap.saturating_sub(runs_so_far);
-    if left == 0 {
-        return interval;
-    }
-    let secs_into_day = now.timestamp().rem_euclid(86_400) as u64;
-    let remaining = 86_400 - secs_into_day;
-    interval.max(std::time::Duration::from_secs(remaining / (u64::from(left) + 1)))
-}
-
 fn utc_day_of(now: chrono::DateTime<chrono::Utc>) -> u64 {
     now.timestamp().div_euclid(86_400) as u64
 }
@@ -11459,31 +11733,6 @@ impl AutoPrLoop {
     const DEFAULT_DAILY_CAP: u32 = 5;
     /// How many consecutive triage-only refusals one tick may clear.
     const MAX_TRIAGE_PER_TICK: u32 = 5;
-    /// #954 — no tick may outlive this. Generous (a builder legitimately
-    /// compiles for tens of minutes), but 15 h is a wedge, and awaiting one
-    /// forever stops every later tick.
-    const MAX_TICK: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
-
-    /// A tick that outran its budget is dropped — its #816 `RunLock` and any
-    /// half-built worktree go with it — and recorded as an `Infra` harness
-    /// failure: never charged to the model, so the next tick may retry it.
-    fn abandon_wedged_tick(max_tick: std::time::Duration) {
-        let secs = max_tick.as_secs();
-        let issue = CURRENT_ISSUE.swap(0, std::sync::atomic::Ordering::Relaxed);
-        warn!(issue, budget_secs = secs, "auto-PR: tick outran its budget; abandoned (#954)");
-        if issue == 0 {
-            return; // Wedged before committing to an issue; nothing to charge.
-        }
-        let rec = AttemptRecord {
-            kind: FailureKind::Infra,
-            stage: "abandoned-tick".into(),
-            detail: format!("no result in {secs}s; run abandoned so the loop keeps ticking"),
-            wall_secs: secs,
-            ..AttemptRecord::unspecified()
-        };
-        record_reasoner_error(issue, rec);
-    }
-
     /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
     /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
     /// tick does a real `gh issue list`) and `AUGMENTAGENT_AUTOPR_DAILY_CAP`
@@ -11556,23 +11805,74 @@ impl AutoPrLoop {
 
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
-        self.run_with(shutdown, Self::MAX_TICK, move || {
+        let sweep_root = root.clone();
+        let canary_stop = shutdown.clone();
+        // Observability has its own lifetime: slow/unavailable reviewer probes
+        // must not delay merge reconciliation or consume a builder attempt.
+        // The protected daily claim prevents restart from multiplying probes.
+        let canary = async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(3600));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = canary_stop.cancelled() => return Ok(()),
+                    _ = timer.tick() => {}
+                }
+                if dry_run { continue; }
+                tokio::select! {
+                    _ = canary_stop.cancelled() => return Ok(()),
+                    result = review_canary_if_due() => {
+                        if let Err(error) = result {
+                            warn!("autoship review canary incomplete: {error:#}");
+                        }
+                    }
+                }
+            }
+        };
+        let shipping = self.run_with(shutdown, move || {
             let root = root.clone();
             async move { run_once(&root, dry_run).await }
-        })
-        .await
+        }, move || {
+            let root = sweep_root.clone();
+            async move {
+                let merged=merge_sweep(&root,dry_run).await;
+                if let Err(error)=legacy_readmission::sweep(&root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
+                merged
+            }
+        });
+        tokio::select! { result = shipping => result, result = canary => result }
     }
 
-    /// The loop body, over an injectable tick + budget (#954's wedge, tested).
-    async fn run_with<F, T>(
-        self,
-        shutdown: tokio_util::sync::CancellationToken,
-        max_tick: std::time::Duration,
-        tick: F,
-    ) -> Result<()>
-    where
-        F: Fn() -> T,
-        T: std::future::Future<Output = Result<RunReport>>,
+    /// Reconciliation runs independently of a builder's lifetime and budget.
+    /// Individual commands/providers own their watchdog and cleanup boundary.
+    async fn run_with<F, T, S, U>(self, shutdown: tokio_util::sync::CancellationToken,
+        tick: F, sweep: S) -> Result<()>
+    where F: Fn() -> T, T: std::future::Future<Output = Result<RunReport>>,
+        S: Fn() -> U, U: std::future::Future<Output = usize>,
+    {
+        let interval = self.interval;
+        let stop = shutdown.clone();
+        let reconciliation = async move {
+            let mut timer = tokio::time::interval(interval);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = stop.cancelled() => return Ok(()), _ = timer.tick() => {} }
+                let swept = tokio::select! {
+                    _ = stop.cancelled() => return Ok(()),
+                    swept = sweep() => swept,
+                };
+                if swept > 0 { info!(swept, "auto-PR: reconciled approved drafts independently of builder"); }
+            }
+        };
+        tokio::select! {
+            biased;
+            result = self.run_builds(shutdown, tick) => result,
+            result = reconciliation => result,
+        }
+    }
+
+    async fn run_builds<F, T>(self, shutdown: tokio_util::sync::CancellationToken, tick: F) -> Result<()>
+    where F: Fn() -> T, T: std::future::Future<Output = Result<RunReport>>,
     {
         info!(
             interval_secs = self.interval.as_secs(),
@@ -11581,7 +11881,6 @@ impl AutoPrLoop {
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
         let counter_path = self.counter_path.clone();
-        let mut counter = DailyCounter::load(&counter_path);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -11590,34 +11889,6 @@ impl AutoPrLoop {
                 }
                 _ = tokio::time::sleep(self.interval) => {}
             }
-            // #1029 — finish already-approved drafts FIRST, and outside the
-            // cap. This spends no reasoner call, so a reasoner budget must not
-            // gate it; gating it is what let approved PRs sit for days.
-            let swept = merge_sweep(&self.repo_root, self.dry_run).await;
-            if swept > 0 {
-                info!(swept, "auto-PR: merged already-approved drafts (unbilled)");
-            }
-
-            let now = (self.clock)();
-            let today = utc_day_of(now);
-            // #1215 — the quota brake: count today's Claude quota latches.
-            let latch = self.latch.latched_entry("claude");
-            counter.observe_claude_latch(today, latch.as_ref().map(|(t, r)| (*t, r.as_str())));
-            counter.save(&counter_path);
-            let cap = counter.cap_today(today, self.daily_cap);
-            if counter.runs_today(today) >= cap {
-                info!(
-                    daily_cap = cap,
-                    braked = counter.brake_runs.is_some(),
-                    "auto-PR: daily cap reached; idling until the next UTC day"
-                );
-                continue;
-            }
-            // #1215 — the spread gate: the last run set when the next may start.
-            if let Some(at) = counter.not_before.filter(|at| now.timestamp() < *at) {
-                info!(not_before = at, "auto-PR: spreading today's runs; next run later");
-                continue;
-            }
             // Triage-only outcomes are cheap and permanently label the
             // issue out of the pool, so keep going within the SAME tick
             // instead of spending a 30-minute interval on each one. Bounded
@@ -11625,45 +11896,40 @@ impl AutoPrLoop {
             // refusal, so this burst is self-limiting.
             let mut triaged = 0u32;
             loop {
-                // #954 — bounded AND cancellable: the 15 h freeze swallowed
-                // shutdown, and awaiting a wedged run forever stopped every
-                // later tick. Abandoning one costs a single tick.
+                // Reserve before spending so restart/shutdown cannot erase work.
+                let started_day = utc_day_of((self.clock)());
+                let latch = self.latch.latched_entry("claude");
+                let reservation = DailyCounter::update(&counter_path, |counter| Ok(counter.reserve(
+                    started_day, self.daily_cap, latch.as_ref().map(|(at, reason)| (*at, reason.as_str())))))?;
+                let Some(reservation) = reservation else {
+                    info!("auto-PR: shared daily resource/quota cap reached");
+                    break;
+                };
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
-                        info!("auto-PR loop stopped mid-tick");
+                        info!("auto-PR loop stopped mid-stage; reservation and checkpoint retained");
                         return Ok(());
                     }
-                    r = tokio::time::timeout(max_tick, tick()) => r,
+                    r = tick() => r,
                 };
-                let Ok(outcome) = outcome else {
-                    Self::abandon_wedged_tick(max_tick);
-                    break;
-                };
+                let completed_day = utc_day_of((self.clock)());
+                let billed = outcome.as_ref().map_or(true, |r| r.billed);
+                let runs_today = DailyCounter::update(&counter_path, |counter| {
+                    counter.settle_reservation(&reservation, completed_day, billed);
+                    Ok(counter.runs_today(completed_day))
+                })?;
                 match outcome {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
-                        counter.record(today);
+                        // The reservation was settled against the actual completion day.
                         // #1532 — the single debt-accounting site, next to the
                         // one that spends the budget: a billed resume owes the
                         // new-issue lane a slot, a billed build settles up.
                         // Persisted, so it survives the post-merge daemon
                         // restart exactly as the run count does (#814).
                         FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
-                        // #1215 — spread the rest of today's runs over the
-                        // rest of the day. This replaces #851's same-tick
-                        // continuation, which spent every run back to back
-                        // at 00:00 UTC; the attempt ledger still guarantees
-                        // the next pick is a different issue.
-                        let delay = next_tick_delay((self.clock)(), cap, counter.runs, self.interval);
-                        counter.not_before = Some((self.clock)().timestamp() + delay.as_secs() as i64);
-                        counter.save(&counter_path);
-                        info!(
-                            runs_today = counter.runs_today(today),
-                            daily_cap = cap,
-                            next_in_secs = delay.as_secs(),
-                            "auto-PR: {r}"
-                        );
+                        info!(runs_today, daily_cap = self.daily_cap, "auto-PR: {r}");
                         break;
                     }
                     Ok(r) => {
@@ -11699,6 +11965,31 @@ mod progress_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_recorded_verdict_remains_readable() {
+        let old = serde_json::json!({"provider":"codex","backend":"native","model":"pinned",
+            "diff_ok":true,"system_ok":true});
+        let verdict: super::RecordedVerdict = serde_json::from_value(old).unwrap();
+        assert!(verdict.structured.is_none());
+        assert!(super::approval_of(Some(&verdict)).reviewed);
+    }
+
+    #[test]
+    fn incomplete_structured_receipt_cannot_fall_back_to_true_legacy_flags() {
+        let evidence = crate::autoship_review::ReviewEvidence {
+            supplemental_source_hashes: Default::default(),
+            origin: Default::default(),
+            binding: crate::autoship_review::ReviewBinding { head:"head".into(),base:"base".into(),
+                environment_id:"env".into(),contract_hash:"contract".into(),evidence_hash:"evidence".into() },
+            builders: vec![], passes:vec![], adjudication:None,
+        };
+        let verdict = super::RecordedVerdict { provider:"codex".into(),backend:"native".into(),model:"pinned".into(),
+            diff_ok:true,system_ok:true,structured:Some(evidence) };
+        assert!(!super::approval_of(Some(&verdict)).reviewed);
+        let roundtrip: super::RecordedVerdict = serde_json::from_str(&serde_json::to_string(&verdict).unwrap()).unwrap();
+        assert_eq!(verdict, roundtrip);
+    }
+
     #[test]
     fn source_inspection_presets_enforce_read_only_bridge_access() {
         use augmentagent_channel_core::codex_tools::BridgeLaunch;
@@ -11893,6 +12184,27 @@ for tool, arguments in [
         assert_eq!(independent_reviewer_candidates(&wide, Some(&[Claude])), vec![Codex, Cerebras]);
     }
 
+    fn declared_review_fixture(root: &Path, provider: &str, authenticated: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let auth = root.join(format!("{provider}-service-auth.json"));
+        let value = if authenticated && provider == "claude" {
+            serde_json::json!({"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh"}})
+        } else if authenticated {
+            serde_json::json!({"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}})
+        } else { serde_json::json!({}) };
+        std::fs::write(&auth, serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let policy = root.join("declared-review-policy.json");
+        let mut profiles = serde_json::Map::new();
+        profiles.insert(provider.into(),serde_json::json!({"gateway":{},"auth_file":auth,
+            "auth_relative":if provider=="claude" {".claude/.credentials.json"}else{".codex/auth.json"},"environment":[]}));
+        std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,
+            "runtime_config":"/fixture/runtime.json","guest_runtime":"/fixture/guest","state_root":"/fixture/state",
+            "memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":profiles})).unwrap()).unwrap();
+        std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+        policy
+    }
+
     #[test]
     fn gateway_only_codex_alias_cannot_be_an_independent_reviewer() {
         const NAME: &str = "self_improve::tests::gateway_only_codex_alias_cannot_be_an_independent_reviewer";
@@ -11903,8 +12215,11 @@ for tool, arguments in [
                 "a gateway account can alias the author model; review needs a native Codex login");
             let home = augmentagent_channel_core::codex::codex_home();
             std::fs::write(home.join("auth.json"), b"{}").unwrap();
+            assert!(matches!(reviewer_status(Codex), ReviewerStatus::NotConfigured(_)),
+                "an undeclared host login cannot authorize a workflow reviewer");
+            declared_review_fixture(&home, "codex", true);
             assert_eq!(reviewer_status(Codex), ReviewerStatus::Ready,
-                "a native Codex login should remain eligible even with 9Router configured");
+                "declared native authentication remains eligible with 9Router configured");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -11920,6 +12235,8 @@ for tool, arguments in [
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture"])
             .env("JARVIS_REVIEW_ALIAS_CHILD", "1")
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY", declared_review_fixture(dir.path(), "codex", false))
+            .env("AUGMENTAGENT_COOLDOWN_FILE",dir.path().join("cooldown.json"))
             .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", &config)
             .env("AUGMENTAGENT_CODEX_HOME", dir.path())
             .env("CODEX_CLI", "/usr/bin/true")
@@ -12188,28 +12505,13 @@ for tool, arguments in [
         assert_eq!(c.runs_today(day + 1), 0);
     }
 
-    /// C3 — after a run, the next one waits so the remaining runs cover the
-    /// rest of the UTC day, never less than the tick interval.
-    #[test]
-    fn next_run_is_spread_across_the_rest_of_the_utc_day() {
-        let interval = std::time::Duration::from_secs(1800);
-        let at_midnight = next_tick_delay(utc("2026-09-26T00:00:00Z"), 5, 0, interval);
-        assert!(at_midnight >= std::time::Duration::from_secs(4 * 3600), "{at_midnight:?}");
-        assert_eq!(
-            next_tick_delay(utc("2026-09-26T22:00:00Z"), 5, 4, interval),
-            std::time::Duration::from_secs(3600)
-        );
-        assert_eq!(next_tick_delay(utc("2026-09-26T23:45:00Z"), 5, 4, interval), interval, "the floor");
-        assert_eq!(next_tick_delay(utc("2026-09-26T12:00:00Z"), 5, 5, interval), interval, "capped: no spread");
-    }
-
     /// C4 — a scripted UTC day with every candidate green: exactly `cap`
     /// engaged runs, spread over the day, and the next candidate is not
     /// built. Paused tokio time drives a synthetic clock; nothing touches
     /// the owner's state (counter and latch live in a tempdir, and the repo
     /// root does not exist, so the sweep's `gh` fails synchronously).
     #[tokio::test(start_paused = true)]
-    async fn a_scripted_green_day_ships_exactly_the_cap_spread_across_it() {
+    async fn a_scripted_green_day_ships_at_poll_cadence_until_cap() {
         use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
         let state = tempfile::tempdir().unwrap();
         let start = tokio::time::Instant::now();
@@ -12224,7 +12526,7 @@ for tool, arguments in [
         let asked = Arc::new(AtomicU32::new(0));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (seen, stop, runs, now) = (Arc::clone(&built), shutdown.clone(), Arc::clone(&asked), Arc::clone(&clock));
-        let run = lp.run_with(shutdown, AutoPrLoop::MAX_TICK, move || {
+        let run = lp.run_with(shutdown, move || {
             let (seen, stop, runs, now) = (Arc::clone(&seen), stop.clone(), Arc::clone(&runs), Arc::clone(&now));
             async move {
                 let at = now();
@@ -12236,7 +12538,7 @@ for tool, arguments in [
                 seen.lock().unwrap().push(at);
                 Ok(RunReport::built(format!("issue #{nth}: PR auto-merged")))
             }
-        });
+        }, || async { 0 });
         // Past the end of the synthetic day, the loop must have stopped.
         tokio::time::timeout(std::time::Duration::from_secs(26 * 3600), run)
             .await
@@ -12249,9 +12551,9 @@ for tool, arguments in [
         let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
         assert_eq!((counter.day, counter.runs), (utc_day_of(utc("2026-09-27T00:00:00Z")), 0));
         let last = *built.last().unwrap();
-        assert!(last >= utc("2026-09-26T16:00:00Z"), "runs cover the day, not its first hours: {built:?}");
+        assert!(last <= utc("2026-09-26T03:00:00Z"), "no calendar spacing after productive work: {built:?}");
         for pair in built.windows(2) {
-            assert!(pair[1] - pair[0] >= chrono::Duration::hours(2), "spread: {built:?}");
+            assert_eq!(pair[1] - pair[0], chrono::Duration::minutes(30));
         }
     }
 
@@ -12735,39 +13037,108 @@ for tool, arguments in [
         assert_eq!(c.runs_today(101), 1);
     }
 
-    /// #954 verbatim, loop side: on 2026-09-04 a run parked forever on a
-    /// leaked CLI-gate permit (15 h, no email triage, no auto-PR). The loop
-    /// must abandon that run and keep ticking, not await it for good.
-    #[tokio::test]
-    async fn a_wedged_tick_is_abandoned_so_the_loop_keeps_ticking() {
-        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
-        let ms = std::time::Duration::from_millis;
-        assert_eq!(AutoPrLoop::MAX_TICK, std::time::Duration::from_secs(3 * 60 * 60));
-        // Cap `u32::MAX`: the tick that matters is the one AFTER the wedge.
-        let (root, cap) = (PathBuf::from("/nonexistent"), u32::MAX);
+    #[test]
+    fn concurrent_lanes_share_one_daily_cap_and_settle_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daily.json");
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let threads: Vec<_> = (0..12).map(|_| {
+            let (path, barrier) = (path.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                DailyCounter::update(&path, |counter| Ok(counter.reserve(100, 5, None))).unwrap()
+            })
+        }).collect();
+        let reservations: Vec<_> = threads.into_iter().filter_map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(reservations.len(), 5);
+        let threads: Vec<_> = reservations.into_iter().map(|id| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2 { DailyCounter::update(&path, |counter| {
+                    counter.settle_reservation(&id, 101, true); Ok(())
+                }).unwrap(); }
+            })
+        }).collect();
+        for thread in threads { thread.join().unwrap(); }
+        let mut counter = DailyCounter::load_checked(&path).unwrap();
+        assert_eq!(counter.runs_today(100), 5);
+        assert_eq!(counter.runs_today(101), 5);
+        assert!(counter.reservations.is_empty());
+        assert!(DailyCounter::update(&path, |counter| Ok(counter.reserve(101, 5, None))).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_daily_accounting_does_not_reset_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daily.json");
+        std::fs::write(&path, "partial").unwrap();
+        assert!(DailyCounter::update(&path, |counter| Ok(counter.reserve(100, 5, None))).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "partial");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn productive_seven_hour_tick_keeps_running_while_merge_sweep_advances() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
         let state = tempfile::tempdir().unwrap();
-        let mut lp = AutoPrLoop::for_tests(root, cap, state.path());
-        lp.interval = ms(5);
-        let calls = Arc::new(AtomicU32::new(0));
+        let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path());
+        lp.interval = std::time::Duration::from_secs(1800);
+        let start = tokio::time::Instant::now();
+        let base = utc("2026-09-26T20:00:00Z");
+        lp.clock = Arc::new(move || base + chrono::Duration::from_std(tokio::time::Instant::now()-start).unwrap());
+        let completed = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(false));
+        let sweeps_during_build = Arc::new(AtomicU32::new(0));
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (seen, stop) = (Arc::clone(&calls), shutdown.clone());
-        let run = lp.run_with(shutdown, ms(50), move || {
-            let (nth, stop) = (seen.fetch_add(1, SeqCst), stop.clone());
+        let (done, running) = (completed.clone(), active.clone());
+        let (sweep_done, sweep_active, sweeps, stop) = (completed.clone(), active.clone(), sweeps_during_build.clone(), shutdown.clone());
+        lp.run_with(shutdown, move || {
+            let (done, running) = (done.clone(), running.clone());
             async move {
-                if nth == 0 {
-                    std::future::pending::<()>().await; // The freeze, verbatim.
-                }
-                stop.cancel();
-                Ok(RunReport::idle())
+                running.store(true, SeqCst);
+                for _ in 0..7 { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
+                running.store(false, SeqCst);
+                done.store(true, SeqCst);
+                Ok(RunReport::built("seven productive stages completed".into()))
             }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(10), run)
-            .await
-            .expect("a wedged run must not stop every later tick")
-            .expect("abandoning a tick is not a loop failure");
-        assert_eq!(calls.load(SeqCst), 2);
-        // Abandoned mid-run, the attempt is the harness's, never the model's.
-        assert!(!FailureKind::Infra.counts_toward_max_attempts());
+        }, move || {
+            let (done, active, sweeps, stop) = (sweep_done.clone(), sweep_active.clone(), sweeps.clone(), stop.clone());
+            async move {
+                if active.load(SeqCst) { sweeps.fetch_add(1, SeqCst); }
+                if done.load(SeqCst) { stop.cancel(); }
+                1
+            }
+        }).await.unwrap();
+        assert!(completed.load(SeqCst));
+        assert!(sweeps_during_build.load(SeqCst) >= 12, "ready PR reconciliation cannot wait for builder completion");
+        let mut counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs_today(utc_day_of(base)), 1, "old-day resource reservation retained");
+        assert_eq!(counter.runs_today(utc_day_of(base)+1), 1, "completion charged to actual day");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_active_builder_without_erasing_reservation() {
+        let state = tempfile::tempdir().unwrap();
+        let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path());
+        lp.interval = std::time::Duration::from_secs(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        lp.run_with(shutdown, move || {
+            let stop = stop.clone();
+            async move { stop.cancel(); std::future::pending::<Result<RunReport>>().await }
+        }, || async { 0 }).await.unwrap();
+        assert_eq!(DailyCounter::load(&state.path().join("autopr-daily-runs.json")).runs, 1);
+    }
+
+    #[tokio::test]
+    async fn individual_hung_gate_is_stopped_without_deleting_candidate() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(dir.path().join("candidate"), "keep work").unwrap();
+        let result = run_sandboxed_bounded("/bin/sh", &["-c", "sleep 0.2; touch late-write"],
+            dir.path(), &[("PATH".into(), "/usr/bin:/bin".into())], std::time::Duration::from_millis(20), &test_resource_audit(dir.path())).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("verification invocation timed out"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!dir.path().join("late-write").exists(), "timed-out descendant must be terminated");
+        assert_eq!(std::fs::read_to_string(dir.path().join("candidate")).unwrap(), "keep work");
     }
 
     // ---- throughput: cheap triage must not cost a build's budget ----
@@ -12965,7 +13336,7 @@ CODEX-REVIEW: lgtm").0);
     #[test]
     fn independent_approval_requires_availability_and_both_passes() {
         let mk = |available, diff_ok, system_ok| IndependentReview {
-            provider: Some(augmentagent_channel_core::ProviderKind::Codex),
+            structured: None, provider: Some(augmentagent_channel_core::ProviderKind::Codex),
             model: Some("synthetic-native-model".into()),
             available,
             diff_ok,
@@ -13645,7 +14016,7 @@ CODEX-REVIEW: lgtm").0);
         // One debt-accounting site, in the loop's billed arm.
         let production = &src[..src.find("mod tests {").unwrap()];
         assert_eq!(production.matches("f.record_billed(").count(), 1);
-        let loop_start = production.find("async fn run_with<F, T>(").expect("run_with");
+        let loop_start = production.find("async fn run_builds<F, T>(").expect("run_builds");
         let billed = production[loop_start..].find("Ok(r) if r.billed =>").expect("billed arm");
         let record = production[loop_start..].find("f.record_billed(r.resumed)").expect("debt update");
         assert!(billed < record, "the debt update follows the billed arm");
@@ -14175,26 +14546,18 @@ CODEX-REVIEW: lgtm").0);
         assert!(!merge_succeeded(false, None));
     }
 
-    // Structural guard for the ordering half of #893: the resume path must
-    // release the worktree BEFORE `gh pr merge --delete-branch`, or the
-    // local-branch deletion fails while a worktree holds the branch.
     #[test]
-    fn resume_cleans_up_worktree_before_merging() {
-        // Earlier failure paths also call cleanup, so anchor on the merge
-        // section: between `gh pr ready` and `gh pr merge` there must be one.
+    fn resume_preserves_worktree_until_merge_is_observed() {
         let src = include_str!("self_improve.rs");
-        let resume_start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let body = &src[resume_start..];
-        let ready_at = body.find("ready_for_merge(repo_root, pr,").expect("ready transition");
-        let merge_at = body
-            .find(r#""pr", "merge", &pr.to_string(), "--squash", "--delete-branch""#)
-            .expect("merge call");
-        assert!(ready_at < merge_at, "ready must precede merge");
-        let between = &body[ready_at..merge_at];
-        assert!(
-            between.contains("cleanup(worktree, branch.to_string()"),
-            "resume_draft_pr must release the worktree between `gh pr ready` and `gh pr merge --delete-branch`"
-        );
+        let start = src.find("async fn resume_draft_pr(").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start;
+        let body = &src[start..end];
+        assert!(!body.contains("--delete-branch"));
+        assert!(!body.contains("reclaim_worktree("));
+        assert!(body.find("workflow.observe_remote(&merge_intent").unwrap()
+            < body.find("\"worktree\", \"remove\"").unwrap());
+        // Head pinning is behavior-tested through publication::merge_mutation.
+
     }
 
     // #895 — every revision round must be pushed + commented on the PR.
@@ -14468,6 +14831,21 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             packages: vec!["augmentagent-channel-contacts".into()],
             gate_err: None,
         }
+    }
+
+    #[tokio::test]
+    async fn existing_red_main_repair_beyond_five_pages_is_reused() {
+        let title=red_main_title(&red_fixture());
+        let expected=title.clone();
+        let rows=fetch_issue_pages(|page| {
+            let title=title.clone();
+            async move { Ok(if page<=5 {
+                serde_json::json!([{"number":1000+page,"title":"unrelated issue"}])
+            } else if page==6 {
+                serde_json::json!([{"number":42,"title":title,"labels":[]}])
+            } else { serde_json::json!([]) }) }
+        }).await.unwrap();
+        assert_eq!(red_main_issue_lookup(&rows,&expected),Some((42,false)));
     }
 
     #[test]
@@ -14954,7 +15332,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             pr: 1000,
             head: "cccc333".into(),
             verdict: Some(RecordedVerdict {
-                provider: "codex".into(),
+                structured: None, provider: "codex".into(),
                 backend: String::new(),
                 model: String::new(),
                 diff_ok: true,
@@ -15021,6 +15399,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "crates/augmentagent-cli/src/self_improve_lifecycle_tests.rs",
                 "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
                 "docs/CODEX-FALLBACK.md",
+                // Removes inherited overrides; never reads or writes the map.
+                "scripts/autoship-native-acceptance-probe.py",
             ],
             "something outside this crate names the opened-PR map: it must go through opened_prs"
         );
@@ -15110,7 +15490,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     fn verdict(provider: &str, ok: bool) -> RecordedVerdict {
         RecordedVerdict {
-            provider: provider.into(), backend: "native".into(),
+            structured: None, provider: provider.into(), backend: "native".into(),
             model: "synthetic-native-model".into(), diff_ok: ok, system_ok: ok,
         }
     }
@@ -15121,7 +15501,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     fn independent_verdict_records_native_backend_and_requested_model() {
         use augmentagent_channel_core::providers::{ModelTier, ProviderKind};
         let review = IndependentReview {
-            provider: Some(ProviderKind::Codex),
+            structured: None, provider: Some(ProviderKind::Codex),
             model: Some(augmentagent_channel_core::providers::model_for(ProviderKind::Codex, ModelTier::Quality)),
             available: true,
             diff_ok: true,
@@ -15188,7 +15568,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
         // The fresh lane holds the same facts and reaches the same answer.
         let claude = IndependentReview {
-            provider: Some(Claude),
+            structured: None, provider: Some(Claude),
             model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
@@ -15223,7 +15603,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // A rejection, a half approval, or any other provider never unlocks.
         for v in [
             verdict("codex", false),
-            RecordedVerdict { provider: "codex".into(), backend: "native".into(),
+            RecordedVerdict { structured: None, provider: "codex".into(), backend: "native".into(),
                 model: "synthetic-native-model".into(), diff_ok: true, system_ok: false },
         ] {
             assert_eq!(approval_of(Some(&v)), Approval::default(), "{v:?}");
@@ -15255,7 +15635,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_eq!(sweep_verdict(&gated_draft(approval)), SweepVerdict::Merge);
 
         let codex = IndependentReview {
-            provider: Some(Codex),
+            structured: None, provider: Some(Codex),
             model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
@@ -15282,26 +15662,22 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     /// and the sweep. Pinned, because the bug was two copies that disagreed.
     #[test]
     fn the_sweep_and_the_lanes_share_one_approval_predicate() {
-        let src = include_str!("self_improve.rs");
-        let imp = src.find("impl IndependentReview {").expect("impl");
-        let within = &src[imp..];
-        for sig in ["fn approved(&self) -> bool {", "fn codex_approved(&self) -> bool {"] {
-            let a = within.find(sig).expect(sig);
-            let body = &within[a..a + within[a..].find("\n    }\n").expect("end")];
-            assert!(body.contains("approval_of("), "{sig} must use the shared predicate: {body}");
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        for provider in [Claude, Codex] {
+            for (diff_ok, system_ok) in [(true, true), (false, true), (true, false), (false, false)] {
+                let review = IndependentReview {
+                    structured: None, provider: Some(provider), model: Some("synthetic-model".into()),
+                    available: true, diff_ok, system_ok, notes: String::new(), why_unavailable: None,
+                };
+                let verdict = review.recorded_verdict();
+                let record = OpenedPr { pr: 42, head: REVIEWED_HEAD.into(), verdict };
+                let persisted = recorded_approval(Some(&record), 42, Some(REVIEWED_HEAD));
+                assert_eq!(persisted.reviewed, review.approved());
+                assert_eq!(persisted.codex, review.codex_approved());
+                assert_eq!(persisted.reviewed, diff_ok && system_ok);
+                assert_eq!(persisted.codex, diff_ok && system_ok && provider == Codex);
+            }
         }
-        let r = src.find("fn recorded_approval(").expect("the sweep's reader");
-        assert!(src[r..r + src[r..].find("\n}\n").expect("end")].contains("approval_of("));
-        let p = src.find("fn approval_of(").expect("the predicate");
-        let pred = code_only(&src[p..p + src[p..].find("\n}\n").expect("end")]);
-        assert!(pred.contains("ProviderKind::Codex"), "Codex-only means the provider the loop called: {pred}");
-
-        let start = src.find("async fn merge_sweep(").expect("the sweep");
-        let sweep = code_only(&src[start..start + src[start..].find("\n}\n").expect("end")]);
-        assert!(!sweep.contains("reviews_approved: true"), "never asserted");
-        assert!(sweep.contains("codex_approved: approval.codex"), "{sweep}");
-        assert!(sweep.contains("reviews_approved: approval.reviewed"));
-        assert!(sweep.contains("review_approved: approval.reviewed"));
     }
 
     /// Codex, a third time on the same shape: sharing `may_automerge` is
@@ -15402,79 +15778,31 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     }
 
-    /// Codex: `gh pr ready` is a state change and the merge after it can
-    /// still fail. Leaving the PR ready-but-unmerged breaks "merge, or leave
-    /// it alone" twice over — the sweep only ever considers DRAFTS, so a
-    /// stranded PR also falls out of every future sweep.
-    #[test]
-    fn a_failed_merge_puts_the_draft_back() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn merge_sweep(").expect("the sweep");
-        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+    // Draft restoration, exact-head mutation and pending checks are exercised
+    // with fake GitHub transport in progress_tests and publication::tests.
 
-        let ready = body.find("ready_for_merge(repo_root, pr,").expect("the sweep marks ready");
-        let merge = body.find(r#""pr", "merge""#).expect("then merges");
-        assert!(ready < merge, "ready comes first");
-        // Codex: everything the sweep checked came from a snapshot. A commit
-        // pushed between that read and this call would merge unreviewed, so
-        // the merge pins the head it validated and lets GitHub refuse.
-        assert!(
-            body[merge..].contains(r#""--match-head-commit""#),
-            "the merge must pin the validated head, or the checks are a TOCTOU"
-        );
-
-        // Codex: pinning the head catches a moved commit, not a check that
-        // went green-to-red on the SAME commit — a CI re-run, a flaky job
-        // retried, a required check added. So the checks are re-read after
-        // readying and immediately before merging.
-        let rechecks: Vec<usize> = body
-            .match_indices("checks_green(")
-            .map(|(i, _)| i)
-            .collect();
-        assert!(
-            rechecks.len() >= 2,
-            "checks must be read again just before the merge, not only at scan time"
-        );
-        let last = *rechecks.last().unwrap();
-        assert!(
-            ready < last && last < merge,
-            "the re-read must sit between readying and merging: \
-             ready={ready} recheck={last} merge={merge}"
-        );
-        // And a red re-read must put the draft back rather than merge.
-        assert!(
-            body[last..merge].contains(r#""--undo""#),
-            "a check that went red after readying must restore the draft"
-        );
-        assert!(
-            body[merge..].contains(r#""--undo""#),
-            "a failed merge must restore the draft state"
-        );
-        // The revert must be conditional on the merge having failed, not
-        // unconditional, and must only undo a transition we made.
-        let undo = body[merge..].find(r#""--undo""#).expect("the undo");
-        let guard = body[merge..merge + undo].rfind("if ").expect("a guard");
-        let cond = &body[merge + guard..merge + undo];
-        assert!(cond.contains("!ok"), "only on failure: {cond:?}");
-        assert!(cond.contains("readied"), "only if we made the transition: {cond:?}");
-    }
 
     /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
     /// is bounded so a backlog cannot stall a tick.
-    #[test]
-    fn the_sweep_is_free_bounded_and_runs_while_capped() {
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_is_free_bounded_and_runs_while_capped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 1, state.path());
+        lp.interval = std::time::Duration::from_secs(5);
+        let mut counter = DailyCounter::default();
+        counter.record(utc_day_now());
+        counter.persist(&lp.counter_path).unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let swept = Arc::new(AtomicUsize::new(0));
+        let seen = swept.clone();
+        let cancel = stop.clone();
+        lp.run_with(stop, || async { panic!("capped builder must not run"); #[allow(unreachable_code)] Ok(RunReport::idle()) }, move || {
+            let seen = seen.clone(); let cancel = cancel.clone();
+            async move { if seen.fetch_add(1, Ordering::SeqCst) >= 2 { cancel.cancel(); } 0 }
+        }).await.unwrap();
+        assert_eq!(swept.load(Ordering::SeqCst), 3);
         let src = include_str!("self_improve.rs");
-        // `run` delegates; the tick loop itself is `run_with`.
-        let start = src.find("async fn run_with<F, T>(").expect("the tick loop");
-        let body = &src[start..start + src[start..].find("\n    }\n").expect("end")];
-        let sweep = body.find("merge_sweep(").expect("the tick must run the sweep");
-        let cap = body.find("daily cap reached").expect("the cap check");
-        assert!(
-            sweep < cap,
-            "the sweep must run BEFORE the cap check; merging an approved \
-             draft spends no reasoner call, so a reasoner budget must not gate it"
-        );
-
         let fn_start = src.find("async fn merge_sweep(").expect("the sweep");
         let fn_body = &src[fn_start..fn_start + src[fn_start..].find("\n}\n").expect("end")];
         // C5 — no reasoner, at all.
@@ -15488,8 +15816,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // page starves the very drafts this sweep exists to drain — rotation
         // only rotates within whatever the page happened to contain.
         assert!(
-            fn_body.contains("sort:created-asc"),
-            "list oldest-first, so the drafts most at risk are always in view"
+            fn_body.contains("complete_repository_inventory("),
+            "complete inventory must precede local oldest-first fair rotation"
         );
         assert!(
             !fn_body.contains("is:draft"),
@@ -16173,22 +16501,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     // and the fall-through hands the overruled verdict to the builder as
     // context instead of dropping it.
     #[test]
-    fn not_fixable_label_out_is_gated_on_may_label_out() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
-        let body = &src[start..];
-        let at = body.find("if !s.fixable").expect("fixability branch");
-        let block = &body[at..];
-        // `is_some_and`: a `gh` failure (None) must not label the issue out.
-        let guard = block.find("label_out_evidence(repo_root, issue.number)").expect("gate");
-        let weighed = block.find(".is_some_and(|kinds| may_label_out(&kinds))").expect("policy");
-        assert!(weighed > guard && weighed - guard < 100, "{guard} {weighed}");
-        let label = block.find("label_gave_up(").expect("label-out");
-        let note = block
-            .find("prior_attempts = Some(overruled_scope_note(")
-            .expect("the overruled verdict reaches the builder");
-        assert!(guard < label, "the policy gate must precede label_gave_up");
-        assert!(label < note, "the fall-through follows the guarded return");
+    fn not_fixable_specification_cannot_override_grounded_readiness() {
+        let source=include_str!("self_improve.rs");let start=source.find("pub async fn run_once(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();let body=&source[start..end];let at=body.find("if !s.fixable").unwrap();let end=at+body[at..].find("// #843").unwrap();
+        assert!(body[at..end].contains("overruled_scope_note"));
+        assert!(!body[at..end].contains("label_gave_up"));
     }
 
     // Structural (#955): the re-triage sweep sits on `pick_issue`'s idle path,
@@ -16202,7 +16518,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let body = &src[start..];
         let body = &body[..body.find("\n}\n").expect("end of pick_issue")];
         let sweep = body.find("retriage_gave_up(").expect("the sweep runs in pick_issue");
-        let picked = body.find("return Ok(Some(Issue {").expect("the picked-issue return");
+        let picked = body.find("return Ok(Some(candidate))").expect("the picked-issue return");
         assert!(picked < sweep, "a tick that picks an issue must not pay for the sweep");
         let guard = body[..sweep].rfind("if !dry_run {").expect("gated on dry_run");
         assert!(sweep - guard < 40, "a dry run must not edit the live inbox: {guard} {sweep}");
@@ -16500,42 +16816,17 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(drafts_to_close(&prs, &std::collections::HashSet::new(), Some("nolanmak")).is_empty());
     }
 
-    // Structural: every gave-up in resume_draft_pr closes the PR (branch
-    // kept), and close_gave_up_pr never deletes the branch.
+    // Review exhaustion retains a resumable draft instead of terminating work.
     #[test]
-    fn gave_up_in_resume_closes_the_pr_but_keeps_the_branch() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let end = start + src[start..].find("\n}\n").expect("fn end");
-        let body = &src[start..end];
-        let mut sites = 0;
-        let mut from = 0;
-        while let Some(at) = body[from..].find("label_gave_up(") {
-            let abs = from + at;
-            let ret = abs
-                + body[abs..]
-                    .find("return Ok(RunReport::")
-                    .expect("return after gave-up");
-            assert!(
-                body[abs..ret].contains("close_gave_up_pr("),
-                "gave-up site {} must close the PR before returning",
-                sites + 1
-            );
-            sites += 1;
-            from = abs + 1;
+    fn review_exhaustion_preserves_the_pr_and_branch() {
+        let findings = "same unresolved reviewer conflict";
+        for attempts in [1, 2, 20, 100] {
+            assert_eq!(give_up_verdict(&[Some(findings.into())], findings, FailureKind::ReviewReject, attempts), None,
+                "review conflicts stay resumable even after the per-run budget is exhausted");
         }
-        assert_eq!(
-            sites, 4,
-            "blast-radius (terminal), conflict-, gate-, review-exhausted"
-        );
-        let cstart = src.find("async fn close_gave_up_pr(").expect("close fn");
-        let cend = cstart + src[cstart..].find("\n}\n").expect("close fn end");
-        let close = &src[cstart..cend];
-        assert!(close.contains(r#""pr", "close""#));
-        assert!(
-            !close.contains("--delete-branch"),
-            "the branch stays for a human"
-        );
+        let prs = serde_json::json!([{ "number":42, "headRefName":"agent-fix/issue-1", "isDraft":true, "isCrossRepository":false }]);
+        assert_eq!(resumable_from(&prs, &AttemptLedger::default(), 5, &std::collections::HashSet::new(), None, None, 0),
+            Some((42, 1, "agent-fix/issue-1".into())));
     }
 
     // Structural: run_once has no PR yet at its gave-up sites — nothing to close.
@@ -16552,15 +16843,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     // Structural: the finder sweeps drafts that already gave up (the one-off
     // for #853-style leftovers) before choosing what to resume.
     #[test]
-    fn find_resumable_draft_sweeps_gave_up_drafts() {
+    fn find_resumable_draft_preserves_exhausted_work_for_recovery() {
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn find_resumable_draft(").expect("finder");
         let end = start + src[start..].find("\n}\n").expect("finder end");
         let body = &src[start..end];
-        let sweep = body.find("drafts_to_close(").expect("sweep");
-        let close = body.find("close_gave_up_pr(").expect("close in sweep");
-        let choose = body.find("resumable_from(").expect("choice");
-        assert!(sweep < close && close < choose, "sweep, close, then choose");
+        assert!(!body.contains("drafts_to_close("));
+        assert!(!body.contains("close_gave_up_pr("));
+        assert!(body.contains("adoption::select_linked_with_retries("));
     }
 
     // --- #936 CodeRabbit as a third reviewer --------------------------------
@@ -16637,26 +16927,18 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     }
 
 
-    // Structural: `gh pr ready` + merge happen only under BOTH approvals.
+    // Complete internal authority, including adjudication, controls review approval.
     #[test]
     fn resume_merge_requires_internal_approvals() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let end = start + src[start..].find("\n}\n").expect("resume fn end");
-        let body = &src[start..end];
-        let gate = body
-            .find("if resume_may_merge(qa_ok, independent.approved()) {")
-            .expect("every approval guards the merge (QA joined in #1488)");
-        let ready = body
-            .find("ready_for_merge(repo_root, pr,")
-            .expect("ready transition");
-        assert!(gate < ready);
-        assert!(!body[gate..ready].contains("if independent.approved() {"));
-        // Advisory: a missing CodeRabbit verdict never parks the draft.
-        assert!(
-            !body.contains("CodeRabbit review pending"),
-            "absent CodeRabbit must not block or park"
-        );
+        let unresolved = super::progress_tests::synthetic_aligned_review("head", false);
+        assert!(!unresolved.approved(), "raw pass booleans cannot erase a QA finding");
+        let adjudicated = super::progress_tests::synthetic_aligned_review("head", true);
+        assert!(adjudicated.approved(), "the final adjudicator can resolve the QA contradiction");
+        assert!(!adjudicated.structured.as_ref().unwrap().passes[0].findings.is_empty(),
+            "approval preserves dissent rather than fabricating unanimous LGTM");
+        let mut missing = super::progress_tests::synthetic_aligned_review("head", true);
+        missing.structured.as_mut().unwrap().passes.pop();
+        assert!(!missing.approved(), "adjudication does not replace a missing pass");
     }
 
 
@@ -17056,8 +17338,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let not_fixable = body.find("if !s.fixable && !is_red_main_issue(&issue.body)").expect("not-fixable branch");
         assert!(overtaken < not_fixable, "relevance is judged before fixability");
         let hold = &body[overtaken..not_fixable];
-        assert!(hold.contains("GIVE_UP_OVERTAKEN") && hold.contains("RunReport::triage("), "held, unbilled");
-        assert!(hold.contains("AttemptLedger::mark_persist("), "off the picker for the day");
+        assert!(hold.contains("prove_current_main") && hold.contains("RunReport::held("), "objective relevance gate");
+        assert!(!hold.contains("label_gave_up"), "no model-only human label");
         assert!(!hold.contains("record_attempt("), "an overtaken issue is not an attempt");
         let slice = body.find("sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body)").expect("slice guard");
         let refusal = body.find("GIVE_UP_SCOPER_PREDICTS_REFUSAL").expect("size refusal");
@@ -17417,14 +17699,10 @@ else:
     /// once the issue has failed the same way twice, and says so with a
     /// reason code; the first pass builds.
     #[test]
-    fn scoper_not_fixable_labels_only_after_a_repeated_charged_failure() {
-        assert!(!may_label_out(&[]), "first-pass triage builds instead of labelling out (#1514)");
-        assert!(may_label_out(&[FailureKind::NoChanges, FailureKind::NoChanges]));
-        assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE, "scoper:not-fixable");
-        let src = include_str!("self_improve.rs");
-        let at = src.find("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}").expect("the scoper refusal");
-        let label = at + src[at..].find("label_gave_up(").expect("labelled");
-        assert!(src[label..label + 120].contains("GIVE_UP_SCOPER_NOT_FIXABLE"), "{}", &src[label..label + 120]);
+    fn historical_not_fixable_markers_remain_readable_without_authorizing_new_labels() {
+        assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE,"scoper:not-fixable");
+        let source=include_str!("self_improve.rs");let start=source.find("pub async fn run_once(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();
+        assert!(!source[start..end].contains("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}"));
     }
 
     /// C6 input — reasons come from the durable comments first, then the
@@ -17455,6 +17733,112 @@ else:
         let buckets = gave_up_breakdown(&labelled, &history);
         assert_eq!(buckets.iter().map(|(_, n)| n).sum::<u32>(), labelled.len() as u32);
         assert!(buckets.contains(&("stuck:gate-red".to_string(), 2)), "{buckets:?}");
+    }
+
+    #[tokio::test]
+    async fn repository_inventory_crosses_search_cap_and_preserves_fair_authorization() {
+        const CHILD: &str = "AUTOSHIP_COMPLETE_INVENTORY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = tempfile::tempdir().unwrap();
+            let gh = root.path().join("gh.py");
+            std::fs::write(&gh,r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+a=sys.argv[1:]
+assert a[1]=='list' and a[a.index('--state')+1]=='open'
+limit=int(a[a.index('--limit')+1])
+# Reproduce gh's search-cap trap, and default descending repository ordering.
+if '--search' in a or '--label' in a: limit=min(limit,1000)
+rows=[]
+for n in range(1501,0,-1):
+    if a[0]=='pr':
+        rows.append(dict(number=n,headRefName='agent-fix/issue-'+str(n),headRefOid='a'*40,
+            baseRefName='main',isCrossRepository=n==1499,author=dict(login='stranger' if n==1500 else 'owner'),
+            title='synthetic',body='',closingIssuesReferences=[]))
+    else:
+        rows.append(dict(number=n,labels=[dict(name='agent-gave-up')] if n==1 else [],comments=[]))
+print(json.dumps(rows[:limit]))
+with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
+"#).unwrap();
+            std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","self_improve::tests::repository_inventory_crosses_search_cap_and_preserves_fair_authorization","--nocapture"])
+                .env(CHILD,root.path()).env("GH_BIN",gh).output().unwrap();
+            assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+            assert!(root.path().join("executed").exists());
+            return;
+        }
+        let root=PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let raw=complete_repository_inventory(&root,"pr",None,"number,headRefName,headRefOid,baseRefName,isCrossRepository,author,title,body,closingIssuesReferences").await.unwrap();
+        let rows:serde_json::Value=serde_json::from_str(&raw).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(),1501);
+        assert_eq!(rows[0]["number"],1);
+        let candidates=adoption::authorized(&rows,"owner/repo",&["owner".into()]);
+        assert_eq!(candidates.len(),1499);
+        assert!(candidates.iter().all(|p|p.pr!=1499 && p.pr!=1500));
+        let ledger=AttemptLedger::default();
+        let first=adoption::select_linked(&candidates,&ledger,1,&Default::default(),None,1498).unwrap();
+        assert_eq!(first.0,1501,"later authorized PR must remain reachable past the search cap");
+        let wrapped=adoption::select_linked(&candidates,&ledger,1,&Default::default(),None,first.0).unwrap();
+        assert_eq!(wrapped.0,1,"fair rotation wraps across the complete oldest-first pool");
+        let labelled=complete_labelled_issues(&root,"number,labels").await.unwrap();
+        assert_eq!(labelled.len(),1);
+        assert_eq!(labelled[0]["number"],1,"old issue labels outside the first 1000 remain visible");
+        let calls:Vec<Vec<String>>=std::fs::read_to_string(root.join("calls")).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert!(calls.iter().all(|a|!a.iter().any(|arg|matches!(arg.as_str(),"--search"|"--label"|"--draft"|"--author"))));
+        assert!(calls.iter().filter(|a|a.contains(&"2000".into())).count()>=2);
+        assert!(filter_inventory_label("[{\"number\":1}]",GAVE_UP_LABEL).is_err());
+        std::fs::write(root.join("executed"),"ok").unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_comments_preserve_late_reason_and_reset_and_reject_partial_shapes() {
+        let mut rows: Vec<_> = (1..=100).map(|id|serde_json::json!({"id":id,"body":"discussion"})).collect();
+        rows[0]["body"] = serde_json::json!(format!("{GAVE_UP_REASON_MARKER_PREFIX}gate-red -->"));
+        let pages = serde_json::json!([rows,[
+            {"id":101,"body":ATTEMPT_RESET_MARKER},
+            {"id":102,"body":format!("{GAVE_UP_REASON_MARKER_PREFIX}review-reject -->")}
+        ]]);
+        let bodies = collect_comment_inventory(|page| {
+            let raw = pages[(page-1) as usize].to_string();
+            async move { Ok(raw) }
+        }).await.unwrap();
+        assert_eq!(bodies.len(),102);
+        assert_eq!(gave_up_reason(&bodies,None),"review-reject");
+        assert!(!reason_matches(&gave_up_reason(&bodies,None),"gate-red"));
+        assert!(after_last_reset(&bodies.join("\n")).contains("review-reject"));
+        assert!(!after_last_reset(&bodies.join("\n")).contains("gate-red"));
+        for raw in [r#"{}"#, r#"[{"id":1,"body":null}]"#, r#"[{"id":1,"body":"x"},{"id":1,"body":"x"}]"#] {
+            assert!(append_comment_page(&mut Default::default(),raw,1).is_err());
+        }
+        let calls = std::cell::Cell::new(0);
+        let error = collect_comment_inventory(|page| {
+            calls.set(calls.get()+1);
+            async move { Ok(serde_json::to_string(&(1..=100).map(|n|
+                serde_json::json!({"id":u64::from(page)*100+n,"body":"discussion"}))
+                .collect::<Vec<_>>())?) }
+        }).await.unwrap_err();
+        assert_eq!(calls.get(),MAX_ISSUE_PAGES);
+        assert!(format!("{error:#}").contains("refusing partial evidence"));
+
+    }
+
+    #[tokio::test]
+    async fn readmission_inventory_includes_rows_beyond_five_hundred() {
+        let calls=std::cell::RefCell::new(Vec::new());
+        let raw=complete_labelled_inventory(|limit| {
+            calls.borrow_mut().push(limit);
+            async move { Ok(serde_json::to_string(&(1..=600usize.min(limit)).map(|n|serde_json::json!({"number":n,"comments":[]})).collect::<Vec<_>>())?) }
+        }).await.unwrap();
+        let rows=parse_labelled(&raw);
+        assert_eq!(rows.len(),600); assert_eq!(rows.last().unwrap().0,600);
+        assert_eq!(*calls.borrow(),vec![500,1000]);
+        assert!(complete_labelled_inventory(|_|async {Ok("{}".into())}).await.is_err());
+        assert!(complete_labelled_inventory(|limit|async move {Ok(serde_json::to_string(&vec![serde_json::json!({"number":1});limit])?)}).await.is_err());
+        let error=complete_labelled_inventory(|limit|async move {
+            Ok(serde_json::to_string(&(1..=limit).map(|number|serde_json::json!({"number":number})).collect::<Vec<_>>())?)
+        }).await.unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds safe bound"),"a full safety ceiling never implies completeness");
     }
 
     #[test]
@@ -17500,17 +17884,15 @@ else:
         assert_eq!(merged.as_array().unwrap().len(), 102);
 
         let calls = std::cell::Cell::new(0u32);
-        fetch_issue_pages(|_| {
+        assert!(fetch_issue_pages(|_| {
             calls.set(calls.get() + 1);
             async move { Ok(issue_page(&(1..=100).collect::<Vec<_>>())) }
-        })
-        .await
-        .unwrap();
+        }).await.is_err());
         assert_eq!(calls.get(), MAX_ISSUE_PAGES, "endless pages stop at the bound");
 
-        // A rate-limit object ends the walk without failing the tick.
+        // An incomplete inventory cannot authorize absence-based creation/selection.
         let calls = std::cell::Cell::new(0u32);
-        let merged = fetch_issue_pages(|page| {
+        let incomplete = fetch_issue_pages(|page| {
             calls.set(calls.get() + 1);
             async move {
                 Ok(if page == 1 {
@@ -17520,10 +17902,9 @@ else:
                 })
             }
         })
-        .await
-        .unwrap();
+        .await;
         assert_eq!(calls.get(), 2);
-        assert_eq!(merged.as_array().unwrap().len(), 1);
+        assert!(incomplete.is_err());
     }
 
     #[tokio::test]
@@ -17748,7 +18129,6 @@ else:
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         for kind in [
-            "FailureKind::NoChanges",
             "FailureKind::GuardRefusal",
             "FailureKind::ReviewReject",
         ] {
@@ -17760,9 +18140,13 @@ else:
             "gate, revise gate, final gate"
         );
         assert!(
-            body.matches("publish_outcome(").count() >= 3,
-            "commit, push, pr create"
+            body.matches("publish_outcome(").count() >= 1 && body.contains("rec(FailureKind::Infra, \"publish:git push\""),
+            "commit classified; uncertain push is infrastructure"
         );
+        assert!(body.contains("await_publication_reconcile") && body.contains("remote_publication_unconfirmed"),
+            "uncertain creation must retain durable free reconciliation");
+        assert!(!body.contains("record_hard_failure(repo_root, issue.number, \"gh pr create failed\""),
+            "remote visibility uncertainty must not charge a code failure");
         assert!(
             body.matches("record_reasoner_error(").count() >= 3,
             "scope, build and qa-review reasoner errors are harness failures"
@@ -17875,7 +18259,7 @@ else:
         let start = src.find("pub async fn run_once(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
-        let gate = body.find("if let Err(gate_err) = verification_gate(&worktree).await {").expect("gate arm");
+        let gate = body.find("if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {").expect("gate arm");
         // The arm's first return is #931's unbilled "red on main too" exit;
         // the charged path (after record_attempt) must be the billed one.
         let charged = gate + body[gate..].find("record_attempt(").expect("gate record");
@@ -17888,11 +18272,10 @@ else:
         let end = start + src[start..].find("\n#[cfg(test)]\n").expect("end of AutoPrLoop");
         let body = &src[start..end];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
-        assert!(body.contains("counter.record(today);"));
-        // #954 — the production tick runs on MAX_TICK, the budget whose
-        // expiry `a_wedged_tick_is_abandoned_so_the_loop_keeps_ticking` drives.
-        assert!(body.contains("self.run_with(shutdown, Self::MAX_TICK, move ||"), "prod budget");
-        assert!(body.contains("r = tokio::time::timeout(max_tick, tick()) => r,"), "bounded tick");
+        assert!(body.contains("counter.settle_reservation(&reservation, completed_day, billed);"));
+        assert!(body.contains("result = self.run_builds(shutdown, tick) => result"));
+        assert!(body.contains("result = reconciliation => result"));
+        assert!(!body.contains("timeout(max_tick"));
     }
 
     // Structural (codex on #859): a revision-round failure is recorded with
@@ -18092,7 +18475,7 @@ else:
         let arm = &body[at..ret];
         assert!(arm.contains("record_attempt("), "the attempt must be recorded");
         assert!(arm.contains("label_gave_up("), "and the issue labelled out");
-        assert!(arm.contains("close_gave_up_pr("), "and the PR closed");
+        assert!(!arm.contains("close_gave_up_pr("), "guard refusal must preserve the PR and branch");
         assert!(
             body[ret..].starts_with("return Ok(RunReport::triage("),
             "no builder ran, so the refusal must be unbilled"
@@ -18336,44 +18719,22 @@ else:
     /// A head branch we cannot fetch (a fork, or one deleted after merge)
     /// must end the run as triage, not as an `Err` that kills the whole tick
     /// and every other draft behind it.
-    #[test]
-    fn an_unfetchable_head_branch_does_not_kill_the_tick() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let end = start + src[start..].find("\n}\n").expect("fn end");
-        let body = &src[start..end];
-        let check = body
-            .find("remote_branch_exists(repo_root, branch)")
-            .expect("resume must confirm the head branch is on origin");
-        let worktree_add = body.find(r#""worktree", "add""#).expect("worktree add");
-        assert!(check < worktree_add, "check before creating a worktree from it");
-        let ret = check + body[check..].find("return Ok(RunReport::").expect("a report, not a bail");
-        assert!(ret < worktree_add, "the missing-branch path returns before the worktree add");
-        // Scoped to the guard block itself. Everything after it may still
-        // `bail!` on its own terms — the #300 trust refusal does — but this
-        // path must not, because a fork's branch is not an error condition
-        // for the tick.
-        assert!(
-            !body[check..ret].contains("bail!"),
-            "a fork's branch is not an error condition for the tick"
-        );
-        // And nothing fallible may run against the branch BEFORE the check.
-        // `git fetch origin <fork-branch>` is guaranteed to fail; today `run`
-        // reports that as Ok((false, ..)) so it happens to be survivable, but
-        // resting a denial-of-service guard on that semantic is how the hole
-        // comes back. Ask for the branch first, then touch the network.
-        let fetch = body.find(r#""fetch", "origin", branch"#).expect("resume fetches the branch");
-        assert!(
-            check < fetch,
-            "confirm the branch is on origin before fetching it, so no failure path precedes the guard"
-        );
-        // #1006 asks for a refusal that "records nothing". The loop re-reads
-        // its open drafts every tick, so any GitHub write here is not one
-        // note — it is one per tick, forever, on a PR nobody is resuming.
-        assert!(
-            !body[check..ret].contains("\"comment\""),
-            "the missing-branch refusal must not write to GitHub; it repeats every tick"
-        );
+    #[tokio::test]
+    async fn an_unfetchable_head_branch_does_not_kill_the_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git").args(args).current_dir(dir.path()).output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["init", "-q", "--bare", "origin.git"]);
+        git(&["remote", "add", "origin", "origin.git"]);
+        for branch in ["agent-fix/issue-1", "agent-fix/issue-2"] {
+            assert!(!remote_branch_exists(dir.path(), branch).await);
+        }
+        let report = RunReport::held("missing remote branch; retry reconciliation".into());
+        assert!(!report.billed);
+        assert!(!dir.path().join(".git/worktrees").exists());
     }
 
     // ---- #1037: a draft nobody independent can review ----
@@ -18419,6 +18780,20 @@ else:
 
     /// C2 — the three reasons are told apart, and the selection that decides
     /// them is one pure function the preflight and the review both call.
+    #[test]
+    fn session_isolated_capacity_prefers_diversity_but_recovers_codex_builder_deadlock() {
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        let ready = |_| ReviewerStatus::Ready;
+        assert_eq!(select_session_isolated_reviewer(&[Codex, Claude], Ok(Some(vec![Codex])), ready), Ok(Claude));
+        let claude_latched = |provider| if provider == Claude { ReviewerStatus::Latched(None) } else { ReviewerStatus::Ready };
+        assert_eq!(select_session_isolated_reviewer(&[Claude, Codex], Ok(Some(vec![Codex])), claude_latched), Ok(Codex));
+        assert_eq!(select_session_isolated_reviewer(&[Claude, Codex], Ok(Some(vec![Claude, Codex])), ready), Ok(Codex));
+        assert!(select_session_isolated_reviewer(&[Claude], Ok(Some(vec![Codex])), claude_latched).is_err());
+        for authors in [None, Some(vec![])] {
+            assert_eq!(select_session_isolated_reviewer(&[Claude, Codex], Ok(authors), ready), Err(ReviewUnavailable::ProvenanceUnknown));
+        }
+    }
+
     #[test]
     fn review_gaps_are_told_apart_before_anything_is_spent() {
         use augmentagent_channel_core::ProviderKind::{Claude, Codex};
@@ -18621,36 +18996,21 @@ else:
         let src = include_str!("self_improve.rs");
         let f = src.find("async fn find_resumable_draft(").expect("the finder");
         let finder = &src[f..f + src[f..].find("\n}\n").expect("end")];
-        assert!(finder.contains("swept_close_comment(") && finder.contains("read_unreviewable("), "{finder}");
+        assert!(!finder.contains("swept_close_comment("), "review exhaustion must not retire a PR: {finder}");
     }
 
-    /// C1 + TDD 4 — structural: the lane asks before it spends, both exits go
-    /// through the one mapping, and billing follows real builder calls.
+    /// Reviewer selection preserves independence; billing follows actual builder work.
     #[test]
     fn the_resume_lane_asks_first_and_bills_only_real_builder_calls() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let bind = body.find("track_review_history(").expect("history is bound");
-        let ask = body.find("select_reviewer(").expect("the lane must ask before spending");
-        assert!(bind < ask, "provenance is read after it is bound");
-        for spend in [r#""worktree", "add""#, r#""merge", "--no-edit""#, "verification_gate(", "call_revision_with_storage("] {
-            let at = body.find(spend).unwrap_or_else(|| panic!("{spend} is in the lane"));
-            assert!(ask < at, "ask before {spend}");
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        let selected = select_reviewer(&[Codex, Claude], Ok(Some(vec![Claude])), |_| ReviewerStatus::Ready).unwrap();
+        assert_eq!(selected, Codex);
+        let why = select_reviewer(&[Codex, Claude], Ok(Some(vec![Codex, Claude])), |_| ReviewerStatus::Ready).unwrap_err();
+        for builder_called in [false, true] {
+            let plan = unreviewable_plan(42, 1, &why, 1, builder_called);
+            assert_eq!(plan.billed, builder_called);
         }
-        let holds: Vec<usize> = body.match_indices("hold_unreviewable(").map(|(i, _)| i).collect();
-        assert_eq!(holds.len(), 2, "the preflight and the post-review race, nothing else");
-        for at in holds {
-            let call = &body[at..at + body[at..].find(".await").expect("awaited")];
-            assert!(call.contains("reasoner.calls() > 0"), "billing must follow builder calls: {call}");
-        }
-        assert!(
-            !body.contains("independent review capacity is unavailable"),
-            "the old blanket message is gone"
-        );
-        let review = src.find("async fn independent_review(").expect("review fn");
-        let review_body = &src[review..review + src[review..].find("\n}\n").expect("end")];
-        assert!(review_body.contains("select_reviewer("), "the review selects exactly like the preflight");
+        assert!(select_reviewer(&[Codex, Claude], Ok(None), |_| ReviewerStatus::Ready).is_err());
     }
 
     /// C4 — structural: the branch record is superseded where the push has
@@ -18660,7 +19020,7 @@ else:
         let src = include_str!("self_improve.rs");
         let start = src.find("pub async fn run_once(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let force = body.find(r#""push", "--force""#).expect("the orphan force-push");
+        let force = body.find("workflow_guard.push(&branch)").expect("guarded compare-and-swap push");
         let failed = body.find("\"git push failed\"").expect("the push-failure exit");
         let supersede = body.find("supersede_review_history(").expect("the reset");
         let create = body.find(r#""pr", "create""#).expect("PR creation");
@@ -18687,6 +19047,8 @@ if args[:1]==['api'] and '/issues/' in args[1]:
     number=int(args[1].rsplit('/',1)[1])
     print(json.dumps({'number':number,'title':'Synthetic casing rule','body':'Synthetic issue body.',
         'state':'open','user':{'login':'synthetic-owner'},'author_association':'OWNER'}))
+elif args[:2]==['repo','view']:
+    print('synthetic-owner/synthetic')
 elif args[:2]==['pr','view']:
     print(json.dumps({'body':'Automated self-improvement for #70994.\n\n## Summary\nSynthetic.\n\n- complexity (scoping pass): simple\n'}))
 elif args[:2]==['issue','edit'] and (root/'fail-label').exists():
@@ -18720,6 +19082,11 @@ else:
             .env("CODEX_CLI", "/nonexistent-synthetic-codex")
             .env_remove("DISCORD_WEBHOOK_URL")
             .env_remove("AUGMENTAGENT_AUTOPR_LANE");
+        child.env_remove("AUGMENTAGENT_NATIVE_VM_POLICY");
+        if name.ends_with("a_latched_reviewer_keeps_the_draft_recoverable_after_the_third_day") {
+            child.env("CLAUDE_CLI", "/usr/bin/true")
+                .env("AUGMENTAGENT_NATIVE_VM_POLICY", declared_review_fixture(root,"claude",true));
+        }
         for (key, file) in [
             ("AUGMENTAGENT_COOLDOWN_FILE", "cooldown.json"),
             ("AUGMENTAGENT_SELFIMPROVE_LOCK", "self-improve.lock"),
@@ -18856,8 +19223,7 @@ else:
     }
 
     /// C3 end to end: a reviewer latched in the (redirected) cooldown file
-    /// holds the draft with a dated reason, and on the third different day the
-    /// loop gives up, labels, and closes with that reason.
+    /// holds the draft with a dated reason and preserves it across later days.
     #[tokio::test]
     async fn a_latched_reviewer_keeps_the_draft_recoverable_after_the_third_day() {
         const NAME: &str = "self_improve::tests::a_latched_reviewer_keeps_the_draft_recoverable_after_the_third_day";
@@ -19131,26 +19497,19 @@ mod iterate_not_delete_tests {
         );
     }
 
-    /// AC2 — every revised diff goes back through Stage 3, and Stage 4
-    /// only sees a diff Stage 3 approved.
+    /// Every revision invalidates old evidence and requires all review roles anew.
     #[test]
     fn fresh_lane_re_runs_qa_after_every_revision() {
-        let body = run_once_src();
-        let lp = body
-            .find("match after_review(")
-            .expect("the decision drives the loop");
-        let rest = &body[lp..];
-        let rev = rest.find(".call_revision_with_storage(").expect("a revision round");
-        let qa = rest[rev..]
-            .find("review_opts(")
-            .expect("QA after the revision");
-        let ind = rest[rev..]
-            .find("independent_review(")
-            .expect("Stage 4 after the revision");
-        assert!(
-            qa < ind,
-            "QA re-reviews before Stage 4 sees the revised diff"
-        );
+        let approved = super::progress_tests::synthetic_aligned_review("round-1", true);
+        assert!(approved.approved());
+        let mut revised = super::progress_tests::synthetic_aligned_review("round-1", true);
+        revised.structured.as_mut().unwrap().binding.head = "round-2".into();
+        assert!(!revised.approved(), "old QA, diff and system passes cannot authorize revised source");
+        let complete_round = super::progress_tests::synthetic_aligned_review("round-2", true);
+        assert!(complete_round.approved());
+        let mut missing_qa = complete_round;
+        missing_qa.structured.as_mut().unwrap().passes.retain(|p| p.role != crate::autoship_review::ReviewRole::Qa);
+        assert!(!missing_qa.approved());
     }
 
     /// AC3 — the reject branch no longer deletes the worktree; parking does.
@@ -19169,25 +19528,14 @@ mod iterate_not_delete_tests {
 
     #[test]
     fn resume_runs_qa_every_round_and_reads_the_parked_findings() {
-        let body = resume_src();
-        let lp = body.find("    loop {").expect("round loop");
-        assert!(
-            body[lp..].contains("review_opts("),
-            "QA inside the round loop"
-        );
-        assert!(
-            body.contains("parse_qa_findings("),
-            "parked findings seed the QA prompt"
-        );
-        assert!(
-            body.contains("resume_may_merge("),
-            "merge needs QA approve too"
-        );
-        // Only the loop's own comments can seed the prompt.
-        assert!(
-            body.contains("select(.author.login == $me)"),
-            "untrusted comments filtered"
-        );
+        let old = qa_findings_comment("first regression");
+        let latest = qa_findings_comment("remaining regression");
+        assert_eq!(parse_qa_findings(&[old, "unrelated text".into(), latest]), Some("remaining regression".into()));
+        assert_eq!(parse_qa_findings(&["REVIEW: approve".into()]), None);
+        let pending = super::progress_tests::synthetic_aligned_review("resumed", false);
+        assert!(!pending.approved());
+        let resolved = super::progress_tests::synthetic_aligned_review("resumed", true);
+        assert!(resolved.approved(), "a final ruling resolves disagreement without waiting for unanimity");
     }
 
     // ---- #1489: exhausted budgets park a draft ---------------------------
@@ -19374,7 +19722,7 @@ mod iterate_not_delete_tests {
     fn a_post_review_repair_is_guarded_budgeted_and_never_auto_merged() {
         let body = run_once_src();
         let at = body.find("let hits = pii_guard_hits(&e);").unwrap();
-        let block = &body[at..at + body[at..].find("if !ok {\n        cleanup").unwrap()];
+        let block = &body[at..at + body[at..].find("\n    if !ok {").unwrap()];
         assert!(block.contains("&& round < max_rounds") && block.contains("round += 1;"));
         assert!(block.contains("repaired_after_review = true;"));
         assert!(block.contains("blast_radius_hit_in_diff(&full_now)"));
@@ -19385,7 +19733,7 @@ mod iterate_not_delete_tests {
     #[test]
     fn a_parked_publish_failure_records_no_second_attempt() {
         let body = run_once_src();
-        for what in ["git commit failed", "git push failed", "gh pr create failed"] {
+        for what in ["git commit failed", "git push failed"] {
             let hard = body.find(&format!("record_hard_failure(repo_root, issue.number, \"{what}\"")).expect(what);
             let guard = body[..hard].rfind("if park_charged {").expect("guard");
             assert!(body[guard..hard].contains(&format!("parked_publish_failed(issue.number, \"{what}\"")));
@@ -19464,8 +19812,8 @@ mod iterate_not_delete_tests {
             !section.contains("RunReport::built("),
             "no billed exit:\n{section}"
         );
-        assert!(section.contains("RunReport::triage("));
-        assert!(section.contains("AttemptLedger::mark_persist("));
-        assert!(section.contains("GIVE_UP_OWNER_TRIAGE"));
+        assert!(section.contains("run registered acceptance and repair"));
+        assert!(!section.contains("GIVE_UP_OWNER_TRIAGE"));
+        assert!(!section.contains("label_gave_up"));
     }
 }

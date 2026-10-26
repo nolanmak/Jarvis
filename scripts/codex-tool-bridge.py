@@ -29,6 +29,8 @@ class Denied(ValueError):
 class Readiness(Denied):
     """Public diagnostics contain fixed categories, never configuration."""
     MESSAGES = {
+        'build_storage_busy': 'Shared build storage is busy; retry command admission after the active build finishes.',
+        'build_storage_reserve': 'Build storage admission or execution reached its required free-space reserve; retry after capacity recovers.',
         'mcp_start': 'Configured MCP server could not start or initialize; check its binary, authentication and transport.',
         'mcp_timeout': 'Configured MCP server timed out; check its availability and timeout setting.',
         'mcp_tools': 'Configured MCP server is missing a required tool; check the server version and tool profile.',
@@ -301,6 +303,73 @@ class BuildScratch:
         if self.session is not None:
             shutil.rmtree(self.session, ignore_errors=True)
             self.session = None
+
+
+class CommandStorage:
+    """Global build/prune admission owned only while a real VM build runs.
+
+    Descendant supervisors inherit the locked descriptor. Closing our copy
+    cannot release it while a canceled VM is still being reaped.
+    """
+    def __init__(self, config, scratch):
+        self.config, self.scratch, self.fd = config, Path(scratch), None
+
+    def __enter__(self):
+        if self.config is None:
+            return self
+        import fcntl
+        try:
+            path = Path(self.config['lock'])
+            floor = self.config['floor_bytes']; admission = self.config['admission_bytes']
+            if (not path.is_absolute() or path.name != 'disk-build.lock'
+                    or type(floor) is not int or type(admission) is not int
+                    or floor < 0 or admission < floor):
+                raise ValueError('invalid command storage policy')
+            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                info = os.fstat(parent)
+                if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                    raise ValueError('storage state is not daemon owned')
+                self.fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+            finally:
+                os.close(parent)
+            info = os.fstat(self.fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022):
+                raise ValueError('invalid storage lease inode')
+            self.path, self.identity = path, (info.st_dev, info.st_ino)
+            deadline = time.monotonic() + 300
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Readiness('build_storage_busy')
+                    time.sleep(0.1)
+            self.check(admission)
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def check(self, required=None):
+        if self.fd is None:
+            return
+        info = os.stat(self.path, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != self.identity:
+            raise Denied('storage lease inode changed')
+        required = self.config['floor_bytes'] if required is None else required
+        vfs = os.statvfs(self.scratch)
+        if vfs.f_bavail * vfs.f_frsize < required:
+            raise Readiness('build_storage_reserve')
+
+    def __exit__(self, *_):
+        if self.fd is not None:
+            # Never LOCK_UN: the supervisor/QEMU may still own this same open
+            # description while cleaning descendants after bridge cancellation.
+            os.close(self.fd)
+            self.fd = None
 
 
 class ReconciliationRequired(Denied):
@@ -1035,10 +1104,26 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        self.write_files = set()
+        for filename in config.get('write_files', []):
+            path = Path(filename)
+            if not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path or not path.is_file():
+                raise Denied('exact write grant requires a canonical precreated file')
+            if any(part in CONTROL_PARTS or part == '.env' or part.startswith('.env.')
+                   or part.lower() in INJECTION_NAMES for part in path.parts):
+                raise Denied('credential and control files cannot be admitted')
+            self.write_files.add(str(path))
+        self.in_place_writes = config.get('autoship_in_place_writes', False)
+        if type(self.in_place_writes) is not bool:
+            raise Denied('invalid in-place write policy')
+        if self.write_files and not self.in_place_writes:
+            raise Denied('exact-file grants require in-place writes')
         # #1045: single files outside the roots that Read alone may open.
         self.read_allowances = self._allowances(config.get('read_allowances', []))
         self._node_install_cache = None
         self.build_vm_config = config.get('build_vm_config')
+        self.command_storage = config.get('command_storage')
+        self._active_command_storage = None
         # #1036: VM build scratch root and default build timeout, from the
         # daemon's policy (codex runs with a cleared environment).
         # A root the model could write through makes builds unavailable; the
@@ -1216,6 +1301,10 @@ class Policy:
         candidate = self._system_path(os.path.abspath(os.path.join(str(self.cwd), name)))
         if len(os.fsencode(candidate)) > MAX_PATH_BYTES:
             raise Denied('path exceeds length limit')
+        if writing and candidate in self.write_files:
+            # Admission never grants writes to the parent/siblings. In-place
+            # descriptor writes below enforce that exact-file capability.
+            return Path(candidate).parent, (Path(candidate).name,)
         roots = self.write_roots if writing else self.read_roots
         for root in sorted(roots, key=lambda p: len(p.parts), reverse=True):
             prefix = str(root)
@@ -1424,6 +1513,19 @@ class Policy:
                 mode = stat.S_IMODE(existing.st_mode) & 0o777
             except FileNotFoundError:
                 mode = 0o600
+            if self.in_place_writes:
+                # File-only Landlock grants cannot create a rename sibling.
+                # Verify the opened inode before truncating; never follow links.
+                fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW |
+                             os.O_NONBLOCK | os.O_CLOEXEC, mode, dir_fd=parent)
+                with os.fdopen(fd, 'wb') as stream:
+                    if verification.verify_regular_private_file(stream.fileno()) is None:
+                        raise Denied('write requires an owned single-link regular file')
+                    os.ftruncate(stream.fileno(), 0)
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                return
             temporary = '.jarvis-write-' + uuid.uuid4().hex
             try:
                 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
@@ -1672,8 +1774,16 @@ class Policy:
         if timeout is None:
             timeout = self.build_timeout if build else COMMAND_TIMEOUT_DEFAULT
         try:
-            outcome = (self.run_vm_build(argv, timeout) if runner == 'vm'
-                       else self._run_host_command(argv, build, timeout))
+            if runner == 'vm' and self.command_storage is not None:
+                with CommandStorage(self.command_storage, self._scratch.root) as storage:
+                    self._active_command_storage = storage
+                    try:
+                        outcome = self.run_vm_build(argv, timeout)
+                    finally:
+                        self._active_command_storage = None
+            else:
+                outcome = (self.run_vm_build(argv, timeout) if runner == 'vm'
+                           else self._run_host_command(argv, build, timeout))
         except BaseException as error:
             if self._command_started:
                 error.jarvis_runner = runner
@@ -1716,6 +1826,33 @@ class Policy:
                     raise Denied('direct git push is unavailable through the bridge; use the CCat public-push gate')
                 if any(arg.split('=', 1)[0] in ('--ext-diff', '--textconv') for arg in argv[1:]):
                     raise Denied('external Git diff helpers are not permitted')
+                if '--no-index' in argv[1:]:
+                    # Git metadata is granted below so ordinary repository diff
+                    # can resolve objects/index. no-index would turn that extra
+                    # authority into arbitrary reads of protected .git files.
+                    raise Denied('filesystem comparisons must use scoped file tools, not Git no-index')
+                # Git also infers no-index when either operand is outside the
+                # repository. Check literal operands before granting metadata,
+                # including links whose lexical name appears to be in scope.
+                for operand in argv[1:]:
+                    if operand.startswith('-'):
+                        continue
+                    # Object expressions are not filesystem paths. A future
+                    # profile allowing show/cat-file must not bypass protected
+                    # names through the separately granted Git object store.
+                    if ':' in operand:
+                        object_path = operand.split(':', 1)[1]
+                        if operand.startswith(':') and ':' in object_path and object_path.split(':', 1)[0] in {'0', '1', '2', '3'}:
+                            object_path = object_path.split(':', 1)[1]
+                        if any(part in CONTROL_PARTS or part == '.env' or part.startswith('.env.')
+                               for part in object_path.split('/')):
+                            raise Denied('credential and control object paths are excluded')
+                    lexical = Path(os.path.abspath(self.cwd / operand))
+                    resolved = lexical.resolve()
+                    if lexical not in self.read_roots:
+                        self._relative(str(lexical))
+                    if resolved not in self.read_roots:
+                        self._relative(str(resolved))
                 git_env = {'PATH': self.environment.get('PATH', os.defpath),
                     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
                     'GIT_OPTIONAL_LOCKS': '0'}
@@ -1727,6 +1864,15 @@ class Policy:
                 runtime_reads.extend(str(path) for path in metadata)
                 run_env.update(git_env)
                 run_env.update({'GIT_DIR': str(metadata[0]), 'GIT_WORK_TREE': str(self.cwd)})
+                if git_subcommand(argv) in ('diff', 'log'):
+                    # Object reads bypass filesystem-level .env/control-name
+                    # filters. Enforce the same exclusions on history output;
+                    # adding pathspecs also rejects direct blob-to-blob diff.
+                    if '--' not in argv[1:]:
+                        argv.append('--')
+                    for name in sorted(CONTROL_PARTS | {'.env', '.env.*'}):
+                        argv.extend([f':(top,exclude,glob)**/{name}',
+                                     f':(top,exclude,glob)**/{name}/**'])
                 argv = [argv[0], '--no-pager', '-c', 'core.hooksPath=/dev/null',
                         '-c', 'core.fsmonitor=false', *argv[1:]]
             if snapshot:
@@ -1889,7 +2035,7 @@ class Policy:
                 self.mark_command_started()
                 result = vm.run(runtime, snapshot.root, guest, build_environment, timeout=timeout,
                     node_workspaces=[] if install else dependencies, download_info=downloads,
-                    scratch_dir=str(scratch.tmp), build_cache=build_cache)
+                    scratch_dir=str(scratch.tmp), build_cache=build_cache, storage_lease=self._active_command_storage)
                 if initial_manifests is not None and initial_manifests != self.node_manifest_state():
                     raise Denied('dependency manifests changed during build; retry before syncing sources')
                 snapshot.sync()
@@ -2065,6 +2211,11 @@ class Policy:
         argv = literal_command_argv(command)
         for tokens, prefix in self.command_patterns:
             if argv == tokens or (prefix and argv[:len(tokens)] == tokens):
+                # The repository wrapper is a request for managed Cargo, not
+                # authority to execute candidate-controlled host shell code.
+                # VM command admission already provides its storage contract.
+                if argv[0] in ('scripts/cargo-managed.sh', './scripts/cargo-managed.sh'):
+                    return ['cargo', *argv[1:]]
                 return argv
         raise Denied('command is not permitted by this profile')
 
