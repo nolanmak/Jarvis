@@ -1407,6 +1407,21 @@ mod tests {
 
     #[tokio::test]
     async fn restricted_fresh_review_never_inherits_mutation_journal() {
+        // Run the scripted dispatch in an authless child even on logged-in
+        // developer hosts. Never mutate HOME/auth vars in the shared test process.
+        if std::env::var_os("AUTOSHIP_AUTHLESS_REVIEW_FIXTURE").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fallback::tests::restricted_fresh_review_never_inherits_mutation_journal", "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin")
+                .env("HOME", home.path()).env("CODEX_HOME", home.path().join("codex"))
+                .env("XDG_STATE_HOME", home.path().join("state"))
+                .env("AUTOSHIP_AUTHLESS_REVIEW_FIXTURE", "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        assert!(!crate::codex::codex_auth_available());
         struct SuppliedEvidence;
         #[async_trait]
         impl Reasoner for SuppliedEvidence {
@@ -1425,15 +1440,17 @@ mod tests {
         let mut opts = text_only_opts();
         opts.restrict_env = true;
         let output = crate::native_session::FRESH_REVIEW.scope(true,
-            crate::model_router::native_reviewer_scope(ProviderKind::Codex,
-                fallback.call(&opts, "supplied candidate"))).await.unwrap();
+            crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::without_router(
+                    fallback.dispatch_snapshot(&opts, "supplied candidate", false, None)))).await.unwrap();
         assert_eq!(output, "review completed");
         assert!(!dir.path().join("handoffs").exists());
         assert!(fallback.mutation_providers().is_empty());
         opts.allowed_tools = vec!["Write".into()];
         assert!(crate::native_session::FRESH_REVIEW.scope(true,
-            crate::model_router::native_reviewer_scope(ProviderKind::Codex,
-                fallback.call(&opts, "supplied candidate"))).await.is_err());
+            crate::model_selection::SELECTED_PROFILE.scope(None,
+                crate::model_router::without_router(
+                    fallback.dispatch_snapshot(&opts, "supplied candidate", false, None)))).await.is_err());
         assert_eq!(fallback.calls(), 1, "invalid fresh-review capability never dispatches");
         assert!(latch_in(&dir).latched_until("codex").is_none());
     }
