@@ -130,7 +130,10 @@ is not evidence of speech recognition or successful model interruption.
 Qualification must measure actual native interruption and stale audio behavior,
 including Twilio's queue. Output audio has no timestamps or audio-done event,
 and transcripts have no completed-turn event. The application bounds pending
-playback to two seconds and fails an overflow explicitly, but cannot infer an
+Twilio playback to two seconds plus one locally buffered provider frame (at
+most two seconds). It pauses provider reads until playback marks free capacity,
+while still processing caller audio, marks, stop and duration/authorization
+checks. Oversized provider frames remain errors. These bounds do not identify an
 exact speech boundary from those events. If real calls fail the epic's no-stale-
 audio requirement, revise and requalify the transport/policy before rollout;
 the prompt and fixture alone do not satisfy that requirement. Explicit app

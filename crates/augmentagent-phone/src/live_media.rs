@@ -123,9 +123,22 @@ async fn conversation(
     let mut final_event = None;
     let mut trigger = "error";
     let mut goodbye = crate::live_goodbye::LiveGoodbye::default();
+    // At most one validated provider frame (16 KB) waits locally. Stop reading
+    // provider events while it waits; caller input, marks and stop remain live.
+    let mut pending_audio: Option<Vec<u8>> = None;
     let outcome:Result<(),LiveError>=async {
         let mut coordinator = LiveCall::new(service.clone(), &call.id, &session_id)?;
         loop {
+            if let Some(audio) = pending_audio.as_ref() {
+                if media.can_output(audio.len()) {
+                    service.authorize_call(&call.id).map_err(|_|LiveError::Access)?;
+                    for (index,frame) in media.output(audio).map_err(|_|LiveError::Capacity)?.into_iter().enumerate() {
+                        send(socket,Message::Text(frame.to_string().into())).await?;
+                        if index==0 { playback.sent_output(audio.len(),media.pending_bytes()); }
+                    }
+                    pending_audio = None;
+                }
+            }
             tokio::select! {
                 _=tick.tick()=>{
                     if checkpoint.elapsed()>=Duration::from_secs(1) {
@@ -174,16 +187,12 @@ async fn conversation(
                         _=>return Err(LiveError::ConnectionLost),
                     }
                 }
-                input=connection.next()=>{
+                input=connection.next(), if pending_audio.is_none()=>{
                     let input=input?;
                     match &input {
                         LiveInput::Audio(audio)=>{
                             playback.received_output(audio.len());
-                            service.authorize_call(&call.id).map_err(|_|LiveError::Access)?;
-                            for (index,frame) in media.output(audio).map_err(|_|LiveError::Capacity)?.into_iter().enumerate() {
-                                send(socket,Message::Text(frame.to_string().into())).await?;
-                                if index==0 { playback.sent_output(audio.len(),media.pending_bytes()); }
-                            }
+                            pending_audio = Some(audio.clone());
                         }
                         LiveInput::Closed{reason,seconds}=>{
                             trigger="provider_closed";

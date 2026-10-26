@@ -212,6 +212,12 @@ impl MediaStream {
         });
         Ok(frames)
     }
+    /// Capacity check without reserving a mark or mutating the stream.
+    pub fn can_output(&self, bytes: usize) -> bool {
+        self.active().is_ok() && bytes > 0
+            && bytes <= MAX_PENDING_BYTES.saturating_sub(self.pending)
+            && self.marks.len() < MAX_MARKS
+    }
     pub fn pending_bytes(&self) -> usize { self.pending }
     pub fn clear(&mut self) -> Result<Value, StreamError> {
         self.active()?;
