@@ -80,32 +80,37 @@ impl Input<'_> {
             )?;
             return Ok(receipt);
         }
-        let attempts = if let Some(guard) = self.guard {
+        if let Some(guard) = self.guard {
             guard.check_resource_policy()?;
-            {
-                let mut slot = None;
-                for prior in 0..aligned::MAX_ADJUDICATION_ATTEMPTS {
-                    if guard.admit_attempt(&format!("adjudication-component:{key}:{prior}"), 1)? {
-                        slot = Some(prior);
-                        break;
-                    }
-                }
-                slot.context("bounded final-authority component attempts exhausted")?
-            }
-        } else {
-            self.attempts_already_made
-        };
-        let receipt = aligned::adjudicate_native_with_origin(
+        }
+        let call = aligned::adjudicate_native_with_origin(
             &self.review.builders,
             self.opts.clone(),
             self.review.binding.clone(),
             self.contract,
             findings,
             &raw,
-            attempts,
+            if self.guard.is_some() {
+                0
+            } else {
+                self.attempts_already_made
+            },
             &self.review.origin,
-        )
-        .await?;
+        );
+        let receipt = if let Some(guard) = self.guard {
+            // The native admission callback persists this bound only after
+            // setup and quota admission, atomically with actual model charging.
+            // Two format corrections per attempt retain the prior four-call cap.
+            guard
+                .bounded_native_calls(
+                    format!("adjudication-native:{key}"),
+                    aligned::MAX_ADJUDICATION_ATTEMPTS.saturating_mul(2),
+                    call,
+                )
+                .await?
+        } else {
+            call.await?
+        };
         aligned::adjudication_groups::validate(
             &receipt,
             &self.review.binding,

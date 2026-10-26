@@ -11,6 +11,17 @@ use std::sync::{
     Mutex,
 };
 
+#[derive(Clone)]
+struct BoundedNativeCall {
+    workflow:String,
+    purpose:String,
+    binding:Binding,
+    limit:u32,
+}
+tokio::task_local! {
+    static BOUNDED_NATIVE_CALL: BoundedNativeCall;
+}
+
 const LEASE_MS: i64 = 10 * 60 * 1000;
 const RENEW_SECS: u64 = 60;
 
@@ -748,6 +759,11 @@ impl WorkflowGuard {
             let mut store = store.lock().map_err(|_| anyhow::anyhow!("workflow accounting lock poisoned"))?;
             let receipt = format!("model-call:{}", uuid::Uuid::new_v4());
             let charge = ResourceCharge { model_calls:1, ..Default::default() };
+            if let Ok(bounded)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
+                anyhow::ensure!(bounded.workflow==lease.workflow,"bounded native call used a different workflow audit sink");
+                return store.charge_bounded_call(&lease,&receipt,millis(),observational.then(observation_call_cap),
+                    &bounded.purpose,&bounded.binding,bounded.limit);
+            }
             if observational {
                 store.charge_observation(&lease,&receipt,charge,millis(),observation_call_cap())
             } else {
@@ -1188,6 +1204,10 @@ impl WorkflowGuard {
     pub(super) fn set_readiness_dependency(&self,issue:u64,record:Option<(&str,&str,&str,&str)>)->Result<()> {
         self.validate_before_side_effect()?;
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?.set_readiness_dependency(&self.lease,&self.binding,&self.repository,issue,record,millis())
+    }
+
+    pub(super) async fn bounded_native_calls<F:std::future::Future>(&self,purpose:String,limit:u32,future:F)->F::Output {
+        BOUNDED_NATIVE_CALL.scope(BoundedNativeCall{workflow:self.id().to_owned(),purpose,binding:self.binding.clone(),limit},future).await
     }
 
     pub(super) fn admit_attempt(&self, purpose: &str, limit: u32) -> Result<bool> {
@@ -2480,6 +2500,27 @@ mod tests {
         assert_eq!(after.model_calls, before.model_calls);
         assert!(guard.validate_before_side_effect().is_err());
         std::fs::write(PathBuf::from(std::env::var_os(CHILD).unwrap()).join("executed"), "ok").unwrap();
+    }
+
+    #[tokio::test]
+    async fn component_budget_is_consumed_only_at_actual_native_admission() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"},millis()).await.unwrap().unwrap();
+        for _ in 0..5 {
+            let result=guard.bounded_native_calls("component".into(),2,async {anyhow::bail!("fixture setup refused before native admission");#[allow(unreachable_code)] Ok::<(),anyhow::Error>(())}).await;
+            assert!(result.is_err());
+        }
+        assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        for _ in 0..2 {
+            let result=guard.bounded_native_calls("component".into(),2,async {
+                guard.audit_logger().model_call_admitted("codex")?;
+                anyhow::bail!("fixture response lost after actual admission");
+                #[allow(unreachable_code)] Ok::<(),anyhow::Error>(())
+            }).await;
+            assert!(result.is_err());
+        }
+        assert!(guard.bounded_native_calls("component".into(),2,async {guard.audit_logger().model_call_admitted("codex")}).await.is_err());
+        assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,2);
     }
 
     #[tokio::test]

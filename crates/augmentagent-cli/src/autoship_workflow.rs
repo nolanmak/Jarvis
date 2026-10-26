@@ -1000,13 +1000,23 @@ impl WorkflowStore {
         charge: ResourceCharge,
         now_ms: i64,
     ) -> Result<()> {
-        self.charge_inner(lease, receipt_id, charge, now_ms, None)
+        self.charge_inner(lease, receipt_id, charge, now_ms, None, None)
     }
 
     pub fn charge_observation(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, daily_cap: u64) -> Result<()> {
         ensure!(lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"), "observation budget requires diagnostic workflow namespace");
-        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap))
+        self.charge_inner(lease, receipt_id, charge, now_ms, Some(daily_cap), None)
+    }
+
+    /// Bound actual native dispatches in the same transaction as quota charging.
+    /// A setup/quota refusal consumes neither; an admitted lost response consumes both.
+    pub fn charge_bounded_call(&mut self, lease:&Lease, receipt_id:&str, now_ms:i64,
+        observation_cap:Option<u64>, purpose:&str, binding:&Binding, limit:u32)->Result<()> {
+        ensure!(observation_cap.is_none() || lease.workflow.starts_with("autoship-observation/") || lease.workflow.starts_with("autoship-canary/"),
+            "observation budget requires diagnostic workflow namespace");
+        self.charge_inner(lease,receipt_id,ResourceCharge{model_calls:1,..Default::default()},now_ms,observation_cap,
+            Some((purpose,binding,limit)))
     }
 
     pub fn observation_available(&self, now_ms: i64, required: u64, daily_cap: u64) -> Result<bool> {
@@ -1025,7 +1035,7 @@ impl WorkflowStore {
     }
 
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
-        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>) -> Result<()> {
+        charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>, bounded:Option<(&str,&Binding,u32)>) -> Result<()> {
         ensure!(!receipt_id.is_empty(), "charge receipt required");
         let values = (
             i64::try_from(charge.wall_ms)?,
@@ -1041,6 +1051,17 @@ impl WorkflowStore {
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
         } else {
+            if let Some((purpose,binding,limit))=bounded {
+                ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
+                require_binding(&tx,lease,binding,now_ms)?;
+                let key=serde_json::to_string(binding)?;
+                let count:u32=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",
+                    params![lease.workflow,purpose,key],|r|r.get(0)).optional()?.unwrap_or(0);
+                ensure!(count<limit,"bounded final-authority actual native calls exhausted");
+                tx.execute("INSERT INTO bounded_attempt(workflow,purpose,binding,attempts) VALUES(?1,?2,?3,1) ON CONFLICT(workflow,purpose,binding) DO UPDATE SET attempts=attempts+1",
+                    params![lease.workflow,purpose,key])?;
+                event(&tx,&lease.workflow,lease.generation,"native_attempt_started",purpose,now_ms)?;
+            }
             if let Some(cap) = observation_cap {
                 let reservation: Option<(u64,u64)>=tx.query_row("SELECT reserved,used FROM observation_reservation WHERE workflow=?1 AND generation=?2",params![lease.workflow,lease.generation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
                 if let Some((reserved,used))=reservation {
@@ -2527,6 +2548,23 @@ mod tests {
 mod observation_accounting_tests {
     use super::*;
     fn binding() -> Binding { Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()} }
+    #[test]
+    fn bounded_native_admission_rolls_back_quota_refusal_and_retains_started_calls() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("ledger.db");
+        let mut store=WorkflowStore::open(&path).unwrap();let id="autoship-observation/bounded";
+        store.register(id,"probe",binding(),1).unwrap();
+        let lease=store.claim(id,"first",2,1000).unwrap().unwrap();
+        for _ in 0..5 {assert!(store.charge_bounded_call(&lease,"refused",3,Some(0),"component",&binding(),2).is_err());}
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0);
+        store.charge_bounded_call(&lease,"started-lost-response",4,Some(10),"component",&binding(),2).unwrap();
+        store.charge_bounded_call(&lease,"started-lost-response",5,Some(10),"component",&binding(),2).unwrap();
+        store.release(&lease,6).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();let next=store.claim(id,"next",7,1000).unwrap().unwrap();
+        store.charge_bounded_call(&next,"malformed-response",8,Some(10),"component",&binding(),2).unwrap();
+        assert!(store.charge_bounded_call(&next,"exhausted",9,Some(10),"component",&binding(),2).is_err());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,2);
+        assert_eq!(store.events(id).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_attempt_started").count(),2);
+    }
     #[test]
     fn observations_are_charged_once_bounded_and_subordinate_to_shipping() {
         let dir=tempfile::tempdir().unwrap();
