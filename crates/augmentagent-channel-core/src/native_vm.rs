@@ -70,6 +70,8 @@ const SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 struct StateLock(std::fs::File);
 impl StateLock {
     fn acquire(root:&Path) -> Result<Self> {
+        let directory=root.symlink_metadata()?;
+        ensure!(directory.is_dir() && !directory.file_type().is_symlink() && directory.uid()==unsafe{libc::geteuid()} && directory.mode() & 0o077==0,"native state root is not private");
         let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
             .custom_flags(libc::O_NOFOLLOW).open(root.join("state.lock"))?;
         let info=file.metadata()?;
@@ -107,7 +109,8 @@ fn prune_and_count(root:&Path) -> Result<usize> {
     let mut count=0;
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
-        if !provider.is_dir() || provider.file_name().is_some_and(|name|name=="credentials") {continue;}
+        if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
+        ensure!(provider.is_dir(),"native provider state is not a directory");
         ensure!(!provider.is_symlink(),"native provider state symlink");
         for entry in std::fs::read_dir(&provider)? {
             let session=entry?.path();
@@ -168,7 +171,8 @@ fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) ->
     let mut count=0;
     for provider in std::fs::read_dir(root)? {
         let provider=provider?.path();
-        if !provider.is_dir() || provider.file_name().is_some_and(|name|name=="credentials"){continue;}
+        if !matches!(provider.file_name().and_then(|name|name.to_str()),Some("codex"|"claude"|"qwen"|"glm")){continue;}
+        ensure!(provider.is_dir(),"native provider state is not a directory");
         ensure!(!provider.is_symlink(),"native owner directory symlink");
         for entry in std::fs::read_dir(&provider)? {
             let session=entry?.path();
@@ -186,6 +190,18 @@ fn retire_owned_at(root:&Path,audit_path:&Path, expected_owner:&RuntimeOwner) ->
         }
     }
     Ok(count)
+}
+
+fn validate_resume_owner(root:&Path,session:&Path,audit_path:&Path,current:&RuntimeOwner)->Result<()> {
+    ensure!(!session.is_symlink() && !session.join("retired.json").exists() && !session.join("retired-owner.json").exists(),"native session was retired");
+    let receipt:serde_json::Value=serde_json::from_slice(&private(&session.join("owned.json"))?)?;
+    let owner:RuntimeOwner=serde_json::from_value(receipt.get("owner").context("native runtime owner missing")?.clone())?;
+    let prior_path=receipt.get("audit_path").and_then(|value|value.as_str()).context("native runtime audit missing")?;
+    ensure!(owner.workflow_id==current.workflow_id && owner.lease_generation<=current.lease_generation
+        && Some(prior_path)==audit_path.to_str(),"native conversation belongs to a different workflow or audit generation");
+    ensure!(!owner_retired(root,Path::new(prior_path),&owner)?,"previous native runtime owner was retired");
+    private(&session.join("complete.json")).context("native runtime completion unavailable")?;
+    Ok(())
 }
 
 pub(crate) struct Launch {
@@ -240,7 +256,7 @@ impl Launch {
                 let name: String = serde_json::from_slice(&private(&aliases.join(digest(id)))?)?;
                 ensure!(name.starts_with("session-") && name.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'-'), "invalid native runtime alias");
                 let session = provider_root.join(name);
-                private(&session.join("complete.json")).context("native runtime completion unavailable")?;
+                validate_resume_owner(&root,&session,owner_logger.path(),&audit_owner)?;
                 session
             },
             _ => {
@@ -364,6 +380,21 @@ mod tests {
         assert!(!held.exists()); assert!(resumable.exists());
         assert!(owner_retired(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap());
         assert!(!owner_retired(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:3}).unwrap());
+    }
+    #[test]
+    fn resume_checks_original_owner_under_state_lock_even_after_later_healthy_claim() {
+        let temp=tempfile::tempdir().unwrap();
+        let path=session(temp.path(),"session-resume","/audit/shared",true);
+        let old=RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1};
+        let later=RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2};
+        let _lock=StateLock::acquire(temp.path()).unwrap();
+        validate_resume_owner(temp.path(),&path,Path::new("/audit/shared"),&later).unwrap();
+        assert!(validate_resume_owner(temp.path(),&path,Path::new("/audit/recovered"),&later).is_err());
+        assert!(validate_resume_owner(temp.path(),&path,Path::new("/audit/shared"),&RuntimeOwner{workflow_id:"other".into(),lease_generation:2}).is_err());
+        // Simulate crash after closed-owner commit, before per-session marker.
+        retirement_db(temp.path()).unwrap().execute("INSERT INTO retired_owner VALUES(?1,?2,?3)",rusqlite::params!["/audit/shared",old.workflow_id,old.lease_generation]).unwrap();
+        assert!(!path.join("retired-owner.json").exists());
+        assert!(validate_resume_owner(temp.path(),&path,Path::new("/audit/shared"),&later).is_err());
     }
     #[test]
     fn scope_retirement_does_not_guess_interrupted_session_safe() {
