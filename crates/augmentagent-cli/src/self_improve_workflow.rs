@@ -1210,6 +1210,15 @@ async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn control_dir() -> tempfile::TempDir {
+        // Managed Cargo puts TMPDIR inside the writable build cache. Control
+        // evidence must live outside every worker write root even in fixtures.
+        let dir = tempfile::Builder::new().prefix("autoship-control-test-").tempdir_in("/tmp").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -1269,7 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn missing_review_does_not_replenish_fresh_episode_budget() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let mut guard = WorkflowGuard::acquire_at(
             &path,
@@ -1333,7 +1342,7 @@ mod tests {
     #[tokio::test]
     async fn episode_counts_only_own_confirmed_merge_and_model_calls_are_separate() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let guard = WorkflowGuard::acquire_at(
             &path,
@@ -1416,7 +1425,7 @@ mod tests {
     #[tokio::test]
     async fn controller_audit_is_anchored_and_lost_rows_block_publication() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let mut guard = WorkflowGuard::acquire_at(
             &path,
@@ -1467,7 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_excludes_active_builder_releases_and_fences_lost_lease() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let now = millis();
         let builder = WorkflowGuard::acquire_at(
@@ -1564,7 +1573,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_never_reuses_approval_after_evidence_changes_at_same_head() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let mut builder = WorkflowGuard::acquire_at(
             &path,
@@ -1627,7 +1636,7 @@ mod tests {
             .unwrap()
             .0
         );
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let start = || Start {
             repo_root: dir.path(),
@@ -1701,7 +1710,7 @@ mod tests {
     #[tokio::test]
     async fn adjudication_reservations_and_receipts_survive_worker_restart() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let start = || Start {
             repo_root: dir.path(),
@@ -1751,7 +1760,7 @@ mod tests {
     #[tokio::test]
     async fn created_pr_resumes_the_original_workflow_without_an_issue() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let start = Start {
             repo_root: dir.path(),
@@ -1795,7 +1804,7 @@ mod tests {
     #[tokio::test]
     async fn interrupted_guard_preserves_pending_intent_and_lease_until_recovery() {
         let dir = repo();
-        let state = tempfile::tempdir().unwrap();
+        let state = control_dir();
         let path = state.path().join("workflow.db");
         let guard = WorkflowGuard::acquire_at(
             &path,

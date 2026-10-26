@@ -16837,7 +16837,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     // Review exhaustion retains a resumable draft instead of terminating work.
     #[test]
-    fn gave_up_in_resume_closes_the_pr_but_keeps_the_branch() {
+    fn review_exhaustion_preserves_the_pr_and_branch() {
         let findings = "same unresolved reviewer conflict";
         for attempts in [1, 2, 20, 100] {
             assert_eq!(give_up_verdict(&[Some(findings.into())], findings, FailureKind::ReviewReject, attempts), None,
@@ -16862,15 +16862,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     // Structural: the finder sweeps drafts that already gave up (the one-off
     // for #853-style leftovers) before choosing what to resume.
     #[test]
-    fn find_resumable_draft_sweeps_gave_up_drafts() {
+    fn find_resumable_draft_preserves_exhausted_work_for_recovery() {
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn find_resumable_draft(").expect("finder");
         let end = start + src[start..].find("\n}\n").expect("finder end");
         let body = &src[start..end];
-        let sweep = body.find("drafts_to_close(").expect("sweep");
-        let close = body.find("close_gave_up_pr(").expect("close in sweep");
-        let choose = body.find("adoption::select_linked(").expect("authorized choice");
-        assert!(sweep < close && close < choose, "sweep, close, then choose");
+        assert!(!body.contains("drafts_to_close("));
+        assert!(!body.contains("close_gave_up_pr("));
+        assert!(body.contains("adoption::select_linked_with_retries("));
     }
 
     // --- #936 CodeRabbit as a third reviewer --------------------------------
@@ -18393,7 +18392,7 @@ else:
         let arm = &body[at..ret];
         assert!(arm.contains("record_attempt("), "the attempt must be recorded");
         assert!(arm.contains("label_gave_up("), "and the issue labelled out");
-        assert!(arm.contains("close_gave_up_pr("), "and the PR closed");
+        assert!(!arm.contains("close_gave_up_pr("), "guard refusal must preserve the PR and branch");
         assert!(
             body[ret..].starts_with("return Ok(RunReport::triage("),
             "no builder ran, so the refusal must be unbilled"
@@ -18914,7 +18913,7 @@ else:
         let src = include_str!("self_improve.rs");
         let f = src.find("async fn find_resumable_draft(").expect("the finder");
         let finder = &src[f..f + src[f..].find("\n}\n").expect("end")];
-        assert!(finder.contains("swept_close_comment(") && finder.contains("read_unreviewable("), "{finder}");
+        assert!(!finder.contains("swept_close_comment("), "review exhaustion must not retire a PR: {finder}");
     }
 
     /// Reviewer selection preserves independence; billing follows actual builder work.
