@@ -152,7 +152,7 @@ pub(crate) async fn run(
         );
         ensure!(
             !request.path.split('/').any(|part| part == ".env"
-                || part.starts_with(".env.")
+                || (part.starts_with(".env.") && part != ".env.example")
                 || part == ".credentials.json"),
             "scoper requested credential file"
         );
