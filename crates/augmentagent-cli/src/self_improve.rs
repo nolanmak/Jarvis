@@ -82,6 +82,9 @@ mod review_calibration;
 #[cfg(test)]
 #[path = "self_improve_native_acceptance.rs"]
 mod native_acceptance;
+#[cfg(test)]
+#[path = "self_improve_native_route_acceptance.rs"]
+mod native_route_acceptance;
 
 pub(crate) async fn review_canary_if_due() -> Result<Option<review_canary::Report>> {
     let canary = review_canary::run_if_due().await;
