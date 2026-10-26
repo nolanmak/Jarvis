@@ -52,6 +52,45 @@ class ToolPolicyTests(unittest.TestCase):
                               'Bash(printf *)', 'Bash(git status*)'],
         })
 
+    def test_literal_file_and_directory_grants_never_grant_worktree_root(self):
+        allowed = self.root / 'allowed.rs'
+        allowed.write_text('old')
+        pinned = self.root / 'verifier.rs'
+        pinned.write_text('PINNED')
+        directory = self.root / 'implementation'
+        directory.mkdir()
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(directory)], 'write_files': [str(allowed)],
+            'allowed_tools': ['Read', 'Write', 'Edit'], 'autoship_in_place_writes': True})
+        policy.edit('allowed.rs', 'old', 'new')
+        policy.write('implementation/new.rs', 'implementation')
+        for path in ['verifier.rs', 'sibling.rs', '.git/config', '.env', '../outside.txt']:
+            with self.assertRaises(bridge.Denied):
+                policy.write(path, 'forbidden')
+        self.assertEqual(allowed.read_text(), 'new')
+        self.assertEqual(pinned.read_text(), 'PINNED')
+        self.assertEqual((directory / 'new.rs').read_text(), 'implementation')
+
+    def test_autoship_in_place_write_preserves_inode_and_refuses_links(self):
+        import os
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Edit'],
+            'autoship_in_place_writes': True})
+        target = self.root / 'admitted.rs'
+        target.write_text('fn old() {}')
+        inode = target.stat().st_ino
+        policy.edit('admitted.rs', 'old', 'fixed')
+        self.assertEqual(target.stat().st_ino, inode)
+        self.assertEqual(target.read_text(), 'fn fixed() {}')
+        policy.write('new.rs', 'fn added() {}')
+        self.assertEqual((self.root / 'new.rs').read_text(), 'fn added() {}')
+        (self.root / 'symlink.rs').symlink_to(self.outside)
+        os.link(self.outside, self.root / 'hardlink.rs')
+        for name in ['symlink.rs', 'hardlink.rs', '.env', '../outside.txt']:
+            with self.assertRaises((bridge.Denied, OSError)):
+                policy.write(name, 'must not land')
+        self.assertEqual(self.outside.read_text(), 'SYNTHETIC_PRIVATE')
+
     def test_read_write_edit_roundtrip(self):
         self.policy.write('note.md', 'alpha\nbeta\n')
         self.assertEqual(self.policy.read('note.md'), 'alpha\nbeta\n')
@@ -2602,6 +2641,25 @@ class BuildRunnerReadinessTests(unittest.TestCase):
         self.assertEqual(outcome['runner'], 'host')
         # First key, so a truncated serialisation still names the runner.
         self.assertTrue(json.dumps(outcome).startswith('{"runner": "host"'))
+
+    @requires_sandbox
+    def test_host_build_fixture_writes_but_cannot_read_credentials_or_network(self):
+        private = Path(self.temp.name) / 'synthetic-credentials.json'
+        private.write_text('SYNTHETIC_PRIVATE')
+        cargo = self.fakebin / 'cargo'
+        cargo.write_text('#!/usr/bin/python3 -I\nimport json,socket,pathlib\n'
+            'result={}\n'
+            'for key, operation in [("credentials", lambda: pathlib.Path(' + repr(str(private)) + ').read_text()),'
+            '("network", lambda: socket.socket().connect(("127.0.0.1", 1)))]:\n'
+            ' try: operation(); result[key]="allowed"\n'
+            ' except PermissionError: result[key]="denied"\n'
+            'pathlib.Path("fixture-built.txt").write_text("synthetic built result")\n'
+            'result["build_write"]=pathlib.Path("fixture-built.txt").read_text()\n'
+            'print(json.dumps(result))\n')
+        outcome = self.policy(build_runner='host').run_command('cargo test')
+        self.assertEqual(outcome['exit_code'], 0, outcome)
+        self.assertEqual(json.loads(outcome['stdout']), {'credentials': 'denied', 'network': 'denied', 'build_write': 'synthetic built result'})
+        self.assertFalse((self.root / 'fixture-built.txt').exists(), 'build artifacts remain inside isolated build output')
 
     def test_vm_runner_outcome_names_the_runner(self):
         policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))

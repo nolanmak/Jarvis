@@ -1035,6 +1035,20 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        self.write_files = set()
+        for filename in config.get('write_files', []):
+            path = Path(filename)
+            if not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path or not path.is_file():
+                raise Denied('exact write grant requires a canonical precreated file')
+            if any(part in CONTROL_PARTS or part == '.env' or part.startswith('.env.')
+                   or part.lower() in INJECTION_NAMES for part in path.parts):
+                raise Denied('credential and control files cannot be admitted')
+            self.write_files.add(str(path))
+        self.in_place_writes = config.get('autoship_in_place_writes', False)
+        if type(self.in_place_writes) is not bool:
+            raise Denied('invalid in-place write policy')
+        if self.write_files and not self.in_place_writes:
+            raise Denied('exact-file grants require in-place writes')
         # #1045: single files outside the roots that Read alone may open.
         self.read_allowances = self._allowances(config.get('read_allowances', []))
         self._node_install_cache = None
@@ -1216,6 +1230,10 @@ class Policy:
         candidate = self._system_path(os.path.abspath(os.path.join(str(self.cwd), name)))
         if len(os.fsencode(candidate)) > MAX_PATH_BYTES:
             raise Denied('path exceeds length limit')
+        if writing and candidate in self.write_files:
+            # Admission never grants writes to the parent/siblings. In-place
+            # descriptor writes below enforce that exact-file capability.
+            return Path(candidate).parent, (Path(candidate).name,)
         roots = self.write_roots if writing else self.read_roots
         for root in sorted(roots, key=lambda p: len(p.parts), reverse=True):
             prefix = str(root)
@@ -1424,6 +1442,19 @@ class Policy:
                 mode = stat.S_IMODE(existing.st_mode) & 0o777
             except FileNotFoundError:
                 mode = 0o600
+            if self.in_place_writes:
+                # File-only Landlock grants cannot create a rename sibling.
+                # Verify the opened inode before truncating; never follow links.
+                fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW |
+                             os.O_NONBLOCK | os.O_CLOEXEC, mode, dir_fd=parent)
+                with os.fdopen(fd, 'wb') as stream:
+                    if verification.verify_regular_private_file(stream.fileno()) is None:
+                        raise Denied('write requires an owned single-link regular file')
+                    os.ftruncate(stream.fileno(), 0)
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                return
             temporary = '.jarvis-write-' + uuid.uuid4().hex
             try:
                 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL |

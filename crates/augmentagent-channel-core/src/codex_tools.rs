@@ -247,6 +247,10 @@ fn choose_policy_base_dir(runtime_dir: Option<std::ffi::OsString>) -> PathBuf {
 
 impl BridgeLaunch {
     pub fn prepare(opts: &ReasonerOpts, directory: &Path) -> anyhow::Result<Self> {
+        Self::prepare_with_write_mode(opts, directory, false)
+    }
+
+    fn prepare_with_write_mode(opts: &ReasonerOpts, directory: &Path, in_place: bool) -> anyhow::Result<Self> {
         use std::collections::BTreeMap;
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -332,7 +336,12 @@ impl BridgeLaunch {
             .collect::<Result<Vec<_>, _>>()?;
         if !roots.contains(&cwd) { roots.push(cwd.clone()); }
         let writes = opts.allowed_tools.iter().any(|t| matches!(t.as_str(), "Write" | "Edit" | "NotebookEdit"));
-        let write_roots = if writes { vec![cwd.clone()] } else { vec![] };
+        let scoped = opts.env.iter().any(|(key, value)| key == crate::autoship_scope::SCOPE_ENV && value == "1");
+        let (write_roots, write_files) = if writes && scoped {
+            let state = crate::state_dir::state_dir().ok_or_else(|| anyhow::anyhow!("autoship scope state unavailable"))?;
+            let grants = crate::autoship_write_scope::grants(&state, &cwd)?;
+            (grants.directories, grants.files)
+        } else { (if writes { vec![cwd.clone()] } else { vec![] }, Vec::new()) };
         let mut environment: BTreeMap<String, String> = BTreeMap::new();
         for key in ["HOME", "PATH", "USER", "LOGNAME", "LANG", "TERM", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
             if let Ok(value) = std::env::var(key) { environment.insert(key.into(), value); }
@@ -351,6 +360,8 @@ impl BridgeLaunch {
             // Pattern-scoped single files, never directories to walk (#1045).
             "read_allowances": read_allowances(opts).iter().map(ReadAllowance::policy).collect::<Vec<_>>(),
             "write_roots": write_roots,
+            "write_files": write_files,
+            "autoship_in_place_writes": in_place || scoped,
             "allowed_tools": bridge_tools,
             "environment": environment,
             "settings": settings,
@@ -428,10 +439,83 @@ impl BridgeLaunch {
     }
 }
 
+/// Native Claude retains provider transport, but every model-visible tool is
+/// served by the same constrained bridge as Codex. Lifetime owns private policy.
+pub struct ClaudeBridgeLaunch {
+    pub bridge: BridgeLaunch,
+    pub config_path: PathBuf,
+    pub allowed_tools: Vec<String>,
+    _directory: tempfile::TempDir,
+}
+impl ClaudeBridgeLaunch {
+    pub fn prepare(opts: &ReasonerOpts) -> anyhow::Result<Self> {
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut tools = BTreeSet::new();
+        for tool in &opts.allowed_tools {
+            let name = if tool.starts_with("Bash(") && tool.ends_with(')') { "Bash" } else { tool.as_str() };
+            anyhow::ensure!(matches!(name, "Read" | "Write" | "Edit" | "Glob" | "Grep" | "Bash"),
+                "autoship Claude tool has no guarded bridge implementation: {name}");
+            tools.insert(format!("mcp__jarvis__{name}"));
+        }
+        // Profile hooks remain enforced inside the bridge, never in the native
+        // CLI. Additional MCP services cannot smuggle a second tool transport.
+        if let Some(raw) = &opts.settings_json {
+            let settings: serde_json::Value = serde_json::from_str(raw)?;
+            anyhow::ensure!(settings.get("mcpServers").is_none_or(|v| v.as_object().is_some_and(|m| m.is_empty())),
+                "autoship Claude accepts only its daemon-owned tool bridge");
+        }
+        let directory = tempfile::Builder::new().prefix("autoship-claude-bridge-").tempdir()?;
+        let bridge = BridgeLaunch::prepare_with_write_mode(opts, directory.path(), true)?;
+        let config_path = bridge.policy_path.parent().expect("private policy directory").join("claude-mcp.json");
+        let config = serde_json::json!({"mcpServers":{"jarvis":{
+            "command":"/usr/bin/python3", "args":["-I",directory.path().join("tool-bridge.py"),bridge.policy_path]
+        }}});
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&config_path)?;
+        file.write_all(&serde_json::to_vec(&config)?)?;
+        file.sync_all()?;
+        Ok(Self { bridge, config_path, allowed_tools: tools.into_iter().collect(), _directory: directory })
+    }
+    pub fn args(&self) -> Vec<String> {
+        vec!["--tools".into(), "".into(), "--allowedTools".into(), self.allowed_tools.join(" "),
+            "--strict-mcp-config".into(), "--mcp-config".into(), self.config_path.to_string_lossy().into_owned(),
+            "--setting-sources".into(), "".into(), "--disable-slash-commands".into()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn autoship_claude_exposes_only_private_guarded_bridge_tools() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut opts = crate::reasoner::triage_opts(None);
+        opts.cwd = Some(fixture.path().into());
+        opts.add_dirs = vec![fixture.path().into()];
+        opts.allowed_tools = vec!["Read".into(), "Write".into(), "Edit".into(), "Bash(git status*)".into()];
+        opts.settings_json = None;
+        let launch = ClaudeBridgeLaunch::prepare(&opts).unwrap();
+        let args = launch.args();
+        assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert!(args.iter().any(|arg| arg == "--disable-slash-commands"));
+        assert_eq!(launch.allowed_tools, vec!["mcp__jarvis__Bash", "mcp__jarvis__Edit", "mcp__jarvis__Read", "mcp__jarvis__Write"]);
+        assert!(!launch.bridge.native_cwd.starts_with(fixture.path()));
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&launch.config_path).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
+        assert_eq!(config["mcpServers"]["jarvis"]["command"], "/usr/bin/python3");
+        assert_eq!(std::fs::metadata(&launch.config_path).unwrap().permissions().mode() & 0o777, 0o600);
+        let policy: serde_json::Value = serde_json::from_slice(&std::fs::read(&launch.bridge.policy_path).unwrap()).unwrap();
+        assert_eq!(policy["autoship_in_place_writes"], true);
+        opts.allowed_tools.push("WebFetch".into());
+        assert!(ClaudeBridgeLaunch::prepare(&opts).is_err());
+        opts.allowed_tools.pop();
+        opts.settings_json = Some(r#"{"mcpServers":{"extra":{"command":"unexpected"}}}"#.into());
+        assert!(ClaudeBridgeLaunch::prepare(&opts).is_err());
+    }
 
     #[test]
     fn compute_mcp_uses_native_transport_with_full_budget_and_private_grant() {

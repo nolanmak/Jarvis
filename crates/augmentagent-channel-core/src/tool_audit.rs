@@ -471,6 +471,10 @@ impl AuditLogger {
         }
     }
 
+    pub fn is_protected(&self) -> bool {
+        self.anchored.is_some()
+    }
+
     /// Register BEFORE spawning a writer. Durable tickets survive cancellation
     /// and process death; a restarted logger cannot silently forget lost rows.
     pub fn begin_write(&self) -> anyhow::Result<AuditWriteGuard> {

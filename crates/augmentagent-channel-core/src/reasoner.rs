@@ -1141,9 +1141,16 @@ impl ClaudeCliReasoner {
             }
         }
 
-        // `--allowedTools`: empty list = no tools. Space-separated names per claude CLI docs.
-        args.push("--allowedTools".into());
-        args.push(opts.allowed_tools.join(" "));
+        let native_scope = crate::autoship_scope::NativeScope::from_opts(opts)?;
+        let claude_bridge = if native_scope.is_some() {
+            Some(crate::codex_tools::ClaudeBridgeLaunch::prepare(opts)?)
+        } else { None };
+        if let Some(bridge) = &claude_bridge {
+            args.extend(bridge.args());
+        } else {
+            args.push("--allowedTools".into());
+            args.push(opts.allowed_tools.join(" "));
+        }
 
         // `--system-prompt` REPLACES Claude Code's default system (tools list,
         // MCP metadata, agent catalog — ~25k tokens). Empty → minimal stub.
@@ -1153,7 +1160,10 @@ impl ClaudeCliReasoner {
             &opts.system_prompt
         };
         args.push("--system-prompt".into());
-        args.push(effective_system.to_string());
+        let effective_system = if claude_bridge.is_some() {
+            format!("{effective_system}\n\nAll file and command tools are guarded jarvis MCP tools. Relative paths resolve in {}. Use mcp__jarvis__Read/Write/Edit/Glob/Grep/Bash as available. Commands accept one executable and arguments; split compound shell operations. Build with cargo/npm through the bridge; it owns build isolation and storage. Native shell/file/web tools are disabled.", opts.cwd.as_ref().map(|p|p.display().to_string()).unwrap_or_default())
+        } else { effective_system.to_owned() };
+        args.push(effective_system);
 
         let router = crate::model_router::current()?.filter(|r| r.enabled());
         let routed_model = router.as_ref().and_then(|r| r.model(crate::providers::ProviderKind::Claude, crate::providers::tier_of(opts)));
@@ -1162,9 +1172,11 @@ impl ClaudeCliReasoner {
             args.push(m.clone());
         }
 
-        for dir in &opts.add_dirs {
-            args.push("--add-dir".into());
-            args.push(dir.to_string_lossy().into_owned());
+        if claude_bridge.is_none() {
+            for dir in &opts.add_dirs {
+                args.push("--add-dir".into());
+                args.push(dir.to_string_lossy().into_owned());
+            }
         }
 
         // `--settings <json>` wires in per-call settings — notably the
@@ -1178,7 +1190,7 @@ impl ClaudeCliReasoner {
         // agent's tool surface stays exactly what we declare and never
         // picks up the host's global MCP config), and the remaining
         // settings (hooks, etc.) go to `--settings`.
-        let handoff_hooks = crate::handoff::ClaudeHooks::prepare(opts)?;
+        let handoff_hooks = if claude_bridge.is_none() { crate::handoff::ClaudeHooks::prepare(opts)? } else { None };
         let effective_settings = handoff_hooks
             .as_ref()
             .map(|launch| &launch.settings_json)
@@ -1187,7 +1199,7 @@ impl ClaudeCliReasoner {
         // private temp file rather than in Claude's process argv, which other
         // same-host processes can inspect via /proc.
         let mut _voice_mcp_file: Option<tempfile::NamedTempFile> = None;
-        if let Some(settings) = effective_settings {
+        if let Some(settings) = effective_settings.filter(|_| claude_bridge.is_none()) {
             let (settings_only, mcp_config) = split_mcp_from_settings(settings);
             if let Some(mcp_json) = mcp_config {
                 args.push("--mcp-config".into());
@@ -1210,7 +1222,7 @@ impl ClaudeCliReasoner {
             }
         }
 
-        let native_scope = crate::autoship_scope::NativeScope::from_opts(opts)?;
+
         let mut cmd = match &native_scope {
             Some(scope) => scope.command(&self.bin),
             None => Command::new(&self.bin),
@@ -1220,7 +1232,9 @@ impl ClaudeCliReasoner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Scope Write/Edit by setting the spawned CLI's cwd when requested.
-        if let Some(cwd) = &opts.cwd {
+        if let Some(bridge) = &claude_bridge {
+            cmd.current_dir(&bridge.bridge.native_cwd);
+        } else if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
         }
         // #128 — When `restrict_env` is set (wiki-query path), clear the
@@ -1300,7 +1314,7 @@ impl ClaudeCliReasoner {
         let audit_logger = opts.audit_logger.clone().or_else(default_audit_logger);
         let audit_active = audit_logger.is_some() || opts.audit_notifier.is_some();
         let audit_session = opts.session_id.clone().unwrap_or_else(|| "-".to_string());
-        let mut pending_tool_uses: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut pending_tool_uses: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
 
         // Every non-empty text block the model emitted, in stream order, plus
         // the terminal `result` payload. Reducing these to one string is
@@ -1386,6 +1400,12 @@ impl ClaudeCliReasoner {
 
         let status = child.wait().await?;
         drop(process_group);
+        // Unmatched tool uses represent uncertain side effects. Dropping their
+        // protected intent tickets leaves durable orphan/failure evidence.
+        pending_tool_uses.clear();
+        if let Some(logger) = &audit_logger {
+            logger.drain_checked().await?;
+        }
         if !status.success() {
             let mut stderr_buf = String::new();
             if let Some(mut err) = child.stderr.take() {
@@ -1474,7 +1494,7 @@ impl ClaudeCliReasoner {
 /// inline loop, including the high-risk gate around the notifier.
 pub(crate) fn audit_stream_line(
     line: &str,
-    pending: &mut HashMap<String, (String, serde_json::Value)>,
+    pending: &mut HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)>,
     session_id: &str,
     model: Option<&str>,
     logger: Option<&Arc<AuditLogger>>,
@@ -1483,14 +1503,19 @@ pub(crate) fn audit_stream_line(
     for ev in parse_stream_event(line) {
         match ev {
             ToolEvent::Use { id, name, input } => {
-                pending.insert(id, (name, input));
+                let intent = logger.filter(|logger| logger.is_protected()).and_then(|logger|
+                    match logger.begin_write() {
+                        Ok(ticket) => Some(ticket),
+                        Err(error) => { warn!("native tool intent audit failed: {error:#}"); None }
+                    });
+                pending.insert(id, (name, input, intent));
             }
             ToolEvent::Result {
                 id,
                 is_error,
                 content,
             } => {
-                let Some((name, input)) = pending.remove(&id) else {
+                let Some((name, input, intent)) = pending.remove(&id) else {
                     debug!("tool-audit: unmatched tool_result id={id}");
                     continue;
                 };
@@ -1507,10 +1532,17 @@ pub(crate) fn audit_stream_line(
                     record.set_model(model);
                 }
                 if let Some(logger) = logger.cloned() {
-                    let rec = record.clone();
-                    tokio::spawn(async move {
-                        logger.record(&rec).await;
-                    });
+                    match logger.begin_write() {
+                        Ok(ticket) => {
+                            let rec = record.clone();
+                            tokio::spawn(async move {
+                                logger.record(&rec).await;
+                                if let Some(intent) = intent { intent.complete(); }
+                                ticket.complete();
+                            });
+                        }
+                        Err(error) => warn!("tool audit registration failed: {error:#}"),
+                    }
                 }
                 if is_high_risk(&name) {
                     if let Some(notifier) = notifier.cloned() {
@@ -2785,6 +2817,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_native_tool_intent_poisoning_is_durable_and_workflow_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.log");
+        let anchor = dir.path().join("anchor.json");
+        let logger = Arc::new(AuditLogger::protected(path.clone(), anchor.clone(), &[]).unwrap());
+        let use_event = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"pending-write","name":"mcp__jarvis__Write","input":{"file_path":"fixture.rs","content":"synthetic"}}]}}"#;
+        let mut pending = HashMap::new();
+        audit_stream_line(use_event, &mut pending, "session", Some("synthetic-model"), Some(&logger), None);
+        assert_eq!(pending.len(), 1);
+        drop(pending); // Process death before the matching result.
+        assert!(logger.drain_checked().await.is_err());
+        drop(logger);
+        let reopened = AuditLogger::protected(path, anchor, &[]).unwrap();
+        assert!(reopened.drain_checked().await.is_err(), "restart cannot erase uncertain side effects");
+        let interactive = Arc::new(AuditLogger::new(dir.path().join("interactive.log")));
+        let mut pending = HashMap::new();
+        audit_stream_line(use_event, &mut pending, "interactive", None, Some(&interactive), None);
+        drop(pending);
+        interactive.drain_checked().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn audit_stream_line_records_writes_and_pings_high_risk() {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("tool-audit.log");
@@ -2795,7 +2849,7 @@ mod tests {
         let typed: Arc<CountingNotifier> = Arc::new(CountingNotifier::default());
         let notifier: Arc<dyn AuditNotifier> = typed.clone();
 
-        let mut pending: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut pending: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
         let session = "ch:123";
         // 1) High-risk Write: tool_use then tool_result.
         let write_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_w","name":"Write","input":{"file_path":"/tmp/x.txt","content":"hi"}}]}}"#;
@@ -2881,7 +2935,7 @@ mod tests {
         // Empty pending + None logger/notifier — should be a no-op even on a
         // tool_use line. Guard against future refactors that accidentally
         // pay parse cost on the no-audit path.
-        let mut pending: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut pending: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_x","name":"Write","input":{}}]}}"#;
         audit_stream_line(line, &mut pending, "s", None, None, None);
         // Pending gains one entry because the use was parsed; that's fine —
