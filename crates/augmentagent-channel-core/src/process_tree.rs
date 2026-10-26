@@ -760,9 +760,15 @@ mod tests {
 
     #[tokio::test]
     async fn missing_resource_admission_receipt_blocks_before_model_charge() {
-        let directory=tempfile::tempdir().unwrap();
+        let directory=tempfile::tempdir_in("/tmp").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["logs", "anchors"] {
+            let path = directory.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let effect=directory.path().join("effect");
-        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(directory.path().join("audit"),directory.path().join("anchor"),&[]).unwrap());
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(directory.path().join("logs/audit.jsonl"),directory.path().join("anchors/audit.json"),&[]).unwrap());
         let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
         logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
         let blocked=Arc::new(std::sync::atomic::AtomicUsize::new(0));let callback=blocked.clone();
