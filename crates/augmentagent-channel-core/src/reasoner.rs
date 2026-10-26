@@ -1210,7 +1210,11 @@ impl ClaudeCliReasoner {
             }
         }
 
-        let mut cmd = Command::new(&self.bin);
+        let native_scope = crate::autoship_scope::NativeScope::from_opts(opts)?;
+        let mut cmd = match &native_scope {
+            Some(scope) => scope.command(&self.bin),
+            None => Command::new(&self.bin),
+        };
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1225,7 +1229,7 @@ impl ClaudeCliReasoner {
         // scoped Bash allowlist) from seeing provider keys the daemon
         // loaded from `.env` at startup. `opts.env` is then layered on
         // top with explicit, just-in-time-loaded secrets.
-        if opts.restrict_env {
+        if opts.restrict_env || native_scope.is_some() {
             cmd.env_clear();
             for var in SAFELIST_ENV_VARS {
                 if let Ok(v) = std::env::var(var) {
@@ -1253,6 +1257,7 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
+        if let Some(scope) = &native_scope { scope.configure(&mut cmd); }
         let (mut child, process_group) = crate::process_tree::spawn_supervised(
             &cmd,
             opts.restrict_env,
