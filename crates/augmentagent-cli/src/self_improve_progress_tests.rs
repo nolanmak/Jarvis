@@ -223,6 +223,7 @@ elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
     print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
+elif a[0]=='api' and '/issues/' in a[1]: print(json.dumps(dict(state='open')))
 elif a[0]=='api': print('[]')
 elif a[:2]==['pr','edit']: time.sleep(30)
 elif a[:2]==['pr','ready']:

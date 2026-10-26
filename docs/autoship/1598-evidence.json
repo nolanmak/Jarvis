@@ -1,0 +1,193 @@
+{
+  "epic": 1598,
+  "plan": "https://github.com/nolanmak/Jarvis/issues/1598#issuecomment-6410025868",
+  "requirements": [
+    {
+      "issue": 1537,
+      "title": "Autoship: explicitly adopt and review existing PRs outside agent-fix branches",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1537",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1531,
+      "title": "Autoship: retire managed drafts when their source issue is already closed",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1531",
+      "implementation_status": "implemented_pending_deployment",
+      "evidence": [
+        "self_improve::source_reconcile::tests: 5 passed; source checks before resume and merge; branches preserved"
+      ]
+    },
+    {
+      "issue": 930,
+      "title": "Auto-PR loop self-heals its own blockers: red `main` and conflicting drafts",
+      "source": "https://github.com/nolanmak/Jarvis/issues/930",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1082,
+      "title": "Auto-resume: policy and receipt holds on approved drafts bill a slot every day; merge sweep may never reach a draft",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1082",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1215,
+      "title": "Ship at least two more PRs per day: daily cap 5, quota brake, spread runs across the UTC day",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1215",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1363,
+      "title": "Auto-PR loop: add a meta-reasoning controller that keeps a compact run ledger and makes budget-aware continue / restart / stop decisions",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1363",
+      "implementation_status": "partial",
+      "evidence": [
+        "autoship_workflow foundation tests passed; workflow bridge tests passed; live lane wiring incomplete"
+      ]
+    },
+    {
+      "issue": 1476,
+      "title": "Auto-PR loop: periodic 'forget and restart from best candidate' to break anchoring in iterative repair/review rounds",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1476",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1426,
+      "title": "Auto-PR loop: add a judge-improvement loop that calibrates reviewer/QA verdicts on human-resolved disagreements when progress plateaus",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1426",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1453,
+      "title": "Auto-ship/self-improve: executable scope contract with pre-run validation and automatic stop conditions",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1453",
+      "implementation_status": "partial",
+      "evidence": [
+        "scripts.tests.autoship_scope_guard_test: 6 kernel tests passed; native transport egress and live startup validation incomplete"
+      ]
+    },
+    {
+      "issue": 1472,
+      "title": "Require a machine-checkable verifier on every agent-fixable issue before the self-improve loop picks it up",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1472",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 810,
+      "title": "Self-improve gate is vacuous: require a pre-registered falsifier that goes red\u2192green",
+      "source": "https://github.com/nolanmak/Jarvis/issues/810",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1012,
+      "title": "Acceptance criteria from the scoping pass, graded by both reviewers",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1012",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1151,
+      "title": "Auto-PR review loop: require measured file-coverage for a LGTM, and fan review out per-file when coverage is incomplete",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1151",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 953,
+      "title": "Add review-constraint checks to the auto-PR loop, mined from real PR review comments, reported separately from functional tests",
+      "source": "https://github.com/nolanmak/Jarvis/issues/953",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1522,
+      "title": "Triage/auto-PR evaluation: penalise 'safe delaying' decisions that a per-step judge lets through (rollout-scorer gap)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1522",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1512,
+      "title": "EPIC: auto-PR backlog reform \u2014 fair-try scoping, relevance check, epic slicing, wider picker, research dedup",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1512",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 472,
+      "title": "Add a persistent Failure Memory + Coverage Map to the self-improve and retry loops (SOCM-style externalized state)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/472",
+      "implementation_status": "partial",
+      "evidence": [
+        "Durable workflow store and bridge recovery tests passed; email retry and scheduled-loop coverage not implemented"
+      ]
+    },
+    {
+      "issue": 970,
+      "title": "Self-improve scoper resolves ambiguity by guessing instead of localizing gaps and asking (IdeaAMBIG asymmetry)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/970",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 524,
+      "title": "self-improve: verify PR\u2194issue alignment before surfacing a draft PR for review",
+      "source": "https://github.com/nolanmak/Jarvis/issues/524",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1184,
+      "title": "Harden the dual-LGTM auto-merge against reviewer/builder collusion drift",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1184",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    },
+    {
+      "issue": 1209,
+      "title": "Move tool-audit / token-usage / auto-PR history sinks out of the reasoner subprocess's reach (trace integrity)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1209",
+      "implementation_status": "partial",
+      "evidence": [
+        "Kernel tests deny control-state writes; external audit anchor integration incomplete"
+      ]
+    },
+    {
+      "issue": 840,
+      "title": "self-improve: codex cannot run any command on this host (bwrap/AppArmor), so the system-interaction review reviews nothing",
+      "source": "https://github.com/nolanmak/Jarvis/issues/840",
+      "implementation_status": "audit_pending",
+      "evidence": []
+    }
+  ],
+  "operational_acceptance": {
+    "virtual_soak_72h": "not_run",
+    "live_canary_24h": "not_started",
+    "throughput_report_7d": "not_started",
+    "convergence_comparison_30d": "not_started"
+  },
+  "validation": {
+    "foundation": {
+      "passed": 46,
+      "failed": 0
+    },
+    "self_improve": {
+      "passed": 305,
+      "failed": 0,
+      "ignored": 6,
+      "note": "Includes recovery and workflow bridge tests; live provider probes are ignored and remain required."
+    },
+    "kernel_scope": {
+      "passed": 6,
+      "failed": 0
+    },
+    "deployed": false
+  }
+}

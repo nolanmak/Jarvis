@@ -37,6 +37,13 @@ use tracing::{info, warn};
 
 use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 
+#[path = "self_improve_source.rs"]
+mod source_reconcile;
+#[path = "self_improve_workflow.rs"]
+mod workflow;
+#[path = "self_improve_recovery.rs"]
+mod recovery;
+
 /// Branch/worktree prefix so the dedup guard can recognize agent PRs.
 const BRANCH_PREFIX: &str = "agent-fix/issue-";
 /// Label the loop selects on.
@@ -1535,6 +1542,10 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
         let Some(issue) = issue_from_branch(branch) else {
             continue;
         };
+        if source_reconcile::reconcile(repo_root, pr, issue, dry_run).await
+            != source_reconcile::SourceAction::Continue {
+            continue;
+        }
         let body = row
             .get("body")
             .and_then(serde_json::Value::as_str)
@@ -1642,6 +1653,11 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                         let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
                             .await;
                     }
+                    continue;
+                }
+
+                if source_reconcile::reconcile(repo_root, pr, issue, false).await
+                    != source_reconcile::SourceAction::Continue {
                     continue;
                 }
 
@@ -6440,6 +6456,11 @@ async fn resume_draft_pr(
     note_current_issue(issue_no);
     info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
 
+    let source = source_reconcile::reconcile(repo_root, pr, issue_no, dry_run).await;
+    if source != source_reconcile::SourceAction::Continue {
+        return Ok(RunReport::held(format!("PR #{pr}: source reconciliation {source:?}")));
+    }
+
     // #1006 — before anything else, and specifically BEFORE the ledger mark
     // below. The head may not be in this repository at all (a fork), or may
     // have been deleted after a merge; either way there is nothing to check
@@ -7717,43 +7738,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
     let reasoner = build_reasoner();
     reasoner.track_review_history(repo_root, &branch, false)?;
-    // #692 — a FIXED path, force-recreated per issue (the branch stays
-    // per-issue). Test binaries bake `env!("CARGO_MANIFEST_DIR")` at compile
-    // time; with the shared gate target cache, binaries compiled under a
-    // deleted per-issue path get reused from later runs and panic reading
-    // fixtures. A stable path keeps every baked path resolvable.
+    // Keep each issue's checkout stable across interruption. Other issues can
+    // advance without deleting this candidate or its compiler fixture paths.
     let worktree = repo_root
         .join(".self-improve-worktrees")
-        .join(lane_from_env().worktree_name());
+        .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
+    recovery::prepare(repo_root, &worktree, &branch).await?;
 
-    // Clean any stale worktree from a crashed prior run.
-    reclaim_worktree(repo_root, &worktree, &branch).await;
-
-    let (ok, _o, e) = run(
-        "git",
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            &worktree.to_string_lossy(),
-            "origin/main",
-        ],
-        repo_root,
-    )
-    .await?;
-    if !ok {
-        bail!("git worktree add failed: {e}");
-    }
-
-    let cleanup = |wt: PathBuf, br: String, root: PathBuf| async move {
-        let _ = run(
-            "git",
-            &["worktree", "remove", "--force", &wt.to_string_lossy()],
-            &root,
-        )
-        .await;
-        let _ = run("git", &["branch", "-D", &br], &root).await;
+    // Failed stages retain committed and unfinished work. Publication alone is
+    // not permission to erase the only local recovery copy.
+    let cleanup = |wt: PathBuf, br: String, _root: PathBuf| async move {
+        info!(path=%wt.display(), branch=%br, "preserving autoship checkpoint for reconciliation");
     };
 
     // #803 — what earlier attempts on this issue already failed on, plus the
