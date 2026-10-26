@@ -117,13 +117,13 @@ pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
     let repository=workflow::canonical_repository(repo).await?;
     let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
     for (id,raw) in store.pending_publications(&repository)? {
-        if let Err(error)=reconcile_one(repo,&repository,&store,&id,&raw).await {
+        if let Err(error)=reconcile_one(repo,&repository,&mut store,&id,&raw).await {
             warn!(workflow=%id,"pending publication reconciliation deferred: {error:#}");
         }
     }
     Ok(())
 }
-async fn reconcile_one(repo:&Path,repository:&str,store:&crate::autoship_workflow::WorkflowStore,id:&str,raw:&str)->Result<()> {
+async fn reconcile_one(repo:&Path,repository:&str,store:&mut crate::autoship_workflow::WorkflowStore,id:&str,raw:&str)->Result<()> {
         let request:PendingPublication=serde_json::from_str(&raw)?;
         anyhow::ensure!(request.repository==repository && id==crate::autoship_workflow::workflow_id(&repository,request.issue)?,"publication identity mismatch");
         let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
