@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
+const DEPENDENCY_AUDIT: &str = include_str!("../../../scripts/autoship-registry-integrity.py");
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 pub(super) const CONTRACT_PROMPT: &str = r#"
 Emit exactly one ```autoship-contract fenced JSON object with fields `contract`
@@ -155,10 +156,19 @@ async fn actual_head(root: &Path) -> Result<String> {
 /// changes. Includes system interpreter binaries and rustup selection metadata.
 /// The orchestrator must also pin the admitted Rust toolchain image; this hash
 /// does not attest every library in a mutable host installation.
-fn environment_id() -> Result<String> {
+fn environment_id(root: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(SANDBOX.as_bytes());
+    hash.update(DEPENDENCY_AUDIT.as_bytes());
+    if root.join("Cargo.lock").exists() {
+        hash.update(std::fs::read(root.join("Cargo.lock"))?);
+    }
+    for name in ["rust-toolchain", "rust-toolchain.toml"] {
+        if root.join(name).exists() {
+            hash.update(std::fs::read(root.join(name))?);
+        }
+    }
     for path in [
         PathBuf::from("/usr/bin/python3"),
         PathBuf::from("/usr/bin/node"),
@@ -174,7 +184,7 @@ fn environment_id() -> Result<String> {
             hash.update(std::fs::read(settings)?);
         }
     }
-    Ok(format!("sandbox-v1:{:x}", hash.finalize()))
+    Ok(format!("sandbox-protected-cache-v2:{:x}", hash.finalize()))
 }
 
 pub(super) async fn register_and_reproduce(
@@ -195,7 +205,7 @@ pub(super) async fn register_and_reproduce(
     let head = actual_head(root).await?;
     install_harness(root, &proposal)?;
     let registration =
-        RegisteredContract::register(root, proposal.contract, head, environment_id()?)?;
+        RegisteredContract::register(root, proposal.contract, head, environment_id(root)?)?;
     let receipts = execute_registered(root, &registration).await?;
     match registration.baseline_result(&receipts)? {
         BaselineResult::Reproduced => Ok(BaselineEvidence {
@@ -255,7 +265,7 @@ pub(super) async fn verify_candidate(
         "candidate must be committed before evidence can bind to HEAD"
     );
     ensure!(
-        environment_id()?
+        environment_id(root)?
             == evidence
                 .registration
                 .binding(&actual_head(root).await?)?
@@ -282,7 +292,7 @@ async fn execute_registered(
     let head = actual_head(&root).await?;
     let binding = registration.binding(&head)?;
     registration.verify_integrity(&root)?;
-    let target = crate::build_storage::effective_target(&root);
+    let target = protected_verifier_target(&root, registration)?;
     // Admission is the same production lease/storage accounting used by gates.
     // Do not recursively invoke cargo-managed.sh while this lease is held.
     let _lease = crate::build_storage::admit(&root, &target).await?;
@@ -298,6 +308,74 @@ async fn execute_registered(
         receipts.push(registration.observe(&root, &verifier.id, binding.clone(), &observation)?);
     }
     Ok(receipts)
+}
+
+fn protected_verifier_target(root: &Path, registration: &RegisteredContract) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let binding = registration.binding(registration.baseline_head())?;
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(
+            registration.contract_hash(),
+            &binding.environment_id
+        ))?)
+    );
+    verifier_cache_sibling(root, &crate::build_storage::effective_target(root), &key)
+}
+fn verifier_cache_sibling(root: &Path, builder: &Path, key: &str) -> Result<PathBuf> {
+    let parent = builder
+        .parent()
+        .context("builder cache has no parent")?
+        .canonicalize()?;
+    let builder = if builder.exists() {
+        builder.canonicalize()?
+    } else {
+        parent.join(builder.file_name().context("builder cache has no name")?)
+    };
+    ensure!(
+        key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid verifier cache identity"
+    );
+    let target = parent.join(format!("augmentagent-verifier-{key}"));
+    let resolved = if target.exists() {
+        target.canonicalize()?
+    } else {
+        target.clone()
+    };
+    ensure!(
+        resolved == target
+            && !resolved.starts_with(&builder)
+            && !builder.starts_with(&resolved)
+            && !resolved.starts_with(root),
+        "verifier cache intersects a builder writable root"
+    );
+    Ok(target)
+}
+async fn attest_registry(root: &Path, registry: &Path) -> Result<()> {
+    let output = Command::new("/usr/bin/python3")
+        .args(["-I", "-c", DEPENDENCY_AUDIT])
+        .arg(root.join("Cargo.lock"))
+        .arg(registry)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    ensure!(
+        output.status.success(),
+        "verifier dependency integrity infrastructure failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure!(
+        receipt["schema_version"] == 1
+            && receipt["sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64),
+        "invalid dependency provenance receipt"
+    );
+    Ok(())
 }
 
 async fn isolated_observation(
@@ -333,6 +411,7 @@ async fn isolated_observation(
     let daemon_home = PathBuf::from(std::env::var_os("HOME").context("daemon home unavailable")?);
     let rustup = daemon_home.join(".rustup");
     if invocation.program == "cargo" {
+        attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
         program = daemon_home.join(".cargo/bin/cargo");
         for path in [
             daemon_home.join(".cargo/bin"),
@@ -421,6 +500,9 @@ async fn isolated_observation(
         )
     })
     .await;
+    if invocation.program == "cargo" {
+        attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
+    }
     match result {
         Ok((status, stdout, stderr)) => Ok(Observation {
             exit_code: status.code(),
@@ -1272,7 +1354,7 @@ pub(super) async fn assert_receipt_current(
     use sha2::{Digest, Sha256};
     let head = actual_head(worktree).await?;
     ensure!(
-        environment_id()? == reference.binding.environment_id,
+        environment_id(worktree)? == reference.binding.environment_id,
         "acceptance environment changed after verification"
     );
     ensure!(
@@ -1304,4 +1386,22 @@ pub(super) async fn assert_receipt_current(
         "candidate changed after acceptance verification"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod verifier_cache_tests {
+    use super::*;
+    #[test]
+    fn verifier_cache_is_a_distinct_sibling_and_symlink_alias_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let builder = parent.path().join("builder");
+        std::fs::create_dir(&builder).unwrap();
+        let key = "a".repeat(64);
+        let verifier = verifier_cache_sibling(source.path(), &builder, &key).unwrap();
+        assert!(!verifier.starts_with(&builder));
+        std::os::unix::fs::symlink(&builder, &verifier).unwrap();
+        assert!(verifier_cache_sibling(source.path(), &builder, &key).is_err());
+        assert!(verifier_cache_sibling(parent.path(), &builder, &"b".repeat(64)).is_err());
+    }
 }
