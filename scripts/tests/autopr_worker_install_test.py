@@ -1,0 +1,80 @@
+"""Render units in an isolated home; never touches the host service manager."""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+class InstallTests(unittest.TestCase):
+    def test_preserves_configuration_and_orders_first_migration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo = base / 'repo fixture'
+            (repo / 'scripts/systemd').mkdir(parents=True)
+            for name in ('ensure-autopr-worker.sh', 'systemd/augmentagent-autopr.service'):
+                shutil.copy(ROOT / 'scripts' / name, repo / 'scripts' / name)
+            runner=repo/'scripts/run-rs.sh'
+            runner.write_text('#!/bin/sh\nexit 0\n');runner.chmod(0o700)
+            binary = base / 'bin'; binary.mkdir()
+            stub = binary / 'systemctl'
+            stub.write_text('''#!/usr/bin/env python3
+import os,sys
+with open(os.environ['CALLS'],'a') as f:f.write(' '.join(sys.argv[1:])+'\\n')
+if 'show' in sys.argv:
+ key=sys.argv[sys.argv.index('-p')+1]
+ print({'Environment':'PATH=/usr/bin RUST_LOG=warn SYNTHETIC=fixture',
+ 'EnvironmentFiles':'/fixture/config (ignore_errors=yes)',
+ 'ExecStart':'{ argv[]=/fixture/bin serve --dry-run false ; }',
+ 'MemoryHigh':'8589934592','MemoryMax':'10737418240',
+ 'TasksMax':'2048','LimitNOFILE':'4096'}.get(key,''))
+''')
+            stub.chmod(0o700)
+            env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ['PATH'],
+                       XDG_CONFIG_HOME=str(base/'config'), XDG_STATE_HOME=str(base/'state'),
+                       CALLS=str(base/'calls'))
+            command = ['bash', str(repo/'scripts/ensure-autopr-worker.sh')]
+            subprocess.run(command, env=env, check=True)
+            units = base/'config/systemd/user'
+            worker = (units/'augmentagent-autopr.service').read_text()
+            self.assertIn('--dry-run false', worker)
+            self.assertIn('Environment="SYNTHETIC=fixture"', worker)
+            self.assertIn('EnvironmentFile=-"/fixture/config"', worker)
+            self.assertIn('After=network-online.target augmentagent.service', worker)
+            self.assertNotIn('PartOf=', worker)
+            self.assertNotIn('BindsTo=', worker)
+            self.assertIn('MemoryMax=10737418240', (units/'augmentagent-runtime.slice').read_text())
+            self.assertIn('Slice=augmentagent-runtime.slice',worker)
+            dropin = units/'augmentagent.service.d/autoship-worker.conf'
+            self.assertIn('AUGMENTAGENT_AUTOPR_EXTERNAL=1',dropin.read_text())
+            self.assertNotIn('ExecStart=',dropin.read_text())
+            before = (units/'augmentagent-autopr.service').stat().st_mtime_ns
+            subprocess.run(command, env=env, check=True)
+            self.assertEqual(before,(units/'augmentagent-autopr.service').stat().st_mtime_ns)
+            self.assertNotIn('start ',(base/'calls').read_text())
+            self.assertNotIn('--now',(base/'calls').read_text())
+            if shutil.which('systemd-analyze'):
+                # Offline parser validation; this neither reloads nor starts
+                # any host unit. Supply the daemon dependency as a fixture.
+                (units/'augmentagent.service').write_text('[Service]\nExecStart=/usr/bin/true\n')
+                verify=subprocess.run(['systemd-analyze','--user','verify',str(units/'augmentagent-autopr.service')],
+                    env=dict(env,SYSTEMD_UNIT_PATH=str(units)+':'),capture_output=True,text=True)
+                self.assertEqual(verify.returncode,0,verify.stderr)
+            # Explicit install dry-run wins; configuration cannot silently
+            # enable write actions when reinstalling a dry-run daemon.
+            subprocess.run(command, env=dict(env,AUGMENTAGENT_AUTOSTART_DRY_RUN='true'),check=True)
+            self.assertIn('--dry-run true',(units/'augmentagent-autopr.service').read_text())
+            subprocess.run(['bash',str(ROOT/'scripts/uninstall-autostart.sh')],env=env,check=True,capture_output=True)
+            self.assertFalse((units/'augmentagent-autopr.service').exists())
+            self.assertFalse((units/'augmentagent-runtime.slice').exists())
+            self.assertFalse(dropin.exists())
+            self.assertIn('disable --now augmentagent-autopr.service',(base/'calls').read_text())
+            subprocess.run(command,env=env,check=True)
+            (units/'augmentagent-autopr.service').write_text('# user managed\n')
+            result=subprocess.run(command,env=env,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('preserving unmanaged unit',result.stderr)
+
+if __name__ == '__main__': unittest.main()

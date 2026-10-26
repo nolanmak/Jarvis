@@ -10572,6 +10572,7 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 /// must approve before any PR opens. Not-fixable verdicts stop after one
 /// call. Budget the daily cap accordingly.
 pub struct AutoPrLoop {
+    upgrade: Option<crate::autoship_worker::UpgradeWatch>,
     repo_root: PathBuf,
     dry_run: bool,
     interval: std::time::Duration,
@@ -11035,9 +11036,12 @@ impl AttemptRecord {
 /// charged; a failure `main` already has is handled by #931 instead.
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
+        ("storage busy:", "storage busy"),
+        ("build storage busy; retry admission", "storage busy"),
         ("no space left on device", "disk full"),
         // #1407 — the pre-gate free-space floor (`disk::LOW_DISK_REFUSAL`).
         ("gate refused: low disk", "disk low"),
+        ("storage admission:", "storage unavailable"),
         ("out of memory", "out of memory"),
         ("memory allocation of", "out of memory"),
         ("signal: 9", "killed (SIGKILL)"),
@@ -11519,6 +11523,7 @@ impl AutoPrLoop {
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
             .max(300);
         Some(Self {
+            upgrade: None,
             repo_root,
             dry_run,
             interval: std::time::Duration::from_secs(interval),
@@ -11543,6 +11548,7 @@ impl AutoPrLoop {
     #[cfg(test)]
     fn for_tests(repo_root: PathBuf, daily_cap: u32, state: &Path) -> Self {
         Self {
+            upgrade: None,
             repo_root,
             dry_run: true,
             interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
@@ -11555,12 +11561,27 @@ impl AutoPrLoop {
     }
 
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
+        let state = crate::build_storage::state_dir()?;
+        let _supervisor = RunLock::try_acquire(&state.join("autopr-supervisor.lock"))?
+            .context("another auto-ship supervisor is already running")?;
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         self.run_with(shutdown, Self::MAX_TICK, move || {
             let root = root.clone();
             async move { run_once(&root, dry_run).await }
         })
         .await
+    }
+
+    pub fn with_upgrade_watch(mut self, watch: crate::autoship_worker::UpgradeWatch) -> Self {
+        self.upgrade = Some(watch);
+        self
+    }
+
+    fn upgrade_boundary(&self) -> Result<()> {
+        if self.upgrade.as_ref().map(|w| w.changed()).transpose()?.unwrap_or(false) {
+            return Err(crate::autoship_worker::UpgradeRequested.into());
+        }
+        Ok(())
     }
 
     /// The loop body, over an injectable tick + budget (#954's wedge, tested).
@@ -11583,13 +11604,19 @@ impl AutoPrLoop {
         let counter_path = self.counter_path.clone();
         let mut counter = DailyCounter::load(&counter_path);
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("auto-PR loop stopped");
-                    return Ok(());
+            let next_tick = tokio::time::Instant::now() + self.interval;
+            loop {
+                self.upgrade_boundary()?;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!("auto-PR loop stopped");
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep_until(next_tick) => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if self.upgrade.is_some() => {}
                 }
-                _ = tokio::time::sleep(self.interval) => {}
             }
+            self.upgrade_boundary()?;
             // #1029 — finish already-approved drafts FIRST, and outside the
             // cap. This spends no reasoner call, so a reasoner budget must not
             // gate it; gating it is what let approved PRs sit for days.
@@ -11625,6 +11652,7 @@ impl AutoPrLoop {
             // refusal, so this burst is self-limiting.
             let mut triaged = 0u32;
             loop {
+                self.upgrade_boundary()?;
                 // #954 — bounded AND cancellable: the 15 h freeze swallowed
                 // shutdown, and awaiting a wedged run forever stopped every
                 // later tick. Abandoning one costs a single tick.
@@ -11699,6 +11727,44 @@ mod progress_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_contention_is_infrastructure_without_being_low_disk() {
+        assert_eq!(super::infra_failure_reason("storage busy: another writer reserved this space"), Some("storage busy"));
+        assert_eq!(super::infra_failure_reason("gate refused: low disk: 8 GB free"), Some("disk low"));
+        assert_eq!(super::infra_failure_reason("storage admission: cleanup failed: gate refused: low disk: 8 GB free"), Some("disk low"));
+    }
+
+    #[tokio::test]
+    async fn worker_upgrade_waits_for_the_run_and_persists_its_result() {
+        use super::*;
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "old").unwrap();
+        let _executing = std::fs::File::open(&binary).unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary));
+        worker.interval = std::time::Duration::from_millis(1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let (s, f) = (started.clone(), finish.clone());
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(),
+            std::time::Duration::from_secs(10), move || {
+                let (s, f) = (s.clone(), f.clone());
+                async move { s.notify_one(); f.notified().await; Ok(RunReport::built("synthetic finished run".into())) }
+            }));
+        started.notified().await;
+        let replacement = state.path().join("replacement");
+        std::fs::write(&replacement, "new").unwrap();
+        std::fs::rename(replacement, &binary).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "an upgrade must not cancel the active run");
+        finish.notify_one();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some());
+        let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs, 1, "finished work must be recorded before the worker reloads");
+    }
+
     #[test]
     fn source_inspection_presets_enforce_read_only_bridge_access() {
         use augmentagent_channel_core::codex_tools::BridgeLaunch;

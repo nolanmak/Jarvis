@@ -24,6 +24,7 @@ make_case() {
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
   printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
@@ -71,6 +72,12 @@ STUB
   cat > "$TMP/work/target/release/augmentagent" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$SYSTEMCTL_STUB_DIR/daemon-calls"
+if [ "$*" = 'disk build --help' ] && [ -n "${STORAGE_CODE:-}" ]; then
+  echo '--update'
+elif [ "${1:-} ${2:-}" = 'disk build' ] && [ -n "${STORAGE_CODE:-}" ]; then
+  echo 'storage admission fixture' >&2
+  exit "$STORAGE_CODE"
+fi
 STUB
   chmod +x "$TMP/work/target/release/augmentagent"
   # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
@@ -86,6 +93,24 @@ run_updater() {
 }
 
 echo "check-for-updates.sh stamp policy:"
+
+for storage_code in 73 75 76; do
+  make_case
+  export STORAGE_CODE="$storage_code"
+  run_updater 1; rc=$?
+  unset STORAGE_CODE
+  [ "$rc" -eq 0 ] && ok "storage $storage_code is a clean deferral" || bad "storage $storage_code is a clean deferral"
+  [ ! -s "$STAMP_FILE" ] && ok "storage $storage_code withholds stamp" || bad "storage $storage_code withholds stamp"
+  [ ! -f "$TMP/mainpid" ] && ok "storage $storage_code does not restart" || bad "storage $storage_code does not restart"
+  if grep -q 'RUST BUILD FAILED' "$TMP/state/augmentagent/update.log"; then
+    bad "storage $storage_code is not a compiler failure"
+  else ok "storage $storage_code is not a compiler failure"; fi
+  if [ "$storage_code" -eq 75 ]; then
+    grep -q 'update deferred: storage busy' "$TMP/state/augmentagent/update.log" && ok 'contention has its own label' || bad 'contention has its own label'
+    if grep -q 'low disk' "$TMP/state/augmentagent/update.log"; then bad 'contention is not low disk'; else ok 'contention is not low disk'; fi
+  fi
+  rm -rf "$TMP"
+done
 
 # A renderer install failure must stop deployment before restart/stamping.
 make_case

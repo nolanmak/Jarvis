@@ -224,6 +224,12 @@ check "defers while a run holds the lock" "$?" "0"
   && ok "records when the deferral began" \
   || bad "records when the deferral began" "stamp file empty/absent"
 
+# Process/cgroup/lock evidence is tested by auto_pr_worker_status_test.py.
+# At this boundary an attested worker permits deployment immediately.
+( external_autopr_isolated() { return 0; }; maybe_defer_restart >/dev/null 2>&1 )
+check "independent attested worker does not defer daemon update" "$?" "1"
+[ ! -e "$RESTART_DEFER_STAMP" ] && ok 'worker handoff clears old restart deferral' || bad 'worker handoff clears old restart deferral'
+
 # Still held but the budget is exhausted -> proceed anyway.
 printf '%s\n' "$(( $(date +%s) - 3000 ))" > "$AUGMENTAGENT_RESTART_DEFER_STAMP"
 maybe_defer_restart >/dev/null 2>&1
