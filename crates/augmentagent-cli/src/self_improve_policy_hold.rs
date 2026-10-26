@@ -449,8 +449,29 @@ else: sys.exit(2)
 
 /// Genuine requirement/evidence dependencies are free on unchanged inputs.
 /// A remote head, PR request, or linked issue request change reopens repair.
+fn dependency_inputs_match(marker: Option<&serde_json::Value>, current: &serde_json::Value, linked_issue: bool) -> bool {
+    let Some(marker) = marker else { return false; };
+    ["remote_head", "pr_body_hash"].iter().all(|key| marker[*key].as_str().is_some() && marker[*key] == current[*key])
+        && (!linked_issue || (marker["request_hash"].as_str().is_some() && marker["request_hash"] == current["request_hash"]))
+}
+fn reopen_dependency(store: &mut crate::autoship_workflow::WorkflowStore, id: &str,
+    expected: &crate::autoship_workflow::Checkpoint, current: serde_json::Value, now: i64) -> Result<bool> {
+    let Some(lease) = store.claim(id, &format!("free-dependency-reconcile:{}",uuid::Uuid::new_v4()), now, 10_000)? else { return Ok(false); };
+    let result = (|| {
+        let snapshot = store.snapshot(id)?.context("dependency workflow disappeared")?;
+        anyhow::ensure!(&snapshot.checkpoint == expected, "dependency checkpoint changed during reconciliation");
+        let mut checkpoint = snapshot.checkpoint;
+        checkpoint.evidence.push(current.to_string());
+        checkpoint.next.action = "retry_adjudicated_amendment".into();
+        checkpoint.next.reason = "dependency inputs recovered or changed; prior decision cannot cover them".into();
+        checkpoint.next.eligible_at_ms = now;
+        store.checkpoint(&lease, &checkpoint, now)
+    })();
+    store.release(&lease,now)?;
+    result.map(|_|true)
+}
 async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr) -> Option<&'static str> {
-    let store = crate::autoship_workflow::WorkflowStore::open(&workflow::path()).ok()?;
+    let mut store = match crate::autoship_workflow::WorkflowStore::open(&workflow::path()) { Ok(store)=>store, Err(_)=>return Some("dependency-evidence-unavailable") };
     let id = store.resolve_pr(&candidate.repository, candidate.pr).ok()??;
     let snapshot = store.snapshot(&id).ok()??;
     let reason = match snapshot.checkpoint.next.action.as_str() {
@@ -458,18 +479,53 @@ async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr) ->
         "dependency_new_adjudication_evidence" => "new-adjudication-evidence-required",
         _ => return None,
     };
-    let marker = snapshot.checkpoint.evidence.iter().filter_map(|item|serde_json::from_str::<serde_json::Value>(item).ok())
-        .find(|value|value["kind"] == "adjudicated_dependency");
-    let Some(marker) = marker else { return (snapshot.checkpoint.binding.head == candidate.head).then_some(reason); };
-    if marker["remote_head"].as_str() != Some(candidate.head.as_str()) { return None; }
-    let digest = crate::autoship_review::digest(candidate.body.as_bytes());
-    if marker["pr_body_hash"].as_str() != Some(digest.as_str()) { return None; }
-    if let (Some(issue), Some(expected)) = (candidate.source_issue,marker["request_hash"].as_str()) {
+    // A missing original snapshot is unknown, never proof that the owner's
+    // request is unchanged. Recover facts for free before reopening one attempt.
+    let request_hash = if let Some(issue) = candidate.source_issue {
         match run("gh", &["issue", "view", &issue.to_string(), "--json", "title,body"], repo).await {
-            Ok((true, current, _)) if crate::autoship_review::digest(current.as_bytes()) != expected => return None,
-            Ok((true, _, _)) => (),
+            Ok((true, raw, _)) if serde_json::from_str::<serde_json::Value>(&raw).ok()
+                .is_some_and(|v|v["title"].is_string()&&v["body"].is_string()) => Some(crate::autoship_review::digest(raw.as_bytes())),
             _ => return Some("dependency-evidence-unavailable"),
         }
+    } else { None };
+    let current = serde_json::json!({"kind":"adjudicated_dependency_reconciliation","remote_head":candidate.head,
+        "pr_body_hash":crate::autoship_review::digest(candidate.body.as_bytes()),"request_hash":request_hash});
+    let marker = snapshot.checkpoint.evidence.iter().filter_map(|item|serde_json::from_str::<serde_json::Value>(item).ok())
+        .find(|value|value["kind"] == "adjudicated_dependency");
+    if dependency_inputs_match(marker.as_ref(),&current,candidate.source_issue.is_some()) { return Some(reason); }
+    match reopen_dependency(&mut store,&id,&snapshot.checkpoint,current,chrono::Utc::now().timestamp_millis()) {
+        Ok(true)=>None,
+        Ok(false)=>Some("dependency-reconciliation-active"),
+        Err(_)=>Some("dependency-evidence-unavailable"),
     }
-    Some(reason)
+}
+
+#[cfg(test)]
+mod dependency_recovery_tests {
+    use super::*;
+    #[test]
+    fn issue_edit_after_failed_snapshot_reopens_durably_without_model_admission() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        let dir=tempfile::tempdir().unwrap();
+        let mut store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let id="owner/repo/pr/20";
+        store.register(id,"branch",Binding{head:"unchanged-head".into(),contract:"contract".into(),evidence_hash:"evidence".into()},1).unwrap();
+        let lease=store.claim(id,"initial",2,100).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;
+        checkpoint.next.action="dependency_owner_requirement_decision".into();
+        checkpoint.next.reason="snapshot issue fetch failed".into();
+        checkpoint.evidence=vec![serde_json::json!({"kind":"adjudicated_dependency","remote_head":"unchanged-head","pr_body_hash":"same-pr","request_hash":null}).to_string()];
+        store.checkpoint(&lease,&checkpoint,3).unwrap(); store.release(&lease,4).unwrap();
+        let current=serde_json::json!({"kind":"adjudicated_dependency_reconciliation","remote_head":"unchanged-head","pr_body_hash":"same-pr","request_hash":"edited-owner-request"});
+        let missing:serde_json::Value=serde_json::from_str(&checkpoint.evidence[0]).unwrap();
+        assert!(!dependency_inputs_match(Some(&missing),&current,true));
+        assert!(!dependency_inputs_match(None,&current,true));
+        assert!(reopen_dependency(&mut store,id,&checkpoint,current.clone(),5).unwrap());
+        drop(store);
+        let store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let recovered=store.snapshot(id).unwrap().unwrap();
+        assert_eq!(recovered.checkpoint.next.action,"retry_adjudicated_amendment");
+        assert!(recovered.checkpoint.evidence.contains(&current.to_string()));
+        assert!(dependency_inputs_match(Some(&current),&current,true));
+    }
 }
