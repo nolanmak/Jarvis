@@ -38,6 +38,11 @@ pub struct AgentError;
 /// durable delivery outbox. Never create a separate phone-only model history.
 #[async_trait]
 pub trait ConversationAgent: Send + Sync {
+    /// Resume a persisted task or retry its result delivery, without redialing.
+    async fn resume_task(&self, _call: &PhoneCall, _task_id: &str) -> Result<(), AgentError> {
+        Err(AgentError)
+    }
+
     async fn answer(
         &self,
         call: &PhoneCall,
@@ -652,8 +657,8 @@ pub enum EndReason {
     PeerClosed,
     /// A read or write on the socket failed.
     TransportError,
-    /// The call left the connected state or a stop was requested, including
-    /// an `end` we sent ourselves.
+    /// Reserved for explicit evidence that the owner hung up. A terminal
+    /// provider state or generic stop flag alone does not establish this.
     OwnerHangup,
     /// Call authority can no longer be verified.
     Revoked,
@@ -1693,11 +1698,51 @@ fn call_end_reason(service: &PhoneService, original: &PhoneCall) -> Option<EndRe
         tracing::warn!(call_id = %original.id, detail = "call_state_unavailable", "phone relay cannot verify call state");
         return Some(EndReason::Revoked);
     };
-    if current.stop_requested || current.state != CallState::Connected {
-        return Some(EndReason::OwnerHangup);
+    if service.authorize_call_origin(&current).is_err() {
+        return Some(EndReason::Revoked);
+    }
+    if let Some(reason) = observed_call_end(current.state, current.stop_requested) {
+        return Some(reason);
     }
     service
         .authorize_call(&original.id)
         .err()
         .map(|_| EndReason::Revoked)
+}
+
+// Generic cleanup and provider completion cannot identify who hung up.
+fn observed_call_end(state: CallState, stop_requested: bool) -> Option<EndReason> {
+    if state == CallState::Failed {
+        Some(EndReason::TransportError)
+    } else if stop_requested || state != CallState::Connected {
+        Some(EndReason::PeerClosed)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+    #[test]
+    fn provider_failure_and_cleanup_never_masquerade_as_owner_hangup() {
+        for stop in [false, true] {
+            assert_eq!(
+                observed_call_end(CallState::Failed, stop),
+                Some(EndReason::TransportError)
+            );
+            for state in [
+                CallState::Canceled,
+                CallState::Completed,
+                CallState::Uncertain,
+            ] {
+                assert_eq!(observed_call_end(state, stop), Some(EndReason::PeerClosed));
+            }
+        }
+        assert_eq!(
+            observed_call_end(CallState::Connected, true),
+            Some(EndReason::PeerClosed)
+        );
+        assert_eq!(observed_call_end(CallState::Connected, false), None);
+    }
 }

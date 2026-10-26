@@ -1812,3 +1812,83 @@ impl Store {
         })
     }
 }
+
+/// Intentionally lacks Debug/Serialize: descriptions and results are private.
+pub struct PhoneDispatchJob {
+    pub call_id: String,
+    pub task_id: String,
+    pub description: String,
+    pub state: String,
+    pub result: Option<String>,
+}
+impl Store {
+    /// Commit intent before telling the caller their work was accepted.
+    pub fn phone_enqueue_dispatch(
+        &self,
+        call_id: &str,
+        task_id: &str,
+        description: &str,
+    ) -> PhoneResult<()> {
+        identifier(task_id)?;
+        if description.trim().is_empty() || description.len() > 12_000 {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT description FROM phone_dispatch_jobs WHERE call_id=?1 AND task_id=?2",
+                    params![call_id, task_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                return if existing == description {
+                    Ok(())
+                } else {
+                    Err(PhoneError::Conflict)
+                };
+            }
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM phone_dispatch_jobs WHERE state != 'done'",
+                [],
+                |r| r.get(0),
+            )?;
+            if pending >= 128 {
+                return Err(PhoneError::RateLimited);
+            }
+            tx.execute("INSERT INTO phone_dispatch_jobs(call_id,task_id,description,state) VALUES(?1,?2,?3,'queued')",
+                params![call_id, task_id, description])?;
+            Ok(())
+        })
+    }
+    pub fn phone_pending_dispatches(&self) -> PhoneResult<Vec<PhoneDispatchJob>> {
+        Ok(self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT call_id,task_id,description,state,result FROM phone_dispatch_jobs WHERE state != 'done' ORDER BY rowid LIMIT 128")?;
+            let rows = stmt.query_map([], |r| Ok(PhoneDispatchJob {
+                call_id: r.get(0)?, task_id: r.get(1)?, description: r.get(2)?, state: r.get(3)?, result: r.get(4)?,
+            }))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })?)
+    }
+    /// Claim only immediately before invoking the native agent, after its queue wait.
+    pub fn phone_start_dispatch(&self, call_id: &str, task_id: &str) -> PhoneResult<bool> {
+        Ok(self.with_conn(|conn| conn.execute("UPDATE phone_dispatch_jobs SET state='running' WHERE call_id=?1 AND task_id=?2 AND state='queued'",
+            params![call_id, task_id]))? == 1)
+    }
+    /// Persist the answer before any attempt to enqueue its chat delivery.
+    pub fn phone_finish_dispatch(
+        &self,
+        call_id: &str,
+        task_id: &str,
+        result: &str,
+    ) -> PhoneResult<()> {
+        self.with_conn(|conn| conn.execute("UPDATE phone_dispatch_jobs SET state='ready',result=?3 WHERE call_id=?1 AND task_id=?2 AND state IN ('queued','running')",
+            params![call_id, task_id, result]))?;
+        Ok(())
+    }
+    pub fn phone_dispatch_delivered(&self, call_id: &str, task_id: &str) -> PhoneResult<()> {
+        self.with_conn(|conn| conn.execute("UPDATE phone_dispatch_jobs SET state='done',result=NULL WHERE call_id=?1 AND task_id=?2 AND state='ready'",
+            params![call_id, task_id]))?;
+        Ok(())
+    }
+}
