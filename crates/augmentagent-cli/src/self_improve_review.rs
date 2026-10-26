@@ -846,6 +846,7 @@ async fn run_impl(
             .flat_map(|p| p.findings.iter().cloned())
             .collect(),
     )?;
+    let mut final_recovered_contexts=BTreeMap::new();
     let supplemental_source_hashes=recovered_files.iter().map(|(p,b)|(p.clone(),aligned::digest(b.as_bytes()))).collect::<BTreeMap<_,_>>();
     let mut structured = aligned::ReviewEvidence {
         supplemental_source_hashes: supplemental_source_hashes.clone(),
@@ -886,11 +887,14 @@ async fn run_impl(
                 "supplemental_immutable_source": recovered_files,
             });
             final_source_evidence(&mut adjudication_evidence,&finding_evidence,context.acceptance_evidence.map(|(prepared,_)|prepared));
-            structured.adjudication = Some(final_authority::Input {
+            let resolved = final_authority::Input {
                 worktree:&worktree,guard:context.workflow,opts,review:&structured,contract:&contract,findings:&unresolved,
                 evidence:adjudication_evidence,source:&finding_evidence,finding_sources:&finding_source_keys,
                 attempts_already_made:context.adjudication_attempts_already_made,diagnostic,
-            }.run().await?);
+            }.run().await?;
+            structured.supplemental_source_hashes.extend(resolved.source_hashes);
+            final_recovered_contexts=resolved.recovered_contexts;
+            structured.adjudication=Some(resolved.receipt);
     }
     if let Some(workflow) = context.workflow {
         workflow.audit_health().await?;
@@ -911,6 +915,7 @@ async fn run_impl(
     );
     if let Some(guard) = context.workflow {
         let mut calibration_context=recovered_files.clone();
+        calibration_context.extend(final_recovered_contexts);
         if caller_plan.is_some() {
             // Preserve outcomes but do not treat a source manifest as replayable
             // source bytes. A replay must reconstruct these exact Git blobs.

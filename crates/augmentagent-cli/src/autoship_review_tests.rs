@@ -975,3 +975,30 @@ fn empty_candidate_target_is_not_an_executable_repair() {
     let raw=serde_json::json!({"binding":binding(),"rulings":{"empty":{"decision":"uphold","evidence":"source","repair_criterion":"edit support.rs now"}}}).to_string();
     assert!(validate_adjudicator_response(&raw,&binding(),&[item]).is_err(),"scope expansion must be independently amended before builder execution");
 }
+
+#[tokio::test]
+async fn fulfilled_source_request_is_corrected_instead_of_repeated_forever() {
+    struct Recovery { calls: AtomicUsize }
+    #[async_trait]
+    impl Reasoner for Recovery {
+        async fn call(&self, _: &ReasonerOpts, prompt:&str)->Result<String> {
+            let call=self.calls.fetch_add(1,Ordering::SeqCst);
+            let ruling=if call==0 {
+                serde_json::json!({"decision":"need_evidence","source_paths":["b.rs","a.rs"],"question":"where   is\n the caller?"})
+            } else {
+                assert!(prompt.contains("already fulfilled or refused"));
+                serde_json::json!({"decision":"need_evidence","source_paths":["actual/caller.rs"],"question":"Which branch invokes the callee?"})
+            };
+            Ok(serde_json::json!({"binding":binding(),"rulings":{"F1":ruling}}).to_string())
+        }
+    }
+    let history=evidence_request_key("F1",&["a.rs".into(),"b.rs".into()],"where is the caller?").unwrap();
+    let evidence=serde_json::json!({"controller_evidence_request_history":[history],"requested_source":{"source_status":[{"path":"a.rs","status":"unavailable"},{"path":"b.rs","status":"unavailable"}]}}).to_string();
+    let reasoner=Recovery{calls:AtomicUsize::new(0)};
+    let original=finding("F1");
+    let receipt=adjudicate(&reasoner,actor("codex","new-authority"),&builders(),opts(),binding(),&criteria(),&[original.clone()],&evidence,0).await.unwrap();
+    assert_eq!(reasoner.calls.load(Ordering::SeqCst),2);
+    assert_eq!(receipt.finding_fingerprints["F1"],original.fingerprint().unwrap());
+    assert!(matches!(&receipt.rulings["F1"],Ruling::NeedEvidence{source_paths,..} if source_paths==&vec!["actual/caller.rs".to_string()]));
+    assert!(review_authority(&binding(),&builders(),&passes(vec![original]),Some(&receipt)).is_err());
+}
