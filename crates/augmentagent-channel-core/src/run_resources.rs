@@ -44,6 +44,24 @@ pub fn check_requirement(
     .into())
 }
 
+pub(crate) fn admission_failed(
+    provider: &str,
+    logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
+    phase: &str,
+) -> Result<()> {
+    let observation = serde_json::json!({"phase":phase,"exhausted":true});
+    if let Some(logger) = logger.filter(|logger| logger.is_protected()) {
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;
+        logger.resource_capacity_exhausted(&observation)?;
+    }
+    Err(crate::reasoner::ReasonerError::ResourceCapacity {
+        provider: provider.into(),
+        message: "run resource admission evidence unavailable; reconcile capacity before retry"
+            .into(),
+    }
+    .into())
+}
+
 /// Install alongside provider-supervisor.py in its controller-private directory.
 pub fn install_helper(directory: &Path) -> Result<()> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};

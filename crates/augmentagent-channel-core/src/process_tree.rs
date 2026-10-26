@@ -38,13 +38,19 @@ impl ProcessGroup {
         while !ready.exists() {
             if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
                 self.resource_outcome(provider,logger)?;
-                return Err(crate::reasoner::ReasonerError::ResourceCapacity {provider:provider.into(),message:"provider launch admission unavailable".into()}.into());
+                return crate::run_resources::admission_failed(provider,logger,"launch_readiness_unavailable");
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         if self.resource_required {
-            let observation:serde_json::Value=serde_json::from_slice(&private_read(&self.receipt.with_file_name("resource-accounting.json"))?)?;
-            anyhow::ensure!(observation.get("phase").and_then(|v|v.as_str())==Some("admitted"),"resource admission not established");
+            let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
+                .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let Some(observation)=parsed.filter(|value|value.get("phase").and_then(|v|v.as_str())==Some("admitted")
+                && value.get("exhausted").and_then(|v|v.as_bool())==Some(false)
+                && value.pointer("/identity/limits").is_some_and(|v|v.is_object())) else {
+                self.resource_observed.store(true,Ordering::SeqCst);
+                return crate::run_resources::admission_failed(provider,logger,"admission_receipt_unavailable");
+            };
             if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
             }
@@ -750,6 +756,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");
         // Idle to the sweep, yet still unsettled, so recovery can act on it.
         assert!(request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_resource_admission_receipt_blocks_before_model_charge() {
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("effect");
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(directory.path().join("audit"),directory.path().join("anchor"),&[]).unwrap());
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
+        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let blocked=Arc::new(std::sync::atomic::AtomicUsize::new(0));let callback=blocked.clone();
+        logger.set_resource_capacity_observer(Arc::new(move |_|{callback.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
+        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        // Inject a missing required receipt after an ordinary test supervisor
+        // is created, without requiring systemd in this transport unit test.
+        group.resource_required=true;
+        let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
+        assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),Some(crate::reasoner::ReasonerError::ResourceCapacity {..})));
+        drop(group);child.wait().await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst),0);
+        assert_eq!(blocked.load(Ordering::SeqCst),1);
+        assert!(!effect.exists());
     }
 
     #[tokio::test]
