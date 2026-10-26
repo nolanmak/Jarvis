@@ -1,7 +1,7 @@
 //! Windowed observations from controller records. Missing history and unknown
 //! token usage are explicit; approvals and PR creation are never shipping.
 use crate::autoship_workflow::{Binding, OperationKind};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::Serialize;
 use std::{collections::BTreeSet, path::Path};
@@ -108,18 +108,81 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
     })
 }
 
+/// Calendar boundaries are derived in the reporting timezone, never by adding
+/// 24 hours. UTC event timestamps and resource reservations remain unchanged.
+fn local_day_bounds<T: chrono::TimeZone>(now: &chrono::DateTime<T>) -> Result<(i64, i64)> {
+    let date = now.date_naive();
+    let next = date.succ_opt().context("local reporting date overflow")?;
+    let midnight = |day: chrono::NaiveDate| -> Result<i64> {
+        now.timezone()
+            .from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .map(|time| time.timestamp_millis())
+            .context("local reporting midnight does not exist in configured timezone")
+    };
+    Ok((midnight(date)?, midnight(next)?))
+}
+
 pub fn summary(since: i64, until: i64) -> Result<String> {
     let window = read(&crate::autoship_workflow::default_path(), since, until)?;
+    let now = chrono::DateTime::from_timestamp_millis(until)
+        .context("invalid report timestamp")?
+        .with_timezone(&chrono::Local);
+    let (day_start, day_end) = local_day_bounds(&now)?;
+    let local = if until > day_start {
+        Some(read(
+            &crate::autoship_workflow::default_path(),
+            day_start,
+            until,
+        )?)
+    } else {
+        None
+    };
+    let day_summary = format!(" Local calendar day {} (host timezone offset {}; UTC boundaries {}..{}; observed through {}): {} autonomous merges, {} model calls, {} ms observed execution. Calendar-day reporting does not reset resource reservations.",
+        now.date_naive(), now.offset(), day_start, day_end, until,
+        local.as_ref().map_or(0, |row| row.autonomous_merges),
+        local.as_ref().map_or(0, |row| row.model_calls),
+        local.as_ref().map_or(0, |row| row.observed_wall_ms));
     Ok(format!("Autonomous merges with accepted mutation proof: {}; confirmed merge operations including unattributed observations: {}; workflows with recorded activity: {}; model calls: {}; observed execution time: {} ms; reported tokens: {}. First recorded event (UTC epoch ms): {:?}. Historical charge receipts without timestamps: {} (excluded from window totals). These records do not prove continuous observation or complete token metering. Manual merges and lost responses without accepted mutation proof are excluded from autonomous throughput.",
         window.autonomous_merges, window.confirmed_merge_operations, window.active_workflows, window.model_calls,
         window.observed_wall_ms, window.reported_tokens, window.first_recorded_event_ms,
-        window.charges_without_timestamp))
+        window.charges_without_timestamp) + &day_summary)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::autoship_workflow::{ResourceCharge, WorkflowStore};
+
+    #[test]
+    fn local_reporting_days_follow_dst_and_not_utc_midnight() {
+        use chrono::TimeZone;
+        let zone = chrono_tz::America::New_York;
+        for (month, day, hours) in [(3, 8, 23), (11, 1, 25), (10, 26, 24)] {
+            let now = zone
+                .with_ymd_and_hms(2026, month, day, 12, 0, 0)
+                .single()
+                .unwrap();
+            let (start, end) = local_day_bounds(&now).unwrap();
+            assert_eq!(end - start, hours * 60 * 60 * 1000);
+            let midnight = zone.timestamp_millis_opt(start).single().unwrap();
+            assert_eq!(midnight.date_naive(), now.date_naive());
+            assert_eq!(
+                midnight.time(),
+                chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+            );
+        }
+        let now = zone
+            .with_ymd_and_hms(2026, 10, 26, 23, 30, 0)
+            .single()
+            .unwrap();
+        let (start, end) = local_day_bounds(&now).unwrap();
+        assert!(start < now.timestamp_millis() && now.timestamp_millis() < end);
+        assert_ne!(
+            now.date_naive(),
+            now.with_timezone(&chrono::Utc).date_naive()
+        );
+    }
 
     #[test]
     fn only_response_bound_accepted_merges_count_toward_autonomous_throughput() {
