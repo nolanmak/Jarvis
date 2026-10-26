@@ -406,7 +406,8 @@ impl SweepGuard {
             let reference = reference.context("protected acceptance checkpoint missing")?;
             acceptance::assert_sweep_receipt(
                 &worktree,
-                &acceptance::control_directory(&inner.repository)?,
+                &acceptance::control_directories(&inner.repository, inner.id())?
+                    .workflow_acceptance,
                 self.source,
                 &reference,
                 expected,

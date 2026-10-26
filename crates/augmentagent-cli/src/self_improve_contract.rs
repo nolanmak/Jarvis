@@ -1386,6 +1386,36 @@ pub(super) fn control_directory(repository: &str) -> Result<PathBuf> {
         .join("autoship-acceptance")
         .join(format!("{:x}", Sha256::digest(repository.as_bytes()))))
 }
+/// Repository policy is shared; mutable contract/amendment transactions belong
+/// to one durable workflow, including its issue-to-PR alias across publication.
+pub(super) struct ControlDirectories {
+    pub repository_policy: PathBuf,
+    pub workflow_acceptance: PathBuf,
+}
+pub(super) fn control_directories(
+    repository: &str,
+    workflow_id: &str,
+) -> Result<ControlDirectories> {
+    ensure!(
+        !workflow_id.is_empty() && workflow_id.len() <= 1024,
+        "workflow identity required for acceptance namespace"
+    );
+    Ok(control_directories_at(
+        control_directory(repository)?,
+        workflow_id,
+    ))
+}
+fn control_directories_at(repository_policy: PathBuf, workflow_id: &str) -> ControlDirectories {
+    use sha2::{Digest, Sha256};
+    let workflow_acceptance = repository_policy
+        .join("workflows")
+        .join(format!("{:x}", Sha256::digest(workflow_id.as_bytes())));
+    ControlDirectories {
+        repository_policy,
+        workflow_acceptance,
+    }
+}
+
 pub(super) fn worker_roots(worktree: &Path) -> Vec<PathBuf> {
     let mut roots = vec![worktree.to_path_buf()];
     let target = crate::build_storage::effective_target(worktree);
@@ -1650,6 +1680,26 @@ pub(super) async fn assert_verifier_receipt_current(
 }
 
 #[cfg(test)]
+mod control_namespace_tests {
+    use super::*;
+    #[test]
+    fn same_issue_pr_workflows_isolate_contracts_but_share_repository_policy() {
+        let root = PathBuf::from("/protected/repository");
+        let issue = control_directories_at(root.clone(), "owner/repo#issue:42");
+        let first = control_directories_at(root.clone(), "owner/repo#pr:7");
+        let second = control_directories_at(root.clone(), "owner/repo#pr:8");
+        assert_ne!(issue.workflow_acceptance, first.workflow_acceptance);
+        assert_ne!(first.workflow_acceptance, second.workflow_acceptance);
+        assert_eq!(first.repository_policy, second.repository_policy);
+        assert_eq!(
+            issue.workflow_acceptance,
+            control_directories_at(root, "owner/repo#issue:42").workflow_acceptance,
+            "published issue workflow keeps its durable identity namespace"
+        );
+    }
+}
+
+#[cfg(test)]
 mod verifier_cache_tests {
     use super::*;
     #[test]
@@ -1823,6 +1873,14 @@ pub(super) async fn assert_sweep_receipt(
         .alignment
         .as_ref()
         .context("sweep alignment evidence missing")?;
+    let repository_policy = control
+        .parent()
+        .and_then(Path::parent)
+        .context("workflow acceptance control missing repository parent")?;
+    ensure!(
+        alignment.policy_root == repository_policy,
+        "alignment policy root differs from controller workflow namespace"
+    );
     ensure!(
         alignment.artifact.parent() == Some(control.as_path()),
         "sweep alignment evidence escaped protected store"

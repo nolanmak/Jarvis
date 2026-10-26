@@ -6584,7 +6584,7 @@ async fn resume_draft_pr(
         return Ok(RunReport::held(format!("PR #{pr}: durable workflow is leased or deferred")));
     };
     workflow.bind_reasoner(reasoner.as_ref())?;
-    let acceptance_control = acceptance::control_directory(&repository)?;
+    let acceptance_control = acceptance::control_directories(&repository, workflow.id())?.workflow_acceptance;
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
     let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
@@ -8056,7 +8056,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .map(|s| s.criteria.clone())
         .unwrap_or_default();
 
-    let acceptance_control = acceptance::control_directory(&repository)?;
+    let acceptance_control = acceptance::control_directories(&repository, workflow_guard.id())?.workflow_acceptance;
     let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
         issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {

@@ -174,7 +174,7 @@ async fn execute(
     guard: &mut workflow::WorkflowGuard,
 ) -> Result<RunReport> {
     let source = AcceptanceSource::PullRequest(pr.pr);
-    let control = acceptance::control_directory(&pr.repository)?;
+    let control = acceptance::control_directories(&pr.repository, guard.id())?.workflow_acceptance;
     let (ok, base, error) = run("git", &["merge-base", "origin/main", "HEAD"], worktree).await?;
     anyhow::ensure!(ok, "cannot resolve adopted acceptance baseline: {error}");
     let mut prepared = acceptance::prepare_acceptance_for(

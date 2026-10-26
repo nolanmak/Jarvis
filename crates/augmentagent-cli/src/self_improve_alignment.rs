@@ -21,6 +21,7 @@ pub(super) struct Reference {
     pub base: String,
     pub contract_hash: String,
     pub policy_hash: String,
+    pub policy_root: PathBuf,
     pub artifact: PathBuf,
     pub artifact_sha256: String,
 }
@@ -56,6 +57,7 @@ struct Artifact {
     base: String,
     contract_hash: String,
     policy_hash: String,
+    policy_root: PathBuf,
     reviewer: String,
     origin: crate::autoship_review::ReviewOrigin,
     native_sessions: Vec<String>,
@@ -543,12 +545,15 @@ pub(super) async fn gate_for(
         .trim()
         .to_owned();
     let contract_hash = prepared.baseline.registration.contract_hash().to_owned();
+    let policy_root =
+        acceptance::control_directories(workflow.repository(), workflow.id())?.repository_policy;
+    std::fs::create_dir_all(&policy_root)?;
     // Learning is optional enrichment. Existing promoted rules remain mandatory;
     // an unavailable miner cannot turn a healthy shipping pipeline into a hold.
-    if let Err(error) = learning::learn(builder, root, prepared, control, workflow).await {
+    if let Err(error) = learning::learn(builder, root, prepared, &policy_root, workflow).await {
         tracing::warn!(error = %error, "autoship constraint learning deferred");
     }
-    let (rules, policy_hash) = policy(control)?;
+    let (rules, policy_hash) = policy(&policy_root)?;
     let evidence = hunks(root, &base, &head).await?;
     let actual: Vec<_> = evidence.iter().map(|e| e.hunk.clone()).collect();
     for hunk in &actual {
@@ -701,6 +706,7 @@ pub(super) async fn gate_for(
         base: base.clone(),
         contract_hash: contract_hash.clone(),
         policy_hash: policy_hash.clone(),
+        policy_root: policy_root.clone(),
         reviewer: provider.name().into(),
         origin,
         native_sessions,
@@ -725,6 +731,7 @@ pub(super) async fn gate_for(
         base,
         contract_hash,
         policy_hash,
+        policy_root,
         artifact: path,
         artifact_sha256,
     })
@@ -747,6 +754,7 @@ pub(super) async fn assert_current(
             && artifact.base == reference.base
             && artifact.contract_hash == reference.contract_hash
             && artifact.policy_hash == reference.policy_hash
+            && artifact.policy_root == reference.policy_root
             && reference.contract_hash == prepared.baseline.registration.contract_hash(),
         "alignment receipt binding mismatch"
     );
@@ -756,13 +764,7 @@ pub(super) async fn assert_current(
         "alignment candidate/base moved"
     );
     ensure!(
-        policy(
-            reference
-                .artifact
-                .parent()
-                .context("alignment control missing")?
-        )?
-        .1 == reference.policy_hash,
+        policy(&reference.policy_root)?.1 == reference.policy_hash,
         "alignment promoted constraints changed"
     );
     assess(prepared, &artifact.hunks, &artifact.mappings)?;

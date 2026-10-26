@@ -102,7 +102,7 @@ pub(crate) async fn run(
     workflow: &workflow::WorkflowGuard,
     prompt: &str,
 ) -> Result<String> {
-    let control = control_directory(repository)?;
+    let control = control_directories(repository, workflow.id())?.workflow_acceptance;
     std::fs::create_dir_all(&control)?;
     let control = control.canonicalize()?;
     ensure!(
