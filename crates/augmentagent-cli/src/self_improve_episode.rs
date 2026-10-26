@@ -61,7 +61,9 @@ pub(super) async fn evaluate(
                 &r.binding.environment_id
             ))?)
         ),
-        None => format!("incomplete:{}", workflow.binding().contract),
+        None => workflow
+            .prior_episode_epoch()?
+            .unwrap_or_else(|| format!("uninitialized:{}", workflow.binding().contract)),
     };
     let review_receipt = serde_json::to_vec(&structured)?;
     let observation = Observation {

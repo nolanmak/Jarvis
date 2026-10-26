@@ -454,6 +454,22 @@ impl WorkflowGuard {
         }))
     }
 
+    pub(super) fn prior_episode_epoch(&self) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .events(self.id())?
+            .into_iter()
+            .rev()
+            .filter(|(_, kind, _, _)| kind == "episode_observed")
+            .filter_map(|(_, _, raw, _)| {
+                serde_json::from_str::<crate::autoship_episode::Observation>(&raw).ok()
+            })
+            .find(|observation| observation.candidate.binding.contract == self.binding.contract)
+            .map(|observation| observation.epoch))
+    }
+
     pub(super) fn observe_episode(
         &self,
         observation: &crate::autoship_episode::Observation,
