@@ -70,6 +70,10 @@ Seen is not done: **Mark as seen** only records that you read the alert, while
   external reply also resolves a reply task in that account/thread, but cannot
   complete preparation. Merely reading an email does not resolve anything.
 
+The clicked Discord card refreshes its heading and controls from saved state without
+mentioning the owner again. Seen cards retain the done control; done cards remove
+controls. Older cards remain safe to click and refresh on interaction.
+
 Meeting cancellation resolves linked preparation. Rescheduling moves inferred
 cutoffs and rearms preparation triggers, retaining the lifetime notice cap.
 Explicit sender deadlines are not rewritten by calendar movement. Tracked events
