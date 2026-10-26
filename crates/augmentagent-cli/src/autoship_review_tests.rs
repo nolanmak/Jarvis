@@ -820,3 +820,51 @@ async fn repeated_invalid_adjudication_is_bounded_without_approval() {
     .is_err());
     assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn correction_checks_complete_prompt_budget_before_second_dispatch() {
+    struct Boundary { calls: AtomicUsize }
+    #[async_trait]
+    impl Reasoner for Boundary {
+        async fn call(&self, opts: &ReasonerOpts, prompt: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(prompt.len() + opts.system_prompt.len() <= MAX_PROMPT_BYTES);
+            // Any invalid response requires correction text; the first request has one byte spare.
+            Ok(serde_json::json!({"binding":binding(),"rulings":{
+                "F1":{"decision":"dismiss","evidence":"source","rationale":"fixture"},
+                "unknown":{"decision":"dismiss","evidence":"source","rationale":"fixture"}
+            }}).to_string())
+        }
+    }
+    let reasoner=Boundary { calls:AtomicUsize::new(0) };
+    let empty=serde_json::to_string(&serde_json::json!({"binding":binding(),"acceptance_criteria":criteria(),
+        "findings":[finding("F1")],"candidate_evidence":""})).unwrap();
+    let evidence="e".repeat(MAX_PROMPT_BYTES-ADJUDICATOR_SYSTEM_PROMPT.len()-empty.len()-1);
+    let error=adjudicate(&reasoner,actor("codex","adjudication-1"),&builders(),opts(),binding(),
+        &criteria(),&[finding("F1")],&evidence,0).await.unwrap_err();
+    assert!(error.to_string().contains("budget"),"{error:#}");
+    assert_eq!(reasoner.calls.load(Ordering::SeqCst),1,"oversized correction must not dispatch");
+}
+
+#[tokio::test]
+async fn correction_uses_two_distinct_fresh_native_protocol_sessions() {
+    struct Protocol { calls:AtomicUsize }
+    #[async_trait]
+    impl Reasoner for Protocol {
+        async fn call(&self,_:&ReasonerOpts,_:&str)->Result<String> {
+            use augmentagent_channel_core::{native_session::{current_for,Launch},ProviderKind::Codex};
+            let index=self.calls.fetch_add(1,Ordering::SeqCst);
+            let session=current_for(Codex)?.context("missing fresh scope")?;
+            let mut lease=session.begin(Codex)?;
+            assert_eq!(lease.launch(),Launch::Create{requested_id:None});
+            lease.observe(&format!("protocol-only-session-{index}"))?;
+            lease.finish()?;
+            Ok(if index==0 { "invalid JSON".into() } else {Scripted::dismiss(&[finding("F1")]).output})
+        }
+    }
+    let reasoner=Protocol{calls:AtomicUsize::new(0)};
+    let receipt=adjudicate_with_origin(&reasoner,actor("codex","adjudication-1"),&builders(),opts(),binding(),
+        &criteria(),&[finding("F1")],"synthetic protocol fixture",0,&ReviewOrigin::RecordedBuilders,true).await.unwrap();
+    assert_eq!(reasoner.calls.load(Ordering::SeqCst),2);
+    assert_eq!(receipt.actor.session_id,"protocol-only-session-1");
+}

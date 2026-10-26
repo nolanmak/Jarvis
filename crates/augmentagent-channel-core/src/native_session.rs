@@ -73,7 +73,9 @@ impl FreshBuilderSessions {
 
 /// Actual transport selection happens after fallback chooses a provider.
 /// A nested independent review must override even a fresh builder episode.
-pub(crate) fn current_for(provider: ProviderKind) -> anyhow::Result<Option<Arc<NativeSession>>> {
+/// Transport adapters use this protocol handle; observing an ID here alone is
+/// not evidence that a real provider CLI executed.
+pub fn current_for(provider: ProviderKind) -> anyhow::Result<Option<Arc<NativeSession>>> {
     if !is_fresh_review() {
         if let Ok(session) = FRESH_BUILDERS.try_with(|sessions| sessions.session(provider)) {
             return session;
