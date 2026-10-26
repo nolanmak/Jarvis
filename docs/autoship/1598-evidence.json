@@ -207,16 +207,17 @@
   },
   "validation": {
     "foundation": {
-      "passed": 56,
+      "passed": 71,
       "failed": 0,
-      "note": "Before latest episode production wiring and native fresh-session changes."
+      "revision": "9c09d9da",
+      "note": "Includes review authority, workflow, metrics/local-calendar DST and publication evidence foundations."
     },
     "self_improve": {
-      "passed": 379,
-      "failed": 2,
+      "passed": 388,
+      "failed": 0,
       "ignored": 7,
-      "revision": "20a6accf",
-      "note": "Completed managed single-job run. Failures: merge-sweep fixture missing real acceptance artifact; diagnostic canary fixture nested storage admission. Fixes in progress; later integration not covered by this result."
+      "revision": "36a6a07e",
+      "note": "Complete managed single-job recovery suite; includes real protected sweep acceptance, isolated verifier canary fixture, workflow namespace, final amendments and calibration fixture tests. Later dependency recovery/native harness/replay corrections need separate validation."
     },
     "kernel_scope": {
       "passed": 6,
@@ -251,7 +252,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "One local managed Rust build/test at a time; capability inventory validation currently running.",
+    "latest_rust_admission": "One local managed build/test at a time; notification regression suite currently compiling.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -272,6 +273,12 @@
       "failed": 0,
       "revision": "7b58c519",
       "note": "Embedded guard helpers now trigger rebuild through standard updater."
+    },
+    "capability_inventory": {
+      "passed": 10,
+      "failed": 0,
+      "revision": "6896aaa6",
+      "note": "Before adding calibration entry; full production inventory and bridge contract suite."
     }
   },
   "remaining_cross_cutting_acceptance": [
