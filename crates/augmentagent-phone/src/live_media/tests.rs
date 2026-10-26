@@ -594,3 +594,74 @@ async fn saturated_task_queue_returns_refusal_commentary_and_keeps_audio_connect
     ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"2","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), backend).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn provider_audio_burst_waits_for_playback_capacity_without_hanging_up() {
+    let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f = fixture(format!("ws://{}/", provider.local_addr().unwrap())).await;
+    let backend = tokio::spawn(async move {
+        let (tcp, _) = provider.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        ws.next().await.unwrap().unwrap();
+        ws.send(Message::Text(json!({"type":"session.started","event_id":"started","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        for byte in [128, 129] {
+            ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode(vec![byte;16_000])}).to_string().into())).await.unwrap();
+        }
+        let close = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+        let close: serde_json::Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
+        assert_eq!(close["type"], "session.close");
+        ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","session":{"id":"live-test"},"reason":"close_requested","usage":{"seconds":0.5}}).to_string().into())).await.unwrap();
+    });
+    let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    let first = ws.next().await.unwrap().unwrap();
+    let first: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(STANDARD.decode(first["media"]["payload"].as_str().unwrap()).unwrap(), vec![128;16_000]);
+    let mark = ws.next().await.unwrap().unwrap();
+    let mark: serde_json::Value = serde_json::from_str(mark.to_text().unwrap()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!f.service.store.phone_provider_call(&f.id).unwrap().stop_requested, "temporary playback pressure must not stop the call");
+    ws.send(Message::Text(json!({"event":"mark","sequenceNumber":"2","streamSid":"MZ-test","mark":mark["mark"]}).to_string().into())).await.unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+    let second: serde_json::Value = serde_json::from_str(second.to_text().unwrap()).unwrap();
+    assert_eq!(STANDARD.decode(second["media"]["payload"].as_str().unwrap()).unwrap(), vec![129;16_000]);
+    ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"3","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), backend).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn provider_audio_burst_keeps_caller_audio_and_stop_live() {
+    let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f = fixture(format!("ws://{}/", provider.local_addr().unwrap())).await;
+    let backend = tokio::spawn(async move {
+        let (tcp, _) = provider.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        ws.next().await.unwrap().unwrap();
+        ws.send(Message::Text(json!({"type":"session.started","event_id":"started","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        for byte in [128, 129] {
+            ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode(vec![byte;16_000])}).to_string().into())).await.unwrap();
+        }
+        let input = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+        let input: serde_json::Value = serde_json::from_str(input.to_text().unwrap()).unwrap();
+        assert_eq!(input["type"], "session.input_audio.append");
+        let close = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+        let close: serde_json::Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
+        assert_eq!(close["type"], "session.close");
+        ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","session":{"id":"live-test"},"reason":"close_requested","usage":{"seconds":0.5}}).to_string().into())).await.unwrap();
+    });
+    let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    let first = ws.next().await.unwrap().unwrap();
+    let first: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(STANDARD.decode(first["media"]["payload"].as_str().unwrap()).unwrap(), vec![128;16_000]);
+    let mark = ws.next().await.unwrap().unwrap();
+    let mark: serde_json::Value = serde_json::from_str(mark.to_text().unwrap()).unwrap();
+    assert_eq!(mark["event"], "mark");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!f.service.store.phone_provider_call(&f.id).unwrap().stop_requested, "temporary playback pressure must not stop the call");
+    ws.send(Message::Text(json!({"event":"media","sequenceNumber":"2","streamSid":"MZ-test","media":{"track":"inbound","chunk":"1","timestamp":"0","payload":STANDARD.encode([255;160])}}).to_string().into())).await.unwrap();
+    ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"3","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), backend).await.unwrap().unwrap();
+}
