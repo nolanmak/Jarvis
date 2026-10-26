@@ -198,6 +198,9 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS episode_action (
+                workflow TEXT NOT NULL REFERENCES workflow(id), epoch TEXT NOT NULL, action TEXT NOT NULL,
+                at_ms INTEGER NOT NULL, PRIMARY KEY(workflow,epoch,action));
             CREATE TABLE IF NOT EXISTS fresh_review_origin (
                 receipt TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id), binding TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS imported_origin (
@@ -901,6 +904,48 @@ impl WorkflowStore {
 
     /// Fenced, idempotent convergence accounting. Full observations remain in
     /// the journal; only the bounded best-candidate controller state is folded.
+    pub fn admit_episode_action(
+        &mut self,
+        lease: &Lease,
+        epoch: &str,
+        action: &str,
+        now: i64,
+    ) -> Result<bool> {
+        ensure!(
+            matches!(action, "fresh_session" | "rescope"),
+            "unknown episode action"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let state: String = tx.query_row(
+            "SELECT state FROM episode_state WHERE workflow=?1",
+            [&lease.workflow],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            serde_json::from_str::<crate::autoship_episode::Episode>(&state)?.epoch == epoch,
+            "episode action epoch changed"
+        );
+        let inserted = tx.execute(
+            "INSERT INTO episode_action VALUES(?1,?2,?3,?4) ON CONFLICT DO NOTHING",
+            params![lease.workflow, epoch, action, now],
+        )? == 1;
+        if inserted {
+            event(
+                &tx,
+                &lease.workflow,
+                lease.generation,
+                "episode_action_admitted",
+                action,
+                now,
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     pub fn observe_episode(
         &mut self,
         lease: &Lease,
@@ -1082,6 +1127,62 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, lease)
+    }
+    #[test]
+    fn episode_dispatch_is_fenced_and_once_per_epoch_across_restart() {
+        use crate::autoship_episode::{Candidate, Observation};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (mut store, lease) = setup(&path);
+        let mut observation = Observation {
+            receipt: "review-1".into(),
+            epoch: "epoch-a".into(),
+            candidate: Candidate {
+                binding: binding(),
+                tests_passed: true,
+                guards_passed: true,
+                verified_criteria: 1,
+                open_findings: ["finding".into()].into_iter().collect(),
+                lines_changed: 1,
+            },
+            review_complete: true,
+            contradictory_requirements: false,
+            infrastructure_failed: false,
+            autonomous_merge_observed: false,
+        };
+        store.observe_episode(&lease, &observation, 30).unwrap();
+        assert!(store
+            .admit_episode_action(&lease, "epoch-a", "fresh_session", 31)
+            .unwrap());
+        assert!(store
+            .admit_episode_action(&lease, "epoch-a", "rescope", 32)
+            .unwrap());
+        drop(store);
+        let mut store = WorkflowStore::open(&path).unwrap();
+        for action in ["fresh_session", "rescope"] {
+            assert!(!store
+                .admit_episode_action(&lease, "epoch-a", action, 33)
+                .unwrap());
+        }
+        assert!(store
+            .admit_episode_action(&lease, "epoch-b", "rescope", 34)
+            .is_err());
+        let next = store
+            .claim(&lease.workflow, "new-worker", 1021, 1000)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .admit_episode_action(&lease, "epoch-a", "rescope", 1022)
+            .is_err());
+        observation.epoch = "epoch-b".into();
+        observation.receipt = "review-2".into();
+        store.observe_episode(&next, &observation, 1023).unwrap();
+        assert!(store
+            .admit_episode_action(&next, "epoch-b", "rescope", 1024)
+            .unwrap());
+        assert!(!store
+            .admit_episode_action(&next, "epoch-b", "rescope", 1025)
+            .unwrap());
     }
     #[test]
     fn reopening_recovers_checkpoint_and_uncertain_remote_operation() {

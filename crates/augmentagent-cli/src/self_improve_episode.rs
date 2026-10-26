@@ -170,12 +170,26 @@ pub(super) async fn session(
     workflow: &mut workflow::WorkflowGuard,
     prepared: &acceptance::PreparedAcceptance,
     evaluated: &Evaluated,
-) -> Result<RepairSession> {
+) -> Result<Option<RepairSession>> {
     let (best, rescope) = match &evaluated.decision {
         Decision::FreshSession { best_head } => (best_head, false),
         Decision::Rescope { best_head } => (best_head, true),
         _ => anyhow::bail!("episode does not request a new repair context"),
     };
+    if !workflow.admit_episode_action(
+        &evaluated.epoch,
+        if rescope { "rescope" } else { "fresh_session" },
+    )? {
+        workflow
+            .transition(
+                crate::autoship_workflow::Stage::Build,
+                "episode_strategy_already_dispatched",
+                "repair_remaining_facts",
+                chrono::Utc::now().timestamp_millis() + 300_000,
+            )
+            .await?;
+        return Ok(None);
+    }
     workflow
         .transition(
             crate::autoship_workflow::Stage::Reconcile,
@@ -224,7 +238,7 @@ pub(super) async fn session(
     let mut opts = fix_opts(root.to_path_buf());
     // Stable across recovery of this one episode; retries do not mint a second fresh session.
     opts.session_id = Some(uuid::Uuid::from_bytes(bytes).to_string());
-    Ok(RepairSession { opts, prompt })
+    Ok(Some(RepairSession { opts, prompt }))
 }
 
 #[cfg(test)]

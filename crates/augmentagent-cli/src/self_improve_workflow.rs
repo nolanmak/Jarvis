@@ -454,6 +454,14 @@ impl WorkflowGuard {
         }))
     }
 
+    pub(super) fn admit_episode_action(&self, epoch: &str, action: &str) -> Result<bool> {
+        self.validate_before_side_effect()?;
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_episode_action(&self.lease, epoch, action, millis())
+    }
+
     pub(super) fn prior_episode_epoch(&self) -> Result<Option<String>> {
         Ok(self
             .store

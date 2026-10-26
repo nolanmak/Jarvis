@@ -7195,12 +7195,14 @@ async fn resume_draft_pr(
             prepared_acceptance.proposal.contract.criteria.len(),lines_now).await?;
         let episode_session = match &evaluated.decision {
             crate::autoship_episode::Decision::FreshSession { .. } => {
-                rounds_done = 0; prior_qa = None; prior_notes = None;
-                Some(episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?)
+                let session = episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?;
+                if session.is_some() { rounds_done = 0; prior_qa = None; prior_notes = None; }
+                session
             }
             crate::autoship_episode::Decision::Rescope { .. } if !episode_rescoped => {
-                episode_rescoped = true; rounds_done = 0; prior_qa = None; prior_notes = None;
-                Some(episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?)
+                episode_rescoped = true; let session = episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?;
+                if session.is_some() { rounds_done = 0; prior_qa = None; prior_notes = None; }
+                session
             }
             crate::autoship_episode::Decision::Rescope { .. } => {
                 workflow.transition(Stage::Scope,"episode_rescope_pending","rescope_remaining_findings",chrono::Utc::now().timestamp_millis()+300_000).await?;
@@ -8632,12 +8634,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         prepared_acceptance.proposal.contract.criteria.len(),lines).await?;
                     match &evaluated.decision {
                         crate::autoship_episode::Decision::FreshSession { .. } => {
-                            round = 0; prior_attempts = None;
-                            episode_session = Some(episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?);
+                            episode_session = episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?;
+                            if episode_session.is_some() { round = 0; prior_attempts = None; }
                         }
                         crate::autoship_episode::Decision::Rescope { .. } if !episode_rescoped => {
-                            episode_rescoped = true; round = 0; prior_attempts = None;
-                            episode_session = Some(episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?);
+                            episode_rescoped = true; episode_session = episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?;
+                            if episode_session.is_some() { round = 0; prior_attempts = None; }
                         }
                         crate::autoship_episode::Decision::Rescope { .. } => {
                             workflow_guard.transition(crate::autoship_workflow::Stage::Scope,"episode_rescope_pending","rescope_remaining_findings",chrono::Utc::now().timestamp_millis()+300_000).await?;
