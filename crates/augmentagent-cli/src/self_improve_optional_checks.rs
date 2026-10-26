@@ -85,7 +85,10 @@ pub(super) async fn classify_with_gh(root: &Path, gh: &str, pr: u64, raw: &str) 
         }
     }
     for row in &mut rows {
-        if matches!(
+        if !matches!(
+            row["state"].as_str(),
+            Some("SUCCESS" | "SKIPPED" | "NEUTRAL")
+        ) && matches!(
             row["name"].as_str(),
             Some(
                 "Eligibility gate"

@@ -255,7 +255,7 @@ elif args[:2]==['pr','checks']:
  out=[{'name':'tests','state':'SUCCESS','bucket':'pass'},{'name':name,'state':'FAILURE','bucket':'fail','link':'https://github.com/o/r/actions/runs/1/job/2','autoship_optional_workflow':True}]
 elif args[0]=='api':
  endpoint=args[1]
- if mode in ('unknown','unknown_with_ci'):out={'status':'403','message':'Forbidden'}
+ if mode in ('unknown','unknown_with_ci','unknown_success','unknown_skipped','unknown_neutral'):out={'status':'403','message':'Forbidden'}
  elif endpoint.endswith('/rules/branches/main'):out=[{'type':'required_status_checks','parameters':{'required_status_checks':[{'context':name}]}}] if mode=='required' else []
  elif endpoint.endswith('/branches/main/protection'):out={'status':'404','message':'Branch not protected'}
  elif endpoint.endswith('/pulls/7'):out={'head':{'sha':'head'}}
@@ -265,10 +265,11 @@ elif args[0]=='api':
  else:raise AssertionError(endpoint)
 else:raise AssertionError(args)
 if mode=='unknown_with_ci' and args[:2]==['pr','checks']:out[0].update(state='FAILURE',bucket='fail')
+if mode in ('unknown_success','unknown_skipped','unknown_neutral') and args[:2]==['pr','checks']:out[1].update(state=mode.removeprefix('unknown_').upper(),bucket='pass')
 print(json.dumps(out))
 "#).unwrap();
         std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
-        for (mode,expected) in [("optional",Free("approved-awaiting-free-merge")),("required",Repair),("different",Repair),("unknown",Free("advisory-check-evidence-unavailable")),("unknown_with_ci",Repair),("optional",Free("approved-awaiting-free-merge"))] {
+        for (mode,expected) in [("optional",Free("approved-awaiting-free-merge")),("required",Repair),("different",Repair),("unknown",Free("advisory-check-evidence-unavailable")),("unknown_with_ci",Repair),("unknown_success",Free("approved-awaiting-free-merge")),("unknown_skipped",Free("approved-awaiting-free-merge")),("unknown_neutral",Free("approved-awaiting-free-merge")),("optional",Free("approved-awaiting-free-merge"))] {
             std::fs::write(root.join("mode"),mode).unwrap();
             assert_eq!(disposition_from_remote(root,gh.to_str().unwrap(),"head",Some("base"),Some("base"),7).await,expected,"{mode}");
         }
