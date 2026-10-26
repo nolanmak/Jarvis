@@ -531,7 +531,7 @@ fn serialized_receipts_cannot_reuse_partial_or_stale_coverage() {
     };
     assert!(receipt.authority().is_ok());
     let encoded = serde_json::to_value(&receipt).unwrap();
-    for defect in 0..5 {
+    for defect in 0..7 {
         let mut tampered = encoded.clone();
         match defect {
             0 => tampered["passes"][1]["coverage"]["supplied_files"] = serde_json::json!({}),
@@ -541,7 +541,15 @@ fn serialized_receipts_cannot_reuse_partial_or_stale_coverage() {
                 tampered["passes"][1]["coverage"]["binding"]["environment_id"] =
                     serde_json::json!("other-toolchain")
             }
-            _ => tampered["passes"][1]["actor"]["provider"] = serde_json::json!("claude"),
+            4 => tampered["passes"][1]["actor"]["provider"] = serde_json::json!("claude"),
+            5 => {
+                tampered["passes"][1]["coverage"]["required_paths"] = serde_json::json!([]);
+                tampered["passes"][1]["coverage"]["supplied_files"] = serde_json::json!({});
+            }
+            _ => {
+                tampered["passes"][1]["coverage"]["supplied_files"]["a.rs"] =
+                    serde_json::json!("different-bytes")
+            }
         }
         let recovered: ReviewEvidence = serde_json::from_value(tampered).unwrap();
         assert!(

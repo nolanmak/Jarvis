@@ -95,6 +95,7 @@ pub struct CoverageReceipt {
 impl CoverageReceipt {
     pub fn complete(&self) -> bool {
         !self.prompt_hash.is_empty()
+            && !self.required_paths.is_empty()
             && self
                 .required_paths
                 .iter()
@@ -589,7 +590,13 @@ pub fn review_authority(
     ensure!(passes.len() == 3, "unexpected review pass");
     let mut sessions = BTreeSet::new();
     let mut unresolved = BTreeMap::new();
+    let expected_coverage = &passes[0].coverage;
     for pass in passes {
+        ensure!(
+            pass.coverage.required_paths == expected_coverage.required_paths
+                && pass.coverage.supplied_files == expected_coverage.supplied_files,
+            "review passes did not receive the same complete candidate evidence"
+        );
         ensure!(
             &pass.binding == binding
                 && pass.completed
