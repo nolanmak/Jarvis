@@ -1016,6 +1016,10 @@ fn persist_candidate_artifact(
     if path.try_exists()? {
         let existing: CandidateArtifact = private_json(&path)?;
         ensure!(
+            std::fs::read(&path)? == bytes,
+            "candidate artifact digest changed"
+        );
+        ensure!(
             existing == artifact,
             "content-addressed candidate artifact was altered"
         );
@@ -1028,6 +1032,10 @@ fn persist_candidate_artifact(
         Ok(_) => (),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing: CandidateArtifact = private_json(&path)?;
+            ensure!(
+                std::fs::read(&path)? == bytes,
+                "candidate artifact digest changed"
+            );
             ensure!(
                 existing == artifact,
                 "concurrent candidate artifact mismatch"
