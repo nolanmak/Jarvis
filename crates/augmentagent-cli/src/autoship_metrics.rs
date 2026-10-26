@@ -39,9 +39,11 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
     )?;
     let (model_calls, observed_wall_ms, reported_tokens) = conn.query_row(
         "SELECT coalesce(sum(r.model_calls),0),coalesce(sum(r.wall_ms),0),coalesce(sum(r.tokens),0)
-         FROM resource_charge r WHERE EXISTS (SELECT 1 FROM workflow_event e
-         WHERE e.workflow=r.workflow AND e.payload=r.id AND e.kind='resource_charged'
-         AND e.at_ms>=?1 AND e.at_ms<?2)",
+         FROM resource_charge r JOIN (
+           SELECT workflow,payload,min(at_ms) AS first_observed_ms FROM workflow_event
+           WHERE kind='resource_charged' GROUP BY workflow,payload
+         ) e ON e.workflow=r.workflow AND e.payload=r.id
+         WHERE e.first_observed_ms>=?1 AND e.first_observed_ms<?2",
         params![since, until],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
@@ -192,7 +194,7 @@ mod tests {
         // A duplicated legacy/recovery observation must not join-multiply the
         // measured charge. Aggregation is by the immutable charge receipt.
         let conn = Connection::open(&path).unwrap();
-        for observed_at in [41, 42] {
+        for observed_at in [41, 42, 80] {
             conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'resource_charged','attempt',?3)",params![lease.workflow,lease.generation,observed_at]).unwrap();
         }
         let before = read(&path, 20, 50).unwrap();
