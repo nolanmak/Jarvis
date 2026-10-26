@@ -969,6 +969,16 @@
       "passed": 6,
       "log": "/tmp/autoship-1598-native-embedded-inventory-tests.log",
       "scope": "Exact embedded helper import, native scope lifecycle/retirement and build memory policy tests. Native workflow rerun still pending."
+    },
+    "workflow_0aac33d1": {
+      "passed": 33,
+      "log": "/tmp/autoship-1598-0aac33d1-workflow-tests.log",
+      "scope": "Rebuilt CLI after main merge and packaged runtime/helper diagnostics fixes."
+    },
+    "native_adjudicator_h3w_9z52": {
+      "status": "failed_second_round_F1_verdict",
+      "log": "/tmp/autoship-native-acceptance-h3w_9z52/transcript.log",
+      "scope": "Actual packaged launch now reaches model, first contradiction round passes, second F1 Uphold assertion failed; response/evidence diagnosis pending. Not accepted as completed adjudicator proof."
     }
   },
   "remaining_cross_cutting_acceptance": [
