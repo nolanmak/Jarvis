@@ -9804,6 +9804,7 @@ fn gave_up_breakdown(labelled: &[(u64, Vec<String>)], history: &AttemptHistory) 
 }
 
 /// `gh issue list --json number,comments` → `(number, comment bodies)`.
+#[cfg(test)]
 fn parse_labelled(json: &str) -> Vec<(u64, Vec<String>)> {
     let Ok(serde_json::Value::Array(rows)) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
@@ -9883,6 +9884,34 @@ async fn complete_labelled_issues(repo_root:&Path,fields:&str)->Result<Vec<serde
     filter_inventory_label(&raw,GAVE_UP_LABEL)
 }
 
+// `gh issue list --json comments` returns only the first 100 comments.
+// REST pagination retains the complete chronological reason/reset history.
+fn issue_comment_inventory_args(issue: u64) -> Vec<String> {
+    vec!["api".into(),"--paginate".into(),"--slurp".into(),
+        format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments?per_page=100")]
+}
+fn complete_comment_bodies(raw: &str) -> Result<Vec<String>> {
+    let pages: Vec<Vec<serde_json::Value>> = serde_json::from_str(raw)
+        .context("issue comment pages malformed")?;
+    anyhow::ensure!(pages.len() <= MAX_ISSUE_PAGES as usize,"issue comment history exceeds safe bound");
+    let mut comments = std::collections::BTreeMap::new();
+    for page in pages {
+        anyhow::ensure!(page.len() <= 100,"issue comment page exceeds requested bound");
+        for comment in page {
+            let id = comment["id"].as_u64().filter(|id|*id>0).context("comment identity unavailable")?;
+            let body = comment["body"].as_str().context("comment body unavailable")?.to_owned();
+            anyhow::ensure!(comments.insert(id,body).is_none(),"duplicate comment in paginated history");
+        }
+    }
+    Ok(comments.into_values().collect())
+}
+async fn complete_issue_comment_bodies(repo_root: &Path, issue: u64) -> Result<Vec<String>> {
+    let args = issue_comment_inventory_args(issue);
+    let (ok,raw,error) = run(&gh_bin(), &args.iter().map(String::as_str).collect::<Vec<_>>(),repo_root).await?;
+    anyhow::ensure!(ok,"issue comment inventory failed: {}",truncate(&error,300));
+    complete_comment_bodies(&raw)
+}
+
 /// #1214 — `augmentagent autopr readmit`: the labelled issues whose reason
 /// matches `wanted`. With `dry_run` nothing on GitHub changes; otherwise the
 /// label comes off each, which puts it back in the pool.
@@ -9899,10 +9928,14 @@ pub(crate) async fn readmit(
     reset_history: bool,
 ) -> Result<Vec<u64>> {
     let gh = gh_bin();
-    let stdout=serde_json::to_string(&complete_labelled_issues(repo_root,"number,comments,labels").await?)?;
+    let rows = complete_labelled_issues(repo_root,"number,labels").await?;
+    let mut labelled = Vec::new();
+    for row in rows {
+        let number = row["number"].as_u64().context("labelled issue identity missing")?;
+        labelled.push((number,complete_issue_comment_bodies(repo_root,number).await?));
+    }
     let history = AttemptHistory::load(&attempt_history_path());
-    let matched: Vec<u64> = parse_labelled(&stdout)
-        .into_iter()
+    let matched: Vec<u64> = labelled.into_iter()
         .filter(|(n, comments)| {
             reason_matches(&gave_up_reason(comments, history.issues.get(n).map(Vec::as_slice)), wanted)
         })
@@ -9954,7 +9987,7 @@ pub(crate) fn gave_up_breakdown_live(repo_root: &Path) -> Option<Vec<(String, u3
     let mut limit=500usize;
     let complete=loop {
         let out=std::process::Command::new(gh_bin())
-            .args(repository_inventory_args("issue",None,"number,comments,labels",limit))
+            .args(repository_inventory_args("issue",None,"number,labels",limit))
             .current_dir(repo_root).stdin(std::process::Stdio::null()).output().ok()
             .filter(|o|o.status.success())?;
         if let Some(complete)=completed_inventory(&String::from_utf8_lossy(&out.stdout),limit).ok()? { break complete; }
@@ -9962,8 +9995,14 @@ pub(crate) fn gave_up_breakdown_live(repo_root: &Path) -> Option<Vec<(String, u3
         if limit>=max { return None; }
         limit=(limit*2).min(max);
     };
-    let raw=serde_json::to_string(&filter_inventory_label(&complete,GAVE_UP_LABEL).ok()?).ok()?;
-    let labelled=parse_labelled(&raw);
+    let mut labelled = Vec::new();
+    for row in filter_inventory_label(&complete,GAVE_UP_LABEL).ok()? {
+        let number = row["number"].as_u64()?;
+        let out = std::process::Command::new(gh_bin()).args(issue_comment_inventory_args(number))
+            .current_dir(repo_root).stdin(std::process::Stdio::null()).output().ok()
+            .filter(|out|out.status.success())?;
+        labelled.push((number,complete_comment_bodies(&String::from_utf8_lossy(&out.stdout)).ok()?));
+    }
     Some(gave_up_breakdown(&labelled, &AttemptHistory::load(&attempt_history_path())))
 }
 
@@ -17809,6 +17848,25 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         assert!(calls.iter().filter(|a|a.contains(&"2000".into())).count()>=2);
         assert!(filter_inventory_label("[{\"number\":1}]",GAVE_UP_LABEL).is_err());
         std::fs::write(root.join("executed"),"ok").unwrap();
+    }
+
+    #[test]
+    fn complete_comments_preserve_late_reason_and_reset_and_reject_partial_shapes() {
+        let mut rows: Vec<_> = (1..=100).map(|id|serde_json::json!({"id":id,"body":"discussion"})).collect();
+        rows[0]["body"] = serde_json::json!(format!("{GAVE_UP_REASON_MARKER_PREFIX}gate-red -->"));
+        let pages = serde_json::json!([rows,[
+            {"id":101,"body":ATTEMPT_RESET_MARKER},
+            {"id":102,"body":format!("{GAVE_UP_REASON_MARKER_PREFIX}review-reject -->")}
+        ]]);
+        let bodies = complete_comment_bodies(&pages.to_string()).unwrap();
+        assert_eq!(bodies.len(),102);
+        assert_eq!(gave_up_reason(&bodies,None),"review-reject");
+        assert!(!reason_matches(&gave_up_reason(&bodies,None),"gate-red"));
+        assert!(after_last_reset(&bodies.join("\n")).contains("review-reject"));
+        assert!(!after_last_reset(&bodies.join("\n")).contains("gate-red"));
+        for raw in ["{}", "[[{\"id\":1,\"body\":null}]]", "[[{\"id\":1,\"body\":\"x\"}],[{\"id\":1,\"body\":\"x\"}]]"] {
+            assert!(complete_comment_bodies(raw).is_err());
+        }
     }
 
     #[tokio::test]
