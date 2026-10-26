@@ -43,7 +43,8 @@ fn open(path: &Path) -> Result<rusqlite::Connection> {
         CREATE TABLE IF NOT EXISTS outcomes(case_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(case_id,sequence));")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS replay_batches(batch TEXT PRIMARY KEY, cases_json TEXT NOT NULL, examples TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS replay_results(batch TEXT NOT NULL, case_id TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(batch,case_id));
-        CREATE TABLE IF NOT EXISTS replay_complete(batch TEXT PRIMARY KEY, version TEXT NOT NULL);")?;
+        CREATE TABLE IF NOT EXISTS replay_complete(batch TEXT PRIMARY KEY, version TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS replay_rejected(batch TEXT PRIMARY KEY, reason TEXT NOT NULL);")?;
     for table in [
         "cases",
         "attempts",
@@ -52,6 +53,7 @@ fn open(path: &Path) -> Result<rusqlite::Connection> {
         "replay_batches",
         "replay_results",
         "replay_complete",
+        "replay_rejected",
     ] {
         conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS {table}_immutable BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'calibration audit immutable'); END; CREATE TRIGGER IF NOT EXISTS {table}_retained BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'calibration audit retained'); END;"))?;
     }
@@ -298,7 +300,7 @@ fn frozen_batch(
     now: i64,
 ) -> Result<Option<(String, Vec<Case>, String)>> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let pending: Option<(String,String,String)> = tx.query_row("SELECT batch,cases_json,examples FROM replay_batches WHERE batch NOT IN (SELECT batch FROM replay_complete) ORDER BY created,rowid LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let pending: Option<(String,String,String)> = tx.query_row("SELECT batch,cases_json,examples FROM replay_batches WHERE batch NOT IN (SELECT batch FROM replay_complete) AND batch NOT IN (SELECT batch FROM replay_rejected) ORDER BY created,rowid LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let result = if let Some((batch, body, examples)) = pending {
         Some((batch, serde_json::from_str(&body)?, examples))
     } else {
@@ -317,6 +319,15 @@ fn frozen_batch(
         } else {
             let body = serde_json::to_string(latest)?;
             let batch = review::digest(body.as_bytes());
+            let rejected: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM replay_rejected WHERE batch=?1)",
+                [&batch],
+                |r| r.get(0),
+            )?;
+            if rejected {
+                tx.commit()?;
+                return Ok(None);
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO replay_batches VALUES(?1,?2,?3,?4)",
                 rusqlite::params![batch, body, examples, now],
@@ -434,7 +445,21 @@ pub(super) async fn run_if_due() -> Result<()> {
         .take(MAX_REPLAY_CASES)
         .collect();
     let (protected, fixture_expected) = fixtures()?;
-    if !remaining.is_empty() && !claim(&mut conn, &format!("{batch}:{}", previous.len()), now)? {
+    let page = format!("{batch}:{}", previous.len());
+    if !remaining.is_empty() && !claim(&mut conn, &page, now)? {
+        let attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE batch=?1",
+            [&page],
+            |r| r.get(0),
+        )?;
+        let last: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(started),0) FROM attempts WHERE batch=?1",
+            [&page],
+            |r| r.get(0),
+        )?;
+        if attempts >= 2 && now.saturating_sub(last) >= DAY_MS {
+            conn.execute("INSERT OR IGNORE INTO replay_rejected VALUES(?1,'bounded page attempts exhausted; retain previous rubric')",[&batch])?;
+        }
         return Ok(());
     }
     drop(conn);
@@ -649,6 +674,22 @@ mod tests {
             .execute("UPDATE replay_results SET receipt='{}'", [])
             .is_err());
         assert!(conn.execute("DELETE FROM replay_batches", []).is_err());
+    }
+
+    #[test]
+    fn rejected_batch_does_not_block_new_evidence_forever() {
+        let (_dir, mut conn) = database_fixture();
+        let original = vec![case("one", "a"), case("two", "b")];
+        let (batch, _, _) = frozen_batch(&mut conn, &original, 1).unwrap().unwrap();
+        conn.execute(
+            "INSERT INTO replay_rejected VALUES(?1,'exhausted')",
+            [&batch],
+        )
+        .unwrap();
+        assert!(frozen_batch(&mut conn, &original, 2).unwrap().is_none());
+        let next = vec![case("three", "c"), case("one", "a"), case("two", "b")];
+        let (new, _, _) = frozen_batch(&mut conn, &next, 3).unwrap().unwrap();
+        assert_ne!(new, batch);
     }
 
     #[test]
