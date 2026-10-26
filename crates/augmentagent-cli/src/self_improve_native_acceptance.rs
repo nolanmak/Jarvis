@@ -34,11 +34,15 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     )?);
     let state_home = state_home.canonicalize()?;
     anyhow::ensure!(
-        state_home.starts_with(std::env::temp_dir().canonicalize()?)
+        state_home.starts_with(Path::new("/tmp").canonicalize()?)
             && workflow::path().starts_with(&state_home),
         "probe state and workflow database must be isolated under the temporary directory"
     );
-    let fixture = tempfile::tempdir()?;
+    // Managed Cargo points TMPDIR inside a builder-writable cache. Keep both
+    // disposable source and protected probe state outside that shared cache.
+    let fixture = tempfile::Builder::new()
+        .prefix("autoship-native-source-")
+        .tempdir_in("/tmp")?;
     let root = fixture.path().join("candidate");
     std::fs::create_dir(&root)?;
     git(&root, &["init", "-q"]).await?;
