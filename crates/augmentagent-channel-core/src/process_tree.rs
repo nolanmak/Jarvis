@@ -526,11 +526,11 @@ pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journ
     spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[])
 }
 pub(crate) fn spawn_admitted_storage(command: &Command, clean: Arc<AtomicBool>, required_resources: bool,
-    storage_files: &[std::fs::File]) -> std::io::Result<(Child, ProcessGroup)> {
+    storage_files: &[std::fs::File], policy: &serde_json::Value) -> std::io::Result<(Child, ProcessGroup)> {
     if storage_files.is_empty() || storage_files.len() > 64 {
         return Err(std::io::Error::other("invalid inherited storage descriptor set"));
     }
-    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, None, storage_files)
+    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files)
 }
 fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File])
     -> std::io::Result<(Child, ProcessGroup)> {

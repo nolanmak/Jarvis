@@ -636,6 +636,7 @@ mod ccat_push_gate_tests {
 /// returns the FULL allowed env (cleared of secrets) so the build still has
 /// `PATH`, `HOME`, `CARGO_*`, etc. — behavior-preserving for honest fixes,
 /// secret-denying for hostile ones.
+#[cfg(test)]
 fn gate_env() -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| !env_name_is_secret(k))
@@ -736,6 +737,7 @@ fn test_resource_audit(control: &Path) -> Arc<augmentagent_channel_core::AuditLo
     workflow::workflow_audit(&control.join("fixture-audit-state"), &format!("fixture-{}", uuid::Uuid::new_v4()), None).unwrap()
 }
 
+#[cfg(test)]
 async fn run_sandboxed(
     cmd: &str,
     args: &[&str],
@@ -746,6 +748,7 @@ async fn run_sandboxed(
     run_sandboxed_bounded(cmd, args, cwd, env, augmentagent_channel_core::reasoner::reasoner_timeout() * 2, audit).await
 }
 
+#[cfg(test)]
 async fn run_sandboxed_bounded(cmd: &str, args: &[&str], cwd: &Path, env: &[(String, String)],
     budget: std::time::Duration, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<(bool, String, String)> {
     let mut command = Command::new(cmd);
@@ -4500,6 +4503,7 @@ the test that guards it.";
 /// `tail`'s exit status (always 0): every gate command had passed
 /// unconditionally since #103, letting a non-compiling diff reach the PR
 /// stage. Caught live on the first real #653 pipeline run.
+#[cfg(test)]
 fn gate_sh(cmd: &str) -> String {
     format!("set -o pipefail; {cmd}")
 }
@@ -4534,41 +4538,7 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// pushed or merged; this trims the redundancy, not the bar.
 async fn verification_gate_targeted(worktree: &Path, crates: &[String], audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     gate_disk_guard()?;
-    let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
-    let mut env = gate_env();
-    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(worktree))?));
-    let pkgs: String = crates
-        .iter()
-        .map(|c| format!("-p {c}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    info!(%pkgs, "verification gate (targeted): cargo build");
-    let (ok, _o, e) = run_sandboxed(
-        "bash",
-        &["-lc", &gate_sh(&format!("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
-        worktree,
-        &env,
-        audit,
-    )
-    .await?;
-    if !ok {
-        bail!("targeted cargo build failed:\n{o}{e}", o = _o.trim());
-    }
-    info!(%pkgs, "verification gate (targeted): cargo test");
-    let (ok, _o, e) = run_sandboxed(
-        "bash",
-        &["-lc", &gate_sh(&format!(
-            ". $HOME/.cargo/env && cargo test {pkgs} -- --test-threads=1 2>&1 | tail -40"
-        ))],
-        worktree,
-        &env,
-        audit,
-    )
-    .await?;
-    if !ok {
-        bail!("targeted cargo test failed:\n{o}{e}", o = _o.trim());
-    }
-    Ok(())
+    shared_ci::targeted(worktree, crates, audit).await
 }
 
 /// Gate for an intermediate revision round: targeted when the diff stays
@@ -4881,19 +4851,7 @@ async fn baseline_failures(
     // Names were validated to Rust-path characters by `failing_tests`.
     let filters = tests.join(" ");
     info!(%pkg_args, %filters, "baseline check: cargo test on origin/main (sandboxed env)");
-    let _storage = crate::build_storage::admit(&worktree, &crate::build_storage::effective_target(&worktree)).await?;
-    let mut env = gate_env();
-    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(&worktree))?));
-    let result = run_sandboxed(
-        "bash",
-        &["-lc", &gate_sh(&format!(
-            ". $HOME/.cargo/env && cargo test {pkg_args} --no-fail-fast -- --test-threads=1 {filters} 2>&1 | tail -60"
-        ))],
-        &worktree,
-        &env,
-        audit,
-    )
-    .await;
+    let result = shared_ci::baseline(&worktree, pkgs, tests, audit).await;
     reclaim_worktree(repo_root, &worktree, &branch).await;
     let (_ok, out, err) = result?;
     let text = format!("{out}{err}");
@@ -10287,7 +10245,7 @@ async fn has_open_agent_pr_remote(
 }
 
 /// Per-repo verification gate. Runs the repo's configured `build_cmd` with
-/// `bash -lc` inside the clone. Empty `build_cmd` ⇒ gate skipped (the loop
+/// the existing no-NIC build VM from a literal candidate snapshot. Empty `build_cmd` ⇒ gate skipped (the loop
 /// still won't open a PR without human approval, so this is safe for
 /// docs-only repos). Mirrors #103's gate pattern, just parameterized.
 async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Result<()> {
@@ -10296,19 +10254,9 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
         info!(repo = %repo.full_name, "verification gate skipped (no build_cmd)");
         return Ok(());
     }
-    info!(repo = %repo.full_name, cmd, "verification gate (sandboxed env)");
-    let wrapped = gate_sh(&format!(". $HOME/.cargo/env 2>/dev/null; {cmd}"));
-    // #300 — same secret-stripping as the single-repo gate: the per-repo
-    // `build_cmd` runs attacker-influenceable build scripts and must not
-    // inherit provider keys.
-    let _storage = crate::build_storage::admit(workspace, &crate::build_storage::effective_target(workspace)).await?;
-    let mut env = gate_env();
-    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(workspace))?));
-    let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env, &standalone_resource_audit(workspace)?).await?;
-    if !ok {
-        bail!("build_cmd `{cmd}` failed:\n{}", truncate(&e, 1500));
-    }
-    Ok(())
+    info!(repo = %repo.full_name, "verification gate: isolated owner-configured command");
+    gate_disk_guard()?;
+    shared_ci::repository(workspace, &repo.base_branch, cmd, &standalone_resource_audit(workspace)?).await
 }
 
 /// Post the prompted-PR approval prompt to Discord. Reuses the existing
@@ -14675,17 +14623,9 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     #[test]
     fn gate_tail_keeps_the_failures_block() {
-        // `tail -8` could not fit a `failures:` list of more than two names
-        // plus the trailer, so the baseline parser saw nothing to compare.
-        let src = include_str!("self_improve.rs");
-        for cmd in [
-            "cargo test {pkgs} -- --test-threads=1 2>&1 | tail -40",
-        ] {
-            assert!(
-                src.contains(cmd),
-                "gate must keep ≥40 lines of cargo test output: {cmd}"
-            );
-        }
+        let transcript = format!("{}failures:\n    module::tests::first_failure\n    module::tests::second_failure\n\ntest result: FAILED. 2 failed\n", "compile progress\n".repeat(4000));
+        let kept = truncate_tail(&transcript, 16000);
+        assert_eq!(failing_tests(&kept), vec!["module::tests::first_failure", "module::tests::second_failure"]);
     }
 
     // --- #932 self-heal: a red main becomes the loop's first issue ---------

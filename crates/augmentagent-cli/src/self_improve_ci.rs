@@ -2,6 +2,8 @@
 //! execution contract. Targeted iteration remains in the parent module.
 use super::acceptance::verifier_checkout;
 use super::*;
+#[path = "self_improve_ci_vm.rs"]
+mod vm;
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,6 +18,7 @@ struct Binding {
     head: String,
     verification_head: String,
     base: String,
+    base_ref: String,
     index_tree: String,
     status: String,
     contract_sha256: String,
@@ -40,9 +43,34 @@ struct Check {
     #[serde(default)]
     matrix: serde_json::Value,
     status: String,
+    #[serde(default = "github_job_timeout")]
+    job_timeout_seconds: u64,
+    #[serde(default)]
+    step_timeout_seconds: Option<u64>,
     #[serde(default)]
     reason: String,
 }
+fn github_job_timeout() -> u64 {
+    6 * 60 * 60
+}
+impl Check {
+    fn remaining(&self, elapsed: std::time::Duration) -> Result<std::time::Duration> {
+        ensure!(
+            (1..=github_job_timeout()).contains(&self.job_timeout_seconds)
+                && self.step_timeout_seconds.is_none_or(|value| value > 0),
+            "{PREREQUISITE}: invalid declared CI deadline"
+        );
+        let remaining = std::time::Duration::from_secs(self.job_timeout_seconds)
+            .checked_sub(elapsed)
+            .filter(|value| !value.is_zero())
+            .context("shared CI job exceeded declared deadline; candidate retained")?;
+        Ok(self
+            .step_timeout_seconds
+            .map(|value| remaining.min(std::time::Duration::from_secs(value)))
+            .unwrap_or(remaining))
+    }
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -114,8 +142,11 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
     Ok(output)
 }
 async fn binding(root: &Path) -> Result<Binding> {
+    binding_at(root, "origin/main").await
+}
+async fn binding_at(root: &Path, base_ref: &str) -> Result<Binding> {
     let head = git(root, &["rev-parse", "HEAD"]).await?.trim().to_string();
-    let base = git(root, &["merge-base", "origin/main", "HEAD"])
+    let base = git(root, &["merge-base", base_ref, "HEAD"])
         .await?
         .trim()
         .to_string();
@@ -176,63 +207,13 @@ async fn binding(root: &Path) -> Result<Binding> {
         head,
         verification_head,
         base,
+        base_ref: base_ref.to_owned(),
         index_tree,
         status,
         contract_sha256: digest(CONTRACT.as_bytes()),
         runner_sha256: digest(RUNNER.as_bytes()),
     })
 }
-async fn plan(root: &Path, binding: &Binding) -> Result<Plan> {
-    let names = git(
-        root,
-        &["diff", "--cached", "--name-only", "-z", &binding.base],
-    )
-    .await?;
-    let mut command = Command::new("/usr/bin/python3");
-    // Discovery is data-only. Even rustc --version can execute a candidate
-    // path toolchain; prerequisite probes belong inside the admitted build VM.
-    command.args([
-        "-I",
-        "-c",
-        RUNNER,
-        "--contract-json",
-        CONTRACT,
-        "plan",
-        "--head",
-        &binding.verification_head,
-        "--base",
-        &binding.base,
-        "--platform",
-        "linux",
-    ]);
-    for path in names.split('\0').filter(|path| !path.is_empty()) {
-        command.arg("--changed-file").arg(path);
-    }
-    command
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .env_clear()
-        .envs(gate_env())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
-        .await
-        .context("shared CI prerequisite unavailable: prerequisite discovery timed out")??;
-    ensure!(
-        output.status.success(),
-        "{PREREQUISITE}: {}",
-        truncate_tail(&String::from_utf8_lossy(&output.stderr), 8192)
-    );
-    ensure!(
-        output.stdout.len() <= 4 * 1024 * 1024,
-        "{PREREQUISITE}: plan output exceeds bound"
-    );
-    let plan: Plan = serde_json::from_slice(&output.stdout)
-        .context("shared CI prerequisite unavailable: invalid controller plan")?;
-    plan.validate(binding)
-        .context("shared CI prerequisite unavailable: invalid controller plan")?;
-    Ok(plan)
-}
-
 /// Literal Git blobs plus a minimal private Git database. No checkout filters,
 /// ignored bytecode, candidate Git config/hooks, or live worktree artifact enters.
 async fn snapshot(
@@ -290,9 +271,49 @@ async fn snapshot(
     )?;
     git(
         directory.path(),
-        &["update-ref", "refs/remotes/origin/main", &binding.base],
+        &[
+            "update-ref",
+            &format!("refs/remotes/{}", binding.base_ref),
+            &binding.base,
+        ],
     )
     .await?;
+    if git(root, &["rev-parse", "--is-shallow-repository"])
+        .await?
+        .trim()
+        == "true"
+    {
+        let path = PathBuf::from(
+            git(root, &["rev-parse", "--git-path", "shallow"])
+                .await?
+                .trim(),
+        );
+        let path = if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        };
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        ensure!(
+            file.metadata()?.is_file() && file.metadata()?.len() <= 1024 * 1024,
+            "{PREREQUISITE}: invalid shallow source boundary"
+        );
+        let mut shallow = String::new();
+        file.take(1024 * 1024 + 1).read_to_string(&mut shallow)?;
+        ensure!(
+            shallow
+                .lines()
+                .all(|line| matches!(line.len(), 40 | 64)
+                    && line.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{PREREQUISITE}: invalid shallow commit IDs"
+        );
+        std::fs::write(directory.path().join(".git/shallow"), shallow)?;
+    }
     git(directory.path(), &["read-tree", &binding.verification_head]).await?;
     git(directory.path(), &["update-index", "--refresh"]).await?;
     Ok(directory)
@@ -303,34 +324,73 @@ pub(super) async fn verify(
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<()> {
     let binding_before = binding(root).await?;
-    let plan = plan(root, &binding_before)
-        .await
-        .context("shared CI prerequisite unavailable: plan discovery failed")?;
-    audit.record_controller(serde_json::json!({"kind":"shared_ci_plan", "binding":binding_before,
-        "checks":plan.checks.iter().map(|check| serde_json::json!({"id":check.id,"status":check.status,"reason":check.reason})).collect::<Vec<_>>()}))?;
     let target = crate::build_storage::effective_target(root);
     let storage = crate::build_storage::admit(root, &target).await?;
-    let mut env = gate_env();
-    env.retain(|(key, _)| key != "CARGO_TARGET_DIR" && key != "TMPDIR");
-    env.push((
-        "CARGO_TARGET_DIR".into(),
-        target.to_string_lossy().into_owned(),
-    ));
-    let temp = target.join("tmp");
-    std::fs::create_dir_all(&temp)?;
-    env.push(("TMPDIR".into(), temp.to_string_lossy().into_owned()));
-    env.push((
-        crate::build_storage::PARENT_LEASE_ENV.into(),
-        storage.parent_proof(&target)?,
-    ));
-    let step_state = tempfile::Builder::new()
-        .prefix("autoship-ci-runtime-")
-        .tempdir()?;
+    let vm = vm::Session::prepare(root, &target)
+        .context("shared CI prerequisite unavailable: prepare isolated CI runtime")?;
+    let names = git(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            &binding_before.base,
+        ],
+    )
+    .await?;
+    let changed: Vec<_> = names
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let discovery_source = snapshot(root, &binding_before, &target).await?;
+    let discovered = vm
+        .run(
+            "plan",
+            discovery_source.path(),
+            root,
+            &binding_before,
+            None,
+            &changed,
+            &[],
+            &[],
+            None,
+            &storage,
+            &target,
+            audit,
+            std::time::Duration::from_secs(180),
+        )
+        .await?;
+    ensure!(
+        discovered.status == "planned",
+        "{PREREQUISITE}: guest prerequisite discovery failed: {}",
+        truncate_tail(&discovered.stderr, 8192)
+    );
+    let plan: Plan = serde_json::from_value(
+        discovered
+            .plan
+            .context("shared CI prerequisite unavailable: guest plan missing")?,
+    )?;
+    plan.validate(&binding_before)
+        .context("shared CI prerequisite unavailable: invalid isolated CI plan")?;
+    ensure!(
+        binding(root).await? == binding_before,
+        "{PREREQUISITE}: source changed during CI discovery"
+    );
+    // A version probe may itself execute candidate path-toolchain code. It ran
+    // inside the VM and cannot be allowed to supply modified source to tests.
+    drop(discovery_source);
+    audit.record_controller(serde_json::json!({"kind":"shared_ci_plan", "binding":binding_before,
+        "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
+        "checks":plan.checks.iter().map(|check| serde_json::json!({"id":check.id,"status":check.status,"reason":check.reason})).collect::<Vec<_>>()}))?;
     let mut source: Option<verifier_checkout::OwnedCheckout> = None;
     let mut group: Option<String> = None;
+    let mut job_started = std::time::Instant::now();
     for check in plan.checks.iter().filter(|check| check.status == "ready") {
         let next_group = serde_json::to_string(&(&check.workflow, &check.job, &check.matrix))?;
         if group.as_ref() != Some(&next_group) {
+            job_started = std::time::Instant::now();
             drop(source.take());
             source = Some(snapshot(root, &binding_before, &target).await?);
             group = Some(next_group);
@@ -339,48 +399,39 @@ pub(super) async fn verify(
             .as_ref()
             .context("CI source snapshot unavailable")?
             .path();
-        info!(check = %check.id, "verification gate: shared CI check");
-        let (passed, stdout, stderr) = run_sandboxed(
-            "/usr/bin/python3",
-            &[
-                "-I",
-                "-c",
-                RUNNER,
-                "--contract-json",
-                CONTRACT,
+        info!(check = %check.id, "verification gate: isolated shared CI check");
+        let outcome = vm
+            .run(
                 "step",
-                "--id",
-                &check.id,
-                "--input-base",
-                &binding_before.base,
-                "--input-head",
-                &binding_before.verification_head,
-                "--state-dir",
-                step_state
-                    .path()
-                    .to_str()
-                    .context("CI state path is not UTF-8")?,
-            ],
-            source_root,
-            &env,
-            audit,
-        )
-        .await?;
+                source_root,
+                root,
+                &binding_before,
+                Some(check),
+                &[],
+                &[],
+                &[],
+                None,
+                &storage,
+                &target,
+                audit,
+                check.remaining(job_started.elapsed())?,
+            )
+            .await?;
         ensure!(
             binding(root).await? == binding_before,
             "{PREREQUISITE}: candidate source changed during shared CI"
         );
-        audit.record_controller(
-            serde_json::json!({"kind":"shared_ci_check", "binding":binding_before,
+        let passed = outcome.status == "passed";
+        audit.record_controller(serde_json::json!({"kind":"shared_ci_check", "binding":binding_before,
+            "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
             "check":check.id,"status":if passed {"local_pass"} else {"failed"},
-            "stdout_sha256":digest(stdout.as_bytes()),"stderr_sha256":digest(stderr.as_bytes())}),
-        )?;
+            "stdout_sha256":digest(outcome.stdout.as_bytes()),"stderr_sha256":digest(outcome.stderr.as_bytes())}))?;
         if !passed {
             bail!(
                 "shared CI check {} failed:\n{}\n{}",
                 check.id,
-                truncate_tail(&stdout, 16000),
-                truncate_tail(&stderr, 8000)
+                truncate_tail(&outcome.stdout, 16000),
+                truncate_tail(&outcome.stderr, 8000)
             );
         }
     }
@@ -389,19 +440,160 @@ pub(super) async fn verify(
         "{PREREQUISITE}: candidate source changed during shared CI"
     );
     audit.record_controller(serde_json::json!({"kind":"shared_ci_local_complete", "binding":binding_before,
-        "remote_required":plan.checks.iter().filter(|check| check.status=="remote_required").map(|check|&check.id).collect::<Vec<_>>(),
+        "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
+        "remote_required":plan.checks.iter().filter(|check|check.status=="remote_required").map(|check|&check.id).collect::<Vec<_>>(),
         "shipping_authority":false}))?;
+    Ok(())
+}
+
+async fn iteration(
+    root: &Path,
+    operation: &str,
+    packages: &[String],
+    filters: &[String],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
+) -> Result<vm::Outcome> {
+    ensure!(
+        packages.len() <= 128
+            && filters.len() <= 256
+            && packages.iter().all(|name| name
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            && filters.iter().all(|name| !name.is_empty()
+                && name.len() <= 512
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')),
+        "invalid fixed CI iteration target"
+    );
+    ensure!(
+        operation == "baseline" || operation == "targeted" && !packages.is_empty(),
+        "invalid CI iteration operation"
+    );
+    let before = binding(root).await?;
+    let target = crate::build_storage::effective_target(root);
+    let storage = crate::build_storage::admit(root, &target).await?;
+    let vm = vm::Session::prepare(root, &target)
+        .context("shared CI prerequisite unavailable: prepare isolated iteration")?;
+    let source = snapshot(root, &before, &target).await?;
+    let outcome = vm
+        .run(
+            operation,
+            source.path(),
+            root,
+            &before,
+            None,
+            &[],
+            packages,
+            filters,
+            None,
+            &storage,
+            &target,
+            audit,
+            std::time::Duration::from_secs(github_job_timeout()),
+        )
+        .await?;
+    ensure!(
+        binding(root).await? == before,
+        "{PREREQUISITE}: candidate changed during isolated iteration"
+    );
+    audit.record_controller(serde_json::json!({"kind":"shared_ci_iteration", "binding":before,
+        "operation":operation,"packages":packages,"filters":filters,"status":outcome.status,
+        "execution_boundary":"existing-build-vm","vm_authority_sha256":vm.authority_sha256,
+        "stdout_sha256":digest(outcome.stdout.as_bytes()),"stderr_sha256":digest(outcome.stderr.as_bytes()),
+        "shipping_authority":false}))?;
+    Ok(outcome)
+}
+pub(super) async fn targeted(
+    root: &Path,
+    packages: &[String],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
+) -> Result<()> {
+    let outcome = iteration(root, "targeted", packages, &[], audit).await?;
+    ensure!(
+        outcome.status == "passed",
+        "targeted CI failed:\n{}\n{}",
+        truncate_tail(&outcome.stdout, 16000),
+        truncate_tail(&outcome.stderr, 8000)
+    );
+    Ok(())
+}
+pub(super) async fn baseline(
+    root: &Path,
+    packages: &[String],
+    filters: &[String],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
+) -> Result<(bool, String, String)> {
+    let outcome = iteration(root, "baseline", packages, filters, audit).await?;
+    Ok((outcome.status == "passed", outcome.stdout, outcome.stderr))
+}
+
+pub(super) async fn repository(
+    root: &Path,
+    base_branch: &str,
+    owner_command: &str,
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
+) -> Result<()> {
+    ensure!(
+        !owner_command.trim().is_empty()
+            && owner_command.len() <= 64 * 1024
+            && !owner_command.contains('\0'),
+        "invalid owner repository verification command"
+    );
+    let base_ref = format!("origin/{base_branch}");
+    let before = binding_at(root, &base_ref).await?;
+    let target = crate::build_storage::effective_target(root);
+    let storage = crate::build_storage::admit(root, &target).await?;
+    let vm = vm::Session::prepare(root, &target)
+        .context("shared CI prerequisite unavailable: prepare owner repository gate")?;
+    let source = snapshot(root, &before, &target).await?;
+    let outcome = vm
+        .run(
+            "repository",
+            source.path(),
+            root,
+            &before,
+            None,
+            &[],
+            &[],
+            &[],
+            Some(owner_command),
+            &storage,
+            &target,
+            audit,
+            std::time::Duration::from_secs(github_job_timeout()),
+        )
+        .await?;
+    ensure!(
+        binding_at(root, &base_ref).await? == before,
+        "{PREREQUISITE}: repository changed during isolated owner gate"
+    );
+    audit.record_controller(serde_json::json!({"kind":"owner_repository_ci", "binding":before,
+        "owner_command_sha256":digest(owner_command.as_bytes()),"status":outcome.status,
+        "execution_boundary":"existing-build-vm","vm_authority_sha256":vm.authority_sha256,"shipping_authority":false}))?;
+    ensure!(
+        outcome.status == "passed",
+        "owner repository verification failed:\n{}\n{}",
+        truncate_tail(&outcome.stdout, 16000),
+        truncate_tail(&outcome.stderr, 8000)
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn binding_fixture() -> Binding {
+    pub(super) fn binding_fixture() -> Binding {
         Binding {
             head: "head".into(),
             verification_head: "head".into(),
             base: "base".into(),
+            base_ref: "origin/main".into(),
             index_tree: "tree".into(),
             status: String::new(),
             contract_sha256: "contract".into(),
@@ -420,6 +612,8 @@ mod tests {
                 job: "job".into(),
                 matrix: serde_json::Value::Null,
                 status: status.into(),
+                job_timeout_seconds: github_job_timeout(),
+                step_timeout_seconds: None,
                 reason: "fixture dependency".into(),
             }],
             complete,
@@ -441,6 +635,38 @@ mod tests {
         assert!(fixture("not_applicable", false)
             .validate(&binding_fixture())
             .is_err());
+    }
+    #[test]
+    fn declared_job_and_step_deadlines_bound_only_the_ci_stage() {
+        let mut plan = fixture("ready", true);
+        let check = &mut plan.checks[0];
+        check.job_timeout_seconds = 2700;
+        check.step_timeout_seconds = Some(420);
+        assert_eq!(
+            check
+                .remaining(std::time::Duration::from_secs(1200))
+                .unwrap()
+                .as_secs(),
+            420
+        );
+        assert_eq!(
+            check
+                .remaining(std::time::Duration::from_secs(2600))
+                .unwrap()
+                .as_secs(),
+            100
+        );
+        assert!(check
+            .remaining(std::time::Duration::from_secs(2700))
+            .is_err());
+        check.step_timeout_seconds = None;
+        assert_eq!(
+            check
+                .remaining(std::time::Duration::from_secs(0))
+                .unwrap()
+                .as_secs(),
+            2700
+        );
     }
     #[test]
     fn missing_shared_prerequisite_is_unpaid_infrastructure_not_builder_repair() {
@@ -471,6 +697,8 @@ mod tests {
             job: "job".into(),
             matrix: serde_json::Value::Null,
             status: "ready".into(),
+            job_timeout_seconds: github_job_timeout(),
+            step_timeout_seconds: None,
             reason: String::new(),
         });
         assert!(plan.validate(&binding).is_err());

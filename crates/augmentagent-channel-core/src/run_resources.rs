@@ -231,12 +231,13 @@ pub fn spawn_command(
 /// CI VM adapter launch retaining the actual build and target flock descriptions
 /// through the supervisor. No environment-only parent proof grants inheritance.
 pub fn spawn_command_with_storage(command: &tokio::process::Command,
-    logger: Option<&Arc<crate::tool_audit::AuditLogger>>, files: &[std::fs::File])
+    logger: Option<&Arc<crate::tool_audit::AuditLogger>>, files: &[std::fs::File], build_memory_mb: u64)
     -> Result<(tokio::process::Child, CommandGuard)> {
     check_requirement("verification", logger)?;
+    let policy = composed_native_policy(build_memory_mb, 0)?;
     let (child, guard) = crate::process_tree::spawn_admitted_storage(command,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        logger.is_some_and(|logger| logger.run_resources_required()), files)?;
+        logger.is_some_and(|logger| logger.run_resources_required()), files, &policy)?;
     guard.bind_resource_audit("verification", logger)?;
     Ok((child, CommandGuard(guard)))
 }
