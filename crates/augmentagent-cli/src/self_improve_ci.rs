@@ -1,5 +1,6 @@
 //! Controller-pinned shared hosted/local CI. Candidate files cannot replace the
 //! execution contract. Targeted iteration remains in the parent module.
+use super::acceptance::verifier_checkout;
 use super::*;
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
