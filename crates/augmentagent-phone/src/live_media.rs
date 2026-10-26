@@ -199,6 +199,9 @@ async fn conversation(
                             LiveAction::Clarify{delegation_id}=>{
                                 connection.commentary(&delegation_id,"Please ask the caller to repeat the complete request; the transcript was incomplete and no task was started.").await?;
                             }
+                            LiveAction::QueueFull{delegation_id}=>{
+                                connection.commentary(&delegation_id,"Please tell the caller the task queue is at capacity. No task was started for this request. We can keep talking.").await?;
+                            }
                             LiveAction::Queued{..}|LiveAction::None=>{},
                             }
                         },

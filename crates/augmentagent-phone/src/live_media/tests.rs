@@ -557,3 +557,40 @@ async fn live_duration_starts_at_answer_and_expires_at_exact_boundary() {
     assert!(super::duration_expired(&call, 120_000));
     assert!(!super::duration_expired(&call, 59_000));
 }
+
+#[tokio::test]
+async fn saturated_task_queue_returns_refusal_commentary_and_keeps_audio_connected() {
+    let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f = fixture(format!("ws://{}/", provider.local_addr().unwrap())).await;
+    for i in 0..128 {
+        f.service.store.phone_enqueue_dispatch(&f.id, &format!("existing-{i}"), "Existing native task").unwrap();
+    }
+    let backend = tokio::spawn(async move {
+        let (tcp, _) = provider.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        ws.next().await.unwrap().unwrap();
+        ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"type":"session.input_transcript.delta","event_id":"request","delta":"Check my calendar.","start_ms":0,"end_ms":20}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"type":"session.delegation.created","event_id":"work","offset_ms":20,"delegation":{"id":"del-full","type":"delegation","target":"client"}}).to_string().into())).await.unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+        let reply: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(reply["type"], "session.commentary.append");
+        assert_eq!(reply["delegation_id"], "del-full");
+        assert!(reply["content"].as_str().unwrap().contains("No task was started"));
+        ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([128;160])}).to_string().into())).await.unwrap();
+        let close = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+        let close: serde_json::Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
+        assert_eq!(close["type"], "session.close");
+        ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","session":{"id":"live-test"},"reason":"close_requested","usage":{"seconds":0.1}}).to_string().into())).await.unwrap();
+    });
+    let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    let audio = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+    let audio: serde_json::Value = serde_json::from_str(audio.to_text().unwrap()).unwrap();
+    assert_eq!(audio["event"], "media", "refusal must leave the audio path alive");
+    assert_eq!(f.service.store.phone_pending_dispatches().unwrap().len(), 128);
+    assert_eq!(f.service.store.phone_provider_call(&f.id).unwrap().state, augmentagent_store::phone::CallState::Connected);
+    ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"2","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), backend).await.unwrap().unwrap();
+}

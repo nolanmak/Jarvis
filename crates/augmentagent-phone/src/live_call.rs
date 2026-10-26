@@ -12,6 +12,7 @@ pub enum LiveAction {
     None,
     Queued { task_id: String },
     Clarify { delegation_id: String },
+    QueueFull { delegation_id: String },
 }
 pub struct LiveCall {
     service: Arc<PhoneService>,
@@ -81,11 +82,15 @@ impl LiveCall {
                         delegation_id: id.clone(),
                     });
                 };
-                let task_id = self
-                    .service
-                    .store
-                    .phone_enqueue_live_dispatch(&self.call_id, &self.session_id, id, &description)
-                    .map_err(|_| LiveError::Unavailable)?;
+                let task_id = match self.service.store.phone_enqueue_live_dispatch(
+                    &self.call_id, &self.session_id, id, &description,
+                ) {
+                    Ok(task_id) => task_id,
+                    Err(augmentagent_store::phone::PhoneError::RateLimited) => {
+                        return Ok(LiveAction::QueueFull { delegation_id: id.clone() });
+                    }
+                    Err(_) => return Err(LiveError::Unavailable),
+                };
                 self.service.dispatch_ready.notify_one();
                 return Ok(LiveAction::Queued { task_id });
             }
