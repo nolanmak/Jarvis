@@ -1130,6 +1130,20 @@
         "deletion"
       ],
       "scope": "Remote branch configuration only. Does not prove daemon deployment or autonomous shipping. Exact Actions app identities confirmed on passing b2098d5e checks."
+    },
+    "production_native_profile_staged": {
+      "status": "staged_not_activated",
+      "policy_sha256": "291e94f729b8216b1ededcb72a9d190e1f10588040375a349035b53646069fd2",
+      "runtime_manifest_sha256": "98d06aebbd119f738d54071fe42d6009da435ce483544301a63d7dac3177aac2",
+      "providers": [
+        "claude",
+        "codex"
+      ],
+      "grants_match_proven_operator_profile": true,
+      "refresh_enabled": false,
+      "outside_worker_roots": true,
+      "scope": "Stable owner-private runtime/profile provisioned with exact previously exercised routes, environment names and read-only original credentials. No daemon environment mutation, provider request or credential renewal. Actual acceptance on this stable profile and daemon activation pending.",
+      "runtime_manifest_validation": "passed_actual_file_digests"
     }
   },
   "remaining_cross_cutting_acceptance": [
