@@ -41,7 +41,7 @@ async fn find(github: &mut impl Github, branch: &str, head: &str) -> Result<Opti
                 "--limit",
                 &limit.to_string(),
                 "--json",
-                "number,url,headRefOid,headRefName,isCrossRepository,state",
+                "number,url,headRefOid,headRefName,baseRefName,isCrossRepository,state",
             ])
             .await?;
         let page: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
@@ -56,6 +56,8 @@ async fn find(github: &mut impl Github, branch: &str, head: &str) -> Result<Opti
         if row["headRefName"] != branch || row["isCrossRepository"] != false {
             continue;
         }
+        let base=row["baseRefName"].as_str().filter(|base|!base.is_empty()).context("missing publication base identity")?;
+        if base!="main" { continue; }
         let state = row["state"].as_str().context("missing PR state")?;
         anyhow::ensure!(
             state != "CLOSED",
@@ -213,7 +215,15 @@ pub(super) async fn publish(
         branch:branch.into(),head:head.into(),contract:contract.into(),environment:environment.into(),args:args.iter().map(|v|(*v).into()).collect()})?)?;
     let operation = guard.intent(OperationKind::CreatePr)?;
     guard.validate_binding(guard.binding()).await?;
-    let result = if operation.receipt.is_some() {
+    // Direct identity survives the crash window after observe_remote commits
+    // but before the pending index is removed. Do not regress to list-only
+    // visibility after a completed operation (including a lost create reply).
+    let known=guard.publication_dispatch(&operation)?.and_then(|(_,_,number)|number)
+        .or_else(||operation.receipt.as_deref().and_then(|receipt|receipt.strip_prefix("github-pr:"))
+            .and_then(|number|number.parse::<u64>().ok()).filter(|number|*number>0));
+    let result = if let Some(number)=known {
+        direct_publication(&mut Transport(worktree,guard),number,branch,head).await?
+    } else if operation.receipt.is_some() {
         // A completed identity can never create another PR, even if it was
         // subsequently closed or its head changed.
         find(&mut Transport(worktree, guard), branch, head)
@@ -221,9 +231,7 @@ pub(super) async fn publish(
             .context("published workflow needs PR reconciliation; refusing duplicate creation")?
     } else {
         let mut github=Transport(worktree,guard);
-        if let Some(number)=guard.publication_dispatch(&operation)?.and_then(|(_,_,number)|number) {
-            direct_publication(&mut github,number,branch,head).await?
-        } else if let Some(found)=find(&mut github,branch,head).await? {
+        if let Some(found)=find(&mut github,branch,head).await? {
             found
         } else {
             creation_facts(&mut github,repository,issue,branch,head,args).await?;
@@ -634,8 +642,20 @@ mod tests {
         }
     }
     fn row(head: &str) -> String {
-        serde_json::json!([{"number":12,"url":"https://github.com/example/repo/pull/12","headRefOid":head,"headRefName":"agent-fix/issue-1","isCrossRepository":false,"state":"OPEN"}]).to_string()
+        serde_json::json!([{"number":12,"url":"https://github.com/example/repo/pull/12","headRefOid":head,"headRefName":"agent-fix/issue-1","baseRefName":"main","isCrossRepository":false,"state":"OPEN"}]).to_string()
     }
+    #[tokio::test]
+    async fn publication_lookup_requires_exact_base_identity() {
+        let mut wrong:serde_json::Value=serde_json::from_str(&row("abc")).unwrap();
+        wrong[0]["baseRefName"]=serde_json::json!("release");
+        let mut github=Fake {replies:VecDeque::from([Ok(wrong.to_string())]),creates:0};
+        assert!(find(&mut github,"agent-fix/issue-1","abc").await.unwrap().is_none());
+        wrong[0].as_object_mut().unwrap().remove("baseRefName");
+        let mut github=Fake {replies:VecDeque::from([Ok(wrong.to_string())]),creates:0};
+        assert!(find(&mut github,"agent-fix/issue-1","abc").await.is_err());
+        assert_eq!(github.creates,0);
+    }
+
     #[tokio::test]
     async fn lost_create_response_recovers_exactly_one_pr() {
         let mut gh = Fake {
@@ -680,9 +700,10 @@ elif a[:2]==['pr','create']:
     if os.environ.get('AUTOSHIP_PENDING_PUBLICATION_RESPONSE')=='lost':sys.exit(1)
     print('https://github.com/owner/repo/pull/12')
 elif a[:2]==['pr','list']:
+    if (root/'list-unavailable').exists():sys.exit(1)
     if not (root/'creates').exists(): print('[]')
     elif not (root/'visible').exists():print('[]')
-    else: print(json.dumps([dict(number=12,url='https://github.com/owner/repo/pull/12',headRefOid=(root/'head').read_text(),headRefName='agent-fix/issue-1',isCrossRepository=False,state='OPEN')]))
+    else: print(json.dumps([dict(number=12,url='https://github.com/owner/repo/pull/12',headRefOid=(root/'head').read_text(),headRefName='agent-fix/issue-1',baseRefName='main',isCrossRepository=False,state='OPEN')]))
 else:sys.exit(2)
 "#).unwrap();
             std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -711,6 +732,7 @@ else:sys.exit(2)
         guard.audit_logger().model_call_admitted("codex").unwrap(); // Simulated already-paid builder admission.
         assert!(publish(&guard,&worktree,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1","--base","main"]).await.is_err());
         guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",0).await.unwrap();
+        let pending=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap().pending_publications("owner/repo").unwrap().into_iter().next().unwrap().1;
         let id=guard.id().to_owned();guard.finish().unwrap();
         // Simulate filesystem loss while Git still retains the exact commit and
         // linked-worktree registration. Free reconciliation must restore it.
@@ -747,6 +769,16 @@ else:sys.exit(2)
         assert!(!store.has_pending_publication(&id).unwrap());
         assert!(store.pending_operations(&id).unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap().lines().count(),1);
+        // Model a crash after durable observation but before pending-index
+        // deletion. Only direct lookup remains available; no list/create call
+        // may be necessary for recovery of the already-confirmed identity.
+        let guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&worktree,repository:"owner/repo",source_issue:Some(1),pr:Some(12),branch:"agent-fix/issue-1",contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
+        guard.save_publication(&pending).unwrap();guard.finish().unwrap();
+        std::fs::write(root.join("list-unavailable"),"yes").unwrap();
+        reconcile_pending(&repo,false).await.unwrap();
+        assert!(!store.has_pending_publication(&id).unwrap());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1);
+        assert_eq!(std::fs::read_to_string(root.join("attempts")).unwrap().lines().count(),if lost {2}else{1});
         std::fs::write(root.join("executed"),"ok").unwrap();
     }
 
