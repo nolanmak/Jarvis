@@ -181,12 +181,38 @@ poweroff -f
     return entries
 
 
+def validate_runtime(path):
+    guest_runtime = Path(path)
+    if guest_runtime.is_symlink() or not guest_runtime.is_absolute() or guest_runtime.stat().st_mode & 0o077:
+        raise ValueError('native guest runtime is not private')
+    manifest = json.loads((guest_runtime / 'manifest.json').read_text())
+    if manifest.get('version') != 1 or not manifest.get('files'):
+        raise ValueError('native guest runtime manifest unavailable')
+    declared = set()
+    for entry in manifest['files']:
+        relative = safe_relative(entry['path'])
+        path = guest_runtime / relative
+        if path.is_symlink() or not path.resolve().is_relative_to(guest_runtime):
+            raise ValueError('runtime manifest contains a link')
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != entry['sha256']:
+            raise ValueError('runtime artifact digest changed')
+        declared.add(str(relative))
+    inventory = list(guest_runtime.rglob('*'))
+    if any(path.is_symlink() for path in inventory):
+        raise ValueError('runtime symlink is undeclared')
+    actual = {str(path.relative_to(guest_runtime)) for path in inventory if path.is_file()}
+    if actual != declared | {'manifest.json'}:
+        raise ValueError('undeclared runtime file')
+
+
 def main(spec_path):
     vm = module('native_vm_runtime', 'codex-build-vm.py')
     gateway_module = module('native_provider_gateway', 'native-provider-gateway.py')
     spec = private_json(spec_path)
     if spec.get('version') != 1:
         raise ValueError('unsupported native VM launch version')
+    validate_runtime(spec['guest_runtime'])
     runtime = vm.Runtime.load(Path(spec['runtime_config']))
     config = dict(runtime.config)
     config['memory_mb'] = spec['memory_mb']
@@ -232,7 +258,7 @@ def main(spec_path):
                                Path(__file__).with_name('native-provider-gateway.py').read_bytes(), certificates)
         image = private / 'initrd.gz'
         image.write_bytes(vm.initrd(entries))
-        command = vm.qemu_command(config, image, [('runtime', Path('/usr'), True), ('provider', binary, True)], None)
+        command = vm.qemu_command(config, image, [('runtime', Path(spec['guest_runtime']), True), ('provider', binary, True)], None)
         command[command.index('-serial') + 1] = 'null'
         endpoint = private / 'channel.sock'
         command.extend(['-device', 'virtio-serial-pci', '-chardev',

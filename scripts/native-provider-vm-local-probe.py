@@ -2,6 +2,7 @@
 """Explicit synthetic native VM lifecycle probe; never invokes a model."""
 import argparse
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +18,10 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='native-vm-synthetic-', dir='/tmp') as name:
         root = Path(name)
+        provision_spec = importlib.util.spec_from_file_location('native_provision', Path(__file__).with_name('provision-native-vm-probe.py'))
+        provision = importlib.util.module_from_spec(provision_spec)
+        provision_spec.loader.exec_module(provision)
+        provision.stage_runtime(root / 'runtime', Path('/usr/bin/python3.12'))
         session = root / 'session'
         session.mkdir(mode=0o700)
         environment = {'PATH': '/usr/bin:/bin', 'JARVIS_NATIVE_VM_READY': str(root / 'ready'),
@@ -36,7 +41,7 @@ prior=(home/'count').read_text() if (home/'count').exists() else '0'
 (home/'count').write_text(str(int(prior)+1))
 print(json.dumps({'type':'synthetic','count':int(prior)+1,'interfaces':os.listdir('/sys/class/net')}),flush=True)
 """
-        spec = {'version': 1, 'runtime_config': str(args.runtime_config), 'memory_mb': 512,
+        spec = {'version': 1, 'runtime_config': str(args.runtime_config), 'guest_runtime': str(root / 'runtime'), 'memory_mb': 512,
             'session_directory': str(session), 'resume': False, 'executable': '/usr/bin/python3.12',
             'argv': ['-I', '-S', '-c', script], 'environment': {'LANG': 'C.UTF-8'},
             'auth_file': None, 'auth_relative': '.codex/auth.json', 'gateway': policy,

@@ -73,6 +73,18 @@ ready.with_name('actual-model-dispatch').write_text('called')
                     process.kill()
                     process.wait()
 
+    def test_undeclared_runtime_sibling_refuses_launch(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            vm.atomic(root / 'python', b'declared runtime')
+            vm.atomic(root / 'manifest.json', json.dumps({'version': 1, 'files': [
+                {'path': 'python', 'sha256': vm.hashlib.sha256(b'declared runtime').hexdigest()}
+            ]}).encode())
+            vm.validate_runtime(root)
+            vm.atomic(root / 'unrelated-credential', b'not granted')
+            with self.assertRaisesRegex(ValueError, 'undeclared runtime file'):
+                vm.validate_runtime(root)
+
     def test_runtime_resume_uses_only_committed_generation(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

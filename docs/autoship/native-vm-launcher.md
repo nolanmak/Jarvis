@@ -12,6 +12,7 @@ The file must be owner-private, regular and single-link. Its version 1 shape is:
 {
   "version": 1,
   "runtime_config": "/controller/build-vm/runtime.json",
+  "guest_runtime": "/controller/private-native-vm-runtime",
   "state_root": "/controller/private-native-vm",
   "memory_mb": 1024,
   "providers": {
@@ -47,7 +48,7 @@ needs explicitly reviewed authentication and inference routes matching its
 configured endpoint. Unlisted hosts/routes/methods and direct guest networking
 are denied. No production policy is installed by this change.
 
-The guest exports no NIC and receives only read-only system runtime, one native
+The guest exports no NIC and receives only read-only manifest-pinned distribution runtime, one native
 executable, declared prompt/image inputs and the selected provider credential.
 Native code runs as a nonroot guest user. A root guest supervisor owns the
 virtio control channel and local gateway. The guest MCP relay exposes only the
@@ -72,9 +73,9 @@ in the authenticated rollout test.
 
 Local executable validation:
 
-- `python3 scripts/test-native-provider-vm.py`: four tests cover pre-admission
+- `python3 scripts/test-native-provider-vm.py`: five tests cover pre-admission
   refusal, cancellation cleanup, completed-generation recovery and symlink
-  rejection. These do not execute a VM or contact a provider.
+  rejection and undeclared runtime siblings. These do not execute a VM or contact a provider.
 - `scripts/native-provider-vm-local-probe.py --execute --runtime-config PATH`:
   actual 512 MiB guest executes a synthetic Python CLI twice, proving nonroot
   execution, root control-file denial, loopback-only networking and persisted
@@ -86,3 +87,14 @@ resume typo; the corrected complete probe passed both launches. This synthetic
 proof does not establish provider authentication, SSE/WebSocket compatibility,
 MCP end-to-end behavior or safe OAuth refresh across distinct conversations.
 Those remain explicit rollout acceptance checks before enabling the policy.
+
+Provision a disposable profile with `/usr/bin/python3
+scripts/provision-native-vm-probe.py --directory NEW_PRIVATE_DIRECTORY
+--runtime-config EXISTING_RUNTIME_CONFIG --provider codex
+--native-executable EXACT_NATIVE_EXECUTABLE --auth-file EXPLICIT_AUTH_FILE
+--gateway-policy REVIEWED_ROUTE_POLICY`. Arguments are paths and declared grants,
+not credential contents. The helper never edits daemon configuration. It copies
+only the distribution Python packages and resolved ELF dependencies, excludes
+site/user customization, and records each file digest. The guest does not mount
+the host `/usr`, `/usr/local`, `/etc` or provider home. Any unlisted file added to
+the staged runtime causes launch refusal.

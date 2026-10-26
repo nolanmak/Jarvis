@@ -109,7 +109,7 @@ def main():
         'TMPDIR': '/tmp', 'CODEX_HOME': '/home/worker/.codex',
         'CLAUDE_CONFIG_DIR': '/home/worker/.claude', 'HTTP_PROXY': proxy,
         'HTTPS_PROXY': proxy, 'http_proxy': proxy, 'https_proxy': proxy,
-        'NO_PROXY': '', 'no_proxy': '', 'SSL_CERT_FILE': job['gateway']['ca_file'],
+        'NO_PROXY': '', 'no_proxy': '', 'ALL_PROXY': '', 'all_proxy': '', 'SSL_CERT_FILE': job['gateway']['ca_file'],
         'NODE_EXTRA_CA_CERTS': job['gateway']['ca_file']})
     # One relay connection is an untrusted byte stream to the original host
     # policy bridge, not access to the gateway/control frame parser.

@@ -10,6 +10,7 @@ use tokio::process::Command;
 struct Policy {
     version: u32,
     runtime_config: PathBuf,
+    guest_runtime: PathBuf,
     state_root: PathBuf,
     memory_mb: u32,
     providers: BTreeMap<String, Provider>,
@@ -146,7 +147,7 @@ impl Launch {
         let mcp_argv = bridge.map(|bridge| vec!["/usr/bin/python3".to_string(), "-I".into(),
             bridge.native_cwd.parent().expect("bridge launch directory").join("tool-bridge.py").to_string_lossy().into_owned(),
             bridge.policy_path.to_string_lossy().into_owned()]);
-        let spec = serde_json::json!({"version":1,"runtime_config":policy.runtime_config,"memory_mb":policy.memory_mb,
+        let spec = serde_json::json!({"version":1,"runtime_config":policy.runtime_config,"guest_runtime":policy.guest_runtime,"memory_mb":policy.memory_mb,
             "session_directory":session,"resume":resume,"executable":executable,"argv":arguments,
             "environment":environment,"auth_file":profile.auth_file,"auth_relative":profile.auth_relative,
             "gateway":profile.gateway,"mcp_argv":mcp_argv,"assets":assets});
