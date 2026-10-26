@@ -20,9 +20,34 @@ pub(super) struct ReviewContext<'a> {
     )>,
 }
 
+pub(super) struct ReviewSubject<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+}
+
 pub(super) async fn run(
     builder: &FallbackReasoner,
     issue: &Issue,
+    worktree: PathBuf,
+    criteria: &[String],
+    context: ReviewContext<'_>,
+) -> IndependentReview {
+    run_for_subject(
+        builder,
+        &ReviewSubject {
+            title: &issue.title,
+            body: &issue.body,
+        },
+        worktree,
+        criteria,
+        context,
+    )
+    .await
+}
+
+pub(super) async fn run_for_subject(
+    builder: &FallbackReasoner,
+    issue: &ReviewSubject<'_>,
     worktree: PathBuf,
     criteria: &[String],
     context: ReviewContext<'_>,
@@ -223,7 +248,7 @@ async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Re
 pub(super) async fn run_inner(
     provider: augmentagent_channel_core::ProviderKind,
     _authors: &[augmentagent_channel_core::ProviderKind],
-    issue: &Issue,
+    issue: &ReviewSubject<'_>,
     worktree: PathBuf,
     criteria: &[String],
     context: ReviewContext<'_>,
@@ -661,8 +686,17 @@ mod tests {
     async fn snapshot_missing_committed_blob_is_incomplete_not_approval_evidence() {
         let dir = candidate_fixture();
         let blob = fixture_git(dir.path(), &["rev-parse", "HEAD:source.rs"]);
-        std::fs::remove_file(dir.path().join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
-        assert!(candidate_snapshot(dir.path()).await.is_err(), "missing source bytes cannot be represented by a coverage digest");
+        std::fs::remove_file(
+            dir.path()
+                .join(".git/objects")
+                .join(&blob[..2])
+                .join(&blob[2..]),
+        )
+        .unwrap();
+        assert!(
+            candidate_snapshot(dir.path()).await.is_err(),
+            "missing source bytes cannot be represented by a coverage digest"
+        );
     }
 
     #[tokio::test]
