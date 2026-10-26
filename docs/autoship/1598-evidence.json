@@ -340,11 +340,11 @@
       "note": "Restricted fresh reviewer dispatch remains tool/history-free; malformed fresh tool request is refused without dispatch or cooldown."
     },
     "readmission_comments": {
-      "revision": "309e950b",
+      "revision": "d0ccfbc4",
       "passed": 3,
       "failed": 0,
-      "log": "/tmp/autoship-1598-readmit-comments.log",
-      "note": "102-comment reset/reason regression passed; explicit request-cap follow-up under central validation."
+      "log": "/tmp/autoship-1598-bounded-readmit-retry.log",
+      "note": "Explicit bounded per-page REST retrieval; reset/new reason after comment100; untouched histories preserved."
     },
     "fresh_reviewer_authless": {
       "revision": "f8f37ba8",
@@ -352,6 +352,26 @@
       "failed": 0,
       "log": "/tmp/autoship-1598-fresh-review-authless.log",
       "note": "Credential-free isolated child passes; replaces accidentally authenticated mocked CI test."
+    },
+    "resource_rollout": {
+      "revision": "2438b628",
+      "passed": 1,
+      "failed": 0,
+      "command": "python3 scripts/tests/run_resource_rollout_test.py",
+      "note": "Synthetic rollout test preserves aggregate caps and ExecStart, installs delegation through normal restart path."
+    },
+    "updater_restart_hygiene": {
+      "revision": "2438b628",
+      "passed": 21,
+      "failed": 0,
+      "command": "bash scripts/tests/updater-restart-hygiene.test.sh"
+    },
+    "github_live_boundary": {
+      "passed": false,
+      "repository": "nolanmak/autoship-acceptance-6073a5330e3a4cae",
+      "evidence_root": "/tmp/autoship-github-acceptance-n0ic5yrv",
+      "log": "/tmp/autoship-1598-real-github-retry.log",
+      "result": "Real accepted merge + durable own receipt passed. Stale candidate rejected with expected-status-check wording; stale-proof assertion/restartable probe follow-up pending. No production repository settings changed; synthetic merges do not count as production shipping."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -368,7 +388,7 @@
     {
       "severity": "P1",
       "gap": "Source-less PR selection can starve newer PRs and reserved new-issue slots",
-      "status": "fair_selection_and_repository_inventory_fixed; 1501_item_regression_passed; nested_issue_comment_pagination_followup_in_progress"
+      "status": "fair_selection_repository_inventory_and_bounded_comment_history_fixed; 1501_item_and_late_comment_integration_regressions_passed"
     },
     {
       "severity": "P1",
