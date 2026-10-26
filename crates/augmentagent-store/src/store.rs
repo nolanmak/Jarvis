@@ -2732,6 +2732,21 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the first failure and the retry context together. Retried actions
+    /// are recorded by the retry controller, which also owns escalation.
+    pub fn record_initial_email_failure(&self, failure: &EmailRetryFailure) -> StoreResult<()> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let changed = tx.execute("UPDATE actions SET status='error',errorMessage=?3,updatedAt=?4 WHERE id=?1 AND messageId=?2",
+            params![failure.action_id,failure.message_id,redact::mask(&failure.detail),failure.observed_at_ms])?;
+        if changed > 0 {
+            tx.execute("INSERT INTO email_retry_failures(action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms) SELECT ?1,?2,1,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM actions WHERE id=?1 AND COALESCE(retryCount,0)=0) AND NOT EXISTS(SELECT 1 FROM email_retry_failures WHERE action_id=?1 AND attempt_n=1)",
+                params![failure.action_id,failure.message_id,redact::mask(&failure.failure_class),failure.guard,redact::mask(&failure.detail),failure.observed_at_ms])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Digest seam: durable retry failures, newest first, with an explicit limit.
     pub fn email_retry_failures_since(&self, since_ms: i64, limit: usize) -> StoreResult<Vec<EmailRetryFailure>> {
         let conn = self.conn.lock().expect("store mutex poisoned");

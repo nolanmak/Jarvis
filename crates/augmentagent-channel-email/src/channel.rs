@@ -242,6 +242,15 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         Ok(fresh)
     }
 
+    fn record_initial_failure(&self, action_id: &str, email: &Email, guard: &str, failure: &str) -> anyhow::Result<()> {
+        self.store.record_initial_email_failure(&augmentagent_store::EmailRetryFailure {
+            action_id: action_id.into(), message_id: email.message_id.clone(), attempt_n: 1,
+            failure_class: retry_failure_class(failure), guard: guard.into(),
+            detail: failure.into(), observed_at_ms: now_millis(),
+        })?;
+        Ok(())
+    }
+
     async fn record_retry_failure(&self, item: &RetryableReply, email: &augmentagent_store::Email, new_count: i64, error: &anyhow::Error) -> anyhow::Result<()> {
                 let failure = format!("{error:#}");
                 self.store.record_email_retry_failure(&augmentagent_store::EmailRetryFailure {
@@ -1147,7 +1156,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     Err(e) => {
                         error!(message_id = %email.message_id, "draft call failed: {e}");
                         if retry.is_none() {
-                        self.store.log_action(
+                        let action_id = self.store.log_action(
                             &email.message_id,
                             email.thread_id.as_deref(),
                             &email.from,
@@ -1156,6 +1165,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                             None,
                             ActionStatus::Error,
                         )?;
+                        self.record_initial_failure(&action_id, &email, "draft-model", &format!("{e:#}"))?;
                         }
                         // NOT mark_email_processed — retry tick will pick up.
                         return Err(e);
@@ -1570,12 +1580,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // blank Gmail draft and carding it. The reason stays generic:
         // `actions.errorMessage` renders on the Discord card.
         if draft_has_nothing_to_send {
-            self.store.update_action_status(
-                &action_id,
-                ActionStatus::Error,
-                None,
-                Some("draft had no sendable text"),
-            )?;
+            self.record_initial_failure(&action_id, &email, "draft-content", "draft had no sendable text")?;
             anyhow::bail!("draft had no sendable text");
         }
 
@@ -1646,12 +1651,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     id
                 }
                 Err(e) => {
-                    self.store.update_action_status(
-                        &action_id,
-                        ActionStatus::Error,
-                        None,
-                        Some(&format!("create_draft: {e}")),
-                    )?;
+                    self.record_initial_failure(&action_id, &email, "create-draft", &format!("create_draft: {e}"))?;
                     return Err(e.into());
                 }
             },
@@ -1688,12 +1688,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             .post_approval(&action_id, &email, &card_body)
             .await
         {
-            self.store.update_action_status(
-                &action_id,
-                ActionStatus::Error,
-                None,
-                Some(&format!("post_approval: {e}")),
-            )?;
+            self.record_initial_failure(&action_id, &email, "post-approval", &format!("post_approval: {e}"))?;
             return Err(anyhow::anyhow!("post_approval: {e}"));
         }
 
@@ -3565,6 +3560,48 @@ Where: Microsoft Teams
     }
 
     #[tokio::test]
+    async fn first_draft_failure_survives_reopen_enters_retry_context_and_digest_without_sending() {
+        struct FailingDraft { calls: std::sync::atomic::AtomicUsize }
+        #[async_trait]
+        impl Reasoner for FailingDraft {
+            async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(r#"{"decision":"reply","reason":"actionable"}"#.into())
+                } else { anyhow::bail!("synthetic draft provider unavailable") }
+            }
+        }
+        let (store, file) = tmp_store();
+        let mut email = threaded_inbound();
+        email.message_id = "initial-draft-memory".into();
+        email.account_entity_id = Some("acc1".into());
+        store.upsert_email(&email).unwrap();
+        let broker = Arc::new(RecordingBroker::default());
+        let config = GmailChannelConfig { skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+            dry_run: false, retry_min_gap: Duration::ZERO, ..Default::default() };
+        let channel = GmailChannel::new(store.clone(), Arc::new(StubGmail { emails: vec![] }),
+            Arc::new(FailingDraft { calls: std::sync::atomic::AtomicUsize::new(0) }), broker.clone(), config.clone());
+        assert!(channel.process_email("", "", "acc1", email).await.is_err());
+        assert!(broker.posts.lock().unwrap().is_empty());
+        drop(channel); drop(store);
+        let store = Arc::new(Store::open(file.path()).unwrap());
+        // The digest consumes this exact durable query, not the mutable action error.
+        let failures = store.email_retry_failures_since(0,25).unwrap();
+        assert_eq!(failures.len(),1);
+        assert_eq!(failures[0].attempt_n,1);
+        assert_eq!(failures[0].guard,"draft-model");
+        assert!(failures[0].failure_class.contains("synthetic draft provider unavailable"));
+        let reasoner = Arc::new(ScriptedReasoner::new([r#"{"decision":"skip","reason":"owner request no longer actionable"}"#]));
+        let channel = GmailChannel::new(store.clone(),Arc::new(StubGmail { emails: vec![] }),reasoner.clone(),broker.clone(),config);
+        assert_eq!(channel.retry_once().await.unwrap(),1);
+        let prompts=reasoner.prompts.lock().unwrap();
+        assert_eq!(prompts.len(),1,"retry must triage again, not draft or send");
+        assert!(prompts[0].contains("attempt_n=2"));
+        assert!(prompts[0].contains("synthetic draft provider unavailable"));
+        assert!(broker.posts.lock().unwrap().is_empty());
+        assert_eq!(store.email_retry_failures_since(0,25).unwrap().len(),1,"success retains original failure");
+    }
+
+    #[tokio::test]
     async fn identical_retry_failure_flags_owner_and_stops_third_dispatch() {
         let (store, _f) = tmp_store();
         let email = Email { message_id: "repeat-failure".into(), thread_id: Some("thread".into()),
@@ -3660,6 +3697,12 @@ Where: Microsoft Teams
         assert_eq!(out1.errors, 1);
         assert!(!store.is_email_complete("m-retry").unwrap());
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
+
+        let failures = store.email_retry_failures_since(0,25).unwrap();
+        assert_eq!(failures.len(),1);
+        assert_eq!(failures[0].attempt_n,1);
+        assert_eq!(failures[0].guard,"create-draft");
+        assert!(failures[0].failure_class.contains("synthetic transient"));
 
         // Retry tick: create_draft now succeeds, approval card posted.
         // First-pass code generation/self-repair can consume multiple replies.
@@ -4057,6 +4100,11 @@ Where: Microsoft Teams
             1
         );
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
+
+        let failures = store.email_retry_failures_since(0,25).unwrap();
+        assert_eq!(failures.len(),1);
+        assert_eq!(failures[0].attempt_n,1);
+        assert_eq!(failures[0].guard,"post-approval");
 
         // Retry tick: post_approval succeeds. create_draft must NOT be called
         // a second time — the action already has a draftId from the first pass.
