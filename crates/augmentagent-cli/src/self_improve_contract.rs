@@ -631,6 +631,10 @@ pub(super) async fn prepare_acceptance(
         );
         prepared
     } else {
+        ensure!(
+            manifest.is_none(),
+            "recorded original baseline evidence is missing; refusing regeneration"
+        );
         ensure!(actual_head(candidate).await? == base, "missing original baseline receipt on repaired candidate; cannot re-register from its head");
         let proposal = proposal_with_retry(reasoner, candidate, issue, scope).await?;
         let temporary = tempfile::Builder::new()
