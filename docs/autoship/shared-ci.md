@@ -145,3 +145,13 @@ remain local, including PDF runtime/updater fixtures and Codex redirect unit
 tests. A future provisioner must supply pinned artifacts plus persistent private
 job paths and verification before removing these explicit requirements. Direct
 VM step invocation also rejects an unmet declaration before running its body.
+
+Validation workflows cancel superseded pull-request runs using a concurrency
+key scoped to workflow and PR number. Non-PR events include their unique run ID,
+so neither running nor pending push/main runs are displaced by this policy.
+Platform retains its existing explicit concurrency policy. The contract generator
+rejects validation workflows that omit the reviewed policy, including newly added
+`.yaml` files; this prevents old-head jobs from silently consuming the queue again.
+GitHub permits only one pending run per concurrency group and replaces an older
+pending run even when running cancellation is disabled; the non-PR run ID avoids
+that side effect ([GitHub concurrency documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)).

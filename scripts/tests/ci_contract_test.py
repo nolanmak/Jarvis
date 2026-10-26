@@ -28,6 +28,21 @@ class ContractTests(unittest.TestCase):
    root=Path(d);c=self.fixture(root,body='touch must-not-run');c['commands']['test/check/0']['vm_provisioning']=['pdf-python-runtime']
    result=subprocess.run([sys.executable,str(ROOT/'scripts/ci-contract.py'),'--contract-json',json.dumps(c),'step','--vm-runtime','--id','test/check/0'],cwd=root,capture_output=True,text=True)
    self.assertEqual(result.returncode,2);self.assertIn('shared CI prerequisite unavailable',result.stderr);self.assertFalse((root/'must-not-run').exists())
+ def test_validation_concurrency_rejects_omission_and_push_cancellation(self):
+  syncspec=importlib.util.spec_from_file_location('sync_concurrency',ROOT/'scripts/ci-contract-sync.py');sync=importlib.util.module_from_spec(syncspec);syncspec.loader.exec_module(sync)
+  import yaml
+  contract=json.loads((ROOT/'scripts/ci-contract.json').read_text())
+  for path,row in contract['workflows'].items():
+   if row['role']=='validation':sync.validate_concurrency(Path(path).name,yaml.safe_load((ROOT/path).read_text()))
+  for policy in [None,{'group':'${{ github.workflow }}-${{ github.ref }}','cancel-in-progress':True},
+                 {**sync.PR_CONCURRENCY,'group':'${{ github.workflow }}-${{ github.ref }}'},
+                 {**sync.PR_CONCURRENCY,'cancel-in-progress':True}]:
+   with self.assertRaisesRegex(ValueError,'PR concurrency policy'):sync.validate_concurrency('future-validation.yaml',{'concurrency':policy})
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);shutil.copytree(ROOT/'.github/workflows',root/'.github/workflows');(root/'scripts').mkdir()
+   shutil.copyfile(ROOT/'scripts/ci-contract.json',root/'scripts/ci-contract.json')
+   (root/'.github/workflows/future-validation.yaml').write_text('name: Future\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n')
+   with self.assertRaisesRegex(ValueError,'PR concurrency policy'):sync.generate(root)
  def test_inventory_all_workflows_and_command_wrappers_match(self):
   c=json.loads((ROOT/'scripts/ci-contract.json').read_text());self.assertEqual(ci.verify(c,ROOT),[])
   self.assertEqual(len(c['workflows']),len(list((ROOT/'.github/workflows').glob('*.yml'))))

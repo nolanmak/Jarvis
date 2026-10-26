@@ -12,6 +12,16 @@ EXCLUDED={'autonomous-code-scanner.yml':'scheduled autonomous scanner and issue 
           'issue-to-pr.yml':'issue-driven implementation and publication, not PR validation',
           'claude-pr-review.yml':'optional comment-only external review'}
 
+PR_CONCURRENCY = {
+ 'group': "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}",
+ 'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
+}
+def validate_concurrency(filename,data):
+    # Platform's existing explicit policy predates this rollout and is retained.
+    expected={'group':'platform-${{ github.ref }}','cancel-in-progress':True} if filename=='platform.yml' else PR_CONCURRENCY
+    if data.get('concurrency')!=expected:
+        raise ValueError('validation workflow requires reviewed PR concurrency policy: '+filename)
+
 def generate(root=ROOT):
     path=root/'scripts/ci-contract.json'
     old=json.loads(path.read_text()) if path.exists() else {'commands':{}}
@@ -23,6 +33,7 @@ def generate(root=ROOT):
         if source.name in EXCLUDED:
             workflows[key]={'role':'excluded','reason':EXCLUDED[source.name],'sha256':hashlib.sha256(raw.encode()).hexdigest()};continue
         if not isinstance(events,dict) or 'pull_request' not in events:raise ValueError('unclassified workflow '+key)
+        validate_concurrency(source.name,data)
         jobs_node=next(value for name,value in node.value if name.value=='jobs')
         replacements=[];jobs={}
         for job_name,job_node in jobs_node.value:

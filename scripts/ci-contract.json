@@ -752,7 +752,7 @@
         }
       },
       "role": "validation",
-      "sha256": "0107f50673ef6ed241f880cc1c6ad336864ac7d442316ddaa1e8eaa887b0d715"
+      "sha256": "61d9922f2ba16e3788e64baa0b935a448c6cd45b55f3432d069f2696a3ec39db"
     },
     ".github/workflows/approval-history.yml": {
       "defaults": {},
@@ -794,7 +794,7 @@
         }
       },
       "role": "validation",
-      "sha256": "ccf4f01f4607d78f8826c1146843afae03a9338419b12c93f9c8269ea7ac75b0"
+      "sha256": "aa8d847c8b5a43726a910347843160f4c87b903d9d2864aeae2b0fadf2b91aec"
     },
     ".github/workflows/autonomous-code-scanner.yml": {
       "reason": "scheduled autonomous scanner and issue reporting",
@@ -857,7 +857,7 @@
         }
       },
       "role": "validation",
-      "sha256": "ebd42b2b5d240e0b079aa393fd4cd6b88a38a66872b755cbc6c27fdb98146111"
+      "sha256": "865d00a0ba6f6f8bb4c80c36c400c96e2482ac71c3e4b6247032c4a78b56d76d"
     },
     ".github/workflows/browser-sidecar.yml": {
       "defaults": {},
@@ -933,7 +933,7 @@
         }
       },
       "role": "validation",
-      "sha256": "ef229bc83572764c56db04f065289038563fb764a8e03659dae35a92cf8eb5f7"
+      "sha256": "c8bfa5d8c43b833aa642e9436db138406b712ca60cc367630ebdb50d7b066173"
     },
     ".github/workflows/claude-pr-review.yml": {
       "reason": "optional comment-only external review",
@@ -1001,7 +1001,7 @@
         }
       },
       "role": "validation",
-      "sha256": "90245256d982568c415b3745f8e32d997b9a03c10a80265027e1104ffe6eb820"
+      "sha256": "2783d975ee525a0020b057c53c8f25eee1b995a78d56f492b0f1ce4c7733a11b"
     },
     ".github/workflows/computer-use.yml": {
       "defaults": {},
@@ -1084,7 +1084,7 @@
         }
       },
       "role": "validation",
-      "sha256": "4c949851d67b268ec178266cd9a2baf4b381d5bf1d82a970f9aebb609126292a"
+      "sha256": "4803825327940a7f151d7b0a5ce2765c1d86f097f3945bf3a3c816ff31a5342d"
     },
     ".github/workflows/dashboard-sessions.yml": {
       "defaults": {},
@@ -1143,7 +1143,7 @@
         }
       },
       "role": "validation",
-      "sha256": "613b749c282745cfe32ec222a56fdadb0828cf6f5d798fc9c990dbe75c962a61"
+      "sha256": "de8990ee4a8d68a43c96bc71453184fff748f95b840dbb9759e18277f3c63ef6"
     },
     ".github/workflows/discord-voice.yml": {
       "defaults": {},
@@ -1261,7 +1261,7 @@
         }
       },
       "role": "validation",
-      "sha256": "d801fb8151f13dce22ae1f3d977bb78d96fb12d7a7508dc50b8ee23683006417"
+      "sha256": "4a00c19c14475e6622d42ff66a20ba625dc553447205e37784aadb60dbba5375"
     },
     ".github/workflows/finance.yml": {
       "defaults": {},
@@ -1331,7 +1331,7 @@
         }
       },
       "role": "validation",
-      "sha256": "cb7386792ecb0de35622246ba5390d6aff8185fae5c86d83de1ea09332b1a042"
+      "sha256": "873114b2e7463369b11c2e4d831adb2be9a77274d0d572423fe0e9dd3fd83851"
     },
     ".github/workflows/heartbeat.yml": {
       "defaults": {},
@@ -1402,7 +1402,7 @@
         }
       },
       "role": "validation",
-      "sha256": "9bbd461c54ccf8251c271b87eeb9f6a67ded8bb07c0a94a7150c5dd8865c81b6"
+      "sha256": "17e01812b4077e547cf7782f895f75fa52420bacd9c2e98e787e6c3952ae55d1"
     },
     ".github/workflows/imessage.yml": {
       "defaults": {},
@@ -1439,7 +1439,7 @@
         }
       },
       "role": "validation",
-      "sha256": "01f77a4d044c472bb20281572fc3bb8b625fbf34679e30e55551e82ce79ea69f"
+      "sha256": "e9764f2984715a5d52caac3923f004cb50b4f21579b4c397b83a040a6f084905"
     },
     ".github/workflows/issue-to-pr.yml": {
       "reason": "issue-driven implementation and publication, not PR validation",
@@ -1686,7 +1686,7 @@
         }
       },
       "role": "validation",
-      "sha256": "4bc6f0f53940394c4c89b759a605f60ad312330023cb573f0298bb6075e9fe80"
+      "sha256": "cf43f77b7a15feba10388e98ec4c8c87b75806b8ebb9429e25f5370213dee45d"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},
@@ -1712,7 +1712,7 @@
         }
       },
       "role": "validation",
-      "sha256": "6ff6da68d1e492dcbef10d7952d4e5119f3091cdbe52e8a3a4cd3d45c01a9100"
+      "sha256": "a8268062d318a357d7588d52523a207dfadfcb625a94753c15ae99e50a8e5405"
     },
     ".github/workflows/pdf-generation.yml": {
       "defaults": {},
@@ -1849,7 +1849,7 @@
         }
       },
       "role": "validation",
-      "sha256": "c725acfbb9e207d7b7bca13c5331cdac80fcf1baa6073ddc2eb10a615b72c585"
+      "sha256": "848744b4cfaf1375dc825588521157a5f8fa622ba65ff3265f3cab22770e4908"
     },
     ".github/workflows/phone.yml": {
       "defaults": {},
@@ -1993,7 +1993,7 @@
         }
       },
       "role": "validation",
-      "sha256": "f4ec3952b4b0d94766b396d8d29c18b235aae4e3fec3c69d0fe4a85377aca82d"
+      "sha256": "5a36ca22d6a2a95c674bd360b739da04782e1fa0be137629a1ba623871993497"
     },
     ".github/workflows/platform.yml": {
       "defaults": {},
@@ -2257,7 +2257,7 @@
         }
       },
       "role": "validation",
-      "sha256": "1bfc10b8e15e7b6b57323435f12659f57a402d6d6dc51fc65022b83473f55a00"
+      "sha256": "d74e245ac95731bbea4c018a4130a839605102c175c3ac7e4163e21807d60b04"
     },
     ".github/workflows/whatsapp-history.yml": {
       "defaults": {},
@@ -2324,7 +2324,7 @@
         }
       },
       "role": "validation",
-      "sha256": "1ad855b3ba479d8167618add5f13743d50692a08d00f33113f48e04036d4ebfe"
+      "sha256": "8cba5248c9d40902d8e31110f5a8ccaa5dc1a2fcc3719c3e0fa2a9447dd169e6"
     },
     ".github/workflows/whatsapp-sidecar.yml": {
       "defaults": {},
@@ -2408,7 +2408,7 @@
         }
       },
       "role": "validation",
-      "sha256": "fdf314ea3c8213d3c207c8ad9baec785ff9d588f90cb6ca055dbd7211a153b4f"
+      "sha256": "41937e7d386a902fb32ff5bd3e29cbff09e2a1bd7b14056882cbb2dd310d5159"
     }
   }
 }

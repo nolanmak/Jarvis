@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
 jobs:
   wire-contract:
     name: wire-contract (${{ matrix.os }})
