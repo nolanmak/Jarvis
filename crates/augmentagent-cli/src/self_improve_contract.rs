@@ -207,10 +207,13 @@ async fn actual_head(root: &Path) -> Result<String> {
 /// The orchestrator must also pin the admitted Rust toolchain image; this hash
 /// does not attest every library in a mutable host installation.
 fn environment_id(root: &Path) -> Result<String> {
+    environment_id_with_exporter(root, Some(verifier_checkout::EXPORTER))
+}
+fn environment_id_with_exporter(root: &Path, exporter: Option<&str>) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(SANDBOX.as_bytes());
-    hash.update(verifier_checkout::EXPORTER.as_bytes());
+    if let Some(exporter) = exporter { hash.update(exporter.as_bytes()); }
     hash.update(DEPENDENCY_AUDIT.as_bytes());
     hash.update(serde_json::to_vec(&compiler_control_inputs(root)?)?);
     if root.join("Cargo.lock").exists() {
@@ -1768,6 +1771,8 @@ pub(super) async fn assert_verifier_receipt_current(
     reference: &CandidateReceiptReference,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
+    ensure!(prepared.proposal.contract.verifiers.iter().all(|v| v.command.controller_asserted()),
+        "legacy in-process verifier requires independent behavioral-oracle migration");
     let head = actual_head(worktree).await?;
     ensure!(
         environment_id(worktree)? == reference.binding.environment_id,
@@ -2042,7 +2047,11 @@ pub(super) fn historical_fixture(root:&Path, modern:&PreparedAcceptance)->Result
     for verifier in &mut proposal.contract.verifiers {
         verifier.command=crate::autoship_contract::VerifierCommand::PythonUnittest{test:"autoship_verifiers.test_sum.Case.test_add".into()};
     }
-    let registration=RegisteredContract::register(root,proposal.contract.clone(),modern.baseline.registration.baseline_head().into(),environment_id(root)?)?;
+    // Reproduce the pre-committed-export engine recipe using identical host
+    // binaries and source compiler inputs; never invent a current fingerprint.
+    let previous_engine = environment_id_with_exporter(root, None)?;
+    ensure!(previous_engine != environment_id(root)?, "historical fixture must have an older engine fingerprint");
+    let registration=RegisteredContract::register(root,proposal.contract.clone(),modern.baseline.registration.baseline_head().into(),previous_engine)?;
     // Historical cached claims are deliberately not re-endorsed by observe().
     let receipts=modern.baseline.receipts.iter().cloned().map(|mut receipt| {
         receipt.binding=registration.binding(registration.baseline_head()).unwrap();receipt

@@ -122,6 +122,55 @@ fn validate_correction_with_files(
     );
     Ok(())
 }
+#[derive(Debug, Serialize)]
+struct EnvironmentEvidence {
+    original_base: String,
+    registered_baseline: String,
+    registered_candidate: String,
+    current_original_baseline: String,
+    current_candidate: String,
+    legacy_proof_migration: bool,
+    current_sandbox_sha256: String,
+    current_exporter_sha256: String,
+    current_registry_audit_sha256: String,
+}
+impl EnvironmentEvidence {
+    fn transition_required(&self) -> bool {
+        self.registered_baseline != self.current_original_baseline
+            || self.registered_candidate != self.current_candidate
+    }
+    fn authorize(&self, approved: bool) -> Result<()> {
+        ensure!(!self.transition_required() || approved,
+            "environment change was not independently approved");
+        Ok(())
+    }
+    fn prompt(&self) -> Result<String> {
+        Ok(format!("Controller-measured environment evidence: {}\nThe registered environment is a composite fingerprint, including the controller verifier engine, source-controlled compiler inputs and runner identity. An older engine may omit committed-source export and use in-process assertions; its old receipts authorize nothing. A changed original-base fingerprint under the current engine is not by itself evidence that the candidate changed dependencies. Compare current_original_baseline with current_candidate and the full source diff to distinguish current source-input changes. Historical component identities cannot be inferred from an opaque old digest. You may explicitly approve_environment_transition for a legitimate controller-engine migration/rebaseline as well as legitimate runner/compiler/dependency changes. Never silently carry old red/green claims forward: the exact recorded original base must produce intended assertion red under the current engine and the candidate must separately produce green. Preserve every owner requirement; reject unknown setup failures or requirement weakening.", serde_json::to_string(self)?))
+    }
+}
+async fn environment_evidence(root: &Path, control: &Path, old: &PreparedAcceptance) -> Result<EnvironmentEvidence> {
+    let base = old.baseline.registration.baseline_head();
+    let temporary = tempfile::Builder::new().prefix("environment-baseline-").tempdir_in(control)?;
+    let checkout = temporary.path().join("checkout");
+    let path = checkout.to_str().context("baseline environment path UTF8")?;
+    trusted_git(root, &["worktree", "add", "--detach", path, base]).await?;
+    let measured = environment_id(&checkout);
+    let cleanup = trusted_git(root, &["worktree", "remove", "--force", path]).await;
+    let current_original_baseline = measured?;
+    cleanup?;
+    Ok(EnvironmentEvidence {
+        original_base: base.into(),
+        registered_baseline: old.baseline.registration.binding(base)?.environment_id,
+        registered_candidate: old.baseline.registration.candidate_environment_id().into(),
+        current_original_baseline,
+        current_candidate: environment_id(root)?,
+        legacy_proof_migration: old.proposal.contract.verifiers.iter().any(|v| !v.command.controller_asserted()),
+        current_sandbox_sha256: digest(SANDBOX.as_bytes()),
+        current_exporter_sha256: digest(verifier_checkout::EXPORTER.as_bytes()),
+        current_registry_audit_sha256: digest(DEPENDENCY_AUDIT.as_bytes()),
+    })
+}
+
 async fn authority(
     builder: &FallbackReasoner,
     workflow: &workflow::WorkflowGuard,
@@ -234,7 +283,8 @@ pub(super) async fn try_amend(
             &[format!("amendment-input:{input_hash}")],
         )
         .await?;
-    let candidate_environment = environment_id(root)?;
+    let environments = environment_evidence(root, control, old).await?;
+    let candidate_environment = environments.current_candidate.clone();
     let diff = trusted_git(
         root,
         &[
@@ -252,6 +302,7 @@ pub(super) async fn try_amend(
         prompt.len() <= 512 * 1024,
         "verifier authority evidence needs smaller scoped revision"
     );
+    let prompt = format!("{prompt}\n{}", environments.prompt()?);
     let prompt = format!("{prompt}\nCurrent controller verifier schema (mandatory for all proposed commands): {CONTRACT_PROMPT}\nLegacy in-process assertions are unsupported proof. If migration is requested, independently translate preserved owner requirements into behavioral adapters and controller oracles; legacy stored red/green receipts are not evidence. Original-base behavior must be measured again.");
     let prompt = if let Some(directive) = adjudication {
         format!("{prompt}\nA final native Codex adjudicator already decided this derived-criterion interpretation. Translate it into executable verifier/scope changes, preserving EVERY original owner requirement verbatim. Do not reconsider its technical ruling; reject only if it cannot be implemented without changing owner intent or protected controls. You may add literal implementation files by returning approve_additional_files:[exact paths], never broaden directories. All deterministic checks rerun. Bound final ruling: {directive}")
@@ -303,12 +354,7 @@ pub(super) async fn try_amend(
         &candidate_environment,
         &decision.approve_additional_files,
     )?;
-    let environment_changed =
-        candidate_environment != old.baseline.registration.binding(&head)?.environment_id;
-    ensure!(
-        !environment_changed || decision.approve_environment_transition,
-        "environment change was not independently approved"
-    );
+    environments.authorize(decision.approve_environment_transition)?;
     let directory = tempfile::Builder::new()
         .prefix("amend-baseline-")
         .tempdir_in(control)?;
@@ -319,6 +365,7 @@ pub(super) async fn try_amend(
     let reproduce = async {
         install_harness(&baseline_root, &proposal)?;
         let baseline_environment = environment_id(&baseline_root)?;
+        ensure!(baseline_environment == environments.current_original_baseline, "runner environment changed during independent amendment");
         let registration = if decision.approve_environment_transition {
             RegisteredContract::register_transition(
                 &baseline_root,
@@ -542,6 +589,13 @@ pub(super) async fn resume_pending(
             .candidate_environment_id(),
         &pending.authority.approve_additional_files,
     )?;
+    let old_base = pending.old.baseline.registration.baseline_head();
+    let baseline_changed = pending.old.baseline.registration.binding(old_base)?.environment_id
+        != pending.next.baseline.registration.binding(old_base)?.environment_id;
+    let candidate_changed = pending.old.baseline.registration.candidate_environment_id()
+        != pending.next.baseline.registration.candidate_environment_id();
+    ensure!(!(baseline_changed || candidate_changed) || pending.authority.approve_environment_transition,
+        "pending environment transition lacks independent approval");
     ensure!(
         pending.next.baseline.registration.baseline_head()
             == pending.old.baseline.registration.baseline_head(),
@@ -766,6 +820,25 @@ mod tests {
         )
     }
     #[test]
+    fn controller_engine_migration_requires_explicit_environment_approval() {
+        let evidence = EnvironmentEvidence {
+            original_base: "a".repeat(40), registered_baseline: "previous-engine".into(),
+            registered_candidate: "previous-engine".into(), current_original_baseline: "current-engine".into(),
+            current_candidate: "current-engine".into(), legacy_proof_migration: true,
+            current_sandbox_sha256: "s".repeat(64), current_exporter_sha256: "e".repeat(64),
+            current_registry_audit_sha256: "r".repeat(64),
+        };
+        assert!(evidence.authorize(false).is_err());
+        evidence.authorize(true).unwrap();
+        let prompt = evidence.prompt().unwrap();
+        assert!(prompt.contains("previous-engine") && prompt.contains("current-engine"));
+        assert!(prompt.contains(&evidence.original_base));
+        // Equal current source-input fingerprints do not silently grandfather
+        // historical assertions from a different controller engine.
+        assert!(evidence.transition_required());
+    }
+
+    #[test]
     fn amendment_preserves_requirements_and_rejects_noop_or_scope_expansion() {
         let (_root, old) = fixture();
         let mut next = old.proposal.clone();
@@ -917,6 +990,14 @@ mod tests {
 #[cfg(test)]
 pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcceptance, mut proposal:ContractProposal)->Result<PreparedAcceptance> {
     proposal.contract.revision=old.proposal.contract.revision+1;
+    let environments = environment_evidence(root, control, old).await?;
+    ensure!(environments.legacy_proof_migration, "fixture must exercise actual legacy migration");
+    ensure!(environments.registered_baseline != environments.current_original_baseline, "legacy fixture must preserve an old engine fingerprint");
+    ensure!(environments.current_original_baseline == environments.current_candidate, "fixture runtime/source compiler inputs must be unchanged");
+    ensure!(environments.authorize(false).is_err(), "migration may not silently approve environment drift");
+    environments.authorize(true)?;
+    validate_correction(old, &proposal, &environments.current_candidate)?;
+    let prompt = environments.prompt()?;
     let scratch=tempfile::tempdir()?;let baseline=scratch.path().join("baseline");
     trusted_git(root,&["worktree","add","--detach",baseline.to_str().unwrap(),old.baseline.registration.baseline_head()]).await?;
     let measured=register_and_reproduce(&baseline,proposal.clone(), &test_resource_audit(control)).await;
@@ -927,8 +1008,8 @@ pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcce
         augmentagent_channel_core::autoship_write_scope::DeclaredPath{path:path.clone(),directory}
     }).collect(),old.proposal.files.keys().cloned().collect())?;
     let pending=Pending{version:1,source:old.proposal.contract.source()?,original_head:actual_head(root).await?,input_hash:digest(b"scripted migration input"),
-        old:old.clone(),next,authority:Decision{approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:false,approve_additional_files:vec![],reason:"Replace legacy claimed test status with independently measured arithmetic behavior".into(),proposal:Some(proposal)},
-        native_provider:"scripted-test-authority".into(),native_session:"scripted-distinct-test-session".into(),prompt_hash:digest(b"scripted migration request")};
+        old:old.clone(),next,authority:Decision{approved:true,previous_contract_hash:old.baseline.registration.contract_hash().into(),approve_environment_transition:true,approve_additional_files:vec![],reason:"Replace legacy claimed test status with independently measured arithmetic behavior".into(),proposal:Some(proposal)},
+        native_provider:"scripted-test-authority".into(),native_session:"scripted-distinct-test-session".into(),prompt_hash:digest(prompt.as_bytes())};
     let path=pending_path(control,pending.source);
     immutable(control,path.file_name().unwrap().to_str().unwrap(),&serde_json::to_vec(&pending)?)?;
     resume_pending(root,control,pending.source).await?.context("migration fixture did not activate")
