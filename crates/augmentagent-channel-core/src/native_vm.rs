@@ -271,6 +271,15 @@ fn build_memory_policy(value:&serde_json::Value)->Result<u64> {
     Ok(memory)
 }
 
+const HELPERS: &[(&str, &[u8])] = &[
+            ("native-provider-vm.py", include_bytes!("../../../scripts/native-provider-vm.py")),
+            ("native-provider-vm-guest.py", include_bytes!("../../../scripts/native-provider-vm-guest.py")),
+            ("native-provider-mcp-relay.py", include_bytes!("../../../scripts/native-provider-mcp-relay.py")),
+            ("native-provider-gateway.py", include_bytes!("../../../scripts/native-provider-gateway.py")),
+            ("codex-build-vm.py", include_bytes!("../../../scripts/codex-build-vm.py")),
+            ("build-dependency-proxy.py", include_bytes!("../../../scripts/build-dependency-proxy.py")),
+    ];
+
 pub(crate) struct Launch {
     pub command: Command,
     pub resource_policy: serde_json::Value,
@@ -342,14 +351,7 @@ impl Launch {
         };
         drop(state_lock);
         let directory = tempfile::Builder::new().prefix("launch-").tempdir_in(&provider_root)?;
-        let helpers: &[(&str, &[u8])] = &[
-            ("native-provider-vm.py", include_bytes!("../../../scripts/native-provider-vm.py")),
-            ("native-provider-vm-guest.py", include_bytes!("../../../scripts/native-provider-vm-guest.py")),
-            ("native-provider-mcp-relay.py", include_bytes!("../../../scripts/native-provider-mcp-relay.py")),
-            ("native-provider-gateway.py", include_bytes!("../../../scripts/native-provider-gateway.py")),
-            ("codex-build-vm.py", include_bytes!("../../../scripts/codex-build-vm.py")),
-        ];
-        for (name, contents) in helpers { write(&directory.path().join(name), contents)?; }
+        for (name, contents) in HELPERS { write(&directory.path().join(name), contents)?; }
         let source = original.as_std();
         let program = PathBuf::from(source.get_program());
         let executable = if program.is_absolute() { program.canonicalize()? } else {
@@ -435,6 +437,15 @@ mod tests {
         write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap()).unwrap();
         if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
         path
+    }
+    #[test]
+    fn embedded_inventory_imports_without_checkout_siblings() {
+        let temp=tempfile::tempdir().unwrap();
+        for (name,contents) in HELPERS {write(&temp.path().join(name),contents).unwrap();}
+        let output=std::process::Command::new("/usr/bin/python3").args(["-I","-c",
+            "import importlib.util, pathlib, sys; p=pathlib.Path(sys.argv[1]); s=importlib.util.spec_from_file_location('fixture',p/'native-provider-vm.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.module('runtime','codex-build-vm.py'); m.module('gateway','native-provider-gateway.py')"])
+            .arg(temp.path()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();
+        assert!(output.status.success(),"exact embedded helper inventory cannot import: {}",String::from_utf8_lossy(&output.stderr));
     }
     #[test]
     fn read_only_bridge_does_not_reserve_build_guest() {
