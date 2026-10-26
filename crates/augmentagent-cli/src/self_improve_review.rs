@@ -143,6 +143,10 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 mod evidence_plan;
 #[path = "self_improve_review_callers.rs"]
 mod caller_stream;
+#[path = "self_improve_review_adjudication.rs"]
+mod final_authority;
+#[path = "self_improve_adjudication_windows.rs"]
+mod adjudication_windows;
 
 const REGRESSION_REQUIREMENT: &str = "No newly demonstrated correctness, security or acceptance regression; report a reproducible example and concrete remedy.";
 
@@ -506,6 +510,7 @@ async fn run_impl(
     let cache_guard=if diagnostic {None}else{context.workflow};
     let mut recovered_files=BTreeMap::<String,String>::new();
     let mut finding_evidence=BTreeMap::<String,String>::new();
+    let mut finding_source_keys=BTreeMap::<String,BTreeSet<String>>::new();
     for role in evidence_plan::ROLES {
         let session = format!("autoship-review:{role:?}:{}", uuid::Uuid::new_v4());
         let mut opts = codex_review_opts(worktree.clone(), &evidence_plan::system_prompt(role,&rubric_prompt));
@@ -598,6 +603,7 @@ async fn run_impl(
             for (path,body) in group.recovered_files {
                 if let Some(old)=recovered_files.insert(path,body.clone()) { anyhow::ensure!(old==body,"recovered source changed across completed groups"); }
             }
+            let supplied_finding_keys:BTreeSet<_>=group.finding_evidence.keys().cloned().collect();
             for (path,body) in group.finding_evidence {
                 if let Some(old)=finding_evidence.insert(path,body.clone()) { anyhow::ensure!(old==body,"finding source changed across review groups"); }
             }
@@ -629,6 +635,9 @@ async fn run_impl(
                     .iter()
                     .map(|id| remap.get(id).cloned().unwrap_or_else(|| id.clone()))
                     .collect();
+            }
+            for finding in &shard_findings {
+                finding_source_keys.entry(finding.id.clone()).or_default().extend(supplied_finding_keys.clone());
             }
             findings.extend(shard_findings);
         }
@@ -679,6 +688,11 @@ async fn run_impl(
         conflicts_with:BTreeSet::new(), repair_rounds:context.repair_round,
     }]
     };
+    if !qa_findings.is_empty() {
+        let keys:BTreeSet<_>=evidence_shards.keys().filter(|key|key.starts_with("source:")||key.starts_with("context:diff:")).cloned().collect();
+        for key in &keys {finding_evidence.insert(key.clone(),evidence_shards[key].clone());}
+        for finding in &qa_findings {finding_source_keys.insert(finding.id.clone(),keys.clone());}
+    }
     // A previous QA rejection remains an explicit finding, even if the new
     // complete QA pass approves. Only repair evidence or adjudication resolves
     // a conflicting old instruction; it cannot evaporate during adaptation.
@@ -706,22 +720,8 @@ async fn run_impl(
         adjudication: None,
     };
     if !unresolved.is_empty() && (aligned::needs_adjudication(&unresolved) || !context.qa_ok) {
-        let reusable = context
-            .previous
-            .filter(|p| supplemental_context_matches(&p.supplemental_source_hashes,&supplemental_source_hashes))
-            .and_then(|p| p.adjudication.as_ref())
-            .filter(|receipt| receipt.binding == binding)
-            .filter(|receipt| {
-                unresolved.iter().all(|finding| {
-                    finding.fingerprint().ok().is_some_and(|hash| {
-                        receipt.finding_fingerprints.get(&finding.id) == Some(&hash)
-                    })
-                })
-            });
-        if let Some(receipt) = reusable {
-            // The same finding/evidence cannot demand a fresh consensus vote.
-            structured.adjudication = Some(receipt.clone());
-        } else {
+        // Exact assembled-context cache keys replace broad previous-receipt
+        // reuse: new selected windows or controller evidence need new authority.
             let mut opts = codex_review_opts(worktree.clone(), "Final adjudication");
             opts.session_id = None;
             if let Some(workflow) = context.workflow {
@@ -749,27 +749,11 @@ async fn run_impl(
                 "streamed_finding_source": if caller_plan.is_some() {Some(&finding_evidence)}else{None},
                 "supplemental_immutable_source": recovered_files,
             }))?;
-            let attempts = match context.workflow {
-                Some(workflow) => {
-                    workflow.check_resource_policy()?;
-                    workflow.reserve_adjudication()?
-                },
-                None => context.adjudication_attempts_already_made,
-            };
-            structured.adjudication = Some(
-                aligned::adjudicate_native_with_origin(
-                    &structured.builders,
-                    opts,
-                    binding.clone(),
-                    &contract,
-                    &unresolved,
-                    &adjudication_evidence,
-                    attempts,
-                    &structured.origin,
-                )
-                .await?,
-            );
-        }
+            structured.adjudication = Some(final_authority::Input {
+                worktree:&worktree,guard:context.workflow,opts,review:&structured,contract:&contract,findings:&unresolved,
+                evidence:serde_json::from_str(&adjudication_evidence)?,source:&finding_evidence,finding_sources:&finding_source_keys,
+                attempts_already_made:context.adjudication_attempts_already_made,diagnostic,
+            }.run().await?);
     }
     if let Some(workflow) = context.workflow {
         workflow.audit_health().await?;
@@ -843,11 +827,13 @@ fn deduplicate_findings(findings: Vec<aligned::Finding>) -> Result<Vec<aligned::
     let mut unique = BTreeMap::<String, aligned::Finding>::new();
     for finding in findings {
         finding.validate()?;
-        if let Some(existing) = unique.get(&finding.id) {
+        if let Some(existing) = unique.get_mut(&finding.id) {
             anyhow::ensure!(
                 existing.fingerprint()? == finding.fingerprint()?,
                 "finding ID has conflicting evidence; request distinct IDs"
             );
+            existing.conflicts_with.extend(finding.conflicts_with);
+            existing.repair_rounds=existing.repair_rounds.max(finding.repair_rounds);
         } else {
             unique.insert(finding.id.clone(), finding);
         }
@@ -1053,6 +1039,9 @@ mod tests {
                 .len(),
             1
         );
+        let mut linked=first.clone();linked.conflicts_with.insert("F2".into());linked.repair_rounds=2;
+        let merged=deduplicate_findings(vec![first.clone(),linked]).unwrap();
+        assert!(merged[0].conflicts_with.contains("F2"));assert_eq!(merged[0].repair_rounds,2);
         let mut changed = first.clone();
         changed.evidence_hash = "proof2".into();
         assert!(deduplicate_findings(vec![first, changed]).is_err());
