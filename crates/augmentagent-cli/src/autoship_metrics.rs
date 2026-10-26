@@ -12,6 +12,7 @@ pub struct Window {
     pub until_ms: i64,
     pub first_recorded_event_ms: Option<i64>,
     pub confirmed_merge_operations: usize,
+    pub autonomous_merges: usize,
     pub model_calls: u64,
     pub observed_wall_ms: u64,
     pub reported_tokens: u64,
@@ -50,8 +51,9 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
         |row| row.get(0),
     )?;
     let mut statement = conn.prepare(
-        "SELECT o.workflow,o.kind,o.binding,o.receipt,w.pr FROM operation o
-         JOIN workflow w ON w.id=o.workflow WHERE o.receipt IS NOT NULL
+        "SELECT o.workflow,o.kind,o.binding,o.receipt,w.pr,o.id,m.receipt FROM operation o
+         JOIN workflow w ON w.id=o.workflow LEFT JOIN merge_mutation_receipt m ON m.operation=o.id
+         WHERE o.receipt IS NOT NULL
          AND EXISTS (SELECT 1 FROM workflow_event e WHERE e.workflow=o.workflow
          AND e.kind='operation_completed' AND e.payload=o.id AND e.at_ms>=?1 AND e.at_ms<?2)",
     )?;
@@ -62,17 +64,29 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, Option<u64>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
     let mut merges = BTreeSet::new();
+    let mut autonomous = BTreeSet::new();
     for row in rows {
-        let (workflow, kind, binding, receipt, pr) = row?;
+        let (workflow, kind, binding, receipt, pr, operation, mutation) = row?;
         if serde_json::from_str::<OperationKind>(&kind)? != OperationKind::MergePr {
             continue;
         }
         let binding: Binding = serde_json::from_str(&binding)?;
         if let Some(pr) = pr {
             if receipt == format!("github:pr:{pr}:merged:{}", binding.head) {
+                if let Some(mutation) = mutation {
+                    let proof: serde_json::Value = serde_json::from_str(&mutation)?;
+                    if proof["client_mutation_id"].as_str() == Some(operation.as_str())
+                        && proof["expected_head"].as_str() == Some(binding.head.as_str())
+                        && proof["pr_number"].as_u64() == Some(pr)
+                    {
+                        autonomous.insert((workflow.clone(), pr));
+                    }
+                }
                 merges.insert((workflow, pr));
             }
         }
@@ -82,6 +96,7 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
         until_ms: until,
         first_recorded_event_ms,
         confirmed_merge_operations: merges.len(),
+        autonomous_merges: autonomous.len(),
         model_calls,
         observed_wall_ms,
         reported_tokens,
@@ -92,8 +107,8 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
 
 pub fn summary(since: i64, until: i64) -> Result<String> {
     let window = read(&crate::autoship_workflow::default_path(), since, until)?;
-    Ok(format!("Confirmed merge operations: {}; workflows with recorded activity: {}; model calls: {}; observed execution time: {} ms; reported tokens: {}. First recorded event (UTC epoch ms): {:?}. Historical charge receipts without timestamps: {} (excluded from window totals). These records do not prove continuous observation or complete token metering; merged-state receipts alone do not distinguish a concurrent manual merge.",
-        window.confirmed_merge_operations, window.active_workflows, window.model_calls,
+    Ok(format!("Autonomous merges with accepted mutation proof: {}; confirmed merge operations including unattributed observations: {}; workflows with recorded activity: {}; model calls: {}; observed execution time: {} ms; reported tokens: {}. First recorded event (UTC epoch ms): {:?}. Historical charge receipts without timestamps: {} (excluded from window totals). These records do not prove continuous observation or complete token metering. Manual merges and lost responses without accepted mutation proof are excluded from autonomous throughput.",
+        window.autonomous_merges, window.confirmed_merge_operations, window.active_workflows, window.model_calls,
         window.observed_wall_ms, window.reported_tokens, window.first_recorded_event_ms,
         window.charges_without_timestamp))
 }
@@ -102,6 +117,49 @@ pub fn summary(since: i64, until: i64) -> Result<String> {
 mod tests {
     use super::*;
     use crate::autoship_workflow::{ResourceCharge, WorkflowStore};
+
+    #[test]
+    fn only_response_bound_accepted_merges_count_toward_autonomous_throughput() {
+        for accepted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("workflow.db");
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let binding = Binding {
+                head: "a".repeat(40),
+                contract: "contract".into(),
+                evidence_hash: "evidence".into(),
+            };
+            store
+                .register("owner/repo#1", "topic", binding.clone(), 10)
+                .unwrap();
+            let lease = store
+                .claim("owner/repo#1", "worker", 10, 1000)
+                .unwrap()
+                .unwrap();
+            store.attach_pr(&lease, 42, 20).unwrap();
+            let op = store
+                .begin_operation(&lease, OperationKind::MergePr, &binding, 25)
+                .unwrap();
+            if accepted {
+                store.record_merge_mutation(&lease, &op.id, &serde_json::json!({
+                    "client_mutation_id":op.id,"expected_head":binding.head,"pr_number":42,
+                    "pr_node_id":"PR_fixture","merge_commit":"b".repeat(40),"merged_by":"fixture"
+                }), 30).unwrap();
+            }
+            store
+                .complete_operation(
+                    &lease,
+                    &op.id,
+                    &format!("github:pr:42:merged:{}", binding.head),
+                    40,
+                )
+                .unwrap();
+            let report = read(&path, 0, 100).unwrap();
+            assert_eq!(report.confirmed_merge_operations, 1);
+            assert_eq!(report.autonomous_merges, usize::from(accepted));
+            assert_eq!(read(&path, 50, 100).unwrap().autonomous_merges, 0);
+        }
+    }
 
     #[test]
     fn window_counts_confirmation_not_intent_and_never_double_charges_retries() {
@@ -143,6 +201,10 @@ mod tests {
             .unwrap();
         let after = read(&path, 50, 100).unwrap();
         assert_eq!(after.confirmed_merge_operations, 1);
+        assert_eq!(
+            after.autonomous_merges, 0,
+            "an observed merge is not proof that autoship performed it"
+        );
         assert_eq!(after.model_calls, 0);
         assert_eq!(after.charges_without_timestamp, 0);
         assert_eq!(read(&path, 80, 100).unwrap().confirmed_merge_operations, 0);
