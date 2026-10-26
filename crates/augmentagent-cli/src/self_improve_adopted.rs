@@ -361,19 +361,10 @@ async fn execute(
             }
             guard.validate_binding(&binding).await?;
             let intent = guard.intent(OperationKind::MergePr)?;
-            let (ok, _, error) = run(
-                &gh_bin(),
-                &[
-                    "pr",
-                    "merge",
-                    &pr.pr.to_string(),
-                    "--squash",
-                    "--match-head-commit",
-                    &binding.head,
-                ],
-                repo,
-            )
-            .await?;
+            let mutation=publication::merge_exact(repo,&pr.repository,pr.pr,&binding.head,&intent).await;
+            if let Ok(Some(receipt))=&mutation { guard.record_merge_mutation(&intent,&serde_json::to_value(receipt)?)?; }
+            let ok=mutation.is_ok();
+            let error=mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
             anyhow::ensure!(
                 sweep_merged_exact(repo, pr.pr, &binding.head).await,
                 "merge not observed (command={ok}): {error}"
@@ -528,19 +519,9 @@ pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
         }
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
         let intent = lease.merge_intent()?;
-        let _ = run(
-            &gh_bin(),
-            &[
-                "pr",
-                "merge",
-                &pr.pr.to_string(),
-                "--squash",
-                "--match-head-commit",
-                &pr.head,
-            ],
-            repo,
-        )
-        .await?;
+        let mutation=publication::merge_exact(repo,&pr.repository,pr.pr,&pr.head,&intent).await;
+        if let Ok(Some(receipt))=&mutation { lease.record_merge_mutation(&intent,&serde_json::to_value(receipt)?)?; }
+        if let Err(error)=&mutation { warn!(pr=pr.pr,"adopted merge awaits reconciliation: {error:#}"); }
         if sweep_merged_exact(repo, pr.pr, &pr.head).await {
             lease.merged(&intent, pr.pr)?;
             merged += 1;

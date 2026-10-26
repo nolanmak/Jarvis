@@ -249,11 +249,19 @@ if a[:2]==['pr','list']:
 elif a[:2]==['repo','view']: print('fixture-owner/project')
 elif a[:2]==['pr','view']:
     if '--jq' in a or '-q' in a: print(s['head'])
-    else: print(json.dumps(dict(state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
+    else: print(json.dumps(dict(id='PR_fixture20',number=20,baseRefName='main',state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
 elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition',author=dict(login='fixture-owner'))))
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
     print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
+elif a[:2]==['api','graphql']:
+    fields=dict(value.split('=',1) for i,value in enumerate(a) if i>0 and a[i-1]=='-f')
+    assert fields['head']==s['head']
+    if s['fail_merge']: sys.exit(1)
+    (root/'merged').write_text(s['head'])
+    print(json.dumps(dict(data=dict(mergePullRequest=dict(clientMutationId=fields['request'],pullRequest=dict(id='PR_fixture20',number=20,state='MERGED',headRefOid=s['head'],mergeCommit=dict(oid='e'*40),mergedBy=dict(login='fixture-owner')))))))
+elif a[0]=='api' and '/rules/branches/main' in a[1]: print(json.dumps([dict(type='required_status_checks',ruleset_id=1,parameters=dict(strict_required_status_checks_policy=True,required_status_checks=[dict(context='rust')]))]))
+elif a[0]=='api' and '/rulesets/1' in a[1]: print(json.dumps(dict(enforcement='active',bypass_actors=[])))
 elif a[0]=='api' and '/git/ref/heads/main' in a[1]: print(s['base'])
 elif a[0]=='api' and '/issues/' in a[1]: print(json.dumps(dict(state='open')))
 elif a[0]=='api': print('[]')

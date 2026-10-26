@@ -1725,16 +1725,15 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
                     warn!(pr, "merge sweep ownership/head changed before merge: {error:#}"); continue;
                 }
-                let (ok, _o, e) = run(
-                    &gh,
-                    &[
-                        "pr", "merge", &pr.to_string(), "--squash",
-                        "--match-head-commit", &head,
-                    ],
-                    repo_root,
-                )
-                .await
-                .unwrap_or((false, String::new(), "spawn failed".into()));
+                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent).await;
+                if let Ok(Some(receipt)) = &mutation {
+                    if let Err(error) = sweep_lease.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt).expect("serializable mutation receipt")) {
+                        warn!(pr,"merge response could not be recorded; retain intent: {error:#}");
+                        continue;
+                    }
+                }
+                let ok = mutation.is_ok();
+                let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
                 let observed = sweep_merged_exact(repo_root, pr, &head).await;
                 if !observed && readied && sweep_lease.validate_remote(repo_root, pr, &head).await.is_ok() {
                     let (undone, ..) =
@@ -7318,13 +7317,12 @@ async fn resume_draft_pr(
             acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
             let merge_intent = workflow.intent(OperationKind::MergePr)?;
             workflow.validate_binding(&reviewed_binding).await?;
-            let (ok, _o, e) = run(
-                &gh,
-                &["pr", "merge", &pr.to_string(), "--squash", "--match-head-commit", reviewed_head],
-                repo_root,
-            )
-            .await.unwrap_or((false, String::new(), "spawn failed".into()));
-            if !ok && !pr_is_merged(repo_root, pr).await {
+            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent).await;
+            if let Ok(Some(receipt)) = &mutation {
+                workflow.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
+            }
+            let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
+            if !publication::merged_exact(repo_root,pr,reviewed_head).await {
                 if readied {
                     let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root).await;
                 }
@@ -7332,9 +7330,6 @@ async fn resume_draft_pr(
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: double LGTM but merge FAILED (left open)"
                 )));
-            }
-            if !ok {
-                warn!(pr, "gh pr merge exited non-zero but the PR is MERGED; treating as success: {e}");
             }
             workflow.observe_remote(&merge_intent, &format!("github:pr:{pr}:merged:{}", reviewed_head), Some(pr))?;
             workflow.transition(Stage::Merged, "remote_merge_observed", "complete", 0).await?;
@@ -9463,12 +9458,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
         acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
     let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
-    let (ok, _o, e) = run(
-        &gh,
-        &["pr", "merge", &branch, "--squash", "--match-head-commit", published_head],
-        repo_root,
-    )
-    .await?;
+    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent).await;
+    if let Ok(Some(receipt)) = &mutation {
+        workflow_guard.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
+    }
+    let ok = mutation.is_ok();
+    let e = mutation.err().map(|e|format!("{e:#}")).unwrap_or_default();
     let merged_observed = publication::merged_exact(repo_root, pr_number.unwrap(), published_head).await;
     if !merged_observed {
         warn!(issue = issue.number, command_ok=ok, "auto-merge not confirmed; preserving pending intent: {e}");
@@ -14530,7 +14525,8 @@ CODEX-REVIEW: lgtm").0);
         assert!(!body.contains("reclaim_worktree("));
         assert!(body.find("workflow.observe_remote(&merge_intent").unwrap()
             < body.find("\"worktree\", \"remove\"").unwrap());
-        assert!(body.contains("--match-head-commit"));
+        // Head pinning is behavior-tested through publication::merge_mutation.
+
     }
 
     // #895 — every revision round must be pushed + commented on the PR.
@@ -15734,62 +15730,9 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     }
 
-    /// Codex: `gh pr ready` is a state change and the merge after it can
-    /// still fail. Leaving the PR ready-but-unmerged breaks "merge, or leave
-    /// it alone" twice over — the sweep only ever considers DRAFTS, so a
-    /// stranded PR also falls out of every future sweep.
-    #[test]
-    fn a_failed_merge_puts_the_draft_back() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn merge_sweep(").expect("the sweep");
-        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+    // Draft restoration, exact-head mutation and pending checks are exercised
+    // with fake GitHub transport in progress_tests and publication::tests.
 
-        let ready = body.find("ready_for_merge(repo_root, pr,").expect("the sweep marks ready");
-        let merge = body.find(r#""pr", "merge""#).expect("then merges");
-        assert!(ready < merge, "ready comes first");
-        // Codex: everything the sweep checked came from a snapshot. A commit
-        // pushed between that read and this call would merge unreviewed, so
-        // the merge pins the head it validated and lets GitHub refuse.
-        assert!(
-            body[merge..].contains(r#""--match-head-commit""#),
-            "the merge must pin the validated head, or the checks are a TOCTOU"
-        );
-
-        // Codex: pinning the head catches a moved commit, not a check that
-        // went green-to-red on the SAME commit — a CI re-run, a flaky job
-        // retried, a required check added. So the checks are re-read after
-        // readying and immediately before merging.
-        let rechecks: Vec<usize> = body
-            .match_indices("checks_green(")
-            .map(|(i, _)| i)
-            .collect();
-        assert!(
-            rechecks.len() >= 2,
-            "checks must be read again just before the merge, not only at scan time"
-        );
-        let last = *rechecks.last().unwrap();
-        assert!(
-            ready < last && last < merge,
-            "the re-read must sit between readying and merging: \
-             ready={ready} recheck={last} merge={merge}"
-        );
-        // And a red re-read must put the draft back rather than merge.
-        assert!(
-            body[last..merge].contains(r#""--undo""#),
-            "a check that went red after readying must restore the draft"
-        );
-        assert!(
-            body[merge..].contains(r#""--undo""#),
-            "a failed merge must restore the draft state"
-        );
-        // The revert must be conditional on the merge having failed, not
-        // unconditional, and must only undo a transition we made.
-        let undo = body[merge..].find(r#""--undo""#).expect("the undo");
-        let guard = body[merge..merge + undo].rfind("if ").expect("a guard");
-        let cond = &body[merge + guard..merge + undo];
-        assert!(cond.contains("!observed"), "only when merge is not confirmed: {cond:?}");
-        assert!(cond.contains("readied"), "only if we made the transition: {cond:?}");
-    }
 
     /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
     /// is bounded so a backlog cannot stall a tick.
