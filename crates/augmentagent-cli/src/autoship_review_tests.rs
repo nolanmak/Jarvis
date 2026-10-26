@@ -475,3 +475,48 @@ fn seeded_defect_or_missing_case_prevents_rubric_promotion() {
     missed.remove("buggy");
     assert!(validate_rubric_replay("rubric v2", &expected, &missed).is_err());
 }
+
+#[test]
+fn coverage_receipt_cannot_be_relabelled_to_a_new_head() {
+    let mut current = passes(vec![]);
+    current[1].coverage.binding.head = "old-head".into();
+    assert!(merge_authority(&binding(), &builders(), &current, &checks(), None).is_err());
+    let mut old = coverage();
+    old.binding.head = "old-head".into();
+    let raw =
+        serde_json::json!({"binding":binding(),"decision":"approve","findings":[]}).to_string();
+    assert!(parse_review_pass(
+        &raw,
+        &binding(),
+        actor("codex", "review-1"),
+        ReviewRole::Diff,
+        old,
+        &criteria()
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn repaired_new_head_does_not_need_previous_upheld_receipt() {
+    let mut current = passes(vec![]);
+    let mut next = binding();
+    next.head = "repaired-head".into();
+    let mut mandatory = checks();
+    mandatory.binding = next.clone();
+    for pass in &mut current {
+        pass.binding = next.clone();
+        pass.coverage.binding = next.clone();
+    }
+    let mut previous = dismissed(&[finding("F1")]).await;
+    previous.rulings.insert(
+        "F1".into(),
+        Ruling::Uphold {
+            evidence: "old failing test".into(),
+            repair_criterion: "test passes".into(),
+        },
+    );
+    assert_eq!(
+        merge_authority(&next, &builders(), &current, &mandatory, Some(&previous)).unwrap(),
+        MergeAuthority::IndependentApproval
+    );
+}

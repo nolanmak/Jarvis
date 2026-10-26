@@ -86,6 +86,7 @@ impl Actor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageReceipt {
+    pub binding: ReviewBinding,
     pub required_paths: BTreeSet<String>,
     pub supplied_files: BTreeMap<String, String>,
     pub prompt_hash: String,
@@ -204,6 +205,7 @@ pub fn review_request(
     }))?;
     ensure!(prompt.len() <= MAX_PROMPT_BYTES, "review evidence exceeds request budget; split into bounded file/crate reviews, never truncate");
     let coverage = CoverageReceipt {
+        binding: binding.clone(),
         required_paths,
         supplied_files,
         prompt_hash: digest(prompt.as_bytes()),
@@ -254,6 +256,10 @@ pub fn parse_review_pass(
         "review response changed binding"
     );
     actor.validate()?;
+    ensure!(
+        &coverage.binding == binding,
+        "coverage receipt concerns another candidate"
+    );
     validate_findings(&response.findings, criteria)?;
     let completed = match response.decision {
         Decision::Approve => {
@@ -552,11 +558,18 @@ pub fn merge_authority(
     let mut unresolved = BTreeMap::new();
     for pass in passes {
         ensure!(
-            &pass.binding == binding && pass.completed && pass.coverage.complete(),
+            &pass.binding == binding
+                && pass.completed
+                && pass.coverage.complete()
+                && &pass.coverage.binding == binding,
             "review incomplete or bound to another candidate"
         );
         pass.actor.validate()?;
         if pass.role != ReviewRole::Qa {
+            ensure!(
+                pass.actor.backend == "native",
+                "review must use native transport"
+            );
             pass.actor.independent_of(builders)?;
         }
         ensure!(
