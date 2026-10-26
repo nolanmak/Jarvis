@@ -1028,6 +1028,44 @@
       "status": "not_launched_insufficient_host_capacity",
       "log": "/tmp/autoship-1598-native-issue-operator.log",
       "scope": "No model or VM started. Full1Gi native+4Gi build+1Gi host budget preserved; current preflight needs6.5Gi host available including controller allowance and host margin."
+    },
+    "hosted_rust_830d05a2": {
+      "conclusion": "success",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40372022136",
+      "cli_passed": 1270,
+      "cli_ignored": 21,
+      "core_passed": 646,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-830d05a2-rust.log",
+      "scope": "Includes complete advisory-check outage/recovery changes. Later routed probe fixture and structured refusal diagnostics require fresh CI."
+    },
+    "native_routed_transport_abyyp0ev": {
+      "status": "passed",
+      "log": "/tmp/autoship-native-acceptance-abyyp0ev/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-abyyp0ev/result.json",
+      "operator_route_unchanged": true,
+      "scope": "Actual production Rust Codex constructor honors explicit operator auto route; exact authenticated configured loopback Responses host receipt, native session and fenced runtime ownership, exactly one protected model admission and zero tools. Transport-only, not full issue/adoption or upstream model identity proof."
+    },
+    "native_route_fixture_76d94209": {
+      "passed": 2,
+      "log": "/tmp/autoship-1598-native-route-acquisition-tests.log",
+      "scope": "Actual isolated WorkflowGuard acquisition, protected audit/runtime ownership, zero charges, release/reacquire; host receipt negative cases."
+    },
+    "native_issue_r70ipcyq": {
+      "status": "refused_before_model",
+      "log": "/tmp/autoship-native-acceptance-r70ipcyq/transcript.log",
+      "refusal_code": "host_headroom",
+      "available_bytes": 6274179072,
+      "required_bytes": 6710886400,
+      "requested_bytes": 6442450944,
+      "margin_bytes": 268435456,
+      "model_admissions": 0,
+      "scope": "Exact protected supervisor refusal evidence, not a completed issue workflow. Full guest/run budgets unchanged."
+    },
+    "resource_refusal_76d94209": {
+      "python_passed": 6,
+      "python_skipped": 9,
+      "scope": "Fixed codes and bounded numeric facts; real supervisor refusal fixture before child dispatch; independent review passed. Actual host_headroom refusal retained at r70ipcyq."
     }
   },
   "remaining_cross_cutting_acceptance": [
