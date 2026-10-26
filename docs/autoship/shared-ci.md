@@ -103,3 +103,32 @@ controller specification and execute in guest Bash, never a host shell. CI guest
 Cargo uses one build job, debug information disabled, and the existing registry
 broker for dependencies; enabling registry access does not add a guest NIC or
 general outbound access.
+
+Real VM smoke (coordinated execution only): compile the ignored test through the
+managed wrapper, let that build exit and release its lease, then invoke the
+resulting **test executable**, not `cargo test`, under a delegated transient unit.
+For the installed 4096 MiB build guest, the following reserves 5 GiB per run and
+6 GiB for the enclosing unit. Set `CI_TEST_BINARY` to the centrally produced test
+executable and `CI_REPO` to its trusted integration checkout. The evidence path
+must not exist yet; the fixture creates it privately and retains protected audit
+and a hashed diagnostic receipt.
+
+```sh
+systemd-run --user --wait --pipe --collect --unit=autoship-shared-ci-vm-smoke \
+  -p 'Delegate=cpu memory pids' -p DelegateSubgroup=daemon \
+  -p MemoryMax=6G -p TasksMax=512 -p CPUQuota=200% \
+  --setenv=AUGMENTAGENT_RUN_RESOURCES=1 \
+  --setenv=AUGMENTAGENT_RUN_MEMORY_BYTES=5368709120 \
+  --setenv=AUGMENTAGENT_RUN_PIDS=256 \
+  --setenv=AUGMENTAGENT_RUN_CPU_PERCENT=200 \
+  --setenv=AUGMENTAGENT_BUILD_VM_CONFIG=/home/nolan-makatche/.local/share/augmentagent/build-vm/runtime.json \
+  --setenv="AUTOSHIP_CI_ACCEPTANCE_REPO=$CI_REPO" \
+  --setenv=AUTOSHIP_CI_ACCEPTANCE_EVIDENCE=/tmp/autoship-shared-ci-vm-smoke-evidence \
+  "$CI_TEST_BINARY" --exact self_improve::shared_ci::acceptance::live_shared_ci_vm_smoke \
+  --ignored --nocapture --test-threads=1
+```
+
+This exercises a real guest plan and the pinned Linux Python installer fixture,
+with actual managed global/target descriptors and required resource admission.
+Its explicit diagnostic path selection does not certify complete branch CI,
+macOS checks, a full issue-to-main run, or deployment readiness.

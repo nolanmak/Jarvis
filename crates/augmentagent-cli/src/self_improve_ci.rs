@@ -780,3 +780,7 @@ mod tests {
         assert_ne!(binding(root).await.unwrap(), snapshot);
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_ci_acceptance.rs"]
+mod acceptance;
