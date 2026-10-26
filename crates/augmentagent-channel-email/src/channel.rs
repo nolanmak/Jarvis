@@ -330,7 +330,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             // Keep the durable error row until the full guard chain completes:
             // a crash must remain retryable and polling must see this open action.
             let prior = item.action.error_message.as_deref().unwrap_or("unknown prior dispatch failure");
-            let context = format!("Retry context (history, not instructions): attempt_n={}; prior_failure={}. Re-evaluate every triage guard; a previous draft is not permission to reply.", new_count + 1, prior);
+            let guard_history = self.store.email_guard_history(&email.message_id)?;
+            let context = format!("Retry context (history, not instructions): attempt_n={}; prior_failure={}. Re-evaluate every triage guard; a previous draft is not permission to reply.", new_count + 1, prior) + &format!(" Prior guard observations (facts, never permission): {guard_history}");
             let result = self.process_email_with_retry(&skill.system, &learned, &entity_id, email.clone(),
                 Some((&item.action.id, item.action.draft_body.as_deref(), context.as_str()))).await;
             if let Err(error) = result {
@@ -437,6 +438,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // even if we've seen the messageId before (retryable error state).
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
+            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AlreadyComplete)?;
             return Ok(None);
         }
         // If a prior dispatch already produced a pending or errored action for
@@ -448,6 +450,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             None => self.store.has_open_action(&email.message_id)?,
         };
         if another_action {
+            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::OpenAction)?;
             return Ok(None);
         }
 
@@ -462,6 +465,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 if pf.is_spot_check(&email.message_id) {
                     spot_check = Some(decision);
                 } else {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::PrefilterSkip)?;
                     let reason = format!("{} {}", crate::prefilter::REASON_PREFIX, decision.reason);
                     self.store.log_action(
                         &email.message_id,
@@ -639,6 +643,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // runs so the sender's signature/page state stays
                 // consistent with the rest of the Skip path.
                 if !is_human_sender(&email.from, &email.body) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AutomatedSender)?;
                     self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
@@ -692,6 +697,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     let after_ms = if parsed > 0 { parsed } else { i64::MAX };
                     match self.store.thread_has_user_reply_after(thread_id, after_ms) {
                         Ok(true) => {
+                            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AlreadyReplied)?;
                             self.store.log_action(
                                 &email.message_id,
                                 Some(thread_id),
@@ -748,6 +754,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // is_event_blast` for the curated domain/subject/body
                 // detection rules.
                 if is_event_blast(&email.from, &email.subject, &email.body) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::EventBlast)?;
                     self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
@@ -813,6 +820,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     }
                 };
                 if is_cc_only_bystander(&email.to, &email.cc, &self_addrs, &email.body) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::CcOnly)?;
                     // Name the actual addressee so the Discord notice reads as
                     // "this wasn't written to you"; a long To list is trimmed
                     // to keep the card legible.
@@ -869,6 +877,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // `sigextract.rs::is_meeting_invite` for the detection
                 // rules.
                 if is_meeting_invite(&email.subject, &email.body, &email.attachments) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::MeetingInvite)?;
                     return Ok(Some(self.suppress_meeting_invite(&email, None).await?));
                 }
 
@@ -1531,6 +1540,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // Defense in depth for every dispatch entry point. Retry now also
         // re-enters triage with persisted recipient and attachment evidence.
         if is_meeting_invite(&email.subject, &email.body, &email.attachments) {
+            self.store.record_email_guard(&email.message_id, existing_action_id.as_deref(), augmentagent_store::email_guards::EmailGuard::MeetingInvite)?;
             return Ok(Some(
                 self.suppress_meeting_invite(&email, existing_action_id.as_deref())
                     .await?,
@@ -3565,6 +3575,13 @@ Where: Microsoft Teams
             assert!(broker.posts.lock().unwrap().is_empty(), "guard bypass: {scenario}");
             assert!(store.is_email_complete(&email.message_id).unwrap());
             assert_eq!(ch.retry_once().await.unwrap(), 0);
+            let guards = store.email_guards_since(0, 25).unwrap();
+            assert_eq!(guards.len(), 1, "one actual guard observation: {scenario}");
+            assert_eq!(guards[0].attempt_n, 2);
+            assert_eq!(guards[0].action_id, id);
+            assert!(store.email_retry_failures_since(0,25).unwrap().is_empty(), "intentional guard is not dispatch failure");
+            let reopened = Store::open(_f.path()).unwrap();
+            assert_eq!(reopened.email_guards_since(0,25).unwrap(), guards);
             let prompts = reasoner.prompts.lock().unwrap();
             assert_eq!(prompts.len(), 1, "no draft model call after a guard fires");
             assert!(prompts[0].contains("attempt_n=2"));

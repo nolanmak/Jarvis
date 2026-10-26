@@ -1228,6 +1228,12 @@ impl Store {
         if !column_exists(conn, "emails", "retryGuardContext")? {
             conn.execute("ALTER TABLE emails ADD COLUMN retryGuardContext TEXT", [])?;
         }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS email_guard_observations (
+            id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT NOT NULL,
+            attempt_n INTEGER NOT NULL, guard TEXT NOT NULL, disposition TEXT NOT NULL,
+            observed_at_ms INTEGER NOT NULL,
+            UNIQUE(message_id,action_id,attempt_n,guard));
+            CREATE INDEX IF NOT EXISTS idx_email_guard_time ON email_guard_observations(observed_at_ms);")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS email_retry_failures (
             id INTEGER PRIMARY KEY, action_id TEXT NOT NULL, message_id TEXT NOT NULL,
             attempt_n INTEGER NOT NULL, failure_class TEXT NOT NULL, guard TEXT NOT NULL,

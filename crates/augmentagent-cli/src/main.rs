@@ -8979,6 +8979,10 @@ async fn run_digest(
             failure.action_id, failure.message_id, failure.attempt_n,
             truncate(&failure.guard, 80), truncate(&failure.failure_class, 240)));
     }
+    ctx.push_str("\n## Email guard observations (intentional dispositions, not retry failures)\n");
+    for guard in optional_digest_rows(&mut ctx,"Email guard evidence",store.email_guards_since(since_ms,25)) {
+        ctx.push_str(&format!("- attempt {}: guard {}; disposition {}\n",guard.attempt_n,guard.guard,guard.disposition));
+    }
     ctx.push_str("\n## Scheduled loop progress (latest 25 occurrences; full evidence retained)\n");
     for occurrence in optional_digest_rows(&mut ctx,"Scheduled loop evidence",store.loop_occurrences_since(since_ms, 25)) {
         let coverage = optional_digest_rows(&mut ctx,&format!("Loop {} coverage",occurrence.loop_id),store.loop_coverage(&occurrence.loop_id, 5));
