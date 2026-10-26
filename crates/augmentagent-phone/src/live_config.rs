@@ -50,20 +50,6 @@ impl LiveConfig {
         config.endpoint = Some(endpoint);
         config
     }
-    /// Validate exact session configuration before placing a phone call. This
-    /// short probe carries no owner profile, transcript or delegated work.
-    pub async fn preflight(&self) -> Result<(), LiveError> {
-        let connection = self
-            .connect("Connection readiness check. Remain silent and do not delegate any work.")
-            .await?;
-        match connection.finish().await? {
-            crate::live_session::LiveInput::Closed {
-                reason: crate::live_session::CloseReason::Requested,
-                seconds: Some(_),
-            } => Ok(()),
-            _ => Err(LiveError::Protocol),
-        }
-    }
     pub async fn connect_for_call(&self, instructions: &str) -> Result<LiveConnection, LiveError> {
         #[cfg(test)]
         if let Some(endpoint) = &self.endpoint {

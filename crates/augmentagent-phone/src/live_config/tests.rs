@@ -84,6 +84,16 @@ async fn service_call(
             "failed preflight must retire reservation without replaying dial"
         );
     }
+    let usage = store.phone_live_usage(1).unwrap();
+    assert_eq!(usage.len(), 1, "readiness probe must retain its own usage receipt");
+    assert_eq!(usage[0].phase, "preflight");
+    if result.is_ok() {
+        assert_eq!(usage[0].seconds, Some(0.1));
+        assert_eq!(usage[0].reason.as_deref(), Some("close_requested"));
+    } else {
+        assert_eq!(usage[0].seconds, None);
+        assert_eq!(usage[0].error.as_deref(), Some("authentication"));
+    }
     (result, calls.load(Ordering::SeqCst))
 }
 #[tokio::test]

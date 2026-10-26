@@ -217,3 +217,16 @@ CREATE TABLE IF NOT EXISTS phone_live_transcripts (
     batch_id TEXT REFERENCES phone_live_history_batches(id),
     PRIMARY KEY(call_id,event_id)
 );
+
+-- One receipt per actual Live attempt; no final event means unknown usage.
+CREATE TABLE IF NOT EXISTS phone_live_usage (
+    call_id TEXT NOT NULL REFERENCES phone_calls(id),
+    phase TEXT NOT NULL CHECK(phase IN ('preflight','conversation')),
+    session_id TEXT UNIQUE,
+    end_trigger TEXT,
+    final_reason TEXT,
+    seconds REAL CHECK(seconds IS NULL OR seconds>=0),
+    error TEXT,
+    finalization_error TEXT,
+    PRIMARY KEY(call_id,phase)
+);

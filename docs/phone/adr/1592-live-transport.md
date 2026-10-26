@@ -12,7 +12,20 @@ owner binding, callback verification, call budget and single-consumer relay clai
 No new number, redial loop, phone verification ceremony or startup dial is added.
 An owner-triggered readiness probe validates and finalizes a short Live session
 before dialing; it carries no owner context and is never triggered by callbacks.
-Its usage must be accounted for separately from the conversation in #1595.
+Its usage is persisted separately from the conversation in `phone_live_usage`.
+Both attempts are registered before connecting; a crash leaves an incomplete
+receipt with unknown usage. The final `session.closed` duration is recorded once,
+including for a provider-reported failure. Socket loss never becomes zero cost.
+Provider finalization, its reason, the local stop trigger and any finalization
+failure remain separate fields; none implies the human owner hung up.
+
+`phone metrics --last N` includes aggregate confirmed Live seconds and unknown
+attempt counts for probes and conversations. The displayed USD calculation is
+an estimate using the published $0.05/minute rate checked 2026-10-26, excludes
+Twilio/backend charges, and leaves the total unknown if any attempt has missing
+final usage. It prints no call/session IDs. Exact correlation remains in the
+private store for the canary receipt. Actual invoice/cost reconciliation and
+audible timing qualification remain in #1595/#1596.
 
 This is an audio backend, not another Chat Completions fast provider. Backend
 work remains in Jarvis's native session/approval harness and durable task queue.
@@ -89,6 +102,8 @@ recorded in #1596. Missing OpenAI credentials block the canary, not offline work
 - [OpenAI WebSocket audio formats and events](https://developers.openai.com/api/docs/guides/voice-websockets)
 - [OpenAI Live conversation events and startup input](https://developers.openai.com/api/docs/guides/live-conversations)
 - [OpenAI playback controls and interruption recovery](https://developers.openai.com/api/docs/guides/voice-server-controls?api=live#check-speech-before-playback)
+- [OpenAI Live usage accounting](https://developers.openai.com/api/docs/guides/voice-latency-cost)
+- [GPT-Live 1 published pricing](https://developers.openai.com/api/docs/models/gpt-live-1)
 - [OpenAI telephony choices](https://developers.openai.com/api/docs/guides/voice-sip)
 - [Twilio Agent Connect overview](https://www.twilio.com/docs/conversations/agent-connect/overview)
 - [Twilio GPT-Live TypeScript integration](https://www.twilio.com/en-us/blog/developers/tutorials/integrations/tac-gpt-live-voice-ai-agent-typescript)

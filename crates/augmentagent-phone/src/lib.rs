@@ -519,9 +519,9 @@ impl PhoneService {
                 grant.binding_revision,
             )?;
             if let Some(live) = &self.config.live {
-                if let Err(error) = live.preflight().await {
+                if let Err(error) = self.live_preflight(live, &reserved.call.id).await {
                     self.store.phone_create_rejected(&reserved.call.id, self.clock.now_ms())?;
-                    return Err(error.into());
+                    return Err(error);
                 }
                 // Authorization can change while the readiness probe is in flight.
                 if let Err(error) = self.check(grant, false) {
@@ -850,3 +850,5 @@ pub mod live_call;
 pub mod live_config;
 
 mod live_media;
+
+pub mod live_usage;

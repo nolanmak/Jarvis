@@ -378,3 +378,57 @@ async fn revoked_owner_cannot_open_live_even_with_valid_provider_signature() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn finalized_provider_failure_keeps_usage_and_is_not_an_owner_hangup() {
+    let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/", provider.local_addr().unwrap());
+    let backend = tokio::spawn(async move {
+        let (tcp, _) = provider.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        let _ = ws.next().await;
+        ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"type":"session.closed","event_id":"evt-close","reason":"connection_lost","session":{"id":"live-test"},"usage":{"seconds":0.25}}).to_string().into())).await.unwrap();
+    });
+    let f = fixture(endpoint).await;
+    let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap();
+    backend.await.unwrap();
+    let rows = f.service.store.phone_live_usage(1).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].phase, "conversation");
+    assert_eq!(rows[0].seconds, Some(0.25));
+    assert_eq!(rows[0].reason.as_deref(), Some("connection_lost"));
+    assert_eq!(rows[0].trigger.as_deref(), Some("provider_closed"));
+    assert_eq!(rows[0].error.as_deref(), Some("connection_lost"));
+    assert!(rows[0].finalization_error.is_none());
+}
+
+#[tokio::test]
+async fn lost_provider_socket_has_unknown_usage_and_incomplete_finalization() {
+    let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/", provider.local_addr().unwrap());
+    let backend = tokio::spawn(async move {
+        let (tcp, _) = provider.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        let _ = ws.next().await;
+        ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        // No session.closed: the wire closing must not imply zero usage.
+        ws.close(None).await.unwrap();
+    });
+    let f = fixture(endpoint).await;
+    let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap();
+    backend.await.unwrap();
+    let rows = f.service.store.phone_live_usage(1).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].seconds, None);
+    assert_eq!(rows[0].reason, None);
+    assert_eq!(rows[0].trigger.as_deref(), Some("error"));
+    assert_eq!(rows[0].error.as_deref(), Some("connection_lost"));
+    assert!(rows[0].finalization_error.is_some());
+}

@@ -7,7 +7,7 @@ use crate::{
     live_transport::{MediaStream, StreamInput},
     PhoneService,
 };
-use augmentagent_store::phone::PhoneCall;
+use augmentagent_store::phone::{PhoneCall, LiveUsagePhase, LiveUsageFinal};
 use axum::extract::ws::{Message, WebSocket};
 use futures::SinkExt;
 use std::{
@@ -29,6 +29,7 @@ pub(crate) async fn run(
     mut socket: WebSocket,
 ) {
     let mut claimed = false;
+    let mut usage_started = false;
     let setup = tokio::time::timeout(Duration::from_secs(10), async {
         let sid = call.provider_sid.as_deref().ok_or(LiveError::Protocol)?;
         let mut media = MediaStream::new(&account, sid);
@@ -56,7 +57,13 @@ pub(crate) async fn run(
                                 .live
                                 .as_ref()
                                 .ok_or(LiveError::Configuration)?;
+                            service.store.phone_live_usage_start(&call.id, LiveUsagePhase::Conversation)
+                                .map_err(|_|LiveError::Unavailable)?;
+                            usage_started = true;
                             let connection = live.connect_for_call(&instructions).await?;
+                            service.store.phone_live_usage_bind(&call.id, LiveUsagePhase::Conversation,
+                                connection.session_id().ok_or(LiveError::Protocol)?)
+                                .map_err(|_|LiveError::Unavailable)?;
                             service
                                 .authorize_call(&call.id)
                                 .map_err(|_| LiveError::Access)?;
@@ -80,7 +87,13 @@ pub(crate) async fn run(
         Ok((media, connection)) => {
             conversation(&service, &call, &mut socket, media, connection).await
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            if usage_started && service.store.phone_live_usage_finish(&call.id, LiveUsagePhase::Conversation, &LiveUsageFinal {
+                    trigger:"setup_failure", reason:None, seconds:None,
+                    error:Some(error.code()), finalization_error:None,
+                }).is_err() { tracing::warn!(call_id=%call.id,"phone Live setup receipt remains incomplete"); }
+            Err(error)
+        },
     };
     if claimed {
         if let Err(error) = outcome {
@@ -101,16 +114,17 @@ async fn conversation(
         .session_id()
         .ok_or(LiveError::Protocol)?
         .to_owned();
-    let mut coordinator = LiveCall::new(service.clone(), &call.id, &session_id)?;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let mut provider_finalized = false;
+    let mut final_event = None;
+    let mut trigger = "error";
     let outcome:Result<(),LiveError>=async {
+        let mut coordinator = LiveCall::new(service.clone(), &call.id, &session_id)?;
         loop {
             tokio::select! {
                 _=tick.tick()=>{
-                    if service.stopping.load(Ordering::SeqCst) {return Ok(());}
+                    if service.stopping.load(Ordering::SeqCst) {trigger="app_stop";return Ok(());}
                     service.authorize_call(&call.id).map_err(|_|LiveError::Access)?;
-                    if service.clock.now_ms().saturating_sub(call.created_ms)>=call.max_duration_seconds.saturating_mul(1000) {return Ok(());}
+                    if service.clock.now_ms().saturating_sub(call.created_ms)>=call.max_duration_seconds.saturating_mul(1000) {trigger="duration_limit";return Ok(());}
                     for result in coordinator.pending_results()? {
                         if coordinator.reply_pending(&result.delegation_id) {continue;}
                         let content=if result.result.len()<=500 {result.result.as_str()} else {"There's an update on your task in our chat. The full result is available there."};
@@ -122,13 +136,13 @@ async fn conversation(
                     match incoming {
                         Some(Ok(Message::Text(text)))=>match media.receive(&text).map_err(|_|LiveError::Protocol)? {
                             StreamInput::Audio(audio)=>connection.send_audio(&audio).await?,
-                            StreamInput::Stopped=>return Ok(()),
+                            StreamInput::Stopped=>{trigger="twilio_stop";return Ok(());},
                             StreamInput::Ignored|StreamInput::Played{..}|StreamInput::Cleared=>{},
                             StreamInput::Started=>return Err(LiveError::Protocol),
                         },
                         Some(Ok(Message::Ping(bytes)))=>send(socket,Message::Pong(bytes)).await?,
                         Some(Ok(Message::Pong(_)))=>{},
-                        Some(Ok(Message::Close(_)))|None=>return Ok(()),
+                        Some(Ok(Message::Close(_)))|None=>{trigger="socket_close";return Ok(());},
                         _=>return Err(LiveError::ConnectionLost),
                     }
                 }
@@ -141,10 +155,12 @@ async fn conversation(
                                 send(socket,Message::Text(frame.to_string().into())).await?;
                             }
                         }
-                        LiveInput::Closed{seconds,..}=>{
-                            provider_finalized = true;
-                            if seconds.is_none() { tracing::warn!(call_id=%call.id,"phone Live final usage unavailable"); }
-                            return Ok(());
+                        LiveInput::Closed{reason,seconds}=>{
+                            trigger="provider_closed";
+                            final_event=Some(LiveInput::Closed{reason:*reason,seconds:*seconds});
+                            return if *reason==crate::live_session::CloseReason::ConnectionLost {
+                                Err(LiveError::ConnectionLost)
+                            } else {Ok(())};
                         },
                         _=>match coordinator.event(&input)? {
                             LiveAction::Clarify{delegation_id}=>{
@@ -157,14 +173,19 @@ async fn conversation(
             }
         }
     }.await;
-    drop(coordinator);
-    // Finalization is bounded inside finish; missing usage is not success.
-    if !provider_finalized {
-        let finalization = connection.finish().await;
-        if outcome.is_ok() && finalization.is_err() {
-            tracing::warn!(call_id=%call.id,"phone Live final usage unavailable");
-        }
-    }
+    // The provider's reason and final usage are independent from the local
+    // stop trigger. In particular, neither a socket close nor remote_hangup
+    // proves that the human owner hung up.
+    let finalization=match final_event {
+        Some(event)=>Ok(event),
+        None=>connection.finish().await,
+    };
+    let finalization_error=finalization.as_ref().err().copied();
+    service.save_live_usage(&call.id, LiveUsagePhase::Conversation, trigger,
+        outcome.as_ref().err().copied(),finalization)
+        .map_err(|_|LiveError::Unavailable)?;
+    if let Some(error)=finalization_error { return outcome.and(Err(error)); }
+
     outcome
 }
 #[cfg(test)]

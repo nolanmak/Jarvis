@@ -1,5 +1,5 @@
 //! `augmentagent phone metrics --last N` (#1551): nearest-rank p50/p95 per
-//! latency field over the last N calls. Reads `phone_turn_metrics` only; it
+//! latency field over the last N calls, plus separate Live usage receipts. It
 //! prints no speech text, numbers or provider identifiers.
 use anyhow::Result;
 use augmentagent_store::{phone::PhoneMetricsSummary, Store};
@@ -27,6 +27,7 @@ pub fn render(summary: &PhoneMetricsSummary) -> String {
 pub fn run(store: &Store, last: usize) -> Result<()> {
     let summary = store.phone_turn_metrics_summary(last)?;
     print!("{}", render(&summary));
+    print!("{}", augmentagent_phone::live_usage::render_usage(&store.phone_live_usage(last)?));
     Ok(())
 }
 
