@@ -47,9 +47,11 @@ def canonical_directory(raw):
 
 def validated_policy(policy):
     expected = {'version', 'write_roots', 'protected_roots', 'network'}
-    if policy.get('version') == 2:
+    if policy.get('version') in (2, 3):
         expected.add('write_files')
-    if set(policy) != expected or policy['version'] not in (1, 2):
+    if policy.get('version') == 3:
+        expected.update(('read_roots', 'read_files'))
+    if set(policy) != expected or policy['version'] not in (1, 2, 3):
         raise RuntimeError('unsupported scope policy')
     if policy['network'] not in ('deny', 'provider_transport'):
         raise RuntimeError('native guard cannot enforce hostname egress; use the command bridge')
@@ -72,8 +74,35 @@ def validated_policy(policy):
     return roots, files
 
 
+def read_grants(policy):
+    """Version 3 is default-deny for content reads and executable loading.
+
+    Grants come only from a controller-owned manifest; write permission never
+    implies read permission. Existing v1/v2 callers retain their honest write-
+    only guarantee until their provider runtime/bridge has migrated.
+    """
+    roots = [canonical_directory(raw) for raw in policy['read_roots']]
+    files = []
+    for raw in policy['read_files']:
+        path = Path(raw)
+        info = path.lstat()
+        if (not path.is_absolute() or path != path.resolve(strict=True)
+                or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+            raise RuntimeError('read file must be canonical and singly linked')
+        files.append(path)
+    if not roots or len(roots) + len(files) > 10000:
+        raise RuntimeError('read grants missing or oversized')
+    for granted in roots + files:
+        for raw in policy['protected_roots']:
+            denied = canonical_directory(raw)
+            if granted == denied or granted in denied.parents or denied in granted.parents:
+                raise RuntimeError('read grant intersects protected control state')
+    return roots, files
+
+
 def restrict(policy):
     roots, files = validated_policy(policy)
+    reads = read_grants(policy) if policy['version'] == 3 else None
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'aarch64'):
         raise RuntimeError('native scope requires a supported Linux architecture')
     libc = ctypes.CDLL(None, use_errno=True)
@@ -91,7 +120,8 @@ def restrict(policy):
     # Handle every filesystem mutation, including truncate/refer/ioctl. Reads
     # remain available to the native provider; tool-level read scope is separate.
     write = (1 << 1) | sum(1 << n for n in range(4, 16))
-    attrs = Ruleset(write, 3 if policy['network'] == 'deny' else 0, 3)
+    read = (1 << 0) | (1 << 2) | (1 << 3)
+    attrs = Ruleset(write | (read if reads else 0), 3 if policy['network'] == 'deny' else 0, 3)
     ruleset = libc.syscall(444, ctypes.byref(attrs), ctypes.sizeof(attrs), 0)
     if ruleset < 0:
         raise OSError(ctypes.get_errno(), 'scope ruleset creation failed')
@@ -105,6 +135,16 @@ def restrict(policy):
                     raise OSError(ctypes.get_errno(), 'scope rule installation failed')
             finally:
                 os.close(descriptor)
+        if reads:
+            for path in reads[0] + reads[1]:
+                descriptor = os.open(path, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    access = read if path in reads[0] else (1 << 0) | (1 << 2)
+                    rule = PathRule(access, descriptor)
+                    if libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0):
+                        raise OSError(ctypes.get_errno(), 'read rule installation failed')
+                finally:
+                    os.close(descriptor)
         # stdout/stderr are inherited; commands may also need /dev/null.
         descriptor = os.open('/dev/null', os.O_PATH | os.O_CLOEXEC)
         try:
@@ -130,6 +170,20 @@ def restrict(policy):
             number = seccomp.seccomp_syscall_resolve_name(name.encode())
             if number >= 0 and seccomp.seccomp_rule_add(context, 0x50000 | errno.EPERM, number, 0):
                 raise RuntimeError('syscall filter rule failed')
+        if reads:
+            # ABI 8 cannot restrict pathname UNIX sockets. Do not mistake
+            # filesystem read denial for blocking a host credential broker.
+            # Anonymous socketpair remains available for internal child IPC.
+            class ArgCompare(ctypes.Structure):
+                _fields_ = [('arg', ctypes.c_uint), ('op', ctypes.c_int),
+                            ('a', ctypes.c_uint64), ('b', ctypes.c_uint64)]
+            seccomp.seccomp_rule_add_array.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                ctypes.c_int, ctypes.c_uint, ctypes.POINTER(ArgCompare)]
+            comparison = ArgCompare(0, 4, 1, 0)  # SCMP_CMP_EQ, AF_UNIX
+            number = seccomp.seccomp_syscall_resolve_name(b'socket')
+            if number < 0 or seccomp.seccomp_rule_add_array(context, 0x50000 | errno.EPERM,
+                    number, 1, ctypes.byref(comparison)):
+                raise RuntimeError('host UNIX socket isolation unavailable')
         if seccomp.seccomp_load(context):
             raise RuntimeError('syscall filter enforcement failed')
     finally:

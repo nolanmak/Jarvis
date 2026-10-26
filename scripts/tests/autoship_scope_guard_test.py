@@ -170,6 +170,56 @@ pathlib.Path({str(implementation / 'brand_new.py')!r}).write_text('new child')
         with self.assertRaises(OSError):
             guard.private_json(link)
 
+    def test_v3_reads_only_declared_auth_and_blocks_host_unix_sockets(self):
+        self.require_kernel()
+        import socket
+        runtime = self.base / 'runtime'
+        runtime.mkdir()
+        auth = runtime / 'auth.json'
+        auth.write_text('synthetic declared auth')
+        secret = self.control / 'unrelated-credentials'
+        secret.write_text('synthetic unrelated credentials')
+        alias = self.work / 'secret-link'
+        alias.symlink_to(secret)
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        endpoint = self.control / 'host.sock'
+        listener.bind(str(endpoint))
+        listener.listen(1)
+        policy = dict(self.policy, version=3, write_files=[],
+                      read_roots=[str(Path('/usr').resolve()), str(self.work)],
+                      read_files=[str(auth)])
+        code = f'''import pathlib,socket,subprocess,sys
+assert pathlib.Path({str(auth)!r}).read_text() == 'synthetic declared auth'
+for raw in {[str(secret), str(alias)]!r}:
+ try:
+  pathlib.Path(raw).read_text()
+  raise SystemExit('unrelated read succeeded')
+ except PermissionError: pass
+try:
+ s=socket.socket(socket.AF_UNIX); s.connect({str(endpoint)!r})
+ raise SystemExit('host socket reachable')
+except PermissionError: pass
+a,b=socket.socketpair();a.close();b.close()
+p=subprocess.run([sys.executable,'-c',"open("+repr({str(secret)!r})+").read()"],capture_output=True)
+assert p.returncode != 0
+pathlib.Path({str(self.work / 'positive')!r}).write_text('allowed')
+'''
+        result = self.run_guard(code, policy)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.work / 'positive').read_text(), 'allowed')
+
+    def test_v3_missing_or_overbroad_profile_fails_before_dispatch(self):
+        policy = dict(self.policy, version=3, write_files=[])
+        marker = self.work / 'executed'
+        result = self.run_guard(f'open({str(marker)!r},"w")', policy)
+        self.assertEqual(result.returncode, 126)
+        self.assertFalse(marker.exists())
+        for root in [self.base, self.control]:
+            invalid = dict(policy, read_roots=[str(root)], read_files=[])
+            with self.assertRaises(RuntimeError):
+                guard.read_grants(invalid)
+
 
 if __name__ == '__main__':
     unittest.main()
