@@ -26,6 +26,8 @@ CHUNK = 64 * 1024
 HEADER_LIMIT = 64 * 1024
 HOP = {'connection', 'proxy-connection', 'proxy-authorization', 'keep-alive',
        'transfer-encoding', 'te', 'trailer', 'upgrade', 'host'}
+PHASES = {'request_line', 'request_headers', 'connect_authority', 'connect_tls', 'target', 'request_body', 'await_upstream', 'response_body'}
+FAILURES = {'authority', 'path', 'headers', 'request', 'http_version', 'host', 'framing', 'request_limit', 'upstream', 'websocket_upgrade', 'transport_unavailable', 'SSLError', 'SSLCertVerificationError', 'TimeoutError', 'OSError', 'EOFError', 'protocol_failure'}
 TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 
@@ -278,6 +280,7 @@ class HostGateway:
         self.states = {}
         self.lock = threading.Lock()
         self.closed = False
+        self.guest_failures = []
 
     def emit(self, kind, ident, **fields):
         try:
@@ -294,6 +297,12 @@ class HostGateway:
             return
         try:
             kind = frame.get('type')
+            if kind == 'gateway_guest_failure':
+                if frame.get('phase') not in PHASES or frame.get('category') not in FAILURES:
+                    raise Denied('frame')
+                with self.lock:
+                    self.guest_failures = (self.guest_failures + [{'phase': frame['phase'], 'category': frame['category']}])[-16:]
+                return
             if kind == 'gateway_open':
                 self.policy.admit(frame.get('authority'), frame.get('method'), frame.get('path'), frame.get('websocket', False))
                 headers_value(frame.get('headers', []))
@@ -561,21 +570,25 @@ class GuestGateway:
         state = State()
         state.socket = client
         opened = False
+        phase = 'request_line'
         try:
             stream = client.makefile('rb')
             line = stream.readline(16385).decode('ascii')
             method, target, version = line.rstrip('\r\n').split(' ')
             if version != 'HTTP/1.1':
-                raise Denied('request')
+                raise Denied('http_version')
+            phase = 'request_headers'
             headers = read_headers(stream)
             fixed_authority = None
             if method == 'CONNECT':
+                phase = 'connect_authority'
                 fixed_authority, _, _ = authority(target)
                 context = self.contexts.get(fixed_authority)
                 if context is None:
                     raise Denied('authority')
                 client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
                 stream.close()
+                phase = 'connect_tls'
                 client = context.wrap_socket(client, server_side=True)
                 state.socket = client
                 stream = client.makefile('rb')
@@ -584,6 +597,7 @@ class GuestGateway:
                 if version != 'HTTP/1.1' or method == 'CONNECT':
                     raise Denied('request')
                 headers = read_headers(stream)
+            phase = 'target'
             parsed = urllib.parse.urlsplit(target)
             hosts = [v for n, v in headers if n.lower() == 'host']
             if len(hosts) != 1:
@@ -608,6 +622,7 @@ class GuestGateway:
             opened = True
             self.emit({'type': 'gateway_open', 'id': ident, 'method': method, 'authority': key,
                              'path': path, 'headers': headers, 'websocket': websocket})
+            phase = 'request_body'
             total = 0
             if transfers:
                 while True:
@@ -638,9 +653,11 @@ class GuestGateway:
                     remaining -= len(chunk)
                     self.emit({'type': 'gateway_data', 'id': ident, 'data': encode(chunk)})
             self.emit({'type': 'gateway_end', 'id': ident})
+            phase = 'await_upstream'
             response = state.queue.get(timeout=self.config['timeout'])
             if response['type'] != 'gateway_headers':
                 raise Denied('upstream')
+            phase = 'response_body'
             status = response['status']
             received = headers_value(response['headers'])
             if websocket:
@@ -683,7 +700,14 @@ class GuestGateway:
                         raise Denied('upstream')
                     data = decode(frame['data'], self.config['frame_bytes'])
                     client.sendall(f'{len(data):x}\r\n'.encode() + data + b'\r\n')
-        except Exception:
+        except Exception as error:
+            category = str(error) if isinstance(error, Denied) else type(error).__name__
+            if category not in FAILURES:
+                category = 'protocol_failure'
+            try:
+                self.emit({'type': 'gateway_guest_failure', 'id': ident, 'phase': phase, 'category': category})
+            except Denied:
+                pass
             try:
                 client.sendall(b'HTTP/1.1 502 Gateway Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             except OSError:

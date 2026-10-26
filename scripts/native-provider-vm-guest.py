@@ -56,6 +56,19 @@ class BoundedWriter:
 
 
 
+def send_frame(output, lock, frame):
+    data = json.dumps(frame, separators=(',', ':')).encode() + b'\n'
+    if len(data) > MAX_FRAME:
+        raise ValueError('oversized guest frame')
+    with lock:
+        remaining = memoryview(data)
+        while remaining:
+            written = output.write(remaining)
+            if not isinstance(written, int) or written <= 0:
+                raise RuntimeError('guest control channel closed during frame')
+            remaining = remaining[written:]
+
+
 def worker(job):
     uid, gid = job['uid'], job['gid']
     if uid <= 0 or gid <= 0:
@@ -111,28 +124,34 @@ def quiesce_worker(uid, timeout=5, enumerate_pids=None, kill=None, reap=None):
     enumerate_pids = enumerate_pids or (lambda: worker_pids(uid))
     kill = kill or (lambda pid: os.kill(pid, 9))
     def reap_children():
+        count = 0
         while True:
             try:
                 pid, _ = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
-                return
+                return count
             if pid == 0:
-                return
+                return count
+            count += 1
     reap = reap or reap_children
     deadline = time.monotonic() + timeout
     quiet = 0
+    scans, reaped, signalled = 0, 0, set()
     while time.monotonic() < deadline:
+        scans += 1
         pids = enumerate_pids()
         for pid in pids:
             try:
                 kill(pid)
+                signalled.add(pid)
             except ProcessLookupError:
                 pass
-        reap()
+        reaped += reap() or 0
         if not pids:
             quiet += 1
             if quiet >= 2:
-                return
+                return {'scans': scans, 'signalled': len(signalled), 'reaped': reaped,
+                        'remaining_workers': 0, 'quiet_scans': quiet}
         else:
             quiet = 0
         time.sleep(0.01)
@@ -178,11 +197,7 @@ def main():
     lock = threading.Lock()
 
     def send(frame):
-        data = json.dumps(frame, separators=(',', ':')).encode() + b'\n'
-        if len(data) > MAX_FRAME:
-            raise ValueError('oversized guest frame')
-        with lock:
-            output.write(data)
+        send_frame(output, lock, frame)
 
     uid, gid = job['uid'], job['gid']
     if uid <= 0 or gid <= 0:
@@ -291,7 +306,8 @@ def main():
     # Quiesce the complete guest worker UID before privileged export. Reap
     # adopted orphans and repeat the scan so concurrent forks cannot survive a
     # one-time process snapshot or race directory traversal during export.
-    quiesce_worker(uid)
+    quiescence = quiesce_worker(uid)
+    send(dict(type='worker_quiescent', **quiescence))
     for thread in threads:
         thread.join(timeout=5)
         if thread.is_alive():

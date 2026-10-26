@@ -2,6 +2,7 @@
 """Local pipe/proc fixtures; never boot a VM or signal host worker processes."""
 import importlib.util
 import os
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -57,6 +58,31 @@ class NativeIoTests(unittest.TestCase):
                     os.close(write_fd)
                 self.assertTrue(failed.is_set())
                 self.assertTrue(writer.closed.is_set())
+
+    def test_guest_frames_survive_short_character_device_writes(self):
+        class ShortWriter:
+            def __init__(self):
+                self.data = bytearray()
+            def write(self, data):
+                amount = min(97, len(data))
+                self.data.extend(data[:amount])
+                return amount
+        output = ShortWriter()
+        lock = threading.Lock()
+        frames = [{'type': 'mcp_input', 'data': 'x' * 90000}, {'type': 'stdout', 'data': 'y' * 90000}]
+        threads = [threading.Thread(target=GUEST.send_frame, args=(output, lock, frame)) for frame in frames]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        observed = [json.loads(line) for line in output.data.splitlines()]
+        self.assertEqual(sorted(observed, key=lambda f: f['type']), sorted(frames, key=lambda f: f['type']))
+        class ClosedWriter:
+            def write(self, data):
+                return 0
+        with self.assertRaisesRegex(RuntimeError, 'closed during frame'):
+            GUEST.send_frame(ClosedWriter(), lock, frames[0])
 
     def test_ordered_bytes_and_eof_are_preserved(self):
         for module in (HOST, GUEST):

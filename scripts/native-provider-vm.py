@@ -459,6 +459,7 @@ def main(spec_path):
             staging.mkdir(mode=0o700)
             exit_code = None
             active_export = None
+            quiescence = None
             for frame in channel.receive():
                 kind = frame['type']
                 if kind == 'ready' and not admitted:
@@ -492,7 +493,14 @@ def main(spec_path):
                     bridge_writer.submit(base64.b64decode(frame['data'], validate=True))
                 elif kind.startswith('gateway_'):
                     gateway.receive(frame)
-                elif kind == 'runtime_start' and admitted:
+                elif kind == 'worker_quiescent' and admitted and quiescence is None:
+                    keys = ('scans', 'signalled', 'reaped', 'remaining_workers', 'quiet_scans')
+                    if any(type(frame.get(key)) is not int or not 0 <= frame[key] <= 100000 for key in keys):
+                        raise ValueError('invalid native quiescence receipt')
+                    if frame['remaining_workers'] != 0 or frame['quiet_scans'] < 2 or frame['scans'] < 2:
+                        raise ValueError('native workers remain before runtime export')
+                    quiescence = {key: frame[key] for key in keys}
+                elif kind == 'runtime_start' and admitted and quiescence is not None:
                     relative = safe_relative(frame['path'])
                     size = frame['size']
                     if active_export is not None or type(size) is not int or size < 0:
@@ -531,7 +539,7 @@ def main(spec_path):
                     break
                 else:
                     raise ValueError('unknown native guest frame')
-            if exit_code is None or active_export is not None or not admitted:
+            if exit_code is None or active_export is not None or not admitted or quiescence is None:
                 raise RuntimeError('native VM disconnected without completion')
             process.wait(timeout=10)
             if process.returncode:
@@ -541,14 +549,20 @@ def main(spec_path):
             refresh_auth(spec, state / generation, original_auth, credential_lock)
             atomic(state / 'complete.json', json.dumps({'version': 1, 'exit_code': exit_code,
                    'generation': generation, 'export_bytes': exported,
-                   'auth_generation': original_auth}).encode())
+                   'auth_generation': original_auth, 'worker_quiescence': quiescence}).encode())
             # Only controller-generated complete exports are retained. Keep the
             # previous generation through pointer publication for crash safety.
             previous = sorted(state.glob('generation-*'), key=lambda path: path.stat().st_mtime)
             for obsolete in previous[:-2]:
                 if obsolete.name != generation and not obsolete.is_symlink():
                     shutil.rmtree(obsolete)
+            if exit_code and gateway.guest_failures:
+                print(json.dumps({'native_gateway_failures': gateway.guest_failures}), file=sys.stderr, flush=True)
             return exit_code
+        except Exception:
+            if gateway is not None and gateway.guest_failures:
+                print(json.dumps({'native_gateway_failures': gateway.guest_failures}), file=sys.stderr, flush=True)
+            raise
         finally:
             if gateway is not None:
                 gateway.close()
@@ -573,7 +587,11 @@ def main(spec_path):
 if __name__ == '__main__':
     try:
         raise SystemExit(main(sys.argv[1]))
-    except Exception:
-        # Exceptions may include credential-bearing provider headers/URLs.
+    except Exception as error:
+        # Only a fixed exception category is safe; messages may contain secrets.
+        category = type(error).__name__
+        if category not in {'JSONDecodeError','ValueError','RuntimeError','TimeoutError','OSError','BrokenPipeError','FileNotFoundError','PermissionError','ChildProcessError','CalledProcessError'}:
+            category = 'BoundaryFailure'
+        print(json.dumps({'native_vm_failure': category}), file=sys.stderr)
         print('Native VM boundary unavailable; launch terminated without host fallback.', file=sys.stderr)
         raise SystemExit(126)
