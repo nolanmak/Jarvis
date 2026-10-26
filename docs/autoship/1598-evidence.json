@@ -382,11 +382,23 @@
       "command": "bash scripts/tests/updater-restart-hygiene.test.sh"
     },
     "github_live_boundary": {
-      "passed": false,
       "repository": "nolanmak/autoship-acceptance-6073a5330e3a4cae",
+      "passed": true,
+      "assertions": [
+        "strict-base-rejection",
+        "head-race-rejection",
+        "own-receipt",
+        "lost-response-no-replay-no-attribution",
+        "external-merge-no-attribution",
+        "concurrent-external-merge-no-attribution"
+      ],
+      "binary_revision": "8f317dd6",
+      "fixture_revision": "7a09d93d",
+      "archived": true,
       "evidence_root": "/tmp/autoship-github-acceptance-n0ic5yrv",
-      "log": "/tmp/autoship-1598-real-github-retry.log",
-      "result": "Real accepted merge + durable own receipt passed. Stale candidate rejected with expected-status-check wording; stale-proof assertion/restartable probe follow-up pending. No production repository settings changed; synthetic merges do not count as production shipping."
+      "log": "/tmp/autoship-1598-github-exact-races.log",
+      "note": "Disposable repository only. All six boundary assertions passed; no production throughput or production branch-protection claim.",
+      "log_sha256": "ebe515aaeb449674fd8956aea144fb6453ac711f6a6a1fb320c3a83be0826a0f"
     },
     "review_contract_recovery": {
       "revision": "3383566e",
@@ -404,12 +416,53 @@
       "actual_charged_calls": 3,
       "active_workflow_owners_after_completion": 0,
       "note": "Real native production diagnostic adapter; required resource delegation; no call-cap override."
+    },
+    "native_final_adjudicator": {
+      "revision": "8f317dd6",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-probe-8f317dd6adjudicator.log",
+      "note": "Real independent Codex sessions resolved synthetic contradictory findings using observed arithmetic behavior; mandatory CI remains non-overridable.",
+      "log_sha256": "31249d88f924edc49f6094ab040308270505899b9d8879a3276f92126b20876a"
+    },
+    "adjudicator_correction": {
+      "revision": "8f317dd6",
+      "passed": 26,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-adjudicator-correction.log",
+      "log_sha256": "b205b63eb1cfa54c61ad9fa12c0a68a01e4f8d726db31f8449439e355842df0c"
+    },
+    "reviewed_store_and_scheduled_delivery": {
+      "revision": "abafa0dd",
+      "store_passed": 158,
+      "approval_discord_passed": 263,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-loop-delivery-regression.log",
+      "note": "Full library suites include immutable original execution/delivery bytes, restart backoff, masked history, and triage expiry precedence."
+    },
+    "resource_compatibility": {
+      "revision": "abafa0dd",
+      "rollout_passed": 2,
+      "installer_passed": 60,
+      "updater_passed": 14,
+      "failed": 0,
+      "logs": [
+        "/tmp/autoship-1598-resource-compat.log",
+        "/tmp/autoship-1598-installer-compat.log",
+        "/tmp/autoship-1598-updater-compat.log"
+      ]
+    },
+    "tool_bridge_object_paths": {
+      "revision": "abafa0dd",
+      "run": 177,
+      "skipped": 10,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-object-paths.log"
     }
   },
   "remaining_cross_cutting_acceptance": [
     "Native seeded-defect canary through diagnostic-only authority",
     "Strategy dispatch crash subcheckpoint recovery",
-    "Unambiguous own-merge attribution versus concurrent manual merge",
     "Atomic protection against main advancing between validation and merge",
     "Independent versioned verifier amendment and rebaseline",
     "Historical constraint mining and recurring replay promotion",
@@ -441,7 +494,7 @@
     {
       "severity": "P1",
       "gap": "Restricted environment incorrectly injects mutation handoff history into fresh native reviewer",
-      "status": "fixed_in_309e950b; fallback48passed; native_rerun_pending"
+      "status": "fixed_in_309e950b; fallback48passed; full_native_positive_negative_probe_passed_3383566e"
     },
     {
       "severity": "P1",
