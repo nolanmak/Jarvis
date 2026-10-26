@@ -68,7 +68,7 @@ pub(super) fn synthetic_aligned_review(head: &str, dismiss: bool) -> Independent
             supplied_files: BTreeMap::from([("a.rs".into(), "source-hash".into())]), prompt_hash: format!("prompt-{i}") },
         findings: if role == ReviewRole::Qa { vec![finding.clone()] } else { vec![] },
     }).collect();
-    let adjudication = dismiss.then(|| AdjudicationReceipt { components:vec![], binding: binding.clone(), actor: actor("codex", "adjudicator"),
+    let adjudication = dismiss.then(|| AdjudicationReceipt { components:vec![], finding_graph_hash:None, binding: binding.clone(), actor: actor("codex", "adjudicator"),
         finding_fingerprints: BTreeMap::from([("F1".into(), finding.fingerprint().unwrap())]),
         rulings: BTreeMap::from([("F1".into(), Ruling::Dismiss { evidence: "proof".into(), rationale: "contract resolves contradiction".into() })]),
         prompt_hash: "adjudication-prompt".into(), response_hash: "adjudication-response".into() });

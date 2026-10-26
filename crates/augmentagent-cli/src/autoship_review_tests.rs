@@ -914,3 +914,18 @@ fn duplicate_finding_observations_preserve_every_conflict_edge() {
     let a=groups[0].iter().find(|finding|finding.id=="A").unwrap();
     assert!(a.conflicts_with.contains("B"));assert_eq!(a.repair_rounds,3);
 }
+
+#[tokio::test]
+async fn newly_dangling_or_connected_edges_invalidate_prior_leaf_authority() {
+    let original=finding("A");let mut other=finding("B");other.criterion_id="C2".into();
+    let receipt=dismissed(&[original.clone(),other.clone()]).await;
+    assert!(review_authority(&binding(),&builders(),&passes(vec![original.clone(),other.clone()]),Some(&receipt)).is_ok());
+    let mut dangling=original.clone();dangling.conflicts_with.insert("absent".into());
+    assert!(adjudication_groups::components(&[dangling.clone(),other.clone()]).is_err());
+    assert!(review_authority(&binding(),&builders(),&passes(vec![dangling,other.clone()]),Some(&receipt)).is_err());
+    let mut connected=original;connected.conflicts_with.insert(other.id.clone());
+    assert_eq!(connected.fingerprint().unwrap(),receipt.finding_fingerprints["A"]);
+    assert!(review_authority(&binding(),&builders(),&passes(vec![connected.clone(),other.clone()]),Some(&receipt)).is_err(),"new relationship needs combined final context even when source facts did not change");
+    let renewed=dismissed(&[connected.clone(),other.clone()]).await;
+    assert!(review_authority(&binding(),&builders(),&passes(vec![connected,other]),Some(&renewed)).is_ok());
+}

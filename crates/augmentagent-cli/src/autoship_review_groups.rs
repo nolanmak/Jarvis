@@ -3,7 +3,36 @@
 //! controller check, never an invented model conversation or a consensus vote.
 use super::*;
 
+/// Bind context edges separately: finding fingerprints intentionally describe
+/// evidence, while newly observed contradictions require renewed authority.
+pub fn graph_hash(findings:&[Finding])->Result<String> {
+    let mut graph=BTreeMap::<String,(String,BTreeSet<String>)>::new();
+    for finding in findings {
+        finding.validate()?;
+        let node=graph.entry(finding.id.clone()).or_insert_with(||(finding.criterion_id.clone(),BTreeSet::new()));
+        ensure!(node.0==finding.criterion_id,"finding criterion changed across observations");
+        node.1.extend(finding.conflicts_with.clone());
+    }
+    for (_,edges) in graph.values() {
+        ensure!(edges.iter().all(|id|graph.contains_key(id)),"conflict graph references an absent finding");
+    }
+    Ok(digest(&serde_json::to_vec(&graph)?))
+}
+fn bound_graph(receipt:&AdjudicationReceipt,findings:&[Finding])->Result<()> {
+    let expected=graph_hash(findings)?;
+    if let Some(recorded)=&receipt.finding_graph_hash {
+        ensure!(recorded==&expected,"adjudication conflict context changed");
+    } else {
+        // Legacy single receipts did not bind graph context. They may still
+        // decide edge-free evidence, but cannot silently absorb contradictions.
+        ensure!(receipt.components.is_empty() && findings.iter().all(|finding|finding.conflicts_with.is_empty()),
+            "legacy adjudication needs renewed conflict-context evidence");
+    }
+    Ok(())
+}
+
 pub fn components(findings:&[Finding])->Result<Vec<Vec<Finding>>> {
+    graph_hash(findings)?;
     let mut by_id=BTreeMap::<String,Finding>::new();
     for finding in findings {
         finding.validate()?;
@@ -36,6 +65,7 @@ fn fingerprints(findings:&[Finding])->Result<BTreeMap<String,String>> {
     findings.iter().map(|finding|Ok((finding.id.clone(),finding.fingerprint()?))).collect()
 }
 fn leaf(receipt:&AdjudicationReceipt,binding:&ReviewBinding,findings:&[Finding],builders:&[Actor],origin:&ReviewOrigin,sessions:&mut BTreeSet<String>)->Result<()> {
+    bound_graph(receipt,findings)?;
     ensure!(receipt.components.is_empty(),"nested adjudication composition is forbidden");
     ensure!(&receipt.binding==binding,"adjudication component binding changed");
     receipt.actor.independent_for(builders,origin)?;
@@ -52,6 +82,7 @@ fn leaf(receipt:&AdjudicationReceipt,binding:&ReviewBinding,findings:&[Finding],
 }
 
 pub fn validate(receipt:&AdjudicationReceipt,binding:&ReviewBinding,findings:&[Finding],builders:&[Actor],origin:&ReviewOrigin,review_sessions:&BTreeSet<String>)->Result<()> {
+    bound_graph(receipt,findings)?;
     let mut sessions=review_sessions.clone();
     if receipt.components.is_empty() {return leaf(receipt,binding,findings,builders,origin,&mut sessions);}
     ensure!(&receipt.binding==binding,"aggregate adjudication binding differs");
@@ -81,7 +112,7 @@ pub fn validate(receipt:&AdjudicationReceipt,binding:&ReviewBinding,findings:&[F
 pub fn compose(binding:&ReviewBinding,findings:&[Finding],parts:Vec<AdjudicationReceipt>,builders:&[Actor],origin:&ReviewOrigin,review_sessions:&BTreeSet<String>)->Result<AdjudicationReceipt> {
     ensure!(!parts.is_empty(),"no final authority components");
     let receipt=AdjudicationReceipt {
-        binding:binding.clone(),actor:parts[0].actor.clone(),finding_fingerprints:fingerprints(findings)?,
+        binding:binding.clone(),actor:parts[0].actor.clone(),finding_fingerprints:fingerprints(findings)?,finding_graph_hash:Some(graph_hash(findings)?),
         rulings:parts.iter().flat_map(|p|p.rulings.iter().map(|(id,r)|(id.clone(),r.clone()))).collect(),
         prompt_hash:digest(&serde_json::to_vec(&parts.iter().map(|p|&p.prompt_hash).collect::<Vec<_>>())?),
         response_hash:digest(&serde_json::to_vec(&parts.iter().map(|p|&p.response_hash).collect::<Vec<_>>())?),components:parts,
