@@ -408,24 +408,24 @@ impl WorkflowGuard {
         )
         .await?;
         anyhow::ensure!(ok, "cannot reconcile remote revision before push");
-        let remote = out
-            .split_whitespace()
-            .next()
-            .context("remote PR branch disappeared")?;
+        // Empty expected SHA is a create-if-absent compare-and-swap.
+        let remote = out.split_whitespace().next().unwrap_or("");
         if remote == operation.binding.head {
             self.observe_remote(&operation, &format!("git-head:{remote}"), None)?;
             return Ok(remote.to_string());
         }
-        let (ancestor, _, _) = run(
-            "git",
-            &["merge-base", "--is-ancestor", remote, "HEAD"],
-            &self.worktree,
-        )
-        .await?;
-        anyhow::ensure!(
-            ancestor,
-            "remote PR changed; reconcile before publishing preserved work"
-        );
+        if !remote.is_empty() {
+            let (ancestor, _, _) = run(
+                "git",
+                &["merge-base", "--is-ancestor", remote, "HEAD"],
+                &self.worktree,
+            )
+            .await?;
+            anyhow::ensure!(
+                ancestor,
+                "remote PR changed; reconcile before publishing preserved work"
+            );
+        }
         self.validate_before_side_effect()?;
         self.validate_binding(&operation.binding).await?;
         let expected = format!("--force-with-lease={target}:{remote}");
@@ -771,6 +771,97 @@ mod tests {
                 .contract
         );
     }
+    #[tokio::test]
+    async fn push_creates_absent_branch_and_reconciles_lost_receipt() {
+        let dir = repo();
+        let remote = tempfile::tempdir().unwrap();
+        assert!(
+            run("git", &["init", "--bare", "-q"], remote.path())
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            run(
+                "git",
+                &["remote", "add", "origin", &remote.path().to_string_lossy()],
+                dir.path()
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let start = || Start {
+            repo_root: dir.path(),
+            worktree: dir.path(),
+            repository: "owner/repo",
+            source_issue: Some(7),
+            pr: None,
+            branch: "fix/seven",
+            contract: "C1",
+            environment: "rust-a",
+        };
+        let mut guard = WorkflowGuard::acquire_at(&path, start(), millis())
+            .await
+            .unwrap()
+            .unwrap();
+        let head = guard.binding().head.clone();
+        assert_eq!(guard.push("fix/seven").await.unwrap(), head);
+        assert!(guard.pending_operations().unwrap().is_empty());
+        // Simulate push success followed by process death before its receipt.
+        std::fs::write(dir.path().join("code.txt"), "new candidate\n").unwrap();
+        assert!(
+            run("git", &["add", "code.txt"], dir.path())
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            run(
+                "git",
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "next"
+                ],
+                dir.path()
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        guard
+            .transition(Stage::Publish, "next_candidate", "push", 0)
+            .await
+            .unwrap();
+        guard.intent(OperationKind::Push).unwrap();
+        assert!(
+            run(
+                "git",
+                &["push", "origin", "HEAD:refs/heads/fix/seven"],
+                dir.path()
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        guard.finish().unwrap();
+        let mut guard = WorkflowGuard::acquire_at(&path, start(), millis())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard.pending_operations().unwrap().len(), 1);
+        guard.push("fix/seven").await.unwrap();
+        assert!(guard.pending_operations().unwrap().is_empty());
+        guard.finish().unwrap();
+    }
+
     #[tokio::test]
     async fn adjudication_reservations_and_receipts_survive_worker_restart() {
         let dir = repo();
