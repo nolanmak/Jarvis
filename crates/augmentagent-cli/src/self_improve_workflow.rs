@@ -1867,6 +1867,55 @@ mod tests {
         workflow_audit(&state,&id,None).unwrap().protected_health().unwrap();
     }
 
+    /// Run centrally inside a disposable delegated user service, never the daemon.
+    #[tokio::test]
+    #[ignore = "requires isolated delegated cgroup service and declared run resources"]
+    async fn cancelled_real_worker_recovers_under_new_lease_and_executes_again() {
+        use tokio::io::AsyncBufReadExt;
+        assert_eq!(std::env::var("AUGMENTAGENT_RUN_RESOURCES").unwrap(),"1");
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&state).unwrap();
+        let id = durable::pr_workflow_id("owner/repo",42).unwrap();
+        let mut binding = Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(&id,"fix/recovery",binding.clone(),10).unwrap();
+        let old_lease = store.claim(&id,"old",11,1000).unwrap().unwrap();
+        let old = open_audit_generation(&state,&id,None,0).unwrap();
+        old.require_run_resources().unwrap();
+        old.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed",
+            "workflow":id,"generation":old_lease.generation})).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c","printf 'ready\n'; exec /bin/sleep 60"])
+            .env_clear().stdout(Stdio::piped()).stderr(Stdio::piped());
+        let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&command,Some(&old)).unwrap();
+        resources.admit("recovery_fixture",Some(&old)).await.unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(output.next_line().await.unwrap().as_deref(),Some("ready"));
+        drop(old.begin_write().unwrap());
+        assert!(old.recovery_evidence(old_lease.generation+1).is_err(),"live descendants prohibit recovery");
+        drop(resources); // Actual supervisor cancellation kills/reaps the sleep subtree.
+        let status = child.wait().await.unwrap();
+        assert!(!status.success());
+        drop(store);
+        let mut store = WorkflowStore::open(&state).unwrap();
+        let lease = store.claim(&id,"new",1012,1000).unwrap().unwrap();
+        let recovered = acquire_audit_generation(&state,&mut store,&lease,None,&mut binding,1013).unwrap();
+        recovered.require_run_resources().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c","printf 'verified\n'"]).env_clear()
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&command,Some(&recovered)).unwrap();
+        resources.admit("recovery_fixture",Some(&recovered)).await.unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(output.next_line().await.unwrap().as_deref(),Some("verified"));
+        assert!(child.wait().await.unwrap().success());
+        resources.record_outcome("recovery_fixture",Some(&recovered)).unwrap();
+        recovered.protected_health().unwrap();
+        assert!(old.protected_health().is_err());
+        assert_eq!(store.audit_generation(&id).unwrap(),1);
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.next.action,"reverify_candidate");
+    }
+
     #[test]
     fn audit_generation_recovery_does_not_accept_tampered_history() {
         let dir = tempfile::tempdir().unwrap();
