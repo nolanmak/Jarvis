@@ -331,6 +331,13 @@
       "failed": 0,
       "log": "/tmp/autoship-1598-real-workflow-recovery.log",
       "note": "Real supervised worker cancelled and reaped in isolated delegated service; new fenced audit generation executes a new guarded command; old failed audit retained."
+    },
+    "fresh_reviewer_fallback": {
+      "revision": "309e950b",
+      "passed": 48,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-fresh-review-dispatch.log",
+      "note": "Restricted fresh reviewer dispatch remains tool/history-free; malformed fresh tool request is refused without dispatch or cooldown."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -367,8 +374,8 @@
     },
     {
       "severity": "P1",
-      "gap": "Fresh native review is rejected before admission because adapter retains tool-enabled options",
-      "status": "confirmed_in_paid_native_probe; adapter_fix_in_progress"
+      "gap": "Restricted environment incorrectly injects mutation handoff history into fresh native reviewer",
+      "status": "fixed_in_309e950b; fallback48passed; native_rerun_pending"
     }
   ]
 }
