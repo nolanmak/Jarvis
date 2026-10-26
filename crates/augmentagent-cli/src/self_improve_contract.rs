@@ -16,6 +16,9 @@ mod amendment;
 #[path = "self_improve_scope.rs"]
 mod scope_authority;
 pub(super) use scope_authority::run as scope_original;
+#[path = "self_improve_adjudicated_contract.rs"]
+mod adjudicated;
+pub(super) use adjudicated::apply as apply_adjudicated_amendment;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
 const DEPENDENCY_AUDIT: &str = include_str!("../../../scripts/autoship-registry-integrity.py");
@@ -1492,7 +1495,7 @@ pub(super) async fn verify_with_repair_for(
                 if round < 2 {
                     if let Some(amended) = amendment::try_amend(
                         reasoner, source, title, worktree, prepared, control, workflow, &detail,
-                        false,
+                        false, None,
                     )
                     .await?
                     {
@@ -1531,7 +1534,7 @@ pub(super) async fn verify_with_repair_for(
                 {
                     if let Some(amended) = amendment::try_amend(
                         reasoner, source, title, worktree, prepared, control, workflow, &detail,
-                        true,
+                        true, None,
                     )
                     .await?
                     {
