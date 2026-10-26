@@ -210,6 +210,9 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS workflow_audit_generation (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
+                lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observation_reservation(workflow TEXT NOT NULL,generation INTEGER NOT NULL,reserved INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS observation_charge (
                 workflow TEXT NOT NULL, receipt_id TEXT NOT NULL, day INTEGER NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(workflow,receipt_id));
@@ -1079,6 +1082,44 @@ impl WorkflowStore {
     /// Check fencing immediately before a remote operation, in addition to
     /// using the remote API's own compare-and-swap head precondition. A local
     /// SQLite lease alone cannot fence a push already accepted by GitHub.
+    /// The pointer is controller state; failed generations remain immutable on disk.
+    pub fn audit_generation(&self, workflow: &str) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT generation FROM workflow_audit_generation WHERE workflow=?1",
+            [workflow], |row| row.get(0)).optional()?.unwrap_or(0))
+    }
+
+    /// Publish a prepared replacement sink and invalidate all current evidence in
+    /// the same fenced transaction. The old sink is never repaired or deleted.
+    pub fn recover_audit_generation(&mut self, lease: &Lease, previous: i64,
+        recovery: &serde_json::Value, now: i64) -> Result<Binding> {
+        let raw = serde_json::to_string(recovery)?;
+        ensure!(raw.len() <= 1024 * 1024, "audit recovery evidence exceeds bound");
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let current: Option<(i64,i64)> = tx.query_row(
+            "SELECT generation,lease_generation FROM workflow_audit_generation WHERE workflow=?1",
+            [&lease.workflow], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        ensure!(current.map(|v|v.0).unwrap_or(0) == previous, "audit generation moved");
+        ensure!(current.is_none_or(|v|lease.generation > v.1), "audit recovery requires a new fenced lease");
+        let checkpoint: String = tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",
+            [&lease.workflow], |r|r.get(0))?;
+        let mut checkpoint: Checkpoint = serde_json::from_str(&checkpoint)?;
+        let marker = format!("audit-recovery:{:x}",Sha256::digest(raw.as_bytes()));
+        checkpoint.binding.evidence_hash = format!("{:x}", Sha256::digest(
+            format!("{}:{marker}",checkpoint.binding.evidence_hash).as_bytes()));
+        checkpoint.stage = Stage::Reconcile;
+        checkpoint.evidence = vec![marker];
+        checkpoint.next = NextAction { reason:"audit_generation_recovered".into(),
+            action:"reverify_candidate".into(),eligible_at_ms:now };
+        tx.execute("INSERT INTO workflow_audit_generation VALUES(?1,?2,?3,?4) ON CONFLICT(workflow) DO UPDATE SET generation=excluded.generation,lease_generation=excluded.lease_generation,recovery=excluded.recovery",
+            params![lease.workflow,previous+1,lease.generation,raw])?;
+        tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",
+            params![lease.workflow,serde_json::to_string(&checkpoint)?,now])?;
+        event(&tx,&lease.workflow,lease.generation,"audit_generation_recovered",&raw,now)?;
+        tx.commit()?;
+        Ok(checkpoint.binding)
+    }
+
     pub fn validate_lease(&mut self, lease: &Lease, binding: &Binding, now_ms: i64) -> Result<()> {
         let tx = self
             .conn
@@ -1391,6 +1432,31 @@ mod tests {
             .unwrap();
         (store, lease)
     }
+    #[test]
+    fn audit_recovery_is_fenced_durable_and_invalidates_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (mut store, old) = setup(&path);
+        store.record_review(&old, &Review { reviewer:"independent".into(),binding:binding(),
+            approved:true,evidence:"old approval".into() }, 30).unwrap();
+        let lease = store.claim(&old.workflow,"successor",1021,1000).unwrap().unwrap();
+        let proof = serde_json::json!({"verified_chain":"digest","quiescent":true,"interrupted_intents":["tool-1"]});
+        assert!(store.recover_audit_generation(&old,0,&proof,1022).is_err());
+        let current = store.recover_audit_generation(&lease,0,&proof,1022).unwrap();
+        assert_ne!(current,binding());
+        assert!(store.current_reviews(&old.workflow).unwrap().is_empty());
+        assert!(store.recover_audit_generation(&lease,1,&proof,1023).is_err());
+        drop(store);
+        let reopened = WorkflowStore::open(&path).unwrap();
+        assert_eq!(reopened.audit_generation(&old.workflow).unwrap(),1);
+        let checkpoint = reopened.snapshot(&old.workflow).unwrap().unwrap().checkpoint;
+        assert_eq!(checkpoint.next.action,"reverify_candidate");
+        assert_eq!(checkpoint.binding,current);
+        let events = reopened.events(&old.workflow).unwrap();
+        assert!(events.iter().any(|(_,kind,payload,_)|kind=="audit_generation_recovered" && payload.contains("tool-1")));
+        assert!(events.iter().any(|(_,kind,payload,_)|kind=="review_recorded" && payload.contains("old approval")));
+    }
+
     #[test]
     fn episode_dispatch_is_fenced_and_once_per_epoch_across_restart() {
         use crate::autoship_episode::{Candidate, Observation};
