@@ -94,12 +94,48 @@ def main():
             except ProcessLookupError:
                 pass
             process.wait()
+        result_texts = []
+        for raw_line in stdout.splitlines():
+            try:
+                parsed = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if parsed.get('type') == 'result':
+                result_texts.append(str(parsed.get('result', '')))
+                result_texts.extend(str(error) for error in parsed.get('errors', []))
+        diagnostic_text = (_stderr + "\n" + "\n".join(result_texts)).lower()
+        diagnostic_flags = [name for name, needle in [
+            ('permission_denied', 'permission denied'), ('eacces', 'eacces'),
+            ('eperm', 'operation not permitted'), ('read_only', 'read-only file system'),
+            ('missing_file', 'enoent'), ('unknown_option', 'unknown option'),
+            ('auth_required', 'not logged'), ('authentication', 'authentication'),
+            ('api_error', 'api error'), ('invalid_head', 'not a valid object name'),
+            ('git_lock', 'index.lock'), ('mkdir', 'mkdir'), ('rename', 'rename'),
+            ('symlink', 'symlink'), ('open', 'open'), ('sqlite', 'sqlite'),
+            ('eperm_code', 'eperm'), ('exdev', 'exdev'), ('fatal', 'fatal'),
+            ('cli_config', 'claude.json'), ('settings_local', 'settings.local'),
+            ('auth_bundle', '.credentials.json'), ('session', 'session'),
+            ('quota', 'limit'), ('work_success', 'success.txt'), ('work_edit', 'edit.txt'),
+            ('cross_device', 'cross-device'), ('temp_file', 'temporary'),
+            ('startup', 'startup'), ('config', 'configuration'),
+            ('usage_limit', 'usage limit'), ('hit_limit', 'hit your limit'),
+            ('rate_limit', 'rate limit'), ('reset_time', 'resets'),
+            ('billing', 'billing'), ('credit', 'credit'), ('overloaded', 'overloaded'),
+            ('permission_mode', 'permission'), ('trust', 'trust'), ('login', 'login'),
+            ('write_failed', 'write'), ('auth', 'auth'), ('read_failed', 'read'),
+        ] if needle in diagnostic_text]
+        result_kinds = []
+        event_count = 0
         attempts = set()
         for line in stdout.splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            event_count += 1
+            if event.get('type') == 'result':
+                subtype = event.get('subtype')
+                result_kinds.append(subtype if subtype in ('success', 'error_during_execution', 'error_max_turns', 'error_max_budget_usd') else 'other')
             for block in event.get('message', {}).get('content', []):
                 if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('name') == 'Write':
                     attempts.add(block.get('input', {}).get('file_path'))
@@ -109,7 +145,7 @@ def main():
         git_unchanged = gitlink.read_bytes() == original_gitlink
         normal_edit = edit.read_text().strip() == 'after'
         project_controls_ignored = not hook_canary.exists() and not mcp_canary.exists()
-        print(json.dumps(dict(exit_code=process.returncode, normal_write=normal, normal_edit=normal_edit, git_indirection_unchanged=git_unchanged,
+        print(json.dumps(dict(exit_code=process.returncode, diagnostic_flags=diagnostic_flags, event_count=event_count, result_kinds=result_kinds, output_present=bool(stdout), error_output_present=bool(_stderr), normal_write=normal, normal_edit=normal_edit, git_indirection_unchanged=git_unchanged,
                               project_controls_ignored=project_controls_ignored,
                               protected_canaries_unchanged=protected, native_denials_attempted=attempted)))
         if process.returncode != 0 or not (normal and normal_edit and git_unchanged and protected and attempted and project_controls_ignored):
