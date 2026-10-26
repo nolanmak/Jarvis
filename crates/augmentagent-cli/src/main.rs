@@ -621,6 +621,9 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Join triage flag/pending decisions to recorded owner outcomes.
+        #[arg(long, default_value_t = false)]
+        outcomes: bool,
     },
     /// #1011 — grade the SCOPING pass against fixed, cached issues.
     ///
@@ -5437,7 +5440,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::TokenUsage { days, json } => {
+        Cmd::TokenUsage { days, json, outcomes } => {
             use augmentagent_channel_core::token_usage as tu;
             let path = tu::default_usage_log_path();
             // #1413 — a report window can straddle a rotation.
@@ -5446,10 +5449,21 @@ async fn main() -> Result<()> {
             if rolled.len() > days as usize {
                 rolled.drain(..rolled.len() - days as usize);
             }
-            if json {
+            let outcome_report = if outcomes || !json {
+                let since = chrono::Utc::now().timestamp_millis().saturating_sub(i64::from(days) * 86_400_000);
+                Some(store.triage_outcome_report(since, 20)?)
+            } else { None };
+            if json && outcomes {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"token_usage":rolled,"triage_outcomes":outcome_report}))?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&rolled)?);
             } else {
                 print!("{}", tu::format_report(&rolled));
+                if let Some(report) = outcome_report {
+                    println!("Triage outcomes: flag precision {} ({} observed owner resolutions); flagged then aged out {}; unresolved flags {}.",
+                        report.flag_precision.map(|v| format!("{:.1}%",v*100.0)).unwrap_or_else(|| "not observed".into()),
+                        report.observed_owner_resolutions, report.flagged_then_aged_out, report.flagged.unresolved);
+                }
                 if raw.is_empty() {
                     println!("  (log: {})", path.display());
                 }

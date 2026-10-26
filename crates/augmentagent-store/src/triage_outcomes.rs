@@ -1,0 +1,195 @@
+//! Outcome joins for triage evaluation. Missing owner evidence is unresolved,
+//! never an inferred approval. Reports contain counts and opaque action IDs.
+use crate::{Store, StoreResult};
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerOutcome {
+    Approved,
+    Revised,
+    Skipped,
+    AgedOut,
+    Unresolved,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeCounts {
+    pub approved: u64,
+    pub revised: u64,
+    pub skipped: u64,
+    pub aged_out: u64,
+    pub unresolved: u64,
+}
+impl OutcomeCounts {
+    fn record(&mut self, outcome: OwnerOutcome) {
+        match outcome {
+            OwnerOutcome::Approved => self.approved += 1,
+            OwnerOutcome::Revised => self.revised += 1,
+            OwnerOutcome::Skipped => self.skipped += 1,
+            OwnerOutcome::AgedOut => self.aged_out += 1,
+            OwnerOutcome::Unresolved => self.unresolved += 1,
+        }
+    }
+    pub fn total(&self) -> u64 {
+        self.approved + self.revised + self.skipped + self.aged_out + self.unresolved
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisagreementCase {
+    pub action_id: String,
+    pub owner_outcome: OwnerOutcome,
+    pub evidence: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriageOutcomeReport {
+    pub since_ms: i64,
+    pub flagged: OutcomeCounts,
+    pub pending: OutcomeCounts,
+    /// Fraction of explicit owner resolutions that needed action. Aged-out and
+    /// unresolved records are reported separately, not counted as skip/success.
+    pub flag_precision: Option<f64>,
+    pub observed_owner_resolutions: u64,
+    pub flagged_then_aged_out: u64,
+    /// Bounded review set, never automatically executable prompt/policy edits.
+    pub disagreement_review_set: Vec<DisagreementCase>,
+}
+
+fn outcome(status: &str, verb: Option<&str>, revised: bool) -> OwnerOutcome {
+    match verb {
+        Some("skip" | "reject" | "cancel") => OwnerOutcome::Skipped,
+        Some("approve" | "send" | "send_now" | "schedule") if revised => OwnerOutcome::Revised,
+        Some("approve" | "send" | "send_now" | "schedule") => OwnerOutcome::Approved,
+        Some("revise") => OwnerOutcome::Revised,
+        _ if status == "timed_out" => OwnerOutcome::AgedOut,
+        _ => OwnerOutcome::Unresolved,
+    }
+}
+impl Store {
+    /// Join action cohorts to durable, completed owner decisions. Current
+    /// action status alone cannot tell an automatic send from owner approval.
+    pub fn triage_outcome_report(
+        &self,
+        since_ms: i64,
+        review_set_limit: usize,
+    ) -> StoreResult<TriageOutcomeReport> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare("SELECT a.id,a.status,COALESCE(e.triageResult,''),
+                (SELECT h.verb FROM approval_history h WHERE h.action_id=a.id
+                 AND h.finished_at IS NOT NULL AND h.outcome IN ('completed','revised')
+                 AND trim(h.actor) NOT IN ('','unknown')
+                 ORDER BY h.seq DESC LIMIT 1),
+                EXISTS(SELECT 1 FROM approval_history h WHERE h.action_id=a.id AND h.verb='revise'
+                 AND h.outcome='revised' AND h.finished_at IS NOT NULL AND trim(h.actor) NOT IN ('','unknown'))
+                FROM actions a JOIN emails e ON e.messageId=a.messageId
+                WHERE a.createdAt>=?1 AND (e.triageResult='flag' OR a.status IN ('flagged','pending','timed_out')
+                 OR EXISTS(SELECT 1 FROM approval_history h WHERE h.action_id=a.id))
+                ORDER BY a.createdAt DESC,a.id")?;
+            let mut report = TriageOutcomeReport { since_ms, flagged: Default::default(), pending: Default::default(), flag_precision:None,
+                observed_owner_resolutions:0, flagged_then_aged_out:0, disagreement_review_set:vec![] };
+            let rows = statement.query_map(params![since_ms], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,bool>(4)?)))?;
+            for row in rows {
+                let (action_id,status,triage,verb,revised) = row?;
+                let result = outcome(&status,verb.as_deref(),revised);
+                if triage == "flag" || status == "flagged" {
+                    report.flagged.record(result);
+                    if result == OwnerOutcome::Skipped && !revised && report.disagreement_review_set.len() < review_set_limit.min(100) {
+                        report.disagreement_review_set.push(DisagreementCase { action_id, owner_outcome:result,
+                            evidence:"agent_flagged_owner_skipped_without_recorded_revision".into() });
+                    }
+                } else { report.pending.record(result); }
+            }
+            report.observed_owner_resolutions = report.flagged.approved + report.flagged.revised + report.flagged.skipped;
+            report.flag_precision = (report.observed_owner_resolutions > 0).then(||
+                (report.flagged.approved + report.flagged.revised) as f64 / report.observed_owner_resolutions as f64);
+            report.flagged_then_aged_out = report.flagged.aged_out;
+            Ok(report)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval_history::DecisionContext;
+    fn add(store: &Store, id: &str, triage: &str, status: &str, at: i64) {
+        store.with_conn(|c| {
+            c.execute("INSERT INTO emails(messageId,fromEmail,subject,triageResult,firstSeenAt) VALUES(?1,'sender@example.invalid','synthetic',?2,?3)",params![id,triage,at])?;
+            c.execute("INSERT INTO actions(id,messageId,fromEmail,subject,status,createdAt,updatedAt) VALUES(?1,?1,'sender@example.invalid','synthetic',?2,?3,?3)",params![id,status,at])?;
+            Ok(())
+        }).unwrap();
+    }
+    fn decision(store: &Store, id: &str, verb: &str, outcome: &str) {
+        let ctx = DecisionContext {
+            surface: "test".into(),
+            actor: "owner".into(),
+            conversation: "fixture".into(),
+            interaction_id: format!("{id}-{verb}"),
+            revision: None,
+        };
+        let seq = store
+            .begin_approval(id, &ctx, verb, "v1", "email", "synthetic")
+            .unwrap()
+            .unwrap();
+        store.finish_approval(seq, outcome, "").unwrap();
+    }
+    #[test]
+    fn joins_actual_owner_outcomes_without_treating_missing_or_failed_evidence_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        for (id, status) in [
+            ("approved", "sent"),
+            ("revised", "sent"),
+            ("skipped", "skipped"),
+            ("aged", "timed_out"),
+            ("missing", "sent"),
+            ("failed", "error"),
+        ] {
+            add(&store, id, "flag", status, 100);
+        }
+        decision(&store, "approved", "approve", "completed");
+        decision(&store, "revised", "revise", "revised");
+        decision(&store, "revised", "approve", "completed");
+        decision(&store, "skipped", "skip", "completed");
+        decision(&store, "failed", "approve", "failed");
+        add(&store, "pending", "reply", "pending", 100);
+        add(&store, "old", "flag", "timed_out", 1);
+        let report = store.triage_outcome_report(50, 10).unwrap();
+        assert_eq!(
+            report.flagged,
+            OutcomeCounts {
+                approved: 1,
+                revised: 1,
+                skipped: 1,
+                aged_out: 1,
+                unresolved: 2
+            }
+        );
+        assert_eq!(report.pending.unresolved, 1);
+        assert_eq!(report.flag_precision, Some(2.0 / 3.0));
+        assert_eq!(report.flagged_then_aged_out, 1);
+        assert_eq!(report.disagreement_review_set.len(), 1);
+        assert_eq!(report.disagreement_review_set[0].action_id, "skipped");
+        assert_eq!(
+            store.triage_outcome_report(101, 10).unwrap().flag_precision,
+            None
+        );
+    }
+    #[test]
+    fn disagreement_sample_is_bounded_and_excludes_revised_then_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        for id in ["one", "two", "edited"] {
+            add(&store, id, "flag", "skipped", 100);
+        }
+        decision(&store, "edited", "revise", "revised");
+        for id in ["one", "two", "edited"] {
+            decision(&store, id, "skip", "completed");
+        }
+        let report = store.triage_outcome_report(0, 1).unwrap();
+        assert_eq!(report.flagged.skipped, 3);
+        assert_eq!(report.disagreement_review_set.len(), 1);
+        assert_ne!(report.disagreement_review_set[0].action_id, "edited");
+    }
+}
