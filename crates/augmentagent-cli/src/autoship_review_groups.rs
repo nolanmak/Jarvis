@@ -75,8 +75,7 @@ fn leaf(receipt:&AdjudicationReceipt,binding:&ReviewBinding,findings:&[Finding],
     ensure!(receipt.finding_fingerprints==fingerprints(findings)?,"adjudication component finding evidence differs");
     ensure!(receipt.rulings.keys().eq(receipt.finding_fingerprints.keys()),"adjudication component is not exhaustive");
     for finding in findings {
-        let ruling=&receipt.rulings[&finding.id];ruling.validate()?;
-        ensure!(finding.criterion_id!="REGRESSION" || !matches!(ruling,Ruling::Amend {..}),"derived regression cannot amend owner intent");
+        validate_ruling_for(finding,&receipt.rulings[&finding.id])?;
     }
     Ok(())
 }

@@ -660,6 +660,15 @@ async fn adjudicate<R: Reasoner + ?Sized>(
     .await
 }
 
+fn validate_ruling_for(finding:&Finding,ruling:&Ruling)->Result<()> {
+    ruling.validate()?;
+    ensure!(matches!(finding.repair_target,Some(RepairTarget::Candidate{..})) || !matches!(ruling,Ruling::Uphold{..}),
+        "immutable controller acceptance, unclassified target or out-of-contract scope cannot be a builder repair; dismiss, independently amend, or request evidence");
+    ensure!(finding.criterion_id!="REGRESSION" || !matches!(ruling,Ruling::Amend{..}),
+        "REGRESSION is a derived immutable criterion; substantive rulings cannot amend owner intent");
+    Ok(())
+}
+
 fn validate_adjudicator_response(
     raw: &str,
     binding: &ReviewBinding,
@@ -682,13 +691,7 @@ fn validate_adjudicator_response(
     );
     for finding in findings {
         let ruling = &response.rulings[&finding.id];
-        ruling.validate()?;
-        ensure!(matches!(finding.repair_target,Some(RepairTarget::Candidate{..})) || !matches!(ruling,Ruling::Uphold{..}),
-            "immutable controller acceptance or out-of-contract scope cannot be a builder repair; dismiss or amend its owner criterion, or request evidence");
-        ensure!(
-            finding.criterion_id != "REGRESSION" || !matches!(ruling, Ruling::Amend { .. }),
-            "REGRESSION is a derived immutable criterion; dismiss or uphold this finding"
-        );
+        validate_ruling_for(finding,ruling)?;
     }
     Ok(response)
 }

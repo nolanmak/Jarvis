@@ -1002,3 +1002,15 @@ async fn fulfilled_source_request_is_corrected_instead_of_repeated_forever() {
     assert!(matches!(&receipt.rulings["F1"],Ruling::NeedEvidence{source_paths,..} if source_paths==&vec!["actual/caller.rs".to_string()]));
     assert!(review_authority(&binding(),&builders(),&passes(vec![original]),Some(&receipt)).is_err());
 }
+
+#[tokio::test]
+async fn cached_receipts_cannot_bypass_typed_repair_routing() {
+    for target in [None,Some(RepairTarget::ControllerAcceptance{verifier_ids:BTreeSet::from(["oracle".into()])}),Some(RepairTarget::ContractScope{paths:BTreeSet::from(["support.rs".into()])})] {
+        let mut item=finding("F");item.repair_target=target;
+        let mut receipt=dismissed(&[item.clone()]).await;
+        adjudication_groups::validate(&receipt,&binding(),&[item.clone()],&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).unwrap();
+        receipt.rulings.insert("F".into(),Ruling::Uphold{evidence:"source inspected".into(),repair_criterion:"edit immutable/unadmitted source".into()});
+        let cached:AdjudicationReceipt=serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
+        assert!(adjudication_groups::validate(&cached,&binding(),&[item],&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).is_err());
+    }
+}
