@@ -468,7 +468,10 @@ def provision(policy, directory):
         subprocess.run(['/usr/bin/openssl', *map(str, args)], check=True, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin'})
     openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', ca_key,
-            '-out', ca, '-days', '2', '-subj', '/CN=Native provider isolated run CA')
+            '-out', ca, '-days', '2', '-subj', '/CN=Native provider isolated run CA',
+            '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0',
+            '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+            '-addext', 'subjectKeyIdentifier=hash')
     os.chmod(ca_key, 0o600)
     guest_root = 'run/native-provider-gateway'
     entries = [(f'{guest_root}/ca.pem', stat.S_IFREG | 0o644, ca.read_bytes(), 0, 0)]
@@ -482,7 +485,12 @@ def provision(policy, directory):
             san = 'IP:' + entry['host']
         except ValueError:
             san = 'DNS:' + entry['host']
-        extension.write_text('subjectAltName=' + san + '\nextendedKeyUsage=serverAuth\n')
+        extension.write_text('subjectAltName=' + san + '\n'
+                             'basicConstraints=critical,CA:FALSE\n'
+                             'keyUsage=critical,digitalSignature,keyEncipherment\n'
+                             'extendedKeyUsage=serverAuth\n'
+                             'subjectKeyIdentifier=hash\n'
+                             'authorityKeyIdentifier=keyid,issuer\n')
         openssl('req', '-new', '-newkey', 'rsa:2048', '-nodes', '-keyout', private,
                 '-out', csr, '-subj', '/CN=' + entry['host'])
         openssl('x509', '-req', '-in', csr, '-CA', ca, '-CAkey', ca_key, '-set_serial', str(index + 1),

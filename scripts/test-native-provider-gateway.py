@@ -218,6 +218,7 @@ class GatewayTests(unittest.TestCase):
             port = int(proxy.rsplit(':', 1)[1])
             try:
                 context = ssl.create_default_context(cafile=config['ca_path'])
+                context.verify_flags |= ssl.VERIFY_X509_STRICT
                 connection = http.client.HTTPSConnection('127.0.0.1', port, context=context, timeout=4)
                 connection.set_tunnel('127.0.0.1', self.port)
                 connection.request('POST', '/v1/messages', body=b'preserved across TLS', headers={'Authorization': 'Bearer fixture'})
