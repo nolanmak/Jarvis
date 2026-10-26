@@ -186,7 +186,9 @@ async fn revocation_prevents_dispatch_and_result_disclosure() {
             panic!("revoked chat must receive no transcript");
         }
     }
+    f.store.phone_record_live_history_gap(&f.id).unwrap();
     f.service.deliver_live_history(&NoDelivery).await.unwrap();
+    assert_eq!(f.store.phone_live_history_notices().unwrap().len(), 1);
     assert!(f.store.phone_live_history_pending(&f.id).unwrap());
 }
 #[tokio::test]
@@ -371,4 +373,48 @@ async fn long_result_is_summarized_outside_audio_and_full_chat_result_is_preserv
     );
     drop(call);
     f.runtime.take().unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn transcript_capacity_keeps_audio_session_alive_and_records_history_gap() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    for i in 0..131 {
+        f.store.phone_append_live_transcript(&f.id, "session-test", &augmentagent_store::phone::LiveTranscript {
+            event_id: format!("fill-{i}"), user: true, text: "x".repeat(8000), start_ms: 0., end_ms: 20.,
+        }).unwrap();
+    }
+    let input = LiveInput::Transcript { event_id: "overflow".into(), user: true, text: "x".repeat(1000), start_ms: 30., end_ms: 40. };
+    assert!(matches!(call.event(&input).unwrap(), LiveAction::None));
+    assert!(f.store.phone_live_history_incomplete(&f.id).unwrap());
+    assert_eq!(f.store.phone_provider_call(&f.id).unwrap().state, CallState::Connected);
+    assert_eq!(f.store.phone_live_history_notices().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn incomplete_history_notice_retries_same_key_then_stops() {
+    use augmentagent_phone::ingress::{AgentError, ConversationAgent, SpeechSender};
+    use augmentagent_store::phone::PhoneCall;
+    use tokio_util::sync::CancellationToken;
+    struct Agent(std::sync::Mutex<Vec<(String, String)>>);
+    #[async_trait]
+    impl ConversationAgent for Agent {
+        async fn answer(&self, _: &PhoneCall, _: &str, _: &str, _: SpeechSender, _: CancellationToken) -> Result<String, AgentError> { panic!("no model calls") }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> { Ok(()) }
+        async fn call_ended(&self, _: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+            let mut attempts = self.0.lock().unwrap();
+            attempts.push((key.into(), text.into()));
+            if attempts.len() == 1 { Err(AgentError) } else { Ok(()) }
+        }
+    }
+    let f = fixture().await;
+    f.store.phone_record_live_history_gap(&f.id).unwrap();
+    let agent = Agent(Default::default());
+    for _ in 0..3 { f.service.deliver_live_history(&agent).await.unwrap(); }
+    let attempts = agent.0.lock().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    assert!(attempts[0].1.contains("incomplete"));
+    assert!(f.store.phone_live_history_notices().unwrap().is_empty());
+    assert!(f.store.phone_live_history_incomplete(&f.id).unwrap(), "warning delivery cannot make history complete");
 }

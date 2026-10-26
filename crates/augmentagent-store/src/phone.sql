@@ -248,3 +248,13 @@ CREATE TABLE IF NOT EXISTS phone_live_playback (
     evidence TEXT NOT NULL,
     collector_closed INTEGER NOT NULL CHECK(collector_closed IN (0,1))
 );
+
+-- A content-free warning survives capacity loss or private staging expiry.
+CREATE TABLE IF NOT EXISTS phone_live_history_gaps (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    notice_delivered INTEGER NOT NULL DEFAULT 0 CHECK(notice_delivered IN (0,1)),
+    attempt_order INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS phone_live_transcripts_pending
+ON phone_live_transcripts(call_id) WHERE text IS NOT NULL;

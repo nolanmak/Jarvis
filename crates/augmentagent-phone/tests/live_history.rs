@@ -206,3 +206,45 @@ fn fresh_call_history_is_not_starved_by_an_older_failed_delivery() {
     assert_eq!(&batches[0].call_id, new_id);
     assert_eq!(batches[1].key, old.key);
 }
+
+#[test]
+fn delivered_fingerprints_do_not_exhaust_pending_transcript_capacity() {
+    let (_dir, store, id) = fixture();
+    store.phone_claim_relay(&id, "CA-test").unwrap();
+    store.phone_bind_live_session(&id, "session-one").unwrap();
+    store.with_conn(|db| {
+        db.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<8192) INSERT INTO phone_live_transcripts(call_id,event_id,fingerprint,user,text) SELECT ?1,'delivered-'||x,'fixture',1,NULL FROM n", [&id])?;
+        Ok(())
+    }).unwrap();
+    assert!(append(&store, &id, "new", "New conversation fragment"));
+}
+
+#[test]
+fn expired_undelivered_history_releases_capacity_without_claiming_delivery() {
+    let (_dir, store, id) = fixture();
+    store.phone_claim_relay(&id, "CA-test").unwrap();
+    store.phone_bind_live_session(&id, "session-one").unwrap();
+    assert!(append(&store, &id, "old", "Private old fragment"));
+    let batch = store.phone_live_history_batches().unwrap().remove(0);
+    let week = 7 * 24 * 60 * 60 * 1000;
+    assert_eq!(store.phone_expire_live_history(week + 100).unwrap(), 0, "active calls are preserved");
+    store.phone_provider_event(&id, "CA-test", CallState::Completed, 100).unwrap();
+    assert!(store.phone_enqueue_call_summary(&id, 100).unwrap());
+    assert_eq!(store.phone_call_summaries_due(100).unwrap().len(), 1);
+    assert_eq!(store.phone_expire_live_history(week + 99).unwrap(), 0);
+    assert_eq!(store.phone_expire_live_history(week + 100).unwrap(), 1);
+    assert!(!store.phone_live_history_pending(&id).unwrap());
+    assert!(store.phone_live_history_incomplete(&id).unwrap());
+    assert!(store.phone_live_history_delivered(&id, &batch.key).is_err(), "expiry is not delivery");
+    assert!(store.phone_call_summaries_due(week + 100).unwrap().is_empty());
+    assert!(!store.phone_claim_call_summary(&id, week + 100).unwrap());
+    assert!(!store.phone_complete_call_summary(&id, "Incomplete", "calls/test.md", &[], week + 100).unwrap());
+    let notices = store.phone_live_history_notices().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].call_id, id);
+    assert!(!notices[0].text.contains("Private old fragment"));
+    assert_eq!(store.phone_expire_live_history(week + 200).unwrap(), 0);
+    assert_eq!(store.phone_live_history_notices().unwrap()[0].key, notices[0].key);
+    store.phone_live_history_notice_delivered(&id).unwrap();
+    assert!(store.phone_live_history_notices().unwrap().is_empty());
+}

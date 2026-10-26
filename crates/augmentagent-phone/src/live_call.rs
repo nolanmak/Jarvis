@@ -54,7 +54,7 @@ impl LiveCall {
                 end_ms,
             } => {
                 self.context.push(input)?;
-                self.service
+                let stored = self.service
                     .store
                     .phone_append_live_transcript(
                         &self.call_id,
@@ -66,8 +66,14 @@ impl LiveCall {
                             start_ms: *start_ms,
                             end_ms: *end_ms,
                         },
-                    )
-                    .map_err(|_| LiveError::Unavailable)?;
+                    );
+                match stored {
+                    Ok(_) => {},
+                    // The store commits an incomplete-history marker atomically
+                    // with this refusal. Audio and native tasks remain live.
+                    Err(augmentagent_store::phone::PhoneError::RateLimited) => {},
+                    Err(_) => return Err(LiveError::Unavailable),
+                }
             }
             LiveInput::Delegation { id, offset_ms } => {
                 let Some(description) = self.context.request(*offset_ms)? else {

@@ -162,6 +162,25 @@ with the OpenAI project before production switches. Public media endpoint reach,
 codec agreement, interruption behavior, measured audible latency and usage are
 recorded in #1596. Missing OpenAI credentials block the canary, not offline work.
 
+## Incomplete history and staging retention
+
+Pending transcript text has an 8,192-fragment per-call limit and a 1 MiB
+aggregate byte limit. Delivered fingerprints do not consume the pending-fragment
+limit; a separate 65,536-event per-call bound limits replay metadata. A capacity
+refusal atomically records a content-free incomplete-history marker. The call
+continues, and current bounded delegation context and durable tasks remain
+available. A stable warning retries through the authorized original-chat outbox.
+Incomplete calls are excluded from automatic memory extraction, including its
+claim and completion transactions; the system never treats lost history as a
+complete conversation.
+
+Undelivered private staging text expires seven days after the call ends, in
+batches of at most 32 calls. Active calls and completed task results are untouched.
+Expiry removes pending transcript batches, preserves event fingerprints, and
+records the same durable warning; it never marks an expired batch delivered.
+Revoked origins cannot receive the warning until authorization permits delivery.
+Warning retries rotate so an unavailable origin cannot monopolize the queue.
+
 ## Primary sources checked 2026-10-26
 
 - [OpenAI partner integrations](https://developers.openai.com/api/docs/guides/live-partner-integrations)

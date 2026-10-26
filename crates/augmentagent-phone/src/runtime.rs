@@ -307,6 +307,15 @@ async fn history_worker(
 
 impl PhoneService {
     pub async fn deliver_live_history(&self, agent: &dyn ConversationAgent) -> Result<(), Error> {
+        self.store.phone_expire_live_history(self.clock.now_ms())?;
+        for notice in self.store.phone_live_history_notices()? {
+            let call = self.store.phone_provider_call(&notice.call_id)?;
+            if self.authorize_call_origin(&call).is_err() { continue; }
+            if matches!(tokio::time::timeout(Duration::from_secs(5),
+                agent.call_ended(&call, &notice.key, &notice.text)).await, Ok(Ok(()))) {
+                self.store.phone_live_history_notice_delivered(&call.id)?;
+            }
+        }
         for batch in self.store.phone_live_history_batches()? {
             let call = self.store.phone_provider_call(&batch.call_id)?;
             // Call completion is allowed; revoked or changed chat authority is not.

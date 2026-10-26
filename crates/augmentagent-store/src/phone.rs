@@ -1255,7 +1255,7 @@ impl Store {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {CALL_COLUMNS} FROM phone_calls WHERE id IN (
                     SELECT call_id FROM phone_call_summary_jobs
-                    WHERE state='pending' AND attempts<3 AND next_ms<=?1)
+                    WHERE state='pending' AND attempts<3 AND next_ms<=?1 AND NOT EXISTS(SELECT 1 FROM phone_live_history_gaps g WHERE g.call_id=phone_call_summary_jobs.call_id))
                  ORDER BY created_ms, id LIMIT 4"
             ))?;
             let calls = stmt
@@ -1268,6 +1268,7 @@ impl Store {
     /// out of attempts, or still leased by an earlier attempt.
     pub fn phone_claim_call_summary(&self, call_id: &str, now_ms: i64) -> PhoneResult<bool> {
         transaction(self, |tx| {
+            if tx.query_row("SELECT EXISTS(SELECT 1 FROM phone_live_history_gaps WHERE call_id=?1)", [call_id], |r| r.get::<_,bool>(0))? { return Ok(false); }
             let job: Option<(String, i64, i64)> = tx
                 .query_row(
                     "SELECT state,attempts,next_ms FROM phone_call_summary_jobs WHERE call_id=?1",
@@ -1312,6 +1313,8 @@ impl Store {
             return Err(PhoneError::InvalidInput);
         }
         transaction(self, |tx| {
+            if tx.query_row("SELECT EXISTS(SELECT 1 FROM phone_live_history_gaps WHERE call_id=?1)", [call_id], |r| r.get::<_,bool>(0))? { return Ok(false); }
+
             let call = call_by_id(tx, call_id)?;
             let pending: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM phone_call_summary_jobs WHERE call_id=?1 AND state='pending')",
