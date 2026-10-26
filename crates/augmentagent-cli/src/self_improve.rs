@@ -1815,17 +1815,20 @@ async fn ready_for_merge(repo_root: &Path, pr: u64, draft: Option<bool>) -> Opti
 
 /// Are every one of this PR's checks green? `None` when that cannot be
 /// determined, which the sweep treats as "do not merge".
+#[path = "self_improve_optional_checks.rs"]
+mod optional_checks;
+
 async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
     // gh can return nonzero with valid JSON when an optional check is pending
     // or failing. Decide from individual checks, not its aggregate exit code.
     let (_, out, _) = run(&gh_bin(),
-        &["pr", "checks", &pr.to_string(), "--json", "name,state"], repo_root).await.ok()?;
-    ci_checks_green(&out)
+        &["pr", "checks", &pr.to_string(), "--json", "name,state,link"], repo_root).await.ok()?;
+    ci_checks_green(&optional_checks::classify(repo_root,pr,&out).await)
 }
 
 fn is_optional_review_check(row: &serde_json::Value) -> bool {
-    row.get("name").and_then(serde_json::Value::as_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("CodeRabbit"))
+    row["autoship_required_context"] != true && (row["autoship_optional_workflow"] == true || row.get("name").and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("CodeRabbit")))
 }
 
 fn ci_checks_green(raw: &str) -> Option<bool> {
@@ -1854,7 +1857,7 @@ async fn failed_ci_findings(repo_root: &Path, pr: u64) -> Option<String> {
     // gh returns nonzero for red/pending checks, with valid JSON on stdout.
     let (_, out, _) = run(&gh_bin(), &["pr", "checks", &pr.to_string(),
         "--json", "name,bucket,link"], repo_root).await.ok()?;
-    let failed = failed_ci_checks(&out);
+    let failed = failed_ci_checks(&optional_checks::classify(repo_root,pr,&out).await);
     if failed.is_empty() { return None; }
     let mut findings = String::from(
         "GitHub CI failed on the previously pushed PR head. Reproduce these failures \
