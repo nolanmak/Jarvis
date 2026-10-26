@@ -745,6 +745,18 @@
         "native_session::tests::fresh_review_overrides_builder_and_cannot_resume_even_on_retry"
       ],
       "provider_conformance": "Native fresh-session transport and deterministic evidence contracts covered; individual authority prompt outcomes require live canary verification."
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve_review_calibration.rs::run_if_due",
+      "permission_profile": "text",
+      "output_contract": "Isolated native replay verdicts for protected labelled review cases; promotion requires exact oracle agreement",
+      "model_tier": "preserved",
+      "tier_rationale": "Preserves pinned native Codex review model while removing tools, additional directories and inherited environment.",
+      "conformance": [
+        "self_improve::review_calibration::tests::replay_never_promotes_missing_or_wrong_labels",
+        "self_improve::review_calibration::tests::executable_oracles_cover_success_and_regression"
+      ],
+      "provider_conformance": "Deterministic promotion and executable oracle checks; live native replay remains required for rubric promotion."
     }
   ]
 }
