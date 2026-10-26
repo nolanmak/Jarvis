@@ -296,23 +296,45 @@ async fn run_inner(
         adjudication: None,
     };
     if !unresolved.is_empty() && (aligned::needs_adjudication(&unresolved) || !context.qa_ok) {
-        let mut opts = codex_review_opts(worktree.clone(), "Final adjudication");
-        opts.session_id = None;
-        // The full evidence remains bound even if the adjudicator needs a
-        // bounded subset; exceeding its explicit request size is recoverable
-        // infrastructure, never an approval or a fresh builder rejection.
-        structured.adjudication = Some(
-            aligned::adjudicate_native(
-                &structured.builders,
-                opts,
-                binding.clone(),
-                &contract,
-                &unresolved,
-                &evidence_json,
-                context.adjudication_attempts_already_made,
-            )
-            .await?,
-        );
+        let reusable = context
+            .previous
+            .and_then(|p| p.adjudication.as_ref())
+            .filter(|receipt| receipt.binding == binding)
+            .filter(|receipt| {
+                unresolved.iter().all(|finding| {
+                    finding.fingerprint().ok().is_some_and(|hash| {
+                        receipt.finding_fingerprints.get(&finding.id) == Some(&hash)
+                    })
+                })
+            });
+        if let Some(receipt) = reusable {
+            // The same finding/evidence cannot demand a fresh consensus vote.
+            structured.adjudication = Some(receipt.clone());
+        } else {
+            let mut opts = codex_review_opts(worktree.clone(), "Final adjudication");
+            opts.session_id = None;
+            // Full source coverage was established above. Supply direct diff
+            // and caller evidence plus the actual review receipts; explicitly
+            // label the source digests as a manifest, not source read here.
+            let adjudication_evidence = serde_json::to_string(&serde_json::json!({
+                "candidate_diff": diff,
+                "caller_evidence": callers,
+                "source_manifest_only": files.iter().map(|(path,body)| (path,aligned::digest(body.as_bytes()))).collect::<BTreeMap<_,_>>(),
+                "completed_reviews": structured.passes,
+            }))?;
+            structured.adjudication = Some(
+                aligned::adjudicate_native(
+                    &structured.builders,
+                    opts,
+                    binding.clone(),
+                    &contract,
+                    &unresolved,
+                    &adjudication_evidence,
+                    context.adjudication_attempts_already_made,
+                )
+                .await?,
+            );
+        }
     }
     // Check the immutable source again after model calls. A sibling push or
     // local edit invalidates the evidence rather than borrowing its approval.
@@ -374,4 +396,38 @@ fn deduplicate_findings(findings: Vec<aligned::Finding>) -> Result<Vec<aligned::
         }
     }
     Ok(unique.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn evidence_chunks_preserve_every_unicode_byte() {
+        let text = "source αβγ\n".repeat(100);
+        let pieces = chunks(&text, 17);
+        assert_eq!(pieces.concat(), text);
+        assert!(pieces.iter().all(|p| p.len() <= 17));
+    }
+
+    #[test]
+    fn identical_finding_ids_cannot_hide_new_evidence() {
+        let first = aligned::Finding {
+            id: "F1".into(),
+            criterion_id: "C1".into(),
+            evidence_hash: "proof1".into(),
+            claim: "observable regression".into(),
+            requested_change: "make fixture pass".into(),
+            conflicts_with: BTreeSet::new(),
+            repair_rounds: 0,
+        };
+        assert_eq!(
+            deduplicate_findings(vec![first.clone(), first.clone()])
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut changed = first.clone();
+        changed.evidence_hash = "proof2".into();
+        assert!(deduplicate_findings(vec![first, changed]).is_err());
+    }
 }
