@@ -769,12 +769,7 @@ pub(super) async fn assert_current(
     );
     assess(prepared, &artifact.hunks, &artifact.mappings)?;
     let evidence = hunks(root, &reference.base, &reference.head).await?;
-    let (rules, _) = policy(
-        reference
-            .artifact
-            .parent()
-            .context("alignment control missing")?,
-    )?;
+    let (rules, _) = policy(&reference.policy_root)?;
     exceptions::assert_current(
         &rules,
         &evidence,
