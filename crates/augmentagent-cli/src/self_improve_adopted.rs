@@ -223,6 +223,7 @@ pub(super) async fn resume(
     let prior_checkpoint = WorkflowStore::open(&workflow::path())?
         .snapshot(guard.id())?
         .map(|snapshot| snapshot.checkpoint);
+    let capacity_accounting = guard.capacity_accounting(true)?;
     let result = execute(
         repo,
         reasoner,
@@ -233,6 +234,7 @@ pub(super) async fn resume(
         &mut guard,
     )
     .await;
+    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     match result {
         Ok(report) => {
             guard.finish()?;

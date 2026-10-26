@@ -6612,6 +6612,8 @@ async fn resume_draft_pr(
     }).await? else {
         return Ok(RunReport::held(format!("PR #{pr}: durable workflow is leased or deferred")));
     };
+    let capacity_accounting = workflow.capacity_accounting(true)?;
+    let outcome = async {
     workflow.bind_reasoner(reasoner.as_ref())?;
     let acceptance_control = acceptance::control_directories(&repository, workflow.id())?.workflow_acceptance;
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
@@ -6741,6 +6743,7 @@ async fn resume_draft_pr(
                         }
                     }
                     Err(e) => {
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         record_reasoner_error(
                             issue.number,
                             failure_record(reasoner, FailureKind::ReasonerError, "resume:conflict", &format!("{e:#}")),
@@ -6788,6 +6791,7 @@ async fn resume_draft_pr(
                     repo_root,
                 )
                 .await;
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
                     label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
@@ -6852,6 +6856,7 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -6916,6 +6921,7 @@ async fn resume_draft_pr(
                 }
                 Err(e) => {
                     warn!(pr, "resume shrink round failed: {e:#}");
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     record_reasoner_error(
                         issue.number,
                         failure_record(reasoner, FailureKind::ReasonerError, "resume:shrink", &format!("{e:#}")),
@@ -7001,6 +7007,7 @@ async fn resume_draft_pr(
                     }
                     Err(e) => {
                         warn!(pr, "gate-repair round failed: {e:#}");
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         record_reasoner_error(
                             issue.number,
                             failure_record(reasoner, FailureKind::ReasonerError, "resume:gate-repair", &format!("{e:#}")),
@@ -7018,6 +7025,7 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
@@ -7053,6 +7061,7 @@ async fn resume_draft_pr(
                         continue;
                     }
                     Err(e) => {
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         record_reasoner_error(issue.number, failure_record(reasoner,
                             FailureKind::ReasonerError, "resume:ci-repair", &format!("{e:#}")));
                         workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
@@ -7077,6 +7086,7 @@ async fn resume_draft_pr(
             Ok(r) => parse_review_output(&r),
             Err(e) => {
                 warn!(pr, "resume QA review failed; keeping the draft: {e:#}");
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 record_reasoner_error(
                     issue.number,
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:qa-review", &format!("{e:#}")),
@@ -7328,6 +7338,7 @@ async fn resume_draft_pr(
             )
             .await;
             workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::ReviewReject, "resume:review", &open_notes))).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 // Every future resume would replay the same disagreement;
@@ -7373,6 +7384,7 @@ async fn resume_draft_pr(
             Ok(rs) => rs,
             Err(e) => {
                 warn!(pr, "resume revision failed; leaving draft as-is: {e:#}");
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 record_reasoner_error(
                     issue.number,
                     failure_record(reasoner, FailureKind::ReasonerError, "resume:revise", &format!("{e:#}")),
@@ -7395,6 +7407,9 @@ async fn resume_draft_pr(
         workflow.publish_round(branch, repo_root, pr, rounds_done, kind, &findings, dry_run).await?;
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
+    }.await;
+    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    outcome
 }
 
 /// Force the pipeline's fixed worktree path back to a usable state before a
@@ -7864,6 +7879,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }).await? else {
         return Ok(RunReport::held(format!("issue #{}: workflow leased by another worker", issue.number)));
     };
+    let capacity_accounting = workflow_guard.capacity_accounting(false)?;
+    let outcome = async {
     workflow_guard.bind_reasoner(reasoner.as_ref())?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
@@ -7911,6 +7928,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
             info!(issue = issue.number, "auto-PR held: {why}");
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Ok(RunReport::held(why));
         }
@@ -7920,6 +7938,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // configuration or deployment fault and must stay loud, or a
             // misconfigured chain looks exactly like a quiet quota day.
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             bail!(
                 "no provider in the chain is cleared for a FullAgentic call; \
@@ -7945,6 +7964,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 issue = issue.number,
                 "scoping pass failed; building without a spec: {e:#}"
             );
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             record_reasoner_error(
                 issue.number,
                 rec(FailureKind::ReasonerError, "scope", &format!("{e:#}"), "", 0),
@@ -7958,6 +7978,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // and the ledger mark keeps the picker off it for the day.
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
             backoff_comment(
@@ -7991,6 +8012,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // ask, epic, owner decision, …). Label it out so it is scoped
                 // at most once, and leave the reason on the issue.
                 workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 backoff_comment(
                     repo_root,
@@ -8048,6 +8070,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     match file_slices(repo_root, &issue, &plan, &workflow_guard).await {
                         Ok(children) if !children.is_empty() => {
                             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::triage(format!(
                                 "issue #{}: oversized — sliced into {} child issues ({})",
@@ -8062,6 +8085,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 }
             }
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             backoff_comment(
                 repo_root,
@@ -8141,14 +8165,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     .lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic);
                 if let Some(report) = build_failure_hold(&err, &lane) {
                     info!(issue = issue.number, "auto-PR held: {report}");
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(report);
                 }
             }
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             record_reasoner_error(
                 issue.number,
                 rec(FailureKind::ReasonerError, "build", &format!("{err:#}"), "", 0),
             );
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Err(err).context("reasoner failed during self-improve");
         }
@@ -8192,6 +8219,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             }
         }
         if diff.trim().is_empty() {
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             // #1491 — a no-change run is minutes, not a build: never billed
             // against the daily cap. The ledger mark (record_attempt makes
@@ -8222,6 +8250,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     issue.number
                 )));
             }
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -8270,7 +8299,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gave-up label pulls the issue from the pool — otherwise the unattended
     // loop would re-spend its whole daily cap on the same issue forever.
     if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_diff) {
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         let attempts = record_attempt(
             repo_root,
             issue.number,
@@ -8382,6 +8413,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // it. Only an exhausted issue (or a guard refusal) ends without a PR.
     let park: Option<ParkReason> = 'stages: {
         if lines > MAX_DIFF_LINES {
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -8396,6 +8428,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             .await
             .unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
                 backoff_comment(
                     repo_root,
@@ -8494,6 +8527,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // accumulate toward gave-up instead of retrying daily forever.
                 if verdict.introduced.is_empty() && !is_red_main_issue(&issue.body) {
                     AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::triage(format!(
                         "issue #{}: gate red on main too ({}); not charged",
@@ -8502,6 +8536,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     )));
                 }
             }
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -8522,6 +8557,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 .await
                 .ok();
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
                     "issue #{}: verification gate failed (attempt {attempts}); no PR opened",
@@ -8546,10 +8582,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             Err(e) => {
                 // Transient reviewer failure (session limit etc.) — don't burn an
                 // attempt on infrastructure noise; the next tick retries whole.
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 record_reasoner_error(
                     issue.number,
                     rec(FailureKind::ReasonerError, "qa-review", &format!("{e:#}"), &diff, lines),
                 );
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Err(e).context("QA review pass failed during self-improve");
             }
@@ -8718,6 +8756,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     }
                     if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
                         warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&diff2), diff_line_count(&diff2)))).await.unwrap_or_else(|_| Tally::uncounted());
                         backoff_comment(
                             repo_root,
@@ -8732,6 +8771,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         if attempts.exhausted() {
                             label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
                         }
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         cleanup(worktree, branch, repo_root.to_path_buf()).await;
                         return Ok(RunReport::built(format!(
                             "issue #{}: revision hit blast-radius guard on `{pattern}` (attempt {attempts})",
@@ -8757,6 +8797,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             ));
                             continue;
                         }
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff_touched_paths(&diff2), lines2))).await.unwrap_or_else(|_| Tally::uncounted());
                         if attempts.exhausted() {
                             backoff_comment(
@@ -8771,6 +8812,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             .await
                             .ok();
                             label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
                                 "issue #{}: revision oversized ({lines2} lines); gave up (attempt {attempts})",
@@ -8797,6 +8839,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             ));
                             continue;
                         }
+                        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                         let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff_touched_paths(&diff2), lines2) })).await.unwrap_or_else(|_| Tally::uncounted());
                         if attempts.exhausted() {
                             backoff_comment(
@@ -8811,6 +8854,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             .await
                             .ok();
                             label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             return Ok(RunReport::built(format!(
                                 "issue #{}: post-revision gate red; gave up (attempt {attempts})",
@@ -8840,6 +8884,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             // The diff built and passed the gate; a reviewer
                             // outage is no reason to delete it. Park it
                             // unbilled and let resume QA it.
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             record_reasoner_error(
                                 issue.number,
                                 rec(FailureKind::ReasonerError, "revise:qa-review", &format!("{e:#}"), &diff_touched_paths(&diff2), lines),
@@ -8879,6 +8924,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 ParkReason::GateRed(out) => { let (kind, detail) = gate_outcome(out); rec(kind, "revise:gate", &detail, &paths, n) }
                 ParkReason::QaReject(_) | ParkReason::QaUnavailable(_) => unreachable!("only guards are pending"),
             };
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(repo_root, issue.number, Some(record)).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 backoff_comment(
@@ -8889,6 +8935,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 .await
                 .ok();
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
                     "issue #{}: revision stopped on a tree that {}; gave up (attempt {attempts})",
@@ -8920,6 +8967,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         if !qa_ok && !independent.as_ref().is_some_and(|r| r.approved()) {
             // #1488 — QA still rejects with the budget spent: one attempt for
             // the run (#852), and the work parks with QA's notes on the PR.
+            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
             let attempts = record_attempt(
                 repo_root,
                 issue.number,
@@ -8939,6 +8987,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 .await
                 .ok();
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
                     "issue #{}: QA review rejected the diff; gave up (attempt {attempts})",
@@ -8953,6 +9002,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // FULL suite exactly once here.
             if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {
                 warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
+                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                 let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
                     backoff_comment(
@@ -8967,6 +9017,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     .await
                     .ok();
                     label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
+                    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
                     return Ok(RunReport::built(format!(
                         "issue #{}: final full gate red after {round} revision round(s); gave up",
@@ -8994,6 +9045,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     });
 
     if dry_run {
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::built(format!(
             "issue #{}: DRY RUN — {}, {lines}-line diff \
@@ -9084,12 +9136,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         );
                         if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_now) {
                             warn!(issue = issue.number, pattern, %line, "personal-data repair hit the blast-radius guard");
+                            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                             cleanup(worktree, branch, repo_root.to_path_buf()).await;
                             let message = format!(
                                 "issue #{}: personal-data repair touched `{pattern}`; refused, no PR opened",
                                 issue.number
                             );
                             if !park_charged {
+                                if let Some(report) = capacity_accounting.report()? { return Ok(report); }
                                 let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "publish:pii-repair", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&full_now), lines))).await.unwrap_or_else(|_| Tally::uncounted());
                                 if attempts.exhausted() {
                                     label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
@@ -9113,6 +9167,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     }
     if !ok {
+        if let Some(report) = capacity_accounting.report()? { return Ok(report); }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         if park_charged {
             return Ok(RunReport::built(parked_publish_failed(issue.number, "git commit failed", &e)));
@@ -9272,6 +9327,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         Ok(created) => (true, created.url, String::new()),
         Err(error) => (false, String::new(), format!("{error:#}")),
     };
+    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
     cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
     if !ok {
         // #815 — the branch is pushed but has no PR. Left as an `Err` this
@@ -9480,6 +9536,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
     )))
+    }.await;
+    if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    outcome
 }
 
 /// The pipeline owns this untracked worktree. It must not make the deploy

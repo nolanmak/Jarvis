@@ -87,6 +87,30 @@ pub(super) struct WorkflowGuard {
     audit: Arc<augmentagent_channel_core::AuditLogger>,
 }
 
+/// A run-local view of durable admissions. It survives guard consumption on
+/// normal completion, so every early `?` can still settle capacity accurately.
+pub(super) struct CapacityAccounting {
+    store: Arc<Mutex<WorkflowStore>>,
+    audit: Arc<augmentagent_channel_core::AuditLogger>,
+    workflow: String,
+    calls_before: u64,
+    resumed: bool,
+}
+impl CapacityAccounting {
+    pub(super) fn report(&self) -> Result<Option<RunReport>> {
+        if !self.audit.resource_capacity_seen() { return Ok(None); }
+        let calls_after = self.store.lock().map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
+            .snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
+        let paid = calls_after.checked_sub(self.calls_before).context("durable model admissions decreased")?;
+        Ok(Some(RunReport {
+            message: format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)"),
+            billed: paid > 0,
+            held: paid == 0,
+            resumed: self.resumed,
+        }))
+    }
+}
+
 pub(super) fn workflow_audit(
     state: &Path,
     id: &str,
@@ -643,6 +667,12 @@ impl WorkflowGuard {
         });
     }
 
+    pub(super) fn capacity_accounting(&self, resumed: bool) -> Result<CapacityAccounting> {
+        let calls_before = self.store.lock().map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
+            .snapshot(self.id())?.context("capacity workflow missing")?.model_calls;
+        Ok(CapacityAccounting { store:self.store.clone(), audit:self.audit.clone(),
+            workflow:self.id().into(), calls_before, resumed })
+    }
     pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
         self.audit.clone()
     }
@@ -2183,11 +2213,14 @@ mod tests {
         }, millis()).await.unwrap().unwrap();
         guard.checkpoint(Stage::Verify, "candidate_committed", "verify", 0, &["protected-candidate".into()]).await.unwrap();
         let before = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let accounting = guard.capacity_accounting(true).unwrap();
         let error = super::super::run_sandboxed("/bin/sh", &["-c", "touch forbidden-execution"], dir.path(),
             &[("PATH".into(), "/usr/bin:/bin".into())], &guard.audit_logger()).await.unwrap_err();
         assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<augmentagent_channel_core::reasoner::ReasonerError>(),
             Some(augmentagent_channel_core::reasoner::ReasonerError::ResourceCapacity { .. }))));
         assert!(!dir.path().join("forbidden-execution").exists());
+        let held = accounting.report().unwrap().unwrap();
+        assert!(!held.billed && held.held && held.resumed);
         assert_eq!(super::super::baseline_infra_reason(&format!("{error:#}")), Some("declared run resource capacity"));
         let after = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
         assert_eq!(after.checkpoint.next.action, "await_capacity");
@@ -2205,8 +2238,15 @@ mod tests {
         let mut guard=WorkflowGuard::acquire_at(&path,start(),millis()).await.unwrap().unwrap();
         guard.checkpoint(Stage::Review,"verified","review",0,&["protected-acceptance-receipt".into()]).await.unwrap();
         let id=guard.id().to_owned();
+        let paid_run = guard.capacity_accounting(false).unwrap();
+        // Deterministic observer fixture: one protected admission in this run,
+        // then a resumed run sees that admission only as historical spend.
+        guard.audit_logger().model_call_admitted("codex").unwrap();
+        let subsequent_run = guard.capacity_accounting(true).unwrap();
         let before=WorkflowStore::open(&path).unwrap().snapshot(&id).unwrap().unwrap();
         guard.audit_logger().resource_capacity_exhausted(&serde_json::json!({"phase":"completed","exhausted":true,"memory_events":{"oom_kill":1}})).unwrap();
+        assert!(paid_run.report().unwrap().unwrap().billed, "actual admission remains billed after capacity exhaustion");
+        assert!(!subsequent_run.report().unwrap().unwrap().billed, "prior workflow admissions do not bill an unadmitted retry");
         assert!(guard.validate_before_side_effect().is_err());
         assert!(guard.audit_logger().model_call_admitted("codex").is_err());
         assert!(guard.checkpoint(Stage::Build,"generic_failure","retry_builder",0,&[]).await.is_err());
