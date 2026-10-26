@@ -8917,6 +8917,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // reconciles successful pushes whose responses were lost.
     if let Err(error) = workflow_guard.push(&branch).await {
         let e = format!("{error:#}");
+        if park_charged {
+            return Ok(RunReport::built(parked_publish_failed(issue.number, "git push failed", &e)));
+        }
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e,
             rec(FailureKind::Infra, "publish:git push", &e, &diff, lines)).await));
     }
@@ -13679,7 +13682,7 @@ CODEX-REVIEW: lgtm").0);
         // One debt-accounting site, in the loop's billed arm.
         let production = &src[..src.find("mod tests {").unwrap()];
         assert_eq!(production.matches("f.record_billed(").count(), 1);
-        let loop_start = production.find("async fn run_with<F, T>(").expect("run_with");
+        let loop_start = production.find("async fn run_builds<F, T>(").expect("run_builds");
         let billed = production[loop_start..].find("Ok(r) if r.billed =>").expect("billed arm");
         let record = production[loop_start..].find("f.record_billed(r.resumed)").expect("debt update");
         assert!(billed < record, "the debt update follows the billed arm");
@@ -15482,20 +15485,25 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
     /// is bounded so a backlog cannot stall a tick.
-    #[test]
-    fn the_sweep_is_free_bounded_and_runs_while_capped() {
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_is_free_bounded_and_runs_while_capped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 1, state.path());
+        lp.interval = std::time::Duration::from_secs(5);
+        let mut counter = DailyCounter::default();
+        counter.record(utc_day_now());
+        counter.persist(&lp.counter_path).unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let swept = Arc::new(AtomicUsize::new(0));
+        let seen = swept.clone();
+        let cancel = stop.clone();
+        lp.run_with(stop, || async { panic!("capped builder must not run"); #[allow(unreachable_code)] Ok(RunReport::idle()) }, move || {
+            let seen = seen.clone(); let cancel = cancel.clone();
+            async move { if seen.fetch_add(1, Ordering::SeqCst) >= 2 { cancel.cancel(); } 0 }
+        }).await.unwrap();
+        assert_eq!(swept.load(Ordering::SeqCst), 3);
         let src = include_str!("self_improve.rs");
-        // `run` delegates; the tick loop itself is `run_with`.
-        let start = src.find("async fn run_with<F, T>(").expect("the tick loop");
-        let body = &src[start..start + src[start..].find("\n    }\n").expect("end")];
-        let sweep = body.find("merge_sweep(").expect("the tick must run the sweep");
-        let cap = body.find("daily cap reached").expect("the cap check");
-        assert!(
-            sweep < cap,
-            "the sweep must run BEFORE the cap check; merging an approved \
-             draft spends no reasoner call, so a reasoner budget must not gate it"
-        );
-
         let fn_start = src.find("async fn merge_sweep(").expect("the sweep");
         let fn_body = &src[fn_start..fn_start + src[fn_start..].find("\n}\n").expect("end")];
         // C5 — no reasoner, at all.
@@ -17748,8 +17756,8 @@ else:
             "gate, revise gate, final gate"
         );
         assert!(
-            body.matches("publish_outcome(").count() >= 3,
-            "commit, push, pr create"
+            body.matches("publish_outcome(").count() >= 2 && body.contains("rec(FailureKind::Infra, \"publish:git push\""),
+            "commit/create classified; uncertain push is infrastructure"
         );
         assert!(
             body.matches("record_reasoner_error(").count() >= 3,
@@ -18610,7 +18618,7 @@ else:
         let src = include_str!("self_improve.rs");
         let start = src.find("pub async fn run_once(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let force = body.find(r#""push", "--force""#).expect("the orphan force-push");
+        let force = body.find("workflow_guard.push(&branch)").expect("guarded compare-and-swap push");
         let failed = body.find("\"git push failed\"").expect("the push-failure exit");
         let supersede = body.find("supersede_review_history(").expect("the reset");
         let create = body.find(r#""pr", "create""#).expect("PR creation");
