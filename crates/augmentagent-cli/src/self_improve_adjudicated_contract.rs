@@ -227,7 +227,7 @@ pub(crate) async fn apply(
             if action.starts_with("dependency_") {
                 if let Some(pr) = workflow.pr()? {
                     if let Ok((true, raw, _)) = run(
-                        "gh",
+                        &gh_bin(),
                         &["pr", "view", &pr.to_string(), "--json", "headRefOid,title,body"],
                         worktree,
                     )
@@ -236,7 +236,7 @@ pub(crate) async fn apply(
                         if let Ok(remote) = serde_json::from_str::<serde_json::Value>(&raw) {
                             let request_hash = if let AcceptanceSource::Issue(issue) = source {
                                 match run(
-                                    "gh",
+                                    &gh_bin(),
                                     &["issue", "view", &issue.to_string(), "--json", "title,body"],
                                     worktree,
                                 )

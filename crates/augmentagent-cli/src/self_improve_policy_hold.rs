@@ -133,7 +133,7 @@ pub(super) async fn filter(repo: &Path, candidates: &mut Vec<adoption::AdoptedPr
     };
     let mut eligible = Vec::with_capacity(candidates.len());
     for candidate in candidates.drain(..) {
-        if let Some(blocker) = adjudicated_dependency(repo, &candidate).await {
+        if let Some(blocker) = adjudicated_dependency(repo, &candidate, dry_run).await {
             if let Some(conn) = &status { let _ = observe(conn, &candidate.repository, candidate.pr, &candidate.head, Some(blocker), chrono::Utc::now().timestamp_millis()); }
             continue;
         }
@@ -470,8 +470,17 @@ fn reopen_dependency(store: &mut crate::autoship_workflow::WorkflowStore, id: &s
     store.release(&lease,now)?;
     result.map(|_|true)
 }
-pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr) -> Option<&'static str> {
-    let mut store = match crate::autoship_workflow::WorkflowStore::open(&workflow::path()) { Ok(store)=>store, Err(_)=>return Some("dependency-evidence-unavailable") };
+pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr, dry_run: bool) -> Option<&'static str> {
+    adjudicated_dependency_at(repo,candidate,dry_run,&workflow::path()).await
+}
+async fn adjudicated_dependency_at(repo: &Path, candidate: &adoption::AdoptedPr, dry_run: bool, state:&Path) -> Option<&'static str> {
+    let mut store = if dry_run {
+        match crate::autoship_workflow::WorkflowStore::open_read_only(state) {
+            Ok(Some(store))=>store,Ok(None)=>return None,Err(_)=>return Some("dependency-evidence-unavailable"),
+        }
+    } else {
+        match crate::autoship_workflow::WorkflowStore::open(state) { Ok(store)=>store, Err(_)=>return Some("dependency-evidence-unavailable") }
+    };
     let id = store.resolve_pr(&candidate.repository, candidate.pr).ok()??;
     let snapshot = store.snapshot(&id).ok()??;
     let reason = match snapshot.checkpoint.next.action.as_str() {
@@ -482,7 +491,7 @@ pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::Ad
     // A missing original snapshot is unknown, never proof that the owner's
     // request is unchanged. Recover facts for free before reopening one attempt.
     let request_hash = if let Some(issue) = candidate.source_issue {
-        match run("gh", &["issue", "view", &issue.to_string(), "--json", "title,body"], repo).await {
+        match run(&gh_bin(), &["issue", "view", &issue.to_string(), "--json", "title,body"], repo).await {
             Ok((true, raw, _)) if serde_json::from_str::<serde_json::Value>(&raw).ok()
                 .is_some_and(|v|v["title"].is_string()&&v["body"].is_string()) => Some(crate::autoship_review::digest(raw.as_bytes())),
             _ => return Some("dependency-evidence-unavailable"),
@@ -493,6 +502,7 @@ pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::Ad
     let marker = snapshot.checkpoint.evidence.iter().filter_map(|item|serde_json::from_str::<serde_json::Value>(item).ok())
         .find(|value|value["kind"] == "adjudicated_dependency");
     if dependency_inputs_match(marker.as_ref(),&current,candidate.source_issue.is_some()) { return Some(reason); }
+    if dry_run { return None; }
     match reopen_dependency(&mut store,&id,&snapshot.checkpoint,current,chrono::Utc::now().timestamp_millis()) {
         Ok(true)=>None,
         Ok(false)=>Some("dependency-reconciliation-active"),
@@ -503,6 +513,28 @@ pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::Ad
 #[cfg(test)]
 mod dependency_recovery_tests {
     use super::*;
+    #[tokio::test]
+    async fn dry_dependency_preview_does_not_create_or_reopen_workflow() {
+        use crate::autoship_workflow::{Binding,WorkflowStore};
+        let dir=tempfile::tempdir().unwrap();let state=dir.path().join("workflow.db");
+        let rows=serde_json::json!([{"number":20,"headRefName":"feature","headRefOid":"a".repeat(40),
+            "baseRefName":"main","isCrossRepository":false,"isDraft":false,"author":{"login":"owner"},
+            "title":"changed title","body":"explicit source-less work","closingIssuesReferences":[]}]);
+        let candidate=adoption::authorized(&rows,"owner/repo",&["owner".into()]).remove(0);
+        assert_eq!(adjudicated_dependency_at(dir.path(),&candidate,true,&state).await,None);
+        assert!(!state.exists());
+        let mut store=WorkflowStore::open(&state).unwrap();let id=candidate.workflow_id().unwrap();
+        store.register(&id,"feature",Binding{head:candidate.head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()},1).unwrap();
+        let lease=store.claim(&id,"initial",2,100).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease,"owner/repo",20,3).unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.next.action="dependency_owner_requirement_decision".into();
+        store.checkpoint(&lease,&checkpoint,4).unwrap();store.release(&lease,5).unwrap();
+        let before=store.snapshot(&id).unwrap();let events=store.events(&id).unwrap();drop(store);
+        assert_eq!(adjudicated_dependency_at(dir.path(),&candidate,true,&state).await,None);
+        let store=WorkflowStore::open_read_only(&state).unwrap().unwrap();
+        assert_eq!(store.snapshot(&id).unwrap(),before);assert_eq!(store.events(&id).unwrap(),events);
+    }
     #[test]
     fn source_less_title_edit_releases_same_head_dependency() {
         let prior=serde_json::json!({"remote_head":"same-head","pr_body_hash":"same-body","pr_title_hash":"old-title","request_hash":null});

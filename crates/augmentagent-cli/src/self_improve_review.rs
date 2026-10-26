@@ -279,9 +279,20 @@ async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Re
             paths.insert(path.to_owned());
         }
     }
+    const MAX_CALLER_FILES: usize = 256;
+    const MAX_CALLER_BYTES: usize = 8 * 1024 * 1024;
+    anyhow::ensure!(paths.len() <= MAX_CALLER_FILES,
+        "incomplete caller evidence: {} files exceed {MAX_CALLER_FILES}; split the candidate into smaller API changes",paths.len());
     let mut files = BTreeMap::new();
+    let mut total_bytes = 0usize;
     for path in paths {
-        let content = git(worktree, &["show", &format!("{head}:{path}")]).await?;
+        let spec=format!("{head}:{path}");
+        let bytes=git(worktree,&["cat-file","-s",&spec]).await?.trim().parse::<usize>()?;
+        total_bytes=total_bytes.checked_add(bytes).context("caller evidence byte count overflow")?;
+        anyhow::ensure!(total_bytes <= MAX_CALLER_BYTES,
+            "incomplete caller evidence: source exceeds {MAX_CALLER_BYTES} bytes; split the candidate into smaller API changes");
+        let content = git(worktree, &["show", &spec]).await?;
+        anyhow::ensure!(content.len()==bytes,"immutable caller evidence size changed");
         files.insert(path, content);
     }
     Ok(serde_json::to_string(&serde_json::json!({
@@ -877,6 +888,16 @@ mod tests {
         fixture_git(dir.path(),&["replace",&original,&replacement]);
         std::fs::remove_file(dir.path().join("replacement")).unwrap();
         assert_eq!(git(dir.path(),&["show","HEAD:source.rs"]).await.unwrap(),"fn changed() {}\n");
+    }
+    #[tokio::test]
+    async fn common_symbol_caller_expansion_is_bounded_before_review() {
+        let dir=candidate_fixture();
+        for n in 0..257 {std::fs::write(dir.path().join(format!("caller{n}.rs")),"fn caller() { changed(); }\n").unwrap();}
+        fixture_git(dir.path(),&["add","."]);fixture_git(dir.path(),&["commit","-qm","large lexical caller set"]);
+        let head=fixture_git(dir.path(),&["rev-parse","HEAD"]);
+        let error=complete_caller_evidence(dir.path(),&head,"+fn changed() {}").await.unwrap_err();
+        assert!(error.to_string().contains("incomplete caller evidence"));
+        assert!(error.to_string().contains("files exceed"));
     }
     #[test]
     fn new_supplemental_context_invalidates_old_dismissal_reuse() {

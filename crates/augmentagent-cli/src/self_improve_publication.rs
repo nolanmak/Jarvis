@@ -87,9 +87,18 @@ async fn create_or_reconcile(
     // Neither an error nor a successful CLI response establishes remote state.
     // Always query GitHub after the request, including a lost response.
     let result = github.call(args).await;
-    if let Some(found) = find(github, branch, head).await? {
-        return Ok(found);
+    // GitHub creation and list visibility are not atomic. Never re-create while
+    // observing a successful or lost response; retry only the read.
+    let mut lookup_error = None;
+    for attempt in 0..3 {
+        match find(github,branch,head).await {
+            Ok(Some(found))=>return Ok(found),
+            Ok(None)=>(),
+            Err(error)=>lookup_error=Some(error),
+        }
+        if attempt < 2 { tokio::time::sleep(std::time::Duration::from_millis(100*(attempt+1))).await; }
     }
+    if let Some(error)=lookup_error { return Err(error.context("publication not observed; intent retained for retry")); }
     match result {
         Err(error) => Err(error.context("publication not observed; intent retained for retry")),
         Ok(_) => anyhow::bail!("publication response not confirmed; intent retained for retry"),
@@ -518,6 +527,17 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(gh.creates, 1);
+    }
+    #[tokio::test]
+    async fn delayed_visibility_and_transient_lookup_never_duplicate_creation() {
+        let mut gh=Fake {replies:VecDeque::from([Ok("[]".into()),Ok("created".into()),
+            Err(anyhow::anyhow!("transient read failure")),Ok("[]".into()),Ok(row("abc"))]),creates:0};
+        let published=create_or_reconcile(&mut gh,"agent-fix/issue-1","abc",&["pr","create"]).await.unwrap();
+        assert_eq!(published.number,12);assert_eq!(gh.creates,1);assert!(gh.replies.is_empty());
+        let mut gh=Fake {replies:VecDeque::from([Ok("[]".into()),Ok("created".into()),
+            Ok("[]".into()),Ok("[]".into()),Ok("[]".into())]),creates:0};
+        assert!(create_or_reconcile(&mut gh,"agent-fix/issue-1","abc",&["pr","create"]).await.is_err());
+        assert_eq!(gh.creates,1);assert!(gh.replies.is_empty());
     }
     #[tokio::test]
     async fn unknown_state_and_changed_head_never_create_another_pr() {

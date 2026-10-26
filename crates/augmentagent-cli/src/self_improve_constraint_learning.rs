@@ -162,7 +162,7 @@ pub(super) async fn learn(
         return Ok(());
     }
     let (ok, repository, _) = run(
-        "gh",
+        &gh_bin(),
         &[
             "repo",
             "view",
@@ -182,7 +182,7 @@ pub(super) async fn learn(
         "repos/{}/pulls/comments?sort=updated&direction=desc&per_page=100",
         repository.trim()
     );
-    let (ok, raw, _) = run("gh", &["api", &endpoint], root).await?;
+    let (ok, raw, _) = run(&gh_bin(), &["api", &endpoint], root).await?;
     ensure!(
         ok && raw.len() <= 8 * 1024 * 1024,
         "historical review discovery unavailable/oversized"

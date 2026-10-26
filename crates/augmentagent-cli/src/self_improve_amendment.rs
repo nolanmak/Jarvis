@@ -93,7 +93,7 @@ fn validate_correction_with_files(
             | crate::autoship_contract::PathScope::Directory(path) => path,
         };
         ensure!(
-            next.files.contains_key(path)
+            (matches!(scope, crate::autoship_contract::PathScope::File(_)) && next.files.contains_key(path))
                 || (matches!(scope, crate::autoship_contract::PathScope::File(_))
                     && additional_files.contains(path))
                 || old
@@ -101,7 +101,7 @@ fn validate_correction_with_files(
                     .contract
                     .allowed_paths
                     .iter()
-                    .any(|old| old.contains(path)
+                    .any(|old| (old == scope || old.contains(path))
                         && !matches!(
                             (old, scope),
                             (
@@ -858,6 +858,19 @@ mod tests {
             .allowed_paths
             .push(PathScope::Directory("unrelated".into()));
         assert!(validate_correction(&old, &next, "environment-b").is_err());
+    }
+    #[test]
+    fn unchanged_and_narrowed_directory_scope_can_be_amended() {
+        let (_root, mut old) = fixture();
+        old.proposal.contract.allowed_paths.push(PathScope::Directory("src".into()));
+        let mut next = old.proposal.clone(); next.contract.revision += 1;
+        assert!(validate_correction(&old,&next,"environment-b").is_ok());
+        *next.contract.allowed_paths.last_mut().unwrap()=PathScope::Directory("src/nested".into());
+        assert!(validate_correction(&old,&next,"environment-b").is_ok());
+        *next.contract.allowed_paths.last_mut().unwrap()=PathScope::Directory("src-other".into());
+        assert!(validate_correction(&old,&next,"environment-b").is_err());
+        next.contract.allowed_paths=vec![PathScope::Directory(next.files.keys().next().unwrap().clone())];
+        assert!(validate_correction(&old,&next,"environment-b").is_err(),"pinned file cannot authorize directory scope");
     }
     #[test]
     fn changed_fixture_is_versioned_and_source_bound() {

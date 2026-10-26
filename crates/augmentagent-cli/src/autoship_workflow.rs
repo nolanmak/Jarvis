@@ -168,6 +168,22 @@ pub struct WorkflowStore {
 }
 
 impl WorkflowStore {
+    /// Preview existing protected state without schema initialization or writes.
+    pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
+        use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+        let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
+            Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+            Err(error)=>return Err(error.into()),
+        };
+        let meta=file.metadata()?;
+        ensure!(meta.is_file() && meta.nlink()==1 && meta.uid()==unsafe {libc::geteuid()} && meta.mode()&0o077==0,"workflow preview state is not owner-private");
+        let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        let after=std::fs::symlink_metadata(path)?;
+        ensure!(meta.dev()==after.dev() && meta.ino()==after.ino() && !after.file_type().is_symlink(),"workflow preview state changed during open");
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Some(Self {conn}))
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         ensure!(
             path != Path::new(":memory:"),

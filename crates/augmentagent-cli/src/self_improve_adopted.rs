@@ -148,7 +148,7 @@ pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::
         if !workflow_available(store.snapshot(&id)?.as_ref(), now) {
             continue;
         }
-        if let Some(reason) = policy_hold::adjudicated_dependency(repo, &candidate).await {
+        if let Some(reason) = policy_hold::adjudicated_dependency(repo, &candidate, dry_run).await {
             info!(
                 pr = candidate.pr,
                 reason, "adopted PR dependency remains in free reconciliation"
