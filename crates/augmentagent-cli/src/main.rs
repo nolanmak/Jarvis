@@ -12242,7 +12242,7 @@ mod approval_body_tests {
         let hint = augmentagent_channel_core::prompt::notes_hint(&["Venue shortlist".into()]);
         let err = body_for_gmail_write(format!("{hint}\n"), "Re: Thursday's venue", None)
             .expect_err("no message is left to send");
-        assert!(err.to_string().contains("internal agent context"), "{err}");
+        assert!(err.to_string().contains("internal context was dropped"), "{err}");
         assert!(!err.to_string().contains("Venue shortlist"), "the refusal must not quote the dropped text: {err}");
     }
 
