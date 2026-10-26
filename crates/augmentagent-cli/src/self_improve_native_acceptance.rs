@@ -304,3 +304,72 @@ async fn live_native_final_adjudicator_resolves_synthetic_contradiction() -> Res
     guard.finish()?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "paid historical #1538 writer-inventory replay; central explicit run only"]
+async fn live_native_writer_inventory_replay_1538() -> Result<()> {
+    use crate::autoship_review as review;
+    anyhow::ensure!(std::env::var("AUGMENTAGENT_AUTOPR_REVIEWERS").as_deref()==Ok("codex"),"probe requires pinned Codex");
+    let state=PathBuf::from(std::env::var_os("XDG_STATE_HOME").context("isolated state required")?).canonicalize()?;
+    anyhow::ensure!(state.starts_with(Path::new("/tmp").canonicalize()?) && workflow::path().starts_with(&state),"isolated probe state required");
+    // Representative replay of the historical dispute, not an assertion that
+    // these synthetic files or verdicts were the original PR's exact contents.
+    let helper=r#"import fcntl, json
+def record(path, key, value):
+    with open(str(path) + '.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(path) as source:
+            data = json.load(source)
+        data[key] = value
+        with open(path, 'w') as target:
+            json.dump(data, target)
+"#;
+    let mut sessions=BTreeSet::new();
+    for repaired in [false,true] {
+        let fixture=tempfile::Builder::new().prefix("autoship-writer-replay-").tempdir_in("/tmp")?;
+        let root=fixture.path().join("source"); std::fs::create_dir(&root)?;
+        git(&root,&["init","-q","-b","disposable"]).await?;
+        git(&root,&["config","user.name","Disposable Autoship Probe"]).await?;
+        git(&root,&["config","user.email","probe@example.invalid"]).await?;
+        let writer=if repaired {"from records import record\ndef publish(path):\n    record(path, 'new', 2)\n"}
+            else {"import json\ndef publish(path):\n    with open(path, 'w') as target:\n        json.dump({'new': 2}, target)\n"};
+        std::fs::write(root.join("records.py"),helper)?;
+        std::fs::write(root.join("second_lane.py"),writer)?;
+        git(&root,&["add","."]).await?;git(&root,&["commit","-qm","writer inventory replay"]).await?;
+        let head=git(&root,&["rev-parse","HEAD"]).await?;
+        git(&root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+        let repository=format!("autoship-canary/writer-replay-{}",uuid::Uuid::new_v4());
+        let guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&root,worktree:&root,repository:&repository,
+            source_issue:Some(1538),pr:None,branch:"disposable",contract:"writer-inventory-replay-v1",environment:"disposable-python"}).await?.context("probe lease unavailable")?;
+        guard.check_resource_policy()?;
+        let data=fixture.path().join("records.json");std::fs::write(&data,r#"{"existing":1}"#)?;
+        let driver="import json,sys; sys.path.insert(0,sys.argv[1]); from second_lane import publish; publish(sys.argv[2]); print(json.dumps(json.load(open(sys.argv[2])),sort_keys=True))";
+        let (ok,stdout,stderr)=run_sandboxed("/usr/bin/python3",&["-I","-B","-c",driver,root.to_str().unwrap(),data.to_str().unwrap()],&root,&[],&guard.audit_logger()).await?;
+        anyhow::ensure!(ok,"writer replay execution failed: {stderr}");
+        let observed:serde_json::Value=serde_json::from_str(&stdout)?;
+        assert_eq!(observed["existing"].as_i64(),if repaired {Some(1)} else {None});
+        assert_eq!(observed["new"],2);
+        let inventory=git(&root,&["ls-tree","-r","--name-only","HEAD"]).await?;
+        assert_eq!(inventory,"records.py\nsecond_lane.py");
+        let criteria=BTreeMap::from([("WRITERS".into(),"Every production writer routes through the same locking read-modify-write helper and preserves unrelated existing records.".into())]);
+        let evidence=serde_json::json!({"historical_case":"PR #1538 writer-inventory dispute; representative executable replay",
+            "complete_tracked_file_inventory":inventory,"complete_source":{"records.py":helper,"second_lane.py":writer},
+            "controller_observation":{"before":{"existing":1},"after":observed,"executed_entrypoint":"second_lane.publish"},
+            "no_reviewer_passes":true}).to_string();
+        let binding=review::ReviewBinding {head:head.clone(),base:head,environment_id:"disposable-python".into(),
+            contract_hash:review::digest(serde_json::to_string(&criteria)?.as_bytes()),evidence_hash:review::digest(evidence.as_bytes())};
+        let findings=vec![review::Finding {id:"WRITER_INVENTORY".into(),criterion_id:"WRITERS".into(),evidence_hash:binding.evidence_hash.clone(),
+            claim:"The second publication lane bypasses the locking helper and discards unrelated records; counting one serializer in the helper file does not prove a complete writer inventory.".into(),
+            requested_change:"Route all actual production writers through the locking helper; provide complete inventory and preservation evidence.".into(),conflicts_with:BTreeSet::new(),repair_rounds:2}];
+        let origin=review::ReviewOrigin::DiagnosticCanary {origin:Box::new(adoption::origin_for_candidate(&root,Some(&guard)).await?)};
+        let mut opts=codex_review_opts(root.clone(),"Historical writer-inventory replay");opts.audit_logger=Some(guard.audit_logger());
+        let receipt=review::adjudicate_native_with_origin(&[],opts,binding.clone(),&criteria,&findings,&evidence,guard.reserve_adjudication()?,&origin).await?;
+        assert_eq!(receipt.binding,binding);assert!(sessions.insert(receipt.actor.session_id.clone()));
+        if repaired {assert!(matches!(receipt.rulings["WRITER_INVENTORY"],review::Ruling::Dismiss{..}),"complete supplied evidence must resolve stale inventory objection");}
+        else {assert!(matches!(receipt.rulings["WRITER_INVENTORY"],review::Ruling::Uphold{..}),"real unguarded second writer must remain blocking");}
+        guard.audit_health().await?;
+        guard.audit_logger().record_controller(serde_json::json!({"kind":"historical_writer_inventory_replay_1538","repaired":repaired,"receipt":receipt,"observed":observed,"no_remote_publication":true}))?;
+        guard.finish()?;
+    }
+    Ok(())
+}
