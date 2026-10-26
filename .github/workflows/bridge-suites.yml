@@ -57,6 +57,7 @@ jobs:
           python3 scripts/test-native-provider-codex-auth-probe.py
           python3 scripts/test-native-provider-claude-auth-probe.py
           python3 scripts/test-autoship-native-acceptance-probe.py
+          python3 scripts/test-native-probe-routing.py
           python3 scripts/test-provision-native-vm.py
       - name: Test the PR verification gate's bridge-suite receipt rule
         run: bash scripts/tests/agent-pr-verify-gate.test.sh
