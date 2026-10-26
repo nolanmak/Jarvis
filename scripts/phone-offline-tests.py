@@ -38,7 +38,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "config", 10),
     ("augmentagent-phone", "--test", "memory", 15),
     ("augmentagent-phone", "--test", "silence", 12),
-    ("augmentagent-phone", "--test", "runtime", 3),
+    ("augmentagent-phone", "--test", "runtime", 5),
     ("augmentagent-phone", "--test", "proposals", 19),
     ("augmentagent-proactive", "--test", "no_dial_path", 3),
     ("augmentagent-store", "--test", "phone_calls", 17),

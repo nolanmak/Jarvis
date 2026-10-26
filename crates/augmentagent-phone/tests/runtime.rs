@@ -366,3 +366,44 @@ async fn runtime_resumes_durable_tasks_without_a_live_relay() {
     tokio::time::timeout(std::time::Duration::from_secs(2), agent.0.notified()).await.expect("startup recovery tick");
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_retries_dispatch_after_reconciliation_database_failure() {
+    struct RecoveryAgent(tokio::sync::Notify);
+    #[async_trait]
+    impl ConversationAgent for RecoveryAgent {
+        async fn answer(&self, _: &PhoneCall, _: &str, _: &str, _: SpeechSender, _: CancellationToken) -> Result<String, AgentError> {
+            panic!("recovery does not fabricate a voice turn")
+        }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> { Ok(()) }
+        async fn resume_task(&self, _: &PhoneCall, task_id: &str) -> Result<(), AgentError> {
+            assert_eq!(task_id, "persisted-task");
+            self.0.notify_one();
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    store.phone_import_destination("owner", "+12025550123", 0).unwrap();
+    let call = store.phone_reserve_call(augmentagent_store::phone::ReserveCall {
+        owner: "owner", request_id: "earlier-call", conversation: "chat", now_ms: 0,
+    }).unwrap().call;
+    // The call has ended; recovery must not need a live relay or a dial permit.
+    store.phone_bind_provider(&call.id, "CA-earlier").unwrap();
+    store.phone_provider_event(&call.id, "CA-earlier", CallState::Canceled, 100).unwrap();
+    store.phone_enqueue_dispatch(&call.id, "persisted-task", "Synthetic task").unwrap();
+    let service = Arc::new(PhoneService::new(store.clone(), Arc::new(Provider::default()), Arc::new(Time(AtomicI64::new(100))),
+        PhoneConfig::new(true, "https://phone.example.test", "runtime-test-verification-secret-32", vec![]).unwrap()));
+    let agent = Arc::new(RecoveryAgent(tokio::sync::Notify::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let runtime = PhoneRuntime::start(service, Arc::new(WebhookAuth::new("AC-test", "token")), agent.clone(), listener).await.unwrap();
+    // Fault only the reconciliation query after synchronous startup succeeds.
+    // This deterministic schema fault models a query failure without blocking
+    // the executor on SQLite's real-time busy timeout.
+    store.with_conn(|db| { db.execute_batch("ALTER TABLE phone_live_sessions RENAME TO temporarily_unavailable_sessions")?; Ok(()) }).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(runtime.is_running(), "a transient reconciliation error must not terminate dispatch");
+    store.with_conn(|db| { db.execute_batch("ALTER TABLE temporarily_unavailable_sessions RENAME TO phone_live_sessions")?; Ok(()) }).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), agent.0.notified()).await.expect("next tick resumes the durable task after recovery");
+    runtime.shutdown().await.unwrap();
+}

@@ -333,7 +333,12 @@ async fn dispatch_worker(
             _ = interval.tick() => {},
             _ = service.dispatch_ready.notified() => {},
         }
-        service.store.phone_reconcile_live_sessions().map_err(Error::from)?;
+        if service.store.phone_reconcile_live_sessions().is_err() {
+            // Preserve queued jobs and retry on the next tick. Do not log raw
+            // database errors, which can include private stored values.
+            tracing::warn!("phone live session reconciliation failed; retrying");
+            continue;
+        }
         let Ok(jobs) = service.store.phone_pending_dispatches() else { continue; };
         for job in jobs {
             if stop.is_cancelled() { return Ok(()); }
