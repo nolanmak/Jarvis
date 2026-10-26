@@ -195,7 +195,9 @@ fn detected_seed(evidence: &crate::autoship_review::ReviewEvidence) -> bool {
     // Deterministic rubric: a completed independent pass must name the known
     // zero-check boundary and shipping/check predicate. Generic rejection or a
     // transport failure does not count as catching the planted defect.
+    let crate::autoship_review::ReviewOrigin::DiagnosticCanary { origin } = &evidence.origin else { return false; };
     let mut structure = evidence.clone();
+    structure.origin = *origin.clone();
     for pass in &mut structure.passes {
         pass.findings.clear();
     }
@@ -233,17 +235,7 @@ async fn git_fixture(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
-async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
-    use augmentagent_channel_core::ProviderKind::Codex;
-    let scratch = tempfile::tempdir()?;
-    let root = scratch.path().join("candidate");
-    let control = workflow::path()
-        .parent()
-        .context("workflow state parent missing")?
-        .join("review-canary-artifacts")
-        .join(id);
-    std::fs::create_dir(&root)?;
-    std::fs::create_dir_all(&control)?;
+async fn prepare_fixture(root: &Path, control: &Path) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
     git_fixture(&root, &["init", "-q"]).await?;
     git_fixture(&root, &["config", "user.name", "Synthetic Canary"]).await?;
     git_fixture(&root, &["config", "user.email", "canary@example.invalid"]).await?;
@@ -270,7 +262,7 @@ async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
         840,
     )?;
     let baseline = acceptance::register_and_reproduce(&root, proposal.clone()).await?;
-    acceptance::persist_baseline(&control.join("baseline.json"), &baseline, &[root.clone()])?;
+    acceptance::persist_baseline(&control.join("baseline.json"), &baseline, &[root.to_path_buf()])?;
     let prepared = acceptance::PreparedAcceptance { proposal, baseline };
     std::fs::write(
         root.join("arithmetic.py"),
@@ -283,8 +275,23 @@ async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
     git_fixture(&root, &["add", "."]).await?;
     git_fixture(&root, &["commit", "-qm", "candidate"]).await?;
     let reference =
-        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()])
+        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.to_path_buf()])
             .await?;
+    Ok((prepared,reference))
+}
+
+async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
+    use augmentagent_channel_core::ProviderKind::Codex;
+    let scratch = tempfile::tempdir()?;
+    let root = scratch.path().join("candidate");
+    let control = workflow::path()
+        .parent()
+        .context("workflow state parent missing")?
+        .join("review-canary-artifacts")
+        .join(id);
+    std::fs::create_dir(&root)?;
+    std::fs::create_dir_all(&control)?;
+    let (prepared,reference) = prepare_fixture(&root,&control).await?;
     let repository = format!("autoship-canary/{id}");
     let mut guard = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root: &root,
@@ -318,7 +325,7 @@ async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
         research_filed: false,
     };
     // Controller owns this synthetic fixture; no claim that a model built it.
-    let result = aligned_review::run_inner(
+    let result = aligned_review::run_diagnostic_canary(
         Codex,
         &[],
         &aligned_review::ReviewSubject {
@@ -466,6 +473,21 @@ mod tests {
             0o770
         );
         assert!(!dir.path().join("canaries.db").exists());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_fixture_has_real_verifier_evidence_but_no_shipping_alignment() {
+        let dir=private_fixture();
+        let root=dir.path().join("candidate");
+        let control=dir.path().join("control");
+        std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&control).unwrap();
+        let (prepared,reference)=prepare_fixture(&root,&control).await.unwrap();
+        assert!(reference.alignment.is_none());
+        acceptance::assert_verifier_receipt_current(&root,&prepared,&reference).await.unwrap();
+        let shipping=acceptance::assert_receipt_current(&root,&prepared,&reference).await.unwrap_err();
+        assert!(shipping.to_string().contains("alignment"),"{shipping:#}");
+        std::fs::write(&reference.artifact,b"changed evidence").unwrap();
+        assert!(acceptance::assert_verifier_receipt_current(&root,&prepared,&reference).await.is_err());
     }
 
     #[tokio::test]

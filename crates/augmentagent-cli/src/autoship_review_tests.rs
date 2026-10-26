@@ -694,3 +694,15 @@ fn fresh_session_origin_is_protected_and_all_roles_reject_actual_builder_session
     assert!(review_authority_checked(&binding(), &[], &repeated, None, &origin).is_err());
     assert!(review_authority(&binding(), &[], &current, None).is_err(), "unknown history without protected origin must fail closed");
 }
+
+#[test]
+fn diagnostic_origin_never_authorizes_shipping_even_with_clean_completed_reviews() {
+    let diagnostic=ReviewOrigin::DiagnosticCanary { origin: Box::new(ReviewOrigin::FreshSession {
+        workflow_id:"autoship-canary/synthetic#840".into(),candidate_head:"head-a".into(),
+        contract_hash:"contract".into(),evidence_hash:"evidence".into(),receipt:"fixture".into(),
+    }) };
+    let error=review_authority_checked(&binding(),&builders(),&passes(vec![]),None,&diagnostic).unwrap_err();
+    assert!(error.to_string().contains("diagnostic canary cannot authorize shipping"));
+    let dir=tempfile::tempdir().unwrap();
+    assert!(diagnostic.validate_at(&dir.path().join("missing.db"),"head-a").is_err(), "unprotected diagnostic origin must fail before provider calls");
+}

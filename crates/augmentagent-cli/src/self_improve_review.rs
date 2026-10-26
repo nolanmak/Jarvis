@@ -254,6 +254,38 @@ pub(super) async fn run_inner(
     context: ReviewContext<'_>,
     origin: aligned::ReviewOrigin,
 ) -> Result<IndependentReview> {
+    run_impl(provider, _authors, issue, worktree, criteria, context, origin,false).await
+}
+
+pub(super) async fn run_diagnostic_canary(
+    provider: augmentagent_channel_core::ProviderKind,
+    _authors: &[augmentagent_channel_core::ProviderKind],
+    issue: &ReviewSubject<'_>,
+    worktree: PathBuf,
+    criteria: &[String],
+    context: ReviewContext<'_>,
+    origin: aligned::ReviewOrigin,
+) -> Result<IndependentReview> {
+    anyhow::ensure!(provider == augmentagent_channel_core::ProviderKind::Codex,
+        "diagnostic canary requires pinned native Codex");
+    let workflow = context.workflow.context("diagnostic review requires a protected workflow")?;
+    anyhow::ensure!(workflow.repository().starts_with("autoship-canary/") && workflow.pr()?.is_none(),
+        "diagnostic review is limited to synthetic canary workflows");
+    let origin = aligned::ReviewOrigin::DiagnosticCanary { origin: Box::new(origin) };
+    origin.validate(&workflow.binding().head)?;
+    run_impl(provider, _authors, issue, worktree, criteria, context, origin,true).await
+}
+
+async fn run_impl(
+    provider: augmentagent_channel_core::ProviderKind,
+    _authors: &[augmentagent_channel_core::ProviderKind],
+    issue: &ReviewSubject<'_>,
+    worktree: PathBuf,
+    criteria: &[String],
+    context: ReviewContext<'_>,
+    origin: aligned::ReviewOrigin,
+    diagnostic: bool,
+) -> Result<IndependentReview> {
     anyhow::ensure!(
         !criteria.is_empty(),
         "acceptance criteria missing; scope before review"
@@ -267,7 +299,11 @@ pub(super) async fn run_inner(
     } = candidate_snapshot(&worktree).await?;
     let mut contract: BTreeMap<String, String> =
         if let Some((prepared, reference)) = context.acceptance_evidence {
-            acceptance::assert_receipt_current(&worktree, prepared, reference).await?;
+            if diagnostic {
+                acceptance::assert_verifier_receipt_current(&worktree,prepared,reference).await?;
+            } else {
+                acceptance::assert_receipt_current(&worktree, prepared, reference).await?;
+            }
             anyhow::ensure!(
                 reference.binding.head == head,
                 "review acceptance head mismatch"

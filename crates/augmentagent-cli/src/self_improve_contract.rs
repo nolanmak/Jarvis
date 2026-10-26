@@ -1510,6 +1510,26 @@ pub(super) async fn assert_receipt_current(
     prepared: &PreparedAcceptance,
     reference: &CandidateReceiptReference,
 ) -> Result<()> {
+    assert_verifier_receipt_current(worktree,prepared,reference).await?;
+    alignment::assert_current(
+        worktree,
+        prepared,
+        reference
+            .alignment
+            .as_ref()
+            .context("candidate lacks independent alignment evidence")?,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Verifier integrity alone is not shipping authority. Only the protected
+/// diagnostic canary uses this without the mandatory alignment gate above.
+pub(super) async fn assert_verifier_receipt_current(
+    worktree: &Path,
+    prepared: &PreparedAcceptance,
+    reference: &CandidateReceiptReference,
+) -> Result<()> {
     use sha2::{Digest, Sha256};
     let head = actual_head(worktree).await?;
     ensure!(
@@ -1535,15 +1555,6 @@ pub(super) async fn assert_receipt_current(
         )?,
         "acceptance artifact does not prove candidate"
     );
-    alignment::assert_current(
-        worktree,
-        prepared,
-        reference
-            .alignment
-            .as_ref()
-            .context("candidate lacks independent alignment evidence")?,
-    )
-    .await?;
     let status = trusted_git(
         worktree,
         &["status", "--porcelain", "--untracked-files=all"],

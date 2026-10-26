@@ -57,6 +57,7 @@ pub struct Actor {
 pub enum ReviewOrigin {
     #[default]
     RecordedBuilders,
+    DiagnosticCanary { origin: Box<ReviewOrigin> },
     FreshSession {
         workflow_id: String,
         candidate_head: String,
@@ -77,6 +78,12 @@ impl ReviewOrigin {
         self.validate_at(&crate::autoship_workflow::default_path(), head)
     }
     fn validate_at(&self, path: &std::path::Path, head: &str) -> Result<()> {
+        if let Self::DiagnosticCanary { origin } = self {
+            ensure!(matches!(origin.as_ref(), Self::FreshSession { workflow_id, .. }
+                if workflow_id.starts_with("autoship-canary/")), "diagnostic review requires protected canary workflow");
+            return origin.validate_at(path,head);
+        }
+
         if let Self::FreshSession {
             workflow_id,
             candidate_head,
@@ -131,7 +138,7 @@ impl ReviewOrigin {
         Ok(())
     }
     pub fn is_session_isolated(&self) -> bool {
-        matches!(self, Self::Imported { .. } | Self::FreshSession { .. })
+        matches!(self, Self::Imported { .. } | Self::FreshSession { .. } | Self::DiagnosticCanary { .. })
     }
     pub fn is_imported(&self) -> bool {
         matches!(self, Self::Imported { .. })
@@ -785,6 +792,7 @@ fn review_authority_checked(
     adjudication: Option<&AdjudicationReceipt>,
     origin: &ReviewOrigin,
 ) -> Result<MergeAuthority> {
+    ensure!(!matches!(origin,ReviewOrigin::DiagnosticCanary { .. }), "diagnostic canary cannot authorize shipping");
     binding.validate()?;
     for role in [ReviewRole::Qa, ReviewRole::Diff, ReviewRole::System] {
         ensure!(
