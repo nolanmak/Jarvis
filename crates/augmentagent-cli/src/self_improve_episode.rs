@@ -100,7 +100,49 @@ pub(super) async fn evaluate(
         infrastructure_failed: !review.available,
         autonomous_merge_observed: false,
     };
-    let decision = workflow.observe_episode(&observation)?;
+    let mut decision = workflow.observe_episode(&observation)?;
+    if complete && review.available {
+        for (action, phase, payload) in workflow.episode_dispatch(&epoch)? {
+            let mut details: serde_json::Value = serde_json::from_str(&payload)?;
+            if matches!(phase.as_str(), "repair_dispatch" | "uncertain_legacy")
+                || (remaining.is_empty()
+                    && matches!(
+                        phase.as_str(),
+                        "prepared" | "scope_dispatch" | "scope_complete"
+                    ))
+            {
+                workflow.checkpoint_episode_dispatch(&epoch,&action,"reconciled",&serde_json::json!({"review_receipt":observation.receipt,"head":workflow.binding().head}).to_string())?;
+                continue;
+            }
+            let resumable = if phase == "scope_dispatch" {
+                // A read-only scoper's response was lost. Never call it again;
+                // the newly verified candidate and remaining facts are sufficient
+                // to resume its still-unlaunched repair intent honestly.
+                details["plan"] = serde_json::json!("Prior scoper outcome is uncertain; use the reverified contract and findings, without assuming an unobserved plan.");
+                workflow.checkpoint_episode_dispatch(
+                    &epoch,
+                    &action,
+                    "scope_complete",
+                    &details.to_string(),
+                )?;
+                true
+            } else {
+                matches!(phase.as_str(), "prepared" | "scope_complete")
+            };
+            if resumable && !remaining.is_empty() {
+                let best_head = details["best_head"]
+                    .as_str()
+                    .unwrap_or(&observation.candidate.binding.head)
+                    .to_string();
+                decision = if action == "fresh_session" {
+                    Decision::FreshSession { best_head }
+                } else {
+                    Decision::Rescope { best_head }
+                };
+                break;
+            }
+        }
+    }
     Ok(Evaluated {
         decision,
         epoch,
@@ -168,6 +210,8 @@ pub(super) async fn restore_best(root: &Path, workflow: &str, best: &str) -> Res
 pub(super) struct RepairSession {
     pub opts: augmentagent_channel_core::ReasonerOpts,
     pub prompt: String,
+    pub epoch: String,
+    pub action: String,
 }
 
 pub(super) async fn session(
@@ -206,20 +250,19 @@ pub(super) async fn session_for(
         Decision::Rescope { best_head } => (best_head, true),
         _ => anyhow::bail!("episode does not request a new repair context"),
     };
-    if !workflow.admit_episode_action(
-        &evaluated.epoch,
-        if rescope { "rescope" } else { "fresh_session" },
-    )? {
-        workflow
-            .transition(
-                crate::autoship_workflow::Stage::Build,
-                "episode_strategy_already_dispatched",
-                "repair_remaining_facts",
-                chrono::Utc::now().timestamp_millis() + 300_000,
-            )
-            .await?;
+    let action = if rescope { "rescope" } else { "fresh_session" };
+    workflow.admit_episode_action(&evaluated.epoch, action)?;
+    let (_, phase, payload) = workflow
+        .episode_dispatch(&evaluated.epoch)?
+        .into_iter()
+        .find(|(a, _, _)| a == action)
+        .context("episode dispatch missing")?;
+    if !matches!(phase.as_str(), "prepared" | "scope_complete") {
         return Ok(None);
     }
+    let mut details: serde_json::Value = serde_json::from_str(&payload)?;
+    details["best_head"] = serde_json::json!(best);
+    workflow.checkpoint_episode_dispatch(&evaluated.epoch, action, &phase, &details.to_string())?;
     workflow
         .transition(
             crate::autoship_workflow::Stage::Reconcile,
@@ -257,12 +300,31 @@ pub(super) async fn session_for(
         "contract":prepared.proposal.contract,"remaining_facts":facts
     }))?;
     if rescope {
-        let mut opts = scope_opts(root.to_path_buf());
-        opts.session_id = Some(uuid::Uuid::new_v4().to_string());
-        let plan=augmentagent_channel_core::native_session::FreshBuilderSessions::new().scope(reasoner.call(&opts,&format!("Re-scope the repair strategy for the following immutable contract and candidate. Read source and return the smallest concrete implementation plan. Do not add requirements, weaken verifiers, or request reviewer unanimity.\n{prompt}"))).await?;
-        prompt.push_str(
-            "\nIndependent re-scoping plan (apply only within the unchanged contract):\n",
-        );
+        let plan = if phase == "scope_complete" {
+            details["plan"]
+                .as_str()
+                .context("completed scope plan missing")?
+                .to_string()
+        } else {
+            let mut opts = scope_opts(root.to_path_buf());
+            opts.session_id = Some(uuid::Uuid::new_v4().to_string());
+            workflow.checkpoint_episode_dispatch(
+                &evaluated.epoch,
+                action,
+                "scope_dispatch",
+                &details.to_string(),
+            )?;
+            let plan = augmentagent_channel_core::native_session::FreshBuilderSessions::new().scope(reasoner.call(&opts,&format!("Re-scope repair for this immutable contract and candidate. Read source and return the smallest implementation plan; do not weaken verifiers.\n{prompt}"))).await?;
+            details["plan"] = serde_json::json!(truncate(&plan, 16000));
+            workflow.checkpoint_episode_dispatch(
+                &evaluated.epoch,
+                action,
+                "scope_complete",
+                &details.to_string(),
+            )?;
+            plan
+        };
+        prompt.push_str("\nIndependent re-scoping plan (unchanged contract):\n");
         prompt.push_str(&truncate(&plan, 16000));
     }
     let digest =
@@ -272,7 +334,36 @@ pub(super) async fn session_for(
     let mut opts = fix_opts(root.to_path_buf());
     // Audit correlation only. Actual transport identity comes from FreshBuilderSessions.
     opts.session_id = Some(uuid::Uuid::from_bytes(bytes).to_string());
-    Ok(Some(RepairSession { opts, prompt }))
+    Ok(Some(RepairSession {
+        opts,
+        prompt,
+        epoch: evaluated.epoch.clone(),
+        action: action.into(),
+    }))
+}
+
+/// Dispatch is journaled before provider admission. A lost response remains
+/// uncertain until completed candidate verification/review reconciles it.
+pub(super) async fn dispatch<T>(
+    workflow: &workflow::WorkflowGuard,
+    intent: Option<(String, String)>,
+    call: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if let Some((epoch, action)) = &intent {
+        let (_, _, payload) = workflow
+            .episode_dispatch(epoch)?
+            .into_iter()
+            .find(|(a, _, _)| a == action)
+            .context("episode dispatch missing")?;
+        workflow.checkpoint_episode_dispatch(epoch, action, "repair_dispatch", &payload)?;
+    }
+    let result = call.await;
+    if result.is_ok() {
+        if let Some((epoch, action)) = &intent {
+            workflow.checkpoint_episode_dispatch(epoch, action, "repair_complete", "{}")?;
+        }
+    }
+    result
 }
 
 #[cfg(test)]

@@ -423,10 +423,13 @@ async fn execute(
             None => (fix_opts(worktree.to_path_buf()),format!("Address verified review findings for this PR. Preserve pinned acceptance; do not weaken verifiers.\n{request}\n{}",review.notes)),
         };
         let call = adoption::revise(reasoner, guard, &opts, &prompt);
-        let result = match &native_sessions {
-            Some(sessions) => sessions.scope(call).await,
-            None => call.await,
-        };
+        let result = episode::dispatch(guard, episode_dispatch, async {
+            match &native_sessions {
+                Some(sessions) => sessions.scope(call).await,
+                None => call.await,
+            }
+        })
+        .await;
         if let Some(sessions) = &native_sessions {
             guard.record_episode_sessions(sessions)?;
         }

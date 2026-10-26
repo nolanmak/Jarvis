@@ -7401,12 +7401,13 @@ async fn resume_draft_pr(
             "resume: revising against findings"
         );
         if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+        let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
         let (repair_opts,repair_prompt) = match episode_session {
             Some(session) => (session.opts,session.prompt),
             None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines_now,prior_attempts.as_deref())),
         };
         let call = adoption::revise(reasoner, &workflow,&repair_opts,&repair_prompt);
-        let revised = match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await };
+        let revised = episode::dispatch(&workflow,episode_dispatch,async { match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await } }).await;
         if let Some(sessions) = &episode_native_sessions { workflow.record_episode_sessions(sessions)?; }
         let rev_summary = match revised
         {
@@ -8687,12 +8688,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
             if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+            let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
             let (repair_opts,repair_prompt) = match episode_session {
                 Some(session) => (session.opts,session.prompt),
                 None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines,prior_attempts.as_deref())),
             };
             let call = reasoner.call_revision_with_storage(&repair_opts,&repair_prompt);
-            let revised = match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await };
+            let revised = episode::dispatch(&workflow_guard,episode_dispatch,async { match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await } }).await;
             if let Some(sessions) = &episode_native_sessions { workflow_guard.record_episode_sessions(sessions)?; }
             match revised
             {

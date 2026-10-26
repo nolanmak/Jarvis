@@ -555,6 +555,25 @@ impl WorkflowGuard {
         Ok(None)
     }
 
+    pub(super) fn episode_dispatch(&self, epoch: &str) -> Result<Vec<(String, String, String)>> {
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .episode_dispatch(self.id(), epoch)
+    }
+    pub(super) fn checkpoint_episode_dispatch(
+        &self,
+        epoch: &str,
+        action: &str,
+        phase: &str,
+        payload: &str,
+    ) -> Result<()> {
+        self.validate_before_side_effect()?;
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .checkpoint_episode_dispatch(&self.lease, epoch, action, phase, payload, millis())
+    }
     pub(super) fn admit_episode_action(&self, epoch: &str, action: &str) -> Result<bool> {
         self.validate_before_side_effect()?;
         self.store

@@ -203,6 +203,10 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS episode_action (
                 workflow TEXT NOT NULL REFERENCES workflow(id), epoch TEXT NOT NULL, action TEXT NOT NULL,
                 at_ms INTEGER NOT NULL, PRIMARY KEY(workflow,epoch,action));
+            CREATE TABLE IF NOT EXISTS episode_dispatch (
+                workflow TEXT NOT NULL, epoch TEXT NOT NULL, action TEXT NOT NULL,
+                phase TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(workflow,epoch,action));
+            INSERT OR IGNORE INTO episode_dispatch SELECT workflow,epoch,action,'uncertain_legacy','{}' FROM episode_action;
             CREATE TABLE IF NOT EXISTS fresh_review_origin (
                 receipt TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id), binding TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS imported_origin (
@@ -935,6 +939,10 @@ impl WorkflowStore {
             params![lease.workflow, epoch, action, now],
         )? == 1;
         if inserted {
+            tx.execute(
+                "INSERT INTO episode_dispatch VALUES(?1,?2,?3,'prepared','{}')",
+                params![lease.workflow, epoch, action],
+            )?;
             event(
                 &tx,
                 &lease.workflow,
@@ -946,6 +954,79 @@ impl WorkflowStore {
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    pub fn episode_dispatch(
+        &self,
+        workflow: &str,
+        epoch: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut statement = self.conn.prepare("SELECT action,phase,payload FROM episode_dispatch WHERE workflow=?1 AND epoch=?2 ORDER BY action")?;
+        let rows = statement.query_map(params![workflow, epoch], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn checkpoint_episode_dispatch(
+        &mut self,
+        lease: &Lease,
+        epoch: &str,
+        action: &str,
+        phase: &str,
+        payload: &str,
+        now: i64,
+    ) -> Result<()> {
+        ensure!(
+            payload.len() <= 32 * 1024,
+            "episode checkpoint exceeds context budget"
+        );
+        ensure!(
+            matches!(
+                phase,
+                "prepared"
+                    | "scope_dispatch"
+                    | "scope_complete"
+                    | "repair_dispatch"
+                    | "repair_complete"
+                    | "reconciled"
+            ),
+            "invalid episode phase"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let state: String = tx.query_row(
+            "SELECT state FROM episode_state WHERE workflow=?1",
+            [&lease.workflow],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            serde_json::from_str::<crate::autoship_episode::Episode>(&state)?.epoch == epoch,
+            "episode epoch changed"
+        );
+        let old: String = tx.query_row(
+            "SELECT phase FROM episode_dispatch WHERE workflow=?1 AND epoch=?2 AND action=?3",
+            params![lease.workflow, epoch, action],
+            |r| r.get(0),
+        )?;
+        let legal = (old == phase && !matches!(phase, "scope_dispatch" | "repair_dispatch"))
+            || matches!(
+                (old.as_str(), phase),
+                (
+                    "prepared",
+                    "scope_dispatch" | "repair_dispatch" | "reconciled"
+                ) | ("scope_dispatch", "scope_complete" | "reconciled")
+                    | ("scope_complete", "repair_dispatch" | "reconciled")
+                    | ("repair_dispatch", "repair_complete" | "reconciled")
+                    | ("uncertain_legacy", "reconciled")
+            );
+        ensure!(legal, "invalid episode transition {old} -> {phase}");
+        tx.execute("UPDATE episode_dispatch SET phase=?4,payload=?5 WHERE workflow=?1 AND epoch=?2 AND action=?3",params![lease.workflow,epoch,action,phase,payload])?;
+        event(&tx,&lease.workflow,lease.generation,"episode_dispatch_checkpoint",&serde_json::json!({"epoch":epoch,"action":action,"phase":phase,"payload":serde_json::from_str::<serde_json::Value>(payload)?}).to_string(),now)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn observe_episode(
@@ -1159,6 +1240,16 @@ mod tests {
         assert!(store
             .admit_episode_action(&lease, "epoch-a", "rescope", 32)
             .unwrap());
+        store
+            .checkpoint_episode_dispatch(
+                &lease,
+                "epoch-a",
+                "fresh_session",
+                "repair_dispatch",
+                r#"{"best_head":"head-a"}"#,
+                32,
+            )
+            .unwrap();
         drop(store);
         let mut store = WorkflowStore::open(&path).unwrap();
         for action in ["fresh_session", "rescope"] {
@@ -1166,6 +1257,73 @@ mod tests {
                 .admit_episode_action(&lease, "epoch-a", action, 33)
                 .unwrap());
         }
+        let recovered = store.episode_dispatch(&lease.workflow, "epoch-a").unwrap();
+        assert!(
+            recovered
+                .iter()
+                .any(|(action, phase, _)| action == "rescope" && phase == "prepared"),
+            "admitted but unlaunched intent must remain resumable"
+        );
+        assert!(
+            recovered
+                .iter()
+                .any(|(action, phase, _)| action == "fresh_session" && phase == "repair_dispatch"),
+            "uncertain launch must survive restart"
+        );
+        assert!(
+            store
+                .checkpoint_episode_dispatch(
+                    &lease,
+                    "epoch-a",
+                    "fresh_session",
+                    "prepared",
+                    "{}",
+                    34
+                )
+                .is_err(),
+            "unknown launch cannot be reset and repeated"
+        );
+        store
+            .checkpoint_episode_dispatch(
+                &lease,
+                "epoch-a",
+                "fresh_session",
+                "reconciled",
+                r#"{"review_receipt":"review-after-crash"}"#,
+                35,
+            )
+            .unwrap();
+        assert!(store
+            .checkpoint_episode_dispatch(
+                &lease,
+                "epoch-a",
+                "fresh_session",
+                "repair_dispatch",
+                "{}",
+                36
+            )
+            .is_err());
+        store
+            .checkpoint_episode_dispatch(&lease, "epoch-a", "rescope", "scope_dispatch", "{}", 37)
+            .unwrap();
+        store
+            .checkpoint_episode_dispatch(
+                &lease,
+                "epoch-a",
+                "rescope",
+                "scope_complete",
+                r#"{"plan":"preserved plan"}"#,
+                38,
+            )
+            .unwrap();
+        drop(store);
+        let mut store = WorkflowStore::open(&path).unwrap();
+        assert!(store
+            .episode_dispatch(&lease.workflow, "epoch-a")
+            .unwrap()
+            .iter()
+            .any(|(_, phase, payload)| phase == "scope_complete"
+                && payload.contains("preserved plan")));
         assert!(store
             .admit_episode_action(&lease, "epoch-b", "rescope", 34)
             .is_err());
