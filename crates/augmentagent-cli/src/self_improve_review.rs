@@ -594,7 +594,10 @@ async fn run_impl(
                 "completed_reviews": structured.passes,
             }))?;
             let attempts = match context.workflow {
-                Some(workflow) => workflow.reserve_adjudication()?,
+                Some(workflow) => {
+                    workflow.check_resource_policy()?;
+                    workflow.reserve_adjudication()?
+                },
                 None => context.adjudication_attempts_already_made,
             };
             structured.adjudication = Some(

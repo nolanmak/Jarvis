@@ -806,7 +806,7 @@ impl WorkflowGuard {
             .checkpoint_episode_dispatch(&self.lease, epoch, action, phase, payload, millis())
     }
     pub(super) fn admit_episode_action(&self, epoch: &str, action: &str) -> Result<bool> {
-        self.validate_before_side_effect()?;
+        self.check_resource_policy()?;
         self.store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
@@ -1079,13 +1079,18 @@ impl WorkflowGuard {
         )
     }
 
+    pub(super) fn check_resource_policy(&self) -> Result<()> {
+        self.validate_before_side_effect()?;
+        augmentagent_channel_core::run_resources::check_requirement("workflow_action", Some(&self.audit))
+    }
+
     pub(super) fn admit_epoch_attempt(
         &self,
         purpose: &str,
         epoch: &str,
         limit: u32,
     ) -> Result<bool> {
-        self.validate_before_side_effect()?;
+        self.check_resource_policy()?;
         self.store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
@@ -2214,6 +2219,11 @@ mod tests {
         guard.checkpoint(Stage::Verify, "candidate_committed", "verify", 0, &["protected-candidate".into()]).await.unwrap();
         let before = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
         let accounting = guard.capacity_accounting(true).unwrap();
+        assert!(guard.admit_epoch_attempt("amendment", "unchanged-inputs", 1).is_err());
+        // The production wrapper refused before the durable reservation. The
+        // direct store assertion is a test probe, never a production bypass.
+        assert!(guard.store.lock().unwrap().admit_epoch_attempt(&guard.lease,
+            "amendment", "unchanged-inputs", 1, millis()).unwrap());
         let error = super::super::run_sandboxed("/bin/sh", &["-c", "touch forbidden-execution"], dir.path(),
             &[("PATH".into(), "/usr/bin:/bin".into())], &guard.audit_logger()).await.unwrap_err();
         assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<augmentagent_channel_core::reasoner::ReasonerError>(),
