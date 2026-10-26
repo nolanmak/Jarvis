@@ -1173,6 +1173,11 @@ impl WorkflowGuard {
             .admit_epoch_attempt(&self.lease, purpose, epoch, limit, millis())
     }
 
+    pub(super) fn set_readiness_dependency(&self,issue:u64,record:Option<(&str,&str,&str,&str)>)->Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?.set_readiness_dependency(&self.lease,&self.binding,&self.repository,issue,record,millis())
+    }
+
     pub(super) fn admit_attempt(&self, purpose: &str, limit: u32) -> Result<bool> {
         self.validate_before_side_effect()?;
         self.store

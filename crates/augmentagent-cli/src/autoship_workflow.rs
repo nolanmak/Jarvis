@@ -184,6 +184,17 @@ impl WorkflowStore {
         Ok(Some(Self {conn}))
     }
 
+    pub fn set_readiness_dependency(&mut self,lease:&Lease,binding:&Binding,repository:&str,issue:u64,record:Option<(&str,&str,&str,&str)>,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        if let Some((request_hash,base,kind,evidence))=record {
+            ensure!(!request_hash.is_empty() && !base.is_empty() && !kind.is_empty() && evidence.len()<=2*1024*1024,"invalid readiness dependency");
+            tx.execute("INSERT INTO issue_readiness_dependencies VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(repository,issue) DO UPDATE SET request_hash=excluded.request_hash,base=excluded.base,kind=excluded.kind,evidence=excluded.evidence",params![repository,issue,request_hash,base,kind,evidence])?;
+        } else {tx.execute("DELETE FROM issue_readiness_dependencies WHERE repository=?1 AND issue=?2",params![repository,issue])?;}
+        event(&tx,&lease.workflow,lease.generation,"readiness_dependency_changed",&serde_json::json!({"repository":repository,"issue":issue,"kind":record.map(|r|r.2)}).to_string(),now)?;
+        tx.commit()?;Ok(())
+    }
+
     pub(crate) fn query_connection<T>(&self,query:impl FnOnce(&Connection)->Result<T>)->Result<T> { query(&self.conn) }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -228,6 +239,7 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
@@ -1847,6 +1859,18 @@ mod tests {
                     .is_err());
             }
         }
+    }
+
+    #[test]
+    fn expired_controller_cannot_install_or_clear_readiness_dependency() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let (mut store,old)=setup(&path);
+        store.set_readiness_dependency(&old,&binding(),"repo",970,Some(("request","base","external_decision","evidence")),30).unwrap();
+        let current=store.claim(&old.workflow,"next",1021,1000).unwrap().unwrap();
+        assert!(store.set_readiness_dependency(&old,&binding(),"repo",970,None,1022).is_err());
+        assert!(store.set_readiness_dependency(&old,&binding(),"repo",971,Some(("request","base","external_decision","evidence")),1022).is_err());
+        let count:i64=store.conn.query_row("SELECT COUNT(*) FROM issue_readiness_dependencies",[],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        store.set_readiness_dependency(&current,&binding(),"repo",970,None,1023).unwrap();
+        let count:i64=store.conn.query_row("SELECT COUNT(*) FROM issue_readiness_dependencies",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
     }
 
     #[test]

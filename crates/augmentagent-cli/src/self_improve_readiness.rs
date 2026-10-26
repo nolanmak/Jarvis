@@ -44,6 +44,7 @@ fn validate(assessment:&Assessment,owner:&str,files:&BTreeMap<String,String>)->R
     }
     Ok(gaps)
 }
+#[cfg(test)]
 fn db(path:&Path)->Result<rusqlite::Connection> {
     let _=crate::autoship_workflow::WorkflowStore::open(path)?;
     let conn=rusqlite::Connection::open(path)?;
@@ -104,8 +105,8 @@ pub(in crate::self_improve) async fn assess(root:&Path,issue:&Issue,workflow:&mu
     let gaps=validate(&assessment,&owner,&files)?;
     let evidence=serde_json::to_string(&assessment)?;
     workflow.audit_logger().record_controller(serde_json::json!({"kind":"independent_readiness","base":base,"request_hash":request_hash(issue),"assessment":assessment}))?;
-    if gaps.is_empty() {db(&workflow::path())?.execute("DELETE FROM issue_readiness_dependencies WHERE repository=?1 AND issue=?2",rusqlite::params![workflow.repository(),issue.number])?;return Ok(Decision::Ready(evidence));}
-    db(&workflow::path())?.execute("INSERT INTO issue_readiness_dependencies VALUES(?1,?2,?3,?4,'external_decision',?5) ON CONFLICT(repository,issue) DO UPDATE SET request_hash=excluded.request_hash,base=excluded.base,kind=excluded.kind,evidence=excluded.evidence",rusqlite::params![workflow.repository(),issue.number,request_hash(issue),current_main,evidence])?;
+    if gaps.is_empty() {workflow.set_readiness_dependency(issue.number,None)?;return Ok(Decision::Ready(evidence));}
+    workflow.set_readiness_dependency(issue.number,Some((&request_hash(issue),&current_main,"external_decision",&evidence)))?;
     workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"material_external_decision_missing","await_request_or_main_change",0,&[evidence]).await?;
     Ok(Decision::Dependency(gaps.join("\n")))
 }
@@ -139,7 +140,7 @@ pub(in crate::self_improve) async fn prove_current_main(repo:&Path,issue:&Issue,
         ensure!(relevance.criterion_evidence.keys().collect::<BTreeSet<_>>()==proposal.contract.criteria.iter().map(|c|&c.id).collect() && relevance.criterion_evidence.values().all(|e|!e.trim().is_empty() && e.len()<=8000),"relevance must cover every registered criterion");
         ensure!(workflow::remote_main_head(repo,workflow.repository()).await?==base,"main changed during relevance investigation");
         let evidence=serde_json::json!({"kind":"already_satisfied_relevance","base":base,"request_hash":request_hash(issue),"baseline":baseline,"criterion_evidence":relevance.criterion_evidence,"explanation":relevance.explanation}).to_string();
-        db(&workflow::path())?.execute("INSERT INTO issue_readiness_dependencies VALUES(?1,?2,?3,?4,'objectively_satisfied',?5) ON CONFLICT(repository,issue) DO UPDATE SET request_hash=excluded.request_hash,base=excluded.base,kind=excluded.kind,evidence=excluded.evidence",rusqlite::params![workflow.repository(),issue.number,request_hash(issue),base,evidence])?;
+        workflow.set_readiness_dependency(issue.number,Some((&request_hash(issue),&base,"objectively_satisfied",&evidence)))?;
         workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"current_main_satisfies_registered_requirements","await_request_or_main_change",0,&[amendment::digest(evidence.as_bytes())]).await?;
         Ok(true)
     }.await;
