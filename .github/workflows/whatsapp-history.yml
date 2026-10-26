@@ -10,6 +10,10 @@ on:
       - 'crates/augmentagent-channel-core/**'
       - 'Cargo.*'
       - '.github/workflows/whatsapp-history.yml'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
 jobs:
@@ -30,7 +34,10 @@ jobs:
         with:
           toolchain: 1.94.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: python3 -m unittest discover -s scripts/whatsapp/tests -v
-      - run: cargo test -p augmentagent-channel-whatsapp-history -p augmentagent-channel-imessage -p augmentagent-mcp-memory
-      - run: cargo test -p augmentagent-cli --test whatsapp_history_cli
-      - run: cargo test -p augmentagent-channel-core --lib ask_opts_registers_memory_mcp_server_and_recall_tools
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-history/history/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-history/history/5"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-history/history/6"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-history/history/7"

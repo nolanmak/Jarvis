@@ -15,13 +15,4 @@ jobs:
         with:
           fetch-depth: 0
       - name: Reject gmail author/committer emails on new commits
-        run: |
-          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
-          bad=$(git log --format='%ae %ce' "$range" | tr ' ' '\n' | grep -iE 'gmail\.com' | sort -u || true)
-          if [ -n "$bad" ]; then
-            echo "::error::Commit(s) in this PR use a personal gmail author/committer address:"
-            echo "$bad"
-            echo "Commit as the nolanmak GitHub noreply instead — see docs/PUBLISH.md."
-            exit 1
-          fi
-          echo "OK: no gmail author/committer emails in this PR's commits."
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id no-gmail-authors/check/1 --input-base \"${{ github.event.pull_request.base.sha }}\" --input-head \"${{ github.event.pull_request.head.sha }}\""

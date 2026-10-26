@@ -25,12 +25,11 @@ jobs:
           cache: npm
       - name: Record OS, architecture and runtime
         shell: bash
-        run: |
-          uname -srm
-          if [ "$(uname -s)" = Darwin ]; then sw_vers; fi
-          node --version
-          npm --version
-      - run: npm ci
-      - run: npm run build
-      - run: node --test test/sessionProcesses.test.js
-      - run: npm test
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id dashboard-sessions/sessions/2"
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id dashboard-sessions/sessions/3"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id dashboard-sessions/sessions/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id dashboard-sessions/sessions/5"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id dashboard-sessions/sessions/6"

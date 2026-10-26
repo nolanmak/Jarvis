@@ -10,7 +10,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo test -p augmentagent-store --test approval_history --locked
-      - run: cargo test -p augmentagent-approval-discord --lib --locked
-      - run: cargo test -p augmentagent-cli --bin augmentagent approval_context::tests --locked
-      - run: cargo test -p augmentagent-cli --bin augmentagent calendar_approval_tests --locked
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id approval-history/decisions-and-context/3"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id approval-history/decisions-and-context/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id approval-history/decisions-and-context/5"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id approval-history/decisions-and-context/6"

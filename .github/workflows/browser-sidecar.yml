@@ -9,6 +9,10 @@ on:
       - 'crates/augmentagent-cli/src/installers.rs'
       - 'systemd/augmentagent-browser-sidecar.service'
       - '.github/workflows/browser-sidecar.yml'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
   push:
     branches: [main]
     paths:
@@ -19,6 +23,10 @@ on:
       - 'systemd/augmentagent-browser-sidecar.service'
       - '.github/workflows/browser-sidecar.yml'
 
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
 
@@ -39,6 +47,7 @@ jobs:
           cache: pip
           cache-dependency-path: sidecars/browser/requirements.txt
       - name: Install pinned browser runtime
-        run: bash sidecars/browser/setup.sh
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id browser-sidecar/synthetic-page/2"
+
       - name: Synthetic page and restart contract
-        run: sidecars/browser/.venv/bin/python -m unittest sidecars.browser.test_smoke -v
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id browser-sidecar/synthetic-page/3"
