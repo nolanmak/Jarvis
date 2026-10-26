@@ -1913,7 +1913,7 @@ mod tests {
         resources.record_outcome("recovery_fixture",Some(&recovered)).unwrap();
         recovered.protected_health().unwrap();
         assert!(old.protected_health().is_err());
-        assert_eq!(store.audit_generation(&id).unwrap(),1);
+        assert_eq!(store.audit_generation(&id).unwrap(),lease.generation);
         assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.next.action,"reverify_candidate");
     }
 
