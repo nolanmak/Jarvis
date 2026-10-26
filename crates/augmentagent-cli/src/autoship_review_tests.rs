@@ -868,3 +868,39 @@ async fn correction_uses_two_distinct_fresh_native_protocol_sessions() {
     assert_eq!(reasoner.calls.load(Ordering::SeqCst),2);
     assert_eq!(receipt.actor.session_id,"protocol-only-session-1");
 }
+
+#[tokio::test]
+async fn component_authority_preserves_exact_native_rulings_and_all_findings() {
+    let first=finding("first");let mut second=finding("second");second.criterion_id="C2".into();
+    let a=dismissed(&[first.clone()]).await;
+    let mut b=dismissed(&[second.clone()]).await;b.actor.session_id="synthetic-second-adjudication".into();
+    let findings=vec![first,second];let empty=BTreeSet::new();
+    let aggregate=adjudication_groups::compose(&binding(),&findings,vec![a.clone(),b.clone()],&builders(),&ReviewOrigin::RecordedBuilders,&empty).unwrap();
+    assert_eq!(aggregate.components.len(),2);
+    assert_eq!(aggregate.actor,a.actor);
+    assert!(review_authority(&binding(),&builders(),&passes(findings.clone()),Some(&aggregate)).is_ok());
+    let mut forged=aggregate.clone();forged.rulings.remove("second");
+    assert!(review_authority(&binding(),&builders(),&passes(findings.clone()),Some(&forged)).is_err());
+    let mut forged=aggregate.clone();forged.components[1].binding.head="changed".into();
+    assert!(review_authority(&binding(),&builders(),&passes(findings.clone()),Some(&forged)).is_err());
+    let mut duplicate=b.clone();duplicate.actor.session_id=a.actor.session_id.clone();
+    assert!(adjudication_groups::compose(&binding(),&findings,vec![a.clone(),duplicate],&builders(),&ReviewOrigin::RecordedBuilders,&empty).is_err());
+    assert!(adjudication_groups::compose(&binding(),&findings,vec![a],&builders(),&ReviewOrigin::RecordedBuilders,&empty).is_err());
+    assert!(adjudication_groups::compose(&binding(),&findings,vec![aggregate],&builders(),&ReviewOrigin::RecordedBuilders,&empty).is_err(),"nested summaries cannot replace native leaf authority");
+}
+
+#[tokio::test]
+async fn connected_conflicts_and_owner_criterion_never_split_final_authority() {
+    let a=finding("A");let b=finding("B");
+    assert_eq!(adjudication_groups::components(&[a.clone(),b.clone()]).unwrap().len(),1);
+    let mut a=a;let mut b=b;a.criterion_id="REGRESSION".into();b.criterion_id="REGRESSION".into();
+    assert_eq!(adjudication_groups::components(&[a.clone(),b.clone()]).unwrap().len(),2);
+    a.conflicts_with.insert(b.id.clone());
+    assert_eq!(adjudication_groups::components(&[a.clone(),b.clone()]).unwrap().len(),1);
+    // Even individually valid leaf transcripts cannot independently decide
+    // opposing sides of the same dispute.
+    a.criterion_id="C1".into();b.criterion_id="C2".into();
+    let first=dismissed(&[a.clone()]).await;
+    let mut second=dismissed(&[b.clone()]).await;second.actor.session_id="synthetic-other".into();
+    assert!(adjudication_groups::compose(&binding(),&[a,b],vec![first,second],&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).is_err());
+}

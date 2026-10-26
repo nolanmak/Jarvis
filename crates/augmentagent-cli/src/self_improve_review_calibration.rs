@@ -603,6 +603,7 @@ mod tests {
                     .to_string(),
             criteria: BTreeMap::from([("C1".into(), "sum".into())]),
             adjudication: review::AdjudicationReceipt {
+                components:vec![],
                 binding,
                 actor: review::Actor {
                     provider: "codex".into(),

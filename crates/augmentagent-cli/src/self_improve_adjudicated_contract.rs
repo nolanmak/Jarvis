@@ -101,6 +101,8 @@ fn directives(
         !sessions.contains(&receipt.actor.session_id),
         "final amendment authority reused reviewer session"
     );
+    crate::autoship_review::adjudication_groups::validate(receipt,&review.binding,
+        &findings.values().map(|finding|(*finding).clone()).collect::<Vec<_>>(),&review.builders,&review.origin,&sessions)?;
     let mut directives = vec![];
     for (id, ruling) in &receipt.rulings {
         let finding = findings

@@ -510,9 +510,16 @@ impl Ruling {
     }
 }
 
+#[path = "autoship_review_groups.rs"]
+pub(crate) mod adjudication_groups;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdjudicationReceipt {
+    /// Empty for a single native call. Aggregates retain actual component
+    /// transcripts and actors; the controller never invents a final session.
+    #[serde(default,skip_serializing_if="Vec::is_empty")]
+    pub components: Vec<AdjudicationReceipt>,
     pub binding: ReviewBinding,
     pub actor: Actor,
     pub finding_fingerprints: BTreeMap<String, String>,
@@ -739,6 +746,7 @@ async fn adjudicate_with_origin<R: Reasoner + ?Sized>(
         .map(|f| Ok((f.id.clone(), f.fingerprint()?)))
         .collect::<Result<_>>()?;
     Ok(AdjudicationReceipt {
+        components:vec![],
         binding,
         actor,
         finding_fingerprints,
@@ -923,6 +931,9 @@ fn review_authority_checked(
         &receipt.binding == binding,
         "adjudication concerns another candidate"
     );
+    let actual:BTreeMap<_,_>=passes.iter().flat_map(|pass|pass.findings.iter().map(|finding|(finding.id.clone(),finding.clone()))).collect();
+    adjudication_groups::validate(receipt,binding,&actual.into_values().collect::<Vec<_>>(),builders,origin,
+        &sessions.iter().map(|session|(*session).clone()).collect())?;
     receipt.actor.independent_for(builders, origin)?;
     ensure!(
         receipt.actor.provider == "codex" && receipt.actor.backend == "native",
