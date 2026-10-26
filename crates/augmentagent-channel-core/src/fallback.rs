@@ -221,6 +221,11 @@ pub fn workflow_native_ineligible_reason(kind:ProviderKind)->Option<String> {
         _=>Some("required native VM provider credential is not declared or valid".into()),
     }
 }
+fn workflow_route_auth(kind: ProviderKind, routed: bool) -> bool {
+    if routed { crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false) }
+    else { crate::native_vm::declared_native_auth(kind.name()).unwrap_or(false) }
+}
+
 fn workflow_entry_for(kind:ProviderKind)->Option<Entry> {
     workflow_native_ineligible_reason(kind).is_none().then(||unchecked_entry(kind))
 }
@@ -438,6 +443,10 @@ impl FallbackReasoner {
             if !(self.profile_enabled)(entry.kind) { continue; }
             if routing.as_ref().is_some_and(|r| !r.allows(entry.kind))
                 || (selected.is_none() && !routing.as_ref().is_some_and(|r| r.enabled()) && self.gateway_only.contains(&entry.kind)) {
+                continue;
+            }
+            if required && (self.workflow_native_only || entry.reasoner.defers_model_admission())
+                && !workflow_route_auth(entry.kind, routing.as_ref().is_some_and(|r| r.enabled())) {
                 continue;
             }
             if !allowed_for(entry.kind, class) {
@@ -699,6 +708,12 @@ impl FallbackReasoner {
             // Account cooldowns belong to 9Router. Native-login cooldowns must
             // neither block a fresh account pool nor be cleared by its success.
             let routed = routing.as_ref().is_some_and(|r| r.enabled());
+            if opts.audit_logger.as_ref().is_some_and(|logger| logger.run_resources_required())
+                && (self.workflow_native_only || entry.reasoner.defers_model_admission())
+                && !workflow_route_auth(entry.kind, routed) {
+                diagnostics.push(format!("{name}: selected route lacks declared workflow credentials"));
+                continue;
+            }
             if revision_authors.is_some_and(|authors| !authors.contains(&entry.kind)) {
                 diagnostics.push(format!("{name}: reserved for independent review"));
                 continue;
@@ -1474,12 +1489,22 @@ mod tests {
         let logger=Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("audit"),anchors.join("anchor"),&[]).unwrap());
         logger.require_run_resources().unwrap();
         let scripted=Scripted::ok("supplied-evidence fixture");
-        let chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,scripted.clone())],latch_in(&temp));
-        let mut opts=text_only_opts();opts.audit_logger=Some(logger);
+        let mut chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,scripted.clone())],latch_in(&temp));
+        chain.workflow_native_only=true;
+        let mut opts=text_only_opts();opts.audit_logger=Some(logger.clone());
+        chain.set_workflow_audit(logger.clone()).unwrap();
+        let routed=crate::model_router::parse(&crate::model_router::tests::fixture().to_string()).unwrap();
+        crate::model_router::SNAPSHOT.scope(Some(routed), async {
+            assert!(matches!(chain.lane_availability(crate::providers::CapabilityClass::TextOnly), LaneAvailability::NoEligibleProvider));
+            assert!(chain.call(&opts,"must not dispatch routed call").await.is_err());
+            assert_eq!(scripted.count(),0,"native credentials cannot authorize the selected router route");
+        }).await;
         let result=crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.unwrap();
         assert_eq!(result,"supplied-evidence fixture");
         assert_eq!(scripted.count(),1);
         opts.audit_logger=None;
+        chain.workflow_native_only=false;
+        *chain.workflow_audit.lock().unwrap()=None;
         assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.is_err());
         assert_eq!(scripted.count(),1,"interactive native eligibility must not borrow service credentials");
     }
