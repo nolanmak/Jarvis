@@ -24,7 +24,7 @@ impl Drop for OwnedCheckout {
         }
     }
 }
-fn allocate(parent: &Path, head: &str, contract: &str) -> Result<OwnedCheckout> {
+pub(super) fn allocate(parent: &Path, head: &str, contract: &str) -> Result<OwnedCheckout> {
     use std::io::Write;
     use std::os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},

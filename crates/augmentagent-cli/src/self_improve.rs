@@ -6,9 +6,9 @@
 //! - **Never touches `main`.** A fresh `git worktree` + branch is created per
 //!   attempt. The auto-updater pulls `origin/main`; an in-place edit there
 //!   would corrupt the deploy. We refuse to run if cwd isn't a clean repo.
-//! - **Verification gate.** `cargo build` + `npm run build` + `cargo test`
-//!   must all pass before a PR is opened. A red gate => no PR, a back-off
-//!   comment on the issue instead.
+//! - **Verification gate.** Controller-pinned shared CI checks validate literal
+//!   source snapshots. Hosted-only checks remain explicit exact-head remote
+//!   requirements; missing local prerequisites never count as a passing check.
 //! - **Draft by default; human merges.** PRs are opened `--draft`. The one
 //!   exception (#630): with `AUGMENTAGENT_AUTOPR_AUTOMERGE=1`, issues
 //!   authored by the OWNER (or an explicit login allowlist) merge
@@ -39,6 +39,9 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, FallbackReasoner, Reasoner};
+
+#[path = "self_improve_ci.rs"]
+mod shared_ci;
 
 #[path = "self_improve_episode.rs"]
 mod episode;
@@ -4501,39 +4504,6 @@ fn gate_sh(cmd: &str) -> String {
     format!("set -o pipefail; {cmd}")
 }
 
-/// Paths whose change makes the Node build load-bearing (#820). `src/` is the
-/// TypeScript daemon + Express dashboard; the rest are what `npm run build`
-/// (`tailwind:build && tsc`) actually consumes.
-const NODE_GATE_PATHS: &[&str] = &[
-    "src/",
-    "views/",
-    "test/",
-    "sidecars/",
-    "public/",
-    "package.json",
-    "package-lock.json",
-    "tsconfig.json",
-    "tailwind.config.js",
-    "tailwind.input.css",
-];
-
-/// True if `path` is one the Node build would compile.
-fn is_node_path(path: &str) -> bool {
-    NODE_GATE_PATHS
-        .iter()
-        .any(|p| if p.ends_with('/') { path.starts_with(p) } else { path == *p })
-}
-
-/// Does the staged diff reach Node? Unknowable ⇒ `true`: skipping the gate is
-/// the failure this replaces, so an unreadable diff must cost an install, not
-/// a missed build.
-async fn node_build_required(worktree: &Path) -> bool {
-    match run("git", &["diff", "--cached", "--name-only"], worktree).await {
-        Ok((true, out, _)) => out.lines().map(str::trim).any(is_node_path),
-        _ => true,
-    }
-}
-
 /// The workspace crates a change set touches, as `-p`-able package names —
 /// or `None` when anything falls outside `crates/`, which means only the
 /// full gate can vouch for it (Node sources, schema, scripts).
@@ -4612,66 +4582,7 @@ async fn gate_for_round(worktree: &Path, changed_paths: &str, audit: &Arc<augmen
 
 async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     gate_disk_guard()?;
-    let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
-    // #300 — Strip provider secrets from the gate's child env. `cargo
-    // build`/`npm run build` execute `build.rs`/proc-macros/`npm
-    // postinstall`, which the issue body could influence; none need
-    // provider keys, so this is behavior-preserving for honest fixes.
-    let mut env = gate_env();
-    env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(worktree))?));
-    info!("verification gate: cargo build (sandboxed env)");
-    let (ok, _o, e) = run_sandboxed(
-        "bash",
-        &["-lc", &gate_sh("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
-        worktree,
-        &env,
-        audit,
-    )
-    .await?;
-    if !ok {
-        bail!("cargo build failed:\n{o}{e}", o = _o.trim());
-    }
-    info!("verification gate: cargo test (sandboxed env)");
-    let (ok, _o, e) = run_sandboxed(
-        "bash",
-        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace -- --test-threads=1 2>&1 | tail -40")],
-        worktree,
-        &env,
-        audit,
-    )
-    .await?;
-    if !ok {
-        bail!("cargo test failed:\n{o}{e}", o = _o.trim());
-    }
-    // #820 — the Node half of the gate. It used to require `node_modules` to
-    // already exist in the worktree, which `git worktree add` can never
-    // produce (it is gitignored): `npm run build` had therefore run ZERO
-    // times since #103, while `src/` stayed fully editable by the builder.
-    // Install on demand instead, and only when the change actually reaches
-    // Node — a Rust-only fix, which is nearly all of them, still skips it.
-    if worktree.join("package.json").exists() && node_build_required(worktree).await {
-        info!("verification gate: npm ci + npm run build (sandboxed env)");
-        let (ok, _o, e) = run_sandboxed(
-            "bash",
-            &["-lc", &gate_sh("npm ci --no-audit --no-fund 2>&1 | tail -5")],
-            worktree,
-            &env,
-            audit,
-        )
-        .await?;
-        if !ok {
-            bail!("npm ci failed:\n{o}{e}", o = _o.trim());
-        }
-        let (ok, _o, e) =
-            run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env, audit)
-                .await?;
-        if !ok {
-            bail!("npm run build failed:\n{o}{e}", o = _o.trim());
-        }
-    } else {
-        info!("verification gate: npm build not required (diff touches no Node paths)");
-    }
-    Ok(())
+    shared_ci::verify(worktree, audit).await
 }
 
 // ---------------------------------------------------------------------------
@@ -9173,7 +9084,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         (_, false) => "QA review (changes requested)",
     };
     let verification = park.as_ref().map_or_else(
-        || "- `cargo build --workspace`: pass\n- `cargo test --workspace`: pass".to_string(),
+        || "- Shared applicable local CI gate: passed\n- Hosted-only CI requirements: enforced separately on the exact PR head".to_string(),
         ParkReason::verification,
     );
     let pr_body = format!(
@@ -11326,6 +11237,7 @@ impl AttemptRecord {
 /// charged; a failure `main` already has is handled by #931 instead.
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
+        ("shared ci prerequisite unavailable", "shared CI environment prerequisite"),
         ("resource capacity", "declared run resource capacity"),
         ("resource_capacity", "declared run resource capacity"),
         ("no space left on device", "disk full"),
@@ -13536,51 +13448,6 @@ CODEX-REVIEW: lgtm").0);
         assert!(glob_matches("skills/*/SKILL.md", "skills/invoice/SKILL.md"));
     }
 
-    // ---- #820: the Node half of the gate must be reachable ----
-
-    #[test]
-    fn node_gate_fires_on_node_paths_and_not_on_rust_only_diffs() {
-        assert!(is_node_path("src/index.ts"));
-        assert!(is_node_path("views/dashboard.ejs"));
-        assert!(is_node_path("package.json"));
-        assert!(is_node_path("tailwind.input.css"));
-
-        assert!(!is_node_path("crates/augmentagent-cli/src/self_improve.rs"));
-        assert!(!is_node_path("schema/triage.md"));
-        assert!(!is_node_path("Cargo.toml"));
-        // Prefix matching must be path-segment honest, not substring.
-        assert!(!is_node_path("crates/x/src/lib.rs"));
-        assert!(!is_node_path("package.json.bak"));
-    }
-
-    #[tokio::test]
-    async fn node_build_is_required_only_when_the_staged_diff_reaches_node() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(repo)
-                .output()
-                .expect("git")
-        };
-        git(&["init", "-q", "-b", "main", "."]);
-        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
-              "--allow-empty", "-m", "init"]);
-
-        // A Rust-only change: the common case, and it must stay fast.
-        std::fs::create_dir_all(repo.join("crates/x/src")).unwrap();
-        std::fs::write(repo.join("crates/x/src/lib.rs"), "pub fn f() {}\n").unwrap();
-        git(&["add", "-A"]);
-        assert!(!node_build_required(repo).await);
-
-        // Touch the TypeScript daemon and the gate becomes load-bearing.
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(repo.join("src/index.ts"), "export const x = 1;\n").unwrap();
-        git(&["add", "-A"]);
-        assert!(node_build_required(repo).await);
-    }
-
     // ---- #817: builder scratch must not reach the commit ----
 
     #[tokio::test]
@@ -14812,7 +14679,6 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // plus the trailer, so the baseline parser saw nothing to compare.
         let src = include_str!("self_improve.rs");
         for cmd in [
-            "cargo test --workspace -- --test-threads=1 2>&1 | tail -40",
             "cargo test {pkgs} -- --test-threads=1 2>&1 | tail -40",
         ] {
             assert!(
