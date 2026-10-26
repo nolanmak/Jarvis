@@ -1732,3 +1732,90 @@ mod source_namespace_tests {
         assert_eq!(stored["pull_request"], 42);
     }
 }
+
+/// Read-only free-sweep admission. Any error requires the owning workflow to
+/// re-enter verification; stale approval is never enough to merge. This does
+/// not execute a model or verifier, but does remeasure current runner/source
+/// inputs and inspect the protected original/revised evidence chain.
+pub(super) async fn assert_sweep_receipt(
+    worktree: &Path,
+    protected_control: &Path,
+    source: AcceptanceSource,
+    reference: &CandidateReceiptReference,
+    expected_head: &str,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let control = protected_control.canonicalize()?;
+    for writable in worker_roots(worktree) {
+        ensure!(
+            !control.starts_with(writable.canonicalize()?),
+            "sweep evidence is worker writable"
+        );
+    }
+    ensure!(
+        reference.schema_version == 1 && reference.binding.head == expected_head,
+        "sweep acceptance does not bind current remote head"
+    );
+    ensure!(
+        reference.artifact == control.join(format!("candidate-{}.json", reference.artifact_sha256)),
+        "sweep candidate evidence escaped protected store"
+    );
+    let manifest = original_manifest(&control, source)?
+        .context("sweep original acceptance manifest missing")?;
+    ensure!(
+        manifest.contract_hash == reference.binding.contract_hash
+            && manifest.original_base == reference.binding.base,
+        "sweep approval predates current registered acceptance revision"
+    );
+    let evidence = if let Some(name) = &manifest.evidence_file {
+        ensure!(
+            name == &format!(
+                "{}-revision-{}-{}.json",
+                source.key(),
+                manifest.contract_revision,
+                manifest.contract_hash
+            ),
+            "sweep amended evidence path mismatch"
+        );
+        control.join(name)
+    } else {
+        evidence_path(&control, source, &manifest.original_base)?
+    };
+    let prepared: PreparedAcceptance = private_json(&evidence)?;
+    let mut expected = WorkflowManifest::from_prepared(source, &prepared);
+    expected.evidence_file = manifest.evidence_file.clone();
+    ensure!(
+        expected == manifest,
+        "sweep registered evidence differs from manifest"
+    );
+    let artifact: CandidateArtifact = private_json(&reference.artifact)?;
+    ensure!(
+        artifact.schema_version == 1 && artifact.binding == reference.binding,
+        "sweep artifact binding mismatch"
+    );
+    let ids = artifact
+        .receipts
+        .iter()
+        .map(|receipt| {
+            Ok(format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(receipt)?)
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        ids == reference.receipt_ids,
+        "sweep verifier receipt IDs changed"
+    );
+    let alignment = reference
+        .alignment
+        .as_ref()
+        .context("sweep alignment evidence missing")?;
+    ensure!(
+        alignment.artifact.parent() == Some(control.as_path()),
+        "sweep alignment evidence escaped protected store"
+    );
+    assert_receipt_current(worktree, &prepared, reference)
+        .await
+        .context("sweep evidence stale; workflow must reverify before merging")
+}
