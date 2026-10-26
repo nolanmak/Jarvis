@@ -1116,6 +1116,18 @@ impl WorkflowGuard {
         )
     }
 
+    pub(super) fn review_fragment(&self, key: &str) -> Result<Option<String>> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .review_fragment(&self.lease,&self.binding,key,millis())
+    }
+    pub(super) fn record_review_fragment(&self, key: &str, payload: &str) -> Result<()> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
+            .record_review_fragment(&self.lease,&self.binding,key,payload,millis())?;
+        self.audit_event("review_fragment_completed",serde_json::json!({"key":key,"payload_sha256":format!("{:x}",Sha256::digest(payload.as_bytes()))}))
+    }
+
     pub(super) fn record_review(
         &self,
         decision_id: &str,

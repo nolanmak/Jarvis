@@ -231,6 +231,9 @@ impl WorkflowStore {
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS publication_dispatch(operation TEXT PRIMARY KEY REFERENCES operation(id),attempt INTEGER NOT NULL,dispatched_at INTEGER NOT NULL,pr INTEGER);
             CREATE TABLE IF NOT EXISTS publication_scan_cursor(repository TEXT PRIMARY KEY,last_workflow TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS review_fragment (
+                workflow TEXT NOT NULL REFERENCES workflow(id), audit_generation INTEGER NOT NULL,
+                key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(workflow,audit_generation,key));
             CREATE TABLE IF NOT EXISTS pending_publication(workflow TEXT PRIMARY KEY REFERENCES workflow(id),repository TEXT NOT NULL,body TEXT NOT NULL,updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS observation_reservation(workflow TEXT NOT NULL,generation INTEGER NOT NULL,reserved INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS observation_charge (
@@ -866,6 +869,34 @@ impl WorkflowStore {
 
     /// Immutable per reviewer/head/contract. Corrections require a new contract
     /// version or reviewer decision identity; a contradictory write is an error.
+    /// Completed evidence groups are not approvals. Keep them separate from the
+    /// review index; interrupted audit generations cannot lend them authority.
+    pub fn review_fragment(&mut self, lease: &Lease, binding: &Binding, key: &str, now: i64) -> Result<Option<String>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let generation:i64=tx.query_row("SELECT generation FROM workflow_audit_generation WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).optional()?.unwrap_or(0);
+        let value=tx.query_row("SELECT payload FROM review_fragment WHERE workflow=?1 AND audit_generation=?2 AND key=?3",
+            params![lease.workflow,generation,key],|r|r.get(0)).optional()?;
+        tx.commit()?;
+        Ok(value)
+    }
+    pub fn record_review_fragment(&mut self, lease: &Lease, binding: &Binding, key: &str, payload: &str, now: i64) -> Result<()> {
+        ensure!(key.len()==64 && key.bytes().all(|b|b.is_ascii_hexdigit()),"invalid review fragment key");
+        ensure!(!payload.is_empty() && payload.len()<=8*1024*1024,"review fragment exceeds storage bound");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        let generation:i64=tx.query_row("SELECT generation FROM workflow_audit_generation WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).optional()?.unwrap_or(0);
+        let prior:Option<String>=tx.query_row("SELECT payload FROM review_fragment WHERE workflow=?1 AND audit_generation=?2 AND key=?3",
+            params![lease.workflow,generation,key],|r|r.get(0)).optional()?;
+        if let Some(prior)=prior { ensure!(prior==payload,"immutable review fragment conflict"); }
+        else {
+            tx.execute("INSERT INTO review_fragment VALUES(?1,?2,?3,?4)",params![lease.workflow,generation,key,payload])?;
+            event(&tx,&lease.workflow,lease.generation,"review_fragment_completed",&serde_json::json!({"key":key,"audit_generation":generation}).to_string(),now)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn record_review(&mut self, lease: &Lease, review: &Review, now_ms: i64) -> Result<()> {
         ensure!(
             !review.reviewer.is_empty() && !review.evidence.is_empty(),
@@ -1559,6 +1590,27 @@ mod tests {
         assert!(store.reserve_publication_dispatch(&next,&op,600_000).is_err());
         assert!(store.record_publication_identity(&next,&op,43,60_035).is_err());
         assert_eq!(store.publication_dispatch(&op.id).unwrap().unwrap().2,Some(42));
+    }
+
+    #[test]
+    fn completed_review_fragments_survive_restart_but_never_become_approvals() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let (mut store,old)=setup(&path);let key="a".repeat(64);
+        store.record_review_fragment(&old,&binding(),&key,"completed-group",25).unwrap();
+        assert!(store.current_reviews(&old.workflow).unwrap().is_empty());
+        assert!(store.record_review_fragment(&old,&binding(),&key,"conflicting-group",26).is_err());
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let new=store.claim(&old.workflow,"worker-b",1021,1000).unwrap().unwrap();
+        assert_eq!(store.review_fragment(&new,&binding(),&key,1022).unwrap().as_deref(),Some("completed-group"));
+        assert!(store.review_fragment(&old,&binding(),&key,1022).is_err());
+        let mut changed=binding();changed.head="other-head".into();
+        assert!(store.review_fragment(&new,&changed,&key,1022).is_err());
+        // Recovery retains the old immutable row but changes its namespace.
+        store.conn.execute("INSERT INTO workflow_audit_generation VALUES(?1,?2,?2,'{}')",params![old.workflow,new.generation]).unwrap();
+        assert!(store.review_fragment(&new,&binding(),&key,1022).unwrap().is_none());
+        assert!(store.current_reviews(&old.workflow).unwrap().is_empty());
+        assert_eq!(store.snapshot(&old.workflow).unwrap().unwrap().model_calls,0);
     }
 
     #[test]
