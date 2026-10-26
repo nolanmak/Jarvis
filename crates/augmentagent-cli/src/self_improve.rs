@@ -15579,7 +15579,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let undo = body[merge..].find(r#""--undo""#).expect("the undo");
         let guard = body[merge..merge + undo].rfind("if ").expect("a guard");
         let cond = &body[merge + guard..merge + undo];
-        assert!(cond.contains("!ok"), "only on failure: {cond:?}");
+        assert!(cond.contains("!observed"), "only when merge is not confirmed: {cond:?}");
         assert!(cond.contains("readied"), "only if we made the transition: {cond:?}");
     }
 

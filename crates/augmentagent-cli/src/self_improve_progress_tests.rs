@@ -245,6 +245,10 @@ s=json.loads((root/'scenario').read_text())
 if a[:2]==['pr','list']:
     assert 'is:draft' not in a
     print(json.dumps([dict(number=20,headRefName='agent-fix/issue-10',headRefOid=s['head'],isDraft=s['draft'],isCrossRepository=False,mergeable='MERGEABLE',body='Automated self-improvement for #10.\n- complexity (scoping pass): medium')]))
+elif a[:2]==['repo','view']: print('fixture-owner/project')
+elif a[:2]==['pr','view']:
+    if '--jq' in a or '-q' in a: print(s['head'])
+    else: print(json.dumps(dict(state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
 elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition',author=dict(login='fixture-owner'))))
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
