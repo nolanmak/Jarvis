@@ -214,7 +214,8 @@
       "implementation_status": "partial",
       "evidence": [
         "Email retry full guard-chain and metadata preservation: complete suite 221 passed. Scheduled-loop coverage and digest previously passed 49 tests. Deployed acceptance pending.",
-        "Separate typed guard history integrated at e2e0630f, independently reviewed; intentional skips/flags retain their disposition. Combined core/email/store regression execution is still pending."
+        "Separate typed guard history integrated at e2e0630f, independently reviewed; intentional skips/flags retain their disposition. Combined core/email/store regression execution is still pending.",
+        "Combined managed regression run passed: core644/email222/store160, including durable guard observations across reopen and real retry guard cases; log /tmp/autoship-1598-e2e0630f-core-email-store.log."
       ],
       "remaining_acceptance": [
         "Verify final durable failure/coverage state and email retry guard chain in deployment.",
@@ -897,6 +898,15 @@
       "version": 1,
       "log": "/tmp/autoship-1598-union-cli-smoke.log",
       "receipt": "/tmp/autoship-native-codex-auth-dfunmr6x/union-cli-smoke/receipt.json"
+    },
+    "core_email_store_e2e0630f": {
+      "passed": 1026,
+      "core_passed": 644,
+      "core_ignored": 14,
+      "email_passed": 222,
+      "store_passed": 160,
+      "log": "/tmp/autoship-1598-e2e0630f-core-email-store.log",
+      "scope": "Managed single-job serial regression run; includes new capture, calibration migration, memory composition and email guard persistence. Resource helper initialization changed after core compilation; separate rebuild/test required."
     }
   },
   "remaining_cross_cutting_acceptance": [
