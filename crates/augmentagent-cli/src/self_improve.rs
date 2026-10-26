@@ -39,6 +39,9 @@ use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 
 #[path = "self_improve_episode.rs"]
 mod episode;
+#[cfg(test)]
+#[path = "self_improve_adoption_acceptance.rs"]
+mod adoption_acceptance;
 #[path = "self_improve_adopted.rs"]
 mod adopted_execution;
 #[path = "self_improve_adoption.rs"]
