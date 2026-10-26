@@ -57,6 +57,194 @@ pub(super) struct WorkflowGuard {
     released: bool,
 }
 
+/// Free reconciliation shares the builder lease but never hashes the deploy
+/// checkout as if it were the reviewed PR. Completed sweep scopes release;
+/// a cancelled remote operation retains its durable intent for reconciliation.
+pub(super) struct SweepGuard {
+    inner: Option<WorkflowGuard>,
+}
+impl SweepGuard {
+    pub(super) async fn acquire(
+        repository: &str,
+        issue: u64,
+        pr: u64,
+        branch: &str,
+        head: &str,
+        recorded: &str,
+    ) -> Result<Option<Self>> {
+        Self::acquire_at(
+            &path(),
+            repository,
+            issue,
+            pr,
+            branch,
+            head,
+            recorded,
+            millis(),
+        )
+    }
+
+    fn acquire_at(
+        path: &Path,
+        repository: &str,
+        issue: u64,
+        pr: u64,
+        branch: &str,
+        head: &str,
+        recorded: &str,
+        now: i64,
+    ) -> Result<Option<Self>> {
+        let mut store = WorkflowStore::open(path)?;
+        let issue_id = durable::workflow_id(repository, issue)?;
+        let id = match store.resolve_pr(repository, pr)? {
+            Some(id) => id,
+            None => match store.snapshot(&issue_id)? {
+                Some(snapshot)
+                    if snapshot.branch == branch && snapshot.pr.is_none_or(|p| p == pr) =>
+                {
+                    issue_id
+                }
+                _ => durable::pr_workflow_id(repository, pr)?,
+            },
+        };
+        let existing = store.snapshot(&id)?;
+        let binding = existing
+            .as_ref()
+            .map(|s| s.checkpoint.binding.clone())
+            .unwrap_or(Binding {
+                head: head.into(),
+                contract: format!("{:x}", Sha256::digest(recorded.as_bytes())),
+                evidence_hash: format!("{:x}", Sha256::digest(recorded.as_bytes())),
+            });
+        store.register(&id, branch, binding.clone(), now)?;
+        let Some(lease) = store.claim(
+            &id,
+            &format!("sweep:{}", uuid::Uuid::new_v4()),
+            now,
+            LEASE_MS,
+        )?
+        else {
+            return Ok(None);
+        };
+        // Validate after claim, never modify another worker's checkpoint.
+        let authorized = if existing.is_some() {
+            binding.head == head
+                && store
+                    .events(&id)?
+                    .into_iter()
+                    .rev()
+                    .filter(|(_, kind, _, _)| kind == "review_recorded")
+                    .filter_map(|(_, _, body, _)| serde_json::from_str::<Review>(&body).ok())
+                    .find(|review| review.binding == binding)
+                    .is_some_and(|review| review.approved)
+        } else {
+            true
+        };
+        if !authorized {
+            store.release(&lease, now)?;
+            return Ok(None);
+        }
+        store.attach_pr_in_repo(&lease, repository, pr, now)?;
+        if existing.is_none() {
+            store.record_review(
+                &lease,
+                &Review {
+                    reviewer: "legacy-recorded-approval".into(),
+                    binding: binding.clone(),
+                    approved: true,
+                    evidence: recorded.into(),
+                },
+                now,
+            )?;
+        }
+        let inner = WorkflowGuard {
+            store: Arc::new(Mutex::new(store)),
+            lease,
+            repository: repository.into(),
+            worktree: PathBuf::new(),
+            contract: String::new(),
+            environment: String::new(),
+            binding,
+            heartbeat: tokio_util::sync::CancellationToken::new(),
+            lease_failure: Arc::new(Mutex::new(None)),
+            started: std::time::Instant::now(),
+            accounted_ms: Arc::new(AtomicU64::new(0)),
+            released: false,
+        };
+        inner.spawn_renewal();
+        Ok(Some(Self { inner: Some(inner) }))
+    }
+
+    pub(super) async fn validate_remote(&self, repo: &Path, pr: u64, expected: &str) -> Result<()> {
+        let inner = self.inner.as_ref().context("released sweep lease")?;
+        inner.validate_before_side_effect()?;
+        anyhow::ensure!(
+            inner.binding.head == expected,
+            "sweep approval binding changed"
+        );
+        let (ok, head, _) = run(
+            &gh_bin(),
+            &[
+                "pr",
+                "view",
+                &pr.to_string(),
+                "--json",
+                "headRefOid",
+                "--jq",
+                ".headRefOid",
+            ],
+            repo,
+        )
+        .await?;
+        anyhow::ensure!(
+            ok && head.trim() == expected,
+            "remote PR head changed since review"
+        );
+        // A network read can span lease expiry; revalidate immediately before mutation.
+        inner.validate_before_side_effect()
+    }
+
+    pub(super) fn merge_intent(&self) -> Result<Operation> {
+        self.inner
+            .as_ref()
+            .context("released sweep lease")?
+            .intent(OperationKind::MergePr)
+    }
+
+    pub(super) fn merged(&self, operation: &Operation, pr: u64) -> Result<()> {
+        let inner = self.inner.as_ref().context("released sweep lease")?;
+        inner.observe_remote(
+            operation,
+            &format!("github:pr:{pr}:merged:{}", operation.binding.head),
+            Some(pr),
+        )?;
+        let mut store = inner
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?;
+        let mut cp = store
+            .snapshot(inner.id())?
+            .context("missing workflow")?
+            .checkpoint;
+        cp.stage = Stage::Merged;
+        cp.next = NextAction {
+            reason: "remote_merge_observed".into(),
+            action: "complete".into(),
+            eligible_at_ms: millis(),
+        };
+        store.checkpoint(&inner.lease, &cp, millis())
+    }
+}
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            if let Err(error) = inner.finish() {
+                warn!("sweep lease release failed: {error:#}");
+            }
+        }
+    }
+}
+
 impl WorkflowGuard {
     pub(super) async fn acquire(start: Start<'_>) -> Result<Option<Self>> {
         Self::acquire_at(&path(), start, millis()).await
@@ -771,6 +959,145 @@ mod tests {
                 .contract
         );
     }
+    #[tokio::test]
+    async fn sweep_excludes_active_builder_releases_and_fences_lost_lease() {
+        let dir = repo();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let now = millis();
+        let builder = WorkflowGuard::acquire_at(
+            &path,
+            Start {
+                repo_root: dir.path(),
+                worktree: dir.path(),
+                repository: "owner/repo",
+                source_issue: Some(7),
+                pr: None,
+                branch: "fix/seven",
+                contract: "C1",
+                environment: "rust-a",
+            },
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let head = builder.binding().head.clone();
+        builder
+            .record_review("approved", true, "native approval")
+            .unwrap();
+        assert!(SweepGuard::acquire_at(
+            &path,
+            "owner/repo",
+            7,
+            42,
+            "fix/seven",
+            &head,
+            "record",
+            millis()
+        )
+        .unwrap()
+        .is_none());
+        builder.finish().unwrap();
+        let sweep = SweepGuard::acquire_at(
+            &path,
+            "owner/repo",
+            7,
+            42,
+            "fix/seven",
+            &head,
+            "record",
+            millis(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sweep.merge_intent().is_ok());
+        assert!(SweepGuard::acquire_at(
+            &path,
+            "owner/repo",
+            7,
+            42,
+            "fix/seven",
+            &head,
+            "record",
+            millis()
+        )
+        .unwrap()
+        .is_none());
+        drop(sweep);
+        let sweep = SweepGuard::acquire_at(
+            &path,
+            "owner/repo",
+            7,
+            42,
+            "fix/seven",
+            &head,
+            "record",
+            millis(),
+        )
+        .unwrap()
+        .unwrap();
+        let id = sweep.inner.as_ref().unwrap().id().to_string();
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let successor = store
+            .claim(&id, "replacement", millis() + LEASE_MS + 1, LEASE_MS)
+            .unwrap()
+            .unwrap();
+        assert!(
+            sweep.merge_intent().is_err(),
+            "lost generation may not authorize a merge"
+        );
+        assert!(store
+            .validate_lease(&successor, millis() + LEASE_MS + 2)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn sweep_never_reuses_approval_after_evidence_changes_at_same_head() {
+        let dir = repo();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let mut builder = WorkflowGuard::acquire_at(
+            &path,
+            Start {
+                repo_root: dir.path(),
+                worktree: dir.path(),
+                repository: "owner/repo",
+                source_issue: Some(7),
+                pr: None,
+                branch: "fix/seven",
+                contract: "C1",
+                environment: "rust-a",
+            },
+            millis(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let head = builder.binding().head.clone();
+        builder
+            .record_review("approved", true, "native approval")
+            .unwrap();
+        std::fs::write(dir.path().join("code.txt"), "unreviewed revision\n").unwrap();
+        builder
+            .transition(Stage::Build, "revision_started", "verify", 0)
+            .await
+            .unwrap();
+        builder.finish().unwrap();
+        assert!(SweepGuard::acquire_at(
+            &path,
+            "owner/repo",
+            7,
+            42,
+            "fix/seven",
+            &head,
+            "old record",
+            millis()
+        )
+        .unwrap()
+        .is_none());
+    }
+
     #[tokio::test]
     async fn push_creates_absent_branch_and_reconciles_lost_receipt() {
         let dir = repo();

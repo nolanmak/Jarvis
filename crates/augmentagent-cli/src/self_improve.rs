@@ -1535,7 +1535,11 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
     let Some(rows) = prs.as_array() else {
         return 0;
     };
-    let owner = repo_owner_from_remote(repo_root).await;
+    let repository = match workflow::canonical_repository(repo_root).await {
+        Ok(repository) => repository,
+        Err(error) => { warn!("merge sweep repository identity unavailable: {error:#}"); return 0; }
+    };
+    let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
     let mut merged = 0usize;
 
@@ -1654,6 +1658,16 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                     );
                     continue;
                 }
+                let head = candidate_head.clone().unwrap_or_default();
+                let recorded = match serde_json::to_string(&record) { Ok(value) => value, Err(_) => continue };
+                let sweep_lease = match workflow::SweepGuard::acquire(&repository, issue, pr, branch, &head, &recorded).await {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => { info!(pr, "merge sweep: workflow busy or approval evidence changed"); continue; }
+                    Err(error) => { warn!(pr, "merge sweep lease unavailable: {error:#}"); continue; }
+                };
+                if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
+                    warn!(pr, "merge sweep cannot ready stale or unowned candidate: {error:#}"); continue;
+                }
                 // Preserve the original state when a merge must be retried.
                 let Some(readied) = ready_for_merge(repo_root, pr,
                     row.get("isDraft").and_then(serde_json::Value::as_bool)).await else {
@@ -1666,7 +1680,7 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 // readying and immediately before merging.
                 if checks_green(repo_root, pr).await != Some(true) {
                     warn!(pr, "merge sweep: checks are no longer green; leaving it alone");
-                    if readied {
+                    if readied && sweep_lease.validate_remote(repo_root, pr, &head).await.is_ok() {
                         let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
                             .await;
                     }
@@ -1684,18 +1698,22 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 // `--match-head-commit` makes GitHub refuse instead, which
                 // turns a silent TOCTOU into a failed merge — and a failed
                 // merge restores the draft below.
-                let head = candidate_head.clone().unwrap_or_default();
+                let merge_intent = match sweep_lease.merge_intent() { Ok(intent) => intent, Err(_) => continue };
+                if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
+                    warn!(pr, "merge sweep ownership/head changed before merge: {error:#}"); continue;
+                }
                 let (ok, _o, e) = run(
                     &gh,
                     &[
-                        "pr", "merge", &pr.to_string(), "--squash", "--delete-branch",
+                        "pr", "merge", &pr.to_string(), "--squash",
                         "--match-head-commit", &head,
                     ],
                     repo_root,
                 )
                 .await
                 .unwrap_or((false, String::new(), "spawn failed".into()));
-                if !ok && readied {
+                let observed = sweep_merged_exact(repo_root, pr, &head).await;
+                if !observed && readied && sweep_lease.validate_remote(repo_root, pr, &head).await.is_ok() {
                     let (undone, ..) =
                         run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
                             .await
@@ -1708,7 +1726,10 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                         );
                     }
                 }
-                if ok {
+                if observed {
+                    if let Err(error) = sweep_lease.merged(&merge_intent, pr) {
+                        warn!(pr, "remote merge observed but receipt needs reconciliation: {error:#}");
+                    }
                     merged += 1;
                     info!(
                         pr = candidate.pr,
@@ -1721,12 +1742,21 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                     ))
                     .await;
                 } else {
-                    warn!(pr, "merge sweep: merge failed, left open: {}", truncate(&e, 200));
+                    warn!(pr, command_ok=ok, "merge sweep: merge not observed, retained intent: {}", truncate(&e, 200));
                 }
             }
         }
     }
     merged
+}
+
+async fn sweep_merged_exact(repo_root: &Path, pr: u64, expected: &str) -> bool {
+    match run(&gh_bin(), &["pr", "view", &pr.to_string(), "--json", "state,headRefOid"], repo_root).await {
+        Ok((true, out, _)) => serde_json::from_str::<serde_json::Value>(&out).ok().is_some_and(|v|
+            v.get("state").and_then(|s| s.as_str()) == Some("MERGED") &&
+            v.get("headRefOid").and_then(|s| s.as_str()) == Some(expected)),
+        _ => false,
+    }
 }
 
 /// Return whether this attempt changed a draft to ready. Unknown state or a
