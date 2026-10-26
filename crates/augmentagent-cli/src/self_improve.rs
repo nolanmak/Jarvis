@@ -4165,7 +4165,7 @@ async fn independent_review(
     _prior_findings: Option<&str>,
     criteria: &[String],
 ) -> IndependentReview {
-    independent_review_with_context(builder, issue, worktree, criteria, true, "", 0, None, 0).await
+    independent_review_with_context(builder, issue, worktree, criteria, true, "", 0, None, 0, None).await
 }
 
 /// Parent lanes pass real QA/round state; legacy callers above start a fresh
@@ -4180,6 +4180,7 @@ async fn independent_review_with_context(
     repair_round: u32,
     previous: Option<&crate::autoship_review::ReviewEvidence>,
     adjudication_attempts_already_made: u32,
+    workflow: Option<&workflow::WorkflowGuard>,
 ) -> IndependentReview {
     match builder.review_authors() {
         Ok(None) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnknown),
@@ -4203,7 +4204,7 @@ async fn independent_review_with_context(
     )).expect("environment identity consists only of serializable strings"));
     aligned_review::run(builder, issue, worktree, criteria, aligned_review::ReviewContext {
         qa_ok, qa_notes, repair_round, previous, environment_id: &environment_id,
-        adjudication_attempts_already_made,
+        adjudication_attempts_already_made, workflow,
     }).await
 }
 
@@ -6722,6 +6723,9 @@ async fn resume_draft_pr(
         }
     }
 
+    let mut previous_review: Option<crate::autoship_review::ReviewEvidence> = workflow
+        .latest_review_receipt("resume-structured-")?
+        .map(|receipt| serde_json::from_str(&receipt)).transpose()?;
     let mut rounds_done = 0u32;
     // Carry remote failures into the revision loop, not only the local gate.
     // Consume this snapshot once: after a push it describes the previous head.
@@ -7005,21 +7009,24 @@ async fn resume_draft_pr(
             }
         };
         prior_qa = Some(qa_notes.clone());
-        // Stage 4 only reviews a diff QA approved.
-        let independent = if qa_ok {
-            independent_review(reasoner, &issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
-                .await
-        } else {
-            IndependentReview::not_run("QA requested changes".into())
-        };
-        if qa_ok && independent.available && !independent.notes.is_empty() {
+        // QA dissent is evidence for the independent final authority, not a
+        // reason to skip it and repeat the same repair debate indefinitely.
+        let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
+            &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
+            0, Some(&workflow)).await;
+        if let Some(structured) = &independent.structured {
+            workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
+                &serde_json::to_string(structured)?)?;
+            previous_review = Some(structured.clone());
+        }
+        if independent.available && !independent.notes.is_empty() {
             prior_notes = Some(independent.notes.clone());
             if !dry_run {
                 let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
                     &independent_findings_comment(&independent.notes)], repo_root).await;
             }
         }
-        if qa_ok {
+        {
             match independent.outcome() {
                 ReviewOutcome::Unavailable(why) => {
                     // Reachable only when the reviewer went away AFTER the
@@ -7029,11 +7036,7 @@ async fn resume_draft_pr(
                     // including whether this run is billed, which it is only if a
                     // builder call was actually made.
                     if !dry_run {
-                        let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
-                        if !ok {
-                            workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
-                            bail!("resume: preserving draft failed: {error}");
-                        }
+                        workflow.push(branch).await?;
                     }
                     workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     return Ok(hold_unreviewable(
@@ -7061,7 +7064,7 @@ async fn resume_draft_pr(
             &serde_json::json!({"verdict": qa_ok, "notes": qa_notes}).to_string())?;
         workflow.record_review(&format!("resume-independent-{rounds_done}-{review_attempt}"), independent.approved(),
             &serde_json::json!({"verdict": independent.approved(), "notes": independent.notes}).to_string())?;
-        if resume_may_merge(qa_ok, independent.approved()) {
+        if independent.approved() {
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
                 // without the full suite passing once (#870).

@@ -13,6 +13,7 @@ pub(super) struct ReviewContext<'a> {
     pub environment_id: &'a str,
     /// Reserved in the protected workflow ledger BEFORE calling this adapter.
     pub adjudication_attempts_already_made: u32,
+    pub workflow: Option<&'a workflow::WorkflowGuard>,
 }
 
 pub(super) async fn run(
@@ -322,6 +323,10 @@ async fn run_inner(
                 "source_manifest_only": files.iter().map(|(path,body)| (path,aligned::digest(body.as_bytes()))).collect::<BTreeMap<_,_>>(),
                 "completed_reviews": structured.passes,
             }))?;
+            let attempts = match context.workflow {
+                Some(workflow) => workflow.reserve_adjudication()?,
+                None => context.adjudication_attempts_already_made,
+            };
             structured.adjudication = Some(
                 aligned::adjudicate_native(
                     &structured.builders,
@@ -330,7 +335,7 @@ async fn run_inner(
                     &contract,
                     &unresolved,
                     &adjudication_evidence,
-                    context.adjudication_attempts_already_made,
+                    attempts,
                 )
                 .await?,
             );

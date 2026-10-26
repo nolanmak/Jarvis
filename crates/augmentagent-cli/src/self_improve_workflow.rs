@@ -349,6 +349,30 @@ impl WorkflowGuard {
         Ok(())
     }
 
+    /// Reserve only immediately before a real adjudicator call. Each slot is
+    /// transactionally persisted, including attempts whose response is lost.
+    pub(super) fn reserve_adjudication(&self) -> Result<u32> {
+        for prior in 0..crate::autoship_review::MAX_ADJUDICATION_ATTEMPTS {
+            if self.admit_attempt(&format!("adjudication-slot-{prior}"), 1)? {
+                return Ok(prior);
+            }
+        }
+        anyhow::bail!("adjudication attempts exhausted for this immutable evidence; reconcile infrastructure before retry")
+    }
+
+    pub(super) fn latest_review_receipt(&self, prefix: &str) -> Result<Option<String>> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?;
+        Ok(store
+            .current_reviews(&self.lease.workflow)?
+            .into_iter()
+            .filter(|r| r.reviewer.starts_with(prefix))
+            .last()
+            .map(|r| r.evidence))
+    }
+
     /// Transition stage while retaining the receipt set that reviewers saw.
     pub(super) async fn transition(
         &mut self,
@@ -536,7 +560,7 @@ pub(super) async fn git_binding(
     let head = git_evidence(worktree, &["rev-parse", "HEAD"]).await?;
     let tree = git_evidence(worktree, &["rev-parse", "HEAD^{tree}"]).await?;
     let base = git_evidence(worktree, &["merge-base", "origin/main", "HEAD"]).await?;
-    let diff = git_evidence(worktree, &["diff", "HEAD", "--"]).await?;
+    let diff = git_evidence(worktree, &["diff", "--binary", "HEAD", "--"]).await?;
     let mut receipts = receipts.to_vec();
     receipts.sort();
     receipts.dedup();
@@ -747,6 +771,56 @@ mod tests {
                 .contract
         );
     }
+    #[tokio::test]
+    async fn adjudication_reservations_and_receipts_survive_worker_restart() {
+        let dir = repo();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let start = || Start {
+            repo_root: dir.path(),
+            worktree: dir.path(),
+            repository: "owner/repo",
+            source_issue: Some(7),
+            pr: None,
+            branch: "fix/seven",
+            contract: "C1",
+            environment: "rust-a",
+        };
+        let guard = WorkflowGuard::acquire_at(&path, start(), millis())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard.reserve_adjudication().unwrap(), 0);
+        guard
+            .record_review("resume-structured-1", false, "receipt-one")
+            .unwrap();
+        guard.finish().unwrap();
+        let mut guard = WorkflowGuard::acquire_at(&path, start(), millis())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            guard
+                .latest_review_receipt("resume-structured-")
+                .unwrap()
+                .as_deref(),
+            Some("receipt-one")
+        );
+        assert_eq!(guard.reserve_adjudication().unwrap(), 1);
+        assert!(guard.reserve_adjudication().is_err());
+        std::fs::write(dir.path().join("file"), "changed evidence\n").unwrap();
+        guard
+            .transition(Stage::Review, "new_evidence", "review", 0)
+            .await
+            .unwrap();
+        assert_eq!(guard.reserve_adjudication().unwrap(), 0);
+        assert!(guard
+            .latest_review_receipt("resume-structured-")
+            .unwrap()
+            .is_none());
+        guard.finish().unwrap();
+    }
+
     #[tokio::test]
     async fn created_pr_resumes_the_original_workflow_without_an_issue() {
         let dir = repo();
