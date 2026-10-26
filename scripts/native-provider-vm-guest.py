@@ -4,6 +4,7 @@ import base64
 import ctypes
 import json
 import os
+import queue
 from pathlib import Path
 import resource
 import shutil
@@ -11,10 +12,48 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 import threading
 
 MAX_FRAME = 2 * 1024 * 1024
 MAX_HOME = 64 * 1024 * 1024
+
+
+
+class BoundedWriter:
+    """Never block the shared control/gateway dispatcher on an application pipe."""
+    def __init__(self, write, finish, failed):
+        self.write, self.finish, self.failed = write, finish, failed
+        self.pending = queue.Queue(16)
+        self.closed = threading.Event()
+        self.ended = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def submit(self, data):
+        if self.closed.is_set() or self.ended or (data is not None and len(data) > 65536):
+            raise RuntimeError('invalid or closed native stream')
+        if data is None:
+            self.ended = True
+        try:
+            self.pending.put_nowait(data)
+        except queue.Full:
+            raise RuntimeError('native stream backpressure limit') from None
+
+    def run(self):
+        try:
+            while True:
+                data = self.pending.get()
+                if data is None:
+                    self.finish()
+                    return
+                self.write(data)
+        except BaseException:
+            # Pipe/transport exceptions can embed private protocol payloads.
+            self.failed()
+        finally:
+            self.closed.set()
+
 
 
 def worker(job):
@@ -46,6 +85,58 @@ def channel():
             os.fchmod(fd, 0o600)
             return fd
     raise RuntimeError('controller channel unavailable')
+
+
+def worker_pids(uid, proc=Path('/proc')):
+    result = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            # /proc/PID inode ownership changes when a worker disables dumpable;
+            # the kernel's Uid status fields retain its actual credentials.
+            for line in (entry / 'status').read_text().splitlines():
+                if line.startswith('Uid:'):
+                    if uid in [int(value) for value in line.split()[1:]]:
+                        result.append(int(entry.name))
+                    break
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return result
+
+
+def quiesce_worker(uid, timeout=5, enumerate_pids=None, kill=None, reap=None):
+    if uid <= 0:
+        raise ValueError('invalid worker identity')
+    enumerate_pids = enumerate_pids or (lambda: worker_pids(uid))
+    kill = kill or (lambda pid: os.kill(pid, 9))
+    def reap_children():
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid == 0:
+                return
+    reap = reap or reap_children
+    deadline = time.monotonic() + timeout
+    quiet = 0
+    while time.monotonic() < deadline:
+        pids = enumerate_pids()
+        for pid in pids:
+            try:
+                kill(pid)
+            except ProcessLookupError:
+                pass
+        reap()
+        if not pids:
+            quiet += 1
+            if quiet >= 2:
+                return
+        else:
+            quiet = 0
+        time.sleep(0.01)
+    raise RuntimeError('native descendants did not quiesce; runtime export refused')
 
 
 def export_home(send):
@@ -80,6 +171,8 @@ def main():
     sys.path.insert(0, '/root')
     from native_provider_gateway import GuestGateway
     job = json.loads(Path('/root/job.json').read_text())
+    if ctypes.CDLL(None).prctl(36, 1, 0, 0, 0):
+        raise RuntimeError('guest child subreaper unavailable')
     fd = channel()
     output = os.fdopen(os.dup(fd), 'wb', buffering=0)
     lock = threading.Lock()
@@ -129,7 +222,29 @@ def main():
     if job['mcp']:
         threading.Thread(target=relay_input, daemon=True).start()
     started = threading.Event()
+    child_ready = threading.Event()
     child = []
+    def failed_stream():
+        os._exit(126)
+    def stdin_write(data):
+        if not child_ready.wait(60):
+            raise RuntimeError('native child unavailable')
+        child[0].stdin.write(data)
+        child[0].stdin.flush()
+    def stdin_finish():
+        if not child_ready.wait(60):
+            raise RuntimeError('native child unavailable')
+        child[0].stdin.close()
+    stdin_writer = BoundedWriter(stdin_write, stdin_finish, failed_stream)
+    def mcp_write(data):
+        if not relay_ready.wait(30):
+            raise RuntimeError('native tool relay unavailable')
+        relay_connection[0].sendall(data)
+    def mcp_finish():
+        if not relay_ready.wait(30):
+            raise RuntimeError('native tool relay unavailable')
+        relay_connection[0].shutdown(socket.SHUT_WR)
+    mcp_writer = BoundedWriter(mcp_write, mcp_finish, failed_stream) if job['mcp'] else None
     def receive():
         with os.fdopen(fd, 'rb') as stream:
             for raw in iter(lambda: stream.readline(MAX_FRAME + 1), b''):
@@ -142,21 +257,15 @@ def main():
                 elif kind.startswith('gateway_'):
                     gateway.receive(frame)
                 elif kind in ('stdin', 'stdin_end'):
-                    started.wait()
-                    while not child:
-                        threading.Event().wait(0.001)
-                    if kind == 'stdin':
-                        child[0].stdin.write(base64.b64decode(frame['data'], validate=True))
-                        child[0].stdin.flush()
-                    else:
-                        child[0].stdin.close()
-                elif kind in ('mcp_output', 'mcp_end') and job['mcp']:
-                    if not relay_ready.wait(30):
+                    try:
+                        stdin_writer.submit(base64.b64decode(frame['data'], validate=True) if kind == 'stdin' else None)
+                    except Exception:
                         os._exit(126)
-                    if kind == 'mcp_output':
-                        relay_connection[0].sendall(base64.b64decode(frame['data'], validate=True))
-                    else:
-                        relay_connection[0].shutdown(socket.SHUT_WR)
+                elif kind in ('mcp_output', 'mcp_end') and job['mcp']:
+                    try:
+                        mcp_writer.submit(base64.b64decode(frame['data'], validate=True) if kind == 'mcp_output' else None)
+                    except Exception:
+                        os._exit(126)
                 else:
                     os._exit(126)
         os._exit(126)
@@ -170,6 +279,7 @@ def main():
     process = subprocess.Popen(['/usr/bin/python3', '-I', '-S', '/root/guest.py', '--worker'],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     child.append(process)
+    child_ready.set()
     def copy(stream, kind):
         while data := stream.read1(65536):
             send({'type': kind, 'data': base64.b64encode(data).decode()})
@@ -178,15 +288,10 @@ def main():
     for thread in threads:
         thread.start()
     code = process.wait()
-    # Native descendants cannot survive export; worker UID is unique in this
-    # disposable VM. Root gateway and supervisor remain alive for export only.
-    for entry in Path('/proc').iterdir():
-        if entry.name.isdigit():
-            try:
-                if entry.stat().st_uid == uid:
-                    os.kill(int(entry.name), 9)
-            except (FileNotFoundError, ProcessLookupError):
-                pass
+    # Quiesce the complete guest worker UID before privileged export. Reap
+    # adopted orphans and repeat the scan so concurrent forks cannot survive a
+    # one-time process snapshot or race directory traversal during export.
+    quiesce_worker(uid)
     for thread in threads:
         thread.join(timeout=5)
         if thread.is_alive():

@@ -12,6 +12,7 @@ import uuid
 import importlib.util
 import json
 import os
+import queue
 from pathlib import Path
 import selectors
 import shutil
@@ -26,6 +27,43 @@ import time
 
 MAX_FRAME = 2 * 1024 * 1024
 MAX_HOME = 64 * 1024 * 1024
+
+
+
+class BoundedWriter:
+    """Never block the shared control/gateway dispatcher on an application pipe."""
+    def __init__(self, write, finish, failed):
+        self.write, self.finish, self.failed = write, finish, failed
+        self.pending = queue.Queue(16)
+        self.closed = threading.Event()
+        self.ended = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def submit(self, data):
+        if self.closed.is_set() or self.ended or (data is not None and len(data) > 65536):
+            raise RuntimeError('invalid or closed native stream')
+        if data is None:
+            self.ended = True
+        try:
+            self.pending.put_nowait(data)
+        except queue.Full:
+            raise RuntimeError('native stream backpressure limit') from None
+
+    def run(self):
+        try:
+            while True:
+                data = self.pending.get()
+                if data is None:
+                    self.finish()
+                    return
+                self.write(data)
+        except BaseException:
+            # Pipe/transport exceptions can embed private protocol payloads.
+            self.failed()
+        finally:
+            self.closed.set()
+
 
 
 def module(name, filename):
@@ -292,6 +330,17 @@ def main(spec_path):
                         channel.send({'type': 'mcp_output', 'data': base64.b64encode(raw).decode()})
                     channel.send({'type': 'mcp_end'})
                 threading.Thread(target=bridge_output, daemon=True).start()
+                def bridge_failed():
+                    try:
+                        channel_socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                def bridge_write(data):
+                    bridge.stdin.write(data)
+                    bridge.stdin.flush()
+                bridge_writer = BoundedWriter(bridge_write, bridge.stdin.close, bridge_failed)
+            else:
+                bridge_writer = None
             def stdin_input():
                 for raw in iter(lambda: sys.stdin.buffer.read1(65536), b''):
                     channel.send({'type': 'stdin', 'data': base64.b64encode(raw).decode()})
@@ -333,8 +382,7 @@ def main(spec_path):
                 elif kind == 'mcp_input':
                     if bridge is None:
                         raise ValueError('undeclared tool channel')
-                    bridge.stdin.write(base64.b64decode(frame['data'], validate=True))
-                    bridge.stdin.flush()
+                    bridge_writer.submit(base64.b64decode(frame['data'], validate=True))
                 elif kind.startswith('gateway_'):
                     gateway.receive(frame)
                 elif kind == 'runtime_start' and admitted:
