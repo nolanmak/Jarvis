@@ -33,12 +33,23 @@ pub(super) fn path() -> PathBuf {
 
 /// Read GitHub's current base, never a possibly stale local tracking ref.
 pub(super) async fn remote_main_head(repo: &Path, repository: &str) -> Result<String> {
-    let (ok, out, error) = run(&gh_bin(), &[
-        "api", &format!("repos/{repository}/git/ref/heads/main"), "--jq", ".object.sha"
-    ], repo).await?;
+    let (ok, out, error) = run(
+        &gh_bin(),
+        &[
+            "api",
+            &format!("repos/{repository}/git/ref/heads/main"),
+            "--jq",
+            ".object.sha",
+        ],
+        repo,
+    )
+    .await?;
     let head = out.trim();
-    anyhow::ensure!(ok && matches!(head.len(), 40 | 64) && head.bytes().all(|c| c.is_ascii_hexdigit()),
-        "current remote main unavailable: {}", truncate(&error, 240));
+    anyhow::ensure!(
+        ok && matches!(head.len(), 40 | 64) && head.bytes().all(|c| c.is_ascii_hexdigit()),
+        "current remote main unavailable: {}",
+        truncate(&error, 240)
+    );
     Ok(head.to_ascii_lowercase())
 }
 
@@ -105,6 +116,22 @@ fn workflow_audit(
     )?;
     logger.protected_health()?;
     Ok(Arc::new(logger))
+}
+
+fn structured_review_base(raw: &str, expected_head: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let binding = value
+        .pointer("/verdict/structured/binding")
+        .or_else(|| value.pointer("/structured/binding"))
+        .or_else(|| value.get("binding"))?;
+    if binding.get("head")?.as_str()? != expected_head {
+        return None;
+    }
+    binding
+        .get("base")?
+        .as_str()
+        .filter(|base| !base.is_empty())
+        .map(str::to_owned)
 }
 
 /// Free reconciliation shares the builder lease but never hashes the deploy
@@ -225,17 +252,28 @@ impl SweepGuard {
         else {
             return Ok(None);
         };
-        // Validate after claim, never modify another worker's checkpoint.
+        // Bind merge metadata to the protected review that granted authority,
+        // not a different cached OpenedPr supplied by a reconciliation caller.
+        let reviews: Vec<Review> = store
+            .events(&id)?
+            .into_iter()
+            .rev()
+            .filter(|(_, kind, _, _)| kind == "review_recorded")
+            .filter_map(|(_, _, body, _)| serde_json::from_str::<Review>(&body).ok())
+            .filter(|review| review.binding == binding)
+            .collect();
+        let structured = reviews.iter().find_map(|review| {
+            structured_review_base(&review.evidence, head).map(|base| (review.approved, base))
+        });
+        let reviewed_base = if existing.is_some() {
+            structured.as_ref().map(|(_, base)| base.clone())
+        } else {
+            structured_review_base(recorded, head)
+        };
         let authorized = if existing.is_some() {
             binding.head == head
-                && store
-                    .events(&id)?
-                    .into_iter()
-                    .rev()
-                    .filter(|(_, kind, _, _)| kind == "review_recorded")
-                    .filter_map(|(_, _, body, _)| serde_json::from_str::<Review>(&body).ok())
-                    .find(|review| review.binding == binding)
-                    .is_some_and(|review| review.approved)
+                && reviews.first().is_some_and(|review| review.approved)
+                && structured.as_ref().is_none_or(|(approved, _)| *approved)
         } else {
             true
         };
@@ -274,11 +312,10 @@ impl SweepGuard {
         };
         inner.audit_event("sweep_claimed", serde_json::json!({}))?;
         inner.spawn_renewal();
-        let reviewed_base = serde_json::from_str::<serde_json::Value>(recorded).ok()
-            .and_then(|value| value.pointer("/verdict/structured/binding/base")
-                .or_else(|| value.pointer("/structured/binding/base"))
-                .and_then(|base| base.as_str()).map(str::to_owned));
-        Ok(Some(Self { inner: Some(inner), reviewed_base }))
+        Ok(Some(Self {
+            inner: Some(inner),
+            reviewed_base,
+        }))
     }
 
     pub(super) async fn validate_remote(&self, repo: &Path, pr: u64, expected: &str) -> Result<()> {
@@ -288,10 +325,14 @@ impl SweepGuard {
             inner.binding.head == expected,
             "sweep approval binding changed"
         );
-        let reviewed_base = self.reviewed_base.as_deref()
+        let reviewed_base = self
+            .reviewed_base
+            .as_deref()
             .context("recorded approval lacks a structured integration base; refresh review")?;
-        anyhow::ensure!(remote_main_head(repo, &inner.repository).await? == reviewed_base,
-            "main changed since review; integrate and verify the candidate again");
+        anyhow::ensure!(
+            remote_main_head(repo, &inner.repository).await? == reviewed_base,
+            "main changed since review; integrate and verify the candidate again"
+        );
         let (ok, head, _) = run(
             &gh_bin(),
             &[
@@ -1259,7 +1300,10 @@ mod tests {
     fn control_dir() -> tempfile::TempDir {
         // Managed Cargo puts TMPDIR inside the writable build cache. Control
         // evidence must live outside every worker write root even in fixtures.
-        let dir = tempfile::Builder::new().prefix("autoship-control-test-").tempdir_in("/tmp").unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("autoship-control-test-")
+            .tempdir_in("/tmp")
+            .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
@@ -1522,6 +1566,25 @@ mod tests {
         let state = worktree.path().join("state/workflow.db");
         std::fs::create_dir_all(state.parent().unwrap()).unwrap();
         assert!(workflow_audit(&state, "owner/repo#7", Some(worktree.path())).is_err());
+    }
+
+    #[test]
+    fn structured_merge_base_is_bound_to_same_reviewed_head() {
+        for raw in [
+            serde_json::json!({"binding":{"head":"candidate","base":"main-a"}}),
+            serde_json::json!({"structured":{"binding":{"head":"candidate","base":"main-a"}}}),
+            serde_json::json!({"verdict":{"structured":{"binding":{"head":"candidate","base":"main-a"}}}}),
+        ] {
+            assert_eq!(
+                structured_review_base(&raw.to_string(), "candidate"),
+                Some("main-a".into())
+            );
+            assert!(structured_review_base(&raw.to_string(), "changed-candidate").is_none());
+        }
+        assert!(
+            structured_review_base(r#"{"head":"candidate","approved":true}"#, "candidate")
+                .is_none()
+        );
     }
 
     #[tokio::test]
