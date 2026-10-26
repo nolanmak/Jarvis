@@ -653,6 +653,9 @@ impl WorkflowGuard {
         }
         let audit = acquire_audit_generation(state, &mut store, &lease,
             Some(start.worktree), &mut binding, now)?;
+        audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
+            workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
+        })?;
         let guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
@@ -794,6 +797,9 @@ impl WorkflowGuard {
         // A recovered observation retains its generation binding across later leases.
         binding = store.snapshot(&id)?.context("observation workflow missing")?.checkpoint.binding;
         let audit = acquire_audit_generation(&state,&mut store,&lease,None,&mut binding,now)?;
+        audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
+            workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
+        })?;
         let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
         guard.install_model_accounting()?;
@@ -1768,6 +1774,10 @@ mod tests {
             augmentagent_channel_core::CooldownLatch::at(state.path().join("cooldowns.json")),
         );
         guard.bind_reasoner(&reasoner).unwrap();
+        assert_eq!(guard.audit_logger().native_runtime_owner().unwrap(),
+            Some(augmentagent_channel_core::native_vm::RuntimeOwner {
+                workflow_id: guard.id().to_owned(), lease_generation: guard.lease.generation,
+            }), "runtime retirement must bind to the actual fenced claim, not audit path alone");
         guard.audit_logger().model_call_admitted("claude").unwrap();
         let observation = crate::autoship_episode::Observation {
             receipt: "review-verified".into(),
