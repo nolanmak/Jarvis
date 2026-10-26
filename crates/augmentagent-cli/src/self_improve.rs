@@ -67,9 +67,15 @@ mod publication;
 mod aligned_review;
 #[path = "self_improve_review_canary.rs"]
 mod review_canary;
+#[path = "self_improve_review_calibration.rs"]
+mod review_calibration;
 
 pub(crate) async fn review_canary_if_due() -> Result<Option<review_canary::Report>> {
-    review_canary::run_if_due().await
+    let canary = review_canary::run_if_due().await;
+    if let Err(error) = review_calibration::run_if_due().await {
+        warn!(%error, "review calibration retained previous rubric");
+    }
+    canary
 }
 pub(crate) fn review_canary_summary() -> Result<String> { review_canary::summary() }
 
@@ -2850,7 +2856,7 @@ async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice], guard: &wo
 /// a failed attempt, exactly like a red verification gate.
 fn review_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
-        system_prompt: REVIEW_SYSTEM.to_string(),
+        system_prompt: format!("{}{}", REVIEW_SYSTEM, review_calibration::active().map(|r| r.prompt()).unwrap_or_default()),
         model: Some(scope_model()),
         allowed_tools: vec![
             "Read".into(),

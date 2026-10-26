@@ -23,7 +23,7 @@ fn database() -> Result<PathBuf> {
         .context("workflow state parent missing")?
         .join("review-canaries.db"))
 }
-fn connect(path: &Path, read_only: bool) -> Result<rusqlite::Connection> {
+pub(super) fn connect(path: &Path, read_only: bool) -> Result<rusqlite::Connection> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     let parent = path.parent().context("canary state parent missing")?;
     if !read_only {

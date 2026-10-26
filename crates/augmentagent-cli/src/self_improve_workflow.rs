@@ -76,7 +76,7 @@ pub(super) struct WorkflowGuard {
     audit: Arc<augmentagent_channel_core::AuditLogger>,
 }
 
-fn workflow_audit(
+pub(super) fn workflow_audit(
     state: &Path,
     id: &str,
     worktree: Option<&Path>,
