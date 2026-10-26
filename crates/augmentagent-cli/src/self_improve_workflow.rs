@@ -347,6 +347,7 @@ impl SweepGuard {
             .events(&id)?
             .into_iter()
             .rev()
+            .take_while(|(_, kind, _, _)| kind != "audit_generation_recovered")
             .filter(|(_, kind, _, _)| kind == "review_recorded")
             .filter_map(|(_, _, body, _)| serde_json::from_str::<Review>(&body).ok())
             .filter(|review| review.binding == binding)

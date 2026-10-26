@@ -1115,6 +1115,10 @@ impl WorkflowStore {
             params![lease.workflow,previous+1,lease.generation,raw])?;
         tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",
             params![lease.workflow,serde_json::to_string(&checkpoint)?,now])?;
+        // This is a current-authority index, not the immutable history (which
+        // remains in review_recorded events). Hash recomputation can return to
+        // the same candidate binding after recovery; it must not revive approval.
+        tx.execute("DELETE FROM review WHERE workflow=?1", [&lease.workflow])?;
         event(&tx,&lease.workflow,lease.generation,"audit_generation_recovered",&raw,now)?;
         tx.commit()?;
         Ok(checkpoint.binding)
@@ -1445,6 +1449,13 @@ mod tests {
         let current = store.recover_audit_generation(&lease,0,&proof,1022).unwrap();
         assert_ne!(current,binding());
         assert!(store.current_reviews(&old.workflow).unwrap().is_empty());
+        let mut reset = store.snapshot(&old.workflow).unwrap().unwrap().checkpoint;
+        reset.binding = binding();
+        store.checkpoint(&lease, &reset, 1023).unwrap();
+        assert!(store.current_reviews(&old.workflow).unwrap().is_empty(),
+            "recomputing the previous candidate hash cannot revive old approval");
+        reset.binding = current.clone();
+        store.checkpoint(&lease, &reset, 1023).unwrap();
         assert!(store.recover_audit_generation(&lease,1,&proof,1023).is_err());
         drop(store);
         let reopened = WorkflowStore::open(&path).unwrap();
