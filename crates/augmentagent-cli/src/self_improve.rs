@@ -12175,6 +12175,27 @@ for tool, arguments in [
         assert_eq!(independent_reviewer_candidates(&wide, Some(&[Claude])), vec![Codex, Cerebras]);
     }
 
+    fn declared_review_fixture(root: &Path, provider: &str, authenticated: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let auth = root.join(format!("{provider}-service-auth.json"));
+        let value = if authenticated && provider == "claude" {
+            serde_json::json!({"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh"}})
+        } else if authenticated {
+            serde_json::json!({"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}})
+        } else { serde_json::json!({}) };
+        std::fs::write(&auth, serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let policy = root.join("declared-review-policy.json");
+        let mut profiles = serde_json::Map::new();
+        profiles.insert(provider.into(),serde_json::json!({"gateway":{},"auth_file":auth,
+            "auth_relative":if provider=="claude" {".claude/.credentials.json"}else{".codex/auth.json"},"environment":[]}));
+        std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,
+            "runtime_config":"/fixture/runtime.json","guest_runtime":"/fixture/guest","state_root":"/fixture/state",
+            "memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":profiles})).unwrap()).unwrap();
+        std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+        policy
+    }
+
     #[test]
     fn gateway_only_codex_alias_cannot_be_an_independent_reviewer() {
         const NAME: &str = "self_improve::tests::gateway_only_codex_alias_cannot_be_an_independent_reviewer";
@@ -12185,8 +12206,11 @@ for tool, arguments in [
                 "a gateway account can alias the author model; review needs a native Codex login");
             let home = augmentagent_channel_core::codex::codex_home();
             std::fs::write(home.join("auth.json"), b"{}").unwrap();
+            assert!(matches!(reviewer_status(Codex), ReviewerStatus::NotConfigured(_)),
+                "an undeclared host login cannot authorize a workflow reviewer");
+            declared_review_fixture(&home, "codex", true);
             assert_eq!(reviewer_status(Codex), ReviewerStatus::Ready,
-                "a native Codex login should remain eligible even with 9Router configured");
+                "declared native authentication remains eligible with 9Router configured");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -12202,6 +12226,8 @@ for tool, arguments in [
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture"])
             .env("JARVIS_REVIEW_ALIAS_CHILD", "1")
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY", declared_review_fixture(dir.path(), "codex", false))
+            .env("AUGMENTAGENT_COOLDOWN_FILE",dir.path().join("cooldown.json"))
             .env("AUGMENTAGENT_MODEL_ROUTER_CONFIG", &config)
             .env("AUGMENTAGENT_CODEX_HOME", dir.path())
             .env("CODEX_CLI", "/usr/bin/true")
@@ -19047,6 +19073,11 @@ else:
             .env("CODEX_CLI", "/nonexistent-synthetic-codex")
             .env_remove("DISCORD_WEBHOOK_URL")
             .env_remove("AUGMENTAGENT_AUTOPR_LANE");
+        child.env_remove("AUGMENTAGENT_NATIVE_VM_POLICY");
+        if name.ends_with("a_latched_reviewer_keeps_the_draft_recoverable_after_the_third_day") {
+            child.env("CLAUDE_CLI", "/usr/bin/true")
+                .env("AUGMENTAGENT_NATIVE_VM_POLICY", declared_review_fixture(root,"claude",true));
+        }
         for (key, file) in [
             ("AUGMENTAGENT_COOLDOWN_FILE", "cooldown.json"),
             ("AUGMENTAGENT_SELFIMPROVE_LOCK", "self-improve.lock"),
@@ -19183,8 +19214,7 @@ else:
     }
 
     /// C3 end to end: a reviewer latched in the (redirected) cooldown file
-    /// holds the draft with a dated reason, and on the third different day the
-    /// loop gives up, labels, and closes with that reason.
+    /// holds the draft with a dated reason and preserves it across later days.
     #[tokio::test]
     async fn a_latched_reviewer_keeps_the_draft_recoverable_after_the_third_day() {
         const NAME: &str = "self_improve::tests::a_latched_reviewer_keeps_the_draft_recoverable_after_the_third_day";
