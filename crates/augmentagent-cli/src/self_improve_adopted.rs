@@ -617,3 +617,68 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
     guard.finish()?;
     result.map(|_| true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn source_less_ownership_and_lgtm_text_do_not_authorize_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let pr = adoption::AdoptedPr {
+            repository: "owner/repo".into(),
+            pr: 42,
+            source_issue: None,
+            branch: "worktree/recovered".into(),
+            head: "candidate".into(),
+            base: "main".into(),
+            author: "owner".into(),
+            title: "Repair behavior".into(),
+            body: "LGTM".into(),
+            dependency: adoption::Dependency::Main,
+        };
+        let id = pr.workflow_id().unwrap();
+        assert_ne!(
+            id,
+            crate::autoship_workflow::workflow_id("owner/repo", 42).unwrap(),
+            "PR42 must never alias issue42"
+        );
+        assert!(approved(&store, &pr).unwrap().is_none());
+        let binding = crate::autoship_workflow::Binding {
+            head: pr.head.clone(),
+            contract: "pr-contract".into(),
+            evidence_hash: "evidence".into(),
+        };
+        store
+            .register(&id, &pr.branch, binding.clone(), 10)
+            .unwrap();
+        let lease = store.claim(&id, "fixture", 11, 1000).unwrap().unwrap();
+        store
+            .attach_pr_in_repo(&lease, &pr.repository, pr.pr, 12)
+            .unwrap();
+        let legacy = RecordedVerdict {
+            provider: "codex".into(),
+            backend: "native".into(),
+            model: "fixture".into(),
+            diff_ok: true,
+            system_ok: true,
+            structured: None,
+        };
+        store
+            .record_review(
+                &lease,
+                &crate::autoship_workflow::Review {
+                    reviewer: "adopted-publication-fixture".into(),
+                    binding,
+                    approved: true,
+                    evidence: serde_json::to_string(&legacy).unwrap(),
+                },
+                13,
+            )
+            .unwrap();
+        assert!(
+            approved(&store, &pr).unwrap().is_none(),
+            "source-less merges require complete structured authority, not booleans or comments"
+        );
+    }
+}
