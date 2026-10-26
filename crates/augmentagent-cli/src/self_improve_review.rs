@@ -147,6 +147,8 @@ mod caller_stream;
 mod final_authority;
 #[path = "self_improve_adjudication_windows.rs"]
 mod adjudication_windows;
+#[path = "self_improve_requested_evidence.rs"]
+mod requested_evidence;
 
 const REGRESSION_REQUIREMENT: &str = "No newly demonstrated correctness, security or acceptance regression; report a reproducible example and concrete remedy.";
 
@@ -977,7 +979,7 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
-    fn candidate_fixture() -> tempfile::TempDir {
+    pub(super) fn candidate_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         fixture_git(path, &["init", "-q"]);

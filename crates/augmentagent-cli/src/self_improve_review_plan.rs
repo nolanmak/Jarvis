@@ -105,7 +105,7 @@ pub(super) fn worst_case_calls(groups: usize) -> Result<u64> {
         .and_then(|n| n.checked_add(2))
         .context("review call budget overflow")
 }
-fn valid_missing_path(path: &str) -> bool {
+pub(super) fn valid_missing_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
         && !path.starts_with(':')

@@ -21,6 +21,12 @@ pub(super) struct Plan {
 impl Plan {
     pub async fn collect(root: &Path, head: &str, diff: &str) -> Result<Self> {
         let (symbols, paths)=caller_paths(root,head,diff).await?;
+        Self::from_paths(root,head,paths,symbols,"All lexical matches for changed and removed Rust item names; not a semantic call graph").await
+    }
+    pub async fn named(root:&Path,head:&str,path:&str)->Result<Self> {
+        Self::from_paths(root,head,BTreeSet::from([path.into()]),BTreeSet::new(),"Explicit immutable source requested by final authority").await
+    }
+    async fn from_paths(root:&Path,head:&str,paths:BTreeSet<String>,symbols:BTreeSet<String>,lookup:&str)->Result<Self> {
         let mut blobs=Vec::new();
         let mut manifest_bytes=0usize;
         for path in paths {
@@ -38,7 +44,7 @@ impl Plan {
             blobs.push(Blob {path,oid,bytes});
         }
         let manifest=serde_json::to_string(&serde_json::json!({
-            "lookup":"All lexical matches for changed and removed Rust item names; not a semantic call graph",
+            "lookup":lookup,
             "symbols":symbols,"source_manifest_only":blobs,
             "delivery":"Every listed immutable blob is separately streamed through every review role; this manifest is not source coverage."
         }))?;
