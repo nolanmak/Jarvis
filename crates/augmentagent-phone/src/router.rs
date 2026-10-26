@@ -70,6 +70,10 @@ impl AgentRouter {
 }
 #[async_trait]
 impl ConversationAgent for AgentRouter {
+    async fn resume_task(&self, call: &PhoneCall, task_id: &str) -> Result<(), AgentError> {
+        self.adapter(call)?.resume_task(call, task_id).await
+    }
+
     async fn answer(
         &self,
         call: &PhoneCall,

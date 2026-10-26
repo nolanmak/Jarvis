@@ -351,3 +351,42 @@ async fn concurrent_callback_binding_cannot_be_overwritten_by_candidate_associat
     assert!(!call.state.terminal());
     assert!(store.phone_usage(&id).unwrap().is_none());
 }
+
+#[test]
+fn dispatch_intent_claim_result_and_delivery_survive_reopen() {
+    let (dir, store, id) = fixture();
+    store
+        .phone_enqueue_dispatch(&id, "task", "Synthetic task")
+        .unwrap();
+    store
+        .phone_enqueue_dispatch(&id, "task", "Synthetic task")
+        .unwrap();
+    assert!(store
+        .phone_enqueue_dispatch(&id, "task", "Different task")
+        .is_err());
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert_eq!(store.phone_pending_dispatches().unwrap().len(), 1);
+    assert!(store.phone_start_dispatch(&id, "task").unwrap());
+    assert!(!store.phone_start_dispatch(&id, "task").unwrap());
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert_eq!(
+        store.phone_pending_dispatches().unwrap()[0].state,
+        "running"
+    );
+    store
+        .phone_finish_dispatch(&id, "task", "Saved result")
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    let jobs = store.phone_pending_dispatches().unwrap();
+    assert_eq!(jobs[0].state, "ready");
+    assert_eq!(jobs[0].result.as_deref(), Some("Saved result"));
+    store.phone_dispatch_delivered(&id, "task").unwrap();
+    assert!(store.phone_pending_dispatches().unwrap().is_empty());
+    store
+        .phone_enqueue_dispatch(&id, "task", "Synthetic task")
+        .unwrap();
+    assert!(!store.phone_start_dispatch(&id, "task").unwrap());
+}

@@ -47,6 +47,11 @@ impl PhoneRuntime {
         // get access to the new runtime and can request another call.
         let initial = service.cleanup_due(true)?;
         let stop = CancellationToken::new();
+        let dispatches = tokio::spawn(dispatch_worker(
+            service.clone(),
+            agent.clone(),
+            stop.clone(),
+        ));
         let memory = tokio::spawn(memory_worker(service.clone(), agent.clone(), stop.clone()));
         let proposals = tokio::spawn(proposal_worker(service.clone(), agent.clone(), stop.clone()));
         let router = crate::ingress::router(service.clone(), auth, agent);
@@ -71,7 +76,7 @@ impl PhoneRuntime {
             service,
             tools,
             stop,
-            tasks: vec![http, watchdog, memory, proposals],
+            tasks: vec![http, watchdog, memory, proposals, dispatches],
         })
     }
     pub fn tools(&self) -> &Arc<ToolServer> {
@@ -272,5 +277,28 @@ async fn watchdog(
         Err(RuntimeError::Task)
     } else {
         Ok(())
+    }
+}
+
+// Independent of slow post-call summaries: queued work survives daemon restart.
+async fn dispatch_worker(
+    service: Arc<PhoneService>,
+    agent: Arc<dyn ConversationAgent>,
+    stop: CancellationToken,
+) -> Result<(), RuntimeError> {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = interval.tick() => {
+                let Ok(jobs) = service.store.phone_pending_dispatches() else { continue; };
+                for job in jobs {
+                    if stop.is_cancelled() { return Ok(()); }
+                    if let Ok(call) = service.store.phone_provider_call(&job.call_id) {
+                        let _ = agent.resume_task(&call, &job.task_id).await;
+                    }
+                }
+            }
+        }
     }
 }

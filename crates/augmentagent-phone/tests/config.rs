@@ -83,7 +83,7 @@ fn ac03_voice_providers_default_to_deepgram_and_elevenlabs_and_fail_closed_on_ba
     assert_eq!(voice.stt_provider(), SttProvider::Deepgram);
     assert_eq!(voice.stt_model(), "nova-3-general");
     assert_eq!(voice.tts_provider(), TtsProvider::ElevenLabs);
-    assert_eq!(voice.tts_voice(), "UgBBYS2sOqTuMpoF3BR0-flash_v2_5");
+    assert_eq!(voice.tts_voice(), "r1KmysJdVYZjJCm4mL3b-flash_v2_5");
     assert_eq!(*voice, VoiceConfig::default());
 
     let mut env = values();

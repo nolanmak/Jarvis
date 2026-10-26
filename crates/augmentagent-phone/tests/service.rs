@@ -1875,7 +1875,7 @@ async fn ac01_default_twiml_pins_deepgram_nova3_and_elevenlabs_flash() {
     assert_eq!(relay["transcriptionProvider"], "Deepgram");
     assert_eq!(relay["speechModel"], "nova-3-general");
     assert_eq!(relay["ttsProvider"], "ElevenLabs");
-    assert_eq!(relay["voice"], "UgBBYS2sOqTuMpoF3BR0-flash_v2_5");
+    assert_eq!(relay["voice"], "r1KmysJdVYZjJCm4mL3b-flash_v2_5");
     assert_eq!(relay["language"], "en-US");
     assert_eq!(relay["elevenlabsTextNormalization"], "on");
     assert_eq!(relay["hints"], DEFAULT_HINTS);
@@ -1922,8 +1922,14 @@ async fn ac02_each_provider_variable_changes_only_its_own_attribute() {
             ],
         ),
         (
-            vec![("AUGMENTAGENT_PHONE_TTS_VOICE", "UgBBYS2sOqTuMpoF3BR0-flash_v2_5-1.0_0.5_0.75")],
-            vec![("voice", Some("UgBBYS2sOqTuMpoF3BR0-flash_v2_5-1.0_0.5_0.75"))],
+            vec![(
+                "AUGMENTAGENT_PHONE_TTS_VOICE",
+                "r1KmysJdVYZjJCm4mL3b-flash_v2_5-1.0_0.5_0.75",
+            )],
+            vec![(
+                "voice",
+                Some("r1KmysJdVYZjJCm4mL3b-flash_v2_5-1.0_0.5_0.75"),
+            )],
         ),
         (
             vec![("AUGMENTAGENT_PHONE_TTS_PROVIDER", "Amazon")],

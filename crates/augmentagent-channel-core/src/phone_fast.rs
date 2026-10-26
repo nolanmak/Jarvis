@@ -132,11 +132,15 @@ fn sse_payloads(buffer: &mut String, chunk: &str) -> Vec<String> {
 #[derive(Default)]
 pub struct AnthropicSse {
     buffer: String,
+    complete: bool,
     /// Open tool_use blocks by content index: (id, name, partial JSON).
     tools: std::collections::HashMap<u64, (String, String, String)>,
 }
 impl AnthropicSse {
     pub fn push(&mut self, chunk: &str) -> Result<Vec<FastEvent>, FastModelError> {
+        if self.buffer.len().saturating_add(chunk.len()) > 1_048_576 {
+            return Err(FastModelError("stream_limit"));
+        }
         let mut events = Vec::new();
         for payload in sse_payloads(&mut self.buffer, chunk) {
             let value: Value =
@@ -144,6 +148,7 @@ impl AnthropicSse {
             let index = value["index"].as_u64().unwrap_or(0);
             match value["type"].as_str() {
                 Some("error") => return Err(FastModelError("provider_error")),
+                Some("message_stop") => self.complete = true,
                 Some("content_block_start") if value["content_block"]["type"] == "tool_use" => {
                     let block = &value["content_block"];
                     self.tools.insert(
@@ -185,6 +190,16 @@ impl AnthropicSse {
                 _ => {}
             }
         }
+        if self.tools.len() > 32
+            || self
+                .tools
+                .values()
+                .map(|(id, name, args)| id.len() + name.len() + args.len())
+                .sum::<usize>()
+                > 1_048_576
+        {
+            return Err(FastModelError("stream_limit"));
+        }
         Ok(events)
     }
 }
@@ -193,14 +208,19 @@ impl AnthropicSse {
 #[derive(Default)]
 pub struct OpenAiSse {
     buffer: String,
+    complete: bool,
     /// Tool calls being assembled, by index: (id, name, arguments).
     tools: std::collections::BTreeMap<u64, (String, String, String)>,
 }
 impl OpenAiSse {
     pub fn push(&mut self, chunk: &str) -> Result<Vec<FastEvent>, FastModelError> {
+        if self.buffer.len().saturating_add(chunk.len()) > 1_048_576 {
+            return Err(FastModelError("stream_limit"));
+        }
         let mut events = Vec::new();
         for payload in sse_payloads(&mut self.buffer, chunk) {
             if payload.trim() == "[DONE]" {
+                self.complete = true;
                 events.extend(self.flush()?);
                 continue;
             }
@@ -239,6 +259,16 @@ impl OpenAiSse {
                 events.extend(self.flush()?);
             }
         }
+        if self.tools.len() > 32
+            || self
+                .tools
+                .values()
+                .map(|(id, name, args)| id.len() + name.len() + args.len())
+                .sum::<usize>()
+                > 1_048_576
+        {
+            return Err(FastModelError("stream_limit"));
+        }
         Ok(events)
     }
     fn flush(&mut self) -> Result<Vec<FastEvent>, FastModelError> {
@@ -262,6 +292,17 @@ enum Parser {
     OpenAi(OpenAiSse),
 }
 impl Parser {
+    fn finish(&self) -> Result<(), FastModelError> {
+        let complete = match self {
+            Self::Anthropic(p) => p.complete && p.tools.is_empty() && p.buffer.trim().is_empty(),
+            Self::OpenAi(p) => p.complete && p.tools.is_empty() && p.buffer.trim().is_empty(),
+        };
+        if complete {
+            Ok(())
+        } else {
+            Err(FastModelError("truncated_stream"))
+        }
+    }
     fn push(&mut self, chunk: &str) -> Result<Vec<FastEvent>, FastModelError> {
         match self {
             Self::Anthropic(p) => p.push(chunk),
@@ -286,7 +327,7 @@ impl HttpFastModel {
 #[async_trait::async_trait]
 impl FastModel for HttpFastModel {
     async fn stream(&self, request: FastRequest) -> Result<FastStream, FastModelError> {
-        let (builder, mut parser) = match self.provider {
+        let (builder, parser) = match self.provider {
             FastProvider::Anthropic => {
                 let key = crate::secret_loader::load_provider_key("ANTHROPIC_API_KEY")
                     .ok_or(FastModelError("missing_credentials"))?;
@@ -320,7 +361,7 @@ impl FastModel for HttpFastModel {
         };
         // Only status classes and fixed codes leave this function: provider
         // bodies may echo request text.
-        let mut response = builder
+        let response = builder
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
@@ -332,49 +373,56 @@ impl FastModel for HttpFastModel {
                 "http_5xx"
             }));
         }
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(async move {
-            let mut pending = Vec::new();
-            loop {
-                let chunk = match response.chunk().await {
-                    Ok(Some(chunk)) => chunk,
-                    Ok(None) => return,
-                    Err(_) => {
-                        let _ = tx.send(Err(FastModelError("transport"))).await;
-                        return;
-                    }
-                };
-                pending.extend_from_slice(&chunk);
-                // Hold back an incomplete UTF-8 tail for the next chunk.
-                let valid = match std::str::from_utf8(&pending) {
-                    Ok(_) => pending.len(),
-                    Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                    Err(_) => {
-                        let _ = tx.send(Err(FastModelError("malformed_stream"))).await;
-                        return;
-                    }
-                };
-                let text = String::from_utf8(pending.drain(..valid).collect())
-                    .expect("validated UTF-8 prefix");
-                match parser.push(&text) {
-                    Ok(events) => {
-                        for event in events {
-                            if tx.send(Ok(event)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
+        Ok(response_stream(response, parser))
+    }
+}
+
+// Shared by production HTTP and local wire fixtures: a clean TCP EOF is not
+// proof that the provider completed a model turn.
+fn response_stream(mut response: reqwest::Response, mut parser: Parser) -> FastStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        let mut pending = Vec::new();
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    let result = if pending.is_empty() { parser.finish() }
+                        else { Err(FastModelError("truncated_stream")) };
+                    if let Err(error) = result { let _ = tx.send(Err(error)).await; }
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx.send(Err(FastModelError("transport"))).await;
+                    return;
+                }
+            };
+            pending.extend_from_slice(&chunk);
+            let valid = match std::str::from_utf8(&pending) {
+                Ok(_) => pending.len(),
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(_) => {
+                    let _ = tx.send(Err(FastModelError("malformed_stream"))).await;
+                    return;
+                }
+            };
+            let text = String::from_utf8(pending.drain(..valid).collect()).expect("validated UTF-8 prefix");
+            match parser.push(&text) {
+                Ok(events) => {
+                    for event in events {
+                        if tx.send(Ok(event)).await.is_err() { return; }
                     }
                 }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
             }
-        });
-        Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
-        })))
-    }
+        }
+    });
+    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|event| (event, rx))
+    }))
 }
 
 /// Read-only keyword lookup over the wiki's Markdown files: up to three
@@ -592,6 +640,67 @@ mod phone_fast_tests {
                 "tool:c1:dispatch_task:{\"description\":\"x\"}"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn phone_fast_http_eof_after_partial_text_reports_truncation() {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (tail, expected) in [
+            (b"".as_slice(), Some("truncated_stream")),
+            (b"data: [DONE]\n\n".as_slice(), None),
+            (b"\xf0\x9f".as_slice(), Some("truncated_stream")),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut body =
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n".to_vec();
+            body.extend_from_slice(tail);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            });
+            let response = reqwest::get(format!("http://{address}")).await.unwrap();
+            let events: Vec<_> = response_stream(response, Parser::OpenAi(OpenAiSse::default()))
+                .collect()
+                .await;
+            assert!(matches!(&events[0], Ok(FastEvent::Token(text)) if text == "Hello"));
+            assert_eq!(
+                events.last().and_then(|e| e.as_ref().err()).map(|e| e.0),
+                expected
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn phone_fast_eof_requires_provider_terminal_event_and_complete_frames() {
+        for mut parser in [
+            Parser::Anthropic(AnthropicSse::default()),
+            Parser::OpenAi(OpenAiSse::default()),
+        ] {
+            assert_eq!(parser.finish(), Err(FastModelError("truncated_stream")));
+            parser.push("data: {").unwrap();
+            assert_eq!(parser.finish(), Err(FastModelError("truncated_stream")));
+        }
+        let mut a = Parser::Anthropic(AnthropicSse::default());
+        a.push("data: {\"type\":\"message_stop\"}\n\n").unwrap();
+        assert_eq!(a.finish(), Ok(()));
+        let mut o = Parser::OpenAi(OpenAiSse::default());
+        o.push("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+            .unwrap();
+        assert_eq!(o.finish(), Err(FastModelError("truncated_stream")));
+        o.push("data: [DONE]\n\n").unwrap();
+        assert_eq!(o.finish(), Ok(()));
+        o.push("data: {").unwrap();
+        assert_eq!(o.finish(), Err(FastModelError("truncated_stream")));
     }
 
     #[test]

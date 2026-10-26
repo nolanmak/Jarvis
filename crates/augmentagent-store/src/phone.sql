@@ -164,3 +164,13 @@ CREATE TABLE IF NOT EXISTS phone_call_end_notices (
     created_ms INTEGER NOT NULL,
     done_ms INTEGER
 );
+
+-- Durable voice delegation intent and delivery, independent of relay lifetime.
+CREATE TABLE IF NOT EXISTS phone_dispatch_jobs (
+    call_id TEXT NOT NULL REFERENCES phone_calls(id),
+    task_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued','running','ready','done')),
+    result TEXT,
+    PRIMARY KEY(call_id, task_id)
+);
