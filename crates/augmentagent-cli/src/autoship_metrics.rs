@@ -189,6 +189,12 @@ mod tests {
         };
         store.charge(&lease, "attempt", charge, 30).unwrap();
         store.charge(&lease, "attempt", charge, 40).unwrap();
+        // A duplicated legacy/recovery observation must not join-multiply the
+        // measured charge. Aggregation is by the immutable charge receipt.
+        let conn = Connection::open(&path).unwrap();
+        for observed_at in [41, 42] {
+            conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'resource_charged','attempt',?3)",params![lease.workflow,lease.generation,observed_at]).unwrap();
+        }
         let before = read(&path, 20, 50).unwrap();
         assert_eq!(before.confirmed_merge_operations, 0);
         assert_eq!(before.model_calls, 2);
