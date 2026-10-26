@@ -371,7 +371,7 @@
       "provider_conformance": "verified"
     },
     {
-      "callsite": "crates/augmentagent-channel-email/src/channel.rs::process_email",
+      "callsite": "crates/augmentagent-channel-email/src/channel.rs::process_email_with_retry",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
@@ -685,6 +685,66 @@
         "phone_agent::fast::summarization_runs_the_heavy_agent_once_with_no_tools"
       ],
       "provider_conformance": "unverified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/autoship_review.rs::adjudicate_with_origin",
+      "permission_profile": "text",
+      "output_contract": "Final native Codex ruling bound to exact head, contract, complete finding evidence and mandatory gates",
+      "model_tier": "preserved",
+      "tier_rationale": "Narrows pinned native review options to supplied evidence only, preserving the configured model tier; host tools and inherited settings are removed.",
+      "conformance": [
+        "autoship_review::tests::binding_adjudication_resolves_docs_conflict_without_unanimity",
+        "autoship_review::tests::adjudicator_never_overrides_mandatory_checks"
+      ],
+      "provider_conformance": "Native fresh-session transport and deterministic evidence contracts covered; individual authority prompt outcomes require live canary verification."
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve_alignment.rs::gate_for",
+      "permission_profile": "text",
+      "output_contract": "Independent complete Git hunk to registered criterion mapping and exact policy exception evidence",
+      "model_tier": "preserved",
+      "tier_rationale": "Narrows pinned native review options to supplied evidence only, preserving the configured model tier; host tools and inherited settings are removed.",
+      "conformance": [
+        "self_improve::alignment::tests::out_of_scope_and_harness_impersonation_are_rejected",
+        "native_session::tests::fresh_review_overrides_builder_and_cannot_resume_even_on_retry"
+      ],
+      "provider_conformance": "Native fresh-session transport and deterministic evidence contracts covered; individual authority prompt outcomes require live canary verification."
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve_amendment.rs::authority",
+      "permission_profile": "text",
+      "output_contract": "Independent structured verifier correction; immutable owner criteria and original baseline red required",
+      "model_tier": "preserved",
+      "tier_rationale": "Narrows pinned native review options to supplied evidence only, preserving the configured model tier; host tools and inherited settings are removed.",
+      "conformance": [
+        "self_improve::acceptance::amendment::tests::amendment_preserves_requirements_and_rejects_noop_or_scope_expansion",
+        "self_improve::acceptance::amendment::tests::changed_fixture_is_versioned_and_source_bound"
+      ],
+      "provider_conformance": "Native fresh-session transport and deterministic evidence contracts covered; individual authority prompt outcomes require live canary verification."
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve_constraint_learning.rs::isolated",
+      "permission_profile": "text",
+      "output_contract": "Literal rule proposal or independent promotion decision from authenticated review evidence; no executable policy",
+      "model_tier": "preserved",
+      "tier_rationale": "Narrows pinned native review options to supplied evidence only, preserving the configured model tier; host tools and inherited settings are removed.",
+      "conformance": [
+        "self_improve::alignment::learning::tests::known_good_changes_veto_overbroad_rules_and_shell_text_is_inert",
+        "self_improve::alignment::learning::tests::known_valid_deleted_renamed_and_binary_paths_veto_forbidden_rules"
+      ],
+      "provider_conformance": "Native fresh-session transport and deterministic evidence contracts covered; individual authority prompt outcomes require live canary verification."
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve_scope.rs::call",
+      "permission_profile": "text",
+      "output_contract": "Fresh native original-source selection or executable acceptance scope from controller-supplied immutable Git evidence",
+      "model_tier": "preserved",
+      "tier_rationale": "Narrows pinned native review options to supplied evidence only, preserving the configured model tier; host tools and inherited settings are removed.",
+      "conformance": [
+        "self_improve::acceptance::scope_authority::tests::source_index_preserves_literal_quoted_and_multiline_filenames",
+        "native_session::tests::fresh_review_overrides_builder_and_cannot_resume_even_on_retry"
+      ],
+      "provider_conformance": "Native fresh-session transport and deterministic evidence contracts covered; individual authority prompt outcomes require live canary verification."
     }
   ]
 }
