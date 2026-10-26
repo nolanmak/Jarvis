@@ -1017,8 +1017,9 @@ mod tests {
     #[test]
     fn cached_response_requires_anchored_matching_result_and_healthy_original_audit() {
         let dir = tempfile::tempdir().unwrap();
+        let anchor_dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
-        let anchor = dir.path().join("anchor.json");
+        let anchor = anchor_dir.path().join("anchor.json");
         let logger =
             augmentagent_channel_core::AuditLogger::protected(log.clone(), anchor, &[]).unwrap();
         logger
