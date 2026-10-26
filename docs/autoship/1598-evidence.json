@@ -24,8 +24,10 @@
       "issue": 930,
       "title": "Auto-PR loop self-heals its own blockers: red `main` and conflicting drafts",
       "source": "https://github.com/nolanmak/Jarvis/issues/930",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Audited existing children; paginated baseline-repair lookup and idempotent durable epic slicing added. Final deployed end-to-end acceptance pending."
+      ]
     },
     {
       "issue": 1082,
@@ -42,7 +44,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1215",
       "implementation_status": "partial",
       "evidence": [
-        "Whole-run deadline and calendar spreading removed; seven-hour productive run with independent sweeps passed; concurrent atomic quota accounting newly integrated under test; seven-day observation not started"
+        "Blanket deadline and calendar spreading removed; durable quota reservations and free merge reconciliation integrated. Local-calendar-day reporting added with DST tests pending execution. Seven-day observation not started."
       ]
     },
     {
@@ -87,7 +89,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1472",
       "implementation_status": "partial",
       "evidence": [
-        "Independent scoping and registered red/green verifier wired before fresh/resume builders. Contract amendment executor and complete live acceptance remain pending."
+        "Independent red/green registration and final adjudicated amendments integrated across fresh/resume/source-less paths. Old approvals discarded after amendments; complete live acceptance pending."
       ]
     },
     {
@@ -121,7 +123,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/953",
       "implementation_status": "partial",
       "evidence": [
-        "Protected literal constraint promotion requires provenance/version and positive/negative replay; comments are proposals only. Historical mining and recurring promotion workflow still incomplete."
+        "Authenticated historical comment mining, independent promotion and replay validation integrated. Exact-head contract exceptions persist and are reused only while policy/contract/hunk inputs match. Latest additions need regression run."
       ]
     },
     {
@@ -137,8 +139,10 @@
       "issue": 1512,
       "title": "EPIC: auto-PR backlog reform \u2014 fair-try scoping, relevance check, epic slicing, wider picker, research dedup",
       "source": "https://github.com/nolanmak/Jarvis/issues/1512",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Complete bounded pagination/readmission, durable slicing recovery and historical research dedup implemented. Verified duplicate #912 consolidated into #674 with preserved mapping. Full policy acceptance pending."
+      ]
     },
     {
       "issue": 472,
@@ -146,7 +150,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/472",
       "implementation_status": "partial",
       "evidence": [
-        "Email retry guard-chain and metadata preservation implemented; prior email suite had two fixture failures, corrected but rerun pending. Scheduled-loop durable coverage and digest integrated; 49 loop/process-loop tests passed."
+        "Email retry full guard-chain and metadata preservation: complete suite 221 passed. Scheduled-loop coverage and digest previously passed 49 tests. Deployed acceptance pending."
       ]
     },
     {
@@ -196,7 +200,7 @@
     }
   ],
   "operational_acceptance": {
-    "virtual_soak_72h": "not_run",
+    "virtual_soak_72h": "partial_pass: five-PR real-Git/fake-GitHub admission and reconciliation fixture passed; full native integrated soak remains unproven",
     "live_canary_24h": "not_started",
     "throughput_report_7d": "not_started",
     "convergence_comparison_30d": "not_started"
@@ -208,11 +212,11 @@
       "note": "Before latest episode production wiring and native fresh-session changes."
     },
     "self_improve": {
-      "passed": 358,
-      "failed": 1,
+      "passed": 379,
+      "failed": 2,
       "ignored": 7,
-      "revision": "12e06b4f",
-      "note": "Latest completed broad run. Remaining sweep fixture control-state isolation fixed; rerun active. Subsequent source changes must be retested."
+      "revision": "20a6accf",
+      "note": "Completed managed single-job run. Failures: merge-sweep fixture missing real acceptance artifact; diagnostic canary fixture nested storage admission. Fixes in progress; later integration not covered by this result."
     },
     "kernel_scope": {
       "passed": 6,
@@ -247,7 +251,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "Production baseline test finished; managed single-job build/test admission now available. Only one Rust process scheduled at a time.",
+    "latest_rust_admission": "One local managed Rust build/test at a time; capability inventory validation currently running.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -256,6 +260,18 @@
       ],
       "coderabbit_required": false,
       "note": "Legacy branch protection endpoint reports unprotected; branch rules endpoint reports only these rules. This does not prove local autoship code is deployed."
+    },
+    "email_retry": {
+      "passed": 221,
+      "failed": 0,
+      "revision": "374a7f0e",
+      "note": "Complete email library suite, managed single-job run."
+    },
+    "updater_rebuild": {
+      "passed": 59,
+      "failed": 0,
+      "revision": "7b58c519",
+      "note": "Embedded guard helpers now trigger rebuild through standard updater."
     }
   },
   "remaining_cross_cutting_acceptance": [
