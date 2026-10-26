@@ -41,7 +41,18 @@ fn open(path: &Path) -> Result<rusqlite::Connection> {
         CREATE TABLE IF NOT EXISTS attempts(batch TEXT NOT NULL, attempt INTEGER NOT NULL, started INTEGER NOT NULL, PRIMARY KEY(batch,attempt));
         CREATE TABLE IF NOT EXISTS versions(version TEXT PRIMARY KEY, examples TEXT NOT NULL, receipt TEXT NOT NULL, created INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS outcomes(case_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(case_id,sequence));")?;
-    for table in ["cases", "attempts", "versions", "outcomes"] {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS replay_batches(batch TEXT PRIMARY KEY, cases_json TEXT NOT NULL, examples TEXT NOT NULL, created INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS replay_results(batch TEXT NOT NULL, case_id TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(batch,case_id));
+        CREATE TABLE IF NOT EXISTS replay_complete(batch TEXT PRIMARY KEY, version TEXT NOT NULL);")?;
+    for table in [
+        "cases",
+        "attempts",
+        "versions",
+        "outcomes",
+        "replay_batches",
+        "replay_results",
+        "replay_complete",
+    ] {
         conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS {table}_immutable BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'calibration audit immutable'); END; CREATE TRIGGER IF NOT EXISTS {table}_retained BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'calibration audit retained'); END;"))?;
     }
     Ok(conn)
@@ -170,8 +181,7 @@ pub(super) fn collect(
     Ok(())
 }
 fn cases(conn: &rusqlite::Connection) -> Result<Vec<Case>> {
-    let mut stmt =
-        conn.prepare("SELECT body FROM cases ORDER BY created DESC,rowid DESC LIMIT 17")?;
+    let mut stmt = conn.prepare("SELECT body FROM cases ORDER BY created DESC,rowid DESC ")?;
     let bodies = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -275,16 +285,120 @@ fn promote(
     )?;
     Ok(version)
 }
+#[derive(Serialize, Deserialize)]
+struct ReplayReceipt {
+    session: String,
+    expected: BTreeMap<String, bool>,
+    observed: BTreeMap<String, bool>,
+    response_hash: String,
+}
+fn frozen_batch(
+    conn: &mut rusqlite::Connection,
+    latest: &[Case],
+    now: i64,
+) -> Result<Option<(String, Vec<Case>, String)>> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let pending: Option<(String,String,String)> = tx.query_row("SELECT batch,cases_json,examples FROM replay_batches WHERE batch NOT IN (SELECT batch FROM replay_complete) ORDER BY created,rowid LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let result = if let Some((batch, body, examples)) = pending {
+        Some((batch, serde_json::from_str(&body)?, examples))
+    } else {
+        let mut training = latest[1..latest.len().min(4)].to_vec();
+        for example in &mut training {
+            example.evidence = serde_json::to_string(&unlabelled_evidence(example)?)?;
+        }
+        let examples = serde_json::to_string(&training)?;
+        let already: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM versions WHERE examples=?1)",
+            [&examples],
+            |r| r.get(0),
+        )?;
+        if already {
+            None
+        } else {
+            let body = serde_json::to_string(latest)?;
+            let batch = review::digest(body.as_bytes());
+            tx.execute(
+                "INSERT OR IGNORE INTO replay_batches VALUES(?1,?2,?3,?4)",
+                rusqlite::params![batch, body, examples, now],
+            )?;
+            Some((batch, latest.to_vec(), examples))
+        }
+    };
+    tx.commit()?;
+    Ok(result)
+}
+fn completed_cases(
+    conn: &rusqlite::Connection,
+    batch: &str,
+) -> Result<BTreeMap<String, ReplayReceipt>> {
+    let mut stmt = conn.prepare("SELECT case_id,receipt FROM replay_results WHERE batch=?1")?;
+    let rows = stmt
+        .query_map([batch], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(id, body)| Ok((id, serde_json::from_str(&body)?)))
+        .collect()
+}
+fn finish_batch(
+    conn: &rusqlite::Connection,
+    batch: &str,
+    cases: &[Case],
+    examples: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let completed = completed_cases(conn, batch)?;
+    if cases.iter().any(|c| !completed.contains_key(&c.id)) {
+        return Ok(None);
+    }
+    let (_, fixtures) = fixtures()?;
+    let mut expected = BTreeMap::new();
+    let mut observed = BTreeMap::new();
+    let mut sessions = std::collections::BTreeSet::new();
+    for (index, case) in cases.iter().enumerate() {
+        let receipt = &completed[&case.id];
+        anyhow::ensure!(
+            !receipt.session.is_empty() && sessions.insert(receipt.session.clone()),
+            "duplicate replay native identity"
+        );
+        let mut oracle = fixtures.clone();
+        oracle.insert(format!("candidate-{index}"), case.expected);
+        anyhow::ensure!(
+            oracle == receipt.expected,
+            "persisted replay oracle differs from immutable suite"
+        );
+        review::validate_rubric_replay(examples, &oracle, &receipt.observed)?;
+        for (key, value) in oracle {
+            expected.insert(format!("{index}:{key}"), value);
+        }
+        for (key, value) in &receipt.observed {
+            observed.insert(format!("{index}:{key}"), *value);
+        }
+    }
+    let version = promote(
+        conn,
+        examples,
+        &expected,
+        &observed,
+        &serde_json::to_string(&sessions)?,
+        &serde_json::to_string(&completed)?,
+        now,
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO replay_complete VALUES(?1,?2)",
+        rusqlite::params![batch, version],
+    )?;
+    Ok(Some(version))
+}
 pub(super) async fn run_if_due() -> Result<()> {
     let path = database();
     if !path.exists() {
         return Ok(());
     }
     let mut conn = open(&path)?;
-    let cases = cases(&conn)?;
-    if cases.len() < 2 || cases.len() > MAX_REPLAY_CASES {
-        // Never silently omit an older protected label. A larger suite needs
-        // checkpointed pagination before any further optional promotion.
+    let latest = cases(&conn)?;
+    if latest.len() < 2 {
         return Ok(());
     }
     // Keep protected eventual observations without relabelling the case. A
@@ -307,22 +421,20 @@ pub(super) async fn run_if_due() -> Result<()> {
             }
         }
     }
-    let training = &cases[1..cases.len().min(4)];
-    let examples = serde_json::to_string(training)?;
-    let already_promoted: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM versions WHERE examples=?1)",
-        [&examples],
-        |r| r.get(0),
-    )?;
-    if already_promoted {
-        return Ok(());
-    }
-    let batch = review::digest(&serde_json::to_vec(&cases)?);
     let now = chrono::Utc::now().timestamp_millis();
+    let Some((batch, cases, examples)) = frozen_batch(&mut conn, &latest, now)? else {
+        return Ok(());
+    };
+    let training: Vec<Case> = serde_json::from_str(&examples)?;
+    let previous = completed_cases(&conn, &batch)?;
+    let remaining: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !previous.contains_key(&c.id))
+        .take(MAX_REPLAY_CASES)
+        .collect();
     let (protected, fixture_expected) = fixtures()?;
-    let mut expected = BTreeMap::new();
-    let mut observed = BTreeMap::new();
-    if !claim(&mut conn, &batch, now)? {
+    if !remaining.is_empty() && !claim(&mut conn, &format!("{batch}:{}", previous.len()), now)? {
         return Ok(());
     }
     drop(conn);
@@ -332,13 +444,12 @@ pub(super) async fn run_if_due() -> Result<()> {
     let isolated = tempfile::tempdir()?;
     let logger =
         workflow::workflow_audit(&workflow::path(), &format!("calibration:{batch}"), None)?;
-    let mut sessions = Vec::new();
-    let mut responses = Vec::new();
-    for (index, held) in cases.iter().enumerate() {
+    let mut sessions: Vec<String> = previous.values().map(|r| r.session.clone()).collect();
+    for (index, held) in remaining {
         let held_id = format!("candidate-{index}");
         let rubric = Rubric {
             version: batch.clone(),
-            examples: held_out_examples(training, held)?,
+            examples: held_out_examples(&training, held)?,
         };
         let prompt = serde_json::to_string(&serde_json::json!({
             "protected_cases":protected,
@@ -377,27 +488,23 @@ pub(super) async fn run_if_due() -> Result<()> {
         // from examples. Every preserved hard-case label must pass, not just
         // the newest case; no partial batch can become active after a crash.
         review::validate_rubric_replay(&examples, &oracle, &actual)?;
-        for (key, value) in oracle {
-            expected.insert(format!("{index}:{key}"), value);
-        }
-        for (key, value) in actual {
-            observed.insert(format!("{index}:{key}"), value);
-        }
+        let receipt = ReplayReceipt {
+            session: session.clone(),
+            expected: oracle,
+            observed: actual,
+            response_hash: review::digest(raw.as_bytes()),
+        };
+        open(&path)?.execute(
+            "INSERT OR IGNORE INTO replay_results VALUES(?1,?2,?3)",
+            rusqlite::params![batch, held.id, serde_json::to_string(&receipt)?],
+        )?;
         sessions.push(session);
-        responses.push(raw);
     }
     logger.drain_checked().await?;
-    let session = serde_json::to_string(&sessions)?;
-    let raw = serde_json::to_string(&responses)?;
-    let version = promote(
-        &open(&path)?,
-        &examples,
-        &expected,
-        &observed,
-        &session,
-        &raw,
-        now,
-    )?;
+    let conn = open(&path)?;
+    let Some(version) = finish_batch(&conn, &batch, &cases, &examples, now)? else {
+        return Ok(());
+    };
     info!(%version,"promoted independently replayed review rubric");
     Ok(())
 }
@@ -478,9 +585,70 @@ mod tests {
         let all = cases(&conn).unwrap();
         assert_eq!(all.len(), MAX_REPLAY_CASES + 1);
         assert!(all.iter().any(|c| c.id == "case-0"));
-        // An over-cap suite disables optional promotion instead of pretending
-        // the newest subset preserved every protected regression label.
         assert!(all.len() > MAX_REPLAY_CASES);
+    }
+
+    #[test]
+    fn paginated_replay_survives_restart_and_requires_every_frozen_case() {
+        let (dir, mut conn) = database_fixture();
+        let all: Vec<_> = (0..17)
+            .map(|i| case(&format!("case-{i}"), &format!("source-{i}")))
+            .collect();
+        let (batch, frozen, examples) = frozen_batch(&mut conn, &all, 1).unwrap().unwrap();
+        let (_, fixture_oracle) = fixtures().unwrap();
+        for (index, case) in frozen.iter().enumerate().take(16) {
+            let mut expected = fixture_oracle.clone();
+            expected.insert(format!("candidate-{index}"), case.expected);
+            let receipt = ReplayReceipt {
+                session: format!("native-{index}"),
+                observed: expected.clone(),
+                expected,
+                response_hash: "raw".into(),
+            };
+            conn.execute(
+                "INSERT INTO replay_results VALUES(?1,?2,?3)",
+                rusqlite::params![batch, case.id, serde_json::to_string(&receipt).unwrap()],
+            )
+            .unwrap();
+        }
+        assert!(finish_batch(&conn, &batch, &frozen, &examples, 2)
+            .unwrap()
+            .is_none());
+        drop(conn);
+        let mut conn = open(&dir.path().join("calibration.db")).unwrap();
+        let newer: Vec<_> = (0..19)
+            .map(|i| case(&format!("new-{i}"), "changed"))
+            .collect();
+        let (resumed, frozen_again, same_examples) =
+            frozen_batch(&mut conn, &newer, 3).unwrap().unwrap();
+        assert_eq!(batch, resumed);
+        assert_eq!(frozen_again.len(), 17);
+        assert_eq!(examples, same_examples);
+        assert_eq!(completed_cases(&conn, &batch).unwrap().len(), 16);
+        let mut expected = fixture_oracle;
+        expected.insert("candidate-16".into(), true);
+        let receipt = ReplayReceipt {
+            session: "native-16".into(),
+            observed: expected.clone(),
+            expected,
+            response_hash: "raw".into(),
+        };
+        conn.execute(
+            "INSERT INTO replay_results VALUES(?1,?2,?3)",
+            rusqlite::params![
+                batch,
+                frozen[16].id,
+                serde_json::to_string(&receipt).unwrap()
+            ],
+        )
+        .unwrap();
+        assert!(finish_batch(&conn, &batch, &frozen, &examples, 4)
+            .unwrap()
+            .is_some());
+        assert!(conn
+            .execute("UPDATE replay_results SET receipt='{}'", [])
+            .is_err());
+        assert!(conn.execute("DELETE FROM replay_batches", []).is_err());
     }
 
     #[test]
