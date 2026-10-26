@@ -165,9 +165,10 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     let reviewed=aligned_review::run(builder.as_ref(),&issue,root.clone(),&criteria,aligned_review::ReviewContext {
         qa_ok:true,qa_notes:"Controller executed pinned Python acceptance; separate independent QA role still required.",repair_round:0,previous:None,environment_id:"disposable-python",adjudication_attempts_already_made:0,workflow:Some(&guard),acceptance_evidence:Some((&prepared,&reference)),
     }).await;
+    let unavailable = format!("native clean review incomplete: {:?}; {}", reviewed.why_unavailable, reviewed.notes);
     let evidence = reviewed
         .structured
-        .context("native clean review incomplete")?;
+        .context(unavailable)?;
     evidence
         .authority()
         .context("native clean candidate did not earn independent approval")?;
