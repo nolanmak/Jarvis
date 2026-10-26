@@ -63,6 +63,9 @@ if run_installer install-autostart.sh; then ok "installer runs against a throwaw
 else bad "installer runs against a throwaway HOME" "$(tail -3 "$TMP/install.out")"; fi
 [ -s "$UNIT" ] && ok "renders the unit" || bad "renders the unit" "no file at $UNIT"
 expect_directives "$UNIT" "daemon unit"
+for d in "Delegate=cpu memory pids" "DelegateSubgroup=daemon" "CPUQuota=400%" "Environment=AUGMENTAGENT_RUN_RESOURCES=1"; do
+  has_line "$UNIT" "$d" && ok "daemon renders $d" || bad "daemon renders $d" "missing directive"
+done
 has_line "$UNIT" "Restart=on-failure" && ok "keeps the existing Restart policy" \
   || bad "keeps the existing Restart policy" "Restart=on-failure gone"
 # The limits belong to [Service], not [Unit]/[Install].

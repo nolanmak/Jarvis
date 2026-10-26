@@ -165,6 +165,13 @@ Environment=PATH=$SERVICE_PATH
 Environment=RUST_LOG=info
 # Deft channel still inert until a token is stored via 'augmentagent deft login'
 Environment=AUGMENTAGENT_DEFT_ENABLED=1
+Environment=AUGMENTAGENT_RUN_RESOURCES=1
+Environment=AUGMENTAGENT_RUN_MEMORY_BYTES=${AUGMENTAGENT_RUN_MEMORY_BYTES:-4294967296}
+Environment=AUGMENTAGENT_RUN_PIDS=${AUGMENTAGENT_RUN_PIDS:-512}
+Environment=AUGMENTAGENT_RUN_CPU_PERCENT=${AUGMENTAGENT_RUN_CPU_PERCENT:-200}
+Delegate=cpu memory pids
+DelegateSubgroup=daemon
+CPUQuota=${AUGMENTAGENT_UNIT_CPU_QUOTA:-400%}
 Restart=on-failure
 RestartSec=10
 # #902 — die alone: a fan-out is killed inside this cgroup, not by the
