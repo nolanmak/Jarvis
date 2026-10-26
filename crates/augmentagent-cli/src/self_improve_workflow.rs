@@ -1158,6 +1158,70 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn missing_review_does_not_replenish_fresh_episode_budget() {
+        let dir = repo();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let mut guard = WorkflowGuard::acquire_at(
+            &path,
+            Start {
+                repo_root: dir.path(),
+                worktree: dir.path(),
+                repository: "owner/repo",
+                source_issue: Some(7),
+                pr: None,
+                branch: "fix/seven",
+                contract: "C1",
+                environment: "rust-a",
+            },
+            millis(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut observation = crate::autoship_episode::Observation {
+            receipt: "review-0".into(),
+            epoch: "contract/base/environment".into(),
+            candidate: crate::autoship_episode::Candidate {
+                binding: guard.binding().clone(),
+                tests_passed: true,
+                guards_passed: true,
+                verified_criteria: 2,
+                open_findings: std::collections::BTreeSet::from(["F1".into()]),
+                lines_changed: 20,
+            },
+            review_complete: true,
+            contradictory_requirements: false,
+            infrastructure_failed: false,
+            autonomous_merge_observed: false,
+        };
+        for round in 0..3 {
+            observation.receipt = format!("review-{round}");
+            guard.observe_episode(&observation).unwrap();
+        }
+        let missing = IndependentReview::not_run("review transport unavailable".into());
+        let recovery = episode::evaluate(&mut guard, &missing, 2, 20)
+            .await
+            .unwrap();
+        assert_eq!(recovery.epoch, "contract/base/environment");
+        assert_eq!(
+            recovery.decision,
+            crate::autoship_episode::Decision::RepairInfrastructure
+        );
+        observation.receipt = "review-3".into();
+        guard.observe_episode(&observation).unwrap();
+        observation.receipt = "review-4".into();
+        assert!(
+            matches!(
+                guard.observe_episode(&observation).unwrap(),
+                crate::autoship_episode::Decision::Rescope { .. }
+            ),
+            "transient transport failure must not grant another fresh builder reset"
+        );
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn episode_counts_only_own_confirmed_merge_and_model_calls_are_separate() {
         let dir = repo();
         let state = tempfile::tempdir().unwrap();
