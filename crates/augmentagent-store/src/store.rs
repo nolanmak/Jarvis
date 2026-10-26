@@ -1,3 +1,6 @@
+#[path = "loop_memory.rs"]
+mod loop_memory;
+pub use loop_memory::{LoopFinding, LoopOccurrence};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1540,6 +1543,7 @@ impl Store {
                 ON user_loops(owner, status)",
             [],
         )?;
+        loop_memory::migrate(conn)?;
         // Auto-stop deadline (#104 follow-up). Nullable; pre-existing rows
         // migrate cleanly with `None` (run forever until manually stopped).
         if !column_exists(conn, "user_loops", "expires_at_ms")? {

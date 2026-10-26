@@ -8914,6 +8914,23 @@ async fn run_digest(
             ctx.push_str(&format!("- {status}: {n}\n"));
         }
     }
+    ctx.push_str("\n## Retry failure memory (latest 25; full history retained)\n");
+    for failure in store.email_retry_failures_since(since_ms, 25)? {
+        ctx.push_str(&format!("- action {} / message {}: attempt {}, guard {}, failure {}\n",
+            failure.action_id, failure.message_id, failure.attempt_n,
+            truncate(&failure.guard, 80), truncate(&failure.failure_class, 240)));
+    }
+    ctx.push_str("\n## Scheduled loop progress (latest 25 occurrences; full evidence retained)\n");
+    for occurrence in store.loop_occurrences_since(since_ms, 25)? {
+        let coverage = store.loop_coverage(&occurrence.loop_id, 5)?;
+        ctx.push_str(&format!("- loop {} / occurrence {}: {}; covered observations shown {}; outcome {}\n",
+            occurrence.loop_id, occurrence.request_id, occurrence.state, coverage.len(),
+            truncate(occurrence.error.as_deref().or(occurrence.answer.as_deref()).unwrap_or("pending"), 300)));
+        for finding in coverage {
+            ctx.push_str(&format!("  - {} [evidence: {}]\n", truncate(&finding.finding, 160),
+                truncate(&finding.evidence.join(", "), 200)));
+        }
+    }
     ctx.push_str(&format!("\n## Pending replies (awaiting approval)\n- {pending}\n"));
 
     // ## Flagged items (all) — exhaustive, not a recency sample.
