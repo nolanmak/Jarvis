@@ -667,6 +667,19 @@ mod tests {
     }
     #[tokio::test]
     async fn real_isolated_python_assertion_and_protected_write() {
+        // This tiny Python boundary fixture does not need the production Cargo
+        // scratch reserve. Isolate its declared floor from other test processes.
+        const CHILD: &str = "AUTOSHIP_PYTHON_BOUNDARY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::acceptance::tests::real_isolated_python_assertion_and_protected_write", "--nocapture"])
+                .env(CHILD, "1")
+                .env("AUGMENTAGENT_GATE_MIN_FREE_GB", "1")
+                .env("AUGMENTAGENT_GATE_BUILD_GROWTH_GB", "0")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let target = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::write(root.path().join("test_case.py"), "import unittest\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  self.assertEqual(1, 2, 'intended regression witness')\n").unwrap();
