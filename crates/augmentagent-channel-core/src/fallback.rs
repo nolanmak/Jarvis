@@ -549,6 +549,13 @@ impl FallbackReasoner {
         Ok(())
     }
 
+    pub fn uses_isolated_command_storage(&self,opts:&ReasonerOpts)->anyhow::Result<bool> {
+        let mut effective=opts.clone();
+        effective.audit_logger=self.workflow_audit.lock().map_err(|_|anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone()
+            .or_else(||opts.audit_logger.clone());
+        Ok(crate::codex_tools::isolated_command_storage(&effective))
+    }
+
     async fn dispatch(
         &self,
         opts: &ReasonerOpts,

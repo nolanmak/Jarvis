@@ -73,6 +73,28 @@ pub fn build_runner() -> BuildRunner {
                             std::env::var_os("HOME"))
 }
 
+/// Only the required native guest + VM-build route can release host build
+/// storage while the model thinks. Its sole host build route is this bridge.
+pub fn isolated_command_storage(opts:&ReasonerOpts)->bool {
+    isolated_storage_route(opts,&build_runner())
+}
+fn isolated_storage_route(opts:&ReasonerOpts,runner:&BuildRunner)->bool {
+    opts.env.iter().any(|(key,value)|key==crate::autoship_scope::SCOPE_ENV && value=="1")
+        && opts.audit_logger.as_ref().is_some_and(|logger|logger.is_protected() && logger.run_resources_required())
+        && matches!(runner,BuildRunner::Vm(_))
+}
+fn command_storage_policy(opts:&ReasonerOpts)->anyhow::Result<Option<serde_json::Value>> {
+    if !isolated_command_storage(opts) {return Ok(None);}
+    let state=crate::state_dir::state_dir().ok_or_else(||anyhow::anyhow!("command storage state missing"))?;
+    let number=|key:&str,default:f64|std::env::var(key).ok().and_then(|v|v.parse::<f64>().ok())
+        .filter(|v|v.is_finite() && *v>=0.0).unwrap_or(default);
+    let floor=number("AUGMENTAGENT_GATE_MIN_FREE_GB",15.0);
+    let growth=number("AUGMENTAGENT_BUILD_GROWTH_GB",10.0);
+    Ok(Some(serde_json::json!({"lock":state.join("disk-build.lock"),
+        "floor_bytes":(floor*1024f64.powi(3)) as u64,
+        "admission_bytes":((floor+growth)*1024f64.powi(3)) as u64})))
+}
+
 // #1045 — single-file Read exceptions outside the read roots.
 //
 // The query preset's scope guard (`scripts/aa-wiki-scope-guard.sh`, #127)
@@ -370,6 +392,7 @@ impl BridgeLaunch {
             // Operator configuration, deliberately not sourced from opts.env.
             "build_vm_config": runner.vm_config(),
             "build_runner": runner.label(),
+            "command_storage": command_storage_policy(opts)?,
             // #1036: VM build scratch root and default build timeout.
             "build_scratch_dir": scratch,
             "build_timeout_secs": crate::build_scratch::build_timeout_secs(),
@@ -488,6 +511,22 @@ impl ClaudeBridgeLaunch {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn only_required_guarded_vm_builds_release_conversation_storage() {
+        let root=tempfile::tempdir().unwrap();let runner=BuildRunner::Vm(root.path().join("runtime.json"));
+        let mut opts=crate::reasoner::triage_opts(None);
+        opts.env.push((crate::autoship_scope::SCOPE_ENV.into(),"1".into()));
+        assert!(!isolated_storage_route(&opts,&runner),"a profile flag alone is not authority");
+        let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("audit.jsonl"),root.path().join("anchor"),&[]).unwrap());
+        opts.audit_logger=Some(logger.clone());
+        assert!(!isolated_storage_route(&opts,&runner),"ordinary audited sessions retain legacy protection");
+        logger.require_run_resources().unwrap();
+        assert!(isolated_storage_route(&opts,&runner));
+        assert!(!isolated_storage_route(&opts,&BuildRunner::Host));
+        opts.env.clear();
+        assert!(!isolated_storage_route(&opts,&runner));
+    }
 
     #[test]
     fn autoship_claude_exposes_only_private_guarded_bridge_tools() {

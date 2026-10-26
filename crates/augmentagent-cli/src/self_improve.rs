@@ -4364,6 +4364,13 @@ trait StorageCalls {
 impl StorageCalls for augmentagent_channel_core::FallbackReasoner {
     async fn call_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
         let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        if self.uses_isolated_command_storage(opts)? {
+            // Required VM builds own private scratch, never the shared host
+            // gate target. The bridge admits each actual command and carries
+            // its lease through the descendant supervisor until cleanup.
+            let scratch=augmentagent_channel_core::build_scratch::scratch_dir();
+            return crate::build_storage::watch_reserve_roots(Some(cwd),Some(&scratch),self.call(opts,prompt)).await;
+        }
         let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
         let mut opts = opts.clone();
         opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));
@@ -4371,6 +4378,13 @@ impl StorageCalls for augmentagent_channel_core::FallbackReasoner {
     }
     async fn call_revision_with_storage(&self, opts: &augmentagent_channel_core::ReasonerOpts, prompt: &str) -> Result<String> {
         let cwd = opts.cwd.as_deref().context("builder has no working directory")?;
+        if self.uses_isolated_command_storage(opts)? {
+            // Required VM builds own private scratch, never the shared host
+            // gate target. The bridge admits each actual command and carries
+            // its lease through the descendant supervisor until cleanup.
+            let scratch=augmentagent_channel_core::build_scratch::scratch_dir();
+            return crate::build_storage::watch_reserve_roots(Some(cwd),Some(&scratch),self.call_revision(opts,prompt)).await;
+        }
         let _storage = crate::build_storage::admit(cwd, Path::new(&gate_target_dir())).await?;
         let mut opts = opts.clone();
         opts.env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(Path::new(&gate_target_dir()))?));

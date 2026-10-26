@@ -77,7 +77,15 @@ def supervise(receipt, argv):
         os.environ.pop('JARVIS_NATIVE_VM_READY', None)
         os.environ.pop('JARVIS_NATIVE_VM_CONTINUE', None)
     try:
+        # Trusted build broker carries the same flock open description through
+        # supervisor and QEMU. A killed broker must not release build storage
+        # before this subtree has actually exited.
+        storage_fd = os.environ.get('JARVIS_STORAGE_LEASE_FD')
+        storage_fds = () if storage_fd is None else (int(storage_fd),)
+        for descriptor in storage_fds:
+            os.fstat(descriptor)  # fail before launch on a missing inherited FD
         child = subprocess.Popen(argv, start_new_session=True,
+                                 pass_fds=storage_fds,
                                  preexec_fn=scope.attach_child if scope else None)
     except BaseException:
         if scope:

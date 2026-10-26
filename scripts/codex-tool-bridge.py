@@ -29,6 +29,8 @@ class Denied(ValueError):
 class Readiness(Denied):
     """Public diagnostics contain fixed categories, never configuration."""
     MESSAGES = {
+        'build_storage_busy': 'Shared build storage is busy; retry command admission after the active build finishes.',
+        'build_storage_reserve': 'Build storage admission or execution reached its required free-space reserve; retry after capacity recovers.',
         'mcp_start': 'Configured MCP server could not start or initialize; check its binary, authentication and transport.',
         'mcp_timeout': 'Configured MCP server timed out; check its availability and timeout setting.',
         'mcp_tools': 'Configured MCP server is missing a required tool; check the server version and tool profile.',
@@ -301,6 +303,73 @@ class BuildScratch:
         if self.session is not None:
             shutil.rmtree(self.session, ignore_errors=True)
             self.session = None
+
+
+class CommandStorage:
+    """Global build/prune admission owned only while a real VM build runs.
+
+    Descendant supervisors inherit the locked descriptor. Closing our copy
+    cannot release it while a canceled VM is still being reaped.
+    """
+    def __init__(self, config, scratch):
+        self.config, self.scratch, self.fd = config, Path(scratch), None
+
+    def __enter__(self):
+        if self.config is None:
+            return self
+        import fcntl
+        try:
+            path = Path(self.config['lock'])
+            floor = self.config['floor_bytes']; admission = self.config['admission_bytes']
+            if (not path.is_absolute() or path.name != 'disk-build.lock'
+                    or type(floor) is not int or type(admission) is not int
+                    or floor < 0 or admission < floor):
+                raise ValueError('invalid command storage policy')
+            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                info = os.fstat(parent)
+                if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                    raise ValueError('storage state is not daemon owned')
+                self.fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+            finally:
+                os.close(parent)
+            info = os.fstat(self.fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022):
+                raise ValueError('invalid storage lease inode')
+            self.path, self.identity = path, (info.st_dev, info.st_ino)
+            deadline = time.monotonic() + 300
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Readiness('build_storage_busy')
+                    time.sleep(0.1)
+            self.check(admission)
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def check(self, required=None):
+        if self.fd is None:
+            return
+        info = os.stat(self.path, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != self.identity:
+            raise Denied('storage lease inode changed')
+        required = self.config['floor_bytes'] if required is None else required
+        vfs = os.statvfs(self.scratch)
+        if vfs.f_bavail * vfs.f_frsize < required:
+            raise Readiness('build_storage_reserve')
+
+    def __exit__(self, *_):
+        if self.fd is not None:
+            # Never LOCK_UN: the supervisor/QEMU may still own this same open
+            # description while cleaning descendants after bridge cancellation.
+            os.close(self.fd)
+            self.fd = None
 
 
 class ReconciliationRequired(Denied):
@@ -1053,6 +1122,8 @@ class Policy:
         self.read_allowances = self._allowances(config.get('read_allowances', []))
         self._node_install_cache = None
         self.build_vm_config = config.get('build_vm_config')
+        self.command_storage = config.get('command_storage')
+        self._active_command_storage = None
         # #1036: VM build scratch root and default build timeout, from the
         # daemon's policy (codex runs with a cleared environment).
         # A root the model could write through makes builds unavailable; the
@@ -1703,8 +1774,16 @@ class Policy:
         if timeout is None:
             timeout = self.build_timeout if build else COMMAND_TIMEOUT_DEFAULT
         try:
-            outcome = (self.run_vm_build(argv, timeout) if runner == 'vm'
-                       else self._run_host_command(argv, build, timeout))
+            if runner == 'vm' and self.command_storage is not None:
+                with CommandStorage(self.command_storage, self._scratch.root) as storage:
+                    self._active_command_storage = storage
+                    try:
+                        outcome = self.run_vm_build(argv, timeout)
+                    finally:
+                        self._active_command_storage = None
+            else:
+                outcome = (self.run_vm_build(argv, timeout) if runner == 'vm'
+                           else self._run_host_command(argv, build, timeout))
         except BaseException as error:
             if self._command_started:
                 error.jarvis_runner = runner
@@ -1956,7 +2035,7 @@ class Policy:
                 self.mark_command_started()
                 result = vm.run(runtime, snapshot.root, guest, build_environment, timeout=timeout,
                     node_workspaces=[] if install else dependencies, download_info=downloads,
-                    scratch_dir=str(scratch.tmp), build_cache=build_cache)
+                    scratch_dir=str(scratch.tmp), build_cache=build_cache, storage_lease=self._active_command_storage)
                 if initial_manifests is not None and initial_manifests != self.node_manifest_state():
                     raise Denied('dependency manifests changed during build; retry before syncing sources')
                 snapshot.sync()
@@ -2132,6 +2211,11 @@ class Policy:
         argv = literal_command_argv(command)
         for tokens, prefix in self.command_patterns:
             if argv == tokens or (prefix and argv[:len(tokens)] == tokens):
+                # The repository wrapper is a request for managed Cargo, not
+                # authority to execute candidate-controlled host shell code.
+                # VM command admission already provides its storage contract.
+                if argv[0] in ('scripts/cargo-managed.sh', './scripts/cargo-managed.sh'):
+                    return ['cargo', *argv[1:]]
                 return argv
         raise Denied('command is not permitted by this profile')
 

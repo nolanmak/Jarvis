@@ -2813,7 +2813,7 @@ class BuildScratchTests(unittest.TestCase):
 
             @staticmethod
             def run(runtime, workspace, argv, environment, timeout=120, node_workspaces=(),
-                    download_info=None, scratch_dir=None, build_cache=None):
+                    download_info=None, scratch_dir=None, build_cache=None, storage_lease=None):
                 test.calls.append({'workspace': Path(workspace), 'argv': argv, 'environment': environment,
                                    'timeout': timeout, 'scratch_dir': scratch_dir, 'build_cache': build_cache})
                 return {'exit_code': 0, 'stdout': '', 'stderr': ''}

@@ -210,7 +210,7 @@ def qemu_command(config, image, shares, build_cache):
 
 
 def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None,
-        scratch_dir=None, build_cache=None):
+        scratch_dir=None, build_cache=None, storage_lease=None):
     """Execute argv in a disposable source snapshot; return after verified VM exit.
 
     `scratch_dir` holds the VM's private control files (default temp dir when
@@ -347,12 +347,18 @@ poweroff -f
         supervisor = Path(__file__).with_name('provider-supervisor.py')
         cleanup = private / 'cleanup-complete'
         broker = dependency_proxy.Broker(control)
+        if storage_lease is not None:
+            storage_lease.check()
+            host_environment["JARVIS_STORAGE_LEASE_FD"] = str(storage_lease.fd)
         with tempfile.TemporaryFile(dir=private) as log:
             process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
-                env=host_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                env=host_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                pass_fds=() if storage_lease is None else (storage_lease.fd,))
             try:
                 deadline = time.monotonic() + min(max(timeout, 1), 900)
                 while True:
+                    if storage_lease is not None:
+                        storage_lease.check()
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise Unavailable('VM command timed out')
@@ -378,8 +384,14 @@ poweroff -f
             finally:
                 if process.poll() is None:
                     process.terminate()
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
+                    if storage_lease is not None:
+                        # The subreaper owns detached descendants. Killing it
+                        # on an arbitrary cleanup timeout could release storage
+                        # while QEMU still writes; retain admission until reaped.
                         process.wait()
+                    else:
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait()
