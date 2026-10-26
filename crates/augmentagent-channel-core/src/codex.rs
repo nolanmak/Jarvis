@@ -699,6 +699,20 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     #[tokio::test]
+    async fn fresh_codex_review_refuses_write_capability_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("unexpected-spawn");
+        let bin = stub(&dir, "should-not-run", &format!("touch '{}'\n", marker.display()));
+        let reasoner = CodexCliReasoner::with_bin(bin);
+        let mut options = opts();
+        options.allowed_tools.push("Write".into());
+        let result = crate::native_session::fresh_review_scope(ProviderKind::Codex,
+            reasoner.call(&options, "write a file")).await;
+        assert!(result.is_err());
+        assert!(!marker.exists(), "write-capable reviewer reached native transport");
+    }
+
+    #[tokio::test]
     async fn fresh_codex_review_uses_new_conversation_and_ignores_project_instructions() {
         let dir = tempfile::tempdir().unwrap();
         let args_path = dir.path().join("argv.txt");

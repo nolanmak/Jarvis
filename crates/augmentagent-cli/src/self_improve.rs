@@ -61,6 +61,13 @@ mod alignment;
 mod publication;
 #[path = "self_improve_review.rs"]
 mod aligned_review;
+#[path = "self_improve_review_canary.rs"]
+mod review_canary;
+
+pub(crate) async fn review_canary_if_due() -> Result<Option<review_canary::Report>> {
+    review_canary::run_if_due().await
+}
+pub(crate) fn review_canary_summary() -> Result<String> { review_canary::summary() }
 
 /// Branch/worktree prefix so the dedup guard can recognize agent PRs.
 const BRANCH_PREFIX: &str = "agent-fix/issue-";

@@ -220,7 +220,7 @@ async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Re
     }))?)
 }
 
-async fn run_inner(
+pub(super) async fn run_inner(
     provider: augmentagent_channel_core::ProviderKind,
     _authors: &[augmentagent_channel_core::ProviderKind],
     issue: &Issue,
@@ -655,6 +655,14 @@ mod tests {
         assert!(snapshot.files["deleted.rs"].contains("fn removed() {}"));
         assert_eq!(snapshot.required, snapshot.files.keys().cloned().collect());
         assert!(snapshot.diff.contains("-fn old() {}"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_missing_committed_blob_is_incomplete_not_approval_evidence() {
+        let dir = candidate_fixture();
+        let blob = fixture_git(dir.path(), &["rev-parse", "HEAD:source.rs"]);
+        std::fs::remove_file(dir.path().join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        assert!(candidate_snapshot(dir.path()).await.is_err(), "missing source bytes cannot be represented by a coverage digest");
     }
 
     #[tokio::test]
