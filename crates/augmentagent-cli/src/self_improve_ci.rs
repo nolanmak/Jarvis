@@ -745,7 +745,10 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             use std::os::unix::process::CommandExt;
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-            child.args(["--exact", "self_improve::shared_ci::tests::staged_snapshot_covers_changes_without_moving_branch_and_detects_mutation", "--nocapture"]).env(CHILD, "1");
+            child.args(["--exact", "self_improve::shared_ci::tests::staged_snapshot_covers_changes_without_moving_branch_and_detects_mutation", "--nocapture"]).env(CHILD, "1")
+                // This tiny source-export fixture does not allocate a build cache.
+                // Keep its disk reserve scoped to the isolated test child.
+                .env("AUGMENTAGENT_GATE_MIN_FREE_GB", "0.001");
             unsafe {
                 child.pre_exec(|| {
                     libc::umask(0o002);
