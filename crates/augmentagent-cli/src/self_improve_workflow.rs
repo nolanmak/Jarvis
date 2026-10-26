@@ -664,6 +664,10 @@ impl WorkflowGuard {
         reasoner.set_workflow_audit(self.audit.clone())
     }
 
+    pub(super) fn reserve_canary_calls(&self,calls:u64,allow_shipping:bool)->Result<bool> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store poisoned"))?
+            .reserve_observation(&self.lease,calls,observation_call_cap(),millis(),allow_shipping)
+    }
     pub(super) async fn acquire_observation(key: &str) -> Result<Option<Self>> {
         let state = path();
         let mut store = WorkflowStore::open(&state)?;

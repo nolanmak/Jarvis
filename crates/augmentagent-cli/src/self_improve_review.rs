@@ -123,6 +123,29 @@ fn chunks(text: &str, budget: usize) -> Vec<&str> {
     result
 }
 
+fn supplied_shards(files:&BTreeMap<String,String>,diff:&str,callers:&str)->BTreeMap<String,String> {
+    let mut evidence_shards = BTreeMap::new();
+    for (path, body) in files {
+        for (i, chunk) in chunks(body, 96 * 1024).into_iter().enumerate() {
+            evidence_shards.insert(format!("{path}#part-{i}"), chunk.to_owned());
+        }
+    }
+    for (i, chunk) in chunks(diff, 96 * 1024).into_iter().enumerate() {
+        evidence_shards.insert(format!("__candidate_diff__#part-{i}"), chunk.to_owned());
+    }
+    for (i, chunk) in chunks(callers, 96 * 1024).into_iter().enumerate() {
+        evidence_shards.insert(format!("__caller_evidence__#part-{i}"), chunk.to_owned());
+    }
+    evidence_shards
+}
+pub(super) async fn diagnostic_call_bound(worktree:&Path)->Result<u64> {
+    let snapshot=candidate_snapshot(worktree).await?;
+    let callers=complete_caller_evidence(worktree,&snapshot.head,&snapshot.diff).await?;
+    // Exactly three independent roles, two evidence shards per native call,
+    // and at most one final adjudication plus its one correction call.
+    Ok((supplied_shards(&snapshot.files,&snapshot.diff,&callers).len().div_ceil(2) as u64)*3+2)
+}
+
 struct CandidateSnapshot {
     head: String,
     base: String,
@@ -381,18 +404,7 @@ async fn run_impl(
     let mut rendered = vec![];
     // Large files are fully delivered in bounded shards. Coverage is the union
     // of successful shard requests, never a model-supplied percentage.
-    let mut evidence_shards = BTreeMap::new();
-    for (path, body) in &files {
-        for (i, chunk) in chunks(body, 96 * 1024).into_iter().enumerate() {
-            evidence_shards.insert(format!("{path}#part-{i}"), chunk.to_owned());
-        }
-    }
-    for (i, chunk) in chunks(&diff, 96 * 1024).into_iter().enumerate() {
-        evidence_shards.insert(format!("__candidate_diff__#part-{i}"), chunk.to_owned());
-    }
-    for (i, chunk) in chunks(&callers, 96 * 1024).into_iter().enumerate() {
-        evidence_shards.insert(format!("__caller_evidence__#part-{i}"), chunk.to_owned());
-    }
+    let evidence_shards = supplied_shards(&files,&diff,&callers);
     for role in [
         aligned::ReviewRole::Qa,
         aligned::ReviewRole::Diff,

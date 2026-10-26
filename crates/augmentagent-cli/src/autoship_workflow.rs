@@ -154,9 +154,13 @@ pub fn default_path() -> std::path::PathBuf {
 }
 
 fn observation_available(conn: &Connection, now_ms: i64, required: u64, cap: u64) -> Result<bool> {
+    observation_capacity(conn,now_ms,required,cap,false)
+}
+fn observation_capacity(conn: &Connection, now_ms: i64, required: u64, cap: u64, allow_shipping: bool) -> Result<bool> {
     let shipping: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow WHERE owner IS NOT NULL AND lease_until>?1 AND id NOT LIKE 'autoship-observation/%' AND id NOT LIKE 'autoship-canary/%')",[now_ms],|r|r.get(0))?;
     let used: u64 = conn.query_row("SELECT COALESCE(SUM(calls),0) FROM observation_charge WHERE day=?1",[now_ms.div_euclid(86_400_000)],|r|r.get(0))?;
-    Ok(!shipping && required > 0 && used.checked_add(required).is_some_and(|total| total <= cap))
+    let reserved: u64 = conn.query_row("SELECT COALESCE(SUM(r.reserved-r.used),0) FROM observation_reservation r JOIN workflow w ON w.id=r.workflow AND w.generation=r.generation WHERE w.owner IS NOT NULL AND w.lease_until>?1",[now_ms],|r|r.get(0))?;
+    Ok((!shipping || allow_shipping) && required > 0 && used.checked_add(reserved).and_then(|n|n.checked_add(required)).is_some_and(|total| total <= cap))
 }
 
 pub struct WorkflowStore {
@@ -206,6 +210,7 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS observation_reservation(workflow TEXT NOT NULL,generation INTEGER NOT NULL,reserved INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS observation_charge (
                 workflow TEXT NOT NULL, receipt_id TEXT NOT NULL, day INTEGER NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(workflow,receipt_id));
             CREATE TABLE IF NOT EXISTS episode_action (
@@ -913,6 +918,17 @@ impl WorkflowStore {
         observation_available(&self.conn, now_ms, required, daily_cap)
     }
 
+    pub fn reserve_observation(&mut self, lease: &Lease, calls: u64, cap: u64, now: i64, allow_shipping: bool) -> Result<bool> {
+        ensure!(lease.workflow.starts_with("autoship-canary/"),"whole probe reservation requires canary namespace");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx,lease,now)?;
+        let prior: Option<u64>=tx.query_row("SELECT reserved FROM observation_reservation WHERE workflow=?1 AND generation=?2",params![lease.workflow,lease.generation],|r|r.get(0)).optional()?;
+        if let Some(prior)=prior { ensure!(prior==calls,"probe reservation changed"); return Ok(true); }
+        if !observation_capacity(&tx,now,calls,cap,allow_shipping)? { return Ok(false); }
+        tx.execute("INSERT INTO observation_reservation(workflow,generation,reserved) VALUES(?1,?2,?3)",params![lease.workflow,lease.generation,i64::try_from(calls)?])?;
+        tx.commit()?; Ok(true)
+    }
+
     fn charge_inner(&mut self, lease: &Lease, receipt_id: &str,
         charge: ResourceCharge, now_ms: i64, observation_cap: Option<u64>) -> Result<()> {
         ensure!(!receipt_id.is_empty(), "charge receipt required");
@@ -931,7 +947,13 @@ impl WorkflowStore {
             ensure!(prior == values, "charge receipt conflict");
         } else {
             if let Some(cap) = observation_cap {
-                ensure!(observation_available(&tx, now_ms, charge.model_calls, cap)?, "optional observation deferred: shipping active or daily model-call budget exhausted");
+                let reservation: Option<(u64,u64)>=tx.query_row("SELECT reserved,used FROM observation_reservation WHERE workflow=?1 AND generation=?2",params![lease.workflow,lease.generation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if let Some((reserved,used))=reservation {
+                    ensure!(used.checked_add(charge.model_calls).is_some_and(|n|n<=reserved),"canary exceeded its complete probe reservation");
+                    tx.execute("UPDATE observation_reservation SET used=used+?3 WHERE workflow=?1 AND generation=?2",params![lease.workflow,lease.generation,values.1])?;
+                } else {
+                    ensure!(observation_available(&tx, now_ms, charge.model_calls, cap)?, "optional observation deferred: shipping active or daily model-call budget exhausted");
+                }
                 tx.execute("INSERT INTO observation_charge VALUES(?1,?2,?3,?4)",params![lease.workflow,receipt_id,now_ms.div_euclid(86_400_000),values.1])?;
             }
             // Check sums before SQL arithmetic can promote an overflowing
@@ -2196,4 +2218,29 @@ mod observation_accounting_tests {
         assert_eq!(store.snapshot(observation).unwrap().unwrap().model_calls,3);
         assert_eq!(store.events(observation).unwrap().iter().filter(|(_,kind,_,_)|kind=="resource_charged").count(),3);
     }
+    #[test]
+    fn complete_probe_reservation_survives_midflight_shipping_and_midnight() {
+        let dir=tempfile::tempdir().unwrap(); let path=dir.path().join("ledger.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id="autoship-canary/probe#840";
+        store.register(id,"probe",binding(),1).unwrap();
+        let probe=store.claim(id,"probe",2,100_000_000).unwrap().unwrap();
+        store.register("owner/repo#1","shipping",binding(),3).unwrap();
+        let shipping=store.claim("owner/repo#1","builder",4,100_000_000).unwrap().unwrap();
+        assert!(!store.reserve_observation(&probe,11,12,5,false).unwrap());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,0,"free deferral cannot charge or pass a probe");
+        // After a controller-recorded full day of starvation, bounded parallel
+        // admission may proceed without delaying or charging shipping capacity.
+        assert!(store.reserve_observation(&probe,11,12,6,true).unwrap());
+        let cost=||ResourceCharge {model_calls:1,..Default::default()};
+        for i in 0..10 { store.charge_observation(&probe,&format!("call-{i}"),cost(),10+i,12).unwrap(); }
+        store.charge_observation(&probe,"call-last",cost(),86_400_001,12).unwrap();
+        assert!(store.charge_observation(&probe,"overflow",cost(),86_400_002,12).is_err());
+        assert_eq!(store.snapshot(id).unwrap().unwrap().model_calls,11);
+        store.charge(&shipping,"shipping-call",cost(),86_400_003).unwrap();
+        store.release(&shipping,86_400_004).unwrap();
+        store.release(&probe,86_400_005).unwrap();
+        assert!(store.observation_available(86_400_006,11,12).unwrap());
+    }
+
 }

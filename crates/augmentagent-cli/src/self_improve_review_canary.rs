@@ -93,20 +93,38 @@ pub(super) fn connect(path: &Path, read_only: bool) -> Result<rusqlite::Connecti
 }
 fn open(path: &Path) -> Result<rusqlite::Connection> {
     let conn = connect(path, false)?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS review_canaries (run_id TEXT PRIMARY KEY, started_ms INTEGER NOT NULL, finished_ms INTEGER, status TEXT NOT NULL, report TEXT);
-        CREATE TRIGGER IF NOT EXISTS canary_final_is_immutable BEFORE UPDATE ON review_canaries
+    conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS review_canaries (run_id TEXT PRIMARY KEY, started_ms INTEGER NOT NULL, finished_ms INTEGER, status TEXT NOT NULL, report TEXT);
+        DROP TRIGGER IF EXISTS canary_final_is_immutable;
+        CREATE TRIGGER canary_final_is_immutable BEFORE UPDATE ON review_canaries
         WHEN OLD.status != 'running' OR NEW.run_id != OLD.run_id OR NEW.started_ms != OLD.started_ms
-          OR NEW.status NOT IN ('passed','drift','incomplete','interrupted')
+          OR NEW.status NOT IN ('passed','drift','incomplete','interrupted','deferred')
         BEGIN SELECT RAISE(ABORT,'canary completion is immutable'); END;
         CREATE TRIGGER IF NOT EXISTS canary_audit_is_retained BEFORE DELETE ON review_canaries
-        BEGIN SELECT RAISE(ABORT,'canary audit is append only'); END;")?;
+        BEGIN SELECT RAISE(ABORT,'canary audit is append only'); END; COMMIT;")?;
     Ok(conn)
 }
+#[derive(Debug)]
+struct CanaryDeferred;
+impl std::fmt::Display for CanaryDeferred { fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"canary deferred before any native dispatch")}}
+impl std::error::Error for CanaryDeferred {}
+fn due_and_starved(path:&Path,now:i64)->Result<(bool,bool)> {
+    let conn=open(path)?;
+    let last:Option<i64>=conn.query_row("SELECT MAX(started_ms) FROM review_canaries WHERE status!='deferred'",[],|r|r.get(0))?;
+    let first:Option<i64>=conn.query_row("SELECT MIN(started_ms) FROM review_canaries WHERE status='deferred' AND started_ms>?1",[last.unwrap_or(i64::MIN)],|r|r.get(0))?;
+    Ok((last.is_none_or(|last|now.saturating_sub(last)>=INTERVAL_MS),first.is_some_and(|first|now.saturating_sub(first)>=INTERVAL_MS)))
+}
+fn defer_once(path:&Path,now:i64)->Result<()> {
+    let mut conn=open(path)?;
+    let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("INSERT INTO review_canaries(run_id,started_ms,finished_ms,status,report) SELECT ?1,?2,?2,'deferred',NULL WHERE NOT EXISTS(SELECT 1 FROM review_canaries WHERE status='deferred' AND started_ms>COALESCE((SELECT MAX(started_ms) FROM review_canaries WHERE status!='deferred'),-9223372036854775808))",rusqlite::params![uuid::Uuid::new_v4().to_string(),now])?;
+    tx.commit()?; Ok(())
+}
+
 fn claim(path: &Path, now: i64) -> Result<Option<String>> {
     let mut conn = open(path)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let last: Option<i64> =
-        tx.query_row("SELECT MAX(started_ms) FROM review_canaries", [], |row| {
+        tx.query_row("SELECT MAX(started_ms) FROM review_canaries WHERE status!='deferred'", [], |row| {
             row.get(0)
         })?;
     if last.is_some_and(|last| now.saturating_sub(last) < INTERVAL_MS) {
@@ -132,20 +150,24 @@ fn record(path: &Path, report: &Report) -> Result<()> {
     Ok(())
 }
 
-/// Safe to invoke on every scheduler tick: at most one native probe per day,
-/// including failed/interrupted occurrences. Findings are reports, not a hidden
+/// Safe to invoke on every scheduler tick: at most one dispatched probe per day;
+/// free deferrals may retry without duplicating native calls. Findings are reports, not a hidden
 /// unanimity gate on unrelated production PRs.
 pub(super) async fn run_if_due() -> Result<Option<Report>> {
-    // Preserve the occurrence when shipping is active or a complete probe
-    // cannot fit. This check is free; every eventual native dispatch is also
-    // charged and fenced atomically by its workflow observer.
-    if !workflow::observation_available(9)? { return Ok(None); }
-    let path = database()?;
-    let now = chrono::Utc::now().timestamp_millis();
+    let path=database()?;
+    let now=chrono::Utc::now().timestamp_millis();
+    let (due,starved)=due_and_starved(&path,now)?;
+    if !due { return Ok(None); }
+    // Ordinary observations yield to shipping. After a full day of recorded
+    // deferral, one bounded canary may run alongside it; shipping never waits
+    // or loses a shipping-attempt reservation.
+    if !starved && !workflow::observation_available(1)? {
+        defer_once(&path,now)?; return Ok(None);
+    }
     let Some(id) = claim(&path, now)? else {
         return Ok(None);
     };
-    let result = probe(&id).await;
+    let result = probe_with_priority(&id,starved).await;
     let (status, detail, evidence) = match result {
         Ok(evidence) => {
             let passed = detected_seed(&evidence);
@@ -160,6 +182,7 @@ pub(super) async fn run_if_due() -> Result<Option<Report>> {
                 Some(evidence),
             )
         }
+        Err(error) if error.downcast_ref::<CanaryDeferred>().is_some() => ("deferred",format!("{error:#}"),None),
         Err(error) => ("incomplete", format!("{error:#}"), None),
     };
     let report = Report {
@@ -295,6 +318,9 @@ pub(super) async fn shipping_fixture(root: &Path, control: &Path, issue: u64) ->
 }
 
 async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
+    probe_with_priority(id,false).await
+}
+async fn probe_with_priority(id: &str,allow_shipping:bool) -> Result<crate::autoship_review::ReviewEvidence> {
     use augmentagent_channel_core::ProviderKind::Codex;
     let scratch = tempfile::tempdir()?;
     let root = scratch.path().join("candidate");
@@ -329,6 +355,11 @@ async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
             &[serde_json::to_string(&reference)?],
         )
         .await?;
+    let bound=aligned_review::diagnostic_call_bound(&root).await?;
+    if !guard.reserve_canary_calls(bound,allow_shipping)? {
+        guard.finish()?;
+        return Err(CanaryDeferred.into());
+    }
     let origin = adoption::origin_for_candidate(&root, Some(&guard)).await?;
     let issue = Issue {
         number: 840,
@@ -379,6 +410,23 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }
+    #[test]
+    fn free_deferrals_retry_same_day_and_gain_bounded_priority_after_a_day() {
+        let dir=private_fixture(); let path=dir.path().join("canaries.db");
+        defer_once(&path,100).unwrap(); defer_once(&path,200).unwrap();
+        assert_eq!(due_and_starved(&path,200).unwrap(),(true,false));
+        let count:i64=open(&path).unwrap().query_row("SELECT count(*) FROM review_canaries",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,1,"repeated free priority checks retain one deferred marker");
+        // Shipping starts after preflight but before the first dispatch.
+        let first=claim(&path,300).unwrap().unwrap();
+        record(&path,&Report{run_id:first,started_ms:300,finished_ms:301,status:"deferred".into(),detail:"no native dispatch; reservation refused".into(),evidence:None}).unwrap();
+        assert_eq!(due_and_starved(&path,400).unwrap(),(true,false));
+        assert_eq!(due_and_starved(&path,INTERVAL_MS+100).unwrap(),(true,true));
+        let next=claim(&path,INTERVAL_MS+100).unwrap().unwrap();
+        record(&path,&Report{run_id:next,started_ms:INTERVAL_MS+100,finished_ms:INTERVAL_MS+101,status:"incomplete".into(),detail:"synthetic transport failure, never a pass".into(),evidence:None}).unwrap();
+        assert_eq!(due_and_starved(&path,INTERVAL_MS+102).unwrap(),(false,false));
+    }
+
     #[test]
     fn daily_canary_claim_survives_crash_and_never_records_false_completion() {
         let dir = private_fixture();
@@ -520,6 +568,8 @@ mod tests {
         let control=dir.path().join("control");
         std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&control).unwrap();
         let (prepared,reference)=prepare_fixture(&root,&control).await.unwrap();
+        let call_bound=aligned_review::diagnostic_call_bound(&root).await.unwrap();
+        assert!(call_bound<=12,"complete native probe, including adjudicator correction, must fit the default observation budget: {call_bound}");
         assert!(reference.alignment.is_none());
         acceptance::assert_verifier_receipt_current(&root,&prepared,&reference).await.unwrap();
         let shipping=acceptance::assert_receipt_current(&root,&prepared,&reference).await.unwrap_err();
