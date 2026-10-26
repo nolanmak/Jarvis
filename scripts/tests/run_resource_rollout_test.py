@@ -16,6 +16,7 @@ class RolloutTests(unittest.TestCase):
             (binary/'systemctl').write_text('''#!/bin/sh
 printf '%s\\n' "$*" >> "$TEST_CALLS"
 case "$*" in
+ --version) echo "systemd 255";;
  *CPUQuotaPerSecUSec*) echo 1s;;
  *MemoryMax*) echo 10737418240;;
  *TasksMax*) echo 2048;;
@@ -48,6 +49,24 @@ esac
             subprocess.run(['bash',str(SCRIPT),'--install'],env=env,check=True,capture_output=True)
             self.assertTrue((root/'config/systemd/user/augmentagent-custom.service.d/60-run-resources.conf').exists())
             self.assertIn('show augmentagent-custom.service',log.read_text())
+
+    def test_unsupported_host_does_not_install_or_disable_interactive_service(self):
+        for version, memory, enabled, expected in [('252','10737418240','',3),
+                ('255','infinity','',3),('unknown','10737418240','',3),
+                ('252','10737418240','AUGMENTAGENT_RUN_RESOURCES=1',1)]:
+            with self.subTest(version=version,memory=memory,enabled=enabled), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);binary=root/'bin';binary.mkdir()
+                command=binary/'systemctl'
+                command.write_text('#!/bin/sh\ncase "$*" in\n'
+                    f' --version) echo "systemd {version}";;\n'
+                    f' *MemoryMax*) echo "{memory}";;\n'
+                    f' *Environment*) echo "{enabled}";;\n'
+                    ' *) exit 91;;\nesac\n')
+                command.chmod(0o755)
+                env=dict(os.environ,HOME=str(root),XDG_CONFIG_HOME=str(root/'config'),PATH=str(binary)+':/usr/bin:/bin')
+                result=subprocess.run(['bash',str(SCRIPT),'--install'],env=env,capture_output=True,text=True)
+                self.assertEqual(result.returncode,expected,result.stderr)
+                self.assertFalse((root/'config').exists(),'unsupported admission must not mutate units')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

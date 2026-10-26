@@ -23,7 +23,7 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 make_case() {
   TMP=$(mktemp -d); export TMP
   mkdir -p "$TMP/repo/scripts/lib" "$TMP/repo/target/release" "$TMP/bin" "$TMP/home"
-  cp "$REPO_ROOT/scripts/install-autostart.sh" "$REPO_ROOT/scripts/install-tenant.sh" "$TMP/repo/scripts/"
+  cp "$REPO_ROOT/scripts/install-autostart.sh" "$REPO_ROOT/scripts/configure-run-resources.sh" "$REPO_ROOT/scripts/install-tenant.sh" "$TMP/repo/scripts/"
   cp "$REPO_ROOT/scripts/lib/launchd-install.sh" "$TMP/repo/scripts/lib/"
   printf '# PDF installation is tested separately.\n' > "$TMP/repo/scripts/pdf-runtime.py"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/scripts/run-rs.sh"
@@ -63,8 +63,11 @@ if run_installer install-autostart.sh; then ok "installer runs against a throwaw
 else bad "installer runs against a throwaway HOME" "$(tail -3 "$TMP/install.out")"; fi
 [ -s "$UNIT" ] && ok "renders the unit" || bad "renders the unit" "no file at $UNIT"
 expect_directives "$UNIT" "daemon unit"
-for d in "Delegate=cpu memory pids" "DelegateSubgroup=daemon" "CPUQuota=400%" "Environment=AUGMENTAGENT_RUN_RESOURCES=1"; do
+for d in "CPUQuota=400%"; do
   has_line "$UNIT" "$d" && ok "daemon renders $d" || bad "daemon renders $d" "missing directive"
+done
+for d in "DelegateSubgroup=daemon" "Environment=AUGMENTAGENT_RUN_RESOURCES=1"; do
+  if has_line "$UNIT" "$d"; then bad "unsupported base unit omits $d"; else ok "unsupported base unit omits $d"; fi
 done
 has_line "$UNIT" "Restart=on-failure" && ok "keeps the existing Restart policy" \
   || bad "keeps the existing Restart policy" "Restart=on-failure gone"

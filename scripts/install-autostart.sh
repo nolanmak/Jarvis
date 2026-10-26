@@ -165,12 +165,6 @@ Environment=PATH=$SERVICE_PATH
 Environment=RUST_LOG=info
 # Deft channel still inert until a token is stored via 'augmentagent deft login'
 Environment=AUGMENTAGENT_DEFT_ENABLED=1
-Environment=AUGMENTAGENT_RUN_RESOURCES=1
-Environment=AUGMENTAGENT_RUN_MEMORY_BYTES=${AUGMENTAGENT_RUN_MEMORY_BYTES:-4294967296}
-Environment=AUGMENTAGENT_RUN_PIDS=${AUGMENTAGENT_RUN_PIDS:-512}
-Environment=AUGMENTAGENT_RUN_CPU_PERCENT=${AUGMENTAGENT_RUN_CPU_PERCENT:-200}
-Delegate=cpu memory pids
-DelegateSubgroup=daemon
 CPUQuota=${AUGMENTAGENT_UNIT_CPU_QUOTA:-400%}
 Restart=on-failure
 RestartSec=10
@@ -191,6 +185,15 @@ UNIT_EOF
 
   log "Reloading systemd --user"
   systemctl --user daemon-reload
+
+  resource_status=0
+  AUGMENTAGENT_RESOURCE_UNIT="$UNIT_NAME" "$REPO_ROOT/scripts/configure-run-resources.sh" --install || resource_status=$?
+  if [[ "$resource_status" -eq 3 ]]; then
+    log "NOTE: per-run delegation unavailable; required Autoship stays disabled, unrelated service remains available."
+  elif [[ "$resource_status" -ne 0 ]]; then
+    log "Resource configuration failed; refusing to restart with an unverified policy."
+    return 1
+  fi
 
   log "Enabling + (re)starting $UNIT_NAME"
   systemctl --user enable "$UNIT_NAME" >/dev/null

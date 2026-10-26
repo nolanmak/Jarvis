@@ -22,13 +22,25 @@ Environment=AUGMENTAGENT_RUN_CPU_PERCENT=$run_cpu_percent
 EOF
 }
 if [[ "$mode" == --render ]]; then render; exit; fi
-version="$(systemd --version | head -1 | awk '{print $2}')"
-[[ "$version" =~ ^[0-9]+$ ]] && (( version >= 254 )) || { echo 'systemd 254+ required for DelegateSubgroup' >&2; exit 1; }
+unsupported() {
+  # A clean unsupported host may keep serving unrelated interactive calls.
+  # Never classify an already enabled incompatible resource policy as safe.
+  local environment
+  environment="$(systemctl --user show "$unit" --value -p Environment)" || { echo 'cannot verify current resource enrollment' >&2; exit 1; }
+  if [[ "$environment" == *AUGMENTAGENT_RUN_RESOURCES=1* ]]; then
+    echo "unsupported resource configuration is already enabled: $1" >&2
+    exit 1
+  fi
+  echo "run resources unavailable; required Autoship remains disabled: $1" >&2
+  exit 3
+}
+version="$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}')" || version=""
+[[ "$version" =~ ^[0-9]+$ ]] && (( version >= 254 )) || unsupported 'systemd 254+ required for DelegateSubgroup'
 # The existing aggregate ceilings remain authoritative; never move work to an
 # unbounded sibling slice or silently weaken the original MemoryMax/TasksMax.
 for property in MemoryMax TasksMax; do
   value="$(systemctl --user show "$unit" --value -p "$property")"
-  [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )) || { echo "finite existing $property required" >&2; exit 1; }
+  [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )) || unsupported "finite existing $property required"
 done
 # Preserve a stricter existing aggregate CPU ceiling. systemctl presents this
 # duration in human units; parse only that public property, never Environment.

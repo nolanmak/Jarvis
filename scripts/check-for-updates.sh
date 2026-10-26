@@ -287,7 +287,15 @@ apply_update() {
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
           # #1571 — proof now includes "and it is running the binary we
           # built"; a bounce onto anything else is a pinned deploy.
-          if [ -x "$REPO_ROOT/scripts/configure-run-resources.sh" ] && ! AUGMENTAGENT_RESOURCE_UNIT="$SYSTEMD_UNIT" "$REPO_ROOT/scripts/configure-run-resources.sh" --install >> "$LOG" 2>&1; then
+          resource_status=0
+          if [ -x "$REPO_ROOT/scripts/configure-run-resources.sh" ]; then
+            AUGMENTAGENT_RESOURCE_UNIT="$SYSTEMD_UNIT" "$REPO_ROOT/scripts/configure-run-resources.sh" --install >> "$LOG" 2>&1 || resource_status=$?
+          fi
+          if [ "$resource_status" -eq 3 ]; then
+            log "run-resource delegation unsupported; required Autoship stays disabled while unrelated service updates continue"
+            notify_owner "Run-resource delegation unavailable for $SYSTEMD_UNIT; required Autoship remains disabled. Other daemon services continue updating."
+          fi
+          if [ "$resource_status" -ne 0 ] && [ "$resource_status" -ne 3 ]; then
             log "resource delegation setup failed; keeping daemon and withholding build stamp"
             RESTART_FAILURES=$((RESTART_FAILURES + 1))
           elif restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
