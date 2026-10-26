@@ -600,7 +600,15 @@ impl FallbackReasoner {
         // retrofit a history that misses an earlier mutating dispatch.
         self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
         let class = classify(opts);
-        let mutating = matches!(class,
+        // restrict_env selects a strong transport capability, not permission to
+        // mutate. A supplied-evidence fresh review must never gain a journal
+        // (and its previous conversation) merely because its env is restricted.
+        let fresh_review = crate::native_session::is_fresh_review();
+        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
+            return Err(ReasonerError::Local { message:
+                "fresh review requires supplied evidence without tools, settings or handoff history".into() }.into());
+        }
+        let mutating = !fresh_review && matches!(class,
             crate::providers::CapabilityClass::WriteTools | crate::providers::CapabilityClass::FullAgentic);
         let mut request_opts = opts.clone();
         if request_opts.handoff_path.is_none() && mutating {
@@ -1395,6 +1403,39 @@ mod tests {
             .any(|row| row.get("provider").and_then(|v|v.as_str()) == Some("claude")
                 && row.get("session_id").and_then(|v|v.as_str()) == Some("actual-claude-session")));
         logger.protected_health().unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_fresh_review_never_inherits_mutation_journal() {
+        struct SuppliedEvidence;
+        #[async_trait]
+        impl Reasoner for SuppliedEvidence {
+            async fn call(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+                assert!(opts.restrict_env);
+                assert!(opts.allowed_tools.is_empty());
+                assert!(opts.handoff_path.is_none(), "environment restriction injected old history");
+                assert_eq!(message, "supplied candidate");
+                Ok("review completed".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut fallback = FallbackReasoner::for_tests(
+            vec![(ProviderKind::Codex, Arc::new(SuppliedEvidence))], latch_in(&dir));
+        fallback.handoff_root = Some(dir.path().join("handoffs"));
+        let mut opts = text_only_opts();
+        opts.restrict_env = true;
+        let output = crate::native_session::FRESH_REVIEW.scope(true,
+            crate::model_router::native_reviewer_scope(ProviderKind::Codex,
+                fallback.call(&opts, "supplied candidate"))).await.unwrap();
+        assert_eq!(output, "review completed");
+        assert!(!dir.path().join("handoffs").exists());
+        assert!(fallback.mutation_providers().is_empty());
+        opts.allowed_tools = vec!["Write".into()];
+        assert!(crate::native_session::FRESH_REVIEW.scope(true,
+            crate::model_router::native_reviewer_scope(ProviderKind::Codex,
+                fallback.call(&opts, "supplied candidate"))).await.is_err());
+        assert_eq!(fallback.calls(), 1, "invalid fresh-review capability never dispatches");
+        assert!(latch_in(&dir).latched_until("codex").is_none());
     }
 
     #[tokio::test]
