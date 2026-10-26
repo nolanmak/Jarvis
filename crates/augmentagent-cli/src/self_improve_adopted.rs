@@ -60,10 +60,72 @@ fn approved(
         .filter(|v| v.structured.is_some() && approval_of(Some(v)).reviewed))
 }
 
+fn workflow_available(snapshot: Option<&crate::autoship_workflow::Snapshot>, now: i64) -> bool {
+    snapshot.is_none_or(|state| {
+        state.lease_until_ms <= now && state.checkpoint.next.eligible_at_ms <= now
+    })
+}
+
+/// Reserve a turn before preflight/checkout so a persistent setup failure also
+/// rotates. The cursor is scheduling state, never a billed model attempt.
+fn choose_round_robin(
+    path: &Path,
+    candidates: Vec<adoption::AdoptedPr>,
+    dry_run: bool,
+) -> Result<Option<adoption::AdoptedPr>> {
+    use rusqlite::OptionalExtension;
+    let Some(first) = candidates.first() else {
+        return Ok(None);
+    };
+    let repository = first.repository.clone();
+    anyhow::ensure!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.repository == repository),
+        "adoption cursor cannot mix repositories"
+    );
+    let _ = WorkflowStore::open(path)?;
+    let mut conn = rusqlite::Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    if dry_run {
+        let cursor = conn
+            .query_row(
+                "SELECT last_pr FROM adopted_execution_cursor WHERE repository=?1",
+                [&repository],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        return Ok(candidates
+            .into_iter()
+            .min_by_key(|candidate| (candidate.pr <= cursor, candidate.pr)));
+    }
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS adopted_execution_cursor(repository TEXT PRIMARY KEY,last_pr INTEGER NOT NULL)")?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let cursor = tx
+        .query_row(
+            "SELECT last_pr FROM adopted_execution_cursor WHERE repository=?1",
+            [&repository],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let chosen = candidates
+        .into_iter()
+        .min_by_key(|candidate| (candidate.pr <= cursor, candidate.pr))
+        .expect("nonempty candidate pool");
+    tx.execute("INSERT INTO adopted_execution_cursor(repository,last_pr) VALUES(?1,?2) ON CONFLICT(repository) DO UPDATE SET last_pr=excluded.last_pr",rusqlite::params![repository,chosen.pr])?;
+    tx.commit()?;
+    Ok(Some(chosen))
+}
+
 pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::AdoptedPr>> {
     let candidates = discover(repo, dry_run).await?;
     let store = WorkflowStore::open(&workflow::path())?;
     let now = chrono::Utc::now().timestamp_millis();
+    let mut eligible = Vec::new();
     for candidate in candidates {
         if candidate.source_issue.is_some() || !candidate.ready_for_review() {
             continue;
@@ -71,10 +133,15 @@ pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::
         let id = store
             .resolve_pr(&candidate.repository, candidate.pr)?
             .unwrap_or(candidate.workflow_id()?);
-        if let Some(snapshot) = store.snapshot(&id)? {
-            if snapshot.checkpoint.next.eligible_at_ms > now {
-                continue;
-            }
+        if !workflow_available(store.snapshot(&id)?.as_ref(), now) {
+            continue;
+        }
+        if let Some(reason) = policy_hold::adjudicated_dependency(repo, &candidate).await {
+            info!(
+                pr = candidate.pr,
+                reason, "adopted PR dependency remains in free reconciliation"
+            );
+            continue;
         }
         if let Some(verdict) = approved(&store, &candidate)? {
             if let policy_hold::ApprovalDisposition::Free(reason) =
@@ -87,9 +154,9 @@ pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::
                 continue;
             }
         }
-        return Ok(Some(candidate));
+        eligible.push(candidate);
     }
-    Ok(None)
+    choose_round_robin(&workflow::path(), eligible, dry_run)
 }
 
 pub(super) async fn resume(
@@ -134,6 +201,9 @@ pub(super) async fn resume(
     };
     guard.bind_reasoner(reasoner.as_ref())?;
     reasoner.track_review_history(repo, &pr.branch, true)?;
+    let prior_checkpoint = WorkflowStore::open(&workflow::path())?
+        .snapshot(guard.id())?
+        .map(|snapshot| snapshot.checkpoint);
     let result = execute(
         repo,
         reasoner,
@@ -150,14 +220,31 @@ pub(super) async fn resume(
             Ok(report)
         }
         Err(error) => {
-            guard
-                .transition(
-                    Stage::Held,
-                    "adopted_execution_retry",
-                    "resume_preserved_pr",
-                    chrono::Utc::now().timestamp_millis() + 300_000,
-                )
-                .await?;
+            let latest = WorkflowStore::open(&workflow::path())?
+                .snapshot(guard.id())?
+                .map(|snapshot| snapshot.checkpoint);
+            let action_preserved = latest.as_ref().is_some_and(|checkpoint| {
+                Some(checkpoint) != prior_checkpoint.as_ref()
+                    && (checkpoint.next.action.starts_with("dependency_")
+                        || checkpoint.next.action.starts_with("retry_")
+                        || matches!(
+                            checkpoint.next.action.as_str(),
+                            "verify_new_revision"
+                                | "rescope_acceptance"
+                                | "repair_verifier_definition"
+                                | "complete_review_or_adjudication"
+                        ))
+            });
+            if !action_preserved {
+                guard
+                    .transition(
+                        Stage::Held,
+                        "adopted_execution_retry",
+                        "resume_preserved_pr",
+                        chrono::Utc::now().timestamp_millis() + 300_000,
+                    )
+                    .await?;
+            }
             guard.finish()?;
             Err(error)
         }
@@ -794,6 +881,151 @@ mod tests {
         assert!(
             approved(&store, &pr).unwrap().is_none(),
             "source-less merges require complete structured authority, not booleans or comments"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use super::*;
+    fn candidate(pr: u64) -> adoption::AdoptedPr {
+        adoption::AdoptedPr {
+            repository: "owner/repo".into(),
+            pr,
+            source_issue: None,
+            branch: format!("worktree/pr-{pr}"),
+            head: format!("head-{pr}"),
+            base: "main".into(),
+            author: "owner".into(),
+            title: "Synthetic repair".into(),
+            body: "Preserve existing behavior".into(),
+            dependency: adoption::Dependency::Main,
+        }
+    }
+    #[test]
+    fn permanently_failing_oldest_rotates_to_two_new_prs_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflows.db");
+        let candidates = vec![candidate(10), candidate(20), candidate(30)];
+        let mut seen = vec![];
+        for tick in 0..4 {
+            let now = 1_000 + tick * 3_600_000;
+            // Every tick opens fresh DB handles, exactly as daemon restart does.
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let pool = candidates
+                .iter()
+                .filter(|candidate| {
+                    workflow_available(
+                        store
+                            .snapshot(&candidate.workflow_id().unwrap())
+                            .unwrap()
+                            .as_ref(),
+                        now,
+                    )
+                })
+                .cloned()
+                .collect();
+            let chosen = choose_round_robin(&path, pool, false).unwrap().unwrap();
+            seen.push(chosen.pr);
+            let id = chosen.workflow_id().unwrap();
+            store
+                .register(
+                    &id,
+                    &chosen.branch,
+                    crate::autoship_workflow::Binding {
+                        head: chosen.head.clone(),
+                        contract: "contract".into(),
+                        evidence_hash: "evidence".into(),
+                    },
+                    now,
+                )
+                .unwrap();
+            let lease = store
+                .claim(&id, "failing-fixture", now, 100)
+                .unwrap()
+                .unwrap();
+            let mut checkpoint = store.snapshot(&id).unwrap().unwrap().checkpoint;
+            checkpoint.stage = Stage::Held;
+            checkpoint.next.action = "resume_preserved_pr".into();
+            checkpoint.next.reason = "permanent synthetic failure".into();
+            checkpoint.next.eligible_at_ms = now + 300_000;
+            store.checkpoint(&lease, &checkpoint, now).unwrap();
+            store.release(&lease, now).unwrap();
+            assert_eq!(
+                store.snapshot(&id).unwrap().unwrap().model_calls,
+                0,
+                "cursor reservation never bills a model call"
+            );
+        }
+        assert_eq!(
+            seen,
+            vec![10, 20, 30, 10],
+            "oldest failure must not monopolize subsequent ticks"
+        );
+    }
+    #[test]
+    fn held_and_leased_heads_are_not_admitted_or_charged_by_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflows.db");
+        let blocked = candidate(10);
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let id = blocked.workflow_id().unwrap();
+        store
+            .register(
+                &id,
+                &blocked.branch,
+                crate::autoship_workflow::Binding {
+                    head: blocked.head.clone(),
+                    contract: "contract".into(),
+                    evidence_hash: "evidence".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let lease = store.claim(&id, "active-worker", 2, 1000).unwrap().unwrap();
+        assert!(!workflow_available(
+            store.snapshot(&id).unwrap().as_ref(),
+            3
+        ));
+        let mut checkpoint = store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.next.eligible_at_ms = 5000;
+        store.checkpoint(&lease, &checkpoint, 4).unwrap();
+        store.release(&lease, 5).unwrap();
+        assert!(!workflow_available(
+            store.snapshot(&id).unwrap().as_ref(),
+            6
+        ));
+        let pool = vec![blocked, candidate(20), candidate(30)]
+            .into_iter()
+            .filter(|candidate| {
+                workflow_available(
+                    store
+                        .snapshot(&candidate.workflow_id().unwrap())
+                        .unwrap()
+                        .as_ref(),
+                    6,
+                )
+            })
+            .collect();
+        assert_eq!(
+            choose_round_robin(&path, pool, false).unwrap().unwrap().pr,
+            20
+        );
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls, 0);
+        assert_eq!(
+            choose_round_robin(&path, vec![candidate(20), candidate(30)], true)
+                .unwrap()
+                .unwrap()
+                .pr,
+            30
+        );
+        assert_eq!(
+            choose_round_robin(&path, vec![candidate(20), candidate(30)], true)
+                .unwrap()
+                .unwrap()
+                .pr,
+            30,
+            "dry runs must not consume the rotation"
         );
     }
 }

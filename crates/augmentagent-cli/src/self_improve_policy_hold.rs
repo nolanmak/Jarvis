@@ -470,7 +470,7 @@ fn reopen_dependency(store: &mut crate::autoship_workflow::WorkflowStore, id: &s
     store.release(&lease,now)?;
     result.map(|_|true)
 }
-async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr) -> Option<&'static str> {
+pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr) -> Option<&'static str> {
     let mut store = match crate::autoship_workflow::WorkflowStore::open(&workflow::path()) { Ok(store)=>store, Err(_)=>return Some("dependency-evidence-unavailable") };
     let id = store.resolve_pr(&candidate.repository, candidate.pr).ok()??;
     let snapshot = store.snapshot(&id).ok()??;

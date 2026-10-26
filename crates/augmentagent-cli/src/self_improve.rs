@@ -7736,7 +7736,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 });
         }
     }
-    if red_main_issue.is_none() && lane != Lane::Build {
+    if red_main_issue.is_none() && lane != Lane::Build && !prefer_build {
         if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
             return adopted_execution::resume(repo_root, &build_reasoner(), candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
         }
@@ -7770,6 +7770,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             r.resumed = true;
                             r
                         });
+                    }
+                    if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
+                        return adopted_execution::resume(repo_root, &build_reasoner(), candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
                     }
                 }
                 return Ok(RunReport::idle());
