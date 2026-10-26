@@ -1077,6 +1077,20 @@
       "core_ignored": 14,
       "log": "/tmp/autoship-1598-ci-9b0c6ab5-rust.log",
       "scope": "Hosted Rust workflow only; full native issue/adoption and production rollout remain pending."
+    },
+    "oauth_rotation_checkpoint_099d90af": {
+      "implementation": [
+        "48c58b97",
+        "099d90af"
+      ],
+      "independent_review": "LGTM for source commits 33b005c8 and 86a3066a",
+      "vm_helper_passed": 17,
+      "gateway_passed": 16,
+      "logs": [
+        "/tmp/autoship-1598-oauth-vm-099d90af.log",
+        "/tmp/autoship-1598-oauth-gateway-099d90af.log"
+      ],
+      "scope": "Synthetic rotation response, SIGKILL and fresh runtime seed; journal recovery, optional Codex response fields, path normalization, scope consistency, all-worker teardown and stale export ordering. Local gateway fixtures only. No live issuer rotation, no VM/provider call, no production credential writes. Packaged rebuild and native pipeline still pending."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -1164,8 +1178,8 @@
     {
       "severity": "P1",
       "gap": "OAuth rotation can lose refreshed credentials on cancellation after issuer response but before guest export and shutdown",
-      "status": "read_only_audit_confirmed; implementation_and_synthetic_rotation_crash_recovery_regression_in_progress",
-      "evidence": "Current successful native profiles disable refresh. Existing lock/CAS/atomic import protects final writes but does not persist the rotated credential before normal export. No live token rotation attempted."
+      "status": "fixed_48c58b97_099d90af; independent_LGTM; 17_vm_helper_and_16_gateway_tests_passed; packaged_and_live_refresh_acceptance_pending",
+      "evidence": "Host persists the received rotation before guest delivery and joins gateway workers before export or credential lease release. True issuer-success/lost-response ambiguity remains an explicit uncertain dependency, never reported as healthy. Existing direct profiles still disable refresh."
     }
   ],
   "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
