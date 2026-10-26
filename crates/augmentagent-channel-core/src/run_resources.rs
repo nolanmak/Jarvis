@@ -187,6 +187,12 @@ mod tests {
             return;
         }
         let directory = tempfile::Builder::new().prefix("autoship-resource-policy-").tempdir_in("/tmp").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["logs", "anchors"] {
+            let path = directory.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let logger = Arc::new(
             crate::tool_audit::AuditLogger::protected(
                 directory.path().join("logs/audit.jsonl"),
