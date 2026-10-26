@@ -158,6 +158,10 @@ pub(crate) async fn run(
             supplied,
         );
     }
+    ensure!(
+        evidence.values().any(|excerpt| !excerpt.trim().is_empty()),
+        "source selections yielded no evidence; choose relevant original-base implementation"
+    );
     let final_prompt=format!("{prompt}\n{CONTRACT_PROMPT}\nYou have no tools. Scope against these controller-supplied original-base excerpts, not assumptions from another conversation. Unseen files are unknown, not proof of a blocker. Original HEAD: {head}\nSource excerpts: {}",serde_json::to_string(&evidence)?);
     let output = call(
         root,

@@ -672,8 +672,7 @@ async fn trusted_git(root: &Path, args: &[&str]) -> Result<String> {
 /// One independent repair of absent/malformed scoper output. This is a scoped
 /// stage retry, not permission to let the builder invent its own acceptance bar.
 async fn proposal_with_retry(
-    _reasoner: &dyn Reasoner,
-    control: &Path,
+    workflow: &workflow::WorkflowGuard,
     candidate: &Path,
     source: AcceptanceSource,
     scope: &str,
@@ -696,70 +695,10 @@ async fn proposal_with_retry(
         Ok(proposal) => Ok(proposal),
         Err(error) => {
             let prompt = format!("Supply the independent executable acceptance contract for {source}. Previous scoper output lacked a valid executable contract ({error}). Use only the supplied original source; do not edit it.\n{CONTRACT_PROMPT}\nScoper requirements:\n{scope}\nPreserve EACH original criterion verbatim as a contract requirement: {}", serde_json::to_string(required_criteria)?);
-            // Supply immutable tracked source as evidence: fresh review transport
-            // intentionally cannot inherit builder tools or conversation state.
-            let head = actual_head(candidate).await?;
-            let tracked = trusted_git(candidate, &["ls-files", "-z"]).await?;
-            let mut supplied = BTreeMap::new();
-            let mut size = 0;
-            for path in tracked
-                .split('\0')
-                .filter(|path| !path.is_empty() && scope.contains(path))
-            {
-                let contents = trusted_git(candidate, &["show", &format!("{head}:{path}")]).await?;
-                size += contents.len();
-                ensure!(
-                    size <= 256 * 1024 && supplied.len() < 64,
-                    "scoper source evidence requires a smaller scope"
-                );
-                supplied.insert(path, contents);
-            }
-            let prompt = format!(
-                "{prompt}\nSource at original baseline {head}: {}",
-                serde_json::to_string(&supplied)?
-            );
-            let provider = reviewer_pool()
-                .into_iter()
-                .find(|provider| {
-                    matches!(
-                        provider,
-                        augmentagent_channel_core::ProviderKind::Claude
-                            | augmentagent_channel_core::ProviderKind::Codex
-                    ) && matches!(reviewer_status(*provider), ReviewerStatus::Ready)
-                })
-                .context("fresh native scope authority unavailable")?;
-            let reasoner = augmentagent_channel_core::build_pinned(provider).context("pinned native provider is unavailable")?;
-            let mut opts = codex_review_opts(candidate.to_path_buf(), "Independent executable contract scoper. Use supplied original source only. No tools or inherited builder context. Return requested contract JSON fence.");
-            opts.allowed_tools.clear();
-            opts.settings_json = None;
-            opts.handoff_path = None;
-            if provider == augmentagent_channel_core::ProviderKind::Claude {
-                opts.model = Some(build_model());
-            }
-            let (output, native_session) =
-                augmentagent_channel_core::native_session::fresh_review_scope(
-                    provider,
-                    augmentagent_channel_core::model_router::native_reviewer_scope(
-                        provider,
-                        reasoner.call(&opts, &prompt),
-                    ),
-                )
-                .await?;
-            let provenance = serde_json::json!({"version":1,"source":source,"baseline":head,"provider":provider.name(),"native_session":native_session,
-                "supplied_request_hash":amendment::digest(prompt.as_bytes()),"proposal_hash":amendment::digest(output.as_bytes())});
-            let bytes = serde_json::to_vec(&provenance)?;
-            use std::io::Write;
-            let mut staged = tempfile::NamedTempFile::new_in(control)?;
-            staged.write_all(&bytes)?;
-            staged.as_file().sync_all()?;
-            staged
-                .persist_noclobber(control.join(format!(
-                    "scope-authority-{}-{}.json",
-                    source.key(),
-                    uuid::Uuid::new_v4()
-                )))
-                .map_err(|error| error.error)?;
-            std::fs::File::open(control)?.sync_all()?;
+            // Reuse the audited, controller-mediated original-source selector.
+            // Directory-only or prose requests must not become empty evidence.
+            let output =
+                scope_authority::run(candidate, workflow.repository(), workflow, &prompt).await?;
             parse_proposal_for(&output, source)
                 .and_then(validate)
                 .context("independent acceptance proposal retry failed")
@@ -812,6 +751,7 @@ pub(super) async fn prepare_acceptance(
     reasoner: &dyn Reasoner,
     writable_roots: &[PathBuf],
     required_criteria: &[String],
+    workflow: &workflow::WorkflowGuard,
 ) -> Result<PreparedAcceptance> {
     prepare_acceptance_for(
         repo,
@@ -823,6 +763,7 @@ pub(super) async fn prepare_acceptance(
         reasoner,
         writable_roots,
         required_criteria,
+        workflow,
     )
     .await
 }
@@ -834,9 +775,10 @@ pub(super) async fn prepare_acceptance_for(
     source: AcceptanceSource,
     base: &str,
     scope: &str,
-    reasoner: &dyn Reasoner,
+    _reasoner: &dyn Reasoner,
     writable_roots: &[PathBuf],
     required_criteria: &[String],
+    workflow: &workflow::WorkflowGuard,
 ) -> Result<PreparedAcceptance> {
     source.validate()?;
     use std::io::Write;
@@ -921,15 +863,8 @@ pub(super) async fn prepare_acceptance_for(
         trusted_git(repo, &["worktree", "add", "--detach", checkout, base]).await?;
         // Legacy candidates may already contain a fix. Generate the independent
         // harness against the original trusted base checkout, never their head.
-        let proposal_result = proposal_with_retry(
-            reasoner,
-            &control,
-            &baseline_root,
-            source,
-            scope,
-            required_criteria,
-        )
-        .await;
+        let proposal_result =
+            proposal_with_retry(workflow, &baseline_root, source, scope, required_criteria).await;
         let result = match proposal_result {
             Ok(proposal) => register_and_reproduce(&baseline_root, proposal.clone())
                 .await
@@ -1654,7 +1589,7 @@ pub(super) async fn assert_receipt_current(
     prepared: &PreparedAcceptance,
     reference: &CandidateReceiptReference,
 ) -> Result<()> {
-    assert_verifier_receipt_current(worktree,prepared,reference).await?;
+    assert_verifier_receipt_current(worktree, prepared, reference).await?;
     alignment::assert_current(
         worktree,
         prepared,

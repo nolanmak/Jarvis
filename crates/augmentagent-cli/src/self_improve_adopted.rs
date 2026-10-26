@@ -78,8 +78,12 @@ pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::
         }
         if let Some(verdict) = approved(&store, &candidate)? {
             if let policy_hold::ApprovalDisposition::Free(reason) =
-                policy_hold::reconciliation_disposition(repo,&candidate,&verdict).await {
-                info!(pr=candidate.pr,reason,"approved adopted PR stays in free reconciliation");
+                policy_hold::reconciliation_disposition(repo, &candidate, &verdict).await
+            {
+                info!(
+                    pr = candidate.pr,
+                    reason, "approved adopted PR stays in free reconciliation"
+                );
                 continue;
             }
         }
@@ -183,6 +187,7 @@ async fn execute(
         reasoner,
         &acceptance::worker_roots(worktree),
         &[],
+        guard,
     )
     .await?;
     guard.bind_acceptance(&prepared)?;
