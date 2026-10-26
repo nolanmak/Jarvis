@@ -6662,13 +6662,8 @@ async fn resume_draft_pr(
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
     let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
-<<<<<<< HEAD
-    let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria).await {
-=======
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, resume_base.trim(), &acceptance_scope, reasoner, &acceptance::worker_roots(&worktree), &resumed_criteria).await {
->>>>>>> 43d4a392 (fix(autoship): independently amend failed verifier contracts with immutable rebaselines)
+        issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria).await {
         Ok(prepared) => prepared,
         Err(error) => {
             workflow.transition(Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
@@ -8138,13 +8133,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 
     let acceptance_control = acceptance::control_directory(&repository)?;
     let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
-<<<<<<< HEAD
-    let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria).await {
-=======
     let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, candidate_base, acceptance_scope, &reasoner, &acceptance::worker_roots(&worktree), &criteria).await {
->>>>>>> 43d4a392 (fix(autoship): independently amend failed verifier contracts with immutable rebaselines)
+        issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria).await {
         Ok(prepared) => prepared,
         Err(error) => {
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;

@@ -173,7 +173,7 @@ async fn execute(
     let control = acceptance::control_directory(&pr.repository)?;
     let (ok, base, error) = run("git", &["merge-base", "origin/main", "HEAD"], worktree).await?;
     anyhow::ensure!(ok, "cannot resolve adopted acceptance baseline: {error}");
-    let prepared = acceptance::prepare_acceptance_for(
+    let mut prepared = acceptance::prepare_acceptance_for(
         repo,
         worktree,
         &control,
@@ -213,7 +213,7 @@ async fn execute(
     let mut native_sessions = None;
     loop {
         let receipt = acceptance::verify_with_repair_for(
-            reasoner, source, &pr.title, worktree, &prepared, &control, guard,
+            reasoner, source, &pr.title, worktree, &mut prepared, &control, guard,
         )
         .await?;
         verification_gate(worktree).await?;

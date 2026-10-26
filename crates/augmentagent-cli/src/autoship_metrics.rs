@@ -55,9 +55,10 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
     let mut statement = conn.prepare(
         "SELECT o.workflow,o.kind,o.binding,o.receipt,w.pr,o.id,m.receipt FROM operation o
          JOIN workflow w ON w.id=o.workflow LEFT JOIN merge_mutation_receipt m ON m.operation=o.id
-         WHERE o.receipt IS NOT NULL
-         AND EXISTS (SELECT 1 FROM workflow_event e WHERE e.workflow=o.workflow
-         AND e.kind='operation_completed' AND e.payload=o.id AND e.at_ms>=?1 AND e.at_ms<?2)",
+         JOIN (SELECT workflow,payload,min(at_ms) AS first_observed_ms FROM workflow_event
+           WHERE kind='operation_completed' GROUP BY workflow,payload
+         ) e ON e.workflow=o.workflow AND e.payload=o.id
+         WHERE o.receipt IS NOT NULL AND e.first_observed_ms>=?1 AND e.first_observed_ms<?2",
     )?;
     let rows = statement.query_map(params![since, until], |row| {
         Ok((
@@ -207,6 +208,7 @@ mod tests {
         store
             .complete_operation(&lease, &op.id, "github:pr:42:merged:head", 80)
             .unwrap();
+        conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,'operation_completed',?3,80)",params![lease.workflow,lease.generation,op.id]).unwrap();
         let after = read(&path, 50, 100).unwrap();
         assert_eq!(after.confirmed_merge_operations, 1);
         assert_eq!(
