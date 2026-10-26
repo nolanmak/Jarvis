@@ -238,11 +238,10 @@
       ]
     },
     "python_boundary_registry_bridge": {
-      "run": 188,
+      "run": 194,
       "failed": 0,
       "skipped": 10,
-      "log": "/tmp/autoship-1598-python-boundary-tests.log",
-      "note": "Before latest native fresh-review session changes."
+      "log": "/tmp/autoship-1598-python-confinement-updated.log"
     },
     "scheduled_loops": {
       "passed": 49,
@@ -252,7 +251,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "One local managed build/test at a time; notification regression suite currently compiling.",
+    "latest_rust_admission": "One managed Rust build/test at a time. Core recovery passed; CLI recovery suite remains pending at this evidence revision.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -269,10 +268,11 @@
       "note": "Complete email library suite, managed single-job run."
     },
     "updater_rebuild": {
-      "passed": 59,
+      "passed": 61,
       "failed": 0,
-      "revision": "7b58c519",
-      "note": "Embedded guard helpers now trigger rebuild through standard updater."
+      "revision": "941c6a78",
+      "log": "/tmp/autoship-1598-updater-resource-rebuild.log",
+      "note": "Includes committed verifier export and resource helper rebuild triggers."
     },
     "capability_inventory": {
       "passed": 10,
@@ -285,6 +285,44 @@
       "failed": 0,
       "revision": "d45052b4",
       "note": "Complete notify_tests suite, including registry coverage of retry escalation."
+    },
+    "core_recovery": {
+      "revision": "941c6a78",
+      "passed": 632,
+      "failed": 0,
+      "ignored": 14,
+      "log": "/tmp/autoship-1598-core-recovery.log"
+    },
+    "kernel_audit_recovery": {
+      "revision": "941c6a78",
+      "passed": 1,
+      "failed": 0,
+      "test": "run_resources::tests::recovery_kernel_proof_refuses_live_descendants_then_accepts_cleanup",
+      "execution": "Compiled managed test binary in isolated delegated transient service; live descendants refused, removed subtree accepted, foreign host rejected."
+    },
+    "self_improve_recovery": {
+      "revision": "1848f669",
+      "passed": 399,
+      "failed": 0,
+      "ignored": 8,
+      "log": "/tmp/autoship-1598-tests-1848f669.log",
+      "note": "Later resource and audit-generation integration is under central validation; this is not latest-head proof."
+    },
+    "behavior_oracles": {
+      "passed": 21,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-behavior-oracles.log"
+    },
+    "foundation_observations": {
+      "revision": "5d7aa6cf",
+      "passed": 76,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-foundation-observations.log"
+    },
+    "full_native_probe": {
+      "passed": false,
+      "log": "/tmp/autoship-1598-native-probe.log",
+      "result": "Initial run stopped at alignment with ProvenanceUnknown. Harness provenance correction implemented; successful rerun still required."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -301,18 +339,23 @@
     {
       "severity": "P1",
       "gap": "Source-less PR selection can starve newer PRs and reserved new-issue slots",
-      "status": "fix_in_progress"
+      "status": "fair_selection_fixed_and_targeted_tests_passed; whole_inventory_pagination_under_review"
     },
     {
       "severity": "P1",
       "gap": "In-process test success text can be forged by candidate code before assertions execute",
-      "status": "controller_asserted_out_of_process_behavior_protocol_in_progress"
+      "status": "controller_held_black_box_expectations_implemented; behavior_suite_passed; native_validation_pending"
     },
     {
       "severity": "P1",
       "gap": "Ignored candidate-local executable inputs such as Python bytecode can differ from reviewed source",
-      "status": "clean_committed_execution_fix_in_progress",
+      "status": "clean_committed_export_implemented; bounded_metadata_and_disk_growth_tests_passed; native_validation_pending",
       "evidence": "Independent review reproduced baseline red becoming green with same source and timestamp/size-matching ignored pyc."
+    },
+    {
+      "severity": "P1",
+      "gap": "Interrupted audit generations can permanently block retry or resurrect prior approval after binding recalculation",
+      "status": "sealed_generation_recovery_integrated; approval_invalidation_followup_and_CLI_validation_in_progress"
     }
   ]
 }
