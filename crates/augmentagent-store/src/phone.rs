@@ -1882,13 +1882,170 @@ impl Store {
         task_id: &str,
         result: &str,
     ) -> PhoneResult<()> {
-        self.with_conn(|conn| conn.execute("UPDATE phone_dispatch_jobs SET state='ready',result=?3 WHERE call_id=?1 AND task_id=?2 AND state IN ('queued','running')",
-            params![call_id, task_id, result]))?;
-        Ok(())
+        transaction(self, |tx| {
+            let changed = tx.execute("UPDATE phone_dispatch_jobs SET state='ready',result=?3 WHERE call_id=?1 AND task_id=?2 AND state IN ('queued','running')",
+                params![call_id, task_id, result])?;
+            if changed == 1 {
+                tx.execute("UPDATE phone_live_dispatches SET result=?3 WHERE call_id=?1 AND task_id=?2 AND delivered=0 AND EXISTS(SELECT 1 FROM phone_live_sessions s WHERE s.call_id=?1 AND s.active=1)",
+                    params![call_id,task_id,result])?;
+            }
+            Ok(())
+        })
     }
     pub fn phone_dispatch_delivered(&self, call_id: &str, task_id: &str) -> PhoneResult<()> {
         self.with_conn(|conn| conn.execute("UPDATE phone_dispatch_jobs SET state='done',result=NULL WHERE call_id=?1 AND task_id=?2 AND state='ready'",
             params![call_id, task_id]))?;
         Ok(())
+    }
+}
+
+/// Private delivery content; deliberately no Debug or Serialize.
+pub struct PhoneLiveResult {
+    pub delegation_id: String,
+    pub result: String,
+}
+fn live_binding(tx: &Transaction<'_>, call_id: &str, session_id: &str) -> PhoneResult<bool> {
+    let row: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT session_id,active FROM phone_live_sessions WHERE call_id=?1",
+            [call_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((id, active)) if id == session_id => Ok(active),
+        _ => Err(PhoneError::Conflict),
+    }
+}
+impl Store {
+    /// Trusted ingress only, after callback verification and durable relay claim.
+    pub fn phone_bind_live_session(&self, call_id: &str, session_id: &str) -> PhoneResult<()> {
+        identifier(session_id)?;
+        if session_id.len() > 256 {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            let call = call_by_id(tx, call_id)?;
+            if call.state != CallState::Connected || call.stop_requested || call.verification {
+                return Err(PhoneError::Conflict);
+            }
+            let claimed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_relay_claims WHERE call_id=?1)",
+                [call_id],
+                |r| r.get(0),
+            )?;
+            if !claimed {
+                return Err(PhoneError::Conflict);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO phone_live_sessions(call_id,session_id) VALUES(?1,?2)",
+                params![call_id, session_id],
+            )?;
+            if !live_binding(tx, call_id, session_id)? {
+                return Err(PhoneError::Conflict);
+            }
+            Ok(())
+        })
+    }
+    /// Atomically bind provider identity to one native intent. No provider text
+    /// can supply a native task ID or replace an already persisted description.
+    pub fn phone_enqueue_live_dispatch(
+        &self,
+        call_id: &str,
+        session_id: &str,
+        delegation_id: &str,
+        description: &str,
+    ) -> PhoneResult<String> {
+        identifier(delegation_id)?;
+        if delegation_id.len() > 256 || description.trim().is_empty() || description.len() > 12_000
+        {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            if !live_binding(tx, call_id, session_id)? {
+                return Err(PhoneError::Conflict);
+            }
+            let call = call_by_id(tx, call_id)?;
+            if call.state != CallState::Connected || call.stop_requested || call.verification {
+                return Err(PhoneError::Conflict);
+            }
+            let existing: Option<(String,String)> = tx.query_row(
+                "SELECT d.task_id,j.description FROM phone_live_dispatches d JOIN phone_dispatch_jobs j ON j.call_id=d.call_id AND j.task_id=d.task_id WHERE d.call_id=?1 AND d.delegation_id=?2",
+                params![call_id,delegation_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if let Some((id, old)) = existing {
+                return if old == description {
+                    Ok(id)
+                } else {
+                    Err(PhoneError::Conflict)
+                };
+            }
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM phone_dispatch_jobs WHERE state != 'done'",
+                [],
+                |r| r.get(0),
+            )?;
+            let per_call: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM phone_live_dispatches WHERE call_id=?1",
+                [call_id],
+                |r| r.get(0),
+            )?;
+            if pending >= 128 || per_call >= 128 {
+                return Err(PhoneError::RateLimited);
+            }
+            let task_id = uuid::Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO phone_dispatch_jobs(call_id,task_id,description,state) VALUES(?1,?2,?3,'queued')",params![call_id,task_id,description])?;
+            tx.execute(
+                "INSERT INTO phone_live_dispatches(call_id,delegation_id,task_id) VALUES(?1,?2,?3)",
+                params![call_id, delegation_id, task_id],
+            )?;
+            Ok(task_id)
+        })
+    }
+    pub fn phone_live_results(
+        &self,
+        call_id: &str,
+        session_id: &str,
+    ) -> PhoneResult<Vec<PhoneLiveResult>> {
+        transaction(self, |tx| {
+            if !live_binding(tx, call_id, session_id)? {
+                return Ok(Vec::new());
+            }
+            let mut statement = tx.prepare("SELECT delegation_id,result FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 AND result IS NOT NULL ORDER BY rowid LIMIT 128")?;
+            let rows = statement.query_map([call_id], |r| {
+                Ok(PhoneLiveResult {
+                    delegation_id: r.get(0)?,
+                    result: r.get(1)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+    /// Mark commentary accepted by the Live provider. This is not evidence
+    /// that audio played or that the caller heard the result.
+    pub fn phone_live_result_delivered(
+        &self,
+        call_id: &str,
+        session_id: &str,
+        delegation_id: &str,
+    ) -> PhoneResult<()> {
+        transaction(self, |tx| {
+            live_binding(tx, call_id, session_id)?;
+            tx.execute("UPDATE phone_live_dispatches SET delivered=1,result=NULL WHERE call_id=?1 AND delegation_id=?2 AND result IS NOT NULL",params![call_id,delegation_id])?;
+            Ok(())
+        })
+    }
+    pub fn phone_end_live_session(&self, call_id: &str, session_id: &str) -> PhoneResult<()> {
+        transaction(self, |tx| {
+            live_binding(tx, call_id, session_id)?;
+            tx.execute(
+                "UPDATE phone_live_sessions SET active=0 WHERE call_id=?1",
+                [call_id],
+            )?;
+            tx.execute(
+                "UPDATE phone_live_dispatches SET delivered=1,result=NULL WHERE call_id=?1",
+                [call_id],
+            )?;
+            Ok(())
+        })
     }
 }

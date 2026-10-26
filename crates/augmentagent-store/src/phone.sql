@@ -174,3 +174,21 @@ CREATE TABLE IF NOT EXISTS phone_dispatch_jobs (
     result TEXT,
     PRIMARY KEY(call_id, task_id)
 );
+
+-- One immutable provider session per durably claimed phone relay.
+CREATE TABLE IF NOT EXISTS phone_live_sessions (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    session_id TEXT NOT NULL UNIQUE,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+);
+-- Separate audio receipt: chat delivery must not erase an unheard result.
+CREATE TABLE IF NOT EXISTS phone_live_dispatches (
+    call_id TEXT NOT NULL REFERENCES phone_live_sessions(call_id),
+    delegation_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    result TEXT,
+    delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+    PRIMARY KEY(call_id,delegation_id),
+    UNIQUE(call_id,task_id),
+    FOREIGN KEY(call_id,task_id) REFERENCES phone_dispatch_jobs(call_id,task_id)
+);
