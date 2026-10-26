@@ -12,13 +12,14 @@ class Tests(unittest.TestCase):
     def test_exact_native_model_session_and_completed_turn_required(self):
         with tempfile.TemporaryDirectory() as root:
             p=Path(root)/'events'
-            events=[{'type':'system','session_id':'actual-session','model':m.probe.MODEL},
+            events=[{'type':'system','subtype':'ui_invalidate','event':'fixture-ui-notification','session_id':'actual-session'},
+                {'type':'system','session_id':'actual-session','model':m.probe.MODEL},
                 {'type':'assistant','message':{'model':m.probe.MODEL,'content':[{'type':'text','text':m.probe.TOKEN}]}},
                 {'type':'result','session_id':'actual-session','subtype':'success','is_error':False,'result':m.probe.TOKEN}]
             def save(rows):p.write_text('\n'.join(json.dumps(v) for v in rows));return p
             self.assertEqual(m.observations(save(events),'actual-session')['observed_model'],m.probe.MODEL)
             with self.assertRaises(ValueError):m.observations(p,'invented-session')
-            for extra in ({'type':'error'}, {'type':'assistant','message':{'model':'lower-quality','content':[]}},
+            for extra in ({'type':'error'}, {'type':'stream_event','event':'malformed'}, {'type':'assistant','message':{'model':'lower-quality','content':[]}},
                     {'type':'assistant','message':{'content':[{'type':'tool_use'}]}},
                     {'type':'stream_event','event':{'type':'content_block_start','content_block':{'type':'tool_use'}}}):
                 with self.assertRaises(ValueError):m.observations(save(events+[extra]))

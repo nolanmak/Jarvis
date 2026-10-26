@@ -57,7 +57,14 @@ def observations(path, expected_session=None):
                     raise ValueError('native session changed during turn')
                 session = current
             message = event.get('message', {})
-            nested = event.get('event', {})
+            if not isinstance(message, dict):
+                raise ValueError('invalid native message object')
+            # UI notifications use an event string; only stream_event carries
+            # the structured Anthropic stream payload. Never mistake UI data
+            # for content or let malformed stream events bypass tool checks.
+            nested = event.get('event', {}) if event.get('type') == 'stream_event' else {}
+            if not isinstance(nested, dict) or not isinstance(nested.get('message', {}), dict) or not isinstance(nested.get('content_block', {}), dict):
+                raise ValueError('invalid native stream event object')
             for observed in (event.get('model'), message.get('model'), nested.get('message', {}).get('model')):
                 if observed is not None:
                     if not isinstance(observed, str):
