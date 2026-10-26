@@ -9,12 +9,17 @@ provider credentials; no required-workflow host transport fallback is allowed.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import stat
 from pathlib import Path
 import subprocess
 import tempfile
+
+
+_spec=importlib.util.spec_from_file_location('probe_routing',Path(__file__).with_name('native-probe-routing.py'))
+routing=importlib.util.module_from_spec(_spec);_spec.loader.exec_module(routing)
 
 
 TESTS = {
@@ -51,6 +56,8 @@ def resource_budget(native_mb, build_mb, available, controller_mb=256):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("probe", choices=TESTS)
+    parser.add_argument("--operator-router-config",type=Path,default=routing.default_path('AUGMENTAGENT_MODEL_ROUTER_CONFIG','model-router.json'))
+    parser.add_argument("--operator-selection-config",type=Path,default=routing.default_path('AUGMENTAGENT_MODEL_SELECTION_CONFIG','model-selection.json'))
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--vm-policy", type=Path, required=True,
                         help="private disposable native VM policy prepared for this probe")
@@ -58,6 +65,7 @@ def main():
     parser.add_argument("--controller-headroom-mb", type=int, default=256,
                         help="preflight controller allowance, minimum256MiB; final RunScope admission remains authoritative")
     args = parser.parse_args()
+    route_evidence,route_environment=routing.snapshot(args.operator_router_config,args.operator_selection_config)
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("binary must be an existing executable managed test artifact")
@@ -98,6 +106,8 @@ def main():
         "CARGO_BUILD_JOBS": "1", "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0", "CARGO_INCREMENTAL": "0", "PATH": os.environ["PATH"],
     }
+    env.update(route_environment)
+    (root/"operator-route.json").write_text(json.dumps(route_evidence,sort_keys=True))
     if args.probe == "issue":
         gh = root / "remote-main-fixture.py"
         gh.write_text('''#!/usr/bin/python3
@@ -130,6 +140,10 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
     print(f"Evidence: {root}", flush=True)
     with (root / "transcript.log").open("w") as log:
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+    route_unchanged=routing.unchanged(route_evidence)
+    (root / "operator-route-final.json").write_text(json.dumps({"unchanged":route_unchanged,"initial_sha256":hashlib.sha256((root/"operator-route.json").read_bytes()).hexdigest()}))
+    if not route_unchanged:
+        raise RuntimeError("operator routing changed during probe; result cannot establish one route")
     (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": digest.hexdigest(), "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": result.returncode, "no_production_mutation": True, "resource_preflight": budget}, indent=2) + "\n")
     print(f"Exit: {result.returncode}; transcript: {root / 'transcript.log'}", flush=True)
     return result.returncode
