@@ -98,3 +98,35 @@ only the distribution Python packages and resolved ELF dependencies, excludes
 site/user customization, and records each file digest. The guest does not mount
 the host `/usr`, `/usr/local`, `/etc` or provider home. Any unlisted file added to
 the staged runtime causes launch refusal.
+
+## Rollout through the normal updater
+
+After the disposable authenticated acceptance probe passes, provision the
+reviewed production profile outside every worker root. Use the same explicit
+provider routes and credential grants proven in that probe. Keep the private
+`state_root` stable across binary updates so observed native session aliases
+continue to resolve. Runtime upgrades require a newly staged manifest and an
+atomic policy update pointing to it; retain the prior runtime until old native
+runs have drained. Do not copy a host home directory into a runtime image.
+
+Configure the existing daemon unit with one environment-only drop-in, preserving
+its `ExecStart` and aggregate resource settings:
+
+```ini
+[Service]
+Environment=AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/private/policy.json
+```
+
+Use the configured `SYSTEMD_UNIT` (not a hardcoded unit name), reload the user
+manager, and let `scripts/check-for-updates.sh` perform its normal deferred,
+verified restart. The updater rebuild predicate includes every embedded VM,
+gateway and MCP helper; no separate installed Python copy can stay stale. The
+provisioning helper itself is read directly from the updated checkout. A missing
+profile keeps required Autoship native calls closed while unrelated interactive
+calls and ordinary updater operation retain their existing behavior.
+
+No installer in this patch writes that drop-in, expands gateway grants or
+refreshes the original authentication file automatically. All profile paths are
+controller inputs. This document describes the reviewed rollout artifact, not
+an assertion that production has been configured or authenticated acceptance
+has passed.
