@@ -254,7 +254,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "Managed CLI no-run succeeded at3c876779. New controller-oracle build is pending managed storage admission; final-head CI and deployment remain unproven.",
+    "latest_rust_admission": "Managed CLI no-run last succeeded at3c876779. Controller-oracle build session27293 terminated with storage-busy refusal; unrelated daemon workspace test process remains live. No final-head build/CI/deployment claim.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -579,6 +579,18 @@
       "passed": false,
       "log": "/tmp/autoship-native-acceptance-ap47kv3f/transcript.log",
       "failure": "Readiness returned not_applicable variant absent from schema; correction and protected raw-response recovery integrated 229862e2. Seven readiness tests pass at3c876779; native rerun pending."
+    },
+    "authority_full_self_improve": {
+      "revision": "3c876779",
+      "passed": 445,
+      "failed": 2,
+      "ignored": 13,
+      "log": "/tmp/autoship-1598-authority-full-self-improve.log",
+      "failures": [
+        "run_once_failure_sites_carry_typed_records: obsolete NoChanges requirement after acceptance-driven repair",
+        "the_locking_recorder_is_the_codebases_only_writer_of_the_map: inventory omitted probe launcher removing inherited override"
+      ],
+      "followup": "f066c941 updates these assertions; rebuild and rerun required."
     }
   },
   "remaining_cross_cutting_acceptance": [
