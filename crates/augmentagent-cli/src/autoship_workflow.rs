@@ -1676,6 +1676,137 @@ mod tests {
     // Exiting bypasses Rust Drop, exercising SQLite crash recovery rather than
     // merely testing transaction RAII rollback.
     #[test]
+    fn episode_process_crash_worker() {
+        let Some(path) = std::env::var_os("AUGMENTAGENT_EPISODE_CRASH_DB") else {
+            return;
+        };
+        let phase = std::env::var("AUGMENTAGENT_EPISODE_CRASH_PHASE").unwrap();
+        let (mut store, lease) = setup(Path::new(&path));
+        let observation = crate::autoship_episode::Observation {
+            receipt: "review-before-crash".into(),
+            epoch: "epoch".into(),
+            candidate: crate::autoship_episode::Candidate {
+                binding: binding(),
+                tests_passed: true,
+                guards_passed: true,
+                verified_criteria: 1,
+                open_findings: ["finding".into()].into_iter().collect(),
+                lines_changed: 1,
+            },
+            review_complete: true,
+            contradictory_requirements: false,
+            infrastructure_failed: false,
+            autonomous_merge_observed: false,
+        };
+        store.observe_episode(&lease, &observation, 30).unwrap();
+        store
+            .admit_episode_action(&lease, "epoch", "rescope", 31)
+            .unwrap();
+        if phase != "prepared" {
+            store
+                .checkpoint_episode_dispatch(&lease, "epoch", "rescope", "scope_dispatch", "{}", 32)
+                .unwrap();
+            store
+                .checkpoint_episode_dispatch(
+                    &lease,
+                    "epoch",
+                    "rescope",
+                    "scope_complete",
+                    r#"{"plan":"durable-plan"}"#,
+                    33,
+                )
+                .unwrap();
+        }
+        if phase == "repair_dispatch" {
+            store
+                .checkpoint_episode_dispatch(
+                    &lease,
+                    "epoch",
+                    "rescope",
+                    "repair_dispatch",
+                    r#"{"plan":"durable-plan"}"#,
+                    34,
+                )
+                .unwrap();
+        }
+        // No destructor or graceful release: the parent must recover exactly
+        // the last committed phase and fence this dead worker after expiry.
+        std::process::exit(73);
+    }
+
+    #[test]
+    fn process_death_preserves_unlaunched_plans_and_uncertain_dispatch() {
+        let test_name = format!(
+            "{}::episode_process_crash_worker",
+            module_path!().split_once("::").unwrap().1
+        );
+        for phase in ["prepared", "scope_complete", "repair_dispatch"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("AUGMENTAGENT_EPISODE_CRASH_DB", &path)
+                .env("AUGMENTAGENT_EPISODE_CRASH_PHASE", phase)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let recovered = store.episode_dispatch("owner/repo#1", "epoch").unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].1, phase);
+            if phase != "prepared" {
+                assert!(recovered[0].2.contains("durable-plan"));
+            }
+            assert!(store
+                .claim("owner/repo#1", "successor", 100, 1000)
+                .unwrap()
+                .is_none());
+            let lease = store
+                .claim("owner/repo#1", "successor", 1021, 1000)
+                .unwrap()
+                .unwrap();
+            if phase == "repair_dispatch" {
+                assert!(store
+                    .checkpoint_episode_dispatch(
+                        &lease,
+                        "epoch",
+                        "rescope",
+                        "repair_dispatch",
+                        "{}",
+                        1022
+                    )
+                    .is_err());
+                store
+                    .checkpoint_episode_dispatch(
+                        &lease,
+                        "epoch",
+                        "rescope",
+                        "reconciled",
+                        r#"{"review_receipt":"verified-after-death"}"#,
+                        1023,
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .checkpoint_episode_dispatch(
+                        &lease,
+                        "epoch",
+                        "rescope",
+                        "repair_dispatch",
+                        &recovered[0].2,
+                        1022,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn crash_worker() {
         let Some(path) = std::env::var_os("AUGMENTAGENT_WORKFLOW_CRASH_TEST_DB") else {
             return;
