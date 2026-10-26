@@ -72,7 +72,7 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `AUGMENTAGENT_PHONE_STT_PROVIDER` | ConversationRelay `transcriptionProvider`: `Deepgram` (default) or `Google`. Exact, case-sensitive; anything else fails configuration. |
 | `AUGMENTAGENT_PHONE_STT_MODEL` | ConversationRelay `speechModel`. Default `nova-3-general` for Deepgram, `telephony` for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
 | `AUGMENTAGENT_PHONE_TTS_PROVIDER` | ConversationRelay `ttsProvider`: `ElevenLabs` (default), `Amazon` or `Google`. Exact, case-sensitive; anything else fails configuration. |
-| `AUGMENTAGENT_PHONE_TTS_VOICE` | ConversationRelay `voice`. Default `UgBBYS2sOqTuMpoF3BR0-flash_v2_5` for ElevenLabs (voice ID with model suffix; a `-<speed>_<stability>_<similarity>` suffix is allowed), `Joanna` for Amazon; required for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
+| `AUGMENTAGENT_PHONE_TTS_VOICE` | ConversationRelay `voice`. Default `r1KmysJdVYZjJCm4mL3b-flash_v2_5` for ElevenLabs (Jessica, feminine; voice ID with model suffix; a `-<speed>_<stability>_<similarity>` suffix is allowed), `Joanna` for Amazon; required for Google. Must match `^[A-Za-z0-9._-]{1,96}$`. |
 | `AUGMENTAGENT_PHONE_DEBUG_EVENTS` | `1` adds `debug="debugging tokens-played speaker-events"` to the ConversationRelay TwiML so #1551 can record when tokens were actually played; `0` disables it. Absent defaults to on for debug (non-production) builds and off for release builds. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_FAST_LAYER` | `1` answers call utterances with the fast conversational layer (#1546); absent or `0` (default) keeps the native agent answering every utterance unchanged. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_FAST_PROVIDER` | Fast model provider when the layer is on: `anthropic` (default, `claude-haiku-5-5`, key `ANTHROPIC_API_KEY`) or `cerebras` (fast-tier Cerebras model, key `CEREBRAS_API_KEY`). Keys load per request from the service keyring, then the service environment. Other values fail configuration. |
@@ -434,7 +434,7 @@ number-verification calls remain separate.
 ConversationRelay TwiML pins the speech providers explicitly instead of relying
 on Twilio account defaults. With no overrides it emits
 `transcriptionProvider="Deepgram" speechModel="nova-3-general"
-ttsProvider="ElevenLabs" voice="UgBBYS2sOqTuMpoF3BR0-flash_v2_5"
+ttsProvider="ElevenLabs" voice="r1KmysJdVYZjJCm4mL3b-flash_v2_5"
 language="en-US" elevenlabsTextNormalization="on"`; the normalization attribute
 is only present for ElevenLabs. The four `AUGMENTAGENT_PHONE_STT_*` /
 `AUGMENTAGENT_PHONE_TTS_*` variables above are read once at startup and
@@ -509,7 +509,9 @@ these tests does not establish those live results.
 With `AUGMENTAGENT_PHONE_FAST_LAYER=1`, each final `prompt` is answered by a
 small streaming model instead of a full native turn. It receives a fixed
 persona prompt, the last 20 phone turns of this call, the last 10 lines of the
-originating chat (bounded) and task updates from this call. Tokens are spoken
+originating chat and task updates from this call. The chat excerpt is cached per
+call (up to 64 entries), with a 200 ms initial fetch budget and an empty excerpt
+on timeout/error. Authority, profile and agenda are rechecked each turn. Tokens are spoken
 at sentence boundaries as they stream. The runtime acknowledgment (#1526)
 becomes a fallback after 1.5 s without speech instead of 250 ms.
 
@@ -518,13 +520,18 @@ The model has exactly three tools, `dispatch_task(description)`,
 every tool; any other tool name, a revoked call or a fourth call in one
 utterance gets a typed refusal and the turn still ends with `last:true`.
 
-- `dispatch_task` returns at once with a `task_id` (`{turn_id}:dispatch`). The
-  work runs as a native surface turn on the originating conversation, with the
-  same session, approvals and phone MCP grant (without call speech) as a text
-  turn. Its result is queued once to the chat outbox under the task key; a
-  replay after restart is refused by the durable turn claim and the outbox
-  key. If the call is still live and idle, a short summary is also spoken as a
-  system turn; after hangup nothing is spoken.
+- `dispatch_task` persists its intent before returning a `task_id`
+  (`{turn_id}:dispatch`). The durable queue admits at most 128 pending tasks.
+  Work runs as a native surface turn on the originating conversation, with the
+  same session, approvals and phone MCP grant (without call speech) as text.
+  A separate five-second recovery worker resumes queued intents after restart,
+  including when the fast layer is disabled. A task marked running has an
+  uncertain outcome after a crash and is reported without replaying tools.
+  Results are persisted before enqueueing to chat under the same task key;
+  delivery failures retry delivery, not execution. A revoked binding cancels
+  recovery without sending its result to a newly bound owner. If the original
+  call is still live and idle, a brief result can also be spoken; recovery
+  never redials or attaches speech to another call.
 - A dispatched turn may report progress (`augmentagent_phone::fast::report_progress`):
   at most one event per 5 s and 6 per task, 140 characters each. The call
   speaks at most one progress line per 15 s. Progress is never posted to chat.
@@ -533,8 +540,20 @@ utterance gets a typed refusal and the turn still ends with `last:true`.
 
 Fast-layer turns are recorded with `provider = fast`; a turn that dispatched
 work records outcome `dispatched`; tool time is added to `tool_ms`. Logs carry
-only fixed category codes (for example `http_4xx`, `scripted_failure`), never
+only fixed category codes (for example `http_4xx`, `truncated_stream`), never
 model text, tool arguments, chat text or keys.
+
+A clean HTTP EOF is successful only after the provider terminal marker
+(`message_stop` for Anthropic, `[DONE]` for Cerebras), with no unfinished frame,
+UTF-8 tail or tool input. Partial tokens can already have been spoken; the turn
+still fails explicitly and incomplete tool calls are never executed.
+
+Before enabling the fast/preemptive flags, check the selected provider's model
+catalog and a synthetic streaming/tool request using the daemon's credentials.
+CLI subscription authentication does not grant the fast HTTP client's API
+access. Leave the flags off on rejected authentication, unavailable models or
+billing failures. GPT-Live 1 is a separate planned audio backend (#1591), not an
+additional value of `AUGMENTAGENT_PHONE_FAST_PROVIDER`.
 
 ### Preemptive generation (#1555)
 

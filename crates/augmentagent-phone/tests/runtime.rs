@@ -332,3 +332,34 @@ async fn ac12_disabled_runtime_cleans_existing_calls_without_ingress_or_dialing(
         "restart must not redial or repeat terminal cleanup"
     );
 }
+
+#[tokio::test]
+async fn runtime_resumes_durable_tasks_without_a_live_relay() {
+    struct RecoveryAgent(tokio::sync::Notify);
+    #[async_trait]
+    impl ConversationAgent for RecoveryAgent {
+        async fn answer(&self, _: &PhoneCall, _: &str, _: &str, _: SpeechSender, _: CancellationToken) -> Result<String, AgentError> {
+            panic!("recovery does not fabricate a voice turn")
+        }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> { Ok(()) }
+        async fn resume_task(&self, _: &PhoneCall, task_id: &str) -> Result<(), AgentError> {
+            assert_eq!(task_id, "persisted-task");
+            self.0.notify_one();
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    store.phone_import_destination("owner", "+12025550123", 0).unwrap();
+    let call = store.phone_reserve_call(augmentagent_store::phone::ReserveCall {
+        owner: "owner", request_id: "earlier-call", conversation: "chat", now_ms: 0,
+    }).unwrap().call;
+    store.phone_enqueue_dispatch(&call.id, "persisted-task", "Synthetic task").unwrap();
+    let service = Arc::new(PhoneService::new(store, Arc::new(Provider::default()), Arc::new(Time(AtomicI64::new(100))),
+        PhoneConfig::new(true, "https://phone.example.test", "runtime-test-verification-secret-32", vec![]).unwrap()));
+    let agent = Arc::new(RecoveryAgent(tokio::sync::Notify::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let runtime = PhoneRuntime::start(service, Arc::new(WebhookAuth::new("AC-test", "token")), agent.clone(), listener).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent.0.notified()).await.expect("startup recovery tick");
+    runtime.shutdown().await.unwrap();
+}

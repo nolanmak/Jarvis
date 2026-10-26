@@ -995,6 +995,19 @@ mod fast {
         assert_eq!(sends(&f.store, &f.origin, "retry-job"), ["Saved result"]);
     }
 
+    #[tokio::test]
+    async fn revoked_binding_cancels_recovered_task_without_executing_or_delivering() {
+        let f = connected().await;
+        f.store.phone_enqueue_dispatch(&f.call.id, "revoked-job", "Synthetic task").unwrap();
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
+        let recovered = bridge(&f, Arc::new(MarkdownAgent), Scripted::new(vec![]));
+        recovered.resume_task(&f.call, "revoked-job").await.unwrap();
+        wait_for(|| f.store.phone_pending_dispatches().unwrap().is_empty()).await;
+        assert!(sends(&f.store, &f.origin, "revoked-job").is_empty());
+        let turn = SurfaceTurnRef::new(f.origin.conversation.clone(), "revoked-job").unwrap();
+        assert!(f.store.claim_surface_turn(&turn).is_ok(), "native turn was never claimed");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn blocked_history_is_bounded_cached_and_does_not_block_speech() {
         struct SlowHistory {
