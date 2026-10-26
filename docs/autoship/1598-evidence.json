@@ -916,6 +916,20 @@
         "/tmp/autoship-1598-resource-recovery-proof.log"
       ],
       "scope": "Fresh core test binary embeds fixed resource helper; actual delegated test refuses recovery while descendant lives, verifies cleanup and rejects foreign-host identity. CLI native acceptance artifact still needs rebuild."
+    },
+    "capability_inventory_665676a8": {
+      "passed": 10,
+      "log": "/tmp/autoship-1598-capability-inventory-final.log",
+      "scope": "Compiled capability inventory including calibration callsite; production permission presets and model pinning."
+    },
+    "platform_inventory_a0affe91": {
+      "passed": 8,
+      "scope": "Missing cli:triage-calibration inventory row now owned, with macOS native acceptance explicitly unverified. Fixes two bridge/installer CI assertions at7420ee15."
+    },
+    "claude_initial_turn_3943f26e": {
+      "status": "initial_turn_revalidated_after_parser_fix;resume_pending",
+      "evidence_directory": "/tmp/autoship-native-codex-auth-dfunmr6x/claude-inference-proof1",
+      "scope": "Actual host-observed authenticated TLS Messages exchange, native Opus4.8 observed, exact reply and completed quiescent export. Original probe failed parsing UI event string; existing evidence revalidated with corrected parser without rerunning inference. Does not yet prove session continuation or full workflow."
     }
   },
   "remaining_cross_cutting_acceptance": [
