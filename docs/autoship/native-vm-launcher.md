@@ -252,3 +252,12 @@ The full native acceptance wrapper explicitly declares matching run and unit
 budgets and checks host capacity before launching. For the 1+4 GiB guest case,
 these are 6 GiB per run and 8 GiB for the isolated unit. The wrapper does not
 change the production service or launch when that host headroom is unavailable.
+
+The acceptance wrapper's preliminary host check uses the run reservation plus
+an explicit controller allowance (`--controller-headroom-mb`, default/minimum
+256 MiB) and a separate 256 MiB host margin. Thus the 6 GiB combined run can
+start its controller at 6.5 GiB available memory while retaining the 8 GiB unit
+ceiling. The allowance is an estimate, not a guaranteed controller memory bound.
+Every real dispatch still passes RunScope's sibling, ancestor and host checks;
+controller growth or other workloads may cause a subsequent capacity refusal.
+The wrapper records these preliminary budgets with its result.

@@ -25,6 +25,29 @@ TESTS = {
 }
 
 
+def resource_budget(native_mb, build_mb, available, controller_mb=256):
+    if (type(native_mb) is not int or not 512<=native_mb<=4096
+            or type(build_mb) is not int or (build_mb!=0 and not 512<=build_mb<=4096)):
+        raise ValueError('invalid declared guest memory')
+    if type(controller_mb) is not int or not 256<=controller_mb<=2048:
+        raise ValueError('controller allowance must be 256 through 2048 MiB')
+    if type(available) is not int or available<0:
+        raise ValueError('invalid host available memory')
+    run=(native_mb+build_mb)*1024**2+1024**3
+    aggregate=run+2*1024**3
+    # Aggregate MemoryMax is a ceiling, not an additional RAM reservation.
+    # This conservative estimate admits starting the test controller only.
+    # RunScope still checks real controller/sibling/ancestor/host usage before
+    # each process dispatch. The allowance is not a controller RSS guarantee.
+    needed=run+(controller_mb+256)*1024**2
+    if aggregate>10*1024**3 or available<needed:
+        raise ValueError('insufficient host headroom for composed isolated probe; wait for capacity')
+    return {'run_memory_bytes':run,'aggregate_ceiling_bytes':aggregate,
+            'controller_allowance_bytes':controller_mb*1024**2,
+            'host_margin_bytes':256*1024**2,'preflight_required_bytes':needed,
+            'observed_available_bytes':available,'final_admission':'RunScope'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("probe", choices=TESTS)
@@ -32,6 +55,8 @@ def main():
     parser.add_argument("--vm-policy", type=Path, required=True,
                         help="private disposable native VM policy prepared for this probe")
     parser.add_argument("--build-vm-config", type=Path, help="explicit build runtime; defaults to native policy runtime")
+    parser.add_argument("--controller-headroom-mb", type=int, default=256,
+                        help="preflight controller allowance, minimum256MiB; final RunScope admission remains authoritative")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -47,15 +72,13 @@ def main():
     if not stat.S_ISREG(build_info.st_mode) or build_info.st_uid!=os.getuid() or build_info.st_mode & 0o077:
         parser.error("build VM configuration must be private")
     build_mb=0 if args.probe=='adjudicator' else json.loads(build_config.read_text())['memory_mb']
-    if type(native_mb) is not int or not 512<=native_mb<=4096 or type(build_mb) is not int or (build_mb and not 512<=build_mb<=4096):
-        parser.error("invalid declared guest memory")
-    # Both QEMUs and the MCP broker share one provider subtree. Reserve the
-    # full guest declarations plus host overhead; do not shrink build memory.
-    run_memory=(native_mb+build_mb)*1024**2+1024**3
-    aggregate_memory=run_memory+2*1024**3
     available=next((int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
-    if aggregate_memory>10*1024**3 or available<aggregate_memory+256*1024**2:
-        parser.error("insufficient host headroom for composed isolated probe; wait for capacity")
+    try:
+        budget=resource_budget(native_mb,build_mb,available,args.controller_headroom_mb)
+    except ValueError as error:
+        parser.error(str(error))
+    run_memory=budget['run_memory_bytes']
+    aggregate_memory=budget['aggregate_ceiling_bytes']
     policy_digest = hashlib.sha256(policy.read_bytes()).hexdigest()
     os.umask(0o077)
     root = Path(tempfile.mkdtemp(prefix="autoship-native-acceptance-", dir="/tmp"))
@@ -107,7 +130,7 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
     print(f"Evidence: {root}", flush=True)
     with (root / "transcript.log").open("w") as log:
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
-    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": digest.hexdigest(), "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": result.returncode, "no_production_mutation": True}, indent=2) + "\n")
+    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": digest.hexdigest(), "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": result.returncode, "no_production_mutation": True, "resource_preflight": budget}, indent=2) + "\n")
     print(f"Exit: {result.returncode}; transcript: {root / 'transcript.log'}", flush=True)
     return result.returncode
 
