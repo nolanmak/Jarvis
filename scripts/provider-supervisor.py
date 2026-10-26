@@ -36,6 +36,7 @@ def supervise(receipt, argv):
     resource_path = Path(receipt).with_name('resource-accounting.json')
     scope = None
     if 'JARVIS_RUN_RESOURCE_POLICY' in os.environ:
+        module = None
         try:
             spec = importlib.util.spec_from_file_location('run_resources', Path(__file__).with_name('run-resource-scope.py'))
             module = importlib.util.module_from_spec(spec)
@@ -43,8 +44,16 @@ def supervise(receipt, argv):
             scope = module.declared_scope()
             resource_path.write_text(json.dumps({'phase':'admitted', **scope.observation()}))
             resource_path.chmod(0o600)
-        except BaseException:
-            resource_path.write_text(json.dumps({'phase':'admission_failed','exhausted':True}))
+        except BaseException as error:
+            category=type(error).__name__
+            if category not in {'RuntimeError','ValueError','TypeError','JSONDecodeError','OSError','FileNotFoundError','PermissionError','BlockingIOError','NotADirectoryError','TimeoutError'}:
+                category='BoundaryFailure'
+            refusal = {'phase':'admission_failed','exhausted':True,'refusal_code':'admission_setup_failed','failure_class':category}
+            if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4095:
+                refusal['errno']=error.errno
+            if module is not None and hasattr(module,'refusal_receipt'):
+                refusal = module.refusal_receipt(error)
+            resource_path.write_text(json.dumps(refusal))
             resource_path.chmod(0o600)
             Path(receipt).write_text('all-descendants-reaped\n')
             Path(receipt).chmod(0o600)

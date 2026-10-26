@@ -16,6 +16,35 @@ import uuid
 CONTROLLERS = {'cpu', 'memory', 'pids'}
 
 
+class AdmissionRefused(RuntimeError):
+    def __init__(self, code, message, **facts):
+        super().__init__(message)
+        self.code = code
+        self.facts = facts
+
+
+def refusal_receipt(error):
+    """Never serialize error strings, filenames, policy bodies or traceback."""
+    receipt={'phase':'admission_failed','exhausted':True,'refusal_code':'admission_setup_failed'}
+    codes={'host_headroom','aggregate_reservations','ancestor_headroom','declared_ceiling','invalid_policy'}
+    fields={'requested_bytes','reserved_bytes','current_bytes','limit_bytes','available_bytes',
+            'reservation_slack_bytes','margin_bytes','required_bytes','requested_pids','limit_pids',
+            'requested_cpu_percent','limit_cpu_quota','limit_cpu_period','memory_bytes','pids',
+            'cpu_percent','minimum','maximum'}
+    if isinstance(error,AdmissionRefused) and error.code in codes:
+        receipt['refusal_code']=error.code
+        receipt['facts']={key:value for key,value in error.facts.items()
+                          if key in fields and type(value) is int and 0<=value<=2**64-1}
+    else:
+        category=type(error).__name__
+        receipt['failure_class']=category if category in {
+            'RuntimeError','ValueError','TypeError','JSONDecodeError','OSError','FileNotFoundError',
+            'PermissionError','BlockingIOError','NotADirectoryError','TimeoutError'} else 'BoundaryFailure'
+        if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4095:
+            receipt['errno']=error.errno
+    return receipt
+
+
 def current_group():
     rows = Path('/proc/self/cgroup').read_text().splitlines()
     paths = [row[3:] for row in rows if row.startswith('0::/')]
@@ -66,16 +95,23 @@ def headroom(parent, requested, host_available):
     # Include kernel charges not visible in child accounting.
     reserved += max(0, aggregate_current - current)
     needed = reserved + requested
-    if needed > finite(parent / 'memory.max'):
-        raise RuntimeError('aggregate memory reservations exhausted')
+    limit=finite(parent / 'memory.max')
+    if needed > limit:
+        raise AdmissionRefused('aggregate_reservations','aggregate memory reservations exhausted',
+                               requested_bytes=requested,reserved_bytes=reserved,current_bytes=aggregate_current,limit_bytes=limit)
     slack = max(0, reserved - aggregate_current)
     if requested + slack + 256 * 1024**2 > host_available:
-        raise RuntimeError('host memory headroom unavailable')
+        raise AdmissionRefused('host_headroom','host memory headroom unavailable',
+                               requested_bytes=requested,reservation_slack_bytes=slack,margin_bytes=256*1024**2,
+                               required_bytes=requested+slack+256*1024**2,available_bytes=host_available)
     ancestor = parent.parent
     while ancestor != Path('/sys/fs/cgroup') and ancestor.is_relative_to('/sys/fs/cgroup'):
         limit = (ancestor / 'memory.max').read_text().strip()
-        if limit != 'max' and requested + slack > int(limit) - int((ancestor / 'memory.current').read_text().strip()):
-            raise RuntimeError('ancestor memory headroom unavailable')
+        if limit != 'max':
+            usage=int((ancestor / 'memory.current').read_text().strip())
+            if requested + slack > int(limit) - usage:
+                raise AdmissionRefused('ancestor_headroom','ancestor memory headroom unavailable',
+                                       requested_bytes=requested,reservation_slack_bytes=slack,current_bytes=usage,limit_bytes=int(limit))
         ancestor = ancestor.parent
     return {'reserved_before_bytes': reserved, 'requested_bytes': requested,
             'host_available_bytes': host_available, 'host_margin_bytes': 256 * 1024**2}
@@ -102,11 +138,11 @@ def reserve(parent, requested):
 class RunScope:
     def __init__(self, policy):
         if set(policy) != {'memory_bytes', 'pids', 'cpu_percent'}:
-            raise RuntimeError('invalid declared run resource policy')
+            raise AdmissionRefused('invalid_policy','invalid declared run resource policy')
         for key, low, high in [('memory_bytes', 64*1024*1024, 64*1024**3),
                                ('pids', 8, 4096), ('cpu_percent', 1, 1600)]:
             if type(policy[key]) is not int or not low <= policy[key] <= high:
-                raise RuntimeError('invalid declared run resource limit')
+                raise AdmissionRefused('invalid_policy','invalid declared run resource limit', **{key:policy[key],'minimum':low,'maximum':high})
         leaf = current_group()
         parent = leaf.parent
         if (leaf.name != 'daemon' or not parent.name.endswith('.service')
@@ -124,7 +160,9 @@ class RunScope:
         quota, period = map(int, cpu)
         if (policy['memory_bytes'] > memory or policy['pids'] > pids
                 or policy['cpu_percent'] * period > quota * 100):
-            raise RuntimeError('run ceiling exceeds aggregate service ceiling')
+            raise AdmissionRefused('declared_ceiling','run ceiling exceeds aggregate service ceiling',
+                                   requested_bytes=policy['memory_bytes'],limit_bytes=memory,requested_pids=policy['pids'],
+                                   limit_pids=pids,requested_cpu_percent=policy['cpu_percent'],limit_cpu_quota=quota,limit_cpu_period=period)
         with reserve(parent, policy['memory_bytes']) as reservation:
             self.path = parent / ('run-' + uuid.uuid4().hex)
             self.path.mkdir(mode=0o700)

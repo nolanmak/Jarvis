@@ -156,6 +156,45 @@ subprocess.Popen(['/bin/sleep','10'],start_new_session=True,stdout=subprocess.DE
             resources.RunScope({'memory_bytes':1024**3,'pids':8,'cpu_percent':20})
 
 
+class AdmissionDiagnosticTests(unittest.TestCase):
+    def test_receipt_uses_only_fixed_codes_and_bounded_numeric_fields(self):
+        error=resources.AdmissionRefused('host_headroom','secret payload /private/path',
+            requested_bytes=6*1024**3,available_bytes=5*1024**3,margin_bytes=256*1024**2,
+            secret='credential',limit_bytes=-1,current_bytes=True,required_bytes=2**65)
+        receipt=resources.refusal_receipt(error)
+        self.assertEqual(receipt['refusal_code'],'host_headroom')
+        self.assertEqual(receipt['facts'],{'requested_bytes':6*1024**3,'available_bytes':5*1024**3,'margin_bytes':256*1024**2})
+        self.assertNotIn('private',json.dumps(receipt));self.assertNotIn('credential',json.dumps(receipt))
+        for error in [ValueError('private payload'),OSError(13,'secret detail','/private/credential'),
+                      resources.AdmissionRefused('secret-code','secret payload')]:
+            receipt=resources.refusal_receipt(error)
+            self.assertEqual(receipt['refusal_code'],'admission_setup_failed')
+            self.assertNotIn('secret',json.dumps(receipt));self.assertNotIn('private',json.dumps(receipt))
+        self.assertEqual(resources.refusal_receipt(PermissionError(13,'secret'))['errno'],13)
+
+    def test_real_supervisor_refuses_before_dispatch_and_retains_safe_reason(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);receipt=root/'cleanup-complete';effect=root/'must-not-exist'
+            for name in ['provider-supervisor.py','run-resource-scope.py']:
+                shutil.copyfile(Path(__file__).parents[1]/name,root/name)
+            # Validation precedes cgroup access, so this runs without delegation.
+            env={'PATH':'/usr/bin:/bin','JARVIS_SUPERVISOR_ADMISSION':'1',
+                 'JARVIS_RUN_RESOURCE_POLICY':json.dumps({'memory_bytes':1,'pids':8,'cpu_percent':20})}
+            completed=subprocess.run(['/usr/bin/python3','-I',str(root/'provider-supervisor.py'),str(receipt),
+                '/usr/bin/python3','-I','-c',f'from pathlib import Path;Path({str(effect)!r}).write_text("started")'],
+                env=env,capture_output=True,timeout=5)
+            self.assertNotEqual(completed.returncode,0)
+            self.assertFalse(effect.exists(),'no subprocess/model may dispatch on refusal')
+            self.assertFalse((root/'launch-ready').exists())
+            self.assertEqual(receipt.read_text(),'all-descendants-reaped\n')
+            refusal=json.loads((root/'resource-accounting.json').read_text())
+            self.assertEqual(refusal['phase'],'admission_failed');self.assertTrue(refusal['exhausted'])
+            self.assertEqual(refusal['refusal_code'],'invalid_policy')
+            self.assertEqual(refusal['facts']['memory_bytes'],1)
+            self.assertEqual(refusal['facts']['minimum'],64*1024**2)
+            self.assertEqual((root/'resource-accounting.json').stat().st_mode&0o777,0o600)
+
 class CompositionHeadroomTests(unittest.TestCase):
     def test_first_admission_enables_child_accounting_before_reading_headroom(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,8 +241,12 @@ class CompositionHeadroomTests(unittest.TestCase):
         gib=1024**3
         with tempfile.TemporaryDirectory() as tmp:
             parent=self.fixture(Path(tmp),10*gib,gib)
-            with self.assertRaisesRegex(RuntimeError,'host memory'):
+            with self.assertRaisesRegex(RuntimeError,'host memory') as caught:
                 resources.headroom(parent,6*gib,5*gib)
+            refusal=resources.refusal_receipt(caught.exception)
+            self.assertEqual(refusal['refusal_code'],'host_headroom')
+            self.assertEqual(refusal['facts']['available_bytes'],5*gib)
+            self.assertEqual(refusal['facts']['required_bytes'],6*gib+256*1024**2)
 
     def test_reservation_tracks_cleanup_not_idle_rss(self):
         gib=1024**3

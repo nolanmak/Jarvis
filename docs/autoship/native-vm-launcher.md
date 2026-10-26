@@ -292,3 +292,11 @@ never reports the run admitted by preflight. Required RunScope admission still
 occurs before native VM launch, and model billing occurs only after verified
 VM readiness. Insufficient actual memory therefore refuses the run without a
 model call. This option changes no production resource policy or process.
+
+Resource admission failures retain fixed diagnostic codes in the protected
+`run_resource_observation` receipt: `host_headroom`, `aggregate_reservations`,
+`ancestor_headroom`, `declared_ceiling`, or `invalid_policy`. Numeric facts show
+requested/reserved/current/available bytes and applicable limits/margins.
+Unclassified setup exceptions retain only an allowlisted class and numeric
+errno. No exception message, raw stderr, filename, credential or policy payload
+is copied. These diagnostics do not change refusal, billing or retry semantics.
