@@ -70,7 +70,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1363",
       "implementation_status": "partial",
       "evidence": [
-        "Durable workflow checkpoints wired in fresh/resume; preserved committed/dirty/untracked work regression passed; sweep concurrency integration under test"
+        "Durable fresh/resume checkpoints, fenced runtime owner registration, terminal/recovery retirement outbox and original-owner resume checks are integrated. Independent delta review passed at 512a8836. Final combined Rust regressions and native crash recovery remain required."
       ],
       "remaining_acceptance": [
         "Validate latest combined controller checkpoints, exact operation receipts and bounded context under full integrated failure injection."
@@ -161,7 +161,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1151",
       "implementation_status": "partial",
       "evidence": [
-        "Complete evidence packing and bounded missing-file recovery passed full native clean/seeded probe on 3383566e. Overflowing caller evidence is now typed distinctly; streaming recovery is in development."
+        "Earlier native complete/seeded review passed at 3383566e. Immutable source windows, pinned controller oracle delivery, typed evidence-budget results and iterative NeedEvidence recovery are now implemented. Final native end-to-end validation remains pending."
       ],
       "remaining_acceptance": [
         "Validate final streamed evidence, exact source windows, controller oracle delivery and automatic NeedEvidence recovery end to end.",
@@ -829,7 +829,12 @@
     {
       "severity": "P1",
       "gap": "Caller evidence exceeding collection bounds is misclassified as reviewer capacity and can repeat unchanged work",
-      "status": "typed_evidence_budget_integrated_04479fb2; executable_streaming_recovery_in_progress"
+      "status": "typed_evidence_budget_and_immutable_streamed_NeedEvidence_recovery_integrated; final_native_validation_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Authenticated probe stdout alone cannot establish successful provider exchange; partial tool events could escape acceptance checks",
+      "status": "independent_review_found; host_observed_redacted_exchange_receipt_and_partial_tool_rejection_in_progress"
     }
   ],
   "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
