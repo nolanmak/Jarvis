@@ -611,6 +611,9 @@ if __name__ == '__main__':
         category = type(error).__name__
         if category not in {'JSONDecodeError','ValueError','RuntimeError','TimeoutError','OSError','BrokenPipeError','FileNotFoundError','PermissionError','ChildProcessError','CalledProcessError'}:
             category = 'BoundaryFailure'
-        print(json.dumps({'native_vm_failure': category}), file=sys.stderr)
+        diagnostic = {'native_vm_failure': category}
+        if isinstance(error, OSError) and isinstance(error.errno, int):
+            diagnostic['errno'] = error.errno
+        print(json.dumps(diagnostic), file=sys.stderr)
         print('Native VM boundary unavailable; launch terminated without host fallback.', file=sys.stderr)
         raise SystemExit(126)

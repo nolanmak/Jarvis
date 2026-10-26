@@ -384,6 +384,7 @@ mod tests {
     #[test]
     fn resume_checks_original_owner_under_state_lock_even_after_later_healthy_claim() {
         let temp=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path=session(temp.path(),"session-resume","/audit/shared",true);
         let old=RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1};
         let later=RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2};
