@@ -73,6 +73,7 @@ impl Outcome {
                 matches!(
                     *value,
                     "Unavailable"
+                        | "SetupError"
                         | "OSError"
                         | "ValueError"
                         | "KeyError"
@@ -89,7 +90,7 @@ impl Outcome {
             })
             .unwrap_or("unknown");
         serde_json::json!({"stage":stage,"category":category,
-            "errno":self.errno.filter(|value| (1..=4095).contains(value))})
+            "errno":self.errno.filter(|value| (0..=4096).contains(value))})
     }
     fn validate(&self, binding: &Binding, operation: &str) -> Result<()> {
         ensure!(
