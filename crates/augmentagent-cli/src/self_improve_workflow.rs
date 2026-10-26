@@ -1029,6 +1029,16 @@ impl WorkflowGuard {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .save_publication(&self.lease,&self.binding,&self.repository,body,millis())
     }
+    pub(super) fn publication_dispatch(&self,operation:&Operation)->Result<Option<(i64,i64,Option<u64>)>> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.publication_dispatch(&operation.id)
+    }
+    pub(super) fn reserve_publication_dispatch(&self,operation:&Operation)->Result<i64> {
+        self.validate_before_side_effect()?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.reserve_publication_dispatch(&self.lease,operation,millis())
+    }
+    pub(super) fn record_publication_identity(&self,operation:&Operation,pr:u64)->Result<()> {
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.record_publication_identity(&self.lease,operation,pr,millis())
+    }
     pub(super) fn forget_publication(&self)->Result<()> {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?.forget_publication(&self.lease,millis())
     }

@@ -229,6 +229,8 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS publication_dispatch(operation TEXT PRIMARY KEY REFERENCES operation(id),attempt INTEGER NOT NULL,dispatched_at INTEGER NOT NULL,pr INTEGER);
+            CREATE TABLE IF NOT EXISTS publication_scan_cursor(repository TEXT PRIMARY KEY,last_workflow TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS pending_publication(workflow TEXT PRIMARY KEY REFERENCES workflow(id),repository TEXT NOT NULL,body TEXT NOT NULL,updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS observation_reservation(workflow TEXT NOT NULL,generation INTEGER NOT NULL,reserved INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS observation_charge (
@@ -1347,10 +1349,51 @@ impl WorkflowStore {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;require_lease(&tx,lease,now)?;
         tx.execute("DELETE FROM pending_publication WHERE workflow=?1",[&lease.workflow])?;tx.commit()?;Ok(())
     }
-    pub fn pending_publications(&self,repository:&str)->Result<Vec<(String,String)>> {
-        let mut stmt=self.conn.prepare("SELECT workflow,body FROM pending_publication WHERE repository=?1 ORDER BY updated_at,workflow LIMIT 16")?;
-        let rows=stmt.query_map([repository],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        let values=rows.collect::<rusqlite::Result<_>>()?;Ok(values)
+    /// Advance the scan cursor before external I/O, including unavailable rows.
+    pub fn pending_publications(&mut self,repository:&str)->Result<Vec<(String,String)>> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cursor:String=tx.query_row("SELECT last_workflow FROM publication_scan_cursor WHERE repository=?1",[repository],|r|r.get(0)).optional()?.unwrap_or_default();
+        let values:Vec<(String,String)>={
+            let mut stmt=tx.prepare("SELECT workflow,body FROM pending_publication WHERE repository=?1 ORDER BY CASE WHEN workflow>?2 THEN 0 ELSE 1 END,workflow LIMIT 16")?;
+            let rows=stmt.query_map(params![repository,cursor],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if let Some((last,_))=values.last() {
+            tx.execute("INSERT INTO publication_scan_cursor VALUES(?1,?2) ON CONFLICT(repository) DO UPDATE SET last_workflow=excluded.last_workflow",params![repository,last])?;
+        }
+        tx.commit()?;Ok(values)
+    }
+    pub fn publication_dispatch(&self,operation:&str)->Result<Option<(i64,i64,Option<u64>)>> {
+        Ok(self.conn.query_row("SELECT attempt,dispatched_at,pr FROM publication_dispatch WHERE operation=?1",[operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?)
+    }
+    pub fn reserve_publication_dispatch(&mut self,lease:&Lease,operation:&Operation,now:i64)->Result<i64> {
+        ensure!(operation.kind==OperationKind::CreatePr,"not a publication operation");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,&operation.binding,now)?;
+        let owner:String=tx.query_row("SELECT workflow FROM operation WHERE id=?1 AND receipt IS NULL",[&operation.id],|r|r.get(0))?;
+        ensure!(owner==lease.workflow,"publication operation ownership mismatch");
+        let prior:Option<(i64,i64,Option<u64>)>=tx.query_row("SELECT attempt,dispatched_at,pr FROM publication_dispatch WHERE operation=?1",[&operation.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let attempt=if let Some((count,at,pr))=prior {
+            ensure!(pr.is_none(),"known publication identity forbids new creation");
+            let delay=60_000_i64.saturating_mul(1_i64 << count.saturating_sub(1).clamp(0,6)).min(3_600_000);
+            ensure!(now>=at.saturating_add(delay),"publication visibility backoff remains active");
+            count+1
+        } else {1};
+        tx.execute("INSERT INTO publication_dispatch VALUES(?1,?2,?3,NULL) ON CONFLICT(operation) DO UPDATE SET attempt=excluded.attempt,dispatched_at=excluded.dispatched_at",params![operation.id,attempt,now])?;
+        event(&tx,&lease.workflow,lease.generation,"publication_dispatch_reserved",&serde_json::json!({"operation":operation.id,"attempt":attempt}).to_string(),now)?;
+        tx.commit()?;Ok(attempt)
+    }
+    pub fn record_publication_identity(&mut self,lease:&Lease,operation:&Operation,pr:u64,now:i64)->Result<()> {
+        ensure!(pr>0,"invalid publication identity");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,&operation.binding,now)?;
+        let owner:String=tx.query_row("SELECT workflow FROM operation WHERE id=?1",[&operation.id],|r|r.get(0))?;
+        ensure!(owner==lease.workflow,"publication identity ownership mismatch");
+        let prior:Option<u64>=tx.query_row("SELECT pr FROM publication_dispatch WHERE operation=?1",[&operation.id],|r|r.get(0))?;
+        ensure!(prior.is_none_or(|value|value==pr),"publication identity changed");
+        tx.execute("UPDATE publication_dispatch SET pr=?2 WHERE operation=?1",params![operation.id,pr])?;
+        event(&tx,&lease.workflow,lease.generation,"publication_direct_identity",&serde_json::json!({"operation":operation.id,"pr":pr}).to_string(),now)?;
+        tx.commit()?;Ok(())
     }
     pub fn has_any_pending_publications(&self)->Result<bool> {
         let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_publication')",[],|r|r.get(0))?;
@@ -1480,6 +1523,44 @@ mod tests {
             .unwrap();
         (store, lease)
     }
+    #[test]
+    fn unavailable_publication_frontier_cannot_starve_later_workflows() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        for number in 0..33 {
+            let id=format!("publication-{number:02}");
+            store.register(&id,"branch",binding(),1).unwrap();
+            let lease=store.claim(&id,"fixture",2,1000).unwrap().unwrap();
+            store.save_publication(&lease,&binding(),"owner/repo","missing retained worktree",3).unwrap();
+        }
+        let first=store.pending_publications("owner/repo").unwrap();assert_eq!(first.len(),16);
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let second=store.pending_publications("owner/repo").unwrap();
+        assert!(second.iter().all(|row|!first.contains(row)),"failed acquisition must still rotate scan");
+        let third=store.pending_publications("owner/repo").unwrap();
+        assert!(third.iter().any(|(id,_)|id=="publication-32"));
+    }
+    #[test]
+    fn publication_dispatch_reservation_recovers_interruption_without_model_charge() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let (mut store,lease)=setup(&path);
+        let op=store.begin_operation(&lease,OperationKind::CreatePr,&binding(),30).unwrap();
+        assert_eq!(store.reserve_publication_dispatch(&lease,&op,31).unwrap(),1);
+        assert!(store.reserve_publication_dispatch(&lease,&op,32).is_err());
+        drop(store);let mut store=WorkflowStore::open(&path).unwrap();
+        let next=store.claim(&lease.workflow,"recovery",60_032,1_000_000).unwrap().unwrap();
+        // Crash before actual dispatch leaves the same uncertain state as lost
+        // response. After visibility reconciliation, same-identity retry is
+        // admitted with backoff; GitHub's open head/base uniqueness is required.
+        assert_eq!(store.reserve_publication_dispatch(&next,&op,60_033).unwrap(),2);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+        store.record_publication_identity(&next,&op,42,60_034).unwrap();
+        assert!(store.reserve_publication_dispatch(&next,&op,600_000).is_err());
+        assert!(store.record_publication_identity(&next,&op,43,60_035).is_err());
+        assert_eq!(store.publication_dispatch(&op.id).unwrap().unwrap().2,Some(42));
+    }
+
     #[test]
     fn publication_request_survives_reopen_is_fenced_and_does_not_rebill_models() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");

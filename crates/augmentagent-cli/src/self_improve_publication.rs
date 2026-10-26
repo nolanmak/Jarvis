@@ -115,24 +115,31 @@ struct PendingPublication {
 pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
     if dry_run { return Ok(()); }
     let repository=workflow::canonical_repository(repo).await?;
-    let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+    let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
     for (id,raw) in store.pending_publications(&repository)? {
+        if let Err(error)=reconcile_one(repo,&repository,&store,&id,&raw).await {
+            warn!(workflow=%id,"pending publication reconciliation deferred: {error:#}");
+        }
+    }
+    Ok(())
+}
+async fn reconcile_one(repo:&Path,repository:&str,store:&crate::autoship_workflow::WorkflowStore,id:&str,raw:&str)->Result<()> {
         let request:PendingPublication=serde_json::from_str(&raw)?;
         anyhow::ensure!(request.repository==repository && id==crate::autoship_workflow::workflow_id(&repository,request.issue)?,"publication identity mismatch");
-        let Some(snapshot)=store.snapshot(&id)? else {continue};
+        let Some(snapshot)=store.snapshot(&id)? else {return Ok(())};
         let now=chrono::Utc::now().timestamp_millis();
-        if snapshot.lease_until_ms>now || snapshot.checkpoint.next.eligible_at_ms>now {continue;}
+        if snapshot.lease_until_ms>now || snapshot.checkpoint.next.eligible_at_ms>now {return Ok(());}
         let acquired=workflow::WorkflowGuard::acquire(workflow::Start {
             repo_root:repo,worktree:&request.worktree,repository:&repository,source_issue:Some(request.issue),pr:snapshot.pr,
             branch:&request.branch,contract:&request.contract,environment:&request.environment,
         }).await;
-        let mut guard=match acquired {Ok(Some(guard))=>guard,Ok(None)=>continue,Err(error)=>{
-            warn!(workflow=%id,"pending publication lease/evidence unavailable: {error:#}");continue;
+        let mut guard=match acquired {Ok(Some(guard))=>guard,Ok(None)=>return Ok(()),Err(error)=>{
+            warn!(workflow=%id,"pending publication lease/evidence unavailable: {error:#}");return Ok(());
         }};
         if guard.binding().head != request.head {
             guard.forget_publication()?;
             guard.transition(crate::autoship_workflow::Stage::Reconcile,"pending_publication_candidate_changed","reverify_candidate",now).await?;
-            guard.finish()?;continue;
+            guard.finish()?;return Ok(());
         }
         let result=publish(&guard,&request.worktree,&request.branch,&request.head,request.issue,
             &request.args.iter().map(String::as_str).collect::<Vec<_>>()).await;
@@ -149,7 +156,6 @@ pub(super) async fn reconcile_pending(repo:&Path,dry_run:bool)->Result<()> {
             }
         }
         guard.finish()?;
-    }
     Ok(())
 }
 pub(super) async fn pending_issue(repo:&Path,issue:u64)->Result<bool> {
@@ -157,6 +163,33 @@ pub(super) async fn pending_issue(repo:&Path,issue:u64)->Result<bool> {
     if !store.has_any_pending_publications()? {return Ok(false);}
     let repository=workflow::canonical_repository(repo).await?;
     store.has_pending_publication(&crate::autoship_workflow::workflow_id(&repository,issue)?)
+}
+
+fn response_pr(repository:&str,response:&str)->Option<u64> {
+    response.trim().strip_prefix(&format!("https://github.com/{repository}/pull/"))?
+        .parse::<u64>().ok().filter(|number|*number>0)
+}
+async fn direct_publication(github:&mut impl Github,number:u64,branch:&str,head:&str)->Result<Published> {
+    let row:serde_json::Value=serde_json::from_str(&github.call(&["pr","view",&number.to_string(),
+        "--json","number,url,state,headRefName,headRefOid,baseRefName,isCrossRepository"]).await?)?;
+    anyhow::ensure!(row["number"].as_u64()==Some(number) && row["headRefName"]==branch
+        && row["headRefOid"]==head && row["baseRefName"]=="main" && row["isCrossRepository"]==false,
+        "known publication identity changed; reconcile without creating another PR");
+    // A closed known PR remains the one workflow publication. Source lifecycle
+    // owns retirement; visibility or closure never licenses a replacement.
+    anyhow::ensure!(["OPEN","CLOSED","MERGED"].iter().any(|state|row["state"]==*state),"unknown publication state");
+    Ok(Published {number,url:row["url"].as_str().context("missing publication URL")?.into()})
+}
+async fn creation_facts(github:&mut impl Github,repository:&str,issue:u64,branch:&str,head:&str,args:&[&str])->Result<()> {
+    anyhow::ensure!(args.starts_with(&["pr","create"])
+        && args.windows(2).filter(|pair|pair[0]=="--head").map(|pair|pair[1]).collect::<Vec<_>>()==vec![branch]
+        && args.windows(2).filter(|pair|pair[0]=="--base").map(|pair|pair[1]).collect::<Vec<_>>()==vec!["main"]
+        && !args.iter().any(|arg|matches!(*arg,"--repo"|"-R")),"publication must retain the exact head/base identity");
+    let source:serde_json::Value=serde_json::from_str(&github.call(&["issue","view",&issue.to_string(),"--json","state"]).await?)?;
+    anyhow::ensure!(source["state"]=="OPEN","source issue is closed; reconcile existing publication only");
+    let remote:serde_json::Value=serde_json::from_str(&github.call(&["api",&format!("repos/{repository}/git/ref/heads/{branch}")]).await?)?;
+    anyhow::ensure!(remote["object"]["sha"]==head,"remote publication branch changed; reverify before creating");
+    Ok(())
 }
 
 pub(super) async fn publish(
@@ -184,7 +217,39 @@ pub(super) async fn publish(
             .await?
             .context("published workflow needs PR reconciliation; refusing duplicate creation")?
     } else {
-        create_or_reconcile(&mut Transport(worktree, guard), branch, head, args).await?
+        let mut github=Transport(worktree,guard);
+        if let Some(number)=guard.publication_dispatch(&operation)?.and_then(|(_,_,number)|number) {
+            direct_publication(&mut github,number,branch,head).await?
+        } else if let Some(found)=find(&mut github,branch,head).await? {
+            found
+        } else {
+            creation_facts(&mut github,repository,issue,branch,head,args).await?;
+            // GitHub rejects a second OPEN PR for the same repository/head/base.
+            // Full open/closed/merged history above guards already-known terminal
+            // publications. Retry the identical identity after bounded backoff;
+            // do not claim clientMutationId supplies server idempotency.
+            guard.reserve_publication_dispatch(&operation)?;
+            let response=github.call(args).await;
+            if let Ok(raw)=&response {
+                if let Some(number)=response_pr(repository,raw) {
+                    guard.record_publication_identity(&operation,number)?;
+                    let found=direct_publication(&mut github,number,branch,head).await?;
+                    guard.observe_remote(&operation,&format!("github-pr:{}",found.number),Some(found.number))?;
+                    guard.forget_publication()?;
+                    return Ok(found);
+                }
+            }
+            let mut found=None;
+            for attempt in 0..3 {
+                if let Ok(Some(value))=find(&mut github,branch,head).await {found=Some(value);break;}
+                if attempt<2 {tokio::time::sleep(std::time::Duration::from_millis(100*(attempt+1))).await;}
+            }
+            match found {
+                Some(found)=>found,
+                None=>return Err(response.err().unwrap_or_else(||anyhow::anyhow!("publication response not yet visible"))
+                    .context("publication intent retained; free same-identity reconciliation will retry")),
+            }
+        }
     };
     guard.observe_remote(
         &operation,
@@ -593,27 +658,39 @@ mod tests {
         const CHILD:&str="AUTOSHIP_PENDING_PUBLICATION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
             use std::os::unix::fs::PermissionsExt;
+            for response_mode in ["known","lost"] {
             let root=tempfile::Builder::new().prefix("autoship-publication-fixture-").tempdir_in("/tmp").unwrap();let gh=root.path().join("gh.py");
             std::fs::write(&gh,r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_PENDING_PUBLICATION_FIXTURE']);a=sys.argv[1:]
 if a[:2]==['repo','view']: print('owner/repo')
+elif a[:2]==['issue','view']: print(json.dumps({'state':'OPEN'}))
+elif a[:1]==['api']: print(json.dumps({'object':{'sha':(root/'head').read_text()}}))
+elif a[:2]==['pr','view']:
+    if not (root/'visible').exists():sys.exit(1)
+    print(json.dumps(dict(number=12,url='https://github.com/owner/repo/pull/12',headRefOid=(root/'head').read_text(),headRefName='agent-fix/issue-1',baseRefName='main',isCrossRepository=False,state='OPEN')))
 elif a[:2]==['pr','create']:
+    with (root/'attempts').open('a') as f:f.write('attempt\n')
+    if (root/'creates').exists():
+        print('A pull request already exists for this head/base',file=sys.stderr);sys.exit(1)
     with (root/'creates').open('a') as f:f.write('create\n')
+    if os.environ.get('AUTOSHIP_PENDING_PUBLICATION_RESPONSE')=='lost':sys.exit(1)
     print('https://github.com/owner/repo/pull/12')
 elif a[:2]==['pr','list']:
     if not (root/'creates').exists(): print('[]')
-    elif not (root/'visible').exists():sys.exit(1)
+    elif not (root/'visible').exists():print('[]')
     else: print(json.dumps([dict(number=12,url='https://github.com/owner/repo/pull/12',headRefOid=(root/'head').read_text(),headRefName='agent-fix/issue-1',isCrossRepository=False,state='OPEN')]))
 else:sys.exit(2)
 "#).unwrap();
             std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
             let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","self_improve::publication::tests::pending_publication_reopens_without_another_build_or_create","--nocapture"])
-                .env(CHILD,root.path()).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
+                .env(CHILD,root.path()).env("AUTOSHIP_PENDING_PUBLICATION_RESPONSE",response_mode).env("GH_BIN",gh).env("XDG_STATE_HOME",root.path().join("state"))
                 .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("state/workflow.db"))
                 .output().unwrap();
             assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
-            assert!(root.path().join("executed").exists());return;
+            assert!(root.path().join("executed").exists());
+            }
+            return;
         }
         let root=PathBuf::from(std::env::var_os(CHILD).unwrap());let repo=root.join("repo");std::fs::create_dir(&repo).unwrap();
         for args in [vec!["init","-q"],vec!["config","user.name","Fixture"],vec!["config","user.email","fixture@example.invalid"]] {
@@ -627,10 +704,28 @@ else:sys.exit(2)
         std::fs::write(root.join("head"),&head).unwrap();
         let mut guard=workflow::WorkflowGuard::acquire(workflow::Start {repo_root:&repo,worktree:&repo,repository:"owner/repo",source_issue:Some(1),pr:None,branch:"agent-fix/issue-1",contract:"contract",environment:"fixture"}).await.unwrap().unwrap();
         guard.audit_logger().model_call_admitted("codex").unwrap(); // Simulated already-paid builder admission.
-        assert!(publish(&guard,&repo,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1"]).await.is_err());
+        assert!(publish(&guard,&repo,"agent-fix/issue-1",&head,1,&["pr","create","--head","agent-fix/issue-1","--base","main"]).await.is_err());
         guard.transition(crate::autoship_workflow::Stage::Publish,"remote_publication_unconfirmed","await_publication_reconcile",0).await.unwrap();
         let id=guard.id().to_owned();guard.finish().unwrap();
         assert!(pending_issue(&repo,1).await.unwrap());
+        // A successful create response supplied direct identity, even while
+        // both direct lookup and list visibility remain unavailable. Retrying
+        // free reconciliation must not dispatch another create.
+        reconcile_pending(&repo,false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap().lines().count(),1);
+        // Reconciliation set a visibility backoff; expire only fixture time.
+        rusqlite::Connection::open(workflow::path()).unwrap().execute(
+            "UPDATE workflow SET checkpoint=json_set(checkpoint,'$.next.eligible_at_ms',0)",[]).unwrap();
+        rusqlite::Connection::open(workflow::path()).unwrap().execute(
+            "UPDATE publication_dispatch SET dispatched_at=dispatched_at-60001",[]).unwrap();
+        reconcile_pending(&repo,false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("creates")).unwrap().lines().count(),1,
+            "same-head/base server constraint prevents duplicate remote publication");
+        let lost=std::env::var("AUTOSHIP_PENDING_PUBLICATION_RESPONSE").unwrap()=="lost";
+        assert_eq!(std::fs::read_to_string(root.join("attempts")).unwrap().lines().count(),if lost {2} else {1},
+            "unknown empty visibility permits bounded same-identity HTTP retry; known identity never does");
+        rusqlite::Connection::open(workflow::path()).unwrap().execute(
+            "UPDATE workflow SET checkpoint=json_set(checkpoint,'$.next.eligible_at_ms',0)",[]).unwrap();
         std::fs::write(root.join("visible"),"yes").unwrap();
         reconcile_pending(&repo,false).await.unwrap();
         let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
