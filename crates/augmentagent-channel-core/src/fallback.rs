@@ -556,7 +556,8 @@ impl FallbackReasoner {
         transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
-        let logger = self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone();
+        let logger = self.workflow_audit.lock().map_err(|_| anyhow::anyhow!("workflow audit binding lock poisoned"))?.clone()
+            .or_else(|| opts.audit_logger.clone());
         let mut effective_opts = opts.clone();
         if let Some(logger) = &logger {
             logger.drain_checked().await?;
