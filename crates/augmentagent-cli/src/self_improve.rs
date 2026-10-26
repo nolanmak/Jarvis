@@ -6662,8 +6662,13 @@ async fn resume_draft_pr(
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
     let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
+<<<<<<< HEAD
     let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
         issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria).await {
+=======
+    let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
+        issue.number, resume_base.trim(), &acceptance_scope, reasoner, &acceptance::worker_roots(&worktree), &resumed_criteria).await {
+>>>>>>> 43d4a392 (fix(autoship): independently amend failed verifier contracts with immutable rebaselines)
         Ok(prepared) => prepared,
         Err(error) => {
             workflow.transition(Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
@@ -7107,7 +7112,7 @@ async fn resume_draft_pr(
         }
 
         let acceptance_receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
-            &prepared_acceptance, &acceptance_control, &mut workflow).await?;
+            &mut prepared_acceptance, &acceptance_control, &mut workflow).await?;
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
         workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
@@ -8133,8 +8138,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 
     let acceptance_control = acceptance::control_directory(&repository)?;
     let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
+<<<<<<< HEAD
     let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
         issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria).await {
+=======
+    let mut prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
+        issue.number, candidate_base, acceptance_scope, &reasoner, &acceptance::worker_roots(&worktree), &criteria).await {
+>>>>>>> 43d4a392 (fix(autoship): independently amend failed verifier contracts with immutable rebaselines)
         Ok(prepared) => prepared,
         Err(error) => {
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
@@ -8565,7 +8575,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
 
         acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
-            &prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+            &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
 
         // Stage 3 (#653): QA review of the diff by the stronger tier. Since
         // #1488 a reject is not terminal: its notes drive revision rounds,
@@ -8827,7 +8837,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     lines = lines2;
                     summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
                     acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
-                        &prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+                        &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
                     // #1488 AC2 — QA re-reviews every revised diff, with its
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();

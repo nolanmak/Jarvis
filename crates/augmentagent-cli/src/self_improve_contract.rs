@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 
+#[path = "self_improve_amendment.rs"]
+mod amendment;
+
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
 const DEPENDENCY_AUDIT: &str = include_str!("../../../scripts/autoship-registry-integrity.py");
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
@@ -272,7 +275,10 @@ pub(super) async fn register_and_reproduce(
             registration,
             receipts,
         }),
-        result => bail!("baseline not independently reproduced: {result:?}"),
+        result => bail!(
+            "baseline not independently reproduced: {result:?}: {}",
+            serde_json::to_string(&receipts)?
+        ),
     }
 }
 /// Persist only under controller-owned state outside every admitted worker
@@ -778,6 +784,7 @@ pub(super) async fn prepare_acceptance_for(
             "acceptance store is writable by worker"
         );
     }
+    amendment::resume_pending(candidate, &control, source).await?;
     let manifest = original_manifest(&control, source)?;
     let original_base = manifest
         .as_ref()
@@ -785,7 +792,25 @@ pub(super) async fn prepare_acceptance_for(
         .unwrap_or(base)
         .to_owned();
     let base = original_base.as_str();
-    let path = evidence_path(&control, source, base)?;
+    let path = match manifest
+        .as_ref()
+        .and_then(|manifest| manifest.evidence_file.as_ref())
+    {
+        Some(name) => {
+            let manifest = manifest.as_ref().unwrap();
+            ensure!(
+                name == &format!(
+                    "{}-revision-{}-{}.json",
+                    source.key(),
+                    manifest.contract_revision,
+                    manifest.contract_hash
+                ),
+                "invalid amended evidence filename"
+            );
+            control.join(name)
+        }
+        None => evidence_path(&control, source, base)?,
+    };
     let prepared = if path.exists() {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -866,7 +891,10 @@ pub(super) async fn prepare_acceptance_for(
             "recorded executable contract omits original criterion: {required}"
         );
     }
-    let binding = WorkflowManifest::from_prepared(source, &prepared);
+    let mut binding = WorkflowManifest::from_prepared(source, &prepared);
+    binding.evidence_file = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.evidence_file.clone());
     if let Some(manifest) = manifest {
         ensure!(
             manifest == binding,
@@ -1034,6 +1062,8 @@ struct WorkflowManifest {
     original_base: String,
     contract_revision: u64,
     contract_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence_file: Option<String>,
 }
 impl WorkflowManifest {
     fn source(&self) -> Result<AcceptanceSource> {
@@ -1047,6 +1077,7 @@ impl WorkflowManifest {
             original_base: prepared.baseline.registration.baseline_head().into(),
             contract_revision: prepared.baseline.registration.contract().revision,
             contract_hash: prepared.baseline.registration.contract_hash().into(),
+            evidence_file: None,
         }
     }
 }
@@ -1151,6 +1182,7 @@ mod manifest_tests {
             original_base: "a".repeat(40),
             contract_revision: 1,
             contract_hash: "pinned".into(),
+            evidence_file: None,
         };
         write_manifest(control.path(), &original).unwrap();
         let recovered = original_manifest(control.path(), AcceptanceSource::Issue(42))
@@ -1312,6 +1344,7 @@ mod receipt_reference_tests {
                 binding,
                 result: crate::autoship_contract::CheckResult::Passed,
                 output_digest: "output".into(),
+                diagnostic: String::new(),
             }],
         };
         let reference =
@@ -1357,7 +1390,7 @@ pub(super) async fn verify_with_repair(
     reasoner: &FallbackReasoner,
     issue: &Issue,
     worktree: &Path,
-    prepared: &PreparedAcceptance,
+    prepared: &mut PreparedAcceptance,
     control: &Path,
     workflow: &mut workflow::WorkflowGuard,
 ) -> Result<CandidateReceiptReference> {
@@ -1378,7 +1411,7 @@ pub(super) async fn verify_with_repair_for(
     source: AcceptanceSource,
     title: &str,
     worktree: &Path,
-    prepared: &PreparedAcceptance,
+    prepared: &mut PreparedAcceptance,
     control: &Path,
     workflow: &mut workflow::WorkflowGuard,
 ) -> Result<CandidateReceiptReference> {
@@ -1449,6 +1482,17 @@ pub(super) async fn verify_with_repair_for(
             }
             Err(error) => {
                 let detail = format!("{error:#}");
+                if round < 2 {
+                    if let Some(amended) = amendment::try_amend(
+                        reasoner, source, title, worktree, prepared, control, workflow, &detail,
+                        false,
+                    )
+                    .await?
+                    {
+                        *prepared = amended;
+                        continue;
+                    }
+                }
                 let infrastructure = detail.contains("infrastructure_failure")
                     || detail.contains("toolchain")
                     || detail.contains("environment changed")
@@ -1468,7 +1512,33 @@ pub(super) async fn verify_with_repair_for(
                         .await?;
                     return Err(error).context("acceptance infrastructure deferred for retry");
                 }
-                if round == 2 || !workflow.admit_attempt("acceptance_repair", 3)? {
+                let repair_epoch = amendment::digest(&serde_json::to_vec(&(
+                    prepared.baseline.registration.contract_hash(),
+                    prepared.baseline.registration.baseline_head(),
+                    prepared.baseline.registration.candidate_environment_id(),
+                ))?);
+                if round == 2
+                    || !workflow.admit_epoch_attempt("acceptance_repair", &repair_epoch, 3)?
+                {
+                    if let Some(amended) = amendment::try_amend(
+                        reasoner, source, title, worktree, prepared, control, workflow, &detail,
+                        true,
+                    )
+                    .await?
+                    {
+                        *prepared = amended;
+                        workflow
+                            .transition(
+                                crate::autoship_workflow::Stage::Verify,
+                                "verifier_amended",
+                                "verify_new_revision",
+                                0,
+                            )
+                            .await?;
+                        return Err(error).context(
+                            "independently amended verifier ready for next verification episode",
+                        );
+                    }
                     workflow
                         .transition(
                             crate::autoship_workflow::Stage::Scope,
@@ -1628,6 +1698,7 @@ mod source_namespace_tests {
             original_base: base.clone(),
             contract_revision: 1,
             contract_hash: "issue-contract".into(),
+            evidence_file: None,
         };
         let pr = WorkflowManifest {
             issue: None,

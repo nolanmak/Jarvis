@@ -280,3 +280,60 @@ mod tests {
             .contains(&root.path().join("src/tests/pinned.rs")));
     }
 }
+
+/// Controller-only activation after independently verified contract amendment.
+/// Candidate tools cannot write this private store or invoke this Rust API.
+pub fn replace_registered(
+    worktree: &Path,
+    expected_contract: &str,
+    next_contract: &str,
+    allowed: Vec<DeclaredPath>,
+    pinned: Vec<String>,
+) -> Result<()> {
+    let state = crate::state_dir::state_dir().context("scope control state unavailable")?;
+    let worktree = worktree.canonicalize()?;
+    let path = location(&state, &worktree);
+    let previous = read(&path)?;
+    if previous.contract_hash == next_contract {
+        return Ok(());
+    }
+    ensure!(
+        previous.contract_hash == expected_contract,
+        "write admission amendment is stale"
+    );
+    ensure!(
+        !next_contract.is_empty() && allowed.len() <= 256 && pinned.len() <= 256,
+        "invalid amended write admission"
+    );
+    for value in allowed.iter().map(|p| &p.path).chain(pinned.iter()) {
+        relative(value)?;
+    }
+    let historical = serde_json::to_vec(&previous)?;
+    let history = path
+        .parent()
+        .unwrap()
+        .join(format!("historical-{:x}.json", Sha256::digest(&historical)));
+    if !history.exists() {
+        let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+        file.write_all(&historical)?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(history).map_err(|e| e.error)?;
+    }
+    let next = Admission {
+        version: 1,
+        worktree,
+        contract_hash: next_contract.into(),
+        allowed,
+        pinned,
+    };
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    file.write_all(&serde_json::to_vec(&next)?)?;
+    file.as_file().sync_all()?;
+    ensure!(
+        read(&path)?.contract_hash == expected_contract,
+        "write admission changed during amendment"
+    );
+    file.persist(&path).map_err(|e| e.error)?;
+    fs::File::open(path.parent().unwrap())?.sync_all()?;
+    Ok(())
+}

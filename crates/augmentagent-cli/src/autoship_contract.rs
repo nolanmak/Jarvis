@@ -140,6 +140,8 @@ pub struct RegisteredContract {
     contract: AcceptanceContract,
     baseline_head: String,
     environment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_environment_id: Option<String>,
     file_hashes: BTreeMap<String, String>,
     contract_hash: String,
 }
@@ -177,6 +179,8 @@ pub struct VerifierReceipt {
     pub binding: EvidenceBinding,
     pub result: CheckResult,
     pub output_digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diagnostic: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -437,8 +441,38 @@ impl RegisteredContract {
             contract,
             baseline_head,
             environment_id,
+            candidate_environment_id: None,
             file_hashes,
             contract_hash,
+        })
+    }
+    /// Controller-only: bind an independently authorized environment transition
+    /// before either baseline or candidate receipts are generated.
+    pub fn register_transition(
+        root: &Path,
+        contract: AcceptanceContract,
+        baseline_head: String,
+        baseline_environment: String,
+        candidate_environment: String,
+    ) -> Result<Self> {
+        ensure!(
+            !candidate_environment.is_empty(),
+            "candidate environment missing"
+        );
+        let mut registered = Self::register(root, contract, baseline_head, baseline_environment)?;
+        registered.candidate_environment_id = Some(candidate_environment);
+        registered.contract_hash = registered.computed_hash()?;
+        Ok(registered)
+    }
+    fn computed_hash(&self) -> Result<String> {
+        Ok(if let Some(candidate) = &self.candidate_environment_id {
+            digest(&serde_json::to_vec(&(
+                &self.contract,
+                &self.file_hashes,
+                candidate,
+            ))?)
+        } else {
+            digest(&serde_json::to_vec(&(&self.contract, &self.file_hashes))?)
         })
     }
     pub fn contract(&self) -> &AcceptanceContract {
@@ -450,12 +484,23 @@ impl RegisteredContract {
     pub fn baseline_head(&self) -> &str {
         &self.baseline_head
     }
+    pub fn candidate_environment_id(&self) -> &str {
+        self.candidate_environment_id
+            .as_deref()
+            .unwrap_or(&self.environment_id)
+    }
     pub fn binding(&self, head: &str) -> Result<EvidenceBinding> {
         ensure!(valid_commit(head), "candidate must be a full commit ID");
         Ok(EvidenceBinding {
             head: head.into(),
             base: self.baseline_head.clone(),
-            environment_id: self.environment_id.clone(),
+            environment_id: if head == self.baseline_head {
+                self.environment_id.clone()
+            } else {
+                self.candidate_environment_id
+                    .clone()
+                    .unwrap_or_else(|| self.environment_id.clone())
+            },
             contract_hash: self.contract_hash.clone(),
         })
     }
@@ -464,8 +509,7 @@ impl RegisteredContract {
     pub fn verify_integrity(&self, root: &Path) -> Result<()> {
         self.contract.validate()?;
         ensure!(
-            digest(&serde_json::to_vec(&(&self.contract, &self.file_hashes))?)
-                == self.contract_hash,
+            self.computed_hash()? == self.contract_hash,
             "contract registration was modified"
         );
         for (file, expected) in &self.file_hashes {
@@ -512,11 +556,17 @@ impl RegisteredContract {
         } else {
             CheckResult::UnexpectedFailure
         };
+        let diagnostic = if result == CheckResult::Passed {
+            String::new()
+        } else {
+            output.chars().take(2048).collect()
+        };
         Ok(VerifierReceipt {
             verifier_id: verifier_id.into(),
             binding,
             result,
             output_digest: digest(output.as_bytes()),
+            diagnostic,
         })
     }
     pub fn baseline_result(&self, receipts: &[VerifierReceipt]) -> Result<BaselineResult> {

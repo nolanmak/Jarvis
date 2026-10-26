@@ -427,3 +427,30 @@ fn legacy_issue_json_and_real_pull_request_identity_are_distinct() {
     imported.pull_request = None;
     assert!(imported.validate().is_err());
 }
+
+#[test]
+fn authorized_revision_binds_distinct_baseline_and_candidate_environments() {
+    let (dir, old) = registered();
+    let mut next = contract();
+    next.revision += 1;
+    let reg = RegisteredContract::register_transition(
+        dir.path(),
+        next,
+        BASE.into(),
+        "old-env".into(),
+        "new-env".into(),
+    )
+    .unwrap();
+    assert_ne!(old.contract_hash(), reg.contract_hash());
+    let red = receipt(&reg, dir.path(), BASE, &red());
+    let green = receipt(&reg, dir.path(), HEAD, &green());
+    assert_eq!(red.binding.environment_id, "old-env");
+    assert_eq!(green.binding.environment_id, "new-env");
+    assert!(reg
+        .candidate_passes(&[red], &[green], &reg.binding(HEAD).unwrap())
+        .unwrap());
+    let mut bytes = serde_json::to_value(&reg).unwrap();
+    bytes["candidate_environment_id"] = serde_json::json!("forged-env");
+    let forged: RegisteredContract = serde_json::from_value(bytes).unwrap();
+    assert!(forged.verify_integrity(dir.path()).is_err());
+}
