@@ -18,6 +18,16 @@ async fn discover(repo: &Path, dry_run: bool) -> Result<Vec<adoption::AdoptedPr>
     if !dry_run {
         adoption::persist(&workflow::path(), &candidates)?;
     }
+    for candidate in &candidates {
+        if !candidate.ready_for_review() {
+            if let Err(error) = reconcile_parent(repo, candidate, dry_run).await {
+                warn!(
+                    pr = candidate.pr,
+                    "parent reconciliation deferred: {error:#}"
+                );
+            }
+        }
+    }
     Ok(candidates)
 }
 
@@ -454,4 +464,156 @@ pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
         }
     }
     Ok(merged)
+}
+
+/// A merged parent no longer blocks the child. Retarget only after Git proves
+/// that the parent's merge commit is reachable from main, under the child's
+/// own workflow lease. Full child verification runs after rediscovery.
+async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) -> Result<bool> {
+    if pr.ready_for_review() {
+        return Ok(false);
+    }
+    let (ok, raw, _) = run(
+        &gh_bin(),
+        &[
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--head",
+            &pr.base,
+            "--limit",
+            "100",
+            "--json",
+            "number,state,isCrossRepository,mergeCommit",
+        ],
+        repo,
+    )
+    .await?;
+    if !ok {
+        return Ok(false);
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
+    // Ambiguous parent history is not authority to silently change a target.
+    let parents: Vec<_> = rows
+        .iter()
+        .filter(|p| p["isCrossRepository"].as_bool() == Some(false))
+        .collect();
+    if parents.len() != 1 || parents[0]["state"].as_str() != Some("MERGED") {
+        return Ok(false);
+    }
+    let Some(merge) = parents[0]["mergeCommit"]["oid"].as_str() else {
+        return Ok(false);
+    };
+    let (ok, _, _) = run("git", &["fetch", "origin", "main"], repo).await?;
+    if !ok
+        || !run(
+            "git",
+            &["merge-base", "--is-ancestor", merge, "origin/main"],
+            repo,
+        )
+        .await?
+        .0
+        || dry_run
+    {
+        return Ok(false);
+    }
+    let lock_path = run_lock_path().with_file_name(format!("self-improve-pr-{}.lock", pr.pr));
+    let Some(_lock) = RunLock::try_acquire(&lock_path)? else {
+        return Ok(false);
+    };
+    let worktree = workflow::prepare_resume_worktree(repo, pr.pr, &pr.branch).await?;
+    let contract = format!(
+        "Retarget authorized child PR #{} after merged parent {}",
+        pr.pr, pr.base
+    );
+    let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root: repo,
+        worktree: &worktree,
+        repository: &pr.repository,
+        source_issue: pr.source_issue,
+        pr: Some(pr.pr),
+        branch: &pr.branch,
+        contract: &contract,
+        environment: "parent-reconciliation-v1",
+    })
+    .await?
+    else {
+        return Ok(false);
+    };
+    let result: Result<()> = async {
+        let (ok, raw, _) = run(
+            &gh_bin(),
+            &[
+                "pr",
+                "view",
+                &pr.pr.to_string(),
+                "--json",
+                "headRefOid,baseRefName,isCrossRepository",
+            ],
+            repo,
+        )
+        .await?;
+        let row: serde_json::Value = serde_json::from_str(&raw)?;
+        anyhow::ensure!(
+            ok && row["headRefOid"].as_str() == Some(pr.head.as_str())
+                && row["baseRefName"].as_str() == Some(pr.base.as_str())
+                && row["isCrossRepository"].as_bool() == Some(false),
+            "child changed before retarget"
+        );
+        let intent = guard.intent(OperationKind::RetargetPr)?;
+        guard.validate_before_side_effect()?;
+        let (ok, _, error) = run(
+            &gh_bin(),
+            &["pr", "edit", &pr.pr.to_string(), "--base", "main"],
+            repo,
+        )
+        .await?;
+        anyhow::ensure!(ok, "child retarget failed: {error}");
+        let (ok, raw, _) = run(
+            &gh_bin(),
+            &[
+                "pr",
+                "view",
+                &pr.pr.to_string(),
+                "--json",
+                "baseRefName,headRefOid",
+            ],
+            repo,
+        )
+        .await?;
+        let row: serde_json::Value = serde_json::from_str(&raw)?;
+        anyhow::ensure!(
+            ok && row["baseRefName"].as_str() == Some("main")
+                && row["headRefOid"].as_str() == Some(pr.head.as_str()),
+            "child retarget needs reconciliation"
+        );
+        guard.observe_remote(
+            &intent,
+            &format!("github:pr:{}:base:main:head:{}", pr.pr, pr.head),
+            Some(pr.pr),
+        )?;
+        guard
+            .transition(
+                Stage::Reconcile,
+                "parent_merged_child_retargeted",
+                "verify_against_main",
+                0,
+            )
+            .await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        guard
+            .transition(
+                Stage::Reconcile,
+                "parent_retarget_retry",
+                "reconcile_child_base",
+                chrono::Utc::now().timestamp_millis() + 300_000,
+            )
+            .await?;
+    }
+    guard.finish()?;
+    result.map(|_| true)
 }
