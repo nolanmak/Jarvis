@@ -456,3 +456,22 @@ fn preflight_recovery_refuses_live_or_provider_bound_reservations() {
         assert!(!store.phone_call("owner", &id).unwrap().state.terminal());
     }
 }
+
+#[tokio::test]
+async fn maintenance_retires_an_expired_preflight_without_provider_io() {
+    use augmentagent_store::phone::LiveUsagePhase;
+    use augmentagent_phone::{PhoneConfig, PhoneService};
+    use std::sync::Arc;
+    let (_dir, store, id) = fixture();
+    store.phone_set_voice_backend(&id, "openai_live").unwrap();
+    store.phone_live_usage_start(&id, LiveUsagePhase::Preflight).unwrap();
+    let store = Arc::new(store);
+    let provider = Arc::new(Provider {result:None,reads:AtomicUsize::new(0)});
+    let config = PhoneConfig::new(true, "https://phone.example.test", "synthetic-secret-at-least-32-bytes", vec![]).unwrap();
+    let service = PhoneService::new(store.clone(), provider.clone(), Arc::new(Expired), config);
+    service.maintenance(false).await.unwrap();
+    assert_eq!(store.phone_call("owner", &id).unwrap().state, CallState::Failed);
+    assert!(store.phone_call("owner", &id).unwrap().stop_requested);
+    service.maintenance(true).await.unwrap();
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 0);
+}
