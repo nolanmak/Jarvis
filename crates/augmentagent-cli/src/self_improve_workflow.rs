@@ -522,6 +522,39 @@ impl WorkflowGuard {
         }))
     }
 
+    pub(super) fn record_episode_sessions(
+        &self,
+        sessions: &augmentagent_channel_core::native_session::FreshBuilderSessions,
+    ) -> Result<()> {
+        self.validate_before_side_effect()?;
+        let observations: Vec<_> = sessions.observed().into_iter().map(|s|serde_json::json!({"provider":s.provider.name(),"native_session":s.id,"uncertain":s.uncertain})).collect();
+        self.audit_event(
+            "episode_native_conversations",
+            serde_json::json!({"observed":observations}),
+        )
+    }
+
+    pub(super) fn episode_review_at_head(
+        &self,
+        head: &str,
+    ) -> Result<Option<crate::autoship_review::ReviewEvidence>> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?;
+        for (_, kind, body, _) in store.events(self.id())?.into_iter().rev() {
+            if kind != "review_recorded" {
+                continue;
+            }
+            if let Ok(review) = serde_json::from_str::<Review>(&body) {
+                if review.binding.head == head && review.reviewer.starts_with("episode-evidence-") {
+                    return Ok(Some(serde_json::from_str(&review.evidence)?));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn admit_episode_action(&self, epoch: &str, action: &str) -> Result<bool> {
         self.validate_before_side_effect()?;
         self.store

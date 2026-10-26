@@ -48,6 +48,13 @@ pub(super) async fn evaluate(
             "episode review is stale"
         );
     }
+    if let Some(evidence) = structured {
+        workflow.record_review(
+            &format!("episode-evidence-{}", uuid::Uuid::new_v4()),
+            review.approved(),
+            &serde_json::to_string(evidence)?,
+        )?;
+    }
     let remaining = structured
         .map(effective_findings)
         .transpose()?
@@ -214,7 +221,11 @@ pub(super) async fn session(
             0,
         )
         .await?;
-    let facts: Vec<_> = evaluated.remaining.iter().map(|f| serde_json::json!({
+    let best_review = workflow
+        .episode_review_at_head(best)?
+        .context("best candidate review evidence missing")?;
+    let best_findings = effective_findings(&best_review)?;
+    let facts: Vec<_> = best_findings.iter().map(|f| serde_json::json!({
         "id":f.id,"criterion":f.criterion_id,"claim":f.claim,"required_change":f.requested_change,"evidence_hash":f.evidence_hash
     })).collect();
     let mut prompt = serde_json::to_string(&serde_json::json!({
@@ -225,7 +236,7 @@ pub(super) async fn session(
     if rescope {
         let mut opts = scope_opts(root.to_path_buf());
         opts.session_id = Some(uuid::Uuid::new_v4().to_string());
-        let plan=reasoner.call(&opts,&format!("Re-scope the repair strategy for the following immutable contract and candidate. Read source and return the smallest concrete implementation plan. Do not add requirements, weaken verifiers, or request reviewer unanimity.\n{prompt}")).await?;
+        let plan=augmentagent_channel_core::native_session::FreshBuilderSessions::new().scope(reasoner.call(&opts,&format!("Re-scope the repair strategy for the following immutable contract and candidate. Read source and return the smallest concrete implementation plan. Do not add requirements, weaken verifiers, or request reviewer unanimity.\n{prompt}"))).await?;
         prompt.push_str(
             "\nIndependent re-scoping plan (apply only within the unchanged contract):\n",
         );
@@ -236,7 +247,7 @@ pub(super) async fn session(
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     let mut opts = fix_opts(root.to_path_buf());
-    // Stable across recovery of this one episode; retries do not mint a second fresh session.
+    // Audit correlation only. Actual transport identity comes from FreshBuilderSessions.
     opts.session_id = Some(uuid::Uuid::from_bytes(bytes).to_string());
     Ok(Some(RepairSession { opts, prompt }))
 }

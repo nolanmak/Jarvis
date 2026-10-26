@@ -6855,6 +6855,7 @@ async fn resume_draft_pr(
         .latest_review_receipt("resume-structured-")?
         .map(|receipt| serde_json::from_str(&receipt)).transpose()?;
     let mut rounds_done = 0u32;
+    let mut episode_native_sessions = None;
     let mut episode_rescoped = false;
     // Carry remote failures into the revision loop, not only the local gate.
     // Consume this snapshot once: after a push it describes the previous head.
@@ -7399,12 +7400,15 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
+        if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
         let (repair_opts,repair_prompt) = match episode_session {
             Some(session) => (session.opts,session.prompt),
             None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines_now,prior_attempts.as_deref())),
         };
-        let rev_summary = match adoption::revise(reasoner, &workflow,&repair_opts,&repair_prompt)
-            .await
+        let call = adoption::revise(reasoner, &workflow,&repair_opts,&repair_prompt);
+        let revised = match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await };
+        if let Some(sessions) = &episode_native_sessions { workflow.record_episode_sessions(sessions)?; }
+        let rev_summary = match revised
         {
             Ok(rs) => rs,
             Err(e) => {
@@ -8633,6 +8637,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // is consulted on a diff that cannot ship anyway.
         let mut findings_override: Option<String> = None;
         let mut episode_rescoped = false;
+        let mut episode_native_sessions = None;
         loop {
             let mut episode_session = None;
             if findings_override.is_none() {
@@ -8681,12 +8686,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             };
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
+            if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
             let (repair_opts,repair_prompt) = match episode_session {
                 Some(session) => (session.opts,session.prompt),
                 None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines,prior_attempts.as_deref())),
             };
-            match reasoner.call_revision_with_storage(&repair_opts,&repair_prompt)
-                .await
+            let call = reasoner.call_revision_with_storage(&repair_opts,&repair_prompt);
+            let revised = match &episode_native_sessions { Some(sessions) => sessions.scope(call).await, None => call.await };
+            if let Some(sessions) = &episode_native_sessions { workflow_guard.record_episode_sessions(sessions)?; }
+            match revised
             {
                 Err(e) => {
                     // Provider trouble, not a verdict — keep the last outcome and
