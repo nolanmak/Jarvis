@@ -28,13 +28,13 @@ Import/compile/setup errors do not count. Do not weaken assertions or edit the
 verifier after registration. Every criterion needs a verifier. No shell commands.
 "#;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ContractProposal {
     pub contract: AcceptanceContract,
     pub files: BTreeMap<String, String>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct BaselineEvidence {
     pub registration: RegisteredContract,
     pub receipts: Vec<VerifierReceipt>,
@@ -229,6 +229,17 @@ pub(super) async fn verify_candidate(
     root: &Path,
     evidence: &BaselineEvidence,
 ) -> Result<Vec<VerifierReceipt>> {
+    let status = Command::new("/usr/bin/git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .await?;
+    ensure!(
+        status.status.success() && status.stdout.is_empty(),
+        "candidate must be committed before evidence can bind to HEAD"
+    );
     ensure!(
         environment_id()?
             == evidence
@@ -463,5 +474,287 @@ mod tests {
             .unwrap();
         assert_eq!(observation.exit_code, Some(0), "{}", observation.stderr);
         assert_eq!(std::fs::read_to_string(protected).unwrap(), "unchanged");
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreparedAcceptance {
+    pub proposal: ContractProposal,
+    pub baseline: BaselineEvidence,
+}
+
+async fn trusted_git(root: &Path, args: &[&str]) -> Result<String> {
+    let result = Command::new("/usr/bin/git")
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    ensure!(
+        result.status.success(),
+        "acceptance checkout operation failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(String::from_utf8(result.stdout)?.trim().to_owned())
+}
+
+/// One independent repair of absent/malformed scoper output. This is a scoped
+/// stage retry, not permission to let the builder invent its own acceptance bar.
+async fn proposal_with_retry(
+    reasoner: &dyn Reasoner,
+    candidate: &Path,
+    issue: u64,
+    scope: &str,
+) -> Result<ContractProposal> {
+    match parse_proposal(scope, issue) {
+        Ok(proposal) => Ok(proposal),
+        Err(error) => {
+            let prompt = format!("Supply the independent executable acceptance contract for issue #{issue}. Previous scoper output lacked a valid executable contract ({error}). Read the current source; do not edit it.\n{CONTRACT_PROMPT}\nScoper requirements:\n{scope}");
+            let output = reasoner
+                .call(&scope_opts(candidate.to_path_buf()), &prompt)
+                .await?;
+            parse_proposal(&output, issue).context("independent acceptance proposal retry failed")
+        }
+    }
+}
+fn evidence_path(control: &Path, issue: u64, base: &str) -> Result<PathBuf> {
+    ensure!(
+        (base.len() == 40 || base.len() == 64) && base.bytes().all(|b| b.is_ascii_hexdigit()),
+        "acceptance base must be an immutable commit ID"
+    );
+    Ok(control.join(format!("issue-{issue}-base-{base}.json")))
+}
+fn install_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
+    // Existing files must match exactly, including files installed before a
+    // restart. Never silently restore a builder-modified verifier.
+    let mut missing = prepared.proposal.clone();
+    missing
+        .files
+        .retain(|path, _| !candidate.join(path).exists());
+    for (relative, bytes) in &prepared.proposal.files {
+        let path = candidate.join(relative);
+        if path.exists() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "candidate verifier is not a regular file"
+            );
+            ensure!(
+                std::fs::read(&path)? == bytes.as_bytes(),
+                "candidate attempted to change registered verifier"
+            );
+        }
+    }
+    install_harness(candidate, &missing)?;
+    prepared.baseline.registration.verify_integrity(candidate)
+}
+
+/// `base` comes from the workflow's saved pre-builder base, NEVER current
+/// candidate HEAD on recovery. Reuses a previously reproduced immutable record.
+/// Caller supplies all admitted worker write roots; control must be outside them.
+/// Root orchestration should persist this returned path/base in its workflow row.
+pub(super) async fn prepare_acceptance(
+    repo: &Path,
+    candidate: &Path,
+    control: &Path,
+    issue: u64,
+    base: &str,
+    scope: &str,
+    reasoner: &dyn Reasoner,
+    writable_roots: &[PathBuf],
+) -> Result<PreparedAcceptance> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    std::fs::create_dir_all(control)?;
+    let control = control.canonicalize()?;
+    for root in writable_roots {
+        ensure!(
+            !control.starts_with(root.canonicalize()?),
+            "acceptance store is writable by worker"
+        );
+    }
+    let path = evidence_path(&control, issue, base)?;
+    let prepared = if path.exists() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0
+                && metadata.len() <= 4 * 1024 * 1024,
+            "acceptance store is not private"
+        );
+        let prepared: PreparedAcceptance = serde_json::from_reader(file)?;
+        ensure!(
+            prepared.baseline.registration.baseline_head() == base
+                && prepared.baseline.registration.contract().issue == issue
+                && prepared.proposal.contract == *prepared.baseline.registration.contract(),
+            "persisted acceptance workflow mismatch"
+        );
+        ensure!(
+            prepared
+                .baseline
+                .registration
+                .baseline_result(&prepared.baseline.receipts)?
+                == BaselineResult::Reproduced,
+            "persisted baseline was never independently red"
+        );
+        prepared
+    } else {
+        ensure!(actual_head(candidate).await? == base, "missing original baseline receipt on repaired candidate; cannot re-register from its head");
+        let proposal = proposal_with_retry(reasoner, candidate, issue, scope).await?;
+        let temporary = tempfile::Builder::new()
+            .prefix("baseline-")
+            .tempdir_in(&control)?;
+        let baseline_root = temporary.path().join("checkout");
+        let checkout = baseline_root
+            .to_str()
+            .context("baseline checkout path is not UTF-8")?;
+        trusted_git(repo, &["worktree", "add", "--detach", checkout, base]).await?;
+        let result = register_and_reproduce(&baseline_root, proposal.clone()).await;
+        let cleanup = trusted_git(repo, &["worktree", "remove", "--force", checkout]).await;
+        let baseline = result?;
+        cleanup.context("remove acceptance baseline worktree")?;
+        let prepared = PreparedAcceptance { proposal, baseline };
+        let mut staged = tempfile::NamedTempFile::new_in(&control)?;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        staged.write_all(&serde_json::to_vec(&prepared)?)?;
+        staged.as_file().sync_all()?;
+        staged
+            .persist_noclobber(&path)
+            .map_err(|error| error.error)?;
+        std::fs::File::open(&control)?.sync_all()?;
+        prepared
+    };
+    // A changed base requires a new independently reproduced workflow contract.
+    trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
+    install_candidate_harness(candidate, &prepared)?;
+    Ok(prepared)
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    use crate::autoship_contract::{Criterion, PathScope, Verifier, VerifierCommand};
+    #[tokio::test]
+    async fn real_baseline_noop_candidate_green_and_harness_tamper() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        trusted_git(root.path(), &["init", "-q"]).await.unwrap();
+        std::fs::write(root.path().join("behavior.py"), "READY = False\n").unwrap();
+        trusted_git(root.path(), &["add", "behavior.py"])
+            .await
+            .unwrap();
+        trusted_git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        )
+        .await
+        .unwrap();
+        let base = actual_head(root.path()).await.unwrap();
+        let path = "autoship_verifiers/test_regression.py";
+        let proposal = ContractProposal {
+            contract: AcceptanceContract { schema_version: 1, revision: 1, issue: 42,
+                criteria: vec![Criterion { id: "ready".into(), requirement: "Ready becomes true".into(), verifier_ids: vec!["regression".into()] }],
+                allowed_paths: vec![PathScope::File("behavior.py".into())],
+                verifiers: vec![Verifier { id: "regression".into(), command: VerifierCommand::PythonUnittest { test: "autoship_verifiers.test_regression.Case.test_ready".into() }, pinned_files: vec![path.into()], failure_witness: "intended ready regression".into() }],
+            },
+            files: [(path.into(), "import unittest\nimport behavior\nclass Case(unittest.TestCase):\n def test_ready(self):\n  self.assertTrue(behavior.READY, 'intended ready regression')\n".into())].into(),
+        };
+        install_harness(root.path(), &proposal).unwrap();
+        let registration = RegisteredContract::register(
+            root.path(),
+            proposal.contract.clone(),
+            base.clone(),
+            "fixture-v1".into(),
+        )
+        .unwrap();
+        let command = &proposal.contract.verifiers[0].command;
+        let red = isolated_observation(root.path(), target.path(), command.invocation().unwrap())
+            .await
+            .unwrap();
+        let baseline = vec![registration
+            .observe(
+                root.path(),
+                "regression",
+                registration.binding(&base).unwrap(),
+                &red,
+            )
+            .unwrap()];
+        assert_eq!(
+            registration.baseline_result(&baseline).unwrap(),
+            BaselineResult::Reproduced
+        );
+        assert!(
+            !registration
+                .candidate_passes(&baseline, &baseline, &registration.binding(&base).unwrap())
+                .unwrap(),
+            "a no-op cannot pass"
+        );
+        std::fs::write(root.path().join("behavior.py"), "READY = True\n").unwrap();
+        trusted_git(root.path(), &["add", "behavior.py", path])
+            .await
+            .unwrap();
+        trusted_git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "candidate",
+            ],
+        )
+        .await
+        .unwrap();
+        let head = actual_head(root.path()).await.unwrap();
+        let green = isolated_observation(root.path(), target.path(), command.invocation().unwrap())
+            .await
+            .unwrap();
+        let candidate = vec![registration
+            .observe(
+                root.path(),
+                "regression",
+                registration.binding(&head).unwrap(),
+                &green,
+            )
+            .unwrap()];
+        assert!(registration
+            .candidate_passes(&baseline, &candidate, &registration.binding(&head).unwrap())
+            .unwrap());
+        std::fs::write(root.path().join(path), "# removed assertions").unwrap();
+        assert!(registration.verify_integrity(root.path()).is_err());
+        let prepared = PreparedAcceptance {
+            proposal,
+            baseline: BaselineEvidence {
+                registration,
+                receipts: baseline,
+            },
+        };
+        assert!(
+            install_candidate_harness(root.path(), &prepared).is_err(),
+            "restart must not repair away verifier tampering"
+        );
     }
 }
