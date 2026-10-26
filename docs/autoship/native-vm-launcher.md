@@ -120,6 +120,35 @@ site/user customization, and records each file digest. The guest does not mount
 the host `/usr`, `/usr/local`, `/etc` or provider home. Any unlisted file added to
 the staged runtime causes launch refusal.
 
+## Adding a declared provider
+
+Use `/usr/bin/python3 scripts/provision-native-vm-probe.py --extend-policy
+EXISTING_PRIVATE_POLICY --provider claude --native-executable EXACT_CLAUDE_BINARY
+--auth-file EXPLICIT_AUTH_FILE --gateway-policy REVIEWED_CLAUDE_ROUTE_POLICY` to
+add a previously undeclared provider. Supply `--environment-key NAME` separately
+for every required environment credential or routing setting. The helper does
+not infer new network destinations, copy environment values, replace existing
+profiles, or alter the global resource policy.
+
+Extension preserves the existing state directory, session aliases, credential
+grants and provider routes. It verifies the old runtime manifest, stages a new
+union with the additional executable's distribution dependencies, and publishes
+one atomic policy pointer under a private provisioning lock. Existing runtime
+generations remain available to active runs. Identical runtime files deduplicate;
+a same-path byte conflict refuses publication and requires an explicit runtime
+upgrade after compatibility checks. Failed staging removes only its unpublished
+random generation. Retire old runtime generations only after their runs drain.
+
+Codex and Claude native authentication require explicitly declared native
+credentials. Routed Claude additionally needs its declared base URL and token;
+routed Codex, Qwen and GLM use the Codex executable and a declared router key.
+Each routed profile also needs reviewed gateway routes matching the actual
+router endpoint. A router key is not native reviewer authentication. Profile
+presence establishes eligibility only: authenticate and exercise the actual
+executable, streaming, guarded tools and session continuation for each enabled
+provider before rollout. The fixture-only provisioning tests prove profile
+preservation and refusal boundaries; they do not make provider requests.
+
 ## Rollout through the normal updater
 
 After the disposable authenticated acceptance probe passes, provision the
