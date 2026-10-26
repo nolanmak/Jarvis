@@ -728,7 +728,7 @@ async fn proposal_with_retry(
                     ) && matches!(reviewer_status(*provider), ReviewerStatus::Ready)
                 })
                 .context("fresh native scope authority unavailable")?;
-            let reasoner = augmentagent_channel_core::build_pinned(provider)?;
+            let reasoner = augmentagent_channel_core::build_pinned(provider).context("pinned native provider is unavailable")?;
             let mut opts = codex_review_opts(candidate.to_path_buf(), "Independent executable contract scoper. Use supplied original source only. No tools or inherited builder context. Return requested contract JSON fence.");
             opts.allowed_tools.clear();
             opts.settings_json = None;

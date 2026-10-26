@@ -53,7 +53,7 @@ async fn call(
     system: &str,
     prompt: &str,
 ) -> Result<String> {
-    let reasoner = augmentagent_channel_core::build_pinned(provider)?;
+    let reasoner = augmentagent_channel_core::build_pinned(provider).context("pinned native provider is unavailable")?;
     let mut opts = codex_review_opts(root.to_path_buf(), system);
     opts.allowed_tools.clear();
     opts.settings_json = None;

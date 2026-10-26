@@ -2829,8 +2829,10 @@ mod tests {
     #[tokio::test]
     async fn interrupted_native_tool_intent_poisoning_is_durable_and_workflow_scoped() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("workflow.log");
-        let anchor = dir.path().join("anchor.json");
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::create_dir(dir.path().join("anchors")).unwrap();
+        let path = dir.path().join("logs/workflow.log");
+        let anchor = dir.path().join("anchors/anchor.json");
         let logger = Arc::new(AuditLogger::protected(path.clone(), anchor.clone(), &[]).unwrap());
         let use_event = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"pending-write","name":"mcp__jarvis__Write","input":{"file_path":"fixture.rs","content":"synthetic"}}]}}"#;
         let mut pending = HashMap::new();

@@ -409,6 +409,7 @@ async fn execute(
         if !review.available || round >= revise_rounds() {
             break;
         }
+        let episode_dispatch = strategy.as_ref().map(|session| (session.epoch.clone(), session.action.clone()));
         let (opts,prompt) = match strategy {
             Some(session) => (session.opts,session.prompt),
             None => (fix_opts(worktree.to_path_buf()),format!("Address verified review findings for this PR. Preserve pinned acceptance; do not weaken verifiers.\n{request}\n{}",review.notes)),
