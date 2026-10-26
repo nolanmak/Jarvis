@@ -70,6 +70,16 @@ impl AgentRouter {
 }
 #[async_trait]
 impl ConversationAgent for AgentRouter {
+    async fn call_ended(&self, call: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+        self.adapter(call)?.call_ended(call, key, text).await
+    }
+    async fn mirror_transcript(&self, call: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+        self.adapter(call)?.mirror_transcript(call, key, text).await
+    }
+    async fn summarize_live_result(&self, call: &PhoneCall, result: &str) -> Result<String, AgentError> {
+        self.adapter(call)?.summarize_live_result(call, result).await
+    }
+
     async fn resume_task(&self, call: &PhoneCall, task_id: &str) -> Result<(), AgentError> {
         self.adapter(call)?.resume_task(call, task_id).await
     }

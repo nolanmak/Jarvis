@@ -795,6 +795,21 @@ async fn phone_router_uses_persisted_origin_and_revocable_adapter_registration()
         ) -> Result<String, AgentError> {
             Ok("answer".into())
         }
+        async fn call_ended(&self, _: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+            assert_eq!((key, text), ("notice-key", "ended"));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn mirror_transcript(&self, _: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+            assert_eq!((key, text), ("history-key", "transcript"));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn summarize_live_result(&self, _: &PhoneCall, result: &str) -> Result<String, AgentError> {
+            assert_eq!(result, "completed result");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("spoken summary".into())
+        }
         async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -819,12 +834,21 @@ async fn phone_router_uses_persisted_origin_and_revocable_adapter_registration()
     let registration = router.register("slack", agent.clone()).unwrap();
     assert!(router.register("slack", agent.clone()).is_err());
     router.interrupted(&call, "heard").await.unwrap();
+    router.call_ended(&call, "notice-key", "ended").await.unwrap();
+    router.mirror_transcript(&call, "history-key", "transcript").await.unwrap();
+    assert_eq!(router.summarize_live_result(&call, "completed result").await.unwrap(), "spoken summary");
     let mut forged = call.clone();
     forged.conversation = "another conversation".into();
     assert!(router.interrupted(&forged, "secret").await.is_err());
+    assert!(router.call_ended(&forged, "notice-key", "ended").await.is_err());
+    assert!(router.mirror_transcript(&forged, "history-key", "transcript").await.is_err());
+    assert!(router.summarize_live_result(&forged, "completed result").await.is_err());
     drop(registration);
     assert!(router.interrupted(&call, "heard").await.is_err());
-    assert_eq!(agent.0.load(Ordering::SeqCst), 1);
+    assert!(router.call_ended(&call, "notice-key", "ended").await.is_err());
+    assert!(router.mirror_transcript(&call, "history-key", "transcript").await.is_err());
+    assert!(router.summarize_live_result(&call, "completed result").await.is_err());
+    assert_eq!(agent.0.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
