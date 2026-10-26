@@ -301,12 +301,11 @@
       "execution": "Compiled managed test binary in isolated delegated transient service; live descendants refused, removed subtree accepted, foreign host rejected."
     },
     "self_improve_recovery": {
-      "revision": "309e950b",
-      "passed": 410,
+      "revision": "3383566e",
+      "passed": 416,
       "failed": 0,
-      "ignored": 9,
-      "log": "/tmp/autoship-1598-native-adapter-workflow.log",
-      "note": "Before bounded comment fetching follow-up; native seeded review still incomplete."
+      "ignored": 10,
+      "log": "/tmp/autoship-1598-review-packing.log"
     },
     "behavior_oracles": {
       "passed": 21,
@@ -320,10 +319,26 @@
       "log": "/tmp/autoship-1598-foundation-recovery.log"
     },
     "full_native_probe": {
-      "revision": "309e950b",
-      "passed": false,
-      "log": "/tmp/autoship-1598-native-probe-309e950b.log",
-      "result": "Real scoping, build, executable acceptance, alignment and clean independent authority passed (probe advanced to protected seeded_diagnostic checkpoint). Seeded negative review stopped with incomplete evidence group 2; byte-aware packing and reviewer-only evidence recovery pending. No remote publication or merge."
+      "revision": "3383566e",
+      "test": "self_improve::native_acceptance::live_native_disposable_scope_build_verify_review_and_seed",
+      "passed": true,
+      "no_remote_publication": true,
+      "audit_log_sha256": "675e6f3bf3dfcc1dda40e610983bdceeb2de307e1defd534619afe981215b08c",
+      "audit_event_payload_sha256": "e7bcf088c09221d374ad24c239f4ff031c826b28caa18ca133cdf84200574812",
+      "native_builder_count": 1,
+      "clean_review_roles": [
+        "qa",
+        "diff",
+        "system"
+      ],
+      "seeded_review_roles": [
+        "qa",
+        "diff",
+        "system"
+      ],
+      "seeded_finding_count": 3,
+      "log": "/tmp/autoship-1598-native-probe-3383566e.log",
+      "protected_evidence_root": "/tmp/autoship-native-probe-bsayg0sy"
     },
     "real_cancelled_workflow_recovery": {
       "revision": "ae11702b",
@@ -372,6 +387,12 @@
       "evidence_root": "/tmp/autoship-github-acceptance-n0ic5yrv",
       "log": "/tmp/autoship-1598-real-github-retry.log",
       "result": "Real accepted merge + durable own receipt passed. Stale candidate rejected with expected-status-check wording; stale-proof assertion/restartable probe follow-up pending. No production repository settings changed; synthetic merges do not count as production shipping."
+    },
+    "review_contract_recovery": {
+      "revision": "3383566e",
+      "passed": 24,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-review-contract-recovery.log"
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -414,7 +435,7 @@
     {
       "severity": "P1",
       "gap": "Arbitrary two-shard review groups can omit context and stop native review as incomplete",
-      "status": "observed_in_real_seeded_probe; byte_aware_packing_and_bounded_evidence_recovery_in_progress"
+      "status": "fixed_in_3383566e; independent_delta_LGTM; central_and_full_native_positive_negative_probe_passed"
     }
   ]
 }
