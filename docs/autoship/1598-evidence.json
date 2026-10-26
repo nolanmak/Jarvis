@@ -9,6 +9,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Selection/provenance/parent-retarget/free holds are integrated; read-only actual selector and audit-generation approval invalidation follow-ups are under central validation. Full native source-less adoption through repair and merge remains required before broad rollout."
+      ],
+      "remaining_acceptance": [
+        "Pass full native source-less adoption through repair, exact-head review and free merge reconciliation after controller-evidence fixes.",
+        "Verify allowed branch prefixes and dependency-targeted PRs in rollout."
       ]
     },
     {
@@ -18,6 +22,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Source lifecycle tests passed; fresh/resume/sweep checks wired; full deployed acceptance pending"
+      ],
+      "remaining_acceptance": [
+        "Verify deployed retirement and retry behavior without closing useful work on unknown remote state."
       ]
     },
     {
@@ -27,6 +34,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Audited existing children; paginated baseline-repair lookup and idempotent durable epic slicing added. Final deployed end-to-end acceptance pending."
+      ],
+      "remaining_acceptance": [
+        "Verify integrated recovery against red main, tractable conflicts and stacked dependencies; preserve shipped children."
       ]
     },
     {
@@ -36,6 +46,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Exact-head approved policy/CI waits now use free reconciliation; actual failed checks/conflicts/main changes reengage repair. Named health observations persisted. Virtual 72-hour five-PR admission/Git/fake-GH soak integrated; full native soak remains pending."
+      ],
+      "remaining_acceptance": [
+        "Verify deployed unchanged holds remain unbilled and changed dependencies resume exactly once; merge sweep remains eligible with exhausted builder budget."
       ]
     },
     {
@@ -45,6 +58,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Calendar spreading and blanket cancellation removed; durable resource/quota reservations and free merge reconciliation implemented. Local-calendar/DST foundation tests passed. Seven-day production throughput observation has not started."
+      ],
+      "remaining_acceptance": [
+        "Complete real capacity-aware five-candidate shipping acceptance.",
+        "Collect seven-day autonomous merge/resource report; manual merges do not count."
       ]
     },
     {
@@ -54,6 +71,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Durable workflow checkpoints wired in fresh/resume; preserved committed/dirty/untracked work regression passed; sweep concurrency integration under test"
+      ],
+      "remaining_acceptance": [
+        "Validate latest combined controller checkpoints, exact operation receipts and bounded context under full integrated failure injection."
       ]
     },
     {
@@ -63,6 +83,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Fresh-session recovery preserves contracts/best candidates/adjudications. Protected audit-generation and cancelled-worker recovery passed real isolated process probes. Thirty-day before/after operational analysis remains open."
+      ],
+      "remaining_acceptance": [
+        "Verify fresh-session recovery in final native pipeline without losing candidate, contract or adjudications.",
+        "Collect thirty-day before/after outcome comparison."
       ]
     },
     {
@@ -72,6 +96,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Structured final adjudication, immutable replay storage and rubric validation are implemented. Native contradiction test passed8f317dd6; representative PR1538 writer-inventory negative/repaired replay passed7591660b. Production calibration and rollout observations remain open."
+      ],
+      "remaining_acceptance": [
+        "Validate typed controller disputes, missing-evidence recovery and final-authority replay at final head.",
+        "Verify protected calibration promotion preserves hard-case verdicts and excludes duplicate-source observation labels."
       ]
     },
     {
@@ -82,6 +110,10 @@
       "evidence": [
         "Native tools routed through confined MCP bridge with literal write grants and private settings. Combined Python boundary/registry/bridge suite: 188 run, 10 skipped, no failures. Earlier native write/read-denial probes passed; latest live probe stopped on Claude quota before tools. Provider transport egress not hostname-restricted.",
         "Native provider process host/read confinement remains unimplemented; concrete host capability probes and exit requirements recorded in docs/autoship/provider-transport-boundary.md. Tool isolation does not prove this broader guarantee."
+      ],
+      "remaining_acceptance": [
+        "Implement and validate authenticated streaming native provider calls inside no-NIC VM with declared credentials and guarded MCP relay.",
+        "Prove every admitted provider/fallback has the same boundary, including denied egress/credential probes and cleanup."
       ]
     },
     {
@@ -91,6 +123,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Independent red/green registration and final adjudicated amendments integrated across fresh/resume/source-less paths. Old approvals discarded after amendments; complete live acceptance pending."
+      ],
+      "remaining_acceptance": [
+        "Rerun native readiness/specification and independently registered verifier pipeline after schema recovery fixes.",
+        "Verify generated verifiers are relevant and baseline failures are behavioral, not setup failures."
       ]
     },
     {
@@ -100,6 +136,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Baseline/no-op/green/tamper verifier fixture passed previously; production call sites integrated. Protected verifier cache and registry integrity checks added; final Rust rerun pending."
+      ],
+      "remaining_acceptance": [
+        "Retain native no-op and seeded-defect negative proofs on the final integrated implementation.",
+        "Verify verifier amendment requires independent authority and fresh baseline; no routine human-only lane."
       ]
     },
     {
@@ -109,6 +149,9 @@
       "implementation_status": "audit_pending",
       "evidence": [
         "Closed foundation preserved: acceptance criteria parsing, transport, schema, required mapping, and resume coverage remain integrated. No reopening or replacement of the closed issue."
+      ],
+      "remaining_acceptance": [
+        "Preserve already-closed criteria foundation; validate final criteria transport/resume and malformed-criteria rescoping during rollout."
       ]
     },
     {
@@ -118,6 +161,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Complete evidence packing and bounded missing-file recovery passed full native clean/seeded probe on 3383566e. Overflowing caller evidence is now typed distinctly; streaming recovery is in development."
+      ],
+      "remaining_acceptance": [
+        "Validate final streamed evidence, exact source windows, controller oracle delivery and automatic NeedEvidence recovery end to end.",
+        "Prove incomplete source cannot approve or become a paid builder repair."
       ]
     },
     {
@@ -127,6 +174,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Authenticated historical comment mining, independent promotion and replay validation integrated. Exact-head contract exceptions persist and are reused only while policy/contract/hunk inputs match. Latest additions need regression run."
+      ],
+      "remaining_acceptance": [
+        "Validate final deterministic constraint promotion and hostile-comment replay with provenance retained."
       ]
     },
     {
@@ -136,6 +186,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Owner-outcome triage joins, disagreement sample and token-usage/digest metrics implemented; two store tests passed. Episode outcome reducer implemented; operational calibration remains pending."
+      ],
+      "remaining_acceptance": [
+        "Verify deployed episode metrics and triage outcome joins/digest; unknown outcomes remain unknown."
       ]
     },
     {
@@ -145,6 +198,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Complete bounded pagination/readmission, durable slicing recovery and historical research dedup implemented. Verified duplicate #912 consolidated into #674 with preserved mapping. Full policy acceptance pending."
+      ],
+      "remaining_acceptance": [
+        "Complete aggregate backlog acceptance across full-pool selection, refusal readmission, relevance, decomposition and research deduplication.",
+        "Audit existing child receipts and retain historical duplicate mapping."
       ]
     },
     {
@@ -154,6 +211,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Email retry full guard-chain and metadata preservation: complete suite 221 passed. Scheduled-loop coverage and digest previously passed 49 tests. Deployed acceptance pending."
+      ],
+      "remaining_acceptance": [
+        "Verify final durable failure/coverage state and email retry guard chain in deployment.",
+        "Verify pending delivery/backoff and scheduled-loop coverage survive restart without losing original execution/delivery bytes."
       ]
     },
     {
@@ -163,6 +224,10 @@
       "implementation_status": "partial",
       "evidence": [
         "Executable contract foundation implemented; material ambiguity routing and production readiness integration pending"
+      ],
+      "remaining_acceptance": [
+        "Rerun native grounded readiness after not_applicable schema correction and raw-response recovery.",
+        "Verify genuine external decisions stay explicit and free while routine gaps progress autonomously."
       ]
     },
     {
@@ -172,6 +237,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Independent hunk/criterion mappings run before model review; protected exact-head alignment artifacts and promoted constraints rechecked. Typed PR-scoped sources supported. Production canary and rollout acceptance still pending."
+      ],
+      "remaining_acceptance": [
+        "Verify final native criterion/hunk alignment and required integration checks for exact merge head."
       ]
     },
     {
@@ -181,6 +249,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Distinct actual native builder/reviewer sessions and exact binding/coverage passed the full native clean/seeded probe on 3383566e. Native adjudicator correction uses a fresh session per call and passed on 8f317dd6."
+      ],
+      "remaining_acceptance": [
+        "Validate final independent actual sessions, typed authority and non-overridable deterministic gates after combined changes."
       ]
     },
     {
@@ -190,6 +261,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Protected audit storage correctly rejected tests whose control evidence lived in managed writable build scratch. Fixtures separated from worker cache; workflow audit tests passed in latest broad run. Runtime and provider-specific targeted suites still required."
+      ],
+      "remaining_acceptance": [
+        "Validate final native VM/relay cannot alter control-plane audit, approval, token or failure history, and recovery rejects tampered evidence."
       ]
     },
     {
@@ -199,6 +273,9 @@
       "implementation_status": "partial",
       "evidence": [
         "Full production native adapter passed clean and seeded-defect probes on 3383566e; native final Codex contradiction probe passed on 8f317dd6. Deployment and ongoing diagnostic observations remain open."
+      ],
+      "remaining_acceptance": [
+        "Run deployed adapter positive/negative diagnostics and verify actual evidence delivery after provider runtime changes."
       ]
     }
   ],
@@ -254,7 +331,7 @@
       "passed": 2,
       "failed": 0
     },
-    "latest_rust_admission": "Managed CLI no-run last succeeded at3c876779. Controller-oracle build session27293 terminated with storage-busy refusal; unrelated daemon workspace test process remains live. No final-head build/CI/deployment claim.",
+    "latest_rust_admission": "Managed CLI no-run last succeeded at3c876779. Retry64665 also terminated storage-busy; kernel lock inspection identifies daemon1181725 as disk-build.lock holder while child workspace tests actively progress. No final-head build/CI/deployment claim.",
     "github_main_rules": {
       "observed": "2026-10-26",
       "rules": [
@@ -649,5 +726,6 @@
       "gap": "Caller evidence exceeding collection bounds is misclassified as reviewer capacity and can repeat unchanged work",
       "status": "typed_evidence_budget_integrated_04479fb2; executable_streaming_recovery_in_progress"
     }
-  ]
+  ],
+  "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
 }
