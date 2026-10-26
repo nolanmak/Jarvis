@@ -314,6 +314,17 @@ impl SweepGuard {
         inner.validate_before_side_effect()
     }
 
+    pub(super) fn record_merge_mutation(
+        &self,
+        operation: &Operation,
+        receipt: &serde_json::Value,
+    ) -> Result<()> {
+        self.inner
+            .as_ref()
+            .context("released sweep lease")?
+            .record_merge_mutation(operation, receipt)
+    }
+
     pub(super) fn merge_intent(&self) -> Result<Operation> {
         self.inner
             .as_ref()
@@ -753,6 +764,22 @@ impl WorkflowGuard {
             .pending_operations(&self.lease.workflow)
     }
 
+    pub(super) fn record_merge_mutation(
+        &self,
+        operation: &Operation,
+        receipt: &serde_json::Value,
+    ) -> Result<()> {
+        self.validate_before_side_effect()?;
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .record_merge_mutation(&self.lease, &operation.id, receipt, millis())?;
+        self.audit_event(
+            "merge_mutation_accepted",
+            serde_json::json!({"operation":operation.id,"receipt":receipt}),
+        )
+    }
+
     pub(super) fn observe_remote(
         &self,
         operation: &Operation,
@@ -775,7 +802,7 @@ impl WorkflowGuard {
             store.attach_pr_in_repo(&self.lease, &self.repository, pr, now)?;
         }
         store.complete_operation(&self.lease, &operation.id, receipt, now)?;
-        if operation.kind == OperationKind::MergePr {
+        if operation.kind == OperationKind::MergePr && store.has_merge_mutation(&operation.id)? {
             let latest = store
                 .events(self.id())?
                 .into_iter()
@@ -1370,7 +1397,7 @@ mod tests {
                 worktree: dir.path(),
                 repository: "owner/repo",
                 source_issue: Some(7),
-                pr: None,
+                pr: Some(42),
                 branch: "fix/seven",
                 contract: "C1",
                 environment: "rust-a",
@@ -1422,6 +1449,11 @@ mod tests {
         };
         assert_eq!(merges(), 0, "LGTM does not count as shipping");
         let op = guard.intent(OperationKind::MergePr).unwrap();
+        assert!(
+            !store.has_merge_mutation(&op.id).unwrap(),
+            "pending intent alone is not autonomous attribution"
+        );
+        guard.record_merge_mutation(&op,&serde_json::json!({"client_mutation_id":op.id,"expected_head":op.binding.head,"pr_number":42,"pr_node_id":"PR_fixture","merge_commit":"merged-sha","merged_by":"owner"})).unwrap();
         guard
             .observe_remote(&op, "github:pr:42:merged:fixture", Some(42))
             .unwrap();

@@ -224,6 +224,8 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS operation (
                 id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id),
                 kind TEXT NOT NULL, binding TEXT NOT NULL, receipt TEXT, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS merge_mutation_receipt (
+                operation TEXT PRIMARY KEY REFERENCES operation(id), receipt TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS review (
                 workflow TEXT NOT NULL REFERENCES workflow(id), reviewer TEXT NOT NULL,
                 binding TEXT NOT NULL, approved INTEGER NOT NULL, evidence TEXT NOT NULL,
@@ -619,6 +621,93 @@ impl WorkflowStore {
 
     /// Complete after observing the remote result (including reconciliation).
     /// Existing receipt cannot be rewritten, even by a later valid lease.
+    /// Accepted mutation response is distinct from observing somebody's merge.
+    /// An uncertain/lost response must never be invented during reconciliation.
+    pub fn record_merge_mutation(
+        &mut self,
+        lease: &Lease,
+        operation: &str,
+        receipt: &serde_json::Value,
+        now: i64,
+    ) -> Result<()> {
+        let raw = serde_json::to_string(receipt)?;
+        ensure!(raw.len() <= 16 * 1024, "merge mutation receipt too large");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let (kind, binding, completed): (String, String, Option<String>) = tx.query_row(
+            "SELECT kind,binding,receipt FROM operation WHERE id=?1 AND workflow=?2",
+            params![operation, lease.workflow],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let binding: Binding = serde_json::from_str(&binding)?;
+        require_binding(&tx, lease, &binding, now)?;
+        ensure!(
+            serde_json::from_str::<OperationKind>(&kind)? == OperationKind::MergePr,
+            "mutation receipt requires merge operation"
+        );
+        ensure!(
+            receipt["client_mutation_id"].as_str() == Some(operation)
+                && receipt["expected_head"].as_str() == Some(binding.head.as_str()),
+            "mutation response identity differs from intent"
+        );
+        let pr: Option<u64> = tx.query_row(
+            "SELECT pr FROM workflow WHERE id=?1",
+            [&lease.workflow],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            pr.is_some() && receipt["pr_number"].as_u64() == pr,
+            "mutation response PR differs from workflow"
+        );
+        for field in ["pr_node_id", "merge_commit", "merged_by"] {
+            ensure!(
+                receipt[field]
+                    .as_str()
+                    .is_some_and(|v| !v.trim().is_empty()),
+                "mutation response missing {field}"
+            );
+        }
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT receipt FROM merge_mutation_receipt WHERE operation=?1",
+                [operation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            ensure!(prior == raw, "immutable mutation receipt conflict");
+        } else {
+            ensure!(
+                completed.is_none(),
+                "cannot attribute an already-reconciled merge retroactively"
+            );
+            tx.execute(
+                "INSERT INTO merge_mutation_receipt VALUES(?1,?2)",
+                params![operation, raw],
+            )?;
+            event(
+                &tx,
+                &lease.workflow,
+                lease.generation,
+                "merge_mutation_accepted",
+                &serde_json::json!({"operation":operation,"receipt":receipt}).to_string(),
+                now,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn has_merge_mutation(&self, operation: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM merge_mutation_receipt WHERE operation=?1)",
+            [operation],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn complete_operation(
         &mut self,
         lease: &Lease,
@@ -1344,6 +1433,54 @@ mod tests {
             .admit_episode_action(&next, "epoch-b", "rescope", 1025)
             .unwrap());
     }
+    #[test]
+    fn autonomous_attribution_requires_accepted_exact_mutation_before_confirmation() {
+        for accepted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            let (mut store, lease) = setup(&path);
+            store.attach_pr(&lease, 42, 30).unwrap();
+            let operation = store
+                .begin_operation(&lease, OperationKind::MergePr, &binding(), 31)
+                .unwrap();
+            let receipt = serde_json::json!({"client_mutation_id":operation.id,"expected_head":binding().head,
+                "pr_number":42,"pr_node_id":"PR_fixture","merge_commit":"merged-sha","merged_by":"owner"});
+            let mut wrong = receipt.clone();
+            wrong["expected_head"] = serde_json::json!("other-head");
+            assert!(store
+                .record_merge_mutation(&lease, &operation.id, &wrong, 32)
+                .is_err());
+            if accepted {
+                store
+                    .record_merge_mutation(&lease, &operation.id, &receipt, 33)
+                    .unwrap();
+            }
+            store
+                .complete_operation(&lease, &operation.id, "observed-merged-exact", 34)
+                .unwrap();
+            drop(store);
+            let mut store = WorkflowStore::open(&path).unwrap();
+            assert_eq!(store.has_merge_mutation(&operation.id).unwrap(), accepted);
+            if !accepted {
+                assert!(
+                    store
+                        .record_merge_mutation(&lease, &operation.id, &receipt, 35)
+                        .is_err(),
+                    "manual/lost-response merge must not gain retroactive attribution"
+                );
+            } else {
+                store
+                    .record_merge_mutation(&lease, &operation.id, &receipt, 35)
+                    .unwrap();
+                let mut changed = receipt.clone();
+                changed["merged_by"] = serde_json::json!("other-actor");
+                assert!(store
+                    .record_merge_mutation(&lease, &operation.id, &changed, 36)
+                    .is_err());
+            }
+        }
+    }
+
     #[test]
     fn reopening_recovers_checkpoint_and_uncertain_remote_operation() {
         let dir = tempfile::tempdir().unwrap();
