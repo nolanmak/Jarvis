@@ -135,3 +135,39 @@ fn recovery_discards_live_receipts_for_stopped_calls_without_losing_jobs() {
         Some("Calendar is clear.")
     );
 }
+
+#[test]
+fn voice_backend_snapshot_is_immutable_and_old_calls_keep_legacy_transport() {
+    let (_dir, store, id) = fixture();
+    assert_eq!(
+        store.phone_voice_backend(&id).unwrap(),
+        "conversation_relay"
+    );
+    assert!(
+        store.phone_set_voice_backend(&id, "openai_live").is_err(),
+        "cannot change an answered call"
+    );
+    store
+        .phone_import_destination("other", "+12025550124", 0)
+        .unwrap();
+    let call = store
+        .phone_reserve_call(ReserveCall {
+            owner: "other",
+            request_id: "new",
+            conversation: "other-chat",
+            now_ms: 0,
+        })
+        .unwrap()
+        .call;
+    store
+        .phone_set_voice_backend(&call.id, "openai_live")
+        .unwrap();
+    store
+        .phone_set_voice_backend(&call.id, "openai_live")
+        .unwrap();
+    assert_eq!(store.phone_voice_backend(&call.id).unwrap(), "openai_live");
+    assert!(store
+        .phone_set_voice_backend(&call.id, "conversation_relay")
+        .is_err());
+    assert!(store.phone_set_voice_backend(&call.id, "unknown").is_err());
+}

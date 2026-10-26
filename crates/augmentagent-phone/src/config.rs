@@ -114,7 +114,20 @@ impl Settings {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        let voice = VoiceConfig::from_lookup(&get)?;
+        let backend = crate::live_config::VoiceBackend::from_lookup(&get)?;
+        let live = match backend {
+            crate::live_config::VoiceBackend::ConversationRelay => None,
+            crate::live_config::VoiceBackend::OpenAiLive => Some(
+                crate::live_config::LiveConfig::new(
+                    get("OPENAI_API_KEY").ok_or(Error::InvalidSetting("OPENAI_API_KEY"))?,
+                )?,
+            ),
+        };
+        let voice = if live.is_some() {
+            VoiceConfig::default()
+        } else {
+            VoiceConfig::from_lookup(&get)?
+        };
         // Relay debug events (#1551): explicit on/off; absent defaults on for
         // non-production (debug) builds only.
         let debug_events = match get("AUGMENTAGENT_PHONE_DEBUG_EVENTS").as_deref() {
@@ -124,14 +137,23 @@ impl Settings {
             _ => return Err(Error::NotConfigured),
         };
         // #1555: explicit on/off, default off; inert without the fast layer.
-        let preemptive = match get("AUGMENTAGENT_PHONE_PREEMPTIVE").as_deref() {
+        let legacy_preemptive = if live.is_none() {
+            get("AUGMENTAGENT_PHONE_PREEMPTIVE")
+        } else {
+            None
+        };
+        let preemptive = match legacy_preemptive.as_deref() {
             None | Some("0") => false,
             Some("1") => true,
             _ => return Err(Error::NotConfigured),
         };
         let silence = crate::silence::SilencePolicy::from_lookup(&get)?;
         let public_url = required("AUGMENTAGENT_PHONE_PUBLIC_URL")?;
-        let fast = crate::fast::FastLayerConfig::from_lookup(&get, &public_url)?;
+        let fast = if live.is_none() {
+            crate::fast::FastLayerConfig::from_lookup(&get, &public_url)?
+        } else {
+            None
+        };
         let phone = PhoneConfig::new(
             true,
             &public_url,
@@ -144,6 +166,7 @@ impl Settings {
         .with_barge_in(barge_in(&get)?)
         .with_fast_layer(fast)
         .with_preemptive(preemptive)
+        .with_live(live)
         .with_proposals(crate::proposals::ProposalPolicy::from_lookup(&get)?);
         let account = required("TWILIO_ACCOUNT_SID")?;
         let token = required("TWILIO_AUTH_TOKEN")?;
@@ -160,6 +183,13 @@ impl Settings {
             auth,
             voice,
         }))
+    }
+    pub fn voice_backend(&self) -> crate::live_config::VoiceBackend {
+        if self.phone.live.is_some() {
+            crate::live_config::VoiceBackend::OpenAiLive
+        } else {
+            crate::live_config::VoiceBackend::ConversationRelay
+        }
     }
     /// Validated silence thresholds (#1556).
     pub fn silence(&self) -> crate::silence::SilencePolicy {

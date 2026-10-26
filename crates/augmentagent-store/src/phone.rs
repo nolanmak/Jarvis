@@ -2061,3 +2061,54 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    pub fn phone_voice_backend(&self, call_id: &str) -> PhoneResult<String> {
+        transaction(self, |tx| {
+            call_by_id(tx, call_id)?;
+            let backend: Option<String> = tx
+                .query_row(
+                    "SELECT backend FROM phone_voice_backends WHERE call_id=?1",
+                    [call_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(backend.unwrap_or_else(|| "conversation_relay".into()))
+        })
+    }
+    /// Operator configuration, persisted before the provider can receive a dial.
+    pub fn phone_set_voice_backend(&self, call_id: &str, backend: &str) -> PhoneResult<()> {
+        if !matches!(backend, "conversation_relay" | "openai_live") {
+            return Err(PhoneError::InvalidInput);
+        }
+        transaction(self, |tx| {
+            let call = call_by_id(tx, call_id)?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT backend FROM phone_voice_backends WHERE call_id=?1",
+                    [call_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                return if existing == backend {
+                    Ok(())
+                } else {
+                    Err(PhoneError::Conflict)
+                };
+            }
+            if call.state != CallState::Requesting
+                || call.provider_sid.is_some()
+                || call.stop_requested
+                || call.verification
+            {
+                return Err(PhoneError::Conflict);
+            }
+            tx.execute(
+                "INSERT INTO phone_voice_backends(call_id,backend) VALUES(?1,?2)",
+                params![call_id, backend],
+            )?;
+            Ok(())
+        })
+    }
+}

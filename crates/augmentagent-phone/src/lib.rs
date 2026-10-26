@@ -133,6 +133,7 @@ pub struct PhoneConfig {
     verification_key: Vec<u8>,
     links: Vec<OwnerLink>,
     voice: voice::VoiceConfig,
+    live: Option<live_config::LiveConfig>,
     owner_first_name: Option<String>,
     debug_events: bool,
     barge_in: relay::BargeIn,
@@ -177,6 +178,7 @@ impl PhoneConfig {
             verification_key: verification_key.as_bytes().into(),
             links,
             voice: voice::VoiceConfig::default(),
+            live: None,
             owner_first_name: None,
             debug_events: false,
             barge_in: relay::BargeIn::default(),
@@ -185,6 +187,14 @@ impl PhoneConfig {
             proposals: proposals::ProposalPolicy::default(),
             silence: silence::SilencePolicy::default(),
         })
+    }
+    pub fn with_live(mut self, live: Option<live_config::LiveConfig>) -> Self {
+        self.live = live;
+        if self.live.is_some() {
+            self.fast = None;
+            self.preemptive = false;
+        }
+        self
     }
     /// Quiet hours and owner time zone for agent-proposed calls (#1553).
     pub fn with_proposals(mut self, proposals: proposals::ProposalPolicy) -> Self {
@@ -281,14 +291,25 @@ impl PhoneService {
     pub fn debug_events(&self) -> bool {
         self.config.debug_events
     }
-    /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
+    /// Operator selection for the next reserved call.
+    pub fn voice_backend(&self) -> live_config::VoiceBackend {
+        if self.config.live.is_some() {
+            live_config::VoiceBackend::OpenAiLive
+        } else {
+            live_config::VoiceBackend::ConversationRelay
+        }
+    }
+    /// Legacy text fast layer; always absent for Live sessions.
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
+        if self.config.live.is_some() {
+            return None;
+        }
         self.config.fast.as_ref()
     }
     /// `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer (#1555): TwiML
     /// requests interim prompts and the relay may speculate on them.
     pub fn preemptive(&self) -> bool {
-        self.config.preemptive && self.config.fast.is_some()
+        self.config.live.is_none() && self.config.preemptive && self.config.fast.is_some()
     }
     /// Silence check-in and automatic-end thresholds (#1556).
     pub fn silence_policy(&self) -> silence::SilencePolicy {
@@ -476,6 +497,7 @@ impl PhoneService {
     }
     async fn finish_call_reservation(&self, grant: &Grant, reserved: augmentagent_store::phone::CallReservation) -> Result<PhoneCall, Error> {
         if reserved.should_dial {
+            self.store.phone_set_voice_backend(&reserved.call.id, self.voice_backend().as_str())?;
             let action = format!(
                 "{}/phone/start/{}",
                 self.config.public_base, reserved.call.id
@@ -809,3 +831,5 @@ pub mod live_connection;
 pub mod live_context;
 
 pub mod live_call;
+
+pub mod live_config;

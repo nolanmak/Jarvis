@@ -192,3 +192,9 @@ CREATE TABLE IF NOT EXISTS phone_live_dispatches (
     UNIQUE(call_id,task_id),
     FOREIGN KEY(call_id,task_id) REFERENCES phone_dispatch_jobs(call_id,task_id)
 );
+
+-- Backend choice is fixed before dialing; absent rows are legacy calls.
+CREATE TABLE IF NOT EXISTS phone_voice_backends (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    backend TEXT NOT NULL CHECK(backend IN ('conversation_relay','openai_live'))
+);

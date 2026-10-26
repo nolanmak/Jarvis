@@ -33,7 +33,13 @@ pub async fn start(
     if dry_run {
         return Ok(None);
     }
-    let Some(settings) = Settings::from_env()? else {
+    let Some(settings) = Settings::from_lookup(|key| {
+        if key == "OPENAI_API_KEY" {
+            augmentagent_channel_core::secret_loader::load_provider_key(key)
+        } else {
+            std::env::var(key).ok()
+        }
+    })? else {
         return Ok(None);
     };
     let configured = settings.build(store.clone())?;
