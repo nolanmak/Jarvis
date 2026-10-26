@@ -4249,6 +4249,15 @@ async fn independent_review_with_context(
     workflow: Option<&workflow::WorkflowGuard>,
     acceptance_evidence: Option<(&acceptance::PreparedAcceptance, &acceptance::CandidateReceiptReference)>,
 ) -> IndependentReview {
+    // Unknown origins need a protected workflow/adoption context before any
+    // environment or provider access. Ownership is never inferred from prose.
+    if workflow.is_none() {
+        match builder.review_authors() {
+            Ok(None) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnknown),
+            Err(error) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnverifiable { error: format!("{error:#}") }),
+            Ok(Some(_)) => {}
+        }
+    }
     let (compiler_ok, compiler, _) = match run("rustc", &["-vV"], &worktree).await {
         Ok(result) => result,
         Err(error) => return IndependentReview::not_run(format!("review environment unavailable: {error:#}")),
@@ -6618,7 +6627,7 @@ async fn resume_draft_pr(
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
     let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
     let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, resume_base.trim(), &acceptance_scope, reasoner, &acceptance::worker_roots(&worktree), &resumed_criteria).await {
+        issue.number, resume_base.trim(), &acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &resumed_criteria).await {
         Ok(prepared) => prepared,
         Err(error) => {
             workflow.transition(Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
@@ -8049,7 +8058,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let acceptance_control = acceptance::control_directory(&repository)?;
     let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
     let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
-        issue.number, candidate_base, acceptance_scope, &reasoner, &acceptance::worker_roots(&worktree), &criteria).await {
+        issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria).await {
         Ok(prepared) => prepared,
         Err(error) => {
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
@@ -16724,7 +16733,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let body = &src[start..end];
         let sweep = body.find("drafts_to_close(").expect("sweep");
         let close = body.find("close_gave_up_pr(").expect("close in sweep");
-        let choose = body.find("resumable_from(").expect("choice");
+        let choose = body.find("adoption::select_linked(").expect("authorized choice");
         assert!(sweep < close && close < choose, "sweep, close, then choose");
     }
 
@@ -18806,6 +18815,8 @@ if args[:1]==['api'] and '/issues/' in args[1]:
     number=int(args[1].rsplit('/',1)[1])
     print(json.dumps({'number':number,'title':'Synthetic casing rule','body':'Synthetic issue body.',
         'state':'open','user':{'login':'synthetic-owner'},'author_association':'OWNER'}))
+elif args[:2]==['repo','view']:
+    print('synthetic-owner/synthetic')
 elif args[:2]==['pr','view']:
     print(json.dumps({'body':'Automated self-improvement for #70994.\n\n## Summary\nSynthetic.\n\n- complexity (scoping pass): simple\n'}))
 elif args[:2]==['issue','edit'] and (root/'fail-label').exists():

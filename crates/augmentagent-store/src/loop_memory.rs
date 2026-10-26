@@ -174,6 +174,8 @@ impl Store {
             |r| r.get(0),
         )?;
         let now = now_millis();
+        tx.execute("INSERT INTO loop_occurrence_failures(request_id,stage,detail,observed_at_ms) VALUES(?1,?2,?3,?4)",
+            params![request_id,if post_failed { "delivery" } else { "execution" },redact::mask(error),now])?;
         tx.execute(
             "UPDATE loop_occurrences SET state=?2,error=?3,updated_at_ms=?4 WHERE request_id=?1",
             params![
