@@ -354,6 +354,9 @@ async fn runtime_resumes_durable_tasks_without_a_live_relay() {
     let call = store.phone_reserve_call(augmentagent_store::phone::ReserveCall {
         owner: "owner", request_id: "earlier-call", conversation: "chat", now_ms: 0,
     }).unwrap().call;
+    // The call has ended; recovery must not need a live relay or a dial permit.
+    store.phone_bind_provider(&call.id, "CA-earlier").unwrap();
+    store.phone_provider_event(&call.id, "CA-earlier", CallState::Canceled, 100).unwrap();
     store.phone_enqueue_dispatch(&call.id, "persisted-task", "Synthetic task").unwrap();
     let service = Arc::new(PhoneService::new(store, Arc::new(Provider::default()), Arc::new(Time(AtomicI64::new(100))),
         PhoneConfig::new(true, "https://phone.example.test", "runtime-test-verification-secret-32", vec![]).unwrap()));
