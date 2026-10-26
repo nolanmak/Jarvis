@@ -186,11 +186,11 @@ mod tests {
             );
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new().prefix("autoship-resource-policy-").tempdir_in("/tmp").unwrap();
         let logger = Arc::new(
             crate::tool_audit::AuditLogger::protected(
-                directory.path().join("audit"),
-                directory.path().join("anchor"),
+                directory.path().join("logs/audit.jsonl"),
+                directory.path().join("anchors/audit.json"),
                 &[],
             )
             .unwrap(),
