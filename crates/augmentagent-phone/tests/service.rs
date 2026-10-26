@@ -3544,10 +3544,9 @@ async fn ac03_ten_consecutive_invalid_frames_send_end_then_close_and_a_valid_fra
 }
 
 // #1549: the provider closes the relay socket before the status callback that
-// records the hang-up, so a close alone must not settle the end reason. Epic
-// #1554 gate G1 expects `owner_hangup` on the ending log line.
+// records a terminal state. Completion alone does not establish who hung up.
 #[tokio::test]
-async fn a_close_followed_by_the_completed_status_is_recorded_as_owner_hangup() {
+async fn delayed_terminal_callbacks_do_not_invent_owner_hangup() {
     use augmentagent_store::phone::CallState;
     use futures::SinkExt;
     let captured = capture::install();
@@ -3559,10 +3558,13 @@ async fn a_close_followed_by_the_completed_status_is_recorded_as_owner_hangup() 
             .to_string()
             .into(),
     );
-    for (how, completed, expected) in [
-        ("close", true, "owner_hangup"),
-        ("close", false, "peer_closed"),
-        ("provider_terminated", true, "owner_hangup"),
+    for (how, terminal, expected) in [
+        ("close", Some(CallState::Completed), "peer_closed"),
+        ("close", None, "peer_closed"),
+        ("provider_terminated", Some(CallState::Completed), "peer_closed"),
+        ("close", Some(CallState::Failed), "transport_error"),
+        ("close", Some(CallState::Canceled), "peer_closed"),
+        ("provider_terminated", Some(CallState::Failed), "transport_error"),
     ] {
         let mut relay = connect_relay(Arc::new(ScriptedAgent)).await;
         relay.socket.send(prompt("hello")).await.unwrap();
@@ -3572,7 +3574,7 @@ async fn a_close_followed_by_the_completed_status_is_recorded_as_owner_hangup() 
         } else {
             relay.socket.send(terminal_error.clone()).await.unwrap();
         }
-        if completed {
+        if let Some(terminal) = terminal {
             // The status callback lands after the close, as it does live: the
             // relay loop has already left its frame loop by now. Well under the
             // recheck window, so a slow host (a sluggish store write, a busy
@@ -3580,7 +3582,7 @@ async fn a_close_followed_by_the_completed_status_is_recorded_as_owner_hangup() 
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             relay
                 .store
-                .phone_provider_event(&relay.id, "CA-test", CallState::Completed, 200)
+                .phone_provider_event(&relay.id, "CA-test", terminal, 200)
                 .unwrap();
         }
         let reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -3602,7 +3604,7 @@ async fn a_close_followed_by_the_completed_status_is_recorded_as_owner_hangup() 
         })
         .await
         .expect("ending log line");
-        assert!(reason.contains(expected), "{how}/completed={completed}: {reason}");
+        assert!(reason.contains(expected), "{how}/terminal={terminal:?}: {reason}");
         relay.server.abort();
     }
 }

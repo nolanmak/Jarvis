@@ -652,8 +652,8 @@ pub enum EndReason {
     PeerClosed,
     /// A read or write on the socket failed.
     TransportError,
-    /// The call left the connected state or a stop was requested, including
-    /// an `end` we sent ourselves.
+    /// Reserved for explicit evidence that the owner hung up; generic terminal
+    /// state and cleanup stop requests do not establish the initiator.
     OwnerHangup,
     /// Call authority can no longer be verified.
     Revoked,
@@ -1203,11 +1203,8 @@ async fn run_socket(state: Ingress, call: PhoneCall, mut socket: WebSocket) {
         }
     };
     let end_reason = if silence_ending && end_reason == EndReason::AgentEnd { EndReason::Silence } else { end_reason };
-    // #1549: an owner hang-up reaches us as a socket close first; the status
-    // callback that leaves the connected state follows. Every close goes
-    // through the recheck, including a provider-reported session end, because
-    // the provider's own error frame is how some hang-ups arrive. Reclassify
-    // before the teardown below requests a stop of its own.
+    // A delayed failure callback can explain a socket close. Completion alone
+    // cannot identify who hung up. Recheck before our own cleanup requests stop.
     let end_reason = if end_reason == EndReason::PeerClosed {
         reclassify_peer_close(&state.service, &call).await
     } else {
@@ -1709,15 +1706,9 @@ fn admit_peer_close_recheck() -> Option<tokio::sync::SemaphorePermit<'static>> {
     PEER_CLOSE_RECHECKS.try_acquire().ok()
 }
 
-/// Whether a provider socket close was really the owner hanging up (#1549).
-/// Twilio closes the relay socket before its status callback lands, so the
-/// stored state is still `Connected` at the moment of the close. Only positive
-/// evidence within [`PEER_CLOSE_RECHECK`] upgrades the reason; a store that
-/// cannot be read, cannot answer inside the window, or has no recheck slot
-/// free, keeps the close as it was classified. The read is synchronous, so the
-/// whole bounded retry runs in a single blocking task: a stalled store must not
-/// hold teardown open, and a close must not leave one abandoned blocking read
-/// per step queued in the shared pool.
+/// Bounded delayed failure evidence. A completion/stop flag does not identify
+/// who ended a call. Keep ambiguous closes as peer_closed, including when the
+/// store cannot answer. A single admitted blocking task bounds abandoned reads.
 async fn reclassify_peer_close(service: &PhoneService, call: &PhoneCall) -> EndReason {
     let Some(slot) = admit_peer_close_recheck() else {
         return EndReason::PeerClosed;
@@ -1728,18 +1719,18 @@ async fn reclassify_peer_close(service: &PhoneService, call: &PhoneCall) -> EndR
         let deadline = std::time::Instant::now() + PEER_CLOSE_RECHECK;
         loop {
             if let Ok(current) = store.phone_provider_call(&id) {
-                if current.stop_requested || current.state != CallState::Connected {
-                    return true;
+                if let Some(reason) = observed_call_end(current.state, current.stop_requested) {
+                    return reason;
                 }
             }
             if std::time::Instant::now() + PEER_CLOSE_RECHECK_STEP > deadline {
-                return false;
+                return EndReason::PeerClosed;
             }
             std::thread::sleep(PEER_CLOSE_RECHECK_STEP);
         }
     });
     match tokio::time::timeout(PEER_CLOSE_RECHECK + PEER_CLOSE_RECHECK_STEP, recheck).await {
-        Ok(Ok(true)) => EndReason::OwnerHangup,
+        Ok(Ok(reason)) => reason,
         _ => EndReason::PeerClosed,
     }
 }
@@ -1757,8 +1748,11 @@ fn call_end_reason(service: &PhoneService, original: &PhoneCall) -> Option<EndRe
         tracing::warn!(call_id = %original.id, detail = "call_state_unavailable", "phone relay cannot verify call state");
         return Some(EndReason::Revoked);
     };
-    if current.stop_requested || current.state != CallState::Connected {
-        return Some(EndReason::OwnerHangup);
+    if service.authorize_call_origin(&current).is_err() {
+        return Some(EndReason::Revoked);
+    }
+    if let Some(reason) = observed_call_end(current.state, current.stop_requested) {
+        return Some(reason);
     }
     service
         .authorize_call(&original.id)
@@ -1780,5 +1774,42 @@ mod tests {
         assert!(admit_peer_close_recheck().is_none());
         drop(held);
         assert!(admit_peer_close_recheck().is_some());
+    }
+}
+
+// Generic cleanup and provider completion cannot identify who hung up.
+fn observed_call_end(state: CallState, stop_requested: bool) -> Option<EndReason> {
+    if state == CallState::Failed {
+        Some(EndReason::TransportError)
+    } else if stop_requested || state != CallState::Connected {
+        Some(EndReason::PeerClosed)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+    #[test]
+    fn provider_failure_and_cleanup_never_masquerade_as_owner_hangup() {
+        for stop in [false, true] {
+            assert_eq!(
+                observed_call_end(CallState::Failed, stop),
+                Some(EndReason::TransportError)
+            );
+            for state in [
+                CallState::Canceled,
+                CallState::Completed,
+                CallState::Uncertain,
+            ] {
+                assert_eq!(observed_call_end(state, stop), Some(EndReason::PeerClosed));
+            }
+        }
+        assert_eq!(
+            observed_call_end(CallState::Connected, true),
+            Some(EndReason::PeerClosed)
+        );
+        assert_eq!(observed_call_end(CallState::Connected, false), None);
     }
 }
