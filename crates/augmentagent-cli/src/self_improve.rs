@@ -6613,7 +6613,7 @@ async fn resume_draft_pr(
     let imported = adoption::preflight(repo_root, pr, branch).await?;
     if imported { prior_qa = None; prior_notes = None; }
     let reviewer = if imported && authors.is_ok() { adoption::imported_reviewer() }
-        else { select_reviewer(&reviewer_pool(), authors, reviewer_status) };
+        else { select_session_isolated_reviewer(&reviewer_pool(), authors, reviewer_status) };
     if let Err(why) = reviewer {
         return Ok(hold_unreviewable(
             repo_root,
