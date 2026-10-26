@@ -7969,8 +7969,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     scope_prompt.push_str(&merged_since_section(
         &merged_since_filed(repo_root, &worktree, issue.number).await,
     ));
-    let scope = match reasoner
-        .call(&scope_opts(worktree.clone()), &scope_prompt)
+    let scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {
         Ok(p) => Some(parse_scope_output(&p)),

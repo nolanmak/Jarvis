@@ -13,6 +13,9 @@ use tokio::io::AsyncReadExt;
 
 #[path = "self_improve_amendment.rs"]
 mod amendment;
+#[path = "self_improve_scope.rs"]
+mod scope_authority;
+pub(super) use scope_authority::run as scope_original;
 
 const SANDBOX: &str = include_str!("../../../scripts/codex-command-sandbox.py");
 const DEPENDENCY_AUDIT: &str = include_str!("../../../scripts/autoship-registry-integrity.py");
