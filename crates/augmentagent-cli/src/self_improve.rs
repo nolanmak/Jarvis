@@ -55,6 +55,8 @@ mod workflow;
 mod recovery;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
+#[path = "self_improve_alignment.rs"]
+mod alignment;
 #[path = "self_improve_publication.rs"]
 mod publication;
 #[path = "self_improve_review.rs"]

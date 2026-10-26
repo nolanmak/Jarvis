@@ -1134,6 +1134,8 @@ pub(super) struct CandidateReceiptReference {
     pub artifact: PathBuf,
     pub artifact_sha256: String,
     pub receipt_ids: Vec<String>,
+    #[serde(default)]
+    pub alignment: Option<alignment::Reference>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1203,6 +1205,7 @@ fn persist_candidate_artifact(
         artifact: path.clone(),
         artifact_sha256,
         receipt_ids,
+        alignment: None,
     };
     ensure!(
         serde_json::to_vec(&reference)?.len() <= 32 * 1024,
@@ -1331,9 +1334,29 @@ pub(super) async fn verify_with_repair(
                 "candidate path outside independently registered scope: {path}"
             );
         }
-        match verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree))
-            .await
-        {
+        let verified = async {
+            let mut reference =
+                verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree))
+                    .await?;
+            reference.alignment = Some(
+                alignment::gate(
+                    reasoner,
+                    issue,
+                    worktree,
+                    prepared,
+                    control,
+                    workflow.audit_logger(),
+                )
+                .await?,
+            );
+            ensure!(
+                serde_json::to_vec(&reference)?.len() <= 32 * 1024,
+                "combined acceptance/alignment checkpoint exceeds budget"
+            );
+            Ok::<_, anyhow::Error>(reference)
+        }
+        .await;
+        match verified {
             Ok(reference) => {
                 workflow.bind_acceptance(prepared)?;
                 workflow
@@ -1353,7 +1376,10 @@ pub(super) async fn verify_with_repair(
                     || detail.contains("toolchain")
                     || detail.contains("environment changed")
                     || detail.contains("disk")
-                    || detail.contains("admission");
+                    || detail.contains("admission")
+                    || detail.contains("alignment reviewer unavailable")
+                    || detail.contains("alignment transport")
+                    || detail.contains("alignment invalid structured response");
                 if infrastructure {
                     workflow
                         .transition(
@@ -1428,6 +1454,15 @@ pub(super) async fn assert_receipt_current(
         )?,
         "acceptance artifact does not prove candidate"
     );
+    alignment::assert_current(
+        worktree,
+        prepared,
+        reference
+            .alignment
+            .as_ref()
+            .context("candidate lacks independent alignment evidence")?,
+    )
+    .await?;
     let status = trusted_git(
         worktree,
         &["status", "--porcelain", "--untracked-files=all"],
