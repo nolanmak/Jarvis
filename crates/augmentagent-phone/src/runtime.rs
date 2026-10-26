@@ -46,6 +46,7 @@ impl PhoneRuntime {
         // Synchronous reconciliation marks stale calls stopped before callers
         // get access to the new runtime and can request another call.
         let initial = service.cleanup_due(true)?;
+        service.store.phone_reconcile_live_sessions().map_err(Error::from)?;
         let stop = CancellationToken::new();
         let dispatches = tokio::spawn(dispatch_worker(
             service.clone(),
@@ -126,6 +127,7 @@ pub fn mark_cleanup_pending(store: &augmentagent_store::Store) -> Result<bool, R
             store.phone_mark_uncertain(&call.id).map_err(Error::from)?;
         }
     }
+    store.phone_reconcile_live_sessions().map_err(Error::from)?;
     Ok(!calls.is_empty())
 }
 
@@ -290,14 +292,15 @@ async fn dispatch_worker(
     loop {
         tokio::select! {
             _ = stop.cancelled() => return Ok(()),
-            _ = interval.tick() => {
-                let Ok(jobs) = service.store.phone_pending_dispatches() else { continue; };
-                for job in jobs {
-                    if stop.is_cancelled() { return Ok(()); }
-                    if let Ok(call) = service.store.phone_provider_call(&job.call_id) {
-                        let _ = agent.resume_task(&call, &job.task_id).await;
-                    }
-                }
+            _ = interval.tick() => {},
+            _ = service.dispatch_ready.notified() => {},
+        }
+        service.store.phone_reconcile_live_sessions().map_err(Error::from)?;
+        let Ok(jobs) = service.store.phone_pending_dispatches() else { continue; };
+        for job in jobs {
+            if stop.is_cancelled() { return Ok(()); }
+            if let Ok(call) = service.store.phone_provider_call(&job.call_id) {
+                let _ = agent.resume_task(&call, &job.task_id).await;
             }
         }
     }

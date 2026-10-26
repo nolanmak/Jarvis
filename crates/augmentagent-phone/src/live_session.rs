@@ -68,6 +68,9 @@ pub enum CloseReason {
 // No Debug implementations on content-bearing session/events.
 pub enum LiveInput {
     Ignored,
+    CommentaryAccepted {
+        client_event_id: String,
+    },
     Started,
     Audio(Vec<u8>),
     Transcript {
@@ -283,6 +286,20 @@ impl LiveSession {
                     return Err(LiveError::Capacity);
                 }
                 Ok(LiveInput::Audio(bytes))
+            }
+            "session.commentary.appended" => {
+                if self.state == LiveState::Closing {
+                    return Ok(LiveInput::Ignored);
+                }
+                if self.state != LiveState::Active {
+                    return Err(LiveError::State);
+                }
+                let Some(client_id) = v.get("client_event_id") else {
+                    return Ok(LiveInput::Ignored);
+                };
+                Ok(LiveInput::CommentaryAccepted {
+                    client_event_id: bounded_id(client_id)?,
+                })
             }
             "session.input_transcript.delta" | "session.output_transcript.delta" => {
                 if self.state == LiveState::Closing {

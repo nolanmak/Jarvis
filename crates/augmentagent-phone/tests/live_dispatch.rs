@@ -110,3 +110,28 @@ fn ending_live_session_preserves_background_job_but_discards_audio_delivery() {
         Some("Calendar is clear.")
     );
 }
+
+#[test]
+fn recovery_discards_live_receipts_for_stopped_calls_without_losing_jobs() {
+    let (_dir, store, id) = fixture();
+    store.phone_claim_relay(&id, "CA-test").unwrap();
+    store.phone_bind_live_session(&id, "session-one").unwrap();
+    let task = store
+        .phone_enqueue_live_dispatch(&id, "session-one", "del", "Check calendar")
+        .unwrap();
+    store.phone_request_stop("owner", &id).unwrap();
+    store.phone_reconcile_live_sessions().unwrap();
+    store
+        .phone_finish_dispatch(&id, &task, "Calendar is clear.")
+        .unwrap();
+    assert!(store
+        .phone_live_results(&id, "session-one")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.phone_pending_dispatches().unwrap()[0]
+            .result
+            .as_deref(),
+        Some("Calendar is clear.")
+    );
+}

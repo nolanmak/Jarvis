@@ -2049,3 +2049,15 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// Recover receipt cleanup after process death or a failed coordinator Drop.
+    /// This never cancels native jobs or changes their original chat outbox.
+    pub fn phone_reconcile_live_sessions(&self) -> PhoneResult<()> {
+        transaction(self, |tx| {
+            tx.execute("UPDATE phone_live_sessions SET active=0 WHERE active=1 AND call_id IN (SELECT id FROM phone_calls WHERE state!='connected' OR stop_requested=1 OR ended_ms IS NOT NULL)", [])?;
+            tx.execute("UPDATE phone_live_dispatches SET delivered=1,result=NULL WHERE delivered=0 AND call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0)", [])?;
+            Ok(())
+        })
+    }
+}

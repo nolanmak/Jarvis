@@ -248,6 +248,7 @@ pub struct PhoneService {
     cleanup_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Whether this service holds an open call-proposal answer window (#1553).
     consent_window: std::sync::atomic::AtomicBool,
+    dispatch_ready: tokio::sync::Notify,
 }
 impl Drop for PhoneService {
     fn drop(&mut self) {
@@ -269,6 +270,7 @@ impl PhoneService {
             stopping: std::sync::atomic::AtomicBool::new(false),
             cleanup_inflight: Arc::new(std::sync::Mutex::new(Default::default())),
             consent_window: std::sync::atomic::AtomicBool::new(false),
+            dispatch_ready: tokio::sync::Notify::new(),
         }
     }
     /// Explicit operator-configured identities, for installing transport adapters
@@ -805,3 +807,5 @@ pub mod live_session;
 pub mod live_connection;
 
 pub mod live_context;
+
+pub mod live_call;

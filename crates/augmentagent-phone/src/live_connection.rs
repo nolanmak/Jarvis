@@ -89,9 +89,14 @@ impl LiveConnection {
         &mut self,
         delegation_id: &str,
         content: &str,
-    ) -> Result<(), LiveError> {
+    ) -> Result<String, LiveError> {
         let event = self.session.commentary(delegation_id, content)?;
-        self.send(event).await
+        let id = event["event_id"]
+            .as_str()
+            .ok_or(LiveError::Protocol)?
+            .to_owned();
+        self.send(event).await?;
+        Ok(id)
     }
     async fn send(&mut self, event: serde_json::Value) -> Result<(), LiveError> {
         let result = timeout(
