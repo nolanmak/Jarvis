@@ -13,9 +13,9 @@
       "issue": 1531,
       "title": "Autoship: retire managed drafts when their source issue is already closed",
       "source": "https://github.com/nolanmak/Jarvis/issues/1531",
-      "implementation_status": "implemented_pending_deployment",
+      "implementation_status": "partial",
       "evidence": [
-        "self_improve::source_reconcile::tests: 5 passed; source checks before resume and merge; branches preserved"
+        "Source lifecycle tests passed; fresh/resume/sweep checks wired; full deployed acceptance pending"
       ]
     },
     {
@@ -36,8 +36,10 @@
       "issue": 1215,
       "title": "Ship at least two more PRs per day: daily cap 5, quota brake, spread runs across the UTC day",
       "source": "https://github.com/nolanmak/Jarvis/issues/1215",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Whole-run deadline and calendar spreading removed; seven-hour productive run with independent sweeps passed; concurrent atomic quota accounting newly integrated under test; seven-day observation not started"
+      ]
     },
     {
       "issue": 1363,
@@ -45,7 +47,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1363",
       "implementation_status": "partial",
       "evidence": [
-        "autoship_workflow foundation tests passed; workflow bridge tests passed; live lane wiring incomplete"
+        "Durable workflow checkpoints wired in fresh/resume; preserved committed/dirty/untracked work regression passed; sweep concurrency integration under test"
       ]
     },
     {
@@ -59,8 +61,10 @@
       "issue": 1426,
       "title": "Auto-PR loop: add a judge-improvement loop that calibrates reviewer/QA verdicts on human-resolved disagreements when progress plateaus",
       "source": "https://github.com/nolanmak/Jarvis/issues/1426",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Structured review/adjudication integrated in fresh/resume; dissent preserved; protected attempt slots implemented; full replay/rubric operational acceptance pending"
+      ]
     },
     {
       "issue": 1453,
@@ -68,22 +72,26 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1453",
       "implementation_status": "partial",
       "evidence": [
-        "scripts.tests.autoship_scope_guard_test: 6 kernel tests passed; native transport egress and live startup validation incomplete"
+        "Real native Claude probe: normal Write succeeded; protected audit/settings Write attempts denied; project-control suppression followup under test; full read scope and network egress incomplete"
       ]
     },
     {
       "issue": 1472,
       "title": "Require a machine-checkable verifier on every agent-fixable issue before the self-improve loop picks it up",
       "source": "https://github.com/nolanmak/Jarvis/issues/1472",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Typed verifier generation/registration/recovery helpers implemented; production scoping integration pending"
+      ]
     },
     {
       "issue": 810,
       "title": "Self-improve gate is vacuous: require a pre-registered falsifier that goes red\u2192green",
       "source": "https://github.com/nolanmak/Jarvis/issues/810",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Independent red/green verifier module passes real Python baseline/no-op/green/tamper fixture; production criteria and call-site wiring incomplete"
+      ]
     },
     {
       "issue": 1012,
@@ -96,8 +104,10 @@
       "issue": 1151,
       "title": "Auto-PR review loop: require measured file-coverage for a LGTM, and fan review out per-file when coverage is incomplete",
       "source": "https://github.com/nolanmak/Jarvis/issues/1151",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Full file/caller evidence transported in bounded shards; untracked files and stale main snapshots refused; seeded live reviewer probe pending"
+      ]
     },
     {
       "issue": 953,
@@ -126,15 +136,17 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/472",
       "implementation_status": "partial",
       "evidence": [
-        "Durable workflow store and bridge recovery tests passed; email retry and scheduled-loop coverage not implemented"
+        "Durable state and remote-intent recovery implemented; email retry guard work in progress; scheduled-loop coverage/digest pending"
       ]
     },
     {
       "issue": 970,
       "title": "Self-improve scoper resolves ambiguity by guessing instead of localizing gaps and asking (IdeaAMBIG asymmetry)",
       "source": "https://github.com/nolanmak/Jarvis/issues/970",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Executable contract foundation implemented; material ambiguity routing and production readiness integration pending"
+      ]
     },
     {
       "issue": 524,
@@ -147,8 +159,10 @@
       "issue": 1184,
       "title": "Harden the dual-LGTM auto-merge against reviewer/builder collusion drift",
       "source": "https://github.com/nolanmak/Jarvis/issues/1184",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Exact-head independent review receipts and stale/builder/coverage negative tests passed; production author provenance and adoption policy still need full audit"
+      ]
     },
     {
       "issue": 1209,
@@ -156,7 +170,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1209",
       "implementation_status": "partial",
       "evidence": [
-        "Kernel tests deny control-state writes; external audit anchor integration incomplete"
+        "Four audit-chain tests passed including tampering, concurrency and partial append recovery; controller audit integration pending"
       ]
     },
     {
@@ -175,19 +189,32 @@
   },
   "validation": {
     "foundation": {
-      "passed": 46,
+      "passed": 48,
       "failed": 0
     },
     "self_improve": {
-      "passed": 305,
+      "passed": 324,
       "failed": 0,
       "ignored": 6,
-      "note": "Includes recovery and workflow bridge tests; live provider probes are ignored and remain required."
+      "note": "Last completed suite before latest sweep-lease/cross-lane-counter integration. Latest changes still under test; live provider tests remain required."
     },
     "kernel_scope": {
       "passed": 6,
       "failed": 0
     },
-    "deployed": false
+    "deployed": false,
+    "audit_chain": {
+      "passed": 4,
+      "failed": 0
+    },
+    "native_scope_probe": {
+      "normal_write": true,
+      "protected_write_denials": true,
+      "project_control_suppression": "retest_running",
+      "does_not_prove": [
+        "full_read_scope",
+        "provider_network_egress"
+      ]
+    }
   }
 }

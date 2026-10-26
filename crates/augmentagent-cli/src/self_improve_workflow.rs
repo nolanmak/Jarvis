@@ -1048,7 +1048,7 @@ mod tests {
             "lost generation may not authorize a merge"
         );
         assert!(store
-            .validate_lease(&successor, millis() + LEASE_MS + 2)
+            .validate_lease(&successor, &store.snapshot(&id).unwrap().unwrap().checkpoint.binding, millis() + LEASE_MS + 2)
             .is_ok());
     }
 
