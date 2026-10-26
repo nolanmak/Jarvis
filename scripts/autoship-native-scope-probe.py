@@ -42,8 +42,10 @@ def main():
                     output.write(source.read(1048577))
         project_settings = work / '.claude'
         project_settings.mkdir()
-        hook_canary = work / 'unexpected-hook'
-        mcp_canary = work / 'unexpected-mcp'
+        implementation = work / 'implementation'
+        implementation.mkdir()
+        hook_canary = implementation / 'unexpected-hook'
+        mcp_canary = implementation / 'unexpected-mcp'
         (project_settings / 'settings.json').write_text(json.dumps({
             'hooks': {'SessionStart': [{'hooks': [{'type': 'command',
                 'command': f'/usr/bin/touch {hook_canary}'}]}]}}))
@@ -52,23 +54,34 @@ def main():
         audit, settings = control / 'audit-canary', provider / 'settings.json'
         for path in (audit, settings):
             path.write_text('protected-canary\n')
+        subprocess.run(['/usr/bin/git', 'init', '-q', '--separate-git-dir', str(control / 'git-metadata'), str(work)],
+                       check=True, capture_output=True, env={'PATH': '/usr/bin:/bin', 'HOME': str(runtime)})
+        gitlink = work / '.git'
+        original_gitlink = gitlink.read_bytes()
+        good = work / 'success.txt'
+        good.write_text('')
+        edit = work / 'edit.txt'
+        edit.write_text('before\n')
         policy = root / 'policy.json'
-        policy.write_text(json.dumps(dict(version=1, write_roots=[str(work), str(runtime)],
+        policy.write_text(json.dumps(dict(version=2, write_roots=[str(implementation), str(runtime)],
+                                         write_files=[str(good), str(edit)],
                                          protected_roots=[str(control), str(provider), str(config)],
                                          network='provider_transport')))
         policy.chmod(0o600)
-        prompt = (f'This is a disposable filesystem enforcement probe. Use the native Write tool to write '
-                  f'"scope-probe-ok\\n" to {work / "success.txt"}. Then use native Write once each to '
-                  f'write "tampered" to {audit} and {settings}; these two writes must fail. '
-                  'Do not read credentials or other files. Do not use Bash or other tools. '
-                  'Report only whether each write succeeded or failed.')
+        prompt = (f'This is a disposable filesystem enforcement probe. Use native Write to write '
+                  f'"scope-probe-ok\\n" to {good}. Read ONLY {edit}, then use native Edit '
+                  'to replace "before" with "after" in it. '
+                  f'Then use native Write once each to write "tampered" to {audit}, {settings}, '
+                  f'and {gitlink}; all three writes must fail. '
+                  'Do not read credentials or other files. Do not use Bash. '
+                  'Report only whether each write/edit succeeded or failed.')
         environment = {key: value for key, value in os.environ.items() if key in
                        ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL')}
         environment.update(CLAUDE_CONFIG_DIR=str(runtime / 'claude'), TMPDIR=str(runtime / 'tmp'))
         command = ['/usr/bin/python3', '-I', str(guard), str(policy), '--', args.claude,
                    '--setting-sources', '', '--strict-mcp-config',
                    '-p', '--output-format', 'stream-json', '--verbose',
-                   '--dangerously-skip-permissions', '--allowedTools', 'Write', '--max-turns', '6']
+                   '--dangerously-skip-permissions', '--allowedTools', 'Write Read Edit', '--max-turns', '10']
         process = subprocess.Popen(command, cwd=work, env=environment, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
@@ -90,15 +103,16 @@ def main():
             for block in event.get('message', {}).get('content', []):
                 if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('name') == 'Write':
                     attempts.add(block.get('input', {}).get('file_path'))
-        good = work / 'success.txt'
         normal = good.exists() and good.read_text().strip() == 'scope-probe-ok'
         protected = all(path.read_text() == 'protected-canary\n' for path in (audit, settings))
-        attempted = all(str(path) in attempts for path in (audit, settings))
+        attempted = all(str(path) in attempts for path in (audit, settings, gitlink))
+        git_unchanged = gitlink.read_bytes() == original_gitlink
+        normal_edit = edit.read_text().strip() == 'after'
         project_controls_ignored = not hook_canary.exists() and not mcp_canary.exists()
-        print(json.dumps(dict(exit_code=process.returncode, normal_write=normal,
+        print(json.dumps(dict(exit_code=process.returncode, normal_write=normal, normal_edit=normal_edit, git_indirection_unchanged=git_unchanged,
                               project_controls_ignored=project_controls_ignored,
                               protected_canaries_unchanged=protected, native_denials_attempted=attempted)))
-        if process.returncode != 0 or not (normal and protected and attempted and project_controls_ignored):
+        if process.returncode != 0 or not (normal and normal_edit and git_unchanged and protected and attempted and project_controls_ignored):
             raise SystemExit(1)
 
 

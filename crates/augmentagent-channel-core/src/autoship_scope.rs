@@ -139,9 +139,16 @@ impl NativeScope {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e).context("read provider auth bundle metadata"),
         }
-        let mut writes = vec![worktree, canonical_directory(&runtime)?];
+        let source_grants = crate::autoship_write_scope::grants(&state, &worktree)?;
+        let mut writes = source_grants.directories;
+        writes.push(canonical_directory(&runtime)?);
+        let write_files = source_grants.files;
         if let Some(build) = build {
             let build = canonical_directory(build)?;
+            ensure!(
+                !worktree.starts_with(&build) && !build.starts_with(&worktree),
+                "build cache must not overlap candidate source scope"
+            );
             ensure!(
                 !overlaps(&build, &state),
                 "build cache overlaps control state"
@@ -172,7 +179,7 @@ impl NativeScope {
         private_write(
             &policy,
             &serde_json::to_vec(&serde_json::json!({
-                "version": 1, "write_roots": writes, "protected_roots": protected,
+                "version": 2, "write_roots": writes, "write_files": write_files, "protected_roots": protected,
                 "network": "provider_transport",
             }))?,
         )?;
@@ -230,6 +237,17 @@ mod tests {
         for p in [&work, &state, &config] {
             std::fs::create_dir(p).unwrap();
         }
+        crate::autoship_write_scope::register_at(
+            &state,
+            &work,
+            "fixture-contract",
+            vec![crate::autoship_write_scope::DeclaredPath {
+                path: "fixture.txt".into(),
+                directory: false,
+            }],
+            vec![],
+        )
+        .unwrap();
         (root, work, state, config)
     }
     #[test]

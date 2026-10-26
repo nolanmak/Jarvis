@@ -711,6 +711,31 @@ pub(super) async fn prepare_acceptance(
     // candidate that no longer descends from it needs explicit re-scoping.
     trusted_git(candidate, &["merge-base", "--is-ancestor", base, "HEAD"]).await?;
     install_candidate_harness(candidate, &prepared)?;
+    augmentagent_channel_core::autoship_write_scope::register(
+        candidate,
+        prepared.baseline.registration.contract_hash(),
+        prepared
+            .proposal
+            .contract
+            .allowed_paths
+            .iter()
+            .map(|scope| match scope {
+                crate::autoship_contract::PathScope::File(path) => {
+                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
+                        path: path.clone(),
+                        directory: false,
+                    }
+                }
+                crate::autoship_contract::PathScope::Directory(path) => {
+                    augmentagent_channel_core::autoship_write_scope::DeclaredPath {
+                        path: path.clone(),
+                        directory: true,
+                    }
+                }
+            })
+            .collect(),
+        prepared.proposal.files.keys().cloned().collect(),
+    )?;
     Ok(prepared)
 }
 

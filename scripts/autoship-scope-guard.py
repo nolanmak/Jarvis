@@ -31,7 +31,7 @@ def private_json(path):
     with os.fdopen(fd) as source:
         info = os.fstat(source.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 65536):
+                or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 2 * 1024 * 1024):
             raise RuntimeError('scope policy is not an owner-private regular file')
         return json.load(source)
 
@@ -46,23 +46,34 @@ def canonical_directory(raw):
 
 
 def validated_policy(policy):
-    if set(policy) != {'version', 'write_roots', 'protected_roots', 'network'} or policy['version'] != 1:
+    expected = {'version', 'write_roots', 'protected_roots', 'network'}
+    if policy.get('version') == 2:
+        expected.add('write_files')
+    if set(policy) != expected or policy['version'] not in (1, 2):
         raise RuntimeError('unsupported scope policy')
     if policy['network'] not in ('deny', 'provider_transport'):
         raise RuntimeError('native guard cannot enforce hostname egress; use the command bridge')
     roots = [canonical_directory(p) for p in policy['write_roots']]
     protected = [canonical_directory(p) for p in policy['protected_roots']]
-    if not roots or not protected or len(roots) > 16 or len(protected) > 16:
+    files = []
+    for raw in policy.get('write_files', []):
+        path = Path(raw)
+        info = path.lstat()
+        if (not path.is_absolute() or path != path.resolve(strict=True)
+                or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+            raise RuntimeError('file write grant must be a canonical singly linked file')
+        files.append(path)
+    if not roots or not protected or len(roots) + len(files) > 10000 or len(protected) > 16:
         raise RuntimeError('scope roots missing or oversized')
-    for root in roots:
+    for root in roots + files:
         for denied in protected:
             if root == denied or root in denied.parents or denied in root.parents:
                 raise RuntimeError('writable scope intersects protected control state')
-    return roots
+    return roots, files
 
 
 def restrict(policy):
-    roots = validated_policy(policy)
+    roots, files = validated_policy(policy)
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'aarch64'):
         raise RuntimeError('native scope requires a supported Linux architecture')
     libc = ctypes.CDLL(None, use_errno=True)
@@ -85,10 +96,11 @@ def restrict(policy):
     if ruleset < 0:
         raise OSError(ctypes.get_errno(), 'scope ruleset creation failed')
     try:
-        for path in roots:
+        for path in roots + files:
             descriptor = os.open(path, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
             try:
-                rule = PathRule(write, descriptor)
+                access = write if path in roots else (1 << 1) | (1 << 14) | (1 << 15)
+                rule = PathRule(access, descriptor)
                 if libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0):
                     raise OSError(ctypes.get_errno(), 'scope rule installation failed')
             finally:

@@ -102,6 +102,41 @@ for path in {list(map(str, [anchor, audit]))!r}:
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(target.read_text(), 'original')
 
+    def test_literal_file_scope_protects_git_and_pinned_harness_but_allows_edits_and_creation(self):
+        self.require_kernel()
+        gitlink = self.work / '.git'
+        pinned = self.work / 'verifier.py'
+        editable = self.work / 'source.py'
+        newfile = self.work / 'new.py'
+        implementation = self.work / 'implementation'
+        implementation.mkdir()
+        for path, content in [(gitlink, 'gitdir: trusted'), (pinned, 'assert correct'),
+                              (editable, 'old'), (newfile, '')]:
+            path.write_text(content)
+        policy = dict(self.policy, version=2, write_roots=[str(implementation)],
+                      write_files=list(map(str, [editable, newfile])))
+        code = f'''import os, pathlib
+for target in {list(map(str, [gitlink, pinned]))!r}:
+ for operation in [lambda: open(target, 'w'), lambda: os.unlink(target),
+                   lambda: os.rename(target, {str(implementation / 'stolen')!r}),
+                   lambda: os.replace({str(editable)!r}, target)]:
+  try:
+   operation()
+   raise SystemExit('protected mutation succeeded')
+  except PermissionError:
+   pass
+pathlib.Path({str(editable)!r}).write_text('edited')
+pathlib.Path({str(newfile)!r}).write_text('created')
+pathlib.Path({str(implementation / 'brand_new.py')!r}).write_text('new child')
+'''
+        result = self.run_guard(code, policy)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(gitlink.read_text(), 'gitdir: trusted')
+        self.assertEqual(pinned.read_text(), 'assert correct')
+        self.assertEqual(editable.read_text(), 'edited')
+        self.assertEqual(newfile.read_text(), 'created')
+        self.assertEqual((implementation / 'brand_new.py').read_text(), 'new child')
+
     def test_network_denial_is_enforced_when_requested(self):
         self.require_kernel()
         policy = dict(self.policy, network='deny')
