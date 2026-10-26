@@ -454,6 +454,23 @@ impl WorkflowGuard {
         }))
     }
 
+    pub(super) fn observe_episode(
+        &self,
+        observation: &crate::autoship_episode::Observation,
+    ) -> Result<crate::autoship_episode::Decision> {
+        self.validate_before_side_effect()?;
+        let decision = self
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .observe_episode(&self.lease, observation, millis())?;
+        self.audit_event(
+            "episode_decision",
+            serde_json::json!({"receipt":observation.receipt,"decision":decision}),
+        )?;
+        Ok(decision)
+    }
+
     pub(super) fn fresh_review_origin_receipt(&self) -> Result<String> {
         self.validate_before_side_effect()?;
         self.store
@@ -614,6 +631,27 @@ impl WorkflowGuard {
             store.attach_pr_in_repo(&self.lease, &self.repository, pr, now)?;
         }
         store.complete_operation(&self.lease, &operation.id, receipt, now)?;
+        if operation.kind == OperationKind::MergePr {
+            let latest = store
+                .events(self.id())?
+                .into_iter()
+                .rev()
+                .filter(|(_, kind, _, _)| kind == "episode_observed")
+                .filter_map(|(_, _, raw, _)| {
+                    serde_json::from_str::<crate::autoship_episode::Observation>(&raw).ok()
+                })
+                .find(|observation| observation.candidate.binding == operation.binding);
+            if let Some(mut observation) = latest.filter(|o| {
+                o.review_complete
+                    && o.candidate.tests_passed
+                    && o.candidate.guards_passed
+                    && o.candidate.open_findings.is_empty()
+            }) {
+                observation.receipt = format!("confirmed-own-merge:{}", operation.id);
+                observation.autonomous_merge_observed = true;
+                store.observe_episode(&self.lease, &observation, now)?;
+            }
+        }
         self.audit_event(
             "remote_observed",
             serde_json::json!({"operation_id":operation.id,
@@ -1103,6 +1141,89 @@ mod tests {
                 .contract
         );
     }
+    #[tokio::test]
+    async fn episode_counts_only_own_confirmed_merge_and_model_calls_are_separate() {
+        let dir = repo();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("workflow.db");
+        let guard = WorkflowGuard::acquire_at(
+            &path,
+            Start {
+                repo_root: dir.path(),
+                worktree: dir.path(),
+                repository: "owner/repo",
+                source_issue: Some(7),
+                pr: None,
+                branch: "fix/seven",
+                contract: "C1",
+                environment: "rust-a",
+            },
+            millis(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let reasoner = FallbackReasoner::for_tests(
+            vec![],
+            augmentagent_channel_core::CooldownLatch::at(state.path().join("cooldowns.json")),
+        );
+        guard.bind_reasoner(&reasoner).unwrap();
+        guard.audit_logger().model_call_admitted("claude").unwrap();
+        let observation = crate::autoship_episode::Observation {
+            receipt: "review-verified".into(),
+            epoch: "contract/base/environment".into(),
+            candidate: crate::autoship_episode::Candidate {
+                binding: guard.binding().clone(),
+                tests_passed: true,
+                guards_passed: true,
+                verified_criteria: 2,
+                open_findings: Default::default(),
+                lines_changed: 20,
+            },
+            review_complete: true,
+            contradictory_requirements: false,
+            infrastructure_failed: false,
+            autonomous_merge_observed: false,
+        };
+        assert_eq!(
+            guard.observe_episode(&observation).unwrap(),
+            crate::autoship_episode::Decision::ReadyToMerge
+        );
+        let store = WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls, 1);
+        let merges = || {
+            store
+                .events(guard.id())
+                .unwrap()
+                .into_iter()
+                .filter(|(_, kind, _, _)| kind == "episode_observed")
+                .filter_map(|(_, _, raw, _)| {
+                    serde_json::from_str::<crate::autoship_episode::Observation>(&raw).ok()
+                })
+                .filter(|o| o.autonomous_merge_observed)
+                .count()
+        };
+        assert_eq!(merges(), 0, "LGTM does not count as shipping");
+        let op = guard.intent(OperationKind::MergePr).unwrap();
+        guard
+            .observe_remote(&op, "github:pr:42:merged:fixture", Some(42))
+            .unwrap();
+        guard
+            .observe_remote(&op, "github:pr:42:merged:fixture", Some(42))
+            .unwrap();
+        assert_eq!(
+            merges(),
+            1,
+            "reconciled duplicate merge receipt counts once"
+        );
+        let logger = guard.audit_logger();
+        guard.finish().unwrap();
+        assert!(
+            logger.model_call_admitted("claude").is_err(),
+            "released workflow cannot admit unaccounted spend"
+        );
+    }
+
     #[tokio::test]
     async fn controller_audit_is_anchored_and_lost_rows_block_publication() {
         let dir = repo();

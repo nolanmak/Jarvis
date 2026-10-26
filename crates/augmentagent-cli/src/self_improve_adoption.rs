@@ -150,14 +150,60 @@ pub(super) fn select_linked(
     only: Option<u64>,
     cursor: u64,
 ) -> Option<(u64, u64, String)> {
+    select_linked_with_retries(
+        candidates,
+        ledger,
+        today,
+        gave_up,
+        only,
+        cursor,
+        &Default::default(),
+    )
+}
+
+pub(super) fn episode_retries(
+    path: &Path,
+    candidates: &[AdoptedPr],
+    now: i64,
+) -> Result<std::collections::BTreeSet<u64>> {
+    let store = WorkflowStore::open(path)?;
+    let mut result = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
+            continue;
+        };
+        let Some(snapshot) = store.snapshot(&id)? else {
+            continue;
+        };
+        if snapshot.lease_until_ms <= now
+            && snapshot.checkpoint.next.eligible_at_ms <= now
+            && matches!(
+                snapshot.checkpoint.next.action.as_str(),
+                "rescope_remaining_findings" | "complete_review_or_adjudication"
+            )
+        {
+            result.insert(candidate.pr);
+        }
+    }
+    Ok(result)
+}
+
+pub(super) fn select_linked_with_retries(
+    candidates: &[AdoptedPr],
+    ledger: &AttemptLedger,
+    today: u64,
+    _gave_up: &std::collections::HashSet<u64>,
+    only: Option<u64>,
+    cursor: u64,
+    retries: &std::collections::BTreeSet<u64>,
+) -> Option<(u64, u64, String)> {
     let eligible: Vec<_> = candidates
         .iter()
         .filter(|c| c.ready_for_review())
         .filter_map(|c| {
             let issue = c.source_issue?;
             (only.is_none_or(|wanted| wanted == issue)
-                && !ledger.attempted_today(today, issue)
-                && !gave_up.contains(&issue))
+                && (!ledger.attempted_today(today, issue) || retries.contains(&c.pr)))
             .then_some(c)
         })
         .collect();
@@ -284,9 +330,7 @@ pub(super) async fn revise(
     if origin.is_imported() {
         // Normal dispatch records actual mutation providers. Imported unknown
         // history remains unknown; it is never replaced by a fictional author.
-        let mut opts = opts.clone();
-        opts.session_id = None;
-        reasoner.call_with_storage(&opts, prompt).await
+        reasoner.call_with_storage(opts, prompt).await
     } else {
         reasoner.call_revision_with_storage(opts, prompt).await
     }

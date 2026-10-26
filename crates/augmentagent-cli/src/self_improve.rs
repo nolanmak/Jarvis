@@ -37,6 +37,8 @@ use tracing::{info, warn};
 
 use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 
+#[path = "self_improve_episode.rs"]
+mod episode;
 #[path = "self_improve_adoption.rs"]
 mod adoption;
 #[path = "self_improve_policy_hold.rs"]
@@ -3725,31 +3727,14 @@ async fn find_resumable_draft(
         }
     }
 
-    // #934 — a draft whose issue already gave up is closed on sight (branch
-    // kept, revival instructions in the comment) so `gh pr list` shows only
-    // work that is actually in play.
-    if !dry_run {
-        // #1037 L2 — a draft the loop stood down on for a review reason is
-        // closed again with that reason, not with an attempt count.
-        let held = read_unreviewable(&unreviewable_path());
-        for (pr, issue) in drafts_to_close(&prs, &gave_up, owner.as_deref()) {
-            close_gave_up_pr(
-                repo_root,
-                pr,
-                issue,
-                &swept_close_comment(pr, issue, held.get(&pr.to_string())),
-            )
-            .await;
-        }
-    }
-
-    // The durable exact-head verdict survives restart/midnight. Re-evaluate
-    // policy without model work; an unchanged authorization hold is not a
-    // new builder attempt. The merge sweep continues checking these PRs.
+    // Review exhaustion does not retire paid work. Source closure is handled
+    // separately by source_reconcile; authorized adopted PRs remain queued.
+    // Re-evaluate policy freely before reserving any billed resume attempt.
     policy_hold::filter(repo_root, &mut adopted, dry_run).await;
     let ledger = AttemptLedger::load(&attempt_ledger_path());
+    let retries = adoption::episode_retries(&workflow::path(), &adopted, chrono::Utc::now().timestamp_millis()).unwrap_or_default();
     let select = |cursor| {
-        adoption::select_linked(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor)
+        adoption::select_linked_with_retries(&adopted, &ledger, utc_day_now(), &gave_up, only, cursor, &retries)
     };
     // #1532 — a pinned red-main fix neither consults nor moves the rotation,
     // and a dry run reserves nothing.
@@ -6817,7 +6802,7 @@ async fn resume_draft_pr(
                 let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
                     label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                    close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &why)).await;
+                // Preserve the draft and committed candidates for episode recovery.
                 }
                 let message = format!(
                     "PR #{pr}: merge conflict with main not resolved ({why}); attempt {attempts}"
@@ -6835,6 +6820,7 @@ async fn resume_draft_pr(
         .latest_review_receipt("resume-structured-")?
         .map(|receipt| serde_json::from_str(&receipt)).transpose()?;
     let mut rounds_done = 0u32;
+    let mut episode_rescoped = false;
     // Carry remote failures into the revision loop, not only the local gate.
     // Consume this snapshot once: after a push it describes the previous head.
     let mut ci_findings = failed_ci_findings(repo_root, pr).await;
@@ -6889,7 +6875,7 @@ async fn resume_draft_pr(
             .await
             .unwrap_or_else(|_| Tally::uncounted());
             label_gave_up(repo_root, issue.number, "guard:blast-radius-diff").await.ok();
-            close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &reason)).await;
+                // Preserve the draft and committed candidates for episode recovery.
             return Ok(RunReport::triage(format!(
                 "PR #{pr}: resume refused — blast radius on `{pattern}`; stood down"
             )));
@@ -7044,7 +7030,7 @@ async fn resume_draft_pr(
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or_else(|_| Tally::uncounted());
             if attempts.exhausted() {
                 label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts.n, &format!("{gate_err:#}"))).await;
+                // Preserve the draft and committed candidates for episode recovery.
             }
             return Ok(RunReport::built(format!(
                 "PR #{pr}: resume gate failed (attempt {attempts})"
@@ -7172,6 +7158,28 @@ async fn resume_draft_pr(
             &serde_json::json!({"verdict": qa_ok, "notes": qa_notes}).to_string())?;
         workflow.record_review(&format!("resume-independent-{rounds_done}-{review_attempt}"), independent.approved(),
             &serde_json::json!({"verdict": independent.approved(), "notes": independent.notes}).to_string())?;
+        let evaluated = episode::evaluate(&mut workflow,&independent,
+            prepared_acceptance.proposal.contract.criteria.len(),lines_now).await?;
+        let episode_session = match &evaluated.decision {
+            crate::autoship_episode::Decision::FreshSession { .. } => {
+                rounds_done = 0; prior_qa = None; prior_notes = None;
+                Some(episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?)
+            }
+            crate::autoship_episode::Decision::Rescope { .. } if !episode_rescoped => {
+                episode_rescoped = true; rounds_done = 0; prior_qa = None; prior_notes = None;
+                Some(episode::session(reasoner,&issue,&worktree,&mut workflow,&prepared_acceptance,&evaluated).await?)
+            }
+            crate::autoship_episode::Decision::Rescope { .. } => {
+                workflow.transition(Stage::Scope,"episode_rescope_pending","rescope_remaining_findings",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                return Ok(RunReport::built(format!("PR #{pr}: retained verified candidate for bounded rescoping")));
+            }
+            crate::autoship_episode::Decision::CompleteEvidence | crate::autoship_episode::Decision::RepairInfrastructure |
+            crate::autoship_episode::Decision::Adjudicate => {
+                workflow.transition(Stage::Review,"review_evidence_recovery","complete_review_or_adjudication",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                return Ok(RunReport::built(format!("PR #{pr}: review evidence recovery queued; candidate preserved")));
+            }
+            _ => None,
+        };
         if independent.approved() {
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
@@ -7354,10 +7362,11 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
-        let rev_summary = match adoption::revise(reasoner, &workflow,
-                &fix_opts(worktree.clone()),
-                &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
-            )
+        let (repair_opts,repair_prompt) = match episode_session {
+            Some(session) => (session.opts,session.prompt),
+            None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines_now,prior_attempts.as_deref())),
+        };
+        let rev_summary = match adoption::revise(reasoner, &workflow,&repair_opts,&repair_prompt)
             .await
         {
             Ok(rs) => rs,
@@ -8581,7 +8590,35 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // round revises against that instead of review notes, and no reviewer
         // is consulted on a diff that cannot ship anyway.
         let mut findings_override: Option<String> = None;
+        let mut episode_rescoped = false;
         loop {
+            let mut episode_session = None;
+            if findings_override.is_none() {
+                if let Some(review) = independent.as_ref() {
+                    let evaluated = episode::evaluate(&mut workflow_guard,review,
+                        prepared_acceptance.proposal.contract.criteria.len(),lines).await?;
+                    match &evaluated.decision {
+                        crate::autoship_episode::Decision::FreshSession { .. } => {
+                            round = 0; prior_attempts = None;
+                            episode_session = Some(episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?);
+                        }
+                        crate::autoship_episode::Decision::Rescope { .. } if !episode_rescoped => {
+                            episode_rescoped = true; round = 0; prior_attempts = None;
+                            episode_session = Some(episode::session(reasoner.as_ref(),&issue,&worktree,&mut workflow_guard,&prepared_acceptance,&evaluated).await?);
+                        }
+                        crate::autoship_episode::Decision::Rescope { .. } => {
+                            workflow_guard.transition(crate::autoship_workflow::Stage::Scope,"episode_rescope_pending","rescope_remaining_findings",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                            break;
+                        }
+                        crate::autoship_episode::Decision::CompleteEvidence | crate::autoship_episode::Decision::RepairInfrastructure |
+                        crate::autoship_episode::Decision::Adjudicate => {
+                            workflow_guard.transition(crate::autoship_workflow::Stage::Review,"review_evidence_recovery","complete_review_or_adjudication",chrono::Utc::now().timestamp_millis()+300_000).await?;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let source = match after_review(
                 qa_ok || independent.as_ref().is_some_and(|r| r.approved()),
                 independent.as_ref().map(|r| (r.available, r.approved())),
@@ -8602,11 +8639,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             };
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
-            match reasoner
-                .call_revision_with_storage(
-                    &fix_opts(worktree.clone()),
-                    &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
-                )
+            let (repair_opts,repair_prompt) = match episode_session {
+                Some(session) => (session.opts,session.prompt),
+                None => (fix_opts(worktree.clone()),build_revise_prompt(&issue,&findings,lines,prior_attempts.as_deref())),
+            };
+            match reasoner.call_revision_with_storage(&repair_opts,&repair_prompt)
                 .await
             {
                 Err(e) => {
