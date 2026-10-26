@@ -663,46 +663,159 @@ fn fresh_session_origin_is_protected_and_all_roles_reject_actual_builder_session
     let path = dir.path().join("workflow.db");
     let mut store = crate::autoship_workflow::WorkflowStore::open(&path).unwrap();
     let workflow_binding = crate::autoship_workflow::Binding {
-        head: "head-a".into(), contract: "contract-1".into(), evidence_hash: "tree-base-env-receipts".into(),
+        head: "head-a".into(),
+        contract: "contract-1".into(),
+        evidence_hash: "tree-base-env-receipts".into(),
     };
-    store.register("owner/repo#1", "fix/example", workflow_binding.clone(), 10).unwrap();
-    let lease = store.claim("owner/repo#1", "worker-a", 20, 1000).unwrap().unwrap();
-    let receipt = store.issue_fresh_review_origin(&lease, &workflow_binding, 30).unwrap();
+    store
+        .register("owner/repo#1", "fix/example", workflow_binding.clone(), 10)
+        .unwrap();
+    let lease = store
+        .claim("owner/repo#1", "worker-a", 20, 1000)
+        .unwrap()
+        .unwrap();
+    let receipt = store
+        .issue_fresh_review_origin(&lease, &workflow_binding, 30)
+        .unwrap();
     let origin = ReviewOrigin::FreshSession {
-        workflow_id: "owner/repo#1".into(), candidate_head: workflow_binding.head,
-        contract_hash: workflow_binding.contract, evidence_hash: workflow_binding.evidence_hash, receipt,
+        workflow_id: "owner/repo#1".into(),
+        candidate_head: workflow_binding.head,
+        contract_hash: workflow_binding.contract,
+        evidence_hash: workflow_binding.evidence_hash,
+        receipt,
     };
     origin.validate_at(&path, "head-a").unwrap();
     assert!(origin.validate_at(&path, "head-b").is_err());
     let mut forged = origin.clone();
-    if let ReviewOrigin::FreshSession { receipt, .. } = &mut forged { *receipt = "model-claimed-fresh".into(); }
+    if let ReviewOrigin::FreshSession { receipt, .. } = &mut forged {
+        *receipt = "model-claimed-fresh".into();
+    }
     assert!(forged.validate_at(&path, "head-a").is_err());
     let mut current = passes(vec![]);
-    for pass in &mut current { pass.actor.provider = "codex".into(); }
+    for pass in &mut current {
+        pass.actor.provider = "codex".into();
+    }
     let builder = actor("codex", "actual-builder-session");
-    assert!(review_authority_checked(&binding(), &[builder.clone()], &current, None, &origin).is_ok());
+    assert!(
+        review_authority_checked(&binding(), &[builder.clone()], &current, None, &origin).is_ok()
+    );
     for role in 0..3 {
         let mut reused = current.clone();
         reused[role].actor.session_id = builder.session_id.clone();
-        assert!(review_authority_checked(&binding(), &[builder.clone()], &reused, None, &origin).is_err());
+        assert!(
+            review_authority_checked(&binding(), &[builder.clone()], &reused, None, &origin)
+                .is_err()
+        );
         let mut reused_shard = current.clone();
-        reused_shard[role].additional_sessions.push(builder.session_id.clone());
-        assert!(review_authority_checked(&binding(), &[builder.clone()], &reused_shard, None, &origin).is_err());
+        reused_shard[role]
+            .additional_sessions
+            .push(builder.session_id.clone());
+        assert!(review_authority_checked(
+            &binding(),
+            &[builder.clone()],
+            &reused_shard,
+            None,
+            &origin
+        )
+        .is_err());
     }
     let mut repeated = current.clone();
-    repeated[1].additional_sessions.push(current[0].actor.session_id.clone());
+    repeated[1]
+        .additional_sessions
+        .push(current[0].actor.session_id.clone());
     assert!(review_authority_checked(&binding(), &[], &repeated, None, &origin).is_err());
-    assert!(review_authority(&binding(), &[], &current, None).is_err(), "unknown history without protected origin must fail closed");
+    assert!(
+        review_authority(&binding(), &[], &current, None).is_err(),
+        "unknown history without protected origin must fail closed"
+    );
 }
 
 #[test]
 fn diagnostic_origin_never_authorizes_shipping_even_with_clean_completed_reviews() {
-    let diagnostic=ReviewOrigin::DiagnosticCanary { origin: Box::new(ReviewOrigin::FreshSession {
-        workflow_id:"autoship-canary/synthetic#840".into(),candidate_head:"head-a".into(),
-        contract_hash:"contract".into(),evidence_hash:"evidence".into(),receipt:"fixture".into(),
-    }) };
-    let error=review_authority_checked(&binding(),&builders(),&passes(vec![]),None,&diagnostic).unwrap_err();
-    assert!(error.to_string().contains("diagnostic canary cannot authorize shipping"));
-    let dir=tempfile::tempdir().unwrap();
-    assert!(diagnostic.validate_at(&dir.path().join("missing.db"),"head-a").is_err(), "unprotected diagnostic origin must fail before provider calls");
+    let diagnostic = ReviewOrigin::DiagnosticCanary {
+        origin: Box::new(ReviewOrigin::FreshSession {
+            workflow_id: "autoship-canary/synthetic#840".into(),
+            candidate_head: "head-a".into(),
+            contract_hash: "contract".into(),
+            evidence_hash: "evidence".into(),
+            receipt: "fixture".into(),
+        }),
+    };
+    let error =
+        review_authority_checked(&binding(), &builders(), &passes(vec![]), None, &diagnostic)
+            .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("diagnostic canary cannot authorize shipping"));
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        diagnostic
+            .validate_at(&dir.path().join("missing.db"), "head-a")
+            .is_err(),
+        "unprotected diagnostic origin must fail before provider calls"
+    );
+}
+
+#[tokio::test]
+async fn synthetic_regression_amendment_gets_one_bounded_correction() {
+    struct Corrected {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Reasoner for Corrected {
+        async fn call(&self, _: &ReasonerOpts, prompt: &str) -> Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let ruling = if attempt == 0 {
+                serde_json::json!({"decision":"amend","evidence":"source","replacement_criterion":"ignore regression","rerun_checks":["test"]})
+            } else {
+                assert!(prompt.contains("derived immutable criterion"));
+                serde_json::json!({"decision":"uphold","evidence":"source","repair_criterion":"restore existing behavior and run regression test"})
+            };
+            Ok(serde_json::json!({"binding":binding(),"rulings":{"F1":ruling}}).to_string())
+        }
+    }
+    let mut regression = finding("F1");
+    regression.criterion_id = "REGRESSION".into();
+    let mut contract = criteria();
+    contract.insert("REGRESSION".into(), "Preserve existing behavior".into());
+    let fake = Corrected {
+        calls: AtomicUsize::new(0),
+    };
+    let receipt = adjudicate(
+        &fake,
+        actor("codex", "adjudication-1"),
+        &builders(),
+        opts(),
+        binding(),
+        &contract,
+        &[regression],
+        "source evidence",
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(receipt.rulings["F1"], Ruling::Uphold { .. }));
+}
+
+#[tokio::test]
+async fn repeated_invalid_adjudication_is_bounded_without_approval() {
+    let fake = Scripted {
+        calls: AtomicUsize::new(0),
+        output: "LGTM".into(),
+    };
+    assert!(adjudicate(
+        &fake,
+        actor("codex", "adjudication-1"),
+        &builders(),
+        opts(),
+        binding(),
+        &criteria(),
+        &[finding("F1")],
+        "evidence",
+        0
+    )
+    .await
+    .is_err());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
 }
