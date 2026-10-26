@@ -110,3 +110,19 @@ restart/retry observations separately. These are longer-window acceptance, not
 implied by one successful rollout or transport call. If rollback is required,
 use owned deployment artifacts and the normal guarded deployment path; retain
 pending workflow/runtime evidence and do not introduce an executable override.
+
+
+## Observed deployment, 2026-10-26
+
+The normal updater deployed `c17ef74eefea6be6324778fad3522150c356902a`
+at 20:32:01 UTC after the active workspace gate ended. Its log records daemon
+PID 2377891 replaced by 3004552 and the build stamp written. Readback confirmed
+`Delegate=yes`, `DelegateSubgroup=daemon`, CPU quota 4s, MemoryMax 10737418240,
+and TasksMax 2048. The running executable resolved to the canonical release
+artifact; both SHA256 values were
+`ad7831c2a25d1e8aaacdc8a927b98aea7030456691ea005ca3f2f9ff5fad92e6`.
+
+This establishes deployment of PR #1603 and resource-unit configuration only.
+The stable native policy remained staged, not selected by the daemon, and
+shared local/GitHub CI PR #1616 was still under validation. Protected native
+issue-to-PR acceptance and sustained autonomous shipping remain outstanding.
