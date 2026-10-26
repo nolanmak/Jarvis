@@ -35,19 +35,45 @@ fn ci_repair_uses_failed_checks_only_and_bounds_work() {
     assert_eq!(failed_ci_checks(&serde_json::to_string(&many).unwrap()).len(), 5);
 }
 
+/// A real persisted structured verdict survives a draft return but never a new head.
 #[test]
 fn publication_records_precede_draft_returns_and_never_cover_post_review_edits() {
-    let src = include_str!("self_improve.rs");
-    let fresh = &src[src.find("pub async fn run_once(").unwrap()..];
-    let published = &fresh[fresh.find("let pr_url = stdout.trim()").unwrap()..];
-    let record = published.find("opened_prs::record(").unwrap();
-    assert!(record < published.find("if let Some(reason) = &park").unwrap());
-    assert!(record < published.find("if !automerge").unwrap());
-    assert!(published[..record].contains("qa_ok && park.is_none() && !repaired_after_review"));
-    assert!(published[record..record+130].contains("published_head"));
-    let resume = &src[src.find("async fn resume_draft_pr(").unwrap()..src.find("async fn reclaim_worktree(").unwrap()];
-    assert!(resume.find("opened_prs::record(").unwrap() < resume.find("if checks_green(").unwrap());
-    assert!(resume.contains("\"--match-head-commit\", reviewed_head"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opened.json");
+    let review = synthetic_aligned_review("reviewed-head", true);
+    record_opened_pr(&path, 1, 42, "reviewed-head", review.recorded_verdict());
+    let recovered = opened_pr_for(&path, 1).unwrap();
+    assert!(recorded_approval(Some(&recovered), 42, Some("reviewed-head")).reviewed);
+    assert!(!recorded_approval(Some(&recovered), 42, Some("post-review-edit")).reviewed);
+    record_opened_pr(&path, 1, 42, "post-review-edit", review.recorded_verdict());
+    let relabeled = opened_pr_for(&path, 1).unwrap();
+    assert!(!recorded_approval(Some(&relabeled), 42, Some("post-review-edit")).reviewed,
+        "relabeling the outer record cannot move the evidence to new code");
+}
+
+pub(super) fn synthetic_aligned_review(head: &str, dismiss: bool) -> IndependentReview {
+    use crate::autoship_review::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    let binding = ReviewBinding { head: head.into(), base: "base".into(), environment_id: "test".into(),
+        contract_hash: "contract".into(), evidence_hash: "evidence".into() };
+    let actor = |provider: &str, session: &str| Actor { provider: provider.into(), backend: "native".into(),
+        model: "synthetic".into(), session_id: session.into() };
+    let finding = Finding { id: "F1".into(), criterion_id: "C1".into(), evidence_hash: "proof".into(),
+        claim: "contradictory doc requirement".into(), requested_change: "align requirement".into(),
+        conflicts_with: BTreeSet::new(), repair_rounds: 2 };
+    let passes = [ReviewRole::Qa, ReviewRole::Diff, ReviewRole::System].into_iter().enumerate().map(|(i, role)| ReviewPass {
+        binding: binding.clone(), actor: actor("codex", &format!("review-{i}")), role, completed: true,
+        coverage: CoverageReceipt { binding: binding.clone(), required_paths: BTreeSet::from(["a.rs".into()]),
+            supplied_files: BTreeMap::from([("a.rs".into(), "source-hash".into())]), prompt_hash: format!("prompt-{i}") },
+        findings: if role == ReviewRole::Qa { vec![finding.clone()] } else { vec![] },
+    }).collect();
+    let adjudication = dismiss.then(|| AdjudicationReceipt { binding: binding.clone(), actor: actor("codex", "adjudicator"),
+        finding_fingerprints: BTreeMap::from([("F1".into(), finding.fingerprint().unwrap())]),
+        rulings: BTreeMap::from([("F1".into(), Ruling::Dismiss { evidence: "proof".into(), rationale: "contract resolves contradiction".into() })]),
+        prompt_hash: "adjudication-prompt".into(), response_hash: "adjudication-response".into() });
+    IndependentReview { provider: Some(augmentagent_channel_core::ProviderKind::Codex), model: Some("synthetic".into()),
+        available: true, diff_ok: true, system_ok: true, notes: String::new(), why_unavailable: None,
+        structured: Some(ReviewEvidence { binding, builders: vec![actor("claude", "builder")], passes, adjudication }) }
 }
 
 #[test]

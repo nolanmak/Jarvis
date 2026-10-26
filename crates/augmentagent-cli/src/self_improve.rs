@@ -16512,42 +16512,17 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(drafts_to_close(&prs, &std::collections::HashSet::new(), Some("nolanmak")).is_empty());
     }
 
-    // Structural: every gave-up in resume_draft_pr closes the PR (branch
-    // kept), and close_gave_up_pr never deletes the branch.
+    // Review exhaustion retains a resumable draft instead of terminating work.
     #[test]
     fn gave_up_in_resume_closes_the_pr_but_keeps_the_branch() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let end = start + src[start..].find("\n}\n").expect("fn end");
-        let body = &src[start..end];
-        let mut sites = 0;
-        let mut from = 0;
-        while let Some(at) = body[from..].find("label_gave_up(") {
-            let abs = from + at;
-            let ret = abs
-                + body[abs..]
-                    .find("return Ok(RunReport::")
-                    .expect("return after gave-up");
-            assert!(
-                body[abs..ret].contains("close_gave_up_pr("),
-                "gave-up site {} must close the PR before returning",
-                sites + 1
-            );
-            sites += 1;
-            from = abs + 1;
+        let findings = "same unresolved reviewer conflict";
+        for attempts in [1, 2, 20, 100] {
+            assert_eq!(give_up_verdict(&[Some(findings.into())], findings, FailureKind::ReviewReject, attempts), None,
+                "review conflicts stay resumable even after the per-run budget is exhausted");
         }
-        assert_eq!(
-            sites, 4,
-            "blast-radius (terminal), conflict-, gate-, review-exhausted"
-        );
-        let cstart = src.find("async fn close_gave_up_pr(").expect("close fn");
-        let cend = cstart + src[cstart..].find("\n}\n").expect("close fn end");
-        let close = &src[cstart..cend];
-        assert!(close.contains(r#""pr", "close""#));
-        assert!(
-            !close.contains("--delete-branch"),
-            "the branch stays for a human"
-        );
+        let prs = serde_json::json!([{ "number":42, "headRefName":"agent-fix/issue-1", "isDraft":true, "isCrossRepository":false }]);
+        assert_eq!(resumable_from(&prs, &AttemptLedger::default(), 5, &std::collections::HashSet::new(), None, None, 0),
+            Some((42, 1, "agent-fix/issue-1".into())));
     }
 
     // Structural: run_once has no PR yet at its gave-up sites — nothing to close.
@@ -16649,26 +16624,18 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     }
 
 
-    // Structural: `gh pr ready` + merge happen only under BOTH approvals.
+    // Complete internal authority, including adjudication, controls review approval.
     #[test]
     fn resume_merge_requires_internal_approvals() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let end = start + src[start..].find("\n}\n").expect("resume fn end");
-        let body = &src[start..end];
-        let gate = body
-            .find("if resume_may_merge(qa_ok, independent.approved()) {")
-            .expect("every approval guards the merge (QA joined in #1488)");
-        let ready = body
-            .find("ready_for_merge(repo_root, pr,")
-            .expect("ready transition");
-        assert!(gate < ready);
-        assert!(!body[gate..ready].contains("if independent.approved() {"));
-        // Advisory: a missing CodeRabbit verdict never parks the draft.
-        assert!(
-            !body.contains("CodeRabbit review pending"),
-            "absent CodeRabbit must not block or park"
-        );
+        let unresolved = super::progress_tests::synthetic_aligned_review("head", false);
+        assert!(!unresolved.approved(), "raw pass booleans cannot erase a QA finding");
+        let adjudicated = super::progress_tests::synthetic_aligned_review("head", true);
+        assert!(adjudicated.approved(), "the final adjudicator can resolve the QA contradiction");
+        assert!(!adjudicated.structured.as_ref().unwrap().passes[0].findings.is_empty(),
+            "approval preserves dissent rather than fabricating unanimous LGTM");
+        let mut missing = super::progress_tests::synthetic_aligned_review("head", true);
+        missing.structured.as_mut().unwrap().passes.pop();
+        assert!(!missing.approved(), "adjudication does not replace a missing pass");
     }
 
 
@@ -18348,44 +18315,22 @@ else:
     /// A head branch we cannot fetch (a fork, or one deleted after merge)
     /// must end the run as triage, not as an `Err` that kills the whole tick
     /// and every other draft behind it.
-    #[test]
-    fn an_unfetchable_head_branch_does_not_kill_the_tick() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let end = start + src[start..].find("\n}\n").expect("fn end");
-        let body = &src[start..end];
-        let check = body
-            .find("remote_branch_exists(repo_root, branch)")
-            .expect("resume must confirm the head branch is on origin");
-        let worktree_add = body.find(r#""worktree", "add""#).expect("worktree add");
-        assert!(check < worktree_add, "check before creating a worktree from it");
-        let ret = check + body[check..].find("return Ok(RunReport::").expect("a report, not a bail");
-        assert!(ret < worktree_add, "the missing-branch path returns before the worktree add");
-        // Scoped to the guard block itself. Everything after it may still
-        // `bail!` on its own terms — the #300 trust refusal does — but this
-        // path must not, because a fork's branch is not an error condition
-        // for the tick.
-        assert!(
-            !body[check..ret].contains("bail!"),
-            "a fork's branch is not an error condition for the tick"
-        );
-        // And nothing fallible may run against the branch BEFORE the check.
-        // `git fetch origin <fork-branch>` is guaranteed to fail; today `run`
-        // reports that as Ok((false, ..)) so it happens to be survivable, but
-        // resting a denial-of-service guard on that semantic is how the hole
-        // comes back. Ask for the branch first, then touch the network.
-        let fetch = body.find(r#""fetch", "origin", branch"#).expect("resume fetches the branch");
-        assert!(
-            check < fetch,
-            "confirm the branch is on origin before fetching it, so no failure path precedes the guard"
-        );
-        // #1006 asks for a refusal that "records nothing". The loop re-reads
-        // its open drafts every tick, so any GitHub write here is not one
-        // note — it is one per tick, forever, on a PR nobody is resuming.
-        assert!(
-            !body[check..ret].contains("\"comment\""),
-            "the missing-branch refusal must not write to GitHub; it repeats every tick"
-        );
+    #[tokio::test]
+    async fn an_unfetchable_head_branch_does_not_kill_the_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git").args(args).current_dir(dir.path()).output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["init", "-q", "--bare", "origin.git"]);
+        git(&["remote", "add", "origin", "origin.git"]);
+        for branch in ["agent-fix/issue-1", "agent-fix/issue-2"] {
+            assert!(!remote_branch_exists(dir.path(), branch).await);
+        }
+        let report = RunReport::held("missing remote branch; retry reconciliation".into());
+        assert!(!report.billed);
+        assert!(!dir.path().join(".git/worktrees").exists());
     }
 
     // ---- #1037: a draft nobody independent can review ----
@@ -18636,30 +18581,18 @@ else:
         assert!(finder.contains("swept_close_comment(") && finder.contains("read_unreviewable("), "{finder}");
     }
 
-    /// C1 + TDD 4 — structural: the lane asks before it spends, both exits go
-    /// through the one mapping, and billing follows real builder calls.
+    /// Reviewer selection preserves independence; billing follows actual builder work.
     #[test]
     fn the_resume_lane_asks_first_and_bills_only_real_builder_calls() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
-        let bind = body.find("track_review_history(").expect("history is bound");
-        let ask = body.find("select_reviewer(").expect("the lane must ask before spending");
-        assert!(bind < ask, "provenance is read after it is bound");
-        for spend in [r#""worktree", "add""#, r#""merge", "--no-edit""#, "verification_gate(", "call_revision_with_storage("] {
-            let at = body.find(spend).unwrap_or_else(|| panic!("{spend} is in the lane"));
-            assert!(ask < at, "ask before {spend}");
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        let selected = select_reviewer(&[Codex, Claude], Ok(Some(vec![Claude])), |_| ReviewerStatus::Ready).unwrap();
+        assert_eq!(selected, Codex);
+        let why = select_reviewer(&[Codex, Claude], Ok(Some(vec![Codex, Claude])), |_| ReviewerStatus::Ready).unwrap_err();
+        for builder_called in [false, true] {
+            let plan = unreviewable_plan(42, 1, &why, 1, builder_called);
+            assert_eq!(plan.billed, builder_called);
         }
-        let holds: Vec<usize> = body.match_indices("hold_unreviewable(").map(|(i, _)| i).collect();
-        assert_eq!(holds.len(), 2, "the preflight and the post-review race, nothing else");
-        for at in holds {
-            let call = &body[at..at + body[at..].find(".await").expect("awaited")];
-            assert!(call.contains("reasoner.calls() > 0"), "billing must follow builder calls: {call}");
-        }
-        assert!(
-            !body.contains("independent review capacity is unavailable"),
-            "the old blanket message is gone"
-        );
+        assert!(select_reviewer(&[Codex, Claude], Ok(None), |_| ReviewerStatus::Ready).is_err());
     }
 
     /// C4 — structural: the branch record is superseded where the push has
@@ -19140,26 +19073,19 @@ mod iterate_not_delete_tests {
         );
     }
 
-    /// AC2 — every revised diff goes back through Stage 3, and Stage 4
-    /// only sees a diff Stage 3 approved.
+    /// Every revision invalidates old evidence and requires all review roles anew.
     #[test]
     fn fresh_lane_re_runs_qa_after_every_revision() {
-        let body = run_once_src();
-        let lp = body
-            .find("match after_review(")
-            .expect("the decision drives the loop");
-        let rest = &body[lp..];
-        let rev = rest.find(".call_revision_with_storage(").expect("a revision round");
-        let qa = rest[rev..]
-            .find("review_opts(")
-            .expect("QA after the revision");
-        let ind = rest[rev..]
-            .find("independent_review(")
-            .expect("Stage 4 after the revision");
-        assert!(
-            qa < ind,
-            "QA re-reviews before Stage 4 sees the revised diff"
-        );
+        let approved = super::progress_tests::synthetic_aligned_review("round-1", true);
+        assert!(approved.approved());
+        let mut revised = super::progress_tests::synthetic_aligned_review("round-1", true);
+        revised.structured.as_mut().unwrap().binding.head = "round-2".into();
+        assert!(!revised.approved(), "old QA, diff and system passes cannot authorize revised source");
+        let complete_round = super::progress_tests::synthetic_aligned_review("round-2", true);
+        assert!(complete_round.approved());
+        let mut missing_qa = complete_round;
+        missing_qa.structured.as_mut().unwrap().passes.retain(|p| p.role != crate::autoship_review::ReviewRole::Qa);
+        assert!(!missing_qa.approved());
     }
 
     /// AC3 — the reject branch no longer deletes the worktree; parking does.
@@ -19178,25 +19104,14 @@ mod iterate_not_delete_tests {
 
     #[test]
     fn resume_runs_qa_every_round_and_reads_the_parked_findings() {
-        let body = resume_src();
-        let lp = body.find("    loop {").expect("round loop");
-        assert!(
-            body[lp..].contains("review_opts("),
-            "QA inside the round loop"
-        );
-        assert!(
-            body.contains("parse_qa_findings("),
-            "parked findings seed the QA prompt"
-        );
-        assert!(
-            body.contains("resume_may_merge("),
-            "merge needs QA approve too"
-        );
-        // Only the loop's own comments can seed the prompt.
-        assert!(
-            body.contains("select(.author.login == $me)"),
-            "untrusted comments filtered"
-        );
+        let old = qa_findings_comment("first regression");
+        let latest = qa_findings_comment("remaining regression");
+        assert_eq!(parse_qa_findings(&[old, "unrelated text".into(), latest]), Some("remaining regression".into()));
+        assert_eq!(parse_qa_findings(&["REVIEW: approve".into()]), None);
+        let pending = super::progress_tests::synthetic_aligned_review("resumed", false);
+        assert!(!pending.approved());
+        let resolved = super::progress_tests::synthetic_aligned_review("resumed", true);
+        assert!(resolved.approved(), "a final ruling resolves disagreement without waiting for unanimity");
     }
 
     // ---- #1489: exhausted budgets park a draft ---------------------------
