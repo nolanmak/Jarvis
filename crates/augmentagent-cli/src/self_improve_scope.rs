@@ -45,6 +45,17 @@ fn excerpt(contents: &str, request: &ReadRequest) -> Result<String> {
     }
     Ok(output)
 }
+fn tree_entries(raw: &str) -> Result<Vec<(&str, &str)>> {
+    raw.split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .split_once('\t')
+                .context("Git source index entry is malformed")
+        })
+        .collect()
+}
+
 async fn call(
     root: &Path,
     control: &Path,
@@ -99,15 +110,17 @@ pub(crate) async fn run(
         "scoper authority store overlaps candidate"
     );
     let head = actual_head(root).await?;
-    let tracked = trusted_git(root, &["ls-tree", "-r", "--long", &head]).await?;
+    let tracked = trusted_git(root, &["ls-tree", "-r", "--long", "-z", &head]).await?;
     ensure!(
         tracked.len() <= 1024 * 1024,
         "scoper file index needs partitioning"
     );
-    let paths = tracked
-        .lines()
-        .filter_map(|line| line.split_once('\t').map(|(_, path)| path))
+    let entries = tree_entries(&tracked)?;
+    let paths = entries
+        .iter()
+        .map(|(_, path)| *path)
         .collect::<std::collections::BTreeSet<_>>();
+    let tracked = serde_json::to_string(&entries)?;
     let provider = reviewer_pool()
         .into_iter()
         .find(|provider| {
@@ -181,6 +194,17 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_index_preserves_literal_quoted_and_multiline_filenames() {
+        let raw = "100644 blob abc 12\tpath with spaces/quoted\"name.rs\0".to_owned()
+            + "100644 blob def 9\ttab\tand\nnewline.py\0";
+        let entries = tree_entries(&raw).unwrap();
+        assert_eq!(entries[0].1, "path with spaces/quoted\"name.rs");
+        assert_eq!(entries[1].1, "tab\tand\nnewline.py");
+        let encoded = serde_json::to_string(&entries).unwrap();
+        assert!(!encoded.contains('\0'));
+    }
+
     #[test]
     fn exact_ranges_and_literal_search_do_not_execute_instructions() {
         let mut request = ReadRequest {
