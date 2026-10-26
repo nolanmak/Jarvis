@@ -83,6 +83,7 @@ def validate_output(output, returncode, minimum, *, allow_filtered=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "target/phone-offline")
+    parser.add_argument("--managed", action="store_true", help="Use the repository build-storage wrapper for local acceptance runs")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, AUGMENTAGENT_GH_DISABLE="1", AUGMENTAGENT_PHONE_ENABLED="0", CARGO_TERM_COLOR="never")
@@ -111,6 +112,8 @@ def main():
                   "channel::tests::private_phone_setup_is_not_stored_or_sent_to_reasoner", "--", "--exact"], 1, True))
     try:
         for label, command, minimum, allow_filtered in jobs:
+            if args.managed:
+                command = [str(ROOT / "scripts/cargo-managed.sh"), *command[1:]]
             print("Running " + label, flush=True)
             run = subprocess.run(command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             (args.output / (label + ".log")).write_text(run.stdout)
