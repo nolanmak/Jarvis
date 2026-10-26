@@ -23,6 +23,8 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(16);
 pub enum RuntimeError {
     #[error(transparent)]
     Service(#[from] Error),
+    #[error(transparent)]
+    Live(#[from] crate::live::LiveError),
     #[error("phone listener or local tool socket failed")]
     Io(#[from] std::io::Error),
     #[error("phone runtime task did not finish cleanly")]
@@ -42,6 +44,7 @@ impl PhoneRuntime {
         listener: TcpListener,
     ) -> Result<Self, RuntimeError> {
         service.enabled()?;
+        service.preflight_live().await?;
         let tools = ToolServer::start(service.clone()).await?;
         // Synchronous reconciliation marks stale calls stopped before callers
         // get access to the new runtime and can request another call.
@@ -152,6 +155,7 @@ pub async fn cleanup_without_runtime(
             debug_events: false,
             barge_in: crate::relay::BargeIn::default(),
             fast: None,
+            live: None,
             preemptive: false,
             proposals: crate::proposals::ProposalPolicy::default(),
             silence: crate::silence::SilencePolicy::default(),

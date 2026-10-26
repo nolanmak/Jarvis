@@ -132,6 +132,7 @@ impl Settings {
         let silence = crate::silence::SilencePolicy::from_lookup(&get)?;
         let public_url = required("AUGMENTAGENT_PHONE_PUBLIC_URL")?;
         let fast = crate::fast::FastLayerConfig::from_lookup(&get, &public_url)?;
+        let live = crate::live::LiveConfig::from_lookup(&get).map_err(|_| Error::NotConfigured)?;
         let phone = PhoneConfig::new(
             true,
             &public_url,
@@ -143,6 +144,7 @@ impl Settings {
         .with_silence(silence)
         .with_barge_in(barge_in(&get)?)
         .with_fast_layer(fast)
+        .with_live(live)
         .with_preemptive(preemptive)
         .with_proposals(crate::proposals::ProposalPolicy::from_lookup(&get)?);
         let account = required("TWILIO_ACCOUNT_SID")?;

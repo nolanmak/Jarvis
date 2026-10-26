@@ -137,6 +137,7 @@ pub struct PhoneConfig {
     debug_events: bool,
     barge_in: relay::BargeIn,
     fast: Option<fast::FastLayerConfig>,
+    live: Option<live::LiveConfig>,
     preemptive: bool,
     proposals: proposals::ProposalPolicy,
     silence: silence::SilencePolicy,
@@ -181,6 +182,7 @@ impl PhoneConfig {
             debug_events: false,
             barge_in: relay::BargeIn::default(),
             fast: None,
+            live: None,
             preemptive: false,
             proposals: proposals::ProposalPolicy::default(),
             silence: silence::SilencePolicy::default(),
@@ -221,6 +223,11 @@ impl PhoneConfig {
     /// Answer utterances with the fast conversational layer (#1546).
     pub fn with_fast_layer(mut self, fast: Option<fast::FastLayerConfig>) -> Self {
         self.fast = fast;
+        self
+    }
+    /// Enables the provider-owned Live transport for already-authorized calls.
+    pub fn with_live(mut self, live: Option<live::LiveConfig>) -> Self {
+        self.live = live;
         self
     }
     /// Preemptive generation on interim transcripts (#1555). Takes effect only
@@ -282,6 +289,22 @@ impl PhoneService {
     /// Fast-layer settings when `AUGMENTAGENT_PHONE_FAST_LAYER=1` (#1546).
     pub fn fast_layer(&self) -> Option<&fast::FastLayerConfig> {
         self.config.fast.as_ref()
+    }
+    /// Validates configured provider access before the runtime accepts calls.
+    pub async fn preflight_live(&self) -> Result<(), live::LiveError> {
+        if let Some(config) = &self.config.live {
+            let mut client = live::OpenAiLiveClient::new(config);
+            live::LiveClient::preflight(&mut client).await?;
+        }
+        Ok(())
+    }
+    /// Creates Live only after the existing store-backed active-call check.
+    /// It therefore cannot allocate a second call or bypass call budgets.
+    pub fn live_adapter(&self, call_id: &str) -> Result<Option<live::LiveAdapter<live::OpenAiLiveClient>>, Error> {
+        self.authorize_call(call_id)?;
+        Ok(self.config.live.as_ref().map(|config| {
+            live::LiveAdapter::new(config.clone(), live::OpenAiLiveClient::new(config))
+        }))
     }
     /// `AUGMENTAGENT_PHONE_PREEMPTIVE=1` on the fast layer (#1555): TwiML
     /// requests interim prompts and the relay may speculate on them.
@@ -789,6 +812,7 @@ pub mod recovery;
 pub mod metrics;
 
 pub mod fast;
+pub mod live;
 
 pub mod memory;
 pub mod end_call;

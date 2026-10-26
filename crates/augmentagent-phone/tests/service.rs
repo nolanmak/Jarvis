@@ -886,6 +886,30 @@ async fn ac04_revoked_owner_cannot_start_or_accept_but_terminal_status_still_rec
 }
 
 #[tokio::test]
+async fn live_adapter_is_gated_on_the_authorized_connected_call() {
+    use augmentagent_store::phone::CallState;
+    let f = fixture("discord", true, true, false);
+    let grant = f.service.authorize(&f.owner, &f.conversation).unwrap();
+    let call = f
+        .service
+        .tool(&grant, "call_owner", json!({"request_id":"live"}))
+        .await
+        .unwrap();
+    let id = call["id"].as_str().unwrap();
+    f.store
+        .phone_provider_event(id, "CA-test", CallState::AwaitingAcceptance, 100)
+        .unwrap();
+    // Live must not open a session for a call that is not yet connected.
+    assert!(f.service.live_adapter(id).is_err());
+    f.store.phone_accept(id, "CA-test", 101).unwrap();
+    // Connected and authorized: the gate passes, and the adapter is absent
+    // only because this fixture has no Live credential configured.
+    assert!(f.service.live_adapter(id).unwrap().is_none());
+    f.store.phone_request_stop("canonical-owner", id).unwrap();
+    assert!(f.service.live_adapter(id).is_err());
+}
+
+#[tokio::test]
 async fn ac04_same_timestamp_rebind_invalidates_existing_call_and_grant() {
     use augmentagent_store::phone::CallState;
     for connected in [false, true] {

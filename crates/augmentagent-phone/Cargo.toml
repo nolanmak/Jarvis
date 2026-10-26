@@ -27,6 +27,7 @@ axum = { version = "0.8", features = ["ws"] }
 futures.workspace = true
 tokio-util.workspace = true
 serde_urlencoded = "0.7"
+tokio-tungstenite = "0.29"
 
 tempfile = "3"
 unicode-general-category = "1"
@@ -35,6 +36,5 @@ unicode-general-category = "1"
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 mockito = "1"
-tokio-tungstenite = "0.29"
 proptest = "1"
 roxmltree = "0.20"
