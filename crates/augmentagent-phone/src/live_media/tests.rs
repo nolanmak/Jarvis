@@ -225,8 +225,21 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
     let backend = tokio::spawn(async move {
         let (tcp, _) = provider.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
-        let _ = ws.next().await;
+        let start = ws.next().await.unwrap().unwrap();
+        let start: serde_json::Value = serde_json::from_str(start.to_text().unwrap()).unwrap();
+        assert_eq!(start["session"]["input"][0]["role"], "developer");
+        assert!(start["session"]["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Greet"));
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(
+            json!({"type":"session.output_audio.delta","delta":STANDARD.encode([128;160])})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
         loop {
             let Some(Ok(Message::Text(text))) = ws.next().await else {
                 break;
@@ -267,7 +280,24 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
     let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
-    ws.send(Message::Text(json!({"event":"media","sequenceNumber":"2","streamSid":"MZ-test","media":{"track":"inbound","chunk":"1","timestamp":"0","payload":STANDARD.encode([255;160])}}).to_string().into())).await.unwrap();
+    // The first audible frame must arrive without any caller audio.
+    let greeting = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let greeting: serde_json::Value = serde_json::from_str(greeting.to_text().unwrap()).unwrap();
+    assert_eq!(greeting["media"]["payload"], STANDARD.encode([128; 160]));
+    let mark = ws.next().await.unwrap().unwrap();
+    let mark: serde_json::Value = serde_json::from_str(mark.to_text().unwrap()).unwrap();
+    ws.send(Message::Text(
+        json!({"event":"mark","streamSid":"MZ-test","sequenceNumber":"2","mark":mark["mark"]})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(Message::Text(json!({"event":"media","sequenceNumber":"3","streamSid":"MZ-test","media":{"track":"inbound","chunk":"1","timestamp":"0","payload":STANDARD.encode([255;160])}}).to_string().into())).await.unwrap();
     let text = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
         .await
         .unwrap()

@@ -56,7 +56,7 @@ pub(crate) async fn run(
                                 .live
                                 .as_ref()
                                 .ok_or(LiveError::Configuration)?;
-                            let connection = live.connect(&instructions).await?;
+                            let connection = live.connect_for_call(&instructions).await?;
                             service
                                 .authorize_call(&call.id)
                                 .map_err(|_| LiveError::Access)?;

@@ -33,6 +33,17 @@ impl LiveConnection {
     pub async fn connect(key: &str, instructions: &str) -> Result<Self, LiveError> {
         Self::connect_to(ENDPOINT, key, instructions).await
     }
+    pub async fn connect_for_call(key: &str, instructions: &str) -> Result<Self, LiveError> {
+        Self::connect_to_mode(ENDPOINT, key, instructions, true).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn connect_call_test(
+        endpoint: &str,
+        key: &str,
+        instructions: &str,
+    ) -> Result<Self, LiveError> {
+        Self::connect_to_mode(endpoint, key, instructions, true).await
+    }
     #[cfg(test)]
     pub(crate) async fn connect_test(
         endpoint: &str,
@@ -42,6 +53,14 @@ impl LiveConnection {
         Self::connect_to(endpoint, key, instructions).await
     }
     async fn connect_to(endpoint: &str, key: &str, instructions: &str) -> Result<Self, LiveError> {
+        Self::connect_to_mode(endpoint, key, instructions, false).await
+    }
+    async fn connect_to_mode(
+        endpoint: &str,
+        key: &str,
+        instructions: &str,
+        greet: bool,
+    ) -> Result<Self, LiveError> {
         if key.is_empty()
             || key.len() > 8192
             || key
@@ -57,7 +76,11 @@ impl LiveConnection {
             .map_err(|_| LiveError::Authentication)?;
         authorization.set_sensitive(true);
         request.headers_mut().insert("authorization", authorization);
-        let mut session = LiveSession::new(instructions)?;
+        let mut session = if greet {
+            LiveSession::for_call(instructions)?
+        } else {
+            LiveSession::new(instructions)?
+        };
         let start = session.start()?;
         // One absolute budget includes DNS, TCP, TLS, upgrade, write and all
         // startup frames. Ping traffic cannot renew it.

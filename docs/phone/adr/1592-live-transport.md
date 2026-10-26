@@ -61,6 +61,20 @@ outbound-only service. Revisit the choice if measured latency misses #1591.
 
 ## Qualification still required
 
+Answered calls supply an initial developer message requesting a brief greeting;
+the pre-dial readiness probe does not. The socket fixture verifies greeting
+audio can reach Twilio before any inbound audio, but only a live call can prove
+that the selected voice actually follows that instruction.
+
+Interruption qualification must account for the Live protocol rather than
+importing Realtime turn events: output audio has no timestamps or audio-done
+event, and transcript fragments have no completed-turn event. OpenAI documents
+local playback clearing and instruction steering, but an instruction acceptance
+is not a safe-resume or playback acknowledgment. The remaining interruption
+implementation must specify a bounded recovery policy and test late audio after
+clearing, short backchannels, and longer corrections. Do not claim the prompt
+alone guarantees immediate yielding or that a returned cleared mark was heard.
+
 Fixtures pin documented message shapes with synthetic identities/audio; they
 are not captures from this account and cannot establish live compatibility.
 The signed HTTP/WSS integration tests must prove zero sessions/backend work on
@@ -73,6 +87,8 @@ recorded in #1596. Missing OpenAI credentials block the canary, not offline work
 
 - [OpenAI partner integrations](https://developers.openai.com/api/docs/guides/live-partner-integrations)
 - [OpenAI WebSocket audio formats and events](https://developers.openai.com/api/docs/guides/voice-websockets)
+- [OpenAI Live conversation events and startup input](https://developers.openai.com/api/docs/guides/live-conversations)
+- [OpenAI playback controls and interruption recovery](https://developers.openai.com/api/docs/guides/voice-server-controls?api=live#check-speech-before-playback)
 - [OpenAI telephony choices](https://developers.openai.com/api/docs/guides/voice-sip)
 - [Twilio Agent Connect overview](https://www.twilio.com/docs/conversations/agent-connect/overview)
 - [Twilio GPT-Live TypeScript integration](https://www.twilio.com/en-us/blog/developers/tutorials/integrations/tac-gpt-live-voice-ai-agent-typescript)

@@ -117,6 +117,10 @@ async fn preflight_finalizes_before_dialing_and_uses_no_owner_context() {
         let start: Value =
             serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(start["session"]["model"], "gpt-live-1");
+        assert!(
+            start["session"].get("input").is_none(),
+            "readiness probes must not greet"
+        );
         assert!(!start.to_string().contains("canonical"));
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"preflight-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         let close: Value =

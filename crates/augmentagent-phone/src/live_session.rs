@@ -92,6 +92,7 @@ pub enum LiveInput {
 pub struct LiveSession {
     state: LiveState,
     instructions: String,
+    greet: bool,
     id: Option<String>,
     deadline: Option<Instant>,
     delegations: HashMap<String, f64>,
@@ -104,10 +105,18 @@ impl LiveSession {
         Ok(Self {
             state: LiveState::Created,
             instructions: instructions.into(),
+            greet: false,
             id: None,
             deadline: None,
             delegations: HashMap::new(),
         })
+    }
+    /// Answered owner calls get a startup developer message. Readiness probes
+    /// use new() so they never request a spoken greeting.
+    pub fn for_call(instructions: &str) -> Result<Self, LiveError> {
+        let mut session = Self::new(instructions)?;
+        session.greet = true;
+        Ok(session)
     }
     pub fn state(&self) -> LiveState {
         self.state
@@ -151,10 +160,15 @@ impl LiveSession {
         }
         self.state = LiveState::Starting;
         self.deadline = Some(Instant::now() + Duration::from_secs(10));
-        let event = json!({"type":"session.start","session":{
+        let mut event = json!({"type":"session.start","session":{
             "model":MODEL,"instructions":self.instructions,
             "audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":VOICE}},
             "delegation":{"type":"client"}}});
+        if self.greet {
+            event["session"]["input"] = json!([{"role":"developer","content":[{
+                "type":"input_text","text":"Greet the caller now in English with one brief friendly sentence, then ask what they need. Use their saved first name only if it is present in the approved profile context. Do not recite profile details or wait for the caller to speak first."
+            }]}]);
+        }
         self.instructions.clear();
         Ok(event)
     }

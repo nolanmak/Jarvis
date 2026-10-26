@@ -64,6 +64,13 @@ impl LiveConfig {
             _ => Err(LiveError::Protocol),
         }
     }
+    pub async fn connect_for_call(&self, instructions: &str) -> Result<LiveConnection, LiveError> {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.endpoint {
+            return LiveConnection::connect_call_test(endpoint, &self.api_key, instructions).await;
+        }
+        LiveConnection::connect_for_call(&self.api_key, instructions).await
+    }
     pub async fn connect(&self, instructions: &str) -> Result<LiveConnection, LiveError> {
         #[cfg(test)]
         if let Some(endpoint) = &self.endpoint {
