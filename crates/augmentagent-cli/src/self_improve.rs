@@ -18223,9 +18223,13 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
             "gate, revise gate, final gate"
         );
         assert!(
-            body.matches("publish_outcome(").count() >= 2 && body.contains("rec(FailureKind::Infra, \"publish:git push\""),
-            "commit/create classified; uncertain push is infrastructure"
+            body.matches("publish_outcome(").count() >= 1 && body.contains("rec(FailureKind::Infra, \"publish:git push\""),
+            "commit classified; uncertain push is infrastructure"
         );
+        assert!(body.contains("await_publication_reconcile") && body.contains("remote_publication_unconfirmed"),
+            "uncertain creation must retain durable free reconciliation");
+        assert!(!body.contains("record_hard_failure(repo_root, issue.number, \"gh pr create failed\""),
+            "remote visibility uncertainty must not charge a code failure");
         assert!(
             body.matches("record_reasoner_error(").count() >= 3,
             "scope, build and qa-review reasoner errors are harness failures"

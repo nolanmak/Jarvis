@@ -593,7 +593,7 @@ mod tests {
         const CHILD:&str="AUTOSHIP_PENDING_PUBLICATION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
             use std::os::unix::fs::PermissionsExt;
-            let root=tempfile::tempdir().unwrap();let gh=root.path().join("gh.py");
+            let root=tempfile::Builder::new().prefix("autoship-publication-fixture-").tempdir_in("/tmp").unwrap();let gh=root.path().join("gh.py");
             std::fs::write(&gh,r#"#!/usr/bin/env python3
 import json,os,pathlib,sys
 root=pathlib.Path(os.environ['AUTOSHIP_PENDING_PUBLICATION_FIXTURE']);a=sys.argv[1:]
