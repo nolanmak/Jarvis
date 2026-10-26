@@ -13,6 +13,8 @@ use tokio::io::AsyncReadExt;
 
 #[path = "self_improve_amendment.rs"]
 mod amendment;
+#[path = "self_improve_verifier_checkout.rs"]
+mod verifier_checkout;
 #[path = "self_improve_scope.rs"]
 mod scope_authority;
 pub(super) use scope_authority::run as scope_original;
@@ -177,6 +179,7 @@ fn environment_id(root: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(SANDBOX.as_bytes());
+    hash.update(verifier_checkout::EXPORTER.as_bytes());
     hash.update(DEPENDENCY_AUDIT.as_bytes());
     hash.update(serde_json::to_vec(&compiler_control_inputs(root)?)?);
     if root.join("Cargo.lock").exists() {
@@ -368,11 +371,12 @@ async fn execute_registered(
     // Admission is the same production lease/storage accounting used by gates.
     // Do not recursively invoke cargo-managed.sh while this lease is held.
     let _lease = crate::build_storage::admit(&root, &target).await?;
+    let committed = verifier_checkout::materialize(&root, &head, registration).await?;
     let mut receipts = Vec::new();
     for verifier in &registration.contract().verifiers {
         registration.verify_integrity(&root)?;
         let invocation = verifier.command.invocation()?;
-        let observation = isolated_observation(&root, &target, invocation).await?;
+        let observation = isolated_observation(committed.path(), &target, invocation).await?;
         ensure!(
             actual_head(&root).await? == head,
             "checkout changed while verifying"
