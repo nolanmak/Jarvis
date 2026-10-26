@@ -312,3 +312,36 @@ requested/reserved/current/available bytes and applicable limits/margins.
 Unclassified setup exceptions retain only an allowlisted class and numeric
 errno. No exception message, raw stderr, filename, credential or policy payload
 is copied. These diagnostics do not change refusal, billing or retry semantics.
+
+OAuth rotation uses a host checkpoint, independently of normal conversation
+export. With the explicit refresh grant, the gateway recognizes only the exact
+Claude `POST https://platform.claude.com/v1/oauth/token` or Codex
+`POST https://auth.openai.com/oauth/token` endpoint and the supported native client
+ID. This recognition **does not add a network route**; the operator must still
+declare the exact route in the gateway policy. Encoded/query variants, other
+clients, expanded requested scopes and non-refresh grants are refused. Codex
+0.164.0 optional response tokens preserve their previous values when omitted or
+null; account identity checks still apply. Custom issuer/client overrides require
+separate reviewed support rather than silently bypassing the checkpoint.
+
+Before upstream dispatch the controller durably records a pending refresh intent.
+A bounded successful response is checkpointed privately and validated, then the
+controlled credential is fsynced before any response headers/body reach the guest.
+A received-response journal recovers across controller death before credential
+publication; replay preserves the original receipt timestamp and token expiry.
+Guest cancellation lets an in-flight refresh finish its checkpoint within the
+existing upstream timeout. A new session uses the updated shared credential even
+when no normal guest runtime export exists. No refresh payload appears in public
+receipts or logs; the temporary private response journal is replaced by digest-only
+completion metadata after successful credential persistence.
+
+Issuer rotation followed by loss of the response before durable receipt remains
+an externally uncertain OAuth outcome. Pending outcomes (including ambiguous HTTP
+failures) refuse both same-launch retries and subsequent launch admission instead
+of declaring the old token healthy. Recovery requires issuer/account reconciliation
+or a separately authorized credential reimport with explicit journal reconciliation;
+we do not automatically reuse a potentially consumed refresh token. The synthetic
+non-network tests cover rotation followed by SIGKILL and fresh-session seeding,
+received-response recovery, original expiry, concurrent/stale requests, scope
+refusal, and persistence-before-delivery. Natural provider refresh and fresh-session
+authentication remain distinct rollout checks; these tests use no actual credentials.

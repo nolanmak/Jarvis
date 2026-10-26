@@ -266,9 +266,15 @@ class State:
         self.socket = None
         self.cancelled = threading.Event()
         self.received = 0
+        self.refreshing = False
+        self.finished = threading.Event()
 
-    def close(self):
+    def close(self, force=False):
         self.cancelled.set()
+        # An already dispatched rotation must finish its host checkpoint even
+        # when the guest disappears. The existing upstream timeout bounds this.
+        if self.refreshing and not force:
+            return
         if self.socket:
             try:
                 self.socket.shutdown(socket.SHUT_RDWR)
@@ -282,7 +288,8 @@ class State:
 
 
 class HostGateway:
-    def __init__(self, policy, send_frame, diagnostic_path=None):
+    def __init__(self, policy, send_frame, diagnostic_path=None, refresh_checkpoint=None):
+        self.refresh_checkpoint = refresh_checkpoint
         self.policy = Policy(policy)
         self.send_frame = send_frame
         self.states = {}
@@ -453,6 +460,7 @@ class HostGateway:
 
     def serve(self, ident, state, request):
         phase = 'request_framing'
+        refreshing = False
         try:
             body = bytearray()
             while True:
@@ -464,6 +472,9 @@ class HostGateway:
                 body.extend(frame['decoded'])
             key, entry = self.policy.admit(request['authority'], request['method'], request['path'], request.get('websocket', False))
             supplied = headers_value(request.get('headers', []))
+            if self.refresh_checkpoint is not None:
+                refreshing = self.refresh_checkpoint.begin(request, entry, body)
+                state.refreshing = refreshing
             phase = 'upstream_connect'
             connection = safe_socket(entry, self.policy.timeout)
             state.socket = connection
@@ -480,6 +491,9 @@ class HostGateway:
             headers = [(n, v) for n, v in supplied if n.lower() not in HOP | {'content-length'}]
             wire = f"{request['method']} {request['path']} HTTP/1.1\r\nHost: {key}\r\nConnection: close\r\nContent-Length: {len(body)}\r\n"
             phase = 'request_send'
+            if refreshing:
+                headers = [(n, v) for n, v in headers if n.lower() != 'accept-encoding'] + [('Accept-Encoding', 'identity')]
+                self.refresh_checkpoint.sent()
             connection.sendall((wire + ''.join(f'{n}: {v}\r\n' for n, v in headers) + '\r\n').encode('latin1') + body)
             phase = 'response_headers'
             response = http.client.HTTPResponse(connection)
@@ -492,7 +506,25 @@ class HostGateway:
                         raise Denied('redirect')
                     redirect_method = 'GET' if response.status == 303 else request['method']
                     self.policy.admit(location.netloc, redirect_method, urllib.parse.urlunsplit(('', '', location.path or '/', location.query, '')))
+            # Rotation is a small non-streaming response. Persist BEFORE even
+            # headers are delivered; cancellation after issuer success must not
+            # discard a token merely because the guest has disappeared.
+            checkpoint_body = None
+            if refreshing and 200 <= response.status < 300:
+                phase = 'credential_checkpoint'
+                checkpoint_body = response.read(1024 * 1024 + 1)
+                if any(n.lower() == 'content-encoding' and v.lower() != 'identity' for n, v in received):
+                    raise Denied('headers')
+                self.refresh_checkpoint.commit(checkpoint_body)
+            elif refreshing:
+                self.refresh_checkpoint.rejected(response.status)
             self.emit('gateway_headers', ident, status=response.status, headers=[(n, v) for n, v in received if n.lower() not in HOP | {'content-length'}])
+            if checkpoint_body is not None:
+                for offset in range(0, len(checkpoint_body), self.policy.frame_bytes):
+                    self.emit('gateway_data', ident, data=encode(checkpoint_body[offset:offset + self.policy.frame_bytes]))
+                self.record_exchange(request, supplied, response.status, len(body), len(checkpoint_body), True)
+                self.emit('gateway_end', ident)
+                return
             total = 0
             phase = 'response_body'
             while not state.cancelled.is_set():
@@ -512,7 +544,10 @@ class HostGateway:
             # Only a fixed code crosses the diagnostic boundary.
             self.emit('gateway_error', ident, code='upstream_failed')
         finally:
-            state.close()
+            if refreshing:
+                self.refresh_checkpoint.end()
+            state.close(force=True)
+            state.finished.set()
             with self.lock:
                 if self.states.get(ident) is state:
                     del self.states[ident]
@@ -583,6 +618,14 @@ class HostGateway:
             states = list(self.states.values())
         for state in states:
             state.close()
+        for state in states:
+            if state.refreshing:
+                state.finished.wait(self.policy.timeout)
+                state.close(force=True)
+                # Never release the enclosing credential lease while a worker
+                # can still publish a checkpoint. Socket shutdown interrupts
+                # transport; any remaining fsync must settle before teardown.
+                state.finished.wait()
         with self.lock:
             if self.diagnostic_fd is not None:
                 os.close(self.diagnostic_fd)

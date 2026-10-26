@@ -25,6 +25,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import datetime
 
 MAX_FRAME = 2 * 1024 * 1024
 MAX_HOME = 64 * 1024 * 1024
@@ -268,6 +270,146 @@ def refresh_auth(spec, generation, original_digest, held_lock=None):
             os.close(lock_fd)
 
 
+class RefreshCheckpoint:
+    """Persist authenticated issuer rotation before delivering it to the guest.
+
+    This does not grant network access: the gateway independently admits the
+    exact route. The process-wide credential_use lock must already be held.
+    """
+    def __init__(self, spec, held_lock):
+        if not spec.get('refresh_auth') or held_lock is None:
+            raise ValueError('refresh checkpoint requires controlled credential lease')
+        self.spec = spec
+        self.lock = threading.Lock()
+        self.current = None
+        self.journal = Path(spec['auth_file']).with_name(Path(spec['auth_file']).name + '.refresh-checkpoint.json')
+        self.recover()
+
+    def recover(self):
+        if not self.journal.exists():
+            return
+        record = json.loads(private_bytes(self.journal, 2 * 1024 * 1024))
+        if record['state'] == 'committed':
+            return
+        current = private_bytes(Path(self.spec['auth_file']), 1024 * 1024)
+        digest = hashlib.sha256(current).hexdigest()
+        if record.get('result_digest') == digest:
+            atomic(self.journal, json.dumps({'state': 'committed', 'result_digest': digest}).encode())
+            return
+        if record.get('original_digest') != digest:
+            raise ValueError('refresh checkpoint credential lineage changed')
+        if record['state'] != 'received':
+            raise ValueError('credential refresh outcome uncertain; issuer reconciliation required')
+        self.current = current
+        try:
+            self.commit(base64.b64decode(record['response'], validate=True), record['received_at_ms'])
+        finally:
+            self.current = None
+
+    def sent(self):
+        atomic(self.journal, json.dumps({'state': 'pending',
+            'original_digest': hashlib.sha256(self.current).hexdigest()}).encode())
+
+    def rejected(self, status):
+        # Non-success is not proof that the issuer did not rotate before an
+        # internal/proxy error. Keep this outcome fenced, including same-launch retries.
+        atomic(self.journal, json.dumps({'state': 'pending', 'http_status': status,
+            'original_digest': hashlib.sha256(self.current).hexdigest()}).encode())
+
+    def begin(self, request, entry, body):
+        endpoint = {'claude': ('platform.claude.com:443', '/v1/oauth/token'),
+                    'codex': ('auth.openai.com:443', '/oauth/token')}[self.spec['provider']]
+        authority = request['authority'].lower()
+        if ':' not in authority:
+            authority += ':443'
+        if (authority, urllib.parse.unquote(urllib.parse.urlsplit(request['path']).path, errors='strict')) != endpoint:
+            return False
+        if request['path'] != endpoint[1]:
+            raise ValueError('refresh query is not supported')
+        if request['method'] != 'POST' or request.get('websocket') or not entry['tls'] or entry['allow_loopback']:
+            raise ValueError('invalid refresh transport')
+        if len(body) > 1024 * 1024:
+            raise ValueError('refresh request too large')
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate refresh JSON field')
+                result[key] = value
+            return result
+        data = json.loads(body, object_pairs_hook=unique_object)
+        if not isinstance(data, dict) or data.get('grant_type') != 'refresh_token':
+            raise ValueError('only refresh grant is permitted for credential checkpoint')
+        expected_client = {'claude': '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+                           'codex': 'app_EMoamEEZ73f0CkXaXp7hrann'}[self.spec['provider']]
+        allowed = {'grant_type', 'refresh_token', 'client_id'} | ({'scope', 'expires_in'} if self.spec['provider'] == 'claude' else {'refresh_reason'})
+        if set(data) - allowed:
+            raise ValueError('undeclared refresh request fields')
+        if data.get('client_id') != expected_client:
+            raise ValueError('refresh client is not the declared native client')
+        if not self.lock.acquire(blocking=False):
+            raise ValueError('credential refresh already in progress')
+        try:
+            self.recover()
+            self.current = private_bytes(Path(self.spec['auth_file']), 1024 * 1024)
+            original = json.loads(self.current)
+            container, token = ('claudeAiOauth', 'refreshToken') if self.spec['provider'] == 'claude' else ('tokens', 'refresh_token')
+            if 'scope' in data and (not isinstance(data['scope'], str) or not set(data['scope'].split()) <= set(original[container]['scopes'])):
+                raise ValueError('refresh request expands credential scope')
+            if data.get('refresh_token') != original[container][token]:
+                raise ValueError('refresh request does not match controlled credential')
+            return True
+        except BaseException:
+            self.end()
+            raise
+
+    def commit(self, response, received_at_ms=None):
+        if self.current is None or len(response) > 1024 * 1024:
+            raise ValueError('invalid refresh checkpoint response')
+        if received_at_ms is None:
+            received_at_ms = int(time.time() * 1000)
+        if type(received_at_ms) is not int or received_at_ms <= 0:
+            raise ValueError('invalid refresh receipt time')
+        record = {'state': 'received', 'received_at_ms': received_at_ms, 'original_digest': hashlib.sha256(self.current).hexdigest(),
+                  'response': base64.b64encode(response).decode()}
+        atomic(self.journal, json.dumps(record).encode())
+        data = json.loads(response)
+        if not isinstance(data, dict):
+            raise ValueError('invalid refresh response schema')
+        original = json.loads(self.current)
+        updated = json.loads(self.current)
+        if self.spec['provider'] == 'claude':
+            tokens = updated['claudeAiOauth']
+            tokens['accessToken'] = data['access_token']
+            if data.get('refresh_token') is not None:
+                tokens['refreshToken'] = data['refresh_token']
+            lifetime = data['expires_in']
+            if type(lifetime) is not int or not 0 < lifetime <= 366 * 86400:
+                raise ValueError('invalid refresh lifetime')
+            tokens['expiresAt'] = received_at_ms + lifetime * 1000
+            if 'scope' in data and (not isinstance(data['scope'], str) or set(data['scope'].split()) != set(tokens['scopes'])):
+                raise ValueError('refresh scope changed')
+        else:
+            for name in ('access_token', 'refresh_token', 'id_token'):
+                if data.get(name) is not None:
+                    updated['tokens'][name] = data[name]
+            if 'last_refresh' in updated:
+                updated['last_refresh'] = datetime.datetime.fromtimestamp(received_at_ms / 1000, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+        refreshed_credential(original, updated, self.spec['provider'])
+        target = Path(self.spec['auth_file'])
+        if private_bytes(target, 1024 * 1024) != self.current:
+            raise ValueError('credential changed during refresh checkpoint')
+        encoded = json.dumps(updated, separators=(',', ':')).encode()
+        record['result_digest'] = hashlib.sha256(encoded).hexdigest()
+        atomic(self.journal, json.dumps(record).encode())
+        atomic(target, encoded)
+        atomic(self.journal, json.dumps({'state': 'committed', 'result_digest': record['result_digest']}).encode())
+
+    def end(self):
+        self.current = None
+        self.lock.release()
+
+
 def runtime_seed(runtime, auth_file, auth_relative):
     entries = []
     total = 0
@@ -400,6 +542,7 @@ def main(spec_path):
         if ready:
             atomic(Path(ready).with_name('vm-startup-failure.json'), b'{"phase":"native_credential_in_use"}')
         raise RuntimeError('native credential is in use; retry after capacity is available') from None
+    refresh_checkpoint = RefreshCheckpoint(spec, credential_lock) if spec.get('refresh_auth') else None
     seed, original_auth = runtime_seed(state, spec.get('auth_file'), spec['auth_relative'])
     with tempfile.TemporaryDirectory(prefix='native-vm-launch-', dir=state) as temporary, short_channel_endpoint() as endpoint:
         private = Path(temporary)
@@ -474,7 +617,8 @@ def main(spec_path):
                     time.sleep(0.02)
             channel = Channel(channel_socket)
             diagnostic_path = Path(spec_path).parent / 'gateway-route-denials.jsonl' if spec.get('probe_route_diagnostics') is True else None
-            gateway = gateway_module.HostGateway(spec['gateway'], channel.send, diagnostic_path=diagnostic_path)
+            gateway = gateway_module.HostGateway(spec['gateway'], channel.send, diagnostic_path=diagnostic_path,
+                refresh_checkpoint=refresh_checkpoint)
             if spec.get('mcp_argv'):
                 bridge = subprocess.Popen(spec['mcp_argv'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           stderr=subprocess.DEVNULL, env={'PATH': os.defpath, 'HOME': str(Path.home())})
