@@ -984,6 +984,32 @@
       "passed": 1,
       "log": "/tmp/autoship-1598-setup-diagnostics-tests.log",
       "scope": "Typed safe setup category regression; actual native admission proceeded after missing helper fix. Separate resource exhaustion precedence independently reviewed."
+    },
+    "optional_checks_21c26af7": {
+      "passed": 3,
+      "log": "/tmp/autoship-1598-optional-checks-tests.log",
+      "scope": "Verified workflow identity, required overrides and unknown policy; later free unknown-identity followup needs fresh compiled tests."
+    },
+    "policy_hold_21c26af7": {
+      "passed": 7,
+      "log": "/tmp/autoship-1598-policy-hold-tests.log",
+      "scope": "Includes actual fake-GH optional failed review staying free, required failure repair, restart/day holds and virtual72h fivePR soak. Unknown-identity unpaid followup added after this run."
+    },
+    "native_adjudicator_fup0ps20": {
+      "status": "passed",
+      "log": "/tmp/autoship-native-acceptance-fup0ps20/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-fup0ps20/result.json",
+      "scope": "Two distinct actual Codex native sessions each uphold real arithmetic defect and dismiss contradictory claim with grounded target. Exact bindings/fingerprints retained, required CI cannot be waived and adjudication alone cannot mint reviewer LGTM. Original failed probe retained; full issue/adoption still pending."
+    },
+    "hosted_rust_f54acffe": {
+      "conclusion": "success",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40368451321",
+      "cli_passed": 1265,
+      "cli_ignored": 21,
+      "core_passed": 646,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-f54acffe-rust.log",
+      "scope": "Rust job passed alongside bridge and installer; later optional check and fixture changes still require fresh CI."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -1055,7 +1081,7 @@
     {
       "severity": "P1",
       "gap": "Required native Rust launcher omitted build-dependency-proxy.py from embedded helper inventory, failing readiness before any model call",
-      "status": "fixed_689f1e8c; exact_embedded_inventory_import_regression_passed; native_workflow_rerun_pending"
+      "status": "fixed_689f1e8c; exact_embedded_inventory_import_passed; actual_packaged_native_adjudication_passed_fup0ps20"
     },
     {
       "severity": "P1",
