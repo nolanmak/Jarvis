@@ -835,6 +835,11 @@ impl WorkflowStore {
                 "UPDATE workflow SET wall_ms=?2,model_calls=?3,tokens=?4 WHERE id=?1",
                 params![lease.workflow, sums.0, sums.1, sums.2],
             )?;
+            // Retain the observation time, not only cumulative totals, so a
+            // seven-day report never attributes old spend to today's work.
+            // This shares the receipt's insert transaction and is idempotent.
+            event(&tx, &lease.workflow, lease.generation,
+                "resource_charged", receipt_id, now_ms)?;
         }
         tx.commit()?;
         Ok(())
