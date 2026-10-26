@@ -99,6 +99,7 @@ mod autopr_eval;
 mod autopr_health;
 mod autoship_contract;
 mod autoship_episode;
+mod autoship_metrics;
 mod autoship_review;
 mod autoship_workflow;
 mod channel_router;
@@ -8920,6 +8921,11 @@ async fn run_digest(
     match self_improve::review_canary_summary() {
         Ok(summary) => ctx.push_str(&format!("{summary}\n")),
         Err(error) => ctx.push_str(&format!("Canary evidence unavailable: {error:#}\n")),
+    }
+    ctx.push_str("\n## Autoship observed throughput and resources\n");
+    match autoship_metrics::summary(since_ms, chrono::Utc::now().timestamp_millis()) {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Workflow evidence unavailable: {error:#}\n")),
     }
     ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
     for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending)] {
