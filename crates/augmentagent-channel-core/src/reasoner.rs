@@ -304,6 +304,12 @@ impl ReasonerError {
     }
 }
 
+// Command::get_envs does not expose env_clear. Use exactly the same policy
+// while constructing the CLI command and its process-tree supervisor.
+fn clear_provider_environment(opts: &ReasonerOpts, scoped: bool) -> bool {
+    opts.restrict_env || scoped
+}
+
 /// Watchdog timeout for one spawned reasoner CLI call (#656). Env-tunable
 /// without a rebuild; the default is deliberately generous because agentic
 /// presets (wiki-ask, auto-PR build) legitimately run many minutes. The
@@ -1253,7 +1259,8 @@ impl ClaudeCliReasoner {
         // scoped Bash allowlist) from seeing provider keys the daemon
         // loaded from `.env` at startup. `opts.env` is then layered on
         // top with explicit, just-in-time-loaded secrets.
-        if opts.restrict_env || native_scope.is_some() {
+        let clear_environment = clear_provider_environment(opts, native_scope.is_some());
+        if clear_environment {
             cmd.env_clear();
             for var in SAFELIST_ENV_VARS {
                 if let Ok(v) = std::env::var(var) {
@@ -1284,7 +1291,7 @@ impl ClaudeCliReasoner {
         if let Some(scope) = &native_scope { scope.configure(&mut cmd); }
         let (mut child, process_group) = crate::process_tree::spawn_supervised(
             &cmd,
-            opts.restrict_env,
+            clear_environment,
             clean,
             opts.handoff_path.as_deref(),
         )
@@ -2997,6 +3004,32 @@ mod tests {
                 Ok(self.canned.clone())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_provider_supervisor_does_not_restore_ambient_credentials() {
+        const PROBE: &str = "AUTOSHIP_SYNTHETIC_AMBIENT_CREDENTIAL";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reasoner::tests::scoped_provider_supervisor_does_not_restore_ambient_credentials", "--nocapture"])
+                .env(PROBE, "synthetic-only").output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let mut opts = dummy_opts();
+        opts.restrict_env = false; // Actual autoship builder preset.
+        let clear = clear_provider_environment(&opts, true);
+        assert!(clear);
+        assert!(!clear_provider_environment(&opts, false));
+        let mut command = tokio::process::Command::new("/usr/bin/python3");
+        command.env_clear().env("DECLARED_PROVIDER_AUTH_PROBE", "synthetic-only")
+            .args(["-I", "-c", "import os; assert 'AUTOSHIP_SYNTHETIC_AMBIENT_CREDENTIAL' not in os.environ; assert os.environ['DECLARED_PROVIDER_AUTH_PROBE']=='synthetic-only'; print('SCOPED_ENV_OK')"]);
+        let clean = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (child, group) = crate::process_tree::spawn_supervised(&command, clear, clean, None).unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        drop(group);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "SCOPED_ENV_OK");
     }
 
     fn dummy_opts() -> ReasonerOpts {
