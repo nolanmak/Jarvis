@@ -31,6 +31,17 @@ pub(super) fn path() -> PathBuf {
     durable::default_path()
 }
 
+/// Read GitHub's current base, never a possibly stale local tracking ref.
+pub(super) async fn remote_main_head(repo: &Path, repository: &str) -> Result<String> {
+    let (ok, out, error) = run(&gh_bin(), &[
+        "api", &format!("repos/{repository}/git/ref/heads/main"), "--jq", ".object.sha"
+    ], repo).await?;
+    let head = out.trim();
+    anyhow::ensure!(ok && matches!(head.len(), 40 | 64) && head.bytes().all(|c| c.is_ascii_hexdigit()),
+        "current remote main unavailable: {}", truncate(&error, 240));
+    Ok(head.to_ascii_lowercase())
+}
+
 fn millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -101,6 +112,7 @@ fn workflow_audit(
 /// a cancelled remote operation retains its durable intent for reconciliation.
 pub(super) struct SweepGuard {
     inner: Option<WorkflowGuard>,
+    reviewed_base: Option<String>,
 }
 impl SweepGuard {
     pub(super) async fn acquire(
@@ -214,7 +226,10 @@ impl SweepGuard {
         };
         inner.audit_event("sweep_claimed", serde_json::json!({}))?;
         inner.spawn_renewal();
-        Ok(Some(Self { inner: Some(inner) }))
+        let reviewed_base = serde_json::from_str::<serde_json::Value>(recorded).ok()
+            .and_then(|value| value.pointer("/verdict/structured/binding/base")
+                .and_then(|base| base.as_str()).map(str::to_owned));
+        Ok(Some(Self { inner: Some(inner), reviewed_base }))
     }
 
     pub(super) async fn validate_remote(&self, repo: &Path, pr: u64, expected: &str) -> Result<()> {
@@ -224,6 +239,10 @@ impl SweepGuard {
             inner.binding.head == expected,
             "sweep approval binding changed"
         );
+        let reviewed_base = self.reviewed_base.as_deref()
+            .context("recorded approval lacks a structured integration base; refresh review")?;
+        anyhow::ensure!(remote_main_head(repo, &inner.repository).await? == reviewed_base,
+            "main changed since review; integrate and verify the candidate again");
         let (ok, head, _) = run(
             &gh_bin(),
             &[
