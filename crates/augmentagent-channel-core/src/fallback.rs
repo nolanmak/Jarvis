@@ -144,6 +144,7 @@ pub struct FallbackReasoner {
     profile_enabled: fn(ProviderKind) -> bool,
     /// Adapters registered only for dashboard routing; direct mode excludes them.
     gateway_only: Vec<ProviderKind>,
+    workflow_native_only: bool,
     latch: CooldownLatch,
     /// #803 — resource accounting for this instance: `(provider, calls
     /// attempted, calls that returned Ok)`, in chain order of first use. The
@@ -211,6 +212,22 @@ pub fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
     }
 }
 
+/// Native reviewer eligibility inside an explicitly required workflow only.
+pub fn workflow_native_ineligible_reason(kind:ProviderKind)->Option<String> {
+    if !matches!(kind,ProviderKind::Codex|ProviderKind::Claude) {return Some("provider has no declared native VM identity".into());}
+    if let Some(reason)=gateway_ineligible_reason(kind){return Some(reason);}
+    match crate::native_vm::declared_native_auth(kind.name()) {
+        Ok(true)=>None,
+        _=>Some("required native VM provider credential is not declared or valid".into()),
+    }
+}
+fn workflow_entry_for(kind:ProviderKind)->Option<Entry> {
+    workflow_native_ineligible_reason(kind).is_none().then(||unchecked_entry(kind))
+}
+fn workflow_gateway_entry_for(kind:ProviderKind)->Option<Entry> {
+    (gateway_ineligible_reason(kind).is_none() && crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false)).then(||unchecked_entry(kind))
+}
+
 /// Construct the entry for one provider, or `None` when it is not eligible.
 fn entry_for(kind: ProviderKind) -> Option<Entry> {
     if let Some(reason) = native_ineligible_reason(kind) {
@@ -252,7 +269,11 @@ fn unchecked_entry(kind: ProviderKind) -> Entry {
 /// Eligibility is checked once per construction: a fallback CLI that is not
 /// installed (or has no resolvable auth) is dropped from the chain with one
 /// log line instead of erroring on every call.
-pub fn build_reasoner() -> Arc<FallbackReasoner> {
+pub fn build_reasoner() -> Arc<FallbackReasoner> { build_reasoner_inner(false) }
+pub fn build_workflow_reasoner()->Arc<FallbackReasoner> {build_reasoner_inner(true)}
+fn build_reasoner_inner(workflow:bool)->Arc<FallbackReasoner> {
+    let entry_for=if workflow {workflow_entry_for} else {entry_for};
+    let gateway_entry_for=if workflow {workflow_gateway_entry_for} else {gateway_entry_for};
     let mut entries: Vec<Entry> = chain_from_env().into_iter().filter_map(entry_for).collect();
     let mut gateway_only = Vec::new();
     // Pre-register gateway adapters while configured, even in direct mode,
@@ -274,7 +295,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
             }
         }
     }
-    if entries.is_empty() {
+    if entries.is_empty() && !workflow {
         // Unreachable via chain_from_env (it always yields claude), but keep
         // the invariant explicit: the composite always has a primary.
         entries.push(Entry {
@@ -293,6 +314,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
         mutation_providers: std::sync::Mutex::new(Vec::new()),
+        workflow_native_only: workflow,
         workflow_audit: std::sync::Mutex::new(None),
         review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
         handoff_root: crate::handoff::system_root(),
@@ -310,10 +332,13 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
 /// Deliberately returns `None` rather than falling back: a caller that
 /// cannot get the provider it asked for must be able to tell, and must fail
 /// closed. There is no chain here, so failover cannot silently occur either.
-pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
-    let native = entry_for(kind);
+pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> { build_pinned_inner(kind,false) }
+pub fn build_workflow_pinned(kind:ProviderKind)->Option<Arc<FallbackReasoner>> {build_pinned_inner(kind,true)}
+fn build_pinned_inner(kind:ProviderKind,workflow:bool)->Option<Arc<FallbackReasoner>> {
+    let native = if workflow {workflow_entry_for(kind)} else {entry_for(kind)};
     let gateway_only = if native.is_none() { vec![kind] } else { Vec::new() };
     native.or_else(|| {
+        if workflow {return None;}
         let config = crate::model_router::load().ok().flatten()?;
         (config.enabled() && config.allows(kind)).then(|| gateway_entry_for(kind)).flatten()
     }).map(|entry| {
@@ -324,6 +349,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_native_only: workflow,
             workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
@@ -359,6 +385,7 @@ impl FallbackReasoner {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_native_only: false,
             workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
@@ -380,6 +407,7 @@ impl FallbackReasoner {
             latch,
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
+            workflow_native_only: false,
             workflow_audit: std::sync::Mutex::new(None),
             review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: None,
@@ -401,7 +429,8 @@ impl FallbackReasoner {
     ) -> LaneAvailability {
         let Ok(selected) = crate::model_selection::current() else { return LaneAvailability::NoEligibleProvider; };
         let Ok(config) = crate::model_router::current() else { return LaneAvailability::NoEligibleProvider; };
-        let Ok(routing) = crate::model_router::select_profile(config, selected) else { return LaneAvailability::NoEligibleProvider; };
+        let required=self.workflow_native_only || self.workflow_audit.lock().ok().and_then(|logger|logger.clone()).is_some_and(|logger|logger.run_resources_required());
+        let Ok(routing) = crate::model_router::select_profile_for_workflow(config, selected, required) else { return LaneAvailability::NoEligibleProvider; };
         let mut latched = Vec::new();
         let mut eligible = 0usize;
         for entry in &self.entries {
@@ -571,6 +600,8 @@ impl FallbackReasoner {
             effective_opts.audit_logger = Some(logger.clone());
         }
         let opts = &effective_opts;
+        let required=opts.audit_logger.as_ref().is_some_and(|logger|logger.run_resources_required());
+        anyhow::ensure!(!self.workflow_native_only || required,"workflow-native reasoner requires protected workflow policy");
         // Respect a caller-pinned routing snapshot (including native phone turns).
         // Unscoped dispatch still reloads configuration for the next request.
         let config = crate::model_router::current().map_err(|_| ReasonerError::Local {
@@ -580,7 +611,7 @@ impl FallbackReasoner {
         // call. Unscoped callers can change the selection file after this
         // read; dispatch_snapshot must not pick up their newer model.
         let selected = crate::model_selection::current()?;
-        let config = crate::model_router::select_profile(config, selected)?;
+        let config = crate::model_router::select_profile_for_workflow(config, selected, required)?;
         #[cfg(test)]
         let _ = AFTER_ROUTE_SELECTION.try_with(|hook| hook());
         let outcome = crate::model_selection::SELECTED_PROFILE.scope(selected,
@@ -1410,6 +1441,47 @@ mod tests {
             .any(|row| row.get("provider").and_then(|v|v.as_str()) == Some("claude")
                 && row.get("session_id").and_then(|v|v.as_str()) == Some("actual-claude-session")));
         logger.protected_health().unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_native_review_uses_declared_credential_without_host_login() {
+        if std::env::var_os("AUTOSHIP_DECLARED_AUTH_FIXTURE").is_none() {
+            let home=tempfile::tempdir().unwrap();
+            let auth=home.path().join("service-auth.json");
+            std::fs::write(&auth,r#"{"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}"#).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let policy=home.path().join("policy.json");
+            std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":"/declared/state","memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+                "providers":{"codex":{"gateway":{},"auth_file":auth,"auth_relative":".codex/auth.json","environment":[]}}})).unwrap()).unwrap();
+            std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let status=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","fallback::tests::required_native_review_uses_declared_credential_without_host_login","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",home.path())
+                .env("XDG_STATE_HOME",home.path().join("state")).env("CODEX_CLI","/usr/bin/true")
+                .env("AUGMENTAGENT_NATIVE_VM_POLICY",policy).env("AUTOSHIP_DECLARED_AUTH_FIXTURE","1")
+                .status().unwrap();
+            assert!(status.success());return;
+        }
+        assert!(!crate::codex::codex_auth_available());
+        assert!(build_pinned(ProviderKind::Codex).is_none());
+        assert!(build_workflow_pinned(ProviderKind::Codex).is_some());
+        let temp=tempfile::Builder::new().prefix("native-auth-fixture-").tempdir_in("/tmp").unwrap();
+        let logs=temp.path().join("logs");let anchors=temp.path().join("anchors");
+        std::fs::create_dir(&logs).unwrap();std::fs::create_dir(&anchors).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&logs,&anchors] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("audit"),anchors.join("anchor"),&[]).unwrap());
+        logger.require_run_resources().unwrap();
+        let scripted=Scripted::ok("supplied-evidence fixture");
+        let chain=FallbackReasoner::for_tests(vec![(ProviderKind::Codex,scripted.clone())],latch_in(&temp));
+        let mut opts=text_only_opts();opts.audit_logger=Some(logger);
+        let result=crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.unwrap();
+        assert_eq!(result,"supplied-evidence fixture");
+        assert_eq!(scripted.count(),1);
+        opts.audit_logger=None;
+        assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.is_err());
+        assert_eq!(scripted.count(),1,"interactive native eligibility must not borrow service credentials");
     }
 
     #[tokio::test]

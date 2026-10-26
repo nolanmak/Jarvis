@@ -508,7 +508,7 @@ pub(super) async fn run_if_due() -> Result<()> {
     }
     drop(conn);
     let provider = augmentagent_channel_core::ProviderKind::Codex;
-    let reasoner = augmentagent_channel_core::build_pinned(provider)
+    let reasoner = augmentagent_channel_core::build_workflow_pinned(provider)
         .context("calibration native Codex unavailable")?;
     let isolated = tempfile::tempdir()?;
     observation.bind_reasoner(reasoner.as_ref())?;

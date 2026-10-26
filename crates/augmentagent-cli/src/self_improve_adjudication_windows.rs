@@ -287,7 +287,7 @@ async fn select_inner(
     let budget = remaining;
     anyhow::ensure!(budget >= 256, "insufficient residual window budget");
     let provider = augmentagent_channel_core::ProviderKind::Codex;
-    let reasoner = augmentagent_channel_core::build_pinned(provider)
+    let reasoner = augmentagent_channel_core::build_workflow_pinned(provider)
         .context("native evidence selector unavailable")?;
     let mut opts = codex_review_opts(worktree.to_path_buf(), SYSTEM);
     opts.allowed_tools.clear();

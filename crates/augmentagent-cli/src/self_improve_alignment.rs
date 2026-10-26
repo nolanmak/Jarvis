@@ -585,7 +585,7 @@ pub(super) async fn gate_for(
     .map_err(|why| anyhow::anyhow!("alignment reviewer unavailable: {why:?}"))?;
     let mut native_sessions = Vec::new();
     let mut supplied_request_hashes = Vec::new();
-    let reviewer = augmentagent_channel_core::build_pinned(provider)
+    let reviewer = augmentagent_channel_core::build_workflow_pinned(provider)
         .context("alignment reviewer unavailable")?;
     let mut mappings = acceptance::harness_alignment(prepared, &actual)
         .into_iter()

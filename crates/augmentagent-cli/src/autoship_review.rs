@@ -623,7 +623,7 @@ pub async fn adjudicate_native_with_origin(
         session_id: format!("autoship-adjudicate:{}", uuid::Uuid::new_v4()),
     };
     actor.independent_for(builders, origin)?;
-    let reasoner = augmentagent_channel_core::build_pinned(provider)
+    let reasoner = augmentagent_channel_core::build_workflow_pinned(provider)
         .context("native Codex adjudicator is not configured")?;
     adjudicate_with_origin(reasoner.as_ref(),actor,builders,opts,binding,criteria,findings,evidence,
         attempts_already_made,origin,true).await

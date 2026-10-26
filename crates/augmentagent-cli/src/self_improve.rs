@@ -35,7 +35,7 @@ use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
+use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, FallbackReasoner, Reasoner};
 
 #[path = "self_improve_episode.rs"]
 mod episode;
@@ -4024,7 +4024,7 @@ fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerSta
     // 9Router's account label cannot attest to its underlying model. An
     // author model could appear again as `cx/...` or `cc/...` and falsely
     // approve its own work. Automated review uses native identities only.
-    if let Some(why) = augmentagent_channel_core::fallback::native_ineligible_reason(kind) {
+    if let Some(why) = augmentagent_channel_core::fallback::workflow_native_ineligible_reason(kind) {
         return ReviewerStatus::NotConfigured(why);
     }
     match augmentagent_channel_core::CooldownLatch::system().latched_until(kind.name()) {

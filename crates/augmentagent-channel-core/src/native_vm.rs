@@ -38,6 +38,40 @@ struct Provider {
     environment: Vec<String>,
 }
 
+/// Declaration-only native authentication readiness. This performs no inference
+/// and never treats a router credential as native provider authentication.
+pub fn declared_native_auth(provider:&str)->Result<bool> {
+    let Some(path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(false)};
+    native_auth_at(Path::new(&path),provider,|key| {
+        if key=="CODEX_API_KEY" {crate::secret_loader::load_provider_key(key)}
+        else {std::env::var(key).ok()}
+    })
+}
+fn native_auth_at(path:&Path,provider:&str,environment:impl Fn(&str)->Option<String>)->Result<bool> {
+    let policy:Policy=serde_json::from_slice(&private(path)?)?;
+    ensure!(policy.version==1,"invalid native VM policy version");
+    let Some(profile)=policy.providers.get(provider) else{return Ok(false)};
+    let key=match provider {"codex"=>"CODEX_API_KEY","claude"=>"ANTHROPIC_API_KEY",_=>return Ok(false)};
+    if profile.environment.iter().any(|name|name==key) && environment(key).is_some_and(|value|!value.trim().is_empty()) {return Ok(true);}
+    let Some(path)=&profile.auth_file else{return Ok(false)};
+    let value:serde_json::Value=serde_json::from_slice(&private(path)?)?;
+    let nonempty=|pointer:&str|value.pointer(pointer).and_then(|v|v.as_str()).is_some_and(|value|!value.trim().is_empty());
+    Ok(match provider {
+        "codex"=>nonempty("/OPENAI_API_KEY") || (nonempty("/tokens/access_token") && nonempty("/tokens/refresh_token") && nonempty("/tokens/id_token")),
+        "claude"=>nonempty("/claudeAiOauth/accessToken") && nonempty("/claudeAiOauth/refreshToken"),
+        _=>false,
+    })
+}
+pub(crate) fn declared_router_auth(provider:&str)->Result<bool> {
+    let Some(path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(false)};
+    let policy:Policy=serde_json::from_slice(&private(Path::new(&path))?)?;
+    ensure!(policy.version==1,"invalid native VM policy version");
+    let Some(profile)=policy.providers.get(provider) else{return Ok(false)};
+    let keys:&[&str]=if provider=="claude" {&["ANTHROPIC_AUTH_TOKEN","ANTHROPIC_BASE_URL"]}
+        else {&["AUGMENTAGENT_ROUTER_API_KEY"]};
+    Ok(keys.iter().all(|key|profile.environment.iter().any(|name|name==key)))
+}
+
 pub(crate) fn required(logger: Option<&std::sync::Arc<crate::tool_audit::AuditLogger>>) -> bool {
     logger.is_some_and(|logger| logger.run_resources_required())
 }
@@ -363,6 +397,28 @@ mod tests {
         if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
         path
     }
+    #[test]
+    fn native_auth_requires_private_declared_native_credentials_not_router_key() {
+        let temp=tempfile::tempdir().unwrap();
+        let auth=temp.path().join("auth.json");
+        write(&auth,b"{\"tokens\":{\"access_token\":\"a\",\"refresh_token\":\"r\",\"id_token\":\"i\"}}").unwrap();
+        let path=temp.path().join("policy.json");
+        let policy=serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":"/declared/state","memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+            "providers":{"codex":{"gateway":{},"auth_file":auth,"auth_relative":".codex/auth.json","environment":[]}}});
+        write(&path,&serde_json::to_vec(&policy).unwrap()).unwrap();
+        assert!(native_auth_at(&path,"codex",|_|None).unwrap());
+        std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(native_auth_at(&path,"codex",|_|None).is_err());
+        let mut routed=policy.clone();routed["providers"]["codex"]["auth_file"]=serde_json::Value::Null;
+        routed["providers"]["codex"]["environment"]=serde_json::json!(["AUGMENTAGENT_ROUTER_API_KEY"]);
+        std::fs::write(&path,serde_json::to_vec(&routed).unwrap()).unwrap();
+        assert!(!native_auth_at(&path,"codex",|_|Some("declared-router-key".into())).unwrap());
+        routed["providers"]["codex"]["environment"]=serde_json::json!(["CODEX_API_KEY"]);
+        std::fs::write(&path,serde_json::to_vec(&routed).unwrap()).unwrap();
+        assert!(native_auth_at(&path,"codex",|_|Some("declared-native-key".into())).unwrap());
+        assert!(!native_auth_at(&path,"codex",|_|None).unwrap());
+    }
+
     #[test]
     fn retirement_preserves_active_and_resumable_sessions_then_reclaims_released_owner() {
         let temp=tempfile::tempdir().unwrap();

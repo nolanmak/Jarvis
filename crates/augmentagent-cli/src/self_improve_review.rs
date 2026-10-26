@@ -593,7 +593,7 @@ async fn run_impl(
     // Provider history does not identify historical native sessions. Preserve
     // it in the original provenance ledger; never invent builder Actor IDs.
     let builders = Vec::new();
-    let reasoner = augmentagent_channel_core::build_pinned(provider)
+    let reasoner = augmentagent_channel_core::build_workflow_pinned(provider)
         .context("native reviewer construction failed")?;
     let prior: Vec<_> = context
         .previous
