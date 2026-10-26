@@ -1889,3 +1889,15 @@ pub(super) async fn assert_sweep_receipt(
         .await
         .context("sweep evidence stale; workflow must reverify before merging")
 }
+
+#[cfg(test)]
+pub(super) fn persist_fixture_registration(control: &Path, prepared: &PreparedAcceptance) -> Result<()> {
+    use std::io::Write;
+    let source = prepared.proposal.contract.source()?;
+    let path = evidence_path(control, source, prepared.baseline.registration.baseline_head())?;
+    let mut staged = tempfile::NamedTempFile::new_in(control)?;
+    staged.write_all(&serde_json::to_vec(prepared)?)?;
+    staged.as_file().sync_all()?;
+    staged.persist_noclobber(path).map_err(|error| error.error)?;
+    write_manifest(control, &WorkflowManifest::from_prepared(source, prepared))
+}

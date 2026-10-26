@@ -235,7 +235,7 @@ async fn git_fixture(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
-async fn prepare_fixture(root: &Path, control: &Path) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
+async fn prepare_fixture_kind(root: &Path, control: &Path, issue: u64, seed_defect: bool) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
     git_fixture(&root, &["init", "-q"]).await?;
     git_fixture(&root, &["config", "user.name", "Synthetic Canary"]).await?;
     git_fixture(&root, &["config", "user.email", "canary@example.invalid"]).await?;
@@ -252,14 +252,14 @@ async fn prepare_fixture(root: &Path, control: &Path) -> Result<(acceptance::Pre
         &format!(
             "```autoship-contract\n{}\n```",
             serde_json::json!({
-                "contract":{"schema_version":1,"revision":1,"issue":840,
+                "contract":{"schema_version":1,"revision":1,"issue":issue,
                     "criteria":[{"id":"SUM","requirement":CRITERION,"verifier_ids":["sum"]}],
                     "allowed_paths":[{"kind":"file","path":"arithmetic.py"},{"kind":"file","path":"rules.rs"}],
                     "verifiers":[{"id":"sum","command":{"kind":"python_unittest","test":"autoship_verifiers.test_sum.Case.test_add"},"pinned_files":["autoship_verifiers/test_sum.py"],"failure_witness":"arithmetic sum regression"}]},
                 "files":{"autoship_verifiers/test_sum.py":"import unittest\nfrom arithmetic import add\nclass Case(unittest.TestCase):\n def test_add(self):\n  for a,b in [(2,3),(-2,5),(0,0)]:\n   self.assertEqual(add(a,b),a+b,'arithmetic sum regression')\n"}
             })
         ),
-        840,
+        issue,
     )?;
     let baseline = acceptance::register_and_reproduce(&root, proposal.clone()).await?;
     acceptance::persist_baseline(&control.join("baseline.json"), &baseline, &[root.to_path_buf()])?;
@@ -268,16 +268,26 @@ async fn prepare_fixture(root: &Path, control: &Path) -> Result<(acceptance::Pre
         root.join("arithmetic.py"),
         "def add(a, b):\n    return a + b\n",
     )?;
-    std::fs::write(
-        root.join("rules.rs"),
-        "pub fn checks_complete(done: usize, total: usize) -> bool { done >= total }\n",
-    )?;
+    if seed_defect {
+        std::fs::write(
+            root.join("rules.rs"),
+            "pub fn checks_complete(done: usize, total: usize) -> bool { done >= total }\n",
+        )?;
+    }
     git_fixture(&root, &["add", "."]).await?;
     git_fixture(&root, &["commit", "-qm", "candidate"]).await?;
     let reference =
         acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.to_path_buf()])
             .await?;
     Ok((prepared,reference))
+}
+
+async fn prepare_fixture(root: &Path, control: &Path) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
+    prepare_fixture_kind(root, control, 840, true).await
+}
+#[cfg(test)]
+pub(super) async fn shipping_fixture(root: &Path, control: &Path, issue: u64) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
+    prepare_fixture_kind(root, control, issue, false).await
 }
 
 async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {

@@ -275,8 +275,15 @@ elif a[:2]==['pr','merge']:
 else: raise Exception('unexpected call '+repr(a))
 "#).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(root.join("home")).unwrap();
+        std::fs::create_dir(root.join("cache")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "self_improve::progress_tests::approved_ready_pr_survives_pending_checks_failed_merge_and_head_change", "--nocapture"])
+            .env("HOME", root.join("home"))
+            .env("CARGO_TARGET_DIR", root.join("cache/builder"))
+            .env("AUGMENTAGENT_GATE_TARGET_DIR", root.join("cache/gate"))
+            .env("AUGMENTAGENT_GATE_MIN_FREE_GB", "0").env("AUGMENTAGENT_BUILD_GROWTH_GB", "0")
+            .env_remove("AUGMENTAGENT_PRUNE_TARGET_DIRS")
             .env(CHILD, root).env("GH_BIN", gh)
             .env("AUGMENTAGENT_GH_OWNER", "fixture-owner")
             .env("AUGMENTAGENT_AUTOPR_AUTOMERGE", "1")
@@ -288,20 +295,29 @@ else: raise Exception('unexpected call '+repr(a))
         assert!(root.join("merged").exists(), "child scenario must actually execute");
         return;
     }
-    let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
-    for args in [vec!["init", "-q"], vec!["remote", "add", "origin", "https://example.invalid/fixture-owner/project.git"]] {
+    let fixture_root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+    let root = fixture_root.join("repo");
+    let initial_control = fixture_root.join("initial-control");
+    std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&initial_control).unwrap();
+    let (prepared, _) = review_canary::shipping_fixture(&root, &initial_control, 10).await.unwrap();
+    let head = run("git", &["rev-parse", "HEAD"], &root).await.unwrap().1.trim().to_owned();
+    let base = prepared.baseline.registration.baseline_head().to_owned();
+    let remote = fixture_root.join("remote.git");
+    for args in [vec!["branch".into(), "-m".into(), "agent-fix/issue-10".into()],
+        vec!["clone".into(), "--bare".into(), root.to_string_lossy().into_owned(), remote.to_string_lossy().into_owned()],
+        vec!["remote".into(), "add".into(), "origin".into(), remote.to_string_lossy().into_owned()]] {
         assert!(std::process::Command::new("git").args(args).current_dir(&root).status().unwrap().success());
     }
-    let head = "a".repeat(40);
     let scenario = |checks: &str, draft: bool, fail_merge: bool, sha: &str| {
-        std::fs::write(root.join("scenario"), serde_json::to_vec(&serde_json::json!({
-            "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha,"base":"c".repeat(40)
+        std::fs::write(fixture_root.join("scenario"), serde_json::to_vec(&serde_json::json!({
+            "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha,"base":base
         })).unwrap()).unwrap();
     };
     let verdict = || {
         let mut review = synthetic_aligned_review(&head,true);
         let evidence = review.structured.as_mut().unwrap();
-        evidence.binding.base = "c".repeat(40);
+        evidence.binding.base = base.clone();
+        evidence.binding.contract_hash = prepared.baseline.registration.contract_hash().into();
         for pass in &mut evidence.passes {
             pass.binding = evidence.binding.clone();
             pass.coverage.binding = evidence.binding.clone();
@@ -310,6 +326,20 @@ else: raise Exception('unexpected call '+repr(a))
         assert!(review.approved(), "fixture approval must validate before sweep");
         review.recorded_verdict()
     };
+    let mut workflow = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root:&root, worktree:&root, repository:"fixture-owner/project", source_issue:Some(10),pr:Some(20),
+        branch:"agent-fix/issue-10",contract:"synthetic arithmetic",environment:"fixture-bootstrap",
+    }).await.unwrap().unwrap();
+    let directories = acceptance::control_directories("fixture-owner/project",workflow.id()).unwrap();
+    std::fs::create_dir_all(&directories.workflow_acceptance).unwrap();
+    acceptance::persist_fixture_registration(&directories.workflow_acceptance,&prepared).unwrap();
+    let mut receipt = acceptance::verify_and_persist_candidate(&root,&prepared,&directories.workflow_acceptance,&acceptance::worker_roots(&root)).await.unwrap();
+    receipt.alignment = Some(alignment::persist_shipping_fixture(&root,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());
+    acceptance::assert_receipt_current(&root,&prepared,&receipt).await.unwrap();
+    workflow.bind_acceptance(&prepared).unwrap();
+    workflow.checkpoint(crate::autoship_workflow::Stage::Verify,"acceptance_passed","review_verified_candidate",0,&[serde_json::to_string(&receipt).unwrap()]).await.unwrap();
+    workflow.record_review("scripted-independent-fixture",true,&serde_json::to_string(&verdict().unwrap()).unwrap()).unwrap();
+    workflow.finish().unwrap();
     // Opening a rejected draft records ownership, but never authorizes merge.
     record_opened_pr(&opened_prs_path(), 10, 20, &head, None);
     scenario("SUCCESS", true, false, &head);
@@ -322,24 +352,24 @@ else: raise Exception('unexpected call '+repr(a))
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", true, true, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
-    let calls = std::fs::read_to_string(root.join("calls")).unwrap();
+    let calls = std::fs::read_to_string(fixture_root.join("calls")).unwrap();
     assert!(calls.lines().any(|line| line.contains("--undo")), "failed draft merge restores draft state");
     assert_eq!(ready_for_merge(&root, 20, None).await, None);
     scenario("SUCCESS", false, false, &"b".repeat(40));
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, false, &head);
-    let mut advanced: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("scenario")).unwrap()).unwrap();
+    let mut advanced: serde_json::Value = serde_json::from_slice(&std::fs::read(fixture_root.join("scenario")).unwrap()).unwrap();
     advanced["base"] = serde_json::json!("d".repeat(40));
-    std::fs::write(root.join("scenario"),serde_json::to_vec(&advanced).unwrap()).unwrap();
+    std::fs::write(fixture_root.join("scenario"),serde_json::to_vec(&advanced).unwrap()).unwrap();
     assert_eq!(merge_sweep(&root, false).await, 0, "approval cannot cover advanced remote main");
     scenario("SUCCESS", false, false, &head);
     assert_eq!(merge_sweep(&root, true).await, 0);
-    assert!(!root.join("merged").exists());
+    assert!(!fixture_root.join("merged").exists());
     let started = std::time::Instant::now();
     assert!(!write_optional_pr_note(&root, "20", "Optional reviewer observation").await);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(merge_sweep(&root, false).await, 1);
-    assert_eq!(std::fs::read_to_string(root.join("merged")).unwrap(), head);
+    assert_eq!(std::fs::read_to_string(fixture_root.join("merged")).unwrap(), head);
 }
 
 #[test]

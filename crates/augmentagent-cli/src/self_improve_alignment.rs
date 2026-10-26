@@ -987,3 +987,26 @@ mod tests {
         assert!(promote(work.path(), proposal, &path, &[work.path().into()]).is_err());
     }
 }
+
+/// Scripted independent mapping for the synthetic arithmetic shipping fixture.
+/// Verifier execution, Git hunk extraction and final artifact checks stay real.
+#[cfg(test)]
+pub(super) async fn persist_shipping_fixture(root: &Path, prepared: &acceptance::PreparedAcceptance, control: &Path, policy_root: &Path) -> Result<Reference> {
+    let head = git(root, &["rev-parse", "HEAD"]).await?.trim().to_owned();
+    let base = git(root, &["rev-parse", "origin/main"]).await?.trim().to_owned();
+    let evidence = hunks(root, &base, &head).await?;
+    let actual = evidence.iter().map(|hunk|hunk.hunk.clone()).collect::<Vec<_>>();
+    let mappings = actual.iter().map(|hunk|Mapping { hunk_id:hunk.id.clone(),
+        criterion_ids:vec!["SUM".into()], kind:if prepared.proposal.files.contains_key(&hunk.path) {Kind::IndependentHarness} else {Kind::Implementation},
+        evidence:"Synthetic arithmetic fixture returns a+b; pinned unittest exercises signed and zero inputs".into() }).collect::<Vec<_>>();
+    assess(prepared,&actual,&mappings)?;
+    let policy_hash = policy(policy_root)?.1;
+    let contract_hash = prepared.baseline.registration.contract_hash().to_owned();
+    let artifact = Artifact { version:1,source:prepared.proposal.contract.source()?,head:head.clone(),base:base.clone(),contract_hash:contract_hash.clone(),
+        policy_hash:policy_hash.clone(),policy_root:policy_root.to_path_buf(),reviewer:"scripted-fixture".into(),origin:crate::autoship_review::ReviewOrigin::RecordedBuilders,
+        native_sessions:vec!["scripted-test-session".into()],supplied_request_hashes:vec![hash(b"synthetic arithmetic fixture")],hunks:actual,mappings,constraint_exception:None };
+    let bytes = serde_json::to_vec(&artifact)?;
+    let artifact_sha256 = hash(&bytes);
+    let artifact = store(control,&format!("alignment-{artifact_sha256}.json"),&bytes)?;
+    Ok(Reference { head,base,contract_hash,policy_hash,policy_root:policy_root.to_path_buf(),artifact,artifact_sha256 })
+}
