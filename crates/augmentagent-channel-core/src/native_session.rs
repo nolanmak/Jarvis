@@ -36,6 +36,52 @@ pub struct Lease {
 tokio::task_local! { pub static CURRENT: Arc<NativeSession>; }
 tokio::task_local! { pub static FRESH_REVIEW: bool; }
 
+/// A controller-owned set of actual native conversations for one restarted
+/// builder episode. Audit UUIDs are deliberately not used as CLI identities.
+#[derive(Default)]
+pub struct FreshBuilderSessions {
+    sessions: Mutex<Vec<Arc<NativeSession>>>,
+}
+#[derive(Debug, Clone)]
+pub struct ObservedConversation {
+    pub provider: ProviderKind,
+    pub id: String,
+    pub uncertain: bool,
+}
+tokio::task_local! { static FRESH_BUILDERS: Arc<FreshBuilderSessions>; }
+impl FreshBuilderSessions {
+    pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
+    pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
+        FRESH_BUILDERS.scope(Arc::clone(self), call).await
+    }
+    pub fn observed(&self) -> Vec<ObservedConversation> {
+        self.sessions.lock().expect("builder sessions mutex poisoned").iter().filter_map(|session| {
+            session.id().map(|id| ObservedConversation { provider: session.provider(), id, uncertain: session.is_uncertain() })
+        }).collect()
+    }
+    fn session(&self, provider: ProviderKind) -> anyhow::Result<Option<Arc<NativeSession>>> {
+        if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) { return Ok(None); }
+        let mut sessions = self.sessions.lock().expect("builder sessions mutex poisoned");
+        if let Some(session) = sessions.iter().find(|session| session.provider() == provider) {
+            return Ok(Some(Arc::clone(session)));
+        }
+        let session = NativeSession::new(provider)?;
+        sessions.push(Arc::clone(&session));
+        Ok(Some(session))
+    }
+}
+
+/// Actual transport selection happens after fallback chooses a provider.
+/// A nested independent review must override even a fresh builder episode.
+pub(crate) fn current_for(provider: ProviderKind) -> anyhow::Result<Option<Arc<NativeSession>>> {
+    if !is_fresh_review() {
+        if let Ok(session) = FRESH_BUILDERS.try_with(|sessions| sessions.session(provider)) {
+            return session;
+        }
+    }
+    Ok(CURRENT.try_with(Arc::clone).ok())
+}
+
 /// Override any inherited builder conversation. Each invocation creates a new
 /// native conversation and returns the identifier actually observed from the CLI.
 pub async fn fresh_review_scope<T>(
@@ -204,6 +250,43 @@ mod fresh_review_tests {
         assert_eq!(observed, "actual-review");
         assert_eq!(builder.id().as_deref(), Some("actual-builder"));
         assert!(!builder.is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn restarted_builder_is_provider_aware_reusable_and_does_not_leak_into_review() {
+        let inherited = NativeSession::from_id(ProviderKind::Claude, Some("old-builder".into())).unwrap();
+        let episode = FreshBuilderSessions::new();
+        CURRENT.scope(inherited.clone(), episode.scope(async {
+            for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+                let session = current_for(provider).unwrap().unwrap();
+                let mut lease = session.begin(provider).unwrap();
+                let id = match lease.launch() {
+                    Launch::Create { requested_id } => requested_id.unwrap_or("new-codex".into()),
+                    _ => panic!("restarted builder inherited history"),
+                };
+                lease.observe(&id).unwrap();
+                lease.finish().unwrap();
+            }
+            fresh_review_scope(ProviderKind::Codex, async {
+                let session = current_for(ProviderKind::Codex)?.unwrap();
+                let mut lease = session.begin(ProviderKind::Codex)?;
+                assert!(matches!(lease.launch(), Launch::Create { .. }));
+                lease.observe("independent-review")?;
+                lease.finish()?;
+                Ok(())
+            }).await.unwrap();
+        })).await;
+        episode.scope(async {
+            let session = current_for(ProviderKind::Codex).unwrap().unwrap();
+            let mut lease = session.begin(ProviderKind::Codex).unwrap();
+            assert_eq!(lease.launch(), Launch::Resume { id: "new-codex".into() });
+            lease.observe("new-codex").unwrap();
+            lease.finish().unwrap();
+        }).await;
+        assert_eq!(inherited.id().as_deref(), Some("old-builder"));
+        let observed = episode.observed();
+        assert_eq!(observed.len(), 2);
+        assert!(observed.iter().all(|s| !s.uncertain && s.id != "old-builder" && s.id != "independent-review"));
     }
 
     #[tokio::test]

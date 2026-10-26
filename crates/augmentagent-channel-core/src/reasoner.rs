@@ -1119,9 +1119,7 @@ impl ClaudeCliReasoner {
             return Err(CallError::Other(anyhow::anyhow!("fresh review must use supplied evidence without tools, settings or handoff history")));
         }
         let review_directory = if fresh_review { Some(tempfile::tempdir()?) } else { None };
-        let mut native_lease = crate::native_session::CURRENT
-            .try_with(|session| Arc::clone(session))
-            .ok()
+        let mut native_lease = crate::native_session::current_for(crate::providers::ProviderKind::Claude)?
             .map(|session| session.begin(crate::providers::ProviderKind::Claude))
             .transpose()?;
         let mut args: Vec<String> = vec![

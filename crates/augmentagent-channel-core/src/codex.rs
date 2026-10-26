@@ -206,9 +206,7 @@ impl CodexCliReasoner {
             anyhow::ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
                 "fresh review must use supplied evidence without tools, settings or handoff history");
         }
-        let mut native_lease = crate::native_session::CURRENT
-            .try_with(|session| std::sync::Arc::clone(session))
-            .ok()
+        let mut native_lease = crate::native_session::current_for(self.kind)?
             .map(|session| session.begin(self.kind))
             .transpose()?;
         let native_launch = native_lease.as_ref().map(|lease| lease.launch());
