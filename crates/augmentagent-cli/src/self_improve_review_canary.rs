@@ -22,10 +22,80 @@ fn database() -> Result<PathBuf> {
         .context("workflow state parent missing")?
         .join("review-canaries.db"))
 }
-fn open(path: &Path) -> Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(path)?;
+fn connect(path: &Path, read_only: bool) -> Result<rusqlite::Connection> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let parent = path.parent().context("canary state parent missing")?;
+    if !read_only {
+        std::fs::create_dir_all(parent)?;
+    }
+    let parent = parent.canonicalize()?;
+    let directory = std::fs::metadata(&parent)?;
+    anyhow::ensure!(
+        directory.uid() == unsafe { libc::geteuid() }
+            && directory.permissions().mode() & 0o022 == 0,
+        "canary control directory must be daemon owned and not externally writable"
+    );
+    let path = parent.join(
+        path.file_name()
+            .context("canary database filename missing")?,
+    );
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(!read_only)
+        .create(!read_only)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file() && before.nlink() == 1 && before.uid() == unsafe { libc::geteuid() },
+        "canary database must be a daemon owned singly linked regular file"
+    );
+    if read_only {
+        anyhow::ensure!(
+            before.permissions().mode() & 0o077 == 0,
+            "canary database is not private"
+        );
+    } else {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    let access = if read_only {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    };
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        access | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    let after = std::fs::symlink_metadata(&path)?;
+    anyhow::ensure!(
+        after.is_file()
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && after.nlink() == 1
+            && after.uid() == before.uid(),
+        "canary database changed while opening"
+    );
     conn.busy_timeout(Duration::from_secs(5))?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS review_canaries (run_id TEXT PRIMARY KEY, started_ms INTEGER NOT NULL, finished_ms INTEGER, status TEXT NOT NULL, report TEXT);")?;
+    if read_only {
+        conn.pragma_update(None, "query_only", true)?;
+    } else {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+    }
+    Ok(conn)
+}
+fn open(path: &Path) -> Result<rusqlite::Connection> {
+    let conn = connect(path, false)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS review_canaries (run_id TEXT PRIMARY KEY, started_ms INTEGER NOT NULL, finished_ms INTEGER, status TEXT NOT NULL, report TEXT);
+        CREATE TRIGGER IF NOT EXISTS canary_final_is_immutable BEFORE UPDATE ON review_canaries
+        WHEN OLD.status != 'running' OR NEW.run_id != OLD.run_id OR NEW.started_ms != OLD.started_ms
+          OR NEW.status NOT IN ('passed','drift','incomplete','interrupted')
+        BEGIN SELECT RAISE(ABORT,'canary completion is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS canary_audit_is_retained BEFORE DELETE ON review_canaries
+        BEGIN SELECT RAISE(ABORT,'canary audit is append only'); END;")?;
     Ok(conn)
 }
 fn claim(path: &Path, now: i64) -> Result<Option<String>> {
@@ -104,7 +174,7 @@ pub(crate) fn summary() -> Result<String> {
     if !path.exists() {
         return Ok("Native review canary: not yet run.".into());
     }
-    let row: Option<(i64, String)> = open(&path)?
+    let row: Option<(i64, String)> = connect(&path, true)?
         .query_row(
             "SELECT started_ms,status FROM review_canaries ORDER BY started_ms DESC LIMIT 1",
             [],
@@ -303,6 +373,73 @@ mod tests {
         )
         .is_err());
     }
+    #[test]
+    fn canary_store_is_private_read_only_when_reported_and_completions_are_immutable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("first-start/control/canaries.db");
+        let id = claim(&path, 100).unwrap().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let conn = open(&path).unwrap();
+        let sync: i64 = conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 2);
+        let report = Report {
+            run_id: id.clone(),
+            started_ms: 100,
+            finished_ms: 200,
+            status: "incomplete".into(),
+            detail: "fixture".into(),
+            evidence: None,
+        };
+        record(&path, &report).unwrap();
+        assert!(record(&path, &report).is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_canaries SET status='passed' WHERE run_id=?1",
+                [&id]
+            )
+            .is_err());
+        assert!(conn.execute("DELETE FROM review_canaries", []).is_err());
+        let reader = connect(&path, true).unwrap();
+        assert!(reader
+            .execute("CREATE TABLE unexpected(value INTEGER)", [])
+            .is_err());
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT status FROM review_canaries WHERE run_id=?1",
+                    [&id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "incomplete"
+        );
+        let absent = dir.path().join("absent/canaries.db");
+        assert!(connect(&absent, true).is_err());
+        assert!(!absent.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn canary_store_refuses_redirected_and_multiply_linked_control_files() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.db");
+        open(&real).unwrap();
+        let link = dir.path().join("link.db");
+        symlink(&real, &link).unwrap();
+        assert!(open(&link).is_err());
+        assert!(connect(&link, true).is_err());
+        std::fs::remove_file(link).unwrap();
+        std::fs::hard_link(&real, dir.path().join("hard.db")).unwrap();
+        assert!(open(&real).is_err());
+        assert!(connect(&real, true).is_err());
+    }
+
     #[tokio::test]
     #[ignore = "paid real native Codex review; requires configured authentication and protected state"]
     async fn live_native_codex_detects_seed_through_production_adapter() {
