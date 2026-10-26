@@ -383,6 +383,23 @@ impl WorkflowGuard {
         &self.binding
     }
 
+    pub(super) fn bind_acceptance(
+        &mut self,
+        prepared: &acceptance::PreparedAcceptance,
+    ) -> Result<()> {
+        self.healthy_lease()?;
+        self.contract = format!(
+            "registered:{}",
+            prepared.baseline.registration.contract_hash()
+        );
+        self.environment = prepared
+            .baseline
+            .registration
+            .binding(prepared.baseline.registration.baseline_head())?
+            .environment_id;
+        Ok(())
+    }
+
     fn healthy_lease(&self) -> Result<()> {
         let failure = self
             .lease_failure
@@ -756,7 +773,11 @@ pub(super) async fn git_binding(
     let evidence = serde_json::to_vec(&(tree, base, environment, diff, untracked, receipts))?;
     Ok(Binding {
         head,
-        contract: format!("{:x}", Sha256::digest(contract.as_bytes())),
+        contract: contract
+            .strip_prefix("registered:")
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{:x}", Sha256::digest(contract.as_bytes()))),
         evidence_hash: format!("{:x}", Sha256::digest(evidence)),
     })
 }
@@ -1048,7 +1069,11 @@ mod tests {
             "lost generation may not authorize a merge"
         );
         assert!(store
-            .validate_lease(&successor, &store.snapshot(&id).unwrap().unwrap().checkpoint.binding, millis() + LEASE_MS + 2)
+            .validate_lease(
+                &successor,
+                &store.snapshot(&id).unwrap().unwrap().checkpoint.binding,
+                millis() + LEASE_MS + 2
+            )
             .is_ok());
     }
 

@@ -4210,7 +4210,7 @@ async fn independent_review(
     _prior_findings: Option<&str>,
     criteria: &[String],
 ) -> IndependentReview {
-    independent_review_with_context(builder, issue, worktree, criteria, true, "", 0, None, 0, None).await
+    independent_review_with_context(builder, issue, worktree, criteria, true, "", 0, None, 0, None, None).await
 }
 
 /// Parent lanes pass real QA/round state; legacy callers above start a fresh
@@ -4226,6 +4226,7 @@ async fn independent_review_with_context(
     previous: Option<&crate::autoship_review::ReviewEvidence>,
     adjudication_attempts_already_made: u32,
     workflow: Option<&workflow::WorkflowGuard>,
+    acceptance_evidence: Option<(&acceptance::PreparedAcceptance, &acceptance::CandidateReceiptReference)>,
 ) -> IndependentReview {
     match builder.review_authors() {
         Ok(None) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnknown),
@@ -4249,7 +4250,7 @@ async fn independent_review_with_context(
     )).expect("environment identity consists only of serializable strings"));
     aligned_review::run(builder, issue, worktree, criteria, aligned_review::ReviewContext {
         qa_ok, qa_notes, repair_round, previous, environment_id: &environment_id,
-        adjudication_attempts_already_made, workflow,
+        adjudication_attempts_already_made, workflow, acceptance_evidence,
     }).await
 }
 
@@ -4313,7 +4314,7 @@ pub(crate) fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
         issue.title,
         issue.body,
         prior_attempts_section(prior)
-    )
+    ) + "\n" + acceptance::CONTRACT_PROMPT
 }
 
 fn prior_attempts_section(prior: Option<&str>) -> String {
@@ -4434,6 +4435,7 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         // system /tmp: the gate was contained (#878) but the builder's own
         // test runs re-leaked 4 GB / 4,500 files within two hours.
         env: vec![
+            (augmentagent_channel_core::autoship_scope::SCOPE_ENV.into(), "1".into()),
             ("CARGO_TARGET_DIR".into(), gate_target_dir()),
             ("CARGO_PROFILE_DEV_DEBUG".into(), "0".into()),
             ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
@@ -6523,7 +6525,7 @@ async fn resume_draft_pr(
     // #1012 — the PR body is the durable store, exactly as it already is for
     // complexity. A resumed run must be graded against the criteria the
     // original scoping pass wrote, not a fresh set nobody agreed to.
-    let resumed_criteria = criteria_from_pr_body(&pr_body);
+    let mut resumed_criteria = criteria_from_pr_body(&pr_body);
     // #1488 — a draft a fresh run parked carries QA's findings in a marked
     // comment; they seed this run's first QA pass so it judges convergence.
     let prior_comments: Vec<String> = match run(
@@ -6591,6 +6593,22 @@ async fn resume_draft_pr(
     }).await? else {
         return Ok(RunReport::held(format!("PR #{pr}: durable workflow is leased or deferred")));
     };
+    let acceptance_control = acceptance::control_directory(&repository)?;
+    let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
+    anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
+    let acceptance_scope = format!("Issue #{}: {}\n{}\n{}", issue.number, issue.title, issue.body, pr_body);
+    let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
+        issue.number, resume_base.trim(), &acceptance_scope, reasoner, &acceptance::worker_roots(&worktree), &resumed_criteria).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            workflow.transition(Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            return Err(error).context("resume independent acceptance registration requires scoped retry");
+        }
+    };
+    for criterion in &prepared_acceptance.proposal.contract.criteria {
+        if !resumed_criteria.contains(&criterion.requirement) { resumed_criteria.push(criterion.requirement.clone()); }
+    }
+    workflow.bind_acceptance(&prepared_acceptance)?;
     workflow.transition(Stage::Reconcile, "resume_started", "reconcile_main", 0).await?;
     // An interrupted edit is valuable recovery state. Never reset it implicitly.
     let (status_ok, status, _) = run("git", &["status", "--porcelain"], &worktree).await?;
@@ -7024,6 +7042,8 @@ async fn resume_draft_pr(
             }
         }
 
+        let acceptance_receipt = acceptance::verify_with_repair(reasoner, &issue, &worktree,
+            &prepared_acceptance, &acceptance_control, &mut workflow).await?;
         // #1488 — QA reviews every resumed round, as it does every fresh one:
         // a draft never merges on a diff QA has not approved.
         workflow.transition(Stage::Review, "review_started", "collect_reviews", 0).await?;
@@ -7058,7 +7078,7 @@ async fn resume_draft_pr(
         // reason to skip it and repeat the same repair debate indefinitely.
         let independent = independent_review_with_context(reasoner, &issue, worktree.clone(),
             &resumed_criteria, qa_ok, &qa_notes, rounds_done, previous_review.as_ref(),
-            0, Some(&workflow)).await;
+            0, Some(&workflow), Some((&prepared_acceptance, &acceptance_receipt))).await;
         if let Some(structured) = &independent.structured {
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
                 &serde_json::to_string(structured)?)?;
@@ -7206,6 +7226,7 @@ async fn resume_draft_pr(
             };
             workflow.transition(Stage::Merge, "approval_and_checks_ready", "merge_exact_head", 0).await?;
             anyhow::ensure!(workflow.binding().head == reviewed_head, "reviewed head changed before merge");
+            acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
             let merge_intent = workflow.intent(OperationKind::MergePr)?;
             workflow.validate_binding(&reviewed_binding).await?;
             let (ok, _o, e) = run(
@@ -7994,7 +8015,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #1012 — written before any code exists, so they are the one target in
     // this pipeline the builder did not also author. Empty when the scoping
     // pass failed or emitted no block, which changes nothing downstream.
-    let criteria: Vec<String> = scope
+    let mut criteria: Vec<String> = scope
         .as_ref()
         .map(|s| s.criteria.clone())
         .unwrap_or_default();
@@ -8009,12 +8030,27 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }).await? else {
         return Ok(RunReport::held(format!("issue #{}: workflow leased by another worker", issue.number)));
     };
+    let acceptance_control = acceptance::control_directory(&repository)?;
+    let acceptance_scope = scope.as_ref().map(|scope| scope.body.as_str()).unwrap_or(&scope_prompt);
+    let prepared_acceptance = match acceptance::prepare_acceptance(repo_root, &worktree, &acceptance_control,
+        issue.number, candidate_base, acceptance_scope, &reasoner, &acceptance::worker_roots(&worktree), &criteria).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
+            return Err(error).context("independent acceptance registration requires scoped retry");
+        }
+    };
+    for criterion in &prepared_acceptance.proposal.contract.criteria {
+        if !criteria.contains(&criterion.requirement) { criteria.push(criterion.requirement.clone()); }
+    }
+    workflow_guard.bind_acceptance(&prepared_acceptance)?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Build, "criteria_registered", "build", chrono::Utc::now().timestamp_millis()).await?;
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt =
-        build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria);
+    let prompt = format!("{}\nThe controller installed independently registered immutable regression harnesses. Do not edit/remove them; implement against this exact contract: {}",
+        build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria),
+        serde_json::to_string(prepared_acceptance.baseline.registration.contract())?);
     let mut summary = match reasoner.call_with_storage(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
@@ -8264,6 +8300,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut qa_ok = false;
     let mut review_notes = String::new();
     let mut independent: Option<IndependentReview> = None;
+    let mut acceptance_receipt: Option<acceptance::CandidateReceiptReference> = None;
     let mut revision_note = String::new();
     // Gate repairs and review rounds continue the same budget.
     let mut round = spent;
@@ -8426,6 +8463,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             break 'stages Some(ParkReason::GateRed(format!("{gate_err:#}")));
         }
 
+        acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+            &prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
+
         // Stage 3 (#653): QA review of the diff by the stronger tier. Since
         // #1488 a reject is not terminal: its notes drive revision rounds,
         // and the revised diff is QA'd again before Stage 4 sees it. Runs
@@ -8464,7 +8504,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             recovery::commit_candidate(&worktree, &issue).await?;
             workflow_guard.transition(crate::autoship_workflow::Stage::Review, "candidate_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
             let review = independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard)).await;
+                qa_ok, &review_notes, round, None, 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await;
             if review.available && !review.approved() {
                 warn!(
                     issue = issue.number,
@@ -8652,6 +8692,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     gated = touches_verify_gated_path(&names2);
                     lines = lines2;
                     summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
+                    acceptance_receipt = Some(acceptance::verify_with_repair(&reasoner, &issue, &worktree,
+                        &prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
                     // #1488 AC2 — QA re-reviews every revised diff, with its
                     // previous findings, before Stage 4 is asked about it.
                     let prior_qa = review_notes.clone();
@@ -8676,7 +8718,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         workflow_guard.transition(crate::autoship_workflow::Stage::Review, "revision_verified", "review", chrono::Utc::now().timestamp_millis()).await?;
                         let previous = independent.as_ref().and_then(|r| r.structured.clone());
                         independent = Some(independent_review_with_context(&reasoner, &issue, worktree.clone(), &criteria,
-                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard)).await);
+                            qa_ok, &review_notes, round, previous.as_ref(), 0, Some(&workflow_guard), acceptance_receipt.as_ref().map(|receipt| (&prepared_acceptance, receipt))).await);
                     }
                     let verdict = match (qa_ok, independent.as_ref()) {
                         (false, _) => "QA changes requested".to_string(),
@@ -9279,6 +9321,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         return Ok(RunReport::built(format!("issue #{}: source changed before merge; reconciliation retained — {pr_url}", issue.number)));
     }
     workflow_guard.validate_binding(workflow_guard.binding()).await?;
+    acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
+        acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
     let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
     let (ok, _o, e) = run(
         &gh,
@@ -9294,7 +9338,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             issue.number
         )));
     }
-    workflow_guard.observe_remote(&merge_intent, &format!("github-merged:{}", pr_number.unwrap()), pr_number)?;
+    workflow_guard.observe_remote(&merge_intent, &format!("github:pr:{}:merged:{}", pr_number.unwrap(), published_head), pr_number)?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Merged, "merge_observed", "complete", chrono::Utc::now().timestamp_millis()).await?;
     workflow_guard.finish()?;
     notify_review(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;

@@ -14,6 +14,10 @@ pub(super) struct ReviewContext<'a> {
     /// Reserved in the protected workflow ledger BEFORE calling this adapter.
     pub adjudication_attempts_already_made: u32,
     pub workflow: Option<&'a workflow::WorkflowGuard>,
+    pub acceptance_evidence: Option<(
+        &'a acceptance::PreparedAcceptance,
+        &'a acceptance::CandidateReceiptReference,
+    )>,
 }
 
 pub(super) async fn run(
@@ -210,20 +214,64 @@ async fn run_inner(
         required,
         files,
     } = candidate_snapshot(&worktree).await?;
-    let mut contract: BTreeMap<String, String> = criteria
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (format!("C{}", i + 1), c.clone()))
-        .collect();
+    let mut contract: BTreeMap<String, String> =
+        if let Some((prepared, reference)) = context.acceptance_evidence {
+            acceptance::assert_receipt_current(&worktree, prepared, reference).await?;
+            anyhow::ensure!(
+                reference.binding.head == head,
+                "review acceptance head mismatch"
+            );
+            for criterion in criteria {
+                anyhow::ensure!(
+                    prepared
+                        .proposal
+                        .contract
+                        .criteria
+                        .iter()
+                        .any(|registered| registered.requirement == *criterion),
+                    "review cannot drop original acceptance criterion: {criterion}"
+                );
+            }
+            prepared
+                .proposal
+                .contract
+                .criteria
+                .iter()
+                .map(|criterion| (criterion.id.clone(), criterion.requirement.clone()))
+                .collect()
+        } else {
+            anyhow::ensure!(
+                context.workflow.is_none(),
+                "production review requires executable acceptance evidence"
+            );
+            criteria
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (format!("C{}", i + 1), c.clone()))
+                .collect()
+        };
+    anyhow::ensure!(
+        !contract.contains_key("REGRESSION"),
+        "reserved reviewer criterion collides with acceptance contract"
+    );
     contract.insert("REGRESSION".into(), "No newly demonstrated correctness, security or acceptance regression; report a reproducible example and concrete remedy.".into());
-    let contract_hash = aligned::digest(&serde_json::to_vec(&contract)?);
+    let contract_hash = context
+        .acceptance_evidence
+        .map(|(_, receipt)| receipt.binding.contract_hash.clone())
+        .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
     let callers = complete_caller_evidence(&worktree, &head, &diff).await?;
-    let evidence_json =
-        serde_json::to_string(&serde_json::json!({"diff":diff,"files":files,"callers":callers}))?;
+    let evidence_json = serde_json::to_string(
+        &serde_json::json!({"diff":diff,"files":files,"callers":callers,"executable_acceptance":context.acceptance_evidence.map(|(_, receipt)| receipt)}),
+    )?;
     let binding = aligned::ReviewBinding {
         head: head.clone(),
         base: base.clone(),
-        environment_id: context.environment_id.into(),
+        environment_id: aligned::digest(&serde_json::to_vec(&(
+            context.environment_id,
+            context
+                .acceptance_evidence
+                .map(|(_, receipt)| &receipt.binding.environment_id),
+        ))?),
         contract_hash,
         evidence_hash: aligned::digest(evidence_json.as_bytes()),
     };

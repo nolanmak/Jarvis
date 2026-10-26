@@ -268,7 +268,8 @@ pub(super) async fn verify_candidate(
         evidence
             .registration
             .candidate_passes(&evidence.receipts, &receipts, &binding)?,
-        "candidate did not satisfy executable contract"
+        "candidate did not satisfy executable contract: {}",
+        serde_json::to_string(&receipts)?
     );
     Ok(receipts)
 }
@@ -524,15 +525,31 @@ async fn proposal_with_retry(
     candidate: &Path,
     issue: u64,
     scope: &str,
+    required_criteria: &[String],
 ) -> Result<ContractProposal> {
-    match parse_proposal(scope, issue) {
+    let validate = |proposal: ContractProposal| -> Result<ContractProposal> {
+        for required in required_criteria {
+            ensure!(
+                proposal
+                    .contract
+                    .criteria
+                    .iter()
+                    .any(|criterion| criterion.requirement.trim() == required.trim()),
+                "executable contract omitted original criterion: {required}"
+            );
+        }
+        Ok(proposal)
+    };
+    match parse_proposal(scope, issue).and_then(&validate) {
         Ok(proposal) => Ok(proposal),
         Err(error) => {
-            let prompt = format!("Supply the independent executable acceptance contract for issue #{issue}. Previous scoper output lacked a valid executable contract ({error}). Read the current source; do not edit it.\n{CONTRACT_PROMPT}\nScoper requirements:\n{scope}");
+            let prompt = format!("Supply the independent executable acceptance contract for issue #{issue}. Previous scoper output lacked a valid executable contract ({error}). Read the current source; do not edit it.\n{CONTRACT_PROMPT}\nScoper requirements:\n{scope}\nPreserve EACH original criterion verbatim as a contract requirement: {}", serde_json::to_string(required_criteria)?);
             let output = reasoner
                 .call(&scope_opts(candidate.to_path_buf()), &prompt)
                 .await?;
-            parse_proposal(&output, issue).context("independent acceptance proposal retry failed")
+            parse_proposal(&output, issue)
+                .and_then(validate)
+                .context("independent acceptance proposal retry failed")
         }
     }
 }
@@ -581,6 +598,7 @@ pub(super) async fn prepare_acceptance(
     scope: &str,
     reasoner: &dyn Reasoner,
     writable_roots: &[PathBuf],
+    required_criteria: &[String],
 ) -> Result<PreparedAcceptance> {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -635,8 +653,6 @@ pub(super) async fn prepare_acceptance(
             manifest.is_none(),
             "recorded original baseline evidence is missing; refusing regeneration"
         );
-        ensure!(actual_head(candidate).await? == base, "missing original baseline receipt on repaired candidate; cannot re-register from its head");
-        let proposal = proposal_with_retry(reasoner, candidate, issue, scope).await?;
         let temporary = tempfile::Builder::new()
             .prefix("baseline-")
             .tempdir_in(&control)?;
@@ -645,9 +661,18 @@ pub(super) async fn prepare_acceptance(
             .to_str()
             .context("baseline checkout path is not UTF-8")?;
         trusted_git(repo, &["worktree", "add", "--detach", checkout, base]).await?;
-        let result = register_and_reproduce(&baseline_root, proposal.clone()).await;
+        // Legacy candidates may already contain a fix. Generate the independent
+        // harness against the original trusted base checkout, never their head.
+        let proposal_result =
+            proposal_with_retry(reasoner, &baseline_root, issue, scope, required_criteria).await;
+        let result = match proposal_result {
+            Ok(proposal) => register_and_reproduce(&baseline_root, proposal.clone())
+                .await
+                .map(|baseline| (proposal, baseline)),
+            Err(error) => Err(error),
+        };
         let cleanup = trusted_git(repo, &["worktree", "remove", "--force", checkout]).await;
-        let baseline = result?;
+        let (proposal, baseline) = result?;
         cleanup.context("remove acceptance baseline worktree")?;
         let prepared = PreparedAcceptance { proposal, baseline };
         let mut staged = tempfile::NamedTempFile::new_in(&control)?;
@@ -662,6 +687,17 @@ pub(super) async fn prepare_acceptance(
         std::fs::File::open(&control)?.sync_all()?;
         prepared
     };
+    for required in required_criteria {
+        ensure!(
+            prepared
+                .proposal
+                .contract
+                .criteria
+                .iter()
+                .any(|criterion| criterion.requirement.trim() == required.trim()),
+            "recorded executable contract omits original criterion: {required}"
+        );
+    }
     let binding = WorkflowManifest::from_prepared(issue, &prepared);
     if let Some(manifest) = manifest {
         ensure!(
@@ -1090,4 +1126,157 @@ mod receipt_reference_tests {
         .is_err());
         assert!(persist_candidate_artifact(work.path(), &[work.path().into()], artifact).is_err());
     }
+}
+
+pub(super) fn control_directory(repository: &str) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    Ok(augmentagent_channel_core::state_dir::state_dir()
+        .context("acceptance control state unavailable")?
+        .join("autoship-acceptance")
+        .join(format!("{:x}", Sha256::digest(repository.as_bytes()))))
+}
+pub(super) fn worker_roots(worktree: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![worktree.to_path_buf()];
+    let target = crate::build_storage::effective_target(worktree);
+    if target.exists() {
+        roots.push(target);
+    }
+    roots
+}
+/// Return explicit retry/re-scope state, never an implicit human hold. Repair
+/// admission is durable and shared across restarts of this workflow.
+pub(super) async fn verify_with_repair(
+    reasoner: &FallbackReasoner,
+    issue: &Issue,
+    worktree: &Path,
+    prepared: &PreparedAcceptance,
+    control: &Path,
+    workflow: &mut workflow::WorkflowGuard,
+) -> Result<CandidateReceiptReference> {
+    for round in 0..=2 {
+        recovery::commit_candidate(worktree, issue).await?;
+        let diff = trusted_git(worktree, &["diff", "origin/main...HEAD"]).await?;
+        ensure!(
+            blast_radius_hit_in_diff(&diff).is_none(),
+            "acceptance repair touched a guarded path"
+        );
+        let paths = trusted_git(worktree, &["diff", "--name-only", "origin/main...HEAD"]).await?;
+        for path in paths.lines() {
+            ensure!(
+                prepared
+                    .proposal
+                    .contract
+                    .allowed_paths
+                    .iter()
+                    .any(|scope| scope.contains(path)),
+                "candidate path outside independently registered scope: {path}"
+            );
+        }
+        match verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree))
+            .await
+        {
+            Ok(reference) => {
+                workflow.bind_acceptance(prepared)?;
+                workflow
+                    .checkpoint(
+                        crate::autoship_workflow::Stage::Verify,
+                        "acceptance_passed",
+                        "review_verified_candidate",
+                        0,
+                        &[serde_json::to_string(&reference)?],
+                    )
+                    .await?;
+                return Ok(reference);
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                let infrastructure = detail.contains("infrastructure_failure")
+                    || detail.contains("toolchain")
+                    || detail.contains("environment changed")
+                    || detail.contains("disk")
+                    || detail.contains("admission");
+                if infrastructure {
+                    workflow
+                        .transition(
+                            crate::autoship_workflow::Stage::Verify,
+                            "acceptance_infrastructure_retry",
+                            "retry_verifier",
+                            chrono::Utc::now().timestamp_millis() + 300_000,
+                        )
+                        .await?;
+                    return Err(error).context("acceptance infrastructure deferred for retry");
+                }
+                if round == 2 || !workflow.admit_attempt("acceptance_repair", 3)? {
+                    workflow
+                        .transition(
+                            crate::autoship_workflow::Stage::Scope,
+                            "acceptance_repair_budget",
+                            "rescope_acceptance",
+                            chrono::Utc::now().timestamp_millis() + 300_000,
+                        )
+                        .await?;
+                    return Err(error)
+                        .context("acceptance repair budget consumed; autonomous re-scope queued");
+                }
+                workflow
+                    .transition(
+                        crate::autoship_workflow::Stage::Build,
+                        "acceptance_failed",
+                        "repair_implementation",
+                        0,
+                    )
+                    .await?;
+                let prompt = format!("Repair issue #{} against the independently registered executable acceptance contract. Do not modify or remove pinned verifier files. Fix implementation, not assertions. Failure: {}\nContract: {}", issue.number, detail, serde_json::to_string(prepared.baseline.registration.contract())?);
+                reasoner
+                    .call_revision_with_storage(&fix_opts(worktree.to_path_buf()), &prompt)
+                    .await?;
+                // A repair can affect code outside the selected regression test.
+                // It must re-earn the normal gate before any review sees it.
+                verification_gate(worktree).await?;
+            }
+        }
+    }
+    unreachable!("bounded verifier repair always returns")
+}
+
+pub(super) async fn assert_receipt_current(
+    worktree: &Path,
+    prepared: &PreparedAcceptance,
+    reference: &CandidateReceiptReference,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let head = actual_head(worktree).await?;
+    ensure!(
+        environment_id()? == reference.binding.environment_id,
+        "acceptance environment changed after verification"
+    );
+    ensure!(
+        prepared.baseline.registration.binding(&head)? == reference.binding,
+        "acceptance receipt no longer matches candidate"
+    );
+    prepared.baseline.registration.verify_integrity(worktree)?;
+    let bytes = std::fs::read(&reference.artifact)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes)) == reference.artifact_sha256,
+        "acceptance artifact changed"
+    );
+    let artifact: CandidateArtifact = private_json(&reference.artifact)?;
+    ensure!(
+        prepared.baseline.registration.candidate_passes(
+            &prepared.baseline.receipts,
+            &artifact.receipts,
+            &reference.binding
+        )?,
+        "acceptance artifact does not prove candidate"
+    );
+    let status = trusted_git(
+        worktree,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
+    ensure!(
+        status.is_empty(),
+        "candidate changed after acceptance verification"
+    );
+    Ok(())
 }
