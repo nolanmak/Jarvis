@@ -6721,7 +6721,8 @@ impl Store {
             "SELECT id, channel, channel_ref FROM user_loops \
               WHERE status = 'active' \
                 AND expires_at_ms IS NOT NULL \
-                AND expires_at_ms <= ?1",
+                AND expires_at_ms <= ?1 \
+                AND NOT EXISTS (SELECT 1 FROM loop_occurrences o WHERE o.loop_id=user_loops.id AND o.answer IS NOT NULL AND o.state IN ('answered','post_failed'))",
         )?;
         let rows = stmt.query_map(params![now_ms], |r| {
             Ok((
@@ -6742,7 +6743,8 @@ impl Store {
                         updated_at_ms = ?1 \
                   WHERE status = 'active' \
                     AND expires_at_ms IS NOT NULL \
-                    AND expires_at_ms <= ?1",
+                    AND expires_at_ms <= ?1 \
+                AND NOT EXISTS (SELECT 1 FROM loop_occurrences o WHERE o.loop_id=user_loops.id AND o.answer IS NOT NULL AND o.state IN ('answered','post_failed'))",
                 params![now_ms],
             )?;
         }

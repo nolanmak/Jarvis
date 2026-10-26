@@ -25,6 +25,7 @@ pub(super) fn migrate(conn: &Connection) -> StoreResult<()> {
         request_id TEXT PRIMARY KEY, loop_id TEXT NOT NULL, prompt TEXT NOT NULL,
         answer TEXT, state TEXT NOT NULL, error TEXT, updated_at_ms INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_loop_occurrence_time ON loop_occurrences(updated_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_loop_pending_delivery ON loop_occurrences(loop_id,state) WHERE answer IS NOT NULL;
         CREATE TABLE IF NOT EXISTS loop_execution_prompts (request_id TEXT PRIMARY KEY, prompt TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS loop_delivery_answers (request_id TEXT PRIMARY KEY, answer TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS loop_coverage (

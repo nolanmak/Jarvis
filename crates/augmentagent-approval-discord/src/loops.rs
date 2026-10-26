@@ -660,6 +660,9 @@ impl LoopScheduler {
         // iteration always runs.
         let loops = self.store.list_active_user_loops()?;
         for l in loops {
+            // A completed final delivery can survive a crash before the expiry
+            // sweep. Never turn that recovery into a new model occurrence.
+            if l.expires_at_ms.is_some_and(|expires| expires<=now && l.last_run_ms.is_some_and(|last|last>=expires)) { continue; }
             // #1135 — a reminder loop with an OPEN nag cycle re-fires on the
             // nag cadence (once a day by default), anchored on its last fire,
             // ignoring the base cron/interval schedule until the owner
@@ -1246,6 +1249,35 @@ mod tests {
         assert!(attempts[1].contains(raw));
         assert_eq!(runner.prompts.lock().unwrap().len(),1);
         assert!(!store.loop_occurrences_since(0,10).unwrap()[0].answer.as_deref().unwrap().contains("synthetic-delivery-literal"));
+    }
+
+    #[tokio::test]
+    async fn expiry_preserves_pending_delivery_backoff_across_restart_without_new_model_work() {
+        let (store,file)=tmp_store();
+        store.create_user_loop("owner","discord","channel",60,"Final scheduled report",Some(now_millis()-1000),None,None).unwrap();
+        let runner=Arc::new(CoverageRunner {replies:std::sync::Mutex::new(std::collections::VecDeque::from(["final answer".into()])),prompts:std::sync::Mutex::new(vec![])});
+        let poster=Arc::new(CoveragePoster {posts:std::sync::Mutex::new(vec![]),fail_once:std::sync::atomic::AtomicBool::new(true)});
+        {
+            let store=Arc::new(store);
+            let scheduler=LoopScheduler::new(store.clone(),runner.clone(),poster.clone());
+            scheduler.tick().await.unwrap();
+            assert_eq!(store.list_active_user_loops().unwrap().len(),1,"expiry must retain already-executed pending delivery");
+            scheduler.tick().await.unwrap();
+            assert!(poster.posts.lock().unwrap().is_empty(),"backoff must suppress delivery and expiry notice");
+        }
+        let store=Arc::new(Store::open(file.path()).unwrap());
+        store.with_conn(|conn|{conn.execute("UPDATE loop_occurrence_failures SET observed_at_ms=observed_at_ms-60001",[])?;Ok(())}).unwrap();
+        let scheduler=LoopScheduler::new(store.clone(),runner.clone(),poster.clone());
+        scheduler.tick().await.unwrap();
+        assert!(store.list_active_user_loops().unwrap().is_empty());
+        assert_eq!(runner.prompts.lock().unwrap().len(),1);
+        assert!(poster.posts.lock().unwrap().iter().any(|body|body.contains("final answer")));
+        // Model a restart after final completion but before the expiry sweep,
+        // with enough elapsed time that the normal interval is due again.
+        store.with_conn(|conn|{conn.execute("UPDATE user_loops SET status='active',last_run_ms=100,expires_at_ms=99",[])?;Ok(())}).unwrap();
+        scheduler.tick().await.unwrap();
+        assert_eq!(runner.prompts.lock().unwrap().len(),1);
+        assert!(store.list_active_user_loops().unwrap().is_empty());
     }
 
     #[test]
