@@ -187,7 +187,8 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1522",
       "implementation_status": "partial",
       "evidence": [
-        "Owner-outcome triage joins, disagreement sample and token-usage/digest metrics implemented; two store tests passed. Episode outcome reducer implemented; operational calibration remains pending."
+        "Owner-outcome triage joins, disagreement sample and token-usage/digest metrics implemented; two store tests passed. Episode outcome reducer implemented; operational calibration remains pending.",
+        "Protected triage calibration integrated at e9f0bec7+a0a8cd11; independent review passed. All ten targeted calibration tests passed at 5bfab49d, plus durable daily admitted-call accounting across lost responses, restart and binding changes. Actual native replay/promotion and deployed outcome observation remain pending."
       ],
       "remaining_acceptance": [
         "Verify deployed episode metrics and triage outcome joins/digest; unknown outcomes remain unknown."
@@ -212,7 +213,8 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/472",
       "implementation_status": "partial",
       "evidence": [
-        "Email retry full guard-chain and metadata preservation: complete suite 221 passed. Scheduled-loop coverage and digest previously passed 49 tests. Deployed acceptance pending."
+        "Email retry full guard-chain and metadata preservation: complete suite 221 passed. Scheduled-loop coverage and digest previously passed 49 tests. Deployed acceptance pending.",
+        "Separate typed guard history integrated at e2e0630f, independently reviewed; intentional skips/flags retain their disposition. Combined core/email/store regression execution is still pending."
       ],
       "remaining_acceptance": [
         "Verify final durable failure/coverage state and email retry guard chain in deployment.",
@@ -844,6 +846,24 @@
       "core_ignored": 14,
       "log": "/tmp/autoship-1598-ci-4ba07097-rust.log",
       "scope": "Corrected auth and low-disk fixtures pass. Later guest diagnostics,FIFO and export ACK require separate validation."
+    },
+    "calibration_5bfab49d": {
+      "passed": 10,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-calibration-anchor-tests.log",
+      "daily_accounting_test_passed": true,
+      "scope": "Targeted local tests, not actual native calibration promotion or production observation."
+    },
+    "delegated_reservations_167dde92": {
+      "passed": true,
+      "log": "/tmp/autoship-1598-resource-reservation-proof-fixed.log",
+      "unit_memory_bytes": 536870912,
+      "concurrent_admissions": 1,
+      "remaining_scopes": 0,
+      "scope": "Actual delegated cgroup idle reservations, concurrent admission, rejection, release/replacement and cleanup. No VM/model; composed full-size native/build VM acceptance still pending.",
+      "negative_before_fix": "/tmp/autoship-1598-resource-reservation-proof.log",
+      "python_passed": 4,
+      "python_skipped": 9
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -906,6 +926,11 @@
       "severity": "P1",
       "gap": "Authenticated probe stdout alone cannot establish successful provider exchange; partial tool events could escape acceptance checks",
       "status": "fixed_cf1cc7e6;5probe_and13gateway_tests_passed;actual_provider_acceptance_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "First admission reads child memory accounting before enabling delegated controllers, refusing every run in a fresh service subtree",
+      "status": "fixed_167dde92; actual_delegated_probe_red_then_green; embedded_Rust_helper_rebuild_pending"
     }
   ],
   "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
