@@ -174,9 +174,9 @@ fn acquire_audit_generation(
     let proof = old.recovery_evidence(lease.generation)?;
     store.validate_lease(lease, binding, now)?;
     let recovery = serde_json::json!({"workflow":lease.workflow,
-        "old_audit_generation":generation,"new_audit_generation":generation+1,
+        "old_audit_generation":generation,"new_audit_generation":lease.generation,
         "lease_generation":lease.generation,"interrupted":proof});
-    let next = open_audit_generation(state, &lease.workflow, worktree, generation+1)?;
+    let next = open_audit_generation(state, &lease.workflow, worktree, lease.generation)?;
     next.protected_health()?;
     next.record_controller(serde_json::json!({"actor":"controller",
         "kind":"audit_generation_recovery","generation":lease.generation,
@@ -1915,6 +1915,32 @@ mod tests {
         assert!(old.protected_health().is_err());
         assert_eq!(store.audit_generation(&id).unwrap(),1);
         assert_eq!(store.snapshot(&id).unwrap().unwrap().checkpoint.next.action,"reverify_candidate");
+    }
+
+    #[test]
+    fn abandoned_recovery_sink_does_not_poison_later_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&state).unwrap();
+        let id = durable::pr_workflow_id("owner/repo",42).unwrap();
+        let mut binding = Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(&id,"fix/recovery",binding.clone(),10).unwrap();
+        let first = store.claim(&id,"first",11,1000).unwrap().unwrap();
+        let old = open_audit_generation(&state,&id,None,0).unwrap();
+        old.require_run_resources().unwrap();
+        old.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed",
+            "workflow":id,"generation":first.generation})).unwrap();
+        drop(old.begin_write().unwrap());
+        let abandoned = store.claim(&id,"abandoned",1012,1000).unwrap().unwrap();
+        old.recovery_evidence(abandoned.generation).unwrap();
+        let prepared = open_audit_generation(&state,&id,None,abandoned.generation).unwrap();
+        prepared.protected_health().unwrap();
+        drop(prepared.begin_write().unwrap()); // crash before pointer commit
+        let successor = store.claim(&id,"successor",2013,1000).unwrap().unwrap();
+        let recovered = acquire_audit_generation(&state,&mut store,&successor,None,&mut binding,2014).unwrap();
+        recovered.protected_health().unwrap();
+        assert_eq!(store.audit_generation(&id).unwrap(), successor.generation);
+        assert!(prepared.protected_health().is_err());
     }
 
     #[test]

@@ -1100,6 +1100,7 @@ impl WorkflowStore {
             "SELECT generation,lease_generation FROM workflow_audit_generation WHERE workflow=?1",
             [&lease.workflow], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
         ensure!(current.map(|v|v.0).unwrap_or(0) == previous, "audit generation moved");
+        ensure!(lease.generation > previous, "replacement audit namespace must be fresh");
         ensure!(current.is_none_or(|v|lease.generation > v.1), "audit recovery requires a new fenced lease");
         let checkpoint: String = tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",
             [&lease.workflow], |r|r.get(0))?;
@@ -1112,7 +1113,7 @@ impl WorkflowStore {
         checkpoint.next = NextAction { reason:"audit_generation_recovered".into(),
             action:"reverify_candidate".into(),eligible_at_ms:now };
         tx.execute("INSERT INTO workflow_audit_generation VALUES(?1,?2,?3,?4) ON CONFLICT(workflow) DO UPDATE SET generation=excluded.generation,lease_generation=excluded.lease_generation,recovery=excluded.recovery",
-            params![lease.workflow,previous+1,lease.generation,raw])?;
+            params![lease.workflow,lease.generation,lease.generation,raw])?;
         tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",
             params![lease.workflow,serde_json::to_string(&checkpoint)?,now])?;
         // This is a current-authority index, not the immutable history (which
@@ -1459,7 +1460,7 @@ mod tests {
         assert!(store.recover_audit_generation(&lease,1,&proof,1023).is_err());
         drop(store);
         let reopened = WorkflowStore::open(&path).unwrap();
-        assert_eq!(reopened.audit_generation(&old.workflow).unwrap(),1);
+        assert_eq!(reopened.audit_generation(&old.workflow).unwrap(),lease.generation);
         let checkpoint = reopened.snapshot(&old.workflow).unwrap().unwrap().checkpoint;
         assert_eq!(checkpoint.next.action,"reverify_candidate");
         assert_eq!(checkpoint.binding,current);
