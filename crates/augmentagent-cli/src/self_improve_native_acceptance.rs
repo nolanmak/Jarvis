@@ -180,6 +180,11 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
             "review reused builder's actual conversation"
         );
     }
+    guard.audit_logger().record_controller(serde_json::json!({
+        "kind":"disposable_native_clean_review_passed",
+        "clean_review":&evidence,
+        "no_remote_publication":true,
+    }))?;
     // Real receipt corruption must be rejected before another paid model call.
     let bytes = std::fs::read(&reference.artifact)?;
     std::fs::write(&reference.artifact, b"corrupt probe artifact")?;

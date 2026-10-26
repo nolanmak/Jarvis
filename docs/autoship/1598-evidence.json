@@ -301,12 +301,12 @@
       "execution": "Compiled managed test binary in isolated delegated transient service; live descendants refused, removed subtree accepted, foreign host rejected."
     },
     "self_improve_recovery": {
-      "revision": "ad29b3e7",
-      "passed": 409,
+      "revision": "309e950b",
+      "passed": 410,
       "failed": 0,
       "ignored": 9,
-      "log": "/tmp/autoship-1598-complete-inventory.log",
-      "note": "Includes repository-only 1501-item pagination, audit recovery, fresh capacity admission, and corrected protected fixtures. Does not prove paid native review success."
+      "log": "/tmp/autoship-1598-native-adapter-workflow.log",
+      "note": "Before bounded comment fetching follow-up; native seeded review still incomplete."
     },
     "behavior_oracles": {
       "passed": 21,
@@ -320,10 +320,10 @@
       "log": "/tmp/autoship-1598-foundation-recovery.log"
     },
     "full_native_probe": {
-      "revision": "ae11702b",
+      "revision": "309e950b",
       "passed": false,
-      "log": "/tmp/autoship-1598-native-probe-resource.log",
-      "result": "Real scoper, builder, executable verifier and alignment succeeded. Independent review rejected before admission because evidence-only fresh session received tool-enabled options; adapter fix in progress."
+      "log": "/tmp/autoship-1598-native-probe-309e950b.log",
+      "result": "Real scoping, build, executable acceptance, alignment and clean independent authority passed (probe advanced to protected seeded_diagnostic checkpoint). Seeded negative review stopped with incomplete evidence group 2; byte-aware packing and reviewer-only evidence recovery pending. No remote publication or merge."
     },
     "real_cancelled_workflow_recovery": {
       "revision": "ae11702b",
@@ -338,6 +338,20 @@
       "failed": 0,
       "log": "/tmp/autoship-1598-fresh-review-dispatch.log",
       "note": "Restricted fresh reviewer dispatch remains tool/history-free; malformed fresh tool request is refused without dispatch or cooldown."
+    },
+    "readmission_comments": {
+      "revision": "309e950b",
+      "passed": 3,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-readmit-comments.log",
+      "note": "102-comment reset/reason regression passed; explicit request-cap follow-up under central validation."
+    },
+    "fresh_reviewer_authless": {
+      "revision": "f8f37ba8",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-fresh-review-authless.log",
+      "note": "Credential-free isolated child passes; replaces accidentally authenticated mocked CI test."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -376,6 +390,11 @@
       "severity": "P1",
       "gap": "Restricted environment incorrectly injects mutation handoff history into fresh native reviewer",
       "status": "fixed_in_309e950b; fallback48passed; native_rerun_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Arbitrary two-shard review groups can omit context and stop native review as incomplete",
+      "status": "observed_in_real_seeded_probe; byte_aware_packing_and_bounded_evidence_recovery_in_progress"
     }
   ]
 }
