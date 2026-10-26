@@ -20,10 +20,58 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub struct AcceptanceContract {
     pub schema_version: u32,
     pub revision: u64,
-    pub issue: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<u64>,
     pub criteria: Vec<Criterion>,
     pub allowed_paths: Vec<PathScope>,
     pub verifiers: Vec<Verifier>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "number", rename_all = "snake_case")]
+pub enum AcceptanceSource {
+    Issue(u64),
+    PullRequest(u64),
+}
+impl AcceptanceSource {
+    pub fn from_ids(issue: Option<u64>, pull_request: Option<u64>) -> Result<Self> {
+        match (issue, pull_request) {
+            (Some(n), None) if n > 0 => Ok(Self::Issue(n)),
+            (None, Some(n)) if n > 0 => Ok(Self::PullRequest(n)),
+            _ => bail!("acceptance requires exactly one positive issue or pull request source"),
+        }
+    }
+    pub fn validate(self) -> Result<()> {
+        Self::from_ids(self.issue(), self.pull_request()).map(|_| ())
+    }
+    pub fn issue(self) -> Option<u64> {
+        match self {
+            Self::Issue(n) => Some(n),
+            _ => None,
+        }
+    }
+    pub fn pull_request(self) -> Option<u64> {
+        match self {
+            Self::PullRequest(n) => Some(n),
+            _ => None,
+        }
+    }
+    pub fn key(self) -> String {
+        match self {
+            Self::Issue(n) => format!("issue-{n}"),
+            Self::PullRequest(n) => format!("pr-{n}"),
+        }
+    }
+}
+impl std::fmt::Display for AcceptanceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Issue(n) => write!(f, "issue #{n}"),
+            Self::PullRequest(n) => write!(f, "PR #{n}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,15 +232,16 @@ impl PathScope {
 }
 
 impl AcceptanceContract {
+    pub fn source(&self) -> Result<AcceptanceSource> {
+        AcceptanceSource::from_ids(self.issue, self.pull_request)
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == SCHEMA_VERSION,
             "unsupported acceptance schema"
         );
-        ensure!(
-            self.revision > 0 && self.issue > 0,
-            "contract requires issue and revision"
-        );
+        ensure!(self.revision > 0, "contract requires revision");
+        self.source()?;
         for (label, size) in [
             ("criteria", self.criteria.len()),
             ("scope", self.allowed_paths.len()),

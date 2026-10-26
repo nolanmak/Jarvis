@@ -3,7 +3,8 @@
 //! pinned registration and cannot change it. Persistence belongs in control state.
 use super::*;
 use crate::autoship_contract::{
-    AcceptanceContract, BaselineResult, Observation, RegisteredContract, VerifierReceipt,
+    AcceptanceContract, AcceptanceSource, BaselineResult, Observation, RegisteredContract,
+    VerifierReceipt,
 };
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ const DEPENDENCY_AUDIT: &str = include_str!("../../../scripts/autoship-registry-
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 pub(super) const CONTRACT_PROMPT: &str = r#"
 Emit exactly one ```autoship-contract fenced JSON object with fields `contract`
-and `files`. contract schema_version=1, revision=1, issue=<number>, criteria are
+and `files`. contract schema_version=1, revision=1, exactly one of issue=<real issue number> or pull_request=<real PR number> (never invent an issue), criteria are
 {id,requirement,verifier_ids}, allowed_paths are {kind:"file"|"directory",path},
 verifiers are {id,command,pinned_files,failure_witness}. command is typed:
 {kind:"python_unittest",test:"autoship_verifiers.test_case.Case.test_behavior"},
@@ -42,6 +43,10 @@ pub(super) struct BaselineEvidence {
 }
 
 pub(super) fn parse_proposal(raw: &str, issue: u64) -> Result<ContractProposal> {
+    parse_proposal_for(raw, AcceptanceSource::Issue(issue))
+}
+pub(super) fn parse_proposal_for(raw: &str, source: AcceptanceSource) -> Result<ContractProposal> {
+    source.validate()?;
     ensure!(raw.len() <= 2 * 1024 * 1024, "contract proposal too large");
     let marker = "```autoship-contract\n";
     let mut parts = raw.split(marker);
@@ -59,7 +64,10 @@ pub(super) fn parse_proposal(raw: &str, issue: u64) -> Result<ContractProposal> 
         .0;
     let mut proposal: ContractProposal = serde_json::from_str(json)?;
     proposal.contract.validate()?;
-    ensure!(proposal.contract.issue == issue, "contract issue mismatch");
+    ensure!(
+        proposal.contract.source()? == source,
+        "contract source mismatch"
+    );
     let pins: std::collections::BTreeSet<_> = proposal
         .contract
         .verifiers
@@ -657,7 +665,7 @@ async fn trusted_git(root: &Path, args: &[&str]) -> Result<String> {
 async fn proposal_with_retry(
     reasoner: &dyn Reasoner,
     candidate: &Path,
-    issue: u64,
+    source: AcceptanceSource,
     scope: &str,
     required_criteria: &[String],
 ) -> Result<ContractProposal> {
@@ -674,25 +682,25 @@ async fn proposal_with_retry(
         }
         Ok(proposal)
     };
-    match parse_proposal(scope, issue).and_then(&validate) {
+    match parse_proposal_for(scope, source).and_then(&validate) {
         Ok(proposal) => Ok(proposal),
         Err(error) => {
-            let prompt = format!("Supply the independent executable acceptance contract for issue #{issue}. Previous scoper output lacked a valid executable contract ({error}). Read the current source; do not edit it.\n{CONTRACT_PROMPT}\nScoper requirements:\n{scope}\nPreserve EACH original criterion verbatim as a contract requirement: {}", serde_json::to_string(required_criteria)?);
+            let prompt = format!("Supply the independent executable acceptance contract for {source}. Previous scoper output lacked a valid executable contract ({error}). Read the current source; do not edit it.\n{CONTRACT_PROMPT}\nScoper requirements:\n{scope}\nPreserve EACH original criterion verbatim as a contract requirement: {}", serde_json::to_string(required_criteria)?);
             let output = reasoner
                 .call(&scope_opts(candidate.to_path_buf()), &prompt)
                 .await?;
-            parse_proposal(&output, issue)
+            parse_proposal_for(&output, source)
                 .and_then(validate)
                 .context("independent acceptance proposal retry failed")
         }
     }
 }
-fn evidence_path(control: &Path, issue: u64, base: &str) -> Result<PathBuf> {
+fn evidence_path(control: &Path, source: AcceptanceSource, base: &str) -> Result<PathBuf> {
     ensure!(
         (base.len() == 40 || base.len() == 64) && base.bytes().all(|b| b.is_ascii_hexdigit()),
         "acceptance base must be an immutable commit ID"
     );
-    Ok(control.join(format!("issue-{issue}-base-{base}.json")))
+    Ok(control.join(format!("{}-base-{base}.json", source.key())))
 }
 fn install_candidate_harness(candidate: &Path, prepared: &PreparedAcceptance) -> Result<()> {
     // Existing files must match exactly, including files installed before a
@@ -734,6 +742,32 @@ pub(super) async fn prepare_acceptance(
     writable_roots: &[PathBuf],
     required_criteria: &[String],
 ) -> Result<PreparedAcceptance> {
+    prepare_acceptance_for(
+        repo,
+        candidate,
+        control,
+        AcceptanceSource::Issue(issue),
+        base,
+        scope,
+        reasoner,
+        writable_roots,
+        required_criteria,
+    )
+    .await
+}
+
+pub(super) async fn prepare_acceptance_for(
+    repo: &Path,
+    candidate: &Path,
+    control: &Path,
+    source: AcceptanceSource,
+    base: &str,
+    scope: &str,
+    reasoner: &dyn Reasoner,
+    writable_roots: &[PathBuf],
+    required_criteria: &[String],
+) -> Result<PreparedAcceptance> {
+    source.validate()?;
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     std::fs::create_dir_all(control)?;
@@ -744,14 +778,14 @@ pub(super) async fn prepare_acceptance(
             "acceptance store is writable by worker"
         );
     }
-    let manifest = original_manifest(&control, issue)?;
+    let manifest = original_manifest(&control, source)?;
     let original_base = manifest
         .as_ref()
         .map(|m| m.original_base.as_str())
         .unwrap_or(base)
         .to_owned();
     let base = original_base.as_str();
-    let path = evidence_path(&control, issue, base)?;
+    let path = evidence_path(&control, source, base)?;
     let prepared = if path.exists() {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -769,7 +803,7 @@ pub(super) async fn prepare_acceptance(
         let prepared: PreparedAcceptance = serde_json::from_reader(file)?;
         ensure!(
             prepared.baseline.registration.baseline_head() == base
-                && prepared.baseline.registration.contract().issue == issue
+                && prepared.baseline.registration.contract().source()? == source
                 && prepared.proposal.contract == *prepared.baseline.registration.contract(),
             "persisted acceptance workflow mismatch"
         );
@@ -798,7 +832,7 @@ pub(super) async fn prepare_acceptance(
         // Legacy candidates may already contain a fix. Generate the independent
         // harness against the original trusted base checkout, never their head.
         let proposal_result =
-            proposal_with_retry(reasoner, &baseline_root, issue, scope, required_criteria).await;
+            proposal_with_retry(reasoner, &baseline_root, source, scope, required_criteria).await;
         let result = match proposal_result {
             Ok(proposal) => register_and_reproduce(&baseline_root, proposal.clone())
                 .await
@@ -832,7 +866,7 @@ pub(super) async fn prepare_acceptance(
             "recorded executable contract omits original criterion: {required}"
         );
     }
-    let binding = WorkflowManifest::from_prepared(issue, &prepared);
+    let binding = WorkflowManifest::from_prepared(source, &prepared);
     if let Some(manifest) = manifest {
         ensure!(
             manifest == binding,
@@ -903,7 +937,7 @@ mod workflow_tests {
         let base = actual_head(root.path()).await.unwrap();
         let path = "autoship_verifiers/test_regression.py";
         let proposal = ContractProposal {
-            contract: AcceptanceContract { schema_version: 1, revision: 1, issue: 42,
+            contract: AcceptanceContract { schema_version: 1, revision: 1, issue: Some(42), pull_request: None,
                 criteria: vec![Criterion { id: "ready".into(), requirement: "Ready becomes true".into(), verifier_ids: vec!["regression".into()] }],
                 allowed_paths: vec![PathScope::File("behavior.py".into())],
                 verifiers: vec![Verifier { id: "regression".into(), command: VerifierCommand::PythonUnittest { test: "autoship_verifiers.test_regression.Case.test_ready".into() }, pinned_files: vec![path.into()], failure_witness: "intended ready regression".into() }],
@@ -993,16 +1027,23 @@ mod workflow_tests {
 #[serde(deny_unknown_fields)]
 struct WorkflowManifest {
     version: u32,
-    issue: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issue: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pull_request: Option<u64>,
     original_base: String,
     contract_revision: u64,
     contract_hash: String,
 }
 impl WorkflowManifest {
-    fn from_prepared(issue: u64, prepared: &PreparedAcceptance) -> Self {
+    fn source(&self) -> Result<AcceptanceSource> {
+        AcceptanceSource::from_ids(self.issue, self.pull_request)
+    }
+    fn from_prepared(source: AcceptanceSource, prepared: &PreparedAcceptance) -> Self {
         Self {
             version: 1,
-            issue,
+            issue: source.issue(),
+            pull_request: source.pull_request(),
             original_base: prepared.baseline.registration.baseline_head().into(),
             contract_revision: prepared.baseline.registration.contract().revision,
             contract_hash: prepared.baseline.registration.contract_hash().into(),
@@ -1026,20 +1067,20 @@ fn private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     );
     Ok(serde_json::from_reader(file)?)
 }
-fn original_manifest(control: &Path, issue: u64) -> Result<Option<WorkflowManifest>> {
-    let index = control.join(format!("issue-{issue}-workflow.json"));
+fn original_manifest(control: &Path, source: AcceptanceSource) -> Result<Option<WorkflowManifest>> {
+    let index = control.join(format!("{}-workflow.json", source.key()));
     if index.try_exists()? {
         let manifest: WorkflowManifest = private_json(&index)?;
         ensure!(
-            manifest.version == 1 && manifest.issue == issue,
+            manifest.version == 1 && manifest.source()? == source,
             "invalid acceptance workflow manifest"
         );
-        evidence_path(control, issue, &manifest.original_base)?;
+        evidence_path(control, source, &manifest.original_base)?;
         return Ok(Some(manifest));
     }
     // Recover the crash window between durable baseline and manifest creation.
     // Never choose a newer baseline by timestamp or silently supersede evidence.
-    let prefix = format!("issue-{issue}-base-");
+    let prefix = format!("{}-base-", source.key());
     let mut recovered = None;
     for entry in std::fs::read_dir(control)? {
         let entry = entry?;
@@ -1049,7 +1090,7 @@ fn original_manifest(control: &Path, issue: u64) -> Result<Option<WorkflowManife
             ensure!(recovered.is_none(), "multiple original baselines require bound adjudication; refusing automatic supersession");
             let prepared: PreparedAcceptance = private_json(&entry.path())?;
             ensure!(
-                prepared.baseline.registration.contract().issue == issue
+                prepared.baseline.registration.contract().source()? == source
                     && prepared
                         .baseline
                         .registration
@@ -1057,9 +1098,9 @@ fn original_manifest(control: &Path, issue: u64) -> Result<Option<WorkflowManife
                         == BaselineResult::Reproduced,
                 "orphaned baseline evidence is invalid"
             );
-            let manifest = WorkflowManifest::from_prepared(issue, &prepared);
+            let manifest = WorkflowManifest::from_prepared(source, &prepared);
             ensure!(
-                evidence_path(control, issue, &manifest.original_base)? == entry.path(),
+                evidence_path(control, source, &manifest.original_base)? == entry.path(),
                 "baseline filename does not match evidence"
             );
             recovered = Some(manifest);
@@ -1072,7 +1113,7 @@ fn original_manifest(control: &Path, issue: u64) -> Result<Option<WorkflowManife
 }
 fn write_manifest(control: &Path, manifest: &WorkflowManifest) -> Result<()> {
     use std::io::Write;
-    let path = control.join(format!("issue-{}-workflow.json", manifest.issue));
+    let path = control.join(format!("{}-workflow.json", manifest.source()?.key()));
     let mut file = tempfile::NamedTempFile::new_in(control)?;
     file.write_all(&serde_json::to_vec(manifest)?)?;
     file.as_file().sync_all()?;
@@ -1105,13 +1146,16 @@ mod manifest_tests {
         let control = tempfile::tempdir().unwrap();
         let original = WorkflowManifest {
             version: 1,
-            issue: 42,
+            issue: Some(42),
+            pull_request: None,
             original_base: "a".repeat(40),
             contract_revision: 1,
             contract_hash: "pinned".into(),
         };
         write_manifest(control.path(), &original).unwrap();
-        let recovered = original_manifest(control.path(), 42).unwrap().unwrap();
+        let recovered = original_manifest(control.path(), AcceptanceSource::Issue(42))
+            .unwrap()
+            .unwrap();
         assert_eq!(recovered, original);
         let newer = WorkflowManifest {
             original_base: "b".repeat(40),
@@ -1120,7 +1164,9 @@ mod manifest_tests {
         };
         assert!(write_manifest(control.path(), &newer).is_err());
         assert_eq!(
-            original_manifest(control.path(), 42).unwrap().unwrap(),
+            original_manifest(control.path(), AcceptanceSource::Issue(42))
+                .unwrap()
+                .unwrap(),
             original
         );
     }
@@ -1315,8 +1361,34 @@ pub(super) async fn verify_with_repair(
     control: &Path,
     workflow: &mut workflow::WorkflowGuard,
 ) -> Result<CandidateReceiptReference> {
+    verify_with_repair_for(
+        reasoner,
+        AcceptanceSource::Issue(issue.number),
+        &issue.title,
+        worktree,
+        prepared,
+        control,
+        workflow,
+    )
+    .await
+}
+
+pub(super) async fn verify_with_repair_for(
+    reasoner: &FallbackReasoner,
+    source: AcceptanceSource,
+    title: &str,
+    worktree: &Path,
+    prepared: &PreparedAcceptance,
+    control: &Path,
+    workflow: &mut workflow::WorkflowGuard,
+) -> Result<CandidateReceiptReference> {
+    source.validate()?;
+    ensure!(
+        prepared.proposal.contract.source()? == source,
+        "repair source differs from acceptance contract"
+    );
     for round in 0..=2 {
-        recovery::commit_candidate(worktree, issue).await?;
+        recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
         let diff = trusted_git(worktree, &["diff", "origin/main...HEAD"]).await?;
         ensure!(
             blast_radius_hit_in_diff(&diff).is_none(),
@@ -1349,7 +1421,10 @@ pub(super) async fn verify_with_repair(
                 )
                 .await?;
             reference.alignment = Some(
-                alignment::gate(reasoner, issue, worktree, prepared, control, workflow).await?,
+                alignment::gate_for(
+                    reasoner, source, title, worktree, prepared, control, workflow,
+                )
+                .await?,
             );
             ensure!(
                 serde_json::to_vec(&reference)?.len() <= 32 * 1024,
@@ -1413,10 +1488,14 @@ pub(super) async fn verify_with_repair(
                         0,
                     )
                     .await?;
-                let prompt = format!("Repair issue #{} against the independently registered executable acceptance contract. Do not modify or remove pinned verifier files. Fix implementation, not assertions. Failure: {}\nContract: {}", issue.number, detail, serde_json::to_string(prepared.baseline.registration.contract())?);
-                reasoner
-                    .call_revision_with_storage(&fix_opts(worktree.to_path_buf()), &prompt)
-                    .await?;
+                let prompt = format!("Repair {} against the independently registered executable acceptance contract. Do not modify or remove pinned verifier files. Fix implementation, not assertions. Failure: {}\nContract: {}", source, detail, serde_json::to_string(prepared.baseline.registration.contract())?);
+                adoption::revise(
+                    reasoner,
+                    workflow,
+                    &fix_opts(worktree.to_path_buf()),
+                    &prompt,
+                )
+                .await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
                 verification_gate(worktree).await?;
@@ -1521,5 +1600,53 @@ mod compiler_input_tests {
         )
         .unwrap();
         assert_eq!(compiler_control_inputs(root.path()).unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod source_namespace_tests {
+    use super::*;
+    #[test]
+    fn issue_and_unlinked_pr_keep_separate_original_baseline_manifests() {
+        let control = tempfile::tempdir().unwrap();
+        let base = "a".repeat(40);
+        let issue = WorkflowManifest {
+            version: 1,
+            issue: Some(42),
+            pull_request: None,
+            original_base: base.clone(),
+            contract_revision: 1,
+            contract_hash: "issue-contract".into(),
+        };
+        let pr = WorkflowManifest {
+            issue: None,
+            pull_request: Some(42),
+            contract_hash: "pr-contract".into(),
+            ..issue.clone()
+        };
+        write_manifest(control.path(), &issue).unwrap();
+        write_manifest(control.path(), &pr).unwrap();
+        assert_eq!(
+            original_manifest(control.path(), AcceptanceSource::Issue(42))
+                .unwrap()
+                .unwrap(),
+            issue
+        );
+        assert_eq!(
+            original_manifest(control.path(), AcceptanceSource::PullRequest(42))
+                .unwrap()
+                .unwrap(),
+            pr
+        );
+        assert_ne!(
+            evidence_path(control.path(), AcceptanceSource::Issue(42), &base).unwrap(),
+            evidence_path(control.path(), AcceptanceSource::PullRequest(42), &base).unwrap()
+        );
+        let stored: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(control.path().join("pr-42-workflow.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(stored.get("issue").is_none());
+        assert_eq!(stored["pull_request"], 42);
     }
 }

@@ -7,7 +7,8 @@ fn contract() -> AcceptanceContract {
     AcceptanceContract {
         schema_version: SCHEMA_VERSION,
         revision: 1,
-        issue: 1598,
+        issue: Some(1598),
+        pull_request: None,
         criteria: vec![Criterion {
             id: "C1".into(),
             requirement: "Ready state is returned".into(),
@@ -393,4 +394,36 @@ fn real_unittest_baseline_and_candidate_prove_behavior_without_mutating_evaluato
     assert!(reg
         .candidate_passes(&[baseline], &[candidate], &reg.binding(HEAD).unwrap())
         .unwrap());
+}
+
+#[test]
+fn legacy_issue_json_and_real_pull_request_identity_are_distinct() {
+    let legacy = contract();
+    let json = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(json["issue"], 1598);
+    assert!(json.get("pull_request").is_none());
+    let loaded: AcceptanceContract = serde_json::from_value(json).unwrap();
+    assert_eq!(loaded.source().unwrap(), AcceptanceSource::Issue(1598));
+    let mut imported = legacy.clone();
+    imported.issue = None;
+    imported.pull_request = Some(1598);
+    imported.validate().unwrap();
+    assert_eq!(
+        imported.source().unwrap(),
+        AcceptanceSource::PullRequest(1598)
+    );
+    assert_ne!(
+        imported.source().unwrap().key(),
+        loaded.source().unwrap().key()
+    );
+    let imported_json = serde_json::to_value(&imported).unwrap();
+    assert!(imported_json.get("issue").is_none());
+    assert_eq!(imported_json["pull_request"], 1598);
+    imported.issue = Some(1598);
+    assert!(imported.validate().is_err());
+    imported.issue = None;
+    imported.pull_request = Some(0);
+    assert!(imported.validate().is_err());
+    imported.pull_request = None;
+    assert!(imported.validate().is_err());
 }
