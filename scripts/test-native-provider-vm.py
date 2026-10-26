@@ -85,6 +85,48 @@ ready.with_name('actual-model-dispatch').write_text('called')
             with self.assertRaisesRegex(ValueError, 'undeclared runtime file'):
                 vm.validate_runtime(root)
 
+    def test_refresh_tokens_preserves_identity_and_concurrent_owner_update(self):
+        original = {'auth_mode': 'chatgpt', 'OPENAI_API_KEY': None, 'last_refresh': 'old',
+                    'tokens': {'access_token': 'old-access', 'refresh_token': 'old-refresh',
+                               'id_token': 'old-id', 'account_id': 'same-account'}}
+        updated = json.loads(json.dumps(original))
+        updated['tokens']['access_token'] = 'new-access'
+        updated['tokens']['refresh_token'] = 'new-refresh'
+        updated['last_refresh'] = 'new'
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            vm.atomic(root / 'codex.json', json.dumps(original).encode())
+            generation = root / 'generation'
+            generation.mkdir(mode=0o700)
+            vm.atomic(generation / 'auth.json', json.dumps(updated).encode())
+            spec = {'refresh_auth': True, 'provider': 'codex', 'auth_file': str(root / 'codex.json'), 'credential_directory': str(root),
+                    'auth_relative': 'auth.json'}
+            digest = vm.hashlib.sha256((root / 'codex.json').read_bytes()).hexdigest()
+            vm.refresh_auth(spec, generation, digest)
+            self.assertEqual(json.loads((root / 'codex.json').read_text()), updated)
+            owner = {**updated, 'last_refresh': 'owner-newer'}
+            vm.atomic(root / 'codex.json', json.dumps(owner).encode())
+            vm.refresh_auth(spec, generation, digest)
+            self.assertEqual(json.loads((root / 'codex.json').read_text()), owner)
+        forged = json.loads(json.dumps(updated))
+        forged['tokens']['account_id'] = 'other-account'
+        with self.assertRaisesRegex(ValueError, 'account identity'):
+            vm.refreshed_credential(original, forged, 'codex')
+        forged = json.loads(json.dumps(updated))
+        forged['OPENAI_API_KEY'] = 'different-static-key'
+        with self.assertRaisesRegex(ValueError, 'identity or configuration'):
+            vm.refreshed_credential(original, forged, 'codex')
+
+    def test_claude_refresh_cannot_expand_scope_or_replace_static_fields(self):
+        old = {'claudeAiOauth': {'accessToken': 'a', 'refreshToken': 'r', 'expiresAt': 1,
+                                'scopes': ['inference'], 'subscriptionType': 'max'}}
+        new = json.loads(json.dumps(old))
+        new['claudeAiOauth'].update(accessToken='b', refreshToken='s', expiresAt=2)
+        self.assertEqual(vm.refreshed_credential(old, new, 'claude'), new)
+        new['claudeAiOauth']['scopes'].append('admin')
+        with self.assertRaisesRegex(ValueError, 'scope changed'):
+            vm.refreshed_credential(old, new, 'claude')
+
     def test_runtime_resume_uses_only_committed_generation(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

@@ -19,6 +19,7 @@ The file must be owner-private, regular and single-link. Its version 1 shape is:
     "codex": {
       "auth_file": "/controller/provider/auth.json",
       "auth_relative": ".codex/auth.json",
+      "refresh_auth": false,
       "environment": ["CODEX_API_KEY"],
       "gateway": {
         "version": 1,
@@ -67,13 +68,20 @@ are bounded to 64 MiB, reject links/nonregular files and commit an immutable
 generation before atomically replacing the completion pointer. Resume refuses
 an unfinished initial export and uses only completed generations. Guest OAuth
 refreshes persist within that conversation unless controller credentials have
-changed independently. Propagation of refreshes back into original credentials
-is not implemented; credential freshness for new conversations must be proven
-in the authenticated rollout test.
+changed independently. The optional `--allow-auth-refresh` provisioning grant explicitly imports the
+credential into `state_root/credentials/PROVIDER.json`. Only this controlled
+credential may be refreshed. The original interactive authentication source is
+never overwritten. Codex/Claude token and timestamp fields may rotate; account
+identity, scopes, static API keys and configuration must remain unchanged.
+A private writer lock plus generation digest serializes VM refreshes; a visible
+independent reimport wins. An uncooperative writer ignoring that lock is outside
+this controlled writer protocol. External credential reimport must acquire the
+same `.native-vm-refresh.lock` and invalidate stale conversation seeds. Real
+fresh-session authentication after rotation remains a rollout acceptance test.
 
 Local executable validation:
 
-- `python3 scripts/test-native-provider-vm.py`: five tests cover pre-admission
+- `python3 scripts/test-native-provider-vm.py`: seven tests cover pre-admission
   refusal, cancellation cleanup, completed-generation recovery and symlink
   rejection and undeclared runtime siblings. These do not execute a VM or contact a provider.
 - `scripts/native-provider-vm-local-probe.py --execute --runtime-config PATH`:

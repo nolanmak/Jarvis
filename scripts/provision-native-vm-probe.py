@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import stat
 
 
 def dependencies(path):
@@ -78,6 +79,7 @@ def main():
     parser.add_argument('--provider', choices=['codex', 'claude', 'qwen', 'glm'], required=True)
     parser.add_argument('--native-executable', type=Path, required=True)
     parser.add_argument('--auth-file', type=Path)
+    parser.add_argument('--allow-auth-refresh', action='store_true', help='explicit CAS token-only refresh grant')
     parser.add_argument('--gateway-policy', type=Path, required=True,
                         help='explicit reviewed authority/method/route policy, never inferred')
     parser.add_argument('--environment-key', action='append', default=[])
@@ -89,8 +91,28 @@ def main():
     stage_runtime(guest, args.native_executable)
     state = root / 'state'
     state.mkdir(mode=0o700)
-    profile = {'gateway': json.loads(args.gateway_policy.read_text()),
-               'auth_file': str(args.auth_file.resolve()) if args.auth_file else None,
+    if args.allow_auth_refresh and (args.provider not in ('codex', 'claude') or args.auth_file is None):
+        raise ValueError('OAuth refresh requires a supported explicit credential file')
+    auth_file = args.auth_file.resolve() if args.auth_file else None
+    if args.allow_auth_refresh:
+        credentials = state / 'credentials'
+        credentials.mkdir(mode=0o700)
+        descriptor = os.open(args.auth_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(descriptor, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 1024 * 1024:
+                raise ValueError('credential import source is not private')
+            contents = stream.read(1024 * 1024 + 1)
+            json.loads(contents)
+        auth_file = credentials / (args.provider + '.json')
+        auth_file.write_bytes(contents)
+        auth_file.chmod(0o600)
+        receipt = credentials / (args.provider + '-import.json')
+        receipt.write_text(json.dumps({'version': 1, 'provider': args.provider,
+            'source_digest': hashlib.sha256(contents).hexdigest(), 'mode': 'explicit-private-import'}))
+        receipt.chmod(0o600)
+    profile = {'refresh_auth': args.allow_auth_refresh, 'gateway': json.loads(args.gateway_policy.read_text()),
+               'auth_file': str(auth_file) if auth_file else None,
                'auth_relative': '.claude/.credentials.json' if args.provider == 'claude' else '.codex/auth.json',
                'environment': args.environment_key}
     policy = {'version': 1, 'runtime_config': str(args.runtime_config.resolve()),

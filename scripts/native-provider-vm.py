@@ -101,6 +101,11 @@ def atomic(path, data):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(name, path)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def safe_relative(raw):
@@ -136,6 +141,79 @@ class Channel:
                 if not isinstance(frame, dict) or not isinstance(frame.get('type'), str):
                     raise ValueError('invalid native VM frame type')
                 yield frame
+
+
+def refreshed_credential(original, refreshed, provider):
+    """Only provider-declared rotating fields may change; identity stays fixed."""
+    if not isinstance(original, dict) or not isinstance(refreshed, dict):
+        raise ValueError('credential schema is not an object')
+    if provider == 'claude':
+        container = 'claudeAiOauth'
+        rotating = {'accessToken': str, 'refreshToken': str, 'expiresAt': int}
+        timestamps = set()
+    elif provider == 'codex':
+        container = 'tokens'
+        rotating = {'access_token': str, 'refresh_token': str, 'id_token': str}
+        timestamps = {'last_refresh'}
+    else:
+        raise ValueError('provider does not declare OAuth refresh')
+    before, after = original.get(container), refreshed.get(container)
+    if not isinstance(before, dict) or not isinstance(after, dict) or set(before) != set(after):
+        raise ValueError('credential token schema changed')
+    if set(original) != set(refreshed):
+        raise ValueError('credential outer schema changed')
+    for key in original:
+        if key == container:
+            continue
+        if key in timestamps:
+            if not isinstance(refreshed[key], str) or len(refreshed[key]) > 128:
+                raise ValueError('invalid credential refresh timestamp')
+        elif original[key] != refreshed[key]:
+            raise ValueError('credential identity or configuration changed')
+    for key in before:
+        if key not in rotating:
+            if before[key] != after[key]:
+                raise ValueError('credential account identity or scope changed')
+        elif type(after[key]) is not rotating[key]:
+            raise ValueError('invalid refreshed token shape')
+        elif isinstance(after[key], str) and not 1 <= len(after[key]) <= 128 * 1024:
+            raise ValueError('invalid refreshed token length')
+        elif isinstance(after[key], int) and after[key] <= 0:
+            raise ValueError('invalid credential expiry')
+    if not set(rotating) <= set(before):
+        raise ValueError('required rotating credential fields unavailable')
+    return refreshed
+
+
+def refresh_auth(spec, generation, original_digest):
+    if not spec.get('refresh_auth'):
+        return
+    auth = Path(spec['auth_file'])
+    controlled = Path(spec['credential_directory'])
+    if auth != controlled / (spec['provider'] + '.json'):
+        raise ValueError('refresh credential is outside controlled writer domain')
+    for parent in auth.parents:
+        info = parent.stat()
+        if info.st_uid not in (0, os.getuid()) or (info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)):
+            raise ValueError('credential ancestor is writable by other principals')
+    if auth.resolve() != auth or auth.parent.stat().st_uid != os.getuid() or auth.parent.stat().st_mode & 0o077:
+        raise ValueError('credential refresh parent is not private')
+    lock_fd = os.open(auth.with_name(auth.name + '.native-vm-refresh.lock'),
+                      os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(lock_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise ValueError('credential refresh lock is not private')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        current = private_bytes(auth, 1024 * 1024)
+        if hashlib.sha256(current).hexdigest() != original_digest:
+            return  # Independently refreshed controller credentials always win.
+        candidate = private_bytes(generation / safe_relative(spec['auth_relative']), 1024 * 1024)
+        updated = refreshed_credential(json.loads(current), json.loads(candidate), spec['provider'])
+        if updated != json.loads(current):
+            atomic(auth, json.dumps(updated, separators=(',', ':')).encode())
+    finally:
+        os.close(lock_fd)
 
 
 def runtime_seed(runtime, auth_file, auth_relative):
@@ -428,6 +506,7 @@ def main(spec_path):
                 raise RuntimeError('native VM shutdown failed')
             generation = 'generation-' + uuid.uuid4().hex
             os.replace(staging, state / generation)
+            refresh_auth(spec, state / generation, original_auth)
             atomic(state / 'complete.json', json.dumps({'version': 1, 'exit_code': exit_code,
                    'generation': generation, 'export_bytes': exported,
                    'auth_generation': original_auth}).encode())

@@ -22,6 +22,8 @@ struct Provider {
     auth_file: Option<PathBuf>,
     auth_relative: String,
     #[serde(default)]
+    refresh_auth: bool,
+    #[serde(default)]
     environment: Vec<String>,
 }
 
@@ -71,6 +73,11 @@ impl Launch {
         for worker in opts.cwd.iter().chain(opts.add_dirs.iter()) {
             let worker = worker.canonicalize()?;
             ensure!(!root.starts_with(&worker), "worker root overlaps native VM controller state");
+        }
+        if profile.refresh_auth {
+            let expected = root.join("credentials").join(format!("{provider}.json"));
+            ensure!(profile.auth_file.as_ref() == Some(&expected),
+                "OAuth refresh requires an explicitly imported controller credential");
         }
         let provider_root = root.join(provider);
         std::fs::create_dir_all(&provider_root)?;
@@ -148,7 +155,7 @@ impl Launch {
             bridge.native_cwd.parent().expect("bridge launch directory").join("tool-bridge.py").to_string_lossy().into_owned(),
             bridge.policy_path.to_string_lossy().into_owned()]);
         let spec = serde_json::json!({"version":1,"runtime_config":policy.runtime_config,"guest_runtime":policy.guest_runtime,"memory_mb":policy.memory_mb,
-            "session_directory":session,"resume":resume,"executable":executable,"argv":arguments,
+            "provider":provider,"refresh_auth":profile.refresh_auth,"credential_directory":root.join("credentials"),"session_directory":session,"resume":resume,"executable":executable,"argv":arguments,
             "environment":environment,"auth_file":profile.auth_file,"auth_relative":profile.auth_relative,
             "gateway":profile.gateway,"mcp_argv":mcp_argv,"assets":assets});
         let spec_path = directory.path().join("launch.json");
