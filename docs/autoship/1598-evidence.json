@@ -6,8 +6,10 @@
       "issue": 1537,
       "title": "Autoship: explicitly adopt and review existing PRs outside agent-fix branches",
       "source": "https://github.com/nolanmak/Jarvis/issues/1537",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Owner-authorized branch-independent linked-issue adoption integrated; source-less execution and automatic parent-base reconciliation remain incomplete."
+      ]
     },
     {
       "issue": 1531,
@@ -29,8 +31,10 @@
       "issue": 1082,
       "title": "Auto-resume: policy and receipt holds on approved drafts bill a slot every day; merge sweep may never reach a draft",
       "source": "https://github.com/nolanmak/Jarvis/issues/1082",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Exact-head approval now excludes policy-held PRs before billed selection; shared policy reread freely, durable health observations distinguish holds. New Rust regressions await managed build admission."
+      ]
     },
     {
       "issue": 1215,
@@ -54,8 +58,10 @@
       "issue": 1476,
       "title": "Auto-PR loop: periodic 'forget and restart from best candidate' to break anchoring in iterative repair/review rounds",
       "source": "https://github.com/nolanmak/Jarvis/issues/1476",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Episode reducer foundation tests passed. Production fresh/resume wiring, preserved candidate refs, fresh-session budget and missing-evidence epoch regression integrated; new integration tests not yet run. Thirty-day observation not started."
+      ]
     },
     {
       "issue": 1426,
@@ -72,7 +78,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1453",
       "implementation_status": "partial",
       "evidence": [
-        "Real native Claude probe: normal Write succeeded; protected audit/settings Write attempts denied; project-control suppression followup under test; full read scope and network egress incomplete"
+        "Native tools routed through confined MCP bridge with literal write grants and private settings. Combined Python boundary/registry/bridge suite: 188 run, 10 skipped, no failures. Earlier native write/read-denial probes passed; latest live probe stopped on Claude quota before tools. Provider transport egress not hostname-restricted."
       ]
     },
     {
@@ -81,7 +87,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1472",
       "implementation_status": "partial",
       "evidence": [
-        "Typed verifier generation/registration/recovery helpers implemented; production scoping integration pending"
+        "Independent scoping and registered red/green verifier wired before fresh/resume builders. Contract amendment executor and complete live acceptance remain pending."
       ]
     },
     {
@@ -90,7 +96,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/810",
       "implementation_status": "partial",
       "evidence": [
-        "Independent red/green verifier module passes real Python baseline/no-op/green/tamper fixture; production criteria and call-site wiring incomplete"
+        "Baseline/no-op/green/tamper verifier fixture passed previously; production call sites integrated. Protected verifier cache and registry integrity checks added; final Rust rerun pending."
       ]
     },
     {
@@ -120,8 +126,10 @@
       "issue": 1522,
       "title": "Triage/auto-PR evaluation: penalise 'safe delaying' decisions that a per-step judge lets through (rollout-scorer gap)",
       "source": "https://github.com/nolanmak/Jarvis/issues/1522",
-      "implementation_status": "audit_pending",
-      "evidence": []
+      "implementation_status": "partial",
+      "evidence": [
+        "Owner-outcome triage joins, disagreement sample and token-usage/digest metrics implemented; two store tests passed. Episode outcome reducer implemented; operational calibration remains pending."
+      ]
     },
     {
       "issue": 1512,
@@ -136,7 +144,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/472",
       "implementation_status": "partial",
       "evidence": [
-        "Durable state and remote-intent recovery implemented; email retry guard work in progress; scheduled-loop coverage/digest pending"
+        "Email retry guard-chain and metadata preservation implemented; prior email suite had two fixture failures, corrected but rerun pending. Scheduled-loop durable coverage and digest integrated; 49 loop/process-loop tests passed."
       ]
     },
     {
@@ -161,7 +169,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1184",
       "implementation_status": "partial",
       "evidence": [
-        "Exact-head independent review receipts and stale/builder/coverage negative tests passed; production author provenance and adoption policy still need full audit"
+        "Fresh native session receipt, actual CLI session identity checks, Codex-after-Codex selection and resume preflight integrated. New Rust tests pending; live seeded-defect canary and drift reporting still incomplete."
       ]
     },
     {
@@ -170,7 +178,7 @@
       "source": "https://github.com/nolanmak/Jarvis/issues/1209",
       "implementation_status": "partial",
       "evidence": [
-        "Four audit-chain tests passed including tampering, concurrency and partial append recovery; controller audit integration pending"
+        "External audit anchors, persistent pending tickets, controller/provider audit wiring and protected drains integrated. Earlier four audit-chain tests passed; latest runtime audit checks await rerun."
       ]
     },
     {
@@ -189,14 +197,15 @@
   },
   "validation": {
     "foundation": {
-      "passed": 48,
-      "failed": 0
+      "passed": 56,
+      "failed": 0,
+      "note": "Before latest episode production wiring and native fresh-session changes."
     },
     "self_improve": {
-      "passed": 324,
-      "failed": 0,
+      "passed": 329,
+      "failed": 4,
       "ignored": 6,
-      "note": "Last completed suite before latest sweep-lease/cross-lane-counter integration. Latest changes still under test; live provider tests remain required."
+      "note": "Most recent completed broad suite. Fixes for these failures and subsequent changes integrated; rerun pending. Do not treat previous green suite as validation of current HEAD."
     },
     "kernel_scope": {
       "passed": 6,
@@ -210,11 +219,27 @@
     "native_scope_probe": {
       "normal_write": true,
       "protected_write_denials": true,
-      "project_control_suppression": "retest_running",
+      "project_control_suppression": "Earlier probe passed; latest stricter end-to-end probe stopped on provider quota before tool execution.",
       "does_not_prove": [
         "full_read_scope",
         "provider_network_egress"
       ]
-    }
+    },
+    "python_boundary_registry_bridge": {
+      "run": 188,
+      "failed": 0,
+      "skipped": 10,
+      "log": "/tmp/autoship-1598-python-boundary-tests.log",
+      "note": "Before latest native fresh-review session changes."
+    },
+    "scheduled_loops": {
+      "passed": 49,
+      "failed": 0
+    },
+    "triage_outcomes": {
+      "passed": 2,
+      "failed": 0
+    },
+    "latest_rust_admission": "Refused build storage busy; production current-baseline workspace test process active. No second Rust build started."
   }
 }
