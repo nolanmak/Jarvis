@@ -26,12 +26,18 @@ pub enum GoogleOp {
         /// Opaque CSRF token the caller verifies on the callback.
         #[arg(long)]
         state: String,
+        /// Mailbox address Google should preselect in its account chooser.
+        #[arg(long)]
+        login_hint: Option<String>,
     },
     /// Start a connect from the terminal: asks the running dashboard for a
     /// consent URL, prints it (and opens it when a display is available),
     /// then waits until the browser callback saves the mailbox. Uses the
     /// same attempt flow the Discord agent uses.
     ConnectStart {
+        /// Mailbox to connect; Google preselects it in the account chooser.
+        #[arg(long)]
+        email: Option<String>,
         /// Open the consent URL with xdg-open when $DISPLAY is set.
         #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         open_browser: bool,
@@ -78,17 +84,19 @@ pub async fn run(store: Arc<Store>, op: GoogleOp) -> Result<()> {
         GoogleOp::AuthUrl {
             redirect_uri,
             state,
+            login_hint,
         } => {
             let app = OAuthApp::from_env()?;
-            println!("{}", app.auth_url(&redirect_uri, &state));
+            println!("{}", app.auth_url(&redirect_uri, &state, login_hint.as_deref()));
             Ok(())
         }
         GoogleOp::Connect { redirect_uri, json } => connect(store, &redirect_uri, json).await,
         GoogleOp::ConnectStart {
+            email,
             open_browser,
             timeout_secs,
             json,
-        } => connect_start(open_browser, timeout_secs, json).await,
+        } => connect_start(email, open_browser, timeout_secs, json).await,
         GoogleOp::Disconnect { account } => disconnect(store, &account).await,
         GoogleOp::Accounts { json } => accounts(store, json),
         GoogleOp::Check { account } => check(&account).await,
@@ -99,12 +107,21 @@ pub async fn run(store: Arc<Store>, op: GoogleOp) -> Result<()> {
 /// open the consent URL → poll status until the callback saved the mailbox.
 /// Works for whichever transport the dashboard picks (Google direct when the
 /// operator's client is configured, Composio otherwise).
-async fn connect_start(open_browser: bool, timeout_secs: u64, json: bool) -> Result<()> {
+async fn connect_start(
+    email: Option<String>,
+    open_browser: bool,
+    timeout_secs: u64,
+    json: bool,
+) -> Result<()> {
     use crate::composio_auth_tool::{call_dashboard, dashboard_api_key, dashboard_port};
 
     let port = dashboard_port();
     let key = dashboard_api_key()?;
-    let started = call_dashboard("start", &serde_json::json!({"provider": "gmail"}), port, &key)
+    let mut start_args = serde_json::json!({"provider": "gmail"});
+    if let Some(e) = email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        start_args["email"] = serde_json::Value::String(e.to_string());
+    }
+    let started = call_dashboard("start", &start_args, port, &key)
         .await
         .context("start a Gmail connect through the dashboard (is it running?)")?;
     let attempt_id = started["attempt_id"]

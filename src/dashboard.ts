@@ -819,7 +819,7 @@ router.use("/api/composio/auth", createComposioAuthRouter({
   // OAuth routes; these are only invoked per request.
   google: {
     configured: () => googleAuth.configured(),
-    start: () => googleAuth.start(),
+    start: (email?: string) => googleAuth.start(email),
     status: (id: string) => googleAuth.status(id),
   },
   persist: async (provider, connectionId, entityId, account) => {
@@ -1102,7 +1102,17 @@ router.get("/oauth/google/callback", async (req, res) => {
     return;
   }
   console.log(`[oauth] Google mailbox connected: ${result.attempt?.email ?? "?"} (${result.attempt?.entity_id ?? "?"})`);
-  res.redirect("/settings?gmail=connected");
+  // A self-contained page, not a redirect into Settings: the consent often
+  // finishes on a phone with no dashboard session, where Settings would
+  // only show the login form and hide that the connect worked.
+  const esc = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const who = esc(result.attempt?.email ?? "your mailbox");
+  const note = result.attempt?.error ? `<p style="color:#b45309">${esc(result.attempt.error)}</p>` : "";
+  res.send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gmail connected</title>
+<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem;line-height:1.5">
+<h1 style="font-size:1.4rem">Connected ${who}</h1>${note}
+<p>Jarvis can read and draft for this mailbox now. You can close this tab.</p></body>`);
 });
 
 // Poll endpoint for frontend to check connection status
