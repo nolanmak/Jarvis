@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location('resources', Path(__file__).parents[1]/'run-resource-scope.py')
 resources = importlib.util.module_from_spec(SPEC)
@@ -135,6 +136,20 @@ subprocess.Popen(['/bin/sleep','10'],start_new_session=True,stdout=subprocess.DE
             self.assertFalse((root/'launch-ready').exists())
             self.assertEqual(json.loads((root/'resource-accounting.json').read_text())['phase'],'admission_failed')
             self.assertEqual(receipt.read_text(),'all-descendants-reaped\n')
+
+    def test_failed_limit_readback_removes_only_new_empty_cgroup(self):
+        parent=self.scope.path.parent
+        before={path.name for path in parent.glob('run-*')}
+        original=Path.read_text
+        def failed_readback(path,*args,**kwargs):
+            if path.name=='pids.max' and path.parent.name.startswith('run-'):
+                return '999999\n'
+            return original(path,*args,**kwargs)
+        with patch.object(Path,'read_text',failed_readback):
+            with self.assertRaisesRegex(RuntimeError,'readback'):
+                resources.RunScope({'memory_bytes':64*1024*1024,'pids':8,'cpu_percent':20})
+        self.assertEqual({path.name for path in parent.glob('run-*')},before)
+        self.assertTrue(self.scope.path.exists(),'unrelated active run must survive cleanup')
 
     def test_ceiling_cannot_exceed_original_aggregate(self):
         with self.assertRaises(RuntimeError):
