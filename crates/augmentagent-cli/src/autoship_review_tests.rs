@@ -294,13 +294,11 @@ async fn new_evidence_or_changed_head_requires_new_review() {
     let findings = vec![finding("F1")];
     let receipt = dismissed(&findings).await;
     let mut changed = passes(findings);
+    assert!(merge_authority(&binding(), &builders(), &changed, &checks(), Some(&receipt)).is_ok());
     changed[1].findings[0].evidence_hash = "new-regression".into();
-    assert!(
-        merge_authority(&binding(), &builders(), &changed, &checks(), Some(&receipt))
-            .unwrap_err()
-            .to_string()
-            .contains("new finding evidence")
-    );
+    assert_ne!(receipt.finding_fingerprints["F1"],changed[1].findings[0].fingerprint().unwrap());
+    assert!(merge_authority(&binding(), &builders(), &changed, &checks(), Some(&receipt)).is_err(),
+        "same-head authority cannot borrow a ruling for different finding evidence");
     let mut moved = binding();
     moved.head = "head-b".into();
     assert!(merge_authority(&moved, &builders(), &changed, &checks(), Some(&receipt)).is_err());
@@ -900,7 +898,8 @@ async fn connected_conflicts_and_owner_criterion_never_split_final_authority() {
     // Even individually valid leaf transcripts cannot independently decide
     // opposing sides of the same dispute.
     a.criterion_id="C1".into();b.criterion_id="C2".into();
-    let first=dismissed(&[a.clone()]).await;
+    let mut before_conflict=a.clone();before_conflict.conflicts_with.clear();
+    let first=dismissed(&[before_conflict]).await;
     let mut second=dismissed(&[b.clone()]).await;second.actor.session_id="synthetic-other".into();
     assert!(adjudication_groups::compose(&binding(),&[a,b],vec![first,second],&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).is_err());
 }
