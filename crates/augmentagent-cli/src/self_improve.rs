@@ -45,6 +45,8 @@ mod adopted_execution;
 mod adoption;
 #[path = "self_improve_policy_hold.rs"]
 mod policy_hold;
+#[path = "self_improve_slicing.rs"]
+mod slicing;
 
 pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
     policy_hold::statuses()
@@ -832,19 +834,16 @@ fn author_is_trusted(login: &str, association: &str, allowlist: &[String]) -> bo
 
 /// #1517 — issues per REST page (GitHub's maximum).
 const ISSUES_PER_PAGE: u32 = 100;
-/// #1517 — how many pages of open issues the picker walks before it settles
-/// for what it has. A bound, not a guess at the backlog: without one a repo
-/// with thousands of open issues would spend a tick listing them.
-const MAX_ISSUE_PAGES: u32 = 5;
+/// Bound inventory work at 10,000 rows. Hitting it is an explicit dependency,
+/// never evidence that an older repair issue or child does not exist.
+const MAX_ISSUE_PAGES: u32 = 100;
 
 /// #1517 — walk `fetch` over pages 1.. and merge the rows into one REST
 /// issues array, preserving the newest-first order the pages arrive in.
 ///
-/// Stops on an empty page, on a body that is not an array (a rate-limit
-/// object — the single-page call always tolerated that shape) or at
-/// [`MAX_ISSUE_PAGES`]. Rows are deduped by `number`: an issue filed
-/// mid-walk shifts every later row one position down, so the same issue can
-/// land on two pages.
+/// Completes on an empty page. Malformed responses and bound exhaustion fail
+/// closed; partial inventories cannot prove absence. Deduplicate rows shifted
+/// between pages by concurrent issue creation.
 async fn fetch_issue_pages<F, Fut>(mut fetch: F) -> Result<serde_json::Value>
 where
     F: FnMut(u32) -> Fut,
@@ -854,9 +853,9 @@ where
     let mut seen = std::collections::HashSet::new();
     for page in 1..=MAX_ISSUE_PAGES {
         let body = fetch(page).await?;
-        let Some(rows) = body.as_array() else { break };
+        let rows = body.as_array().context("issue inventory is not a complete array")?;
         if rows.is_empty() {
-            break;
+            return Ok(serde_json::Value::Array(merged));
         }
         for row in rows {
             let fresh = match row.get("number").and_then(serde_json::Value::as_u64) {
@@ -868,7 +867,7 @@ where
             }
         }
     }
-    Ok(serde_json::Value::Array(merged))
+    bail!("issue inventory exceeded safe pagination bound; refusing partial selection")
 }
 
 /// Pick the first `agent-fixable` issue that isn't already claimed (open agent
@@ -2709,7 +2708,7 @@ fn merged_since_section(subjects: &[String]) -> String {
 // =====================================================================
 
 /// One child issue the slice planner proposed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Slice {
     pub(crate) title: String,
     pub(crate) body: String,
@@ -2840,83 +2839,10 @@ async fn ensure_label(repo_root: &Path, name: &str, color: &str, description: &s
     .await;
 }
 
-/// File the children, comment the list on the parent, label the parent
-/// [`SLICED_LABEL`]. Returns the child numbers filed. A child that fails to
-/// file is skipped; the parent is labelled only if at least one was filed,
-/// so a run that filed nothing leaves no trace and the refusal proceeds.
-async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice]) -> Result<Vec<u64>> {
-    let gh = gh_bin();
-    let total = plan.len();
-    // Labels first: `gh issue create --label` fails outright on a label the
-    // repo never had, and a fresh deployment has neither.
-    ensure_label(repo_root, FIXABLE_LABEL, "0E8A16", "Eligible for the auto-PR pipeline").await;
-    ensure_label(
-        repo_root,
-        SLICED_LABEL,
-        "BFD4F2",
-        "Parent issue split into child issues by the auto-PR pipeline; the picker skips it",
-    )
-    .await;
-    let mut labels = vec![FIXABLE_LABEL.to_string()];
-    if issue.research_filed {
-        ensure_label(repo_root, RESEARCH_LABEL, "D4C5F9", "Filed by the daily research pipeline").await;
-        labels.push(RESEARCH_LABEL.to_string());
-    }
-    let labels = labels.join(",");
-    let mut children: Vec<(u64, String)> = Vec::new();
-    for (i, slice) in plan.iter().enumerate() {
-        let body = slice_issue_body(issue.number, i + 1, total, &slice.body, issue.research_filed);
-        if let Err(e) = augmentagent_channel_core::public_report::validate(&slice.title, &body) {
-            warn!(issue = issue.number, slice = i + 1, "slice failed the public-output check: {e:#}");
-            continue;
-        }
-        let (ok, out, err) = run(
-            &gh,
-            &["issue", "create", "--title", &slice.title, "--body", &body, "--label", &labels],
-            repo_root,
-        )
-        .await?;
-        if !ok {
-            warn!(issue = issue.number, slice = i + 1, "gh issue create failed: {}", truncate(&err, 300));
-            continue;
-        }
-        match out.trim().rsplit('/').find_map(|s| s.parse::<u64>().ok()) {
-            Some(n) => children.push((n, slice.title.clone())),
-            None => warn!(issue = issue.number, "gh stdout has no issue number: {}", truncate(&out, 200)),
-        }
-    }
-    if children.is_empty() {
-        return Ok(Vec::new());
-    }
-    let list = children
-        .iter()
-        .map(|(n, t)| format!("- #{n} — {t}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    backoff_comment(
-        repo_root,
-        issue.number,
-        &format!(
-            "Auto-fix triage: the scoping pass estimates this issue is larger than \
-             one unattended change (the pipeline caps a diff at {MAX_DIFF_LINES} \
-             lines), so it was split into child issues the pipeline will pick up \
-             in order:\n\n{list}\n\nThis parent is labelled `{SLICED_LABEL}` and \
-             will not be built as a whole. Close it once the parts have landed, or \
-             remove the label to have it re-scoped."
-        ),
-    )
-    .await
-    .ok();
-    let (ok, _o, err) = run(
-        &gh,
-        &["issue", "edit", &issue.number.to_string(), "--add-label", SLICED_LABEL],
-        repo_root,
-    )
-    .await?;
-    if !ok {
-        bail!("labelling #{} `{SLICED_LABEL}` failed: {}", issue.number, truncate(&err, 300));
-    }
-    Ok(children.into_iter().map(|(n, _)| n).collect())
+/// Reconcile the immutable admitted plan across retries; label the parent
+/// only after every child has a remotely confirmed identity.
+async fn file_slices(repo_root: &Path, issue: &Issue, plan: &[Slice], guard: &workflow::WorkflowGuard) -> Result<Vec<u64>> {
+    slicing::file(repo_root,issue,plan,guard).await
 }
 
 /// Stage 3 (#653): read-only QA review of the builder's diff, on the same
@@ -5384,18 +5310,18 @@ enum RedMainPlan {
 async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
     let title = red_main_title(red);
     let gh = gh_bin();
-    let listing = run(
-        &gh,
-        &[
-            "api",
-            "repos/{owner}/{repo}/issues?state=open&per_page=100&sort=created&direction=desc",
-        ],
-        repo_root,
-    )
-    .await;
-    let json: serde_json::Value = match listing {
-        Ok((true, out, _)) => serde_json::from_str(&out).unwrap_or(serde_json::Value::Null),
-        _ => return RedMainPlan::Hold("could not list open issues".into()),
+    let listing = fetch_issue_pages(|page| {
+        let gh=gh.clone();
+        async move {
+            let path=format!("repos/{{owner}}/{{repo}}/issues?state=open&per_page=100&sort=created&direction=desc&page={page}");
+            let (ok,out,error)=run(&gh,&["api",&path],repo_root).await?;
+            anyhow::ensure!(ok,"red-main issue lookup failed: {error}");
+            serde_json::from_str(&out).context("red-main issue inventory malformed")
+        }
+    }).await;
+    let json=match listing {
+        Ok(json)=>json,
+        Err(error)=>return RedMainPlan::Hold(format!("could not completely list open issues: {error:#}")),
     };
     let number = match red_main_issue_lookup(&json, &title) {
         Some((n, true)) => {
@@ -8078,7 +8004,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         Vec::new()
                     });
                 if plan.len() >= MIN_SLICES {
-                    match file_slices(repo_root, &issue, &plan).await {
+                    match file_slices(repo_root, &issue, &plan, &workflow_guard).await {
                         Ok(children) if !children.is_empty() => {
                             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -14801,6 +14727,21 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         }
     }
 
+    #[tokio::test]
+    async fn existing_red_main_repair_beyond_five_pages_is_reused() {
+        let title=red_main_title(&red_fixture());
+        let expected=title.clone();
+        let rows=fetch_issue_pages(|page| {
+            let title=title.clone();
+            async move { Ok(if page<=5 {
+                serde_json::json!([{"number":1000+page,"title":"unrelated issue"}])
+            } else if page==6 {
+                serde_json::json!([{"number":42,"title":title,"labels":[]}])
+            } else { serde_json::json!([]) }) }
+        }).await.unwrap();
+        assert_eq!(red_main_issue_lookup(&rows,&expected),Some((42,false)));
+    }
+
     #[test]
     fn red_main_issue_title_is_stable_per_sha_and_names_tests() {
         let red = red_fixture();
@@ -17745,17 +17686,15 @@ else:
         assert_eq!(merged.as_array().unwrap().len(), 102);
 
         let calls = std::cell::Cell::new(0u32);
-        fetch_issue_pages(|_| {
+        assert!(fetch_issue_pages(|_| {
             calls.set(calls.get() + 1);
             async move { Ok(issue_page(&(1..=100).collect::<Vec<_>>())) }
-        })
-        .await
-        .unwrap();
+        }).await.is_err());
         assert_eq!(calls.get(), MAX_ISSUE_PAGES, "endless pages stop at the bound");
 
-        // A rate-limit object ends the walk without failing the tick.
+        // An incomplete inventory cannot authorize absence-based creation/selection.
         let calls = std::cell::Cell::new(0u32);
-        let merged = fetch_issue_pages(|page| {
+        let incomplete = fetch_issue_pages(|page| {
             calls.set(calls.get() + 1);
             async move {
                 Ok(if page == 1 {
@@ -17765,10 +17704,9 @@ else:
                 })
             }
         })
-        .await
-        .unwrap();
+        .await;
         assert_eq!(calls.get(), 2);
-        assert_eq!(merged.as_array().unwrap().len(), 1);
+        assert!(incomplete.is_err());
     }
 
     #[tokio::test]
