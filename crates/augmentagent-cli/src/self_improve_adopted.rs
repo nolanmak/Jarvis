@@ -30,10 +30,10 @@ async fn discover(repo: &Path, dry_run: bool) -> Result<Vec<adoption::AdoptedPr>
     Ok(candidates)
 }
 
-fn approved(
+fn publication_review(
     store: &WorkflowStore,
     candidate: &adoption::AdoptedPr,
-) -> Result<Option<RecordedVerdict>> {
+) -> Result<Option<crate::autoship_workflow::Review>> {
     let Some(id) = store.resolve_pr(&candidate.repository, candidate.pr)? else {
         return Ok(None);
     };
@@ -44,6 +44,7 @@ fn approved(
         .events(&id)?
         .into_iter()
         .rev()
+        .take_while(|(_, kind, _, _)| kind != "audit_generation_recovered")
         .filter(|(_, kind, _, _)| kind == "review_recorded")
         .filter_map(|(_, _, raw, _)| {
             serde_json::from_str::<crate::autoship_workflow::Review>(&raw).ok()
@@ -54,7 +55,11 @@ fn approved(
                 && r.reviewer.starts_with("adopted-publication-")
         })
         .filter(|r| r.approved);
-    Ok(review
+    Ok(review)
+}
+
+fn approved(store:&WorkflowStore,candidate:&adoption::AdoptedPr)->Result<Option<RecordedVerdict>> {
+    Ok(publication_review(store,candidate)?
         .and_then(|r| serde_json::from_str::<RecordedVerdict>(&r.evidence).ok())
         .filter(|v| v.structured.is_some() && approval_of(Some(v)).reviewed))
 }
@@ -926,6 +931,31 @@ mod fairness_tests {
             dependency: adoption::Dependency::Main,
         }
     }
+    #[test]
+    fn recovered_audit_cannot_revive_adopted_publication_approval() {
+        use crate::autoship_workflow::{Binding,Review};
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();let candidate=candidate(42);
+        let id=candidate.workflow_id().unwrap();
+        let binding=Binding {head:candidate.head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(&id,&candidate.branch,binding.clone(),10).unwrap();
+        let first=store.claim(&id,"first",11,100).unwrap().unwrap();
+        store.attach_pr_in_repo(&first,&candidate.repository,candidate.pr,12).unwrap();
+        let review=Review {reviewer:"adopted-publication-old".into(),binding:binding.clone(),approved:true,evidence:"old structured receipt".into()};
+        store.record_review(&first,&review,13).unwrap();
+        assert!(publication_review(&store,&candidate).unwrap().is_some());
+        let next=store.claim(&id,"next",112,100).unwrap().unwrap();
+        store.recover_audit_generation(&next,0,&serde_json::json!({"fixture":"verified recovery"}),113).unwrap();
+        let mut checkpoint=store.snapshot(&id).unwrap().unwrap().checkpoint;
+        checkpoint.binding=binding;
+        store.checkpoint(&next,&checkpoint,114).unwrap();
+        drop(store);
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert!(publication_review(&store,&candidate).unwrap().is_none());
+        assert!(approved(&store,&candidate).unwrap().is_none(),"old receipt cannot keep candidate in free hold");
+        assert!(store.events(&id).unwrap().iter().any(|(_,kind,_,_)|kind=="review_recorded"),"history must be retained");
+    }
+
     #[tokio::test]
     async fn full_dry_selector_never_creates_state_or_changes_existing_cursor() {
         let dir=tempfile::tempdir().unwrap();
