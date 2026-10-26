@@ -136,6 +136,9 @@ class BuildVMExtensionTests(unittest.TestCase):
    self.assertIn(('ci_objects',root/'objects',True),captured['shares']);self.assertIn(('ci_runtime',root/'state',False),captured['shares'])
    entries={name:(mode,data) for name,mode,data,_,_ in captured['entries']};self.assertEqual(entries['ci-tools/runner.py'],(stat.S_IFREG|0o444,b'pinned runner'))
    self.assertIn(b'ro,nosuid,nodev ci_objects /ci-git-objects',entries['init'][1])
+   (root/'objects').chmod(0o777)
+   with self.assertRaisesRegex(vm.Unavailable,'separate owned'):vm.run(self.runtime(root),root/'workspace',['true'],{},ci_context=context)
+   (root/'objects').chmod(0o775)
    context['state']=root/'workspace'
    with self.assertRaisesRegex(vm.Unavailable,'separate owned'):vm.run(self.runtime(root),root/'workspace',['true'],{},ci_context=context)
  def test_supervised_ci_has_no_900_second_wall_kill(self):

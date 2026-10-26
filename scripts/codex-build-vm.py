@@ -275,7 +275,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         for key in ('state','git_objects'):
             path=Path(ci_context[key]);info=path.lstat()
             if (not path.is_absolute() or path.resolve()!=path or not stat.S_ISDIR(info.st_mode)
-                    or info.st_uid!=os.getuid() or (key=='state' and info.st_mode&0o022) or path.is_relative_to(workspace)
+                    or info.st_uid!=os.getuid() or info.st_mode&0o002 or (key=='state' and info.st_mode&0o022) or path.is_relative_to(workspace)
                     or workspace.is_relative_to(path)):
                 raise Unavailable('CI state and Git objects require separate owned directories')
             if key=='state' and info.st_mode&0o077:raise Unavailable('CI state is not private')
