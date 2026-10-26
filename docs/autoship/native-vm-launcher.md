@@ -98,6 +98,17 @@ proof does not establish provider authentication, SSE/WebSocket compatibility,
 MCP end-to-end behavior or safe OAuth refresh across distinct conversations.
 Those remain explicit rollout acceptance checks before enabling the policy.
 
+The authenticated transport probe is separate from full Autoship acceptance:
+`scripts/native-provider-codex-auth-probe.py --execute --policy PRIVATE_POLICY
+--executable EXACT_CODEX_EXECUTABLE --resume --output NEW_PRIVATE_DIRECTORY`.
+Run it in a bounded transient unit with at least 2 GiB for a 1 GiB guest.
+It checks an exact reply, actual native session continuation, completed runtime
+export and unchanged source authentication. Private logs retain failures;
+public output contains only status and evidence locations. It does not prove
+MCP execution, issue-to-LGTM behavior or cross-conversation token refresh.
+The full pipeline launcher additionally requires `--vm-policy PRIVATE_POLICY`
+and passes that policy into its transient systemd service explicitly.
+
 Provision a disposable profile with `/usr/bin/python3
 scripts/provision-native-vm-probe.py --directory NEW_PRIVATE_DIRECTORY
 --runtime-config EXISTING_RUNTIME_CONFIG --provider codex
