@@ -125,21 +125,26 @@ def cargo_request(request):
     return {'operation':operation,'packages':packages,'filters':filters}
 
 
-def execute(request,run=vm.run):
+def execute(request,run=vm.run,progress=None):
+    progress={} if progress is None else progress
+    progress["stage"]="request_schema"
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache'}
     optional={'id','changed_files','cache_bytes','packages','filters','command'}
     if set(request)-required-optional or not required<=set(request) or request['version']!=1 or request['operation'] not in ('plan','step','targeted','baseline','repository'):raise vm.Unavailable('invalid CI VM request')
     if not all(isinstance(request[key],str) and re.fullmatch(r'[a-f0-9]{40,64}',request[key]) for key in ('head','base')):raise vm.Unavailable('CI candidate binding invalid')
     cargo=cargo_request(request)
+    progress['stage']='controller_bundle'
     runner=private_bytes(request['runner']);contract=private_bytes(request['contract'])
     parsed=json.loads(contract)
     if parsed.get('version')!=1:raise vm.Unavailable('unsupported CI contract')
+    progress['stage']='private_directories'
     workspace=Path(request['workspace']);state=Path(request['state']);scratch=Path(request['scratch'])
     for path in (workspace,state,scratch):
         info=path.lstat()
         if path.resolve()!=path or not path.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:raise vm.Unavailable('CI snapshot/state/scratch is not private')
     # The supplied snapshot has controller-generated Git metadata, never the
     # source worktree's config/hooks. Rebind only its private alternate file.
+    progress['stage']='git_alternate'
     alternate=workspace/'.git/objects/info/alternates'
     if alternate.exists():
         if alternate.resolve()!=alternate or not alternate.resolve().is_relative_to(workspace):raise vm.Unavailable('CI Git metadata escapes snapshot')
@@ -148,8 +153,11 @@ def execute(request,run=vm.run):
             info=os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_nlink!=1 or info.st_mode&0o022:raise vm.Unavailable('CI Git alternate is not controller-owned')
             stream.truncate(0);stream.write(b'/ci-git-objects\n');stream.flush();os.fsync(stream.fileno())
+    progress['stage']='storage_lease'
     lease=InheritedStorage(request['storage'],scratch)
+    progress['stage']='runtime_load'
     runtime=vm.Runtime.load(Path(request['runtime_config']))
+    progress['stage']='command_prepare'
     command=['/usr/bin/python3','-I','/ci-tools/runner.py','--contract','/ci-tools/contract.json']
     if request['operation']=='plan':
         changed=request.get('changed_files',[])
@@ -158,6 +166,7 @@ def execute(request,run=vm.run):
         for path in changed:command+=['--changed-file',path]
     else:
         if not isinstance(request['build_cache'],str):raise vm.Unavailable('managed CI cache image is required')
+        progress['stage']='cache_prepare'
         ensure_cache(request['build_cache'],request.get('cache_bytes'),lease)
         if request['operation']=='step':
             identifier=request.get('id')
@@ -167,8 +176,10 @@ def execute(request,run=vm.run):
             command=['/bin/bash','--noprofile','--norc','-o','pipefail','-c',request['command']]
         else:
             command=['/usr/bin/python3','-I','-c',CARGO_OPERATIONS,json.dumps(cargo,separators=(',',':'))]
+    progress['stage']='vm_launch'
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
                 ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract})
+    progress['stage']='receipt_validate'
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),
             'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr']}
     if outcome['exit_code']==0:
@@ -184,10 +195,11 @@ def execute(request,run=vm.run):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--spec',type=Path,required=True);args=parser.parse_args()
-    try:result=execute(json.loads(private_bytes(args.spec)))
+    progress={'stage':'request_read'}
+    try:result=execute(json.loads(private_bytes(args.spec)),progress=progress)
     except (OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
         # Local diagnostics deliberately omit raw paths, requests and exception text.
-        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','reason':'CI VM setup unavailable','category':type(error).__name__}
+        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','reason':'CI VM setup unavailable','category':type(error).__name__ if type(error).__name__ in ('Unavailable','OSError','PermissionError','FileNotFoundError','ValueError','KeyError','JSONDecodeError','CalledProcessError') else 'SetupError','stage':progress['stage'],'errno':error.errno if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4096 else None}
     print(json.dumps(result,sort_keys=True))
     return 0 if result['status'] in ('passed','planned') else 2
 if __name__=='__main__':raise SystemExit(main())

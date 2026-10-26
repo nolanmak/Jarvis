@@ -18,7 +18,7 @@ class AdapterTests(unittest.TestCase):
    'storage':{'fd':fd,'fds':[fd],'path':str(lock),'device':info.st_dev,'inode':info.st_ino,'floor_bytes':0}}
  def test_plan_probe_is_only_dispatched_inside_vm_with_pinned_bundle(self):
   with tempfile.TemporaryDirectory() as d:
-   request=self.fixture(Path(d));seen=[]
+   request=self.fixture(Path(d));request.update(id=None,changed_files=[],packages=[],filters=[],command=None,cache_bytes=None);seen=[]
    def execute(runtime,workspace,argv,environment,**options):
     seen.append((argv,options));self.assertIn('--probe-prerequisites',argv);self.assertEqual(environment,{})
     self.assertEqual(options['ci_context']['runner'],b'controller runner');self.assertIsNone(options['timeout'])
@@ -103,6 +103,19 @@ class AdapterTests(unittest.TestCase):
     self.assertEqual(adapter.execute(request,run=run)['status'],'failed')
   with self.assertRaises(vm.Unavailable):adapter.cargo_request({'operation':'repository','command':'x'*65537})
 
+ def test_setup_diagnostics_are_fixed_and_exclude_request_content(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);request=self.fixture(root);request.update(id=None,changed_files=[],packages=[],filters=[],command=None,cache_bytes=None)
+   path=root/'request.json';path.write_text(json.dumps(request));path.chmod(0o600)
+   # Real Rust-shaped request through parser, actual held descriptors and safe
+   # failure at the runtime loader. No VM launch or arbitrary stderr text.
+   import io,contextlib
+   output=io.StringIO()
+   with patch.object(adapter.sys,'argv',['adapter','--spec',str(path)]),patch.object(vm.Runtime,'load',side_effect=PermissionError(13,'SECRET_PATH_AND_PAYLOAD')),contextlib.redirect_stdout(output):
+    self.assertEqual(adapter.main(),2)
+   result=json.loads(output.getvalue());self.assertEqual(result['stage'],'runtime_load');self.assertEqual(result['category'],'PermissionError');self.assertEqual(result['errno'],13)
+   self.assertNotIn('SECRET',output.getvalue());self.assertNotIn(str(root),output.getvalue())
+
 class BuildVMExtensionTests(unittest.TestCase):
  def runtime(self,root):
   artifact=root/'artifact';artifact.write_bytes(b'synthetic');artifact.chmod(0o600)
@@ -115,7 +128,7 @@ class BuildVMExtensionTests(unittest.TestCase):
  def test_ci_mounts_are_explicit_and_controller_bundle_is_readonly(self):
   class Stop(Exception):pass
   with tempfile.TemporaryDirectory() as d:
-   root=Path(d);context=self.setup(root);captured={}
+   root=Path(d);context=self.setup(root);(root/'objects').chmod(0o775);captured={}
    def archive(entries):captured['entries']=entries;return b'fixture'
    def qemu(config,image,shares,cache):captured['shares']=shares;raise Stop()
    with patch.object(vm.subprocess,'run',side_effect=self.openssl),patch.object(vm,'initrd',side_effect=archive),patch.object(vm,'qemu_command',side_effect=qemu),self.assertRaises(Stop):
