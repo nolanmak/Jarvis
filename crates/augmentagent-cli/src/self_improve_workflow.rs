@@ -1843,7 +1843,7 @@ mod tests {
 
     #[test]
     fn interrupted_audit_generation_reopens_without_erasing_failure_or_old_approval() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let state = dir.path().join("workflow.db");
         let mut store = WorkflowStore::open(&state).unwrap();
         let id = durable::pr_workflow_id("owner/repo",42).unwrap();
@@ -1874,7 +1874,7 @@ mod tests {
     async fn cancelled_real_worker_recovers_under_new_lease_and_executes_again() {
         use tokio::io::AsyncBufReadExt;
         assert_eq!(std::env::var("AUGMENTAGENT_RUN_RESOURCES").unwrap(),"1");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let state = dir.path().join("workflow.db");
         let mut store = WorkflowStore::open(&state).unwrap();
         let id = durable::pr_workflow_id("owner/repo",42).unwrap();
@@ -1919,7 +1919,7 @@ mod tests {
 
     #[test]
     fn abandoned_recovery_sink_does_not_poison_later_lease() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let state = dir.path().join("workflow.db");
         let mut store = WorkflowStore::open(&state).unwrap();
         let id = durable::pr_workflow_id("owner/repo",42).unwrap();
@@ -1945,7 +1945,7 @@ mod tests {
 
     #[test]
     fn audit_generation_recovery_does_not_accept_tampered_history() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         let state = dir.path().join("workflow.db");
         let mut store = WorkflowStore::open(&state).unwrap();
         let id = durable::pr_workflow_id("owner/repo",42).unwrap();

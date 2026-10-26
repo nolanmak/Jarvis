@@ -13191,7 +13191,7 @@ for tool, arguments in [
 
     #[tokio::test]
     async fn individual_hung_gate_is_stopped_without_deleting_candidate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::write(dir.path().join("candidate"), "keep work").unwrap();
         let result = run_sandboxed_bounded("/bin/sh", &["-c", "sleep 0.2; touch late-write"],
             dir.path(), &[("PATH".into(), "/usr/bin:/bin".into())], std::time::Duration::from_millis(20), &test_resource_audit(dir.path())).await;
@@ -19697,7 +19697,7 @@ mod iterate_not_delete_tests {
     fn a_post_review_repair_is_guarded_budgeted_and_never_auto_merged() {
         let body = run_once_src();
         let at = body.find("let hits = pii_guard_hits(&e);").unwrap();
-        let block = &body[at..at + body[at..].find("if !ok {\n        cleanup").unwrap()];
+        let block = &body[at..at + body[at..].find("\n    if !ok {").unwrap()];
         assert!(block.contains("&& round < max_rounds") && block.contains("round += 1;"));
         assert!(block.contains("repaired_after_review = true;"));
         assert!(block.contains("blast_radius_hit_in_diff(&full_now)"));

@@ -663,8 +663,8 @@ mod tests {
     }
     #[tokio::test]
     async fn real_isolated_python_assertion_and_protected_write() {
-        let root = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let target = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::write(root.path().join("test_case.py"), "import unittest\nclass Case(unittest.TestCase):\n def test_behavior(self):\n  self.assertEqual(1, 2, 'intended regression witness')\n").unwrap();
         let invocation = crate::autoship_contract::VerifierCommand::PythonUnittest {
             test: "test_case.Case.test_behavior".into(),
@@ -1007,8 +1007,8 @@ mod workflow_tests {
     use crate::autoship_contract::{Criterion, PathScope, Verifier, VerifierCommand};
     #[tokio::test]
     async fn real_baseline_noop_candidate_green_and_harness_tamper() {
-        let root = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let target = tempfile::tempdir_in("/tmp").unwrap();
         trusted_git(root.path(), &["init", "-q"]).await.unwrap();
         std::fs::write(root.path().join("behavior.py"), "READY = False\n").unwrap();
         trusted_git(root.path(), &["add", "behavior.py"])
