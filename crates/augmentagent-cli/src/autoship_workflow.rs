@@ -184,6 +184,8 @@ impl WorkflowStore {
         Ok(Some(Self {conn}))
     }
 
+    pub(crate) fn query_connection<T>(&self,query:impl FnOnce(&Connection)->Result<T>)->Result<T> { query(&self.conn) }
+
     pub fn open(path: &Path) -> Result<Self> {
         ensure!(
             path != Path::new(":memory:"),

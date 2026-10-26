@@ -51,6 +51,8 @@ mod policy_hold;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
+pub(crate) fn readiness_summary()->Result<String> { acceptance::readiness::summary() }
+
 pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
     policy_hold::statuses()
 }
@@ -7904,7 +7906,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     scope_prompt.push_str(&merged_since_section(
         &merged_since_filed(repo_root, &worktree, issue.number).await,
     ));
-    let scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
+    let mut scope = match acceptance::scope_original(&worktree, &repository, &workflow_guard, &scope_prompt)
         .await
     {
         Ok(p) => Some(parse_scope_output(&p)),
@@ -7921,77 +7923,22 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             None
         }
     };
-    if let Some(s) = &scope {
-        // #1515 — main already delivers this. Hold it with the evidence for
-        // the owner to confirm and close; nothing is built, nothing billed,
-        // and the ledger mark keeps the picker off it for the day.
+    if let Some(s) = &mut scope {
         if s.relevance == Relevance::Overtaken && !is_red_main_issue(&issue.body) {
-            workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
-            backoff_comment(
-                repo_root,
-                issue.number,
-                &format!(
-                    "Auto-fix triage: the scoping pass found that main already \
-                     delivers this since the issue was filed, so nothing was \
-                     built.\n\n{}\n\nHeld for the owner to confirm and close — \
-                     it is not closed. Remove the `{GAVE_UP_LABEL}` label to \
-                     put it back in the pool.",
-                    truncate(&s.body, 1500)
-                ),
-            )
-            .await
-            .ok();
-            label_gave_up(repo_root, issue.number, GIVE_UP_OVERTAKEN).await.ok();
-            return Ok(RunReport::triage(format!(
-                "issue #{}: overtaken by main since filing — held for owner triage",
-                issue.number
-            )));
-        }
-        // #932 — a red-main issue is never labelled out: that would hold the
-        // loop until a human notices, which is the outage this exists to end.
-        if !s.fixable && !is_red_main_issue(&issue.body) {
-            if label_out_evidence(repo_root, issue.number)
-                .await
-                .is_some_and(|kinds| may_label_out(&kinds))
-            {
-                // #653 — the scoper judged this not agent-fixable (research
-                // ask, epic, owner decision, …). Label it out so it is scoped
-                // at most once, and leave the reason on the issue.
-                workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "scope_deferred", "retry_scope", chrono::Utc::now().timestamp_millis()+300_000).await?;
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                backoff_comment(
-                    repo_root,
-                    issue.number,
-                    &format!(
-                        "Auto-fix triage: {SCOPE_GAVE_UP_MARKER}, so the \
-                         pipeline is leaving it for a human. Reason:\n\n{}\n\n\
-                         Remove the `{GAVE_UP_LABEL}` label to have it \
-                         re-triaged.",
-                        truncate(&s.body, 1200)
-                    ),
-                )
-                .await
-                .ok();
-                label_gave_up(repo_root, issue.number, GIVE_UP_SCOPER_NOT_FIXABLE).await.ok();
-                return Ok(RunReport::triage(format!(
-                    "issue #{}: scoped as not agent-fixable — labeled out",
-                    issue.number
-                )));
+            if acceptance::readiness::prove_current_main(repo_root,&issue,s,&mut workflow_guard).await? {
+                return Ok(RunReport::held(format!("issue #{}: registered observations and independent completeness review show current main satisfies the request; automatically re-evaluate on request/main change",issue.number)));
             }
-            // #955/#1514 — the evidence does not carry the verdict (see
-            // `may_label_out`; a first pass never does): the run falls
-            // through to the builder with the objection as context rather
-            // than spending the terminal label.
-            info!(
-                issue = issue.number,
-                "scoped as not agent-fixable on evidence that does not support \
-                 it — building anyway instead of labeling out"
-            );
-            prior_attempts = Some(overruled_scope_note(prior_attempts.as_deref(), &s.body));
+            // A model's relevance claim or an inadequate green test is never
+            // enough to retire useful work. Generate a fresh falsifier below.
+            s.relevance=Relevance::Current;
+            s.body=format!("{}\nPrevious relevance claim was not independently proven. Generate a new complete executable contract that reproduces the remaining owner requirement on original main; do not weaken requirements.",scope_prompt);
+        }
+        if !s.fixable && !is_red_main_issue(&issue.body) {
+            prior_attempts=Some(overruled_scope_note(prior_attempts.as_deref(),&s.body));
+            // Material external decisions were handled by independent
+            // readiness before this specification. A binary model objection
+            // cannot replace that authority with a routine human-only label.
+            s.fixable=true;
         }
     }
     // #843 — the scoper's own predictions, made binding. A refusal here has
@@ -8076,6 +8023,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         issue.number, candidate_base, acceptance_scope, reasoner.as_ref(), &acceptance::worker_roots(&worktree), &criteria, &workflow_guard).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            if error.downcast_ref::<acceptance::BaselineNotRed>().is_some() {
+                let children=acceptance::readiness::decompose_unverifiable(repo_root,&worktree,&issue,&criteria,&format!("{error:#}"),&mut workflow_guard).await?;
+                if !children.is_empty() {return Ok(RunReport::triage(format!("issue #{}: acceptance split into observable children {:?}",issue.number,children)));}
+            }
+
             workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "acceptance_registration_retry", "rescope_executable_acceptance", chrono::Utc::now().timestamp_millis()+300_000).await?;
             return Err(error).context("independent acceptance registration requires scoped retry");
         }
@@ -8168,63 +8120,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             }
         }
         if diff.trim().is_empty() {
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            // #1491 — a no-change run is minutes, not a build: never billed
-            // against the daily cap. The ledger mark (record_attempt makes
-            // one too) keeps the picker off this issue for the rest of today.
-            AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
-            let held = match &reply {
-                NoChange::AlreadyFixed(why) => Some(("already fixed", why)),
-                NoChange::Underspecified(why) => Some(("under-specified", why)),
-                NoChange::Silent => None,
-            };
-            if let Some((what, why)) = held {
-                backoff_comment(
-                    repo_root,
-                    issue.number,
-                    &format!(
-                        "Auto-fix made no change: the builder reports this issue is \
-                         {what}.\n\n{}\n\nHeld for the owner to verify — it is not \
-                         closed. Remove the `{GAVE_UP_LABEL}` label to put it back \
-                         in the pool.",
-                        truncate(why, 1500)
-                    ),
-                )
-                .await
-                .ok();
-                label_gave_up(repo_root, issue.number, GIVE_UP_OWNER_TRIAGE).await.ok();
-                return Ok(RunReport::triage(format!(
-                    "issue #{}: no changes — builder reports it {what}; held for owner triage",
-                    issue.number
-                )));
-            }
-            if let Some(report) = capacity_accounting.report()? { return Ok(report); }
-            let attempts = record_attempt(
-                repo_root,
-                issue.number,
-                Some(rec(FailureKind::NoChanges, "build", &truncate(&summary, 800), "", 0)),
-            )
-            .await
-            .unwrap_or_else(|_| Tally::uncounted());
-            if attempts.exhausted() {
-                backoff_comment(
-                    repo_root,
-                    issue.number,
-                    &format!(
-                        "Self-improve gave up after {attempts} attempts: the \
-                         reasoner produced no changes for this issue. Needs a \
-                         human (or a more concrete issue body)."
-                    ),
-                )
-                .await
-                .ok();
-                label_gave_up(repo_root, issue.number, attempts.reason()).await.ok();
-            }
-            return Ok(RunReport::triage(format!(
-                "issue #{}: reasoner made no changes; skipped (attempt {attempts}, not charged to the daily cap)",
-                issue.number
-            )));
+            if let Some(report)=capacity_accounting.report()? {return Ok(report);}
+            // A pinned independent baseline already exists. Its executable
+            // verifier, not a builder's already-fixed/underspecified claim,
+            // determines whether this candidate needs bounded repair.
+            summary.push_str(&format!("\nNo-change explanation (untrusted): {reply:?}; run registered acceptance and repair."));
         }
     }
 
@@ -16581,22 +16481,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     // and the fall-through hands the overruled verdict to the builder as
     // context instead of dropping it.
     #[test]
-    fn not_fixable_label_out_is_gated_on_may_label_out() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
-        let body = &src[start..];
-        let at = body.find("if !s.fixable").expect("fixability branch");
-        let block = &body[at..];
-        // `is_some_and`: a `gh` failure (None) must not label the issue out.
-        let guard = block.find("label_out_evidence(repo_root, issue.number)").expect("gate");
-        let weighed = block.find(".is_some_and(|kinds| may_label_out(&kinds))").expect("policy");
-        assert!(weighed > guard && weighed - guard < 100, "{guard} {weighed}");
-        let label = block.find("label_gave_up(").expect("label-out");
-        let note = block
-            .find("prior_attempts = Some(overruled_scope_note(")
-            .expect("the overruled verdict reaches the builder");
-        assert!(guard < label, "the policy gate must precede label_gave_up");
-        assert!(label < note, "the fall-through follows the guarded return");
+    fn not_fixable_specification_cannot_override_grounded_readiness() {
+        let body=run_once_src();let at=body.find("if !s.fixable").unwrap();let end=at+body[at..].find("// #843").unwrap();
+        assert!(body[at..end].contains("overruled_scope_note"));
+        assert!(!body[at..end].contains("label_gave_up"));
     }
 
     // Structural (#955): the re-triage sweep sits on `pick_issue`'s idle path,
@@ -16610,7 +16498,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let body = &src[start..];
         let body = &body[..body.find("\n}\n").expect("end of pick_issue")];
         let sweep = body.find("retriage_gave_up(").expect("the sweep runs in pick_issue");
-        let picked = body.find("return Ok(Some(Issue {").expect("the picked-issue return");
+        let picked = body.find("return Ok(Some(candidate))").expect("the picked-issue return");
         assert!(picked < sweep, "a tick that picks an issue must not pay for the sweep");
         let guard = body[..sweep].rfind("if !dry_run {").expect("gated on dry_run");
         assert!(sweep - guard < 40, "a dry run must not edit the live inbox: {guard} {sweep}");
@@ -17430,8 +17318,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let not_fixable = body.find("if !s.fixable && !is_red_main_issue(&issue.body)").expect("not-fixable branch");
         assert!(overtaken < not_fixable, "relevance is judged before fixability");
         let hold = &body[overtaken..not_fixable];
-        assert!(hold.contains("GIVE_UP_OVERTAKEN") && hold.contains("RunReport::triage("), "held, unbilled");
-        assert!(hold.contains("AttemptLedger::mark_persist("), "off the picker for the day");
+        assert!(hold.contains("prove_current_main") && hold.contains("RunReport::held("), "objective relevance gate");
+        assert!(!hold.contains("label_gave_up"), "no model-only human label");
         assert!(!hold.contains("record_attempt("), "an overtaken issue is not an attempt");
         let slice = body.find("sc.fixable && !sc.guarded_paths && !is_slice_body(&issue.body)").expect("slice guard");
         let refusal = body.find("GIVE_UP_SCOPER_PREDICTS_REFUSAL").expect("size refusal");
@@ -17791,14 +17679,9 @@ else:
     /// once the issue has failed the same way twice, and says so with a
     /// reason code; the first pass builds.
     #[test]
-    fn scoper_not_fixable_labels_only_after_a_repeated_charged_failure() {
-        assert!(!may_label_out(&[]), "first-pass triage builds instead of labelling out (#1514)");
-        assert!(may_label_out(&[FailureKind::NoChanges, FailureKind::NoChanges]));
-        assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE, "scoper:not-fixable");
-        let src = include_str!("self_improve.rs");
-        let at = src.find("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}").expect("the scoper refusal");
-        let label = at + src[at..].find("label_gave_up(").expect("labelled");
-        assert!(src[label..label + 120].contains("GIVE_UP_SCOPER_NOT_FIXABLE"), "{}", &src[label..label + 120]);
+    fn historical_not_fixable_markers_remain_readable_without_authorizing_new_labels() {
+        assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE,"scoper:not-fixable");
+        assert!(!run_once_src().contains("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}"));
     }
 
     /// C6 input — reasons come from the durable comments first, then the
@@ -19905,8 +19788,8 @@ mod iterate_not_delete_tests {
             !section.contains("RunReport::built("),
             "no billed exit:\n{section}"
         );
-        assert!(section.contains("RunReport::triage("));
-        assert!(section.contains("AttemptLedger::mark_persist("));
-        assert!(section.contains("GIVE_UP_OWNER_TRIAGE"));
+        assert!(section.contains("run registered acceptance and repair"));
+        assert!(!section.contains("GIVE_UP_OWNER_TRIAGE"));
+        assert!(!section.contains("label_gave_up"));
     }
 }

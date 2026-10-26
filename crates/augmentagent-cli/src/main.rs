@@ -8941,6 +8941,8 @@ async fn run_digest(
         Ok(summary) => ctx.push_str(&format!("{summary}\n")),
         Err(error) => ctx.push_str(&format!("Workflow evidence unavailable: {error:#}\n")),
     }
+    ctx.push_str("\n## Autoship readiness dependencies\n");
+    match self_improve::readiness_summary() { Ok(summary)=>ctx.push_str(&summary),Err(error)=>ctx.push_str(&format!("Readiness evidence unavailable: {error}\n")) }
     ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
     match store.triage_outcome_report(since_ms,25) {
         Ok(triage_outcomes) => {

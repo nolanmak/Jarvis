@@ -295,11 +295,22 @@ fn compiler_control_inputs(root: &Path) -> Result<Vec<(String, String)>> {
     Ok(inputs)
 }
 
+#[derive(Debug)]
+pub(super) struct BaselineNotRed { detail:String }
+impl std::fmt::Display for BaselineNotRed {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"baseline not independently reproduced: {}",self.detail)}}
+impl std::error::Error for BaselineNotRed {}
 pub(super) async fn register_and_reproduce(
     root: &Path,
     proposal: ContractProposal,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<BaselineEvidence> {
+    let evidence=register_and_observe(root,proposal,audit).await?;
+    match evidence.registration.baseline_result(&evidence.receipts)? {
+        BaselineResult::Reproduced=>Ok(evidence),
+        result=>Err(BaselineNotRed{detail:format!("{result:?}: {}",serde_json::to_string(&evidence.receipts)?)}.into()),
+    }
+}
+async fn register_and_observe(root:&Path,proposal:ContractProposal,audit:&Arc<augmentagent_channel_core::AuditLogger>)->Result<BaselineEvidence> {
     let status = Command::new("/usr/bin/git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(root)
@@ -316,16 +327,7 @@ pub(super) async fn register_and_reproduce(
     let registration =
         RegisteredContract::register(root, proposal.contract, head, environment_id(root)?)?;
     let receipts = execute_registered(root, &registration, audit).await?;
-    match registration.baseline_result(&receipts)? {
-        BaselineResult::Reproduced => Ok(BaselineEvidence {
-            registration,
-            receipts,
-        }),
-        result => bail!(
-            "baseline not independently reproduced: {result:?}: {}",
-            serde_json::to_string(&receipts)?
-        ),
-    }
+    Ok(BaselineEvidence {registration,receipts})
 }
 /// Persist only under controller-owned state outside every admitted worker
 /// writable root. Creation is exclusive: revising a contract needs a new path.
@@ -926,12 +928,26 @@ pub(super) async fn prepare_acceptance_for(
         // harness against the original trusted base checkout, never their head.
         let proposal_result =
             proposal_with_retry(workflow, &baseline_root, source, scope, required_criteria).await;
-        let result = match proposal_result {
-            Ok(proposal) => register_and_reproduce(&baseline_root, proposal.clone(), &workflow.audit_logger())
-                .await
-                .map(|baseline| (proposal, baseline)),
+        let result:Result<(ContractProposal,BaselineEvidence)> = async { match proposal_result {
+            Ok(proposal) => match register_and_reproduce(&baseline_root, proposal.clone(), &workflow.audit_logger()).await {
+                Ok(baseline)=>Ok((proposal,baseline)),
+                Err(error) if error.downcast_ref::<BaselineNotRed>().is_some()=>{
+                    workflow.check_resource_policy()?;
+                    let epoch=amendment::digest(format!("{source}|{base}|{}",serde_json::to_string(required_criteria)?).as_bytes());
+                    if workflow.admit_epoch_attempt("initial_baseline_correction",&epoch,1)? {
+                        // Only this controller-owned disposable baseline is reset.
+                        trusted_git(&baseline_root,&["reset","--hard",base]).await?;
+                        trusted_git(&baseline_root,&["clean","-fdx"]).await?;
+                        let correction=format!("Independently correct this inadequate initial verifier without weakening ANY owner requirement. Previous registration did not reproduce intended behavioral red: {error}. Use actual original-base implementation. Preserve each original criterion verbatim. Scoper request:{scope}\nRequired criteria:{}\n{CONTRACT_PROMPT}",serde_json::to_string(required_criteria)?);
+                        let output=scope_authority::run(&baseline_root,workflow.repository(),workflow,&correction).await?;
+                        let next=proposal_with_retry(workflow,&baseline_root,source,&output,required_criteria).await?;
+                        register_and_reproduce(&baseline_root,next.clone(),&workflow.audit_logger()).await.map(|baseline|(next,baseline))
+                    } else {Err(error)}
+                },
+                Err(error)=>Err(error),
+            },
             Err(error) => Err(error),
-        };
+        } }.await;
         let cleanup = trusted_git(repo, &["worktree", "remove", "--force", checkout]).await;
         let (proposal, baseline) = result?;
         cleanup.context("remove acceptance baseline worktree")?;

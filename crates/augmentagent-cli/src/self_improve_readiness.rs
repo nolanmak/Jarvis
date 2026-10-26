@@ -52,19 +52,32 @@ fn db(path:&Path)->Result<rusqlite::Connection> {
     Ok(conn)
 }
 fn blocked_at(path:&Path,repository:&str,issue:&Issue,base:&str)->Result<bool> {
-    if !path.exists() {return Ok(false);}
-    let conn=rusqlite::Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_readiness_dependencies')",[],|r|r.get(0))?;
-    if !exists {return Ok(false);}
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM issue_readiness_dependencies WHERE repository=?1 AND issue=?2 AND request_hash=?3 AND base=?4)",rusqlite::params![repository,issue.number,request_hash(issue),base],|r|r.get(0))?)
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(path)? else{return Ok(false);};
+    store.query_connection(|conn| {
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_readiness_dependencies')",[],|r|r.get(0))?;
+        if !exists {return Ok(false);}
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM issue_readiness_dependencies WHERE repository=?1 AND issue=?2 AND request_hash=?3 AND base=?4)",rusqlite::params![repository,issue.number,request_hash(issue),base],|r|r.get(0))?)
+    })
 }
 pub(in crate::self_improve) async fn blocked(repo:&Path,issue:&Issue)->Result<bool> {
     // No model, state mutation, or budget charge in dependency reconciliation.
-    if !workflow::path().exists() {return Ok(false);}
+    if crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?.is_none() {return Ok(false);}
     let repository=workflow::canonical_repository(repo).await?;
     let base=workflow::remote_main_head(repo,&repository).await?;
     blocked_at(&workflow::path(),&repository,issue,&base)
 }
+pub(in crate::self_improve) fn summary()->Result<String> {
+    let Some(store)=crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())? else{return Ok("No readiness dependency evidence.".into());};
+    store.query_connection(|conn| {
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_readiness_dependencies')",[],|r|r.get(0))?;
+        if !exists {return Ok("No readiness dependency evidence.".into());}
+        let mut statement=conn.prepare("SELECT repository,issue,kind,evidence FROM issue_readiness_dependencies ORDER BY repository,issue LIMIT 25")?;
+        let rows=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?;
+        let mut out=String::from("Recorded readiness dependencies (rechecked against current issue/main before selection):\n");
+        for row in rows {let (repo,issue,kind,evidence)=row?;let detail=serde_json::from_str::<Assessment>(&evidence).ok().map(|a|a.slots.into_iter().filter_map(|(slot,value)|match value {Slot::ExternalDecision{question,..}=>Some(format!("{slot}: {question}")),_=>None}).collect::<Vec<_>>().join("; ")).unwrap_or_else(||"independently verified current-main satisfaction; reopens automatically when request/main changes".into());out.push_str(&format!("- {repo}#{issue}: {kind}: {}\n",truncate(&detail,1200)));}Ok(out)
+    })
+}
+
 pub(in crate::self_improve) async fn assess(root:&Path,issue:&Issue,workflow:&mut workflow::WorkflowGuard)->Result<Decision> {
     workflow.check_resource_policy()?;
     let base=actual_head(root).await?;
@@ -91,10 +104,84 @@ pub(in crate::self_improve) async fn assess(root:&Path,issue:&Issue,workflow:&mu
     let gaps=validate(&assessment,&owner,&files)?;
     let evidence=serde_json::to_string(&assessment)?;
     workflow.audit_logger().record_controller(serde_json::json!({"kind":"independent_readiness","base":base,"request_hash":request_hash(issue),"assessment":assessment}))?;
-    if gaps.is_empty() {return Ok(Decision::Ready(evidence));}
+    if gaps.is_empty() {db(&workflow::path())?.execute("DELETE FROM issue_readiness_dependencies WHERE repository=?1 AND issue=?2",rusqlite::params![workflow.repository(),issue.number])?;return Ok(Decision::Ready(evidence));}
     db(&workflow::path())?.execute("INSERT INTO issue_readiness_dependencies VALUES(?1,?2,?3,?4,'external_decision',?5) ON CONFLICT(repository,issue) DO UPDATE SET request_hash=excluded.request_hash,base=excluded.base,kind=excluded.kind,evidence=excluded.evidence",rusqlite::params![workflow.repository(),issue.number,request_hash(issue),current_main,evidence])?;
     workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"material_external_decision_missing","await_request_or_main_change",0,&[evidence]).await?;
     Ok(Decision::Dependency(gaps.join("\n")))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Relevance { complete:bool, criterion_evidence:BTreeMap<String,String>, explanation:String }
+/// All-green alone is not acceptance. A separate independent assessment must
+/// establish that the registered observations cover the unchanged owner ask.
+/// This never yields a shipping receipt or closes the issue.
+pub(in crate::self_improve) async fn prove_current_main(repo:&Path,issue:&Issue,scope:&ScopeOutcome,workflow:&mut workflow::WorkflowGuard)->Result<bool> {
+    workflow.check_resource_policy()?;
+    let base=workflow::remote_main_head(repo,workflow.repository()).await?;
+    let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    std::fs::create_dir_all(&control)?;
+    let temporary=tempfile::Builder::new().prefix("relevance-").tempdir_in(&control)?;
+    let root=temporary.path().join("checkout");let checkout=root.to_str().context("relevance checkout path invalid")?;
+    trusted_git(repo,&["worktree","add","--detach",checkout,&base]).await?;
+    let result:Result<bool>=async {
+        let proposal=proposal_with_retry(workflow,&root,AcceptanceSource::Issue(issue.number),&scope.body,&scope.criteria).await?;
+        let baseline=register_and_observe(&root,proposal.clone(),&workflow.audit_logger()).await?;
+        let result=baseline.registration.baseline_result(&baseline.receipts)?;
+        let BaselineResult::AlreadyPasses(passed)=result else{return Ok(false);};
+        if passed.len()!=proposal.contract.verifiers.len() {return Ok(false);}
+        let prompt=format!("Independently verify relevance and completeness against the ENTIRE owner request; do not treat an already-green test as sufficient. Return ONLY JSON {{\"complete\":true|false,\"criterion_evidence\":{{\"criterion-id\":\"concrete implementation and observable coverage\"}},\"explanation\":\"...\"}}. complete=true only if every owner requirement is covered by the registered executable observations and current immutable implementation; partial/inadequate tests require false. No issue closure or approval is authorized. Owner title:{}\nOwner body:{}\nRegistered contract:{}\nIndependently pinned adapter sources:{}\nObserved baseline receipts:{}",issue.title,issue.body,serde_json::to_string(&proposal.contract)?,serde_json::to_string(&proposal.files)?,serde_json::to_string(&baseline.receipts)?);
+        let raw=scope_authority::assess(&root,workflow.repository(),workflow,&prompt).await?;
+        let raw=raw.trim();let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
+        let relevance:Relevance=serde_json::from_str(raw)?;
+        if !relevance.complete {return Ok(false);}
+        ensure!(!relevance.explanation.trim().is_empty() && relevance.explanation.len()<=8000,"relevance lacks explanation");
+        ensure!(relevance.criterion_evidence.keys().collect::<BTreeSet<_>>()==proposal.contract.criteria.iter().map(|c|&c.id).collect() && relevance.criterion_evidence.values().all(|e|!e.trim().is_empty() && e.len()<=8000),"relevance must cover every registered criterion");
+        ensure!(workflow::remote_main_head(repo,workflow.repository()).await?==base,"main changed during relevance investigation");
+        let evidence=serde_json::json!({"kind":"already_satisfied_relevance","base":base,"request_hash":request_hash(issue),"baseline":baseline,"criterion_evidence":relevance.criterion_evidence,"explanation":relevance.explanation}).to_string();
+        db(&workflow::path())?.execute("INSERT INTO issue_readiness_dependencies VALUES(?1,?2,?3,?4,'objectively_satisfied',?5) ON CONFLICT(repository,issue) DO UPDATE SET request_hash=excluded.request_hash,base=excluded.base,kind=excluded.kind,evidence=excluded.evidence",rusqlite::params![workflow.repository(),issue.number,request_hash(issue),base,evidence])?;
+        workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"current_main_satisfies_registered_requirements","await_request_or_main_change",0,&[amendment::digest(evidence.as_bytes())]).await?;
+        Ok(true)
+    }.await;
+    let cleanup=trusted_git(repo,&["worktree","remove","--force",checkout]).await;
+    let outcome=result?;cleanup?;Ok(outcome)
+}
+
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Decomposition { children:Vec<Slice> }
+fn validate_decomposition(plan:&Decomposition,criteria:&[String])->Result<()> {
+    ensure!((MIN_SLICES..=MAX_SLICES).contains(&plan.children.len()),"observable decomposition needs 2-6 children");
+    ensure!(plan.children.iter().all(|child|!child.title.trim().is_empty() && child.title.len()<=200 && !child.body.trim().is_empty() && child.body.len()<=16000),"invalid observable child");
+    for criterion in criteria {ensure!(plan.children.iter().any(|child|child.body.contains(criterion)),"decomposition omitted original criterion: {criterion}");}Ok(())
+}
+pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Path,issue:&Issue,criteria:&[String],detail:&str,workflow:&mut workflow::WorkflowGuard)->Result<Vec<u64>> {
+    if is_slice_body(&issue.body) {return Ok(vec![]);}
+    workflow.check_resource_policy()?;
+    let base=workflow::remote_main_head(repo,workflow.repository()).await?;
+    let epoch=amendment::digest(format!("{}|{base}|{}",request_hash(issue),serde_json::to_string(criteria)?).as_bytes());
+    let control=control_directories(workflow.repository(),workflow.id())?.workflow_acceptance;
+    std::fs::create_dir_all(&control)?;let path=control.join(format!("observable-decomposition-{epoch}.json"));
+    let plan=if path.exists() {
+        use std::os::unix::fs::{OpenOptionsExt,MetadataExt};
+        let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path)?;let meta=file.metadata()?;
+        ensure!(meta.is_file() && meta.nlink()==1 && meta.uid()==unsafe{libc::geteuid()} && meta.mode()&0o077==0 && meta.len()<=128*1024,"unsafe decomposition receipt");
+        serde_json::from_reader(file)?
+    } else {
+        if !workflow.admit_epoch_attempt("initial_verifier_decomposition",&epoch,1)? {return Ok(vec![]);}
+        let prompt=format!("{SLICE_SYSTEM}\nIndependent acceptance generation could not produce an intended-red behavioral verifier after bounded correction. Localize the missing executable observability and split into 2-6 smallest verifiable ordered children that together preserve the ENTIRE owner request. Do not create a research-only or owner-consent task merely because implementation is difficult. Return ONLY JSON {{\"children\":[{{\"title\":\"...\",\"body\":\"...\"}}]}}. Each original criterion must appear verbatim in at least one child body. Owner request:{}\n{}\nOriginal criteria:{}\nObserved failure:{}",issue.title,issue.body,serde_json::to_string(criteria)?,truncate(detail,16000));
+        let raw=scope_authority::assess(root,workflow.repository(),workflow,&prompt).await?;
+        let raw=raw.trim();let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
+        let plan:Decomposition=serde_json::from_str(raw)?;validate_decomposition(&plan,criteria)?;
+        use std::io::Write;use std::os::unix::fs::PermissionsExt;
+        let mut staged=tempfile::NamedTempFile::new_in(&control)?;staged.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        staged.write_all(&serde_json::to_vec(&plan)?)?;staged.as_file().sync_all()?;staged.persist_noclobber(&path).map_err(|e|e.error)?;
+        std::fs::File::open(&control)?.sync_all()?;plan
+    };
+    validate_decomposition(&plan,criteria)?;
+    let children=file_slices(repo,issue,&plan.children,workflow).await?;
+    workflow.transition(crate::autoship_workflow::Stage::Scope,"acceptance_decomposed_into_observable_children","await_child_completion",0).await?;
+    Ok(children)
 }
 
 #[cfg(test)]
@@ -133,4 +220,22 @@ mod tests {
         assert!(!blocked_at(&path,"repo",&changed,"base-a").unwrap());
         assert!(!blocked_at(&path,"repo",&original,"base-b").unwrap());
     }
+    #[test]
+    fn dependency_reader_refuses_symlink_and_nonprivate_database() {
+        use std::os::unix::fs::{symlink,PermissionsExt};
+        let dir=tempfile::Builder::new().prefix("readiness-private-").tempdir_in("/tmp").unwrap();let path=dir.path().join("db");
+        drop(db(&path).unwrap());let link=dir.path().join("link");symlink(&path,&link).unwrap();
+        assert!(blocked_at(&link,"repo",&issue(),"base").is_err());
+        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(blocked_at(&path,"repo",&issue(),"base").is_err());
+    }
+
+    #[test]
+    fn observable_decomposition_preserves_every_original_requirement() {
+        let mut plan=Decomposition{children:vec![Slice{title:"Expose behavior".into(),body:"Keep owner behavior A".into()},Slice{title:"Finish integration".into(),body:"Keep owner behavior B".into()}]};
+        let criteria=vec!["Keep owner behavior A".into(),"Keep owner behavior B".into()];
+        validate_decomposition(&plan,&criteria).unwrap();
+        plan.children[1].body="Only behavior A".into();assert!(validate_decomposition(&plan,&criteria).is_err());
+    }
+
 }
