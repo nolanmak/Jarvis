@@ -14,7 +14,87 @@ pub(crate) struct ProcessGroup {
     receipt: PathBuf,
     clean: Arc<AtomicBool>,
     active_request: Option<PathBuf>,
+    resource_required: bool,
+    vm_preflight: bool,
+    resource_observed: AtomicBool,
+    resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
     _directory: tempfile::TempDir,
+}
+
+impl ProcessGroup {
+    pub(crate) fn bind_resource_audit(&self, provider:&str, logger:Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        if let Some(logger)=logger { *self.resource_audit.lock().map_err(|_|anyhow::anyhow!("resource audit lock poisoned"))?=Some((provider.into(),logger.clone())); }
+        Ok(())
+    }
+    pub(crate) async fn admit_model(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        self.admit(provider,logger,true).await
+    }
+    pub(crate) async fn admit_command(&self, label: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        self.admit(label,logger,false).await
+    }
+    async fn admit(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>, model:bool) -> anyhow::Result<()> {
+        self.bind_resource_audit(provider,logger)?;
+        let ready=self.receipt.with_file_name("launch-ready");
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(if self.vm_preflight { 65 } else { 5 });
+        while !ready.exists() {
+            if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
+                self.resource_outcome(provider,logger)?;
+                let startup=private_read(&self.receipt.with_file_name("vm-startup-failure.json")).ok()
+                    .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if let Some(category)=startup.as_ref().and_then(native_setup_category) {
+                    if let Some(logger)=logger {
+                        logger.record_controller(serde_json::json!({"kind":"native_setup_failed","provider":provider,"category":category}))?;
+                    }
+                    return Err(crate::reasoner::ReasonerError::Local {
+                        message:format!("{provider}: native VM setup failed before model admission ({category}); resource limits were not exhausted")
+                    }.into());
+                }
+                let phase=if startup.as_ref().and_then(|value|value.get("phase")).and_then(|value|value.as_str())==Some("native_credential_in_use") {
+                    "native_credential_in_use"
+                } else {"launch_readiness_unavailable"};
+                return crate::run_resources::admission_failed(provider,logger,phase);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        if self.resource_required {
+            let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
+                .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let Some(observation)=parsed.filter(|value|value.get("phase").and_then(|v|v.as_str())==Some("admitted")
+                && value.get("exhausted").and_then(|v|v.as_bool())==Some(false)
+                && value.pointer("/identity/limits").is_some_and(|v|v.is_object())) else {
+                self.resource_observed.store(true,Ordering::SeqCst);
+                return crate::run_resources::admission_failed(provider,logger,"admission_receipt_unavailable");
+            };
+            if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
+            }
+        }
+        if model { if let Some(logger)=logger { logger.model_call_admitted(provider)?; } }
+        let mut proceed=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.receipt.with_file_name("launch-continue"))?;
+        proceed.write_all(b"admitted\n")?;
+        proceed.sync_all()?;
+        Ok(())
+    }
+    pub(crate) fn resource_outcome(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
+        if self.resource_observed.swap(true,Ordering::SeqCst) { return Ok(()); }
+        crate::run_resources::record_outcome(&self.receipt.with_file_name("resource-accounting.json"),self.resource_required,provider,logger)
+    }
+}
+
+fn native_setup_category(value:&serde_json::Value)->Option<&'static str> {
+    if value.get("phase").and_then(|v|v.as_str())!=Some("native_setup_failed") {return None;}
+    Some(match value.get("native_vm_failure").and_then(|v|v.as_str()) {
+        Some("JSONDecodeError")=>"JSONDecodeError",Some("ValueError")=>"ValueError",
+        Some("RuntimeError")=>"RuntimeError",Some("TimeoutError")=>"TimeoutError",
+        Some("OSError")=>"OSError",Some("BrokenPipeError")=>"BrokenPipeError",
+        Some("FileNotFoundError")=>"FileNotFoundError",Some("PermissionError")=>"PermissionError",
+        Some("ChildProcessError")=>"ChildProcessError",Some("CalledProcessError")=>"CalledProcessError",
+        _=>"BoundaryFailure",
+    })
+}
+
+fn cleanup_receipt_complete(bytes:&[u8])->bool {
+    bytes==b"all-descendants-reaped\n" || bytes==b"cgroup-descendants-cleared\n"
 }
 
 impl Drop for ProcessGroup {
@@ -28,20 +108,33 @@ impl Drop for ProcessGroup {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        let processes_reaped = std::fs::read_to_string(&self.receipt)
-            .is_ok_and(|value| value == "all-descendants-reaped\n");
-        let mut clean = processes_reaped;
-        if clean {
-            if let Some(marker) = &self.active_request {
-                clean = retire_request(marker, &self.receipt).is_ok();
+        if let Ok(audit)=self.resource_audit.lock() {
+            if let Some((provider,logger))=audit.as_ref() { let _=self.resource_outcome(provider,Some(logger)); }
+        }
+        let mut processes_settled = std::fs::read(&self.receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
+        if !processes_settled {
+            unsafe { libc::kill(self.id,libc::SIGKILL); }
+            if self.resource_required {
+                let killed=std::process::Command::new("/usr/bin/python3").arg("-I")
+                    .arg(self.receipt.with_file_name("run-resource-scope.py")).arg("--cleanup")
+                    .arg(self.receipt.with_file_name("resource-accounting.json"))
+                    .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()
+                    .is_ok_and(|status|status.success());
+                if killed {
+                    // This is kernel-proven quiescence, not a claim that a dead
+                    // supervisor personally reaped every process.
+                    processes_settled=(|| -> std::io::Result<()> {
+                        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.receipt)?;
+                        file.write_all(b"cgroup-descendants-cleared\n")?;file.sync_all()
+                    })().is_ok();
+                }
             }
         }
-        self.clean.store(clean, Ordering::SeqCst);
-        if !clean {
-            // Do not falsely acknowledge cleanup. Adapters stop the chain.
-            if !processes_reaped { unsafe { libc::kill(self.id, libc::SIGKILL); } }
-            tracing::error!("provider descendant cleanup is unverified; failover blocked");
-        }
+        let mut clean=processes_settled;
+        if clean { if let Some(marker)=&self.active_request { clean=retire_request(marker,&self.receipt).is_ok(); } }
+        self.clean.store(clean,Ordering::SeqCst);
+        if !clean { tracing::error!("provider descendant cleanup is unverified; failover blocked"); }
+
     }
 }
 
@@ -175,7 +268,7 @@ fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 /// Proof that no descendant of the call can still be running: the supervisor's
-/// `all-descendants-reaped` receipt, or — with no receipt left — that the writer is gone
+/// a supervisor-reaped or identity-bound cgroup-quiescent receipt, or — with no receipt left — that the writer is gone
 /// (#1071). Neither subsumes the other.
 enum Proof<'a> { Reaped(&'a std::path::Path), WriterGone(&'a LivenessEnv) }
 
@@ -388,7 +481,7 @@ pub(crate) fn ensure_request_idle(journal: &std::path::Path) -> std::io::Result<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         result => result?,
     };
-    if private_read(&receipt)? != b"all-descendants-reaped\n" {
+    if !cleanup_receipt_complete(&private_read(&receipt)?) {
         return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "cleanup receipt is incomplete"));
     }
     clear_marker(&marker, Proof::Reaped(&receipt)).map(|_| ())
@@ -421,6 +514,19 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None)
+}
+pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
+    -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None)
+}
+/// Controller-only VM startup capability. Native code cannot run before admission.
+pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
+    -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy))
+}
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>)
+    -> std::io::Result<(Child, ProcessGroup)> {
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
     let search = original.get_envs().find(|(key, _)| *key == "PATH")
@@ -445,6 +551,9 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
     let receipt = directory.path().join("cleanup-complete");
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&helper)?;
     file.write_all(include_bytes!("../../../scripts/provider-supervisor.py"))?;
+    let resource_policy=match composed {Some(policy)=>Some(policy.clone()),None=>crate::run_resources::declared_policy().map_err(std::io::Error::other)?};
+    if required_resources && resource_policy.is_none() { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"required run resource declaration unavailable")); }
+    if resource_policy.is_some() { crate::run_resources::install_helper(directory.path()).map_err(std::io::Error::other)?; }
     let mut supervised = Command::new("python3");
     supervised.args([std::ffi::OsStr::new("-I"), helper.as_os_str(), receipt.as_os_str(), executable.as_os_str()])
         .args(original.get_args()).current_dir(cwd)
@@ -455,6 +564,14 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
         if let Some(value) = value { supervised.env(key, value); }
         else { supervised.env_remove(key); }
     }
+    supervised.env_remove("JARVIS_SUPERVISOR_VM_PREFLIGHT");
+    supervised.env_remove("JARVIS_NATIVE_VM_READY");
+    supervised.env_remove("JARVIS_NATIVE_VM_CONTINUE");
+    if vm_preflight { supervised.env("JARVIS_SUPERVISOR_VM_PREFLIGHT","1"); }
+    supervised.env_remove("JARVIS_SUPERVISOR_ADMISSION");
+    if admission { supervised.env("JARVIS_SUPERVISOR_ADMISSION","1"); }
+    supervised.env_remove("JARVIS_RUN_RESOURCE_POLICY");
+    if let Some(policy)=&resource_policy { supervised.env("JARVIS_RUN_RESOURCE_POLICY",policy.to_string()); }
     let active_request = begin_request(journal, &receipt)?;
     let child = match supervised.spawn() {
         Ok(child) => child,
@@ -466,7 +583,7 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, _directory: directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), _directory: directory }))
 }
 
 #[cfg(test)]
@@ -475,6 +592,25 @@ mod tests {
     use serde_json::{json, Value};
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[test]
+    fn setup_diagnostics_do_not_masquerade_as_capacity_or_echo_untrusted_detail() {
+        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"FileNotFoundError","message":"private path"})),Some("FileNotFoundError"));
+        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"private credentials"})),Some("BoundaryFailure"));
+        assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_credential_in_use"})),None);
+    }
+    #[test]
+    fn kernel_quiescence_receipt_settles_interrupted_request_without_fake_reaping() {
+        let directory=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal=directory.path().join("operations.json");
+        let receipt=directory.path().join("cleanup-complete");
+        begin_request(Some(&journal),&receipt).unwrap();
+        let mut proof=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+        proof.write_all(b"cgroup-descendants-cleared\n").unwrap();proof.sync_all().unwrap();
+        ensure_request_idle(&journal).unwrap();
+        assert!(!journal.with_extension("active").exists());
+    }
 
     #[test]
     fn restart_uses_a_verified_receipt_but_never_age_or_partial_state() {
@@ -661,6 +797,71 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");
         // Idle to the sweep, yet still unsettled, so recovery can act on it.
         assert!(request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_resource_admission_receipt_blocks_before_model_charge() {
+        let directory=tempfile::tempdir_in("/tmp").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["logs", "anchors"] {
+            let path = directory.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let effect=directory.path().join("effect");
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(directory.path().join("logs/audit.jsonl"),directory.path().join("anchors/audit.json"),&[]).unwrap());
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
+        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let blocked=Arc::new(std::sync::atomic::AtomicUsize::new(0));let callback=blocked.clone();
+        logger.set_resource_capacity_observer(Arc::new(move |_|{callback.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
+        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        // Inject a missing required receipt after an ordinary test supervisor
+        // is created, without requiring systemd in this transport unit test.
+        group.resource_required=true;
+        let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
+        assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),Some(crate::reasoner::ReasonerError::ResourceCapacity {..})));
+        drop(group);child.wait().await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst),0);
+        assert_eq!(blocked.load(Ordering::SeqCst),1);
+        assert!(!effect.exists());
+    }
+
+    #[tokio::test]
+    async fn denied_model_admission_never_dispatches_waiting_provider() {
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("provider-effect");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
+        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+        logger.set_model_call_observer(Arc::new(|_|anyhow::bail!("synthetic budget denied"))).unwrap();
+        let clean=Arc::new(AtomicBool::new(true));
+        let (mut child,group)=spawn_admitted(&command,true,clean.clone(),None,false).unwrap();
+        let error=group.admit_model("codex",Some(&logger)).await.unwrap_err();
+        assert!(error.to_string().contains("synthetic budget denied"));
+        drop(group);
+        child.wait().await.unwrap();
+        assert!(clean.load(Ordering::SeqCst));
+        assert!(!effect.exists());
+    }
+
+    #[tokio::test]
+    async fn admitted_model_dispatches_once_after_controller_observer() {
+        let directory=tempfile::tempdir().unwrap();
+        let effect=directory.path().join("provider-effect");
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('executed')"]).arg(&effect);
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed=count.clone();let expected=effect.clone();
+        let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+        logger.set_model_call_observer(Arc::new(move |_|{ assert!(!expected.exists()); observed.fetch_add(1,Ordering::SeqCst);Ok(()) })).unwrap();
+        let (child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        group.admit_model("codex",Some(&logger)).await.unwrap();
+        assert!(child.wait_with_output().await.unwrap().status.success());
+        drop(group);
+        assert_eq!(count.load(Ordering::SeqCst),1);
+        assert!(effect.exists());
     }
 
     #[tokio::test]

@@ -33,6 +33,18 @@ after the enclosing build finishes. On other platforms, use Cargo directly
 with the inherited target inside an already managed command; native evidence
 for nested lease reuse is unavailable.
 
+Required Autoship native-VM builders acquire the global build/prune lease for
+each actual VM build command, not for the whole model conversation. Reading and
+thinking leave the lease available to interactive builds. VM commands retain
+their private scratch-image ownership and aggregate growth reservations; they
+check the configured admission/free-space floor before and during execution.
+The bridge, descendant supervisor, and QEMU share the locked descriptor, so
+canceling a model cannot unlock storage before its build descendants exit.
+Repository `cargo-managed.sh` tool requests map to managed Cargo inside the VM;
+they never execute a candidate-controlled host wrapper. Deterministic host gates
+and explicit host/legacy builders retain verified target leases and parent-proof
+checks. No model output can opt into the narrower admission path.
+
 For ad hoc session names, opt a dedicated build parent into discovery once:
 
 ```sh

@@ -83,6 +83,9 @@ pub trait LoopRunner: Send + Sync {
     ) -> anyhow::Result<String>;
 }
 
+#[path = "loop_coverage.rs"]
+mod coverage;
+
 fn loop_request_id(id: &str, created_at_ms: i64, last_run_ms: Option<i64>) -> String {
     // Until record_user_loop_run commits, retrying a crashed occurrence must
     // reuse its journal. The next recorded occurrence gets a different anchor.
@@ -657,6 +660,9 @@ impl LoopScheduler {
         // iteration always runs.
         let loops = self.store.list_active_user_loops()?;
         for l in loops {
+            // A completed final delivery can survive a crash before the expiry
+            // sweep. Never turn that recovery into a new model occurrence.
+            if l.expires_at_ms.is_some_and(|expires| expires<=now && l.last_run_ms.is_some_and(|last|last>=expires)) { continue; }
             // #1135 — a reminder loop with an OPEN nag cycle re-fires on the
             // nag cadence (once a day by default), anchored on its last fire,
             // ignoring the base cron/interval schedule until the owner
@@ -725,19 +731,41 @@ impl LoopScheduler {
         let cycle_ms = if due_at > 0 { due_at } else { now_millis() };
         let pause_after = pause_after_failures();
         let request_id = loop_request_id(&l.id, l.created_at_ms, l.last_run_ms);
-        match self
-            .runner
-            .run_prompt(&request_id, &l.owner, &l.prompt, l.model_profile.as_deref())
-            .await
-        {
-            Ok(answer) => {
+        let occurrence = match coverage::prompt(&self.store, l).and_then(|prompt|
+            self.store.prepare_loop_occurrence(&l.id, &request_id, &prompt).map_err(Into::into)) {
+            Ok(row) => row,
+            Err(error) => { warn!(loop_id = %l.id, "loop journal unavailable: {error:#}"); return; }
+        };
+        if occurrence.state == "delivered" { return; }
+        match self.store.loop_delivery_retry_ready(&request_id,now_millis()) {
+            Ok(true)=>{}, Ok(false)=>return,
+            Err(error)=>{warn!(loop_id=%l.id,"delivery retry journal unavailable: {error}");return;}
+        }
+        let result = match self.store.loop_delivery_answer(&request_id) {
+            Err(error)=>Err(error.into()),
+            Ok(Some(answer)) => Ok(answer),
+            Ok(None) => match self.store.loop_execution_prompt(&request_id) {
+                Ok(prompt)=>self.runner.run_prompt(&request_id, &l.owner, &prompt, l.model_profile.as_deref()).await,
+                Err(error)=>Err(error.into()),
+            },
+        };
+        match result {
+            Ok(raw_answer) => {
+                if let Err(error) = self.store.save_loop_answer(&request_id, &raw_answer) {
+                    warn!(loop_id = %l.id, "loop answer journal failed: {error:#}"); return;
+                }
+                let (answer, findings) = coverage::decode(&raw_answer);
+                let duplicate = !l.nag_until_ack && !findings.is_empty()
+                    && findings.iter().all(|finding| self.store.loop_finding_covered(&l.id, &finding.fingerprint).unwrap_or(false));
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
                 let body = loop_result_body(&header, &answer);
                 // #1135 — nag loops post with Acknowledge / Dismiss controls;
                 // everything else posts plain text. The buttons are keyed to
                 // the cycle they resolve: the already-open marker, or (on the
                 // first fire) the schedule time we're about to stamp below.
-                let posted = if l.nag_until_ack {
+                let posted = if duplicate {
+                    Ok(())
+                } else if l.nag_until_ack {
                     let cycle_id = l.nag_cycle_ms.unwrap_or(cycle_ms);
                     self.poster
                         .post_reminder(&l.channel_ref, &body, &l.id, cycle_id)
@@ -747,17 +775,12 @@ impl LoopScheduler {
                 };
                 if let Err(e) = posted {
                     warn!(loop_id = %l.id, "loop post failed: {e:#}");
-                    let _ = self.store.record_user_loop_run(
-                        &l.id,
-                        false,
-                        &format!("post failed: {e}"),
-                        pause_after,
-                    );
+                    let _ = self.store.fail_loop_occurrence(&request_id, &format!("post failed: {e}"), true, pause_after);
                     return;
                 }
-                let _ = self
-                    .store
-                    .record_user_loop_run(&l.id, true, "ok", pause_after);
+                if let Err(error) = self.store.complete_loop_occurrence(&request_id, &findings) {
+                    warn!(loop_id = %l.id, "loop completion journal failed: {error:#}"); return;
+                }
                 // #1135 — first fire of a scheduled cycle opens the nag so the
                 // scheduler keeps re-nagging daily until Ack/Dismiss. Guarded
                 // by `nag_cycle_ms IS NULL` in the store, so a re-nag within an
@@ -770,12 +793,7 @@ impl LoopScheduler {
             }
             Err(e) => {
                 warn!(loop_id = %l.id, "loop prompt failed: {e:#}");
-                let _ = self.store.record_user_loop_run(
-                    &l.id,
-                    false,
-                    &truncate(&format!("error: {e}"), 200),
-                    pause_after,
-                );
+                let _ = self.store.fail_loop_occurrence(&request_id, &format!("error: {e:#}"), false, pause_after);
             }
         }
     }
@@ -1090,6 +1108,192 @@ mod tests {
         assert_eq!(ids[0], ids[1], "restarted occurrence must reuse its request identity");
         assert_ne!(ids[1], ids[2], "next occurrence must not reuse prior receipts");
         assert_eq!(*runner.models.lock().unwrap(), vec![Some("glm".into()); 3]);
+    }
+
+    struct CoverageRunner {
+        replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl LoopRunner for CoverageRunner {
+        async fn run_prompt(&self, _id: &str, _owner: &str, prompt: &str, _model: Option<&str>) -> anyhow::Result<String> {
+            self.prompts.lock().unwrap().push(prompt.into());
+            let next = self.replies.lock().unwrap().pop_front().expect("unexpected model replay");
+            if next == "ERROR" { anyhow::bail!("synthetic provider failure"); }
+            Ok(next)
+        }
+    }
+    struct CoveragePoster {
+        posts: std::sync::Mutex<Vec<String>>,
+        fail_once: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl LoopPoster for CoveragePoster {
+        async fn post_to(&self, _channel: &str, body: &str) -> anyhow::Result<()> {
+            if self.fail_once.swap(false, std::sync::atomic::Ordering::SeqCst) { anyhow::bail!("synthetic lost delivery"); }
+            self.posts.lock().unwrap().push(body.into()); Ok(())
+        }
+    }
+    fn coverage_report(status: &str, finding: &str, evidence: &str) -> String {
+        serde_json::json!({"status":status,"answer":finding,"findings":[{"finding":finding,"evidence":[evidence]}]}).to_string()
+    }
+
+    #[tokio::test]
+    async fn scheduled_runner_receives_original_prompt_while_history_is_masked() {
+        let (store,_file)=tmp_store();
+        let prompt="Inspect literal fixture {\"password\":\"synthetic-secret-shaped-value\"}";
+        store.create_user_loop_with_model("owner","discord","channel",60,prompt,None,None,None,None,false).unwrap();
+        let store=Arc::new(store);
+        let runner=Arc::new(CoverageRunner { replies:std::sync::Mutex::new(std::collections::VecDeque::from(["done".into()])),prompts:std::sync::Mutex::new(vec![]) });
+        let poster=Arc::new(CoveragePoster {posts:std::sync::Mutex::new(vec![]),fail_once:std::sync::atomic::AtomicBool::new(false)});
+        let row=store.list_active_user_loops().unwrap().remove(0);
+        LoopScheduler::new(store.clone(),runner.clone(),poster).run_one(&row,0).await;
+        assert!(runner.prompts.lock().unwrap()[0].starts_with(prompt));
+        assert!(!store.loop_occurrences_since(0,10).unwrap()[0].prompt.contains("synthetic-secret-shaped-value"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_coverage_suppresses_exact_duplicates_but_not_new_evidence() {
+        let (store, _file) = tmp_store();
+        store.create_user_loop_with_model("owner", "discord", "channel", 60, "Report synthetic changes", None, None, None, None, false).unwrap();
+        let store = Arc::new(store);
+        let first = coverage_report("complete", "Fixture changed", "fixture:v1");
+        let runner = Arc::new(CoverageRunner { replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            first.clone(), first, coverage_report("complete", "Fixture changed", "fixture:v2")
+        ])), prompts: std::sync::Mutex::new(vec![]) });
+        let poster = Arc::new(CoveragePoster { posts: std::sync::Mutex::new(vec![]), fail_once: std::sync::atomic::AtomicBool::new(false) });
+        let scheduler = LoopScheduler::new(store.clone(), runner.clone(), poster.clone());
+        for _ in 0..3 { scheduler.run_one(&store.list_active_user_loops().unwrap()[0], 0).await; }
+        assert_eq!(poster.posts.lock().unwrap().len(), 2);
+        let prompts = runner.prompts.lock().unwrap();
+        assert!(prompts[1].contains("fixture:v1"));
+        assert!(prompts[1].contains("Fixture changed"));
+        assert_eq!(store.loop_occurrences_since(0, 10).unwrap().len(), 3, "duplicate still has an audit record");
+        let id = &store.list_active_user_loops().unwrap()[0].id;
+        assert_eq!(store.loop_coverage(id, 10).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_or_incomplete_loop_work_never_becomes_coverage() {
+        let (store, _file) = tmp_store();
+        store.create_user_loop_with_model("owner", "discord", "channel", 60, "Report changes", None, None, None, None, false).unwrap();
+        let store = Arc::new(store);
+        let runner = Arc::new(CoverageRunner { replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            "ERROR".into(), coverage_report("incomplete", "Still investigating", "fixture:v1"),
+            coverage_report("complete", "Unsupported claim", "")
+        ])), prompts: std::sync::Mutex::new(vec![]) });
+        let poster = Arc::new(CoveragePoster { posts: std::sync::Mutex::new(vec![]), fail_once: std::sync::atomic::AtomicBool::new(false) });
+        let scheduler = LoopScheduler::new(store.clone(), runner.clone(), poster);
+        for _ in 0..3 { scheduler.run_one(&store.list_active_user_loops().unwrap()[0], 0).await; }
+        let id = &store.list_active_user_loops().unwrap()[0].id;
+        assert!(store.loop_coverage(id, 10).unwrap().is_empty());
+        let audit = store.loop_occurrences_since(0, 10).unwrap();
+        assert!(audit.iter().any(|r| r.state == "failed" && r.error.as_deref().unwrap().contains("synthetic provider")));
+        assert!(runner.prompts.lock().unwrap()[1].contains("synthetic provider failure"));
+    }
+
+    #[tokio::test]
+    async fn loop_post_retry_reuses_persisted_answer_across_store_reopen() {
+        let (store, file) = tmp_store();
+        store.create_user_loop_with_model("owner", "discord", "channel", 60, "Report changes", None, None, None, None, false).unwrap();
+        let runner = Arc::new(CoverageRunner { replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            coverage_report("complete", "Completed observation", "fixture:v1")
+        ])), prompts: std::sync::Mutex::new(vec![]) });
+        let poster = Arc::new(CoveragePoster { posts: std::sync::Mutex::new(vec![]), fail_once: std::sync::atomic::AtomicBool::new(true) });
+        {
+            let row = store.list_active_user_loops().unwrap().remove(0);
+            let scheduler = LoopScheduler::new(Arc::new(store), runner.clone(), poster.clone());
+            scheduler.run_one(&row, 0).await;
+        }
+        let store = Arc::new(Store::open(file.path()).unwrap());
+        let row = store.list_active_user_loops().unwrap().remove(0);
+        assert!(row.last_run_ms.is_none(), "failed delivery retains occurrence identity");
+        assert!(store.loop_coverage(&row.id, 10).unwrap().is_empty());
+        LoopScheduler::new(store.clone(), runner.clone(), poster.clone()).run_one(&row, 0).await;
+        assert!(poster.posts.lock().unwrap().is_empty(),"immediate restart must retain delivery backoff");
+        store.with_conn(|conn| {conn.execute("UPDATE loop_occurrence_failures SET observed_at_ms=observed_at_ms-60001",[])?;Ok(())}).unwrap();
+        LoopScheduler::new(store.clone(), runner.clone(), poster.clone()).run_one(&row,0).await;
+        assert_eq!(runner.prompts.lock().unwrap().len(), 1, "no model repeat after persisted answer");
+        assert_eq!(poster.posts.lock().unwrap().len(), 1);
+        assert_eq!(store.loop_coverage(&row.id, 10).unwrap().len(), 1);
+        let request_id = loop_request_id(&row.id, row.created_at_ms, row.last_run_ms);
+        let failures = store.loop_occurrence_failures(&request_id).unwrap();
+        assert_eq!(failures.len(), 1, "later success must not erase the failed delivery audit");
+        assert_eq!(failures[0].0, "delivery");
+        assert!(failures[0].1.contains("synthetic lost delivery"));
+    }
+
+    #[tokio::test]
+    async fn delivery_retry_preserves_exact_secret_shaped_literal_after_restart() {
+        struct RecordingPoster { attempts:std::sync::Mutex<Vec<String>> }
+        #[async_trait]
+        impl LoopPoster for RecordingPoster {
+            async fn post_to(&self,_:&str,body:&str)->anyhow::Result<()> {
+                let mut attempts=self.attempts.lock().unwrap();attempts.push(body.into());
+                if attempts.len()==1 {anyhow::bail!("synthetic delivery failure");} Ok(())
+            }
+        }
+        let (store,file)=tmp_store();
+        store.create_user_loop_with_model("owner","discord","channel",60,"Report fixture",None,None,None,None,false).unwrap();
+        let raw=r#"Literal fixture: {"password":"synthetic-delivery-literal"}"#;
+        let runner=Arc::new(CoverageRunner { replies:std::sync::Mutex::new(std::collections::VecDeque::from([raw.into()])),prompts:std::sync::Mutex::new(vec![]) });
+        let poster=Arc::new(RecordingPoster {attempts:std::sync::Mutex::new(vec![])});
+        {let row=store.list_active_user_loops().unwrap().remove(0);LoopScheduler::new(Arc::new(store),runner.clone(),poster.clone()).run_one(&row,0).await;}
+        let store=Arc::new(Store::open(file.path()).unwrap());
+        store.with_conn(|conn|{conn.execute("UPDATE loop_occurrence_failures SET observed_at_ms=observed_at_ms-60001",[])?;Ok(())}).unwrap();
+        let row=store.list_active_user_loops().unwrap().remove(0);
+        LoopScheduler::new(store.clone(),runner.clone(),poster.clone()).run_one(&row,0).await;
+        let attempts=poster.attempts.lock().unwrap();
+        assert_eq!(attempts.len(),2);
+        assert_eq!(attempts[0],attempts[1]);
+        assert!(attempts[1].contains(raw));
+        assert_eq!(runner.prompts.lock().unwrap().len(),1);
+        assert!(!store.loop_occurrences_since(0,10).unwrap()[0].answer.as_deref().unwrap().contains("synthetic-delivery-literal"));
+    }
+
+    #[tokio::test]
+    async fn expiry_preserves_pending_delivery_backoff_across_restart_without_new_model_work() {
+        let (store,file)=tmp_store();
+        store.create_user_loop("owner","discord","channel",60,"Final scheduled report",Some(now_millis()-1000),None,None).unwrap();
+        let runner=Arc::new(CoverageRunner {replies:std::sync::Mutex::new(std::collections::VecDeque::from(["final answer".into()])),prompts:std::sync::Mutex::new(vec![])});
+        let poster=Arc::new(CoveragePoster {posts:std::sync::Mutex::new(vec![]),fail_once:std::sync::atomic::AtomicBool::new(true)});
+        {
+            let store=Arc::new(store);
+            let scheduler=LoopScheduler::new(store.clone(),runner.clone(),poster.clone());
+            scheduler.tick().await.unwrap();
+            assert_eq!(store.list_active_user_loops().unwrap().len(),1,"expiry must retain already-executed pending delivery");
+            scheduler.tick().await.unwrap();
+            assert!(poster.posts.lock().unwrap().is_empty(),"backoff must suppress delivery and expiry notice");
+        }
+        let store=Arc::new(Store::open(file.path()).unwrap());
+        store.with_conn(|conn|{conn.execute("UPDATE loop_occurrence_failures SET observed_at_ms=observed_at_ms-60001",[])?;Ok(())}).unwrap();
+        let scheduler=LoopScheduler::new(store.clone(),runner.clone(),poster.clone());
+        scheduler.tick().await.unwrap();
+        assert!(store.list_active_user_loops().unwrap().is_empty());
+        assert_eq!(runner.prompts.lock().unwrap().len(),1);
+        assert!(poster.posts.lock().unwrap().iter().any(|body|body.contains("final answer")));
+        // Model a restart after final completion but before the expiry sweep,
+        // with enough elapsed time that the normal interval is due again.
+        store.with_conn(|conn|{conn.execute("UPDATE user_loops SET status='active',last_run_ms=100,expires_at_ms=99",[])?;Ok(())}).unwrap();
+        scheduler.tick().await.unwrap();
+        assert_eq!(runner.prompts.lock().unwrap().len(),1);
+        assert!(store.list_active_user_loops().unwrap().is_empty());
+    }
+
+    #[test]
+    fn coverage_context_is_bounded_while_full_audit_retains_all_bytes() {
+        let (store, _file) = tmp_store();
+        store.create_user_loop_with_model("owner", "discord", "channel", 60, "Report changes", None, None, None, None, false).unwrap();
+        let row = store.list_active_user_loops().unwrap().remove(0);
+        let answer = coverage_report("complete", &"evidence αβγ ".repeat(8000), "fixture:v1");
+        store.prepare_loop_occurrence(&row.id, "synthetic-occurrence", "prompt").unwrap();
+        store.save_loop_answer("synthetic-occurrence", &answer).unwrap();
+        let (_, findings) = coverage::decode(&answer);
+        store.complete_loop_occurrence("synthetic-occurrence", &findings).unwrap();
+        let prompt = coverage::prompt(&store, &row).unwrap();
+        assert!(prompt.len() < 16 * 1024);
+        assert_eq!(store.loop_occurrences_since(0, 1).unwrap()[0].answer.as_deref(), Some(answer.as_str()));
+        assert_eq!(store.loop_coverage(&row.id, 1).unwrap()[0].finding.len(), findings[0].finding.len());
     }
 
     #[test]

@@ -82,9 +82,15 @@ pub async fn without_router<F: std::future::Future>(fut: F) -> F::Output {
 /// A Discord/default profile applies only to this call's cloned router
 /// configuration. The persisted account settings and other calls are intact.
 pub fn select_profile(config: Option<RouterConfig>, selected: Option<ProviderKind>) -> anyhow::Result<Option<RouterConfig>> {
-    let native_codex_available = selected == Some(ProviderKind::Codex)
-        && crate::codex::codex_auth_available();
-    select_profile_with_auth(config, selected, native_codex_available)
+    select_profile_for_workflow(config,selected,false)
+}
+/// Required workflows use only the explicit isolated native credential grant.
+/// Interactive selection retains the original host-authentication behavior.
+pub(crate) fn select_profile_for_workflow(config:Option<RouterConfig>,selected:Option<ProviderKind>,required:bool)->anyhow::Result<Option<RouterConfig>> {
+    let native_codex_available=selected==Some(ProviderKind::Codex) && if required {
+        crate::native_vm::declared_native_auth("codex")?
+    } else {crate::codex::codex_auth_available()};
+    select_profile_with_auth(config,selected,native_codex_available)
 }
 
 fn select_profile_with_auth(mut config: Option<RouterConfig>, selected: Option<ProviderKind>, native_codex_available: bool) -> anyhow::Result<Option<RouterConfig>> {
