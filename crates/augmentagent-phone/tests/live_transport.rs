@@ -94,7 +94,7 @@ fn clear_acknowledgments_do_not_claim_audio_was_played() {
         stream
             .receive(&mark("2", first[1]["mark"]["name"].clone()))
             .unwrap(),
-        StreamInput::Cleared
+        StreamInput::Cleared { bytes: 160 }
     ));
     let second = stream.output(&[255; 160]).unwrap();
     assert!(matches!(

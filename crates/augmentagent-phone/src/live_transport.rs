@@ -30,7 +30,7 @@ pub enum StreamInput {
     Started,
     Audio(Vec<u8>),
     Played { bytes: usize },
-    Cleared,
+    Cleared { bytes: usize },
     Stopped,
 }
 struct Mark {
@@ -163,7 +163,7 @@ impl MediaStream {
                 }
                 let mark = self.marks.pop_front().ok_or(StreamError::Order)?;
                 if mark.cleared {
-                    StreamInput::Cleared
+                    StreamInput::Cleared { bytes: mark.bytes }
                 } else {
                     self.pending -= mark.bytes;
                     StreamInput::Played { bytes: mark.bytes }
@@ -212,6 +212,7 @@ impl MediaStream {
         });
         Ok(frames)
     }
+    pub fn pending_bytes(&self) -> usize { self.pending }
     pub fn clear(&mut self) -> Result<Value, StreamError> {
         self.active()?;
         for mark in &mut self.marks {

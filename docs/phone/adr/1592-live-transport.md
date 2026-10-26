@@ -27,6 +27,22 @@ final usage. It prints no call/session IDs. Exact correlation remains in the
 private store for the canary receipt. Actual invoice/cost reconciliation and
 audible timing qualification remain in #1595/#1596.
 
+Playback evidence is checkpointed once per second and when collection ends.
+It separates input bytes received, provider output received, output successfully
+sent to Twilio, uncleared playback-mark bytes, requested clears, and returned
+marks classified as cleared. Bytes sent without a playback/clear receipt remain
+unconfirmed, including when the socket closes. A process crash leaves an open
+collector checkpoint; a finalized collector record cannot be overwritten by a
+late checkpoint. No audio or transcript is retained in these metrics.
+
+`phone metrics` reports first-provider-frame and first-playback-receipt timings
+relative to bridge startup, with separate sample counts and p50/p95 across calls.
+These are startup/transport diagnostics, not per-turn response latency. A mark
+describes buffer drain, not the first audible sample, and audio may be silence.
+The report explicitly leaves audible response latency unavailable. The epic's
+15-turn audible p50/p95 gate still needs independent caller-side timing evidence;
+neither these counters nor estimated server timing can satisfy it alone.
+
 This is an audio backend, not another Chat Completions fast provider. Backend
 work remains in Jarvis's native session/approval harness and durable task queue.
 

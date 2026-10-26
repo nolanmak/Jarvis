@@ -443,6 +443,7 @@ async fn owner_goodbye_closes_twilio_before_provider_finalization_and_keeps_task
         let mut ws=accept_async(tcp).await.unwrap();
         let _=ws.next().await;
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([128;160])}).to_string().into())).await.unwrap();
         for event in [
             json!({"type":"session.input_transcript.delta","event_id":"task","delta":"Look up the weather.","start_ms":0,"end_ms":100}),
             json!({"type":"session.delegation.created","event_id":"delegate","delegation":{"type":"delegation","target":"client","id":"task-one"},"offset_ms":110}),
@@ -476,6 +477,14 @@ async fn owner_goodbye_closes_twilio_before_provider_finalization_and_keeps_task
         }
     }).await.unwrap();
     assert_eq!(f.service.store.phone_pending_dispatches().unwrap().len(),1);
+    let playback=f.service.store.phone_live_playback(1).unwrap();
+    assert!(playback[0].1);
+    assert_eq!(playback[0].0.output_sent_bytes,160);
+    assert_eq!(playback[0].0.played_bytes,0);
+    assert_eq!(playback[0].0.clear_requested_bytes,160);
+    assert_eq!(playback[0].0.cleared_receipt_bytes,0);
+    assert_eq!(playback[0].0.first_playback_receipt_ms,None);
+
 }
 
 #[tokio::test]
@@ -524,4 +533,14 @@ async fn full_duplex_keeps_input_flowing_during_unacknowledged_output() {
     assert!(!f.service.store.phone_provider_call(&f.id).unwrap().stop_requested);
     ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"10","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
     backend.await.unwrap();
+    let playback=f.service.store.phone_live_playback(1).unwrap();
+    assert_eq!(playback.len(),1);
+    assert!(playback[0].1);
+    let stats=&playback[0].0;
+    assert_eq!(stats.input_bytes,640);
+    assert_eq!(stats.output_received_bytes,640);
+    assert_eq!(stats.output_sent_bytes,640);
+    assert_eq!(stats.played_bytes,640);
+    assert_eq!(stats.cleared_receipt_bytes,0);
+    assert!(stats.first_playback_receipt_ms.is_some());
 }

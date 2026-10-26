@@ -28,6 +28,7 @@ pub fn run(store: &Store, last: usize) -> Result<()> {
     let summary = store.phone_turn_metrics_summary(last)?;
     print!("{}", render(&summary));
     print!("{}", augmentagent_phone::live_usage::render_usage(&store.phone_live_usage(last)?));
+    print!("{}", augmentagent_phone::live_playback::render_playback(&store.phone_live_playback(last)?));
     Ok(())
 }
 

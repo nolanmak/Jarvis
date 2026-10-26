@@ -241,3 +241,10 @@ CREATE TABLE IF NOT EXISTS phone_live_summary_jobs (
     PRIMARY KEY(call_id,delegation_id),
     FOREIGN KEY(call_id,delegation_id) REFERENCES phone_live_dispatches(call_id,delegation_id)
 );
+
+-- Content-free playback checkpoints; collector closure is not proof of hearing.
+CREATE TABLE IF NOT EXISTS phone_live_playback (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    evidence TEXT NOT NULL,
+    collector_closed INTEGER NOT NULL CHECK(collector_closed IN (0,1))
+);

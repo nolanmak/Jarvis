@@ -28,6 +28,7 @@ pub(crate) async fn run(
     call: PhoneCall,
     mut socket: WebSocket,
 ) {
+    let playback=crate::live_playback::PlaybackTracker::default();
     let mut claimed = false;
     let mut usage_started = false;
     let setup = tokio::time::timeout(Duration::from_secs(10), async {
@@ -46,6 +47,7 @@ pub(crate) async fn run(
                                 .phone_claim_relay(&call.id, sid)
                                 .map_err(|_| LiveError::Protocol)?;
                             claimed = true;
+                            service.store.phone_save_live_playback(&call.id,&playback.snapshot(),false).map_err(|_|LiveError::Unavailable)?;
                             let profile = service
                                 .owner_context(&call.owner)
                                 .map_err(|_| LiveError::Unavailable)?
@@ -85,9 +87,10 @@ pub(crate) async fn run(
     .and_then(|r| r);
     let outcome = match setup {
         Ok((media, connection)) => {
-            conversation(&service, &call, &mut socket, media, connection).await
+            conversation(&service, &call, &mut socket, media, connection, playback).await
         }
         Err(error) => {
+            if claimed { let _=service.store.phone_save_live_playback(&call.id,&playback.snapshot(),true); }
             if usage_started && service.store.phone_live_usage_finish(&call.id, LiveUsagePhase::Conversation, &LiveUsageFinal {
                     trigger:"setup_failure", reason:None, seconds:None,
                     error:Some(error.code()), finalization_error:None,
@@ -109,12 +112,14 @@ async fn conversation(
     socket: &mut WebSocket,
     mut media: MediaStream,
     mut connection: LiveConnection,
+    mut playback: crate::live_playback::PlaybackTracker,
 ) -> Result<(), LiveError> {
     let session_id = connection
         .session_id()
         .ok_or(LiveError::Protocol)?
         .to_owned();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut checkpoint=tokio::time::Instant::now();
     let mut final_event = None;
     let mut trigger = "error";
     let mut goodbye = crate::live_goodbye::LiveGoodbye::default();
@@ -123,6 +128,10 @@ async fn conversation(
         loop {
             tokio::select! {
                 _=tick.tick()=>{
+                    if checkpoint.elapsed()>=Duration::from_secs(1) {
+                        service.store.phone_save_live_playback(&call.id,&playback.snapshot(),false).map_err(|_|LiveError::Unavailable)?;
+                        checkpoint=tokio::time::Instant::now();
+                    }
                     if service.stopping.load(Ordering::SeqCst) {trigger="app_stop";return Ok(());}
                     service.authorize_call(&call.id).map_err(|_|LiveError::Access)?;
                     if service.clock.now_ms().saturating_sub(call.created_ms)>=call.max_duration_seconds.saturating_mul(1000) {trigger="duration_limit";return Ok(());}
@@ -134,6 +143,7 @@ async fn conversation(
                         // independent watchdog can finish it after disconnect.
                         service.store.phone_request_stop(&call.owner,&call.id)
                             .map_err(|_|LiveError::Unavailable)?;
+                        playback.clear_requested(media.pending_bytes());
                         let clear=media.clear().map_err(|_|LiveError::Protocol)?;
                         tokio::time::timeout(Duration::from_secs(2),async {
                             send(socket,Message::Text(clear.to_string().into())).await?;
@@ -151,9 +161,11 @@ async fn conversation(
                 incoming=socket.recv()=>{
                     match incoming {
                         Some(Ok(Message::Text(text)))=>match media.receive(&text).map_err(|_|LiveError::Protocol)? {
-                            StreamInput::Audio(audio)=>{goodbye.audio(&audio);connection.send_audio(&audio).await?;},
+                            StreamInput::Audio(audio)=>{playback.input(audio.len());goodbye.audio(&audio);connection.send_audio(&audio).await?;},
                             StreamInput::Stopped=>{trigger="twilio_stop";return Ok(());},
-                            StreamInput::Ignored|StreamInput::Played{..}|StreamInput::Cleared=>{},
+                            StreamInput::Ignored=>{},
+                            StreamInput::Played{bytes}=>playback.played(bytes,media.pending_bytes()),
+                            StreamInput::Cleared{bytes}=>playback.cleared(bytes,media.pending_bytes()),
                             StreamInput::Started=>return Err(LiveError::Protocol),
                         },
                         Some(Ok(Message::Ping(bytes)))=>send(socket,Message::Pong(bytes)).await?,
@@ -166,9 +178,11 @@ async fn conversation(
                     let input=input?;
                     match &input {
                         LiveInput::Audio(audio)=>{
+                            playback.received_output(audio.len());
                             service.authorize_call(&call.id).map_err(|_|LiveError::Access)?;
-                            for frame in media.output(audio).map_err(|_|LiveError::Capacity)? {
+                            for (index,frame) in media.output(audio).map_err(|_|LiveError::Capacity)?.into_iter().enumerate() {
                                 send(socket,Message::Text(frame.to_string().into())).await?;
+                                if index==0 { playback.sent_output(audio.len(),media.pending_bytes()); }
                             }
                         }
                         LiveInput::Closed{reason,seconds}=>{
@@ -193,6 +207,8 @@ async fn conversation(
             }
         }
     }.await;
+    playback.pending(media.pending_bytes());
+    let playback_saved=service.store.phone_save_live_playback(&call.id,&playback.snapshot(),true);
     // The provider's reason and final usage are independent from the local
     // stop trigger. In particular, neither a socket close nor remote_hangup
     // proves that the human owner hung up.
@@ -204,6 +220,7 @@ async fn conversation(
     service.save_live_usage(&call.id, LiveUsagePhase::Conversation, trigger,
         outcome.as_ref().err().copied(),finalization)
         .map_err(|_|LiveError::Unavailable)?;
+    playback_saved.map_err(|_|LiveError::Unavailable)?;
     if let Some(error)=finalization_error { return outcome.and(Err(error)); }
 
     outcome
