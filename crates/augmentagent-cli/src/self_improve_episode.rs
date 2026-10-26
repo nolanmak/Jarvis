@@ -38,6 +38,7 @@ pub(super) async fn evaluate(
     let structured = review.structured.as_ref();
     let complete = structured.is_some_and(|r| {
         r.passes.len() == 3
+            && !r.needs_evidence()
             && r.passes
                 .iter()
                 .all(|p| p.completed && p.coverage.complete())

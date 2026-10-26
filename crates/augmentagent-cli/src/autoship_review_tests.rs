@@ -929,3 +929,17 @@ async fn newly_dangling_or_connected_edges_invalidate_prior_leaf_authority() {
     let renewed=dismissed(&[connected.clone(),other.clone()]).await;
     assert!(review_authority(&binding(),&builders(),&passes(vec![connected,other]),Some(&renewed)).is_ok());
 }
+
+#[tokio::test]
+async fn missing_source_request_is_typed_non_authority_not_a_code_verdict() {
+    let findings=vec![finding("F1")];
+    let mut receipt=dismissed(&findings).await;
+    receipt.rulings.insert("F1".into(),Ruling::NeedEvidence {source_paths:vec!["caller.rs".into()],question:"Which branch preserves the required behavior?".into()});
+    adjudication_groups::validate(&receipt,&binding(),&findings,&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).unwrap();
+    assert!(review_authority(&binding(),&builders(),&passes(findings.clone()),Some(&receipt)).is_err());
+    let raw=serde_json::json!({"binding":binding(),"rulings":receipt.rulings}).to_string();
+    let parsed=validate_adjudicator_response(&raw,&binding(),&findings).unwrap();
+    assert!(matches!(parsed.rulings["F1"],Ruling::NeedEvidence {..}));
+    receipt.rulings.insert("F1".into(),Ruling::NeedEvidence {source_paths:vec![],question:"guess".into()});
+    assert!(adjudication_groups::validate(&receipt,&binding(),&findings,&builders(),&ReviewOrigin::RecordedBuilders,&BTreeSet::new()).is_err());
+}
