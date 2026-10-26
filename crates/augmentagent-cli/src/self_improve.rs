@@ -9760,6 +9760,21 @@ const LABELLED_LIST_ARGS: [&str; 10] = [
     "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL, "--limit", "500", "--json", "number,comments",
 ];
 
+/// gh paginates internally up to --limit; grow that bound until the response
+/// proves completeness. A full final page is never the whole backlog by fiat.
+async fn complete_labelled_inventory<F,Fut>(mut fetch:F)->Result<String>
+where F:FnMut(usize)->Fut,Fut:std::future::Future<Output=Result<String>> {
+    let max=(MAX_ISSUE_PAGES*ISSUES_PER_PAGE) as usize;
+    let mut limit=500usize;
+    loop {
+        let raw=fetch(limit).await?;
+        let rows:Vec<serde_json::Value>=serde_json::from_str(&raw).context("readmission inventory malformed")?;
+        if rows.len()<limit { return Ok(raw); }
+        anyhow::ensure!(limit<max,"readmission inventory exceeds safe bound; refusing partial reset");
+        limit=(limit*2).min(max);
+    }
+}
+
 /// #1214 — `augmentagent autopr readmit`: the labelled issues whose reason
 /// matches `wanted`. With `dry_run` nothing on GitHub changes; otherwise the
 /// label comes off each, which puts it back in the pool.
@@ -9776,10 +9791,17 @@ pub(crate) async fn readmit(
     reset_history: bool,
 ) -> Result<Vec<u64>> {
     let gh = gh_bin();
-    let (ok, stdout, stderr) = run(&gh, &LABELLED_LIST_ARGS, repo_root).await?;
-    if !ok {
-        bail!("gh issue list failed: {}", truncate(&stderr, 300));
-    }
+    let stdout=complete_labelled_inventory(|limit| {
+        let gh=gh.clone();
+        async move {
+            let bound=limit.to_string();
+            let mut args=LABELLED_LIST_ARGS;
+            args[7]=&bound;
+            let (ok,stdout,stderr)=run(&gh,&args,repo_root).await?;
+            anyhow::ensure!(ok,"gh readmission inventory failed: {}",truncate(&stderr,300));
+            Ok(stdout)
+        }
+    }).await?;
     let history = AttemptHistory::load(&attempt_history_path());
     let matched: Vec<u64> = parse_labelled(&stdout)
         .into_iter()
@@ -17641,6 +17663,20 @@ else:
         let buckets = gave_up_breakdown(&labelled, &history);
         assert_eq!(buckets.iter().map(|(_, n)| n).sum::<u32>(), labelled.len() as u32);
         assert!(buckets.contains(&("stuck:gate-red".to_string(), 2)), "{buckets:?}");
+    }
+
+    #[tokio::test]
+    async fn readmission_inventory_includes_rows_beyond_five_hundred() {
+        let calls=std::cell::RefCell::new(Vec::new());
+        let raw=complete_labelled_inventory(|limit| {
+            calls.borrow_mut().push(limit);
+            async move { Ok(serde_json::to_string(&(1..=600usize.min(limit)).map(|n|serde_json::json!({"number":n,"comments":[]})).collect::<Vec<_>>())?) }
+        }).await.unwrap();
+        let rows=parse_labelled(&raw);
+        assert_eq!(rows.len(),600); assert_eq!(rows.last().unwrap().0,600);
+        assert_eq!(*calls.borrow(),vec![500,1000]);
+        assert!(complete_labelled_inventory(|_|async {Ok("{}".into())}).await.is_err());
+        assert!(complete_labelled_inventory(|limit|async move {Ok(serde_json::to_string(&vec![serde_json::json!({"number":1});limit])?)}).await.is_err());
     }
 
     #[test]
