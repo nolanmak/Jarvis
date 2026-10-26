@@ -166,7 +166,7 @@ pub enum ReviewRole {
     System,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewPass {
     pub binding: ReviewBinding,
@@ -358,7 +358,7 @@ impl Ruling {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdjudicationReceipt {
     pub binding: ReviewBinding,
@@ -506,7 +506,7 @@ async fn adjudicate<R: Reasoner + ?Sized>(
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewEvidence {
     pub binding: ReviewBinding,

@@ -43,6 +43,8 @@ mod source_reconcile;
 mod workflow;
 #[path = "self_improve_recovery.rs"]
 mod recovery;
+#[path = "self_improve_review.rs"]
+mod aligned_review;
 
 /// Branch/worktree prefix so the dedup guard can recognize agent PRs.
 const BRANCH_PREFIX: &str = "agent-fix/issue-";
@@ -1862,6 +1864,9 @@ struct RecordedVerdict {
     model: String,
     diff_ok: bool,
     system_ok: bool,
+    /// Explicit adjudication authority; legacy records deserialize without it.
+    #[serde(default)]
+    structured: Option<crate::autoship_review::ReviewEvidence>,
 }
 
 /// #1076 — what a verdict approves.
@@ -1881,12 +1886,20 @@ struct Approval {
 /// Claude approval satisfied the Codex-only overrides, and the body also
 /// carries model output that can say anything.
 fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
-    match verdict {
-        Some(v) if v.diff_ok && v.system_ok && v.backend == "native" && !v.model.is_empty() => Approval {
-            reviewed: true,
-            codex: v.provider == augmentagent_channel_core::ProviderKind::Codex.name(),
-        },
-        _ => Approval::default(),
+    let Some(v) = verdict.filter(|v| v.backend == "native" && !v.model.is_empty()) else {
+        return Approval::default();
+    };
+    if let Some(evidence) = &v.structured {
+        return Approval {
+            reviewed: evidence.authority().is_ok(),
+            codex: evidence.authority().is_ok() && evidence.passes.iter()
+                .filter(|p| p.role != crate::autoship_review::ReviewRole::Qa)
+                .all(|p| p.actor.provider == "codex" && p.actor.backend == "native"),
+        };
+    }
+    Approval {
+        reviewed: v.diff_ok && v.system_ok,
+        codex: v.diff_ok && v.system_ok && v.provider == augmentagent_channel_core::ProviderKind::Codex.name(),
     }
 }
 
@@ -1895,7 +1908,9 @@ fn approval_of(verdict: Option<&RecordedVerdict>) -> Approval {
 /// another PR, or a head that has moved since the review, approves nothing.
 fn recorded_approval(record: Option<&OpenedPr>, pr: u64, head: Option<&str>) -> Approval {
     let reviewed_here =
-        record.filter(|r| r.pr == pr && head.is_some_and(|h| !h.is_empty() && h == r.head));
+        record.filter(|r| r.pr == pr && head.is_some_and(|h| !h.is_empty() && h == r.head)
+            && r.verdict.as_ref().and_then(|v| v.structured.as_ref())
+                .is_none_or(|evidence| evidence.binding.head == r.head));
     approval_of(reviewed_here.and_then(|r| r.verdict.as_ref()))
 }
 
@@ -3783,6 +3798,8 @@ struct IndependentReview {
     notes: String,
     /// #1037 — why `available` is false. `None` whenever a reviewer ran.
     why_unavailable: Option<ReviewUnavailable>,
+    /// Harness-owned review passes and any binding final adjudication.
+    structured: Option<crate::autoship_review::ReviewEvidence>,
 }
 
 /// #1037 — the independent stage's result as the three things a caller can do
@@ -3863,6 +3880,15 @@ impl IndependentReview {
                 None => "unavailable".into(),
             };
         }
+        if let Some(evidence) = &self.structured {
+            return match evidence.authority() {
+                Ok(crate::autoship_review::MergeAuthority::AdjudicatedApproval) =>
+                    "approved by final adjudication (original reviewer findings retained)".into(),
+                Ok(crate::autoship_review::MergeAuthority::IndependentApproval) =>
+                    "lgtm (complete QA + independent diff/system)".into(),
+                Err(error) => format!("changes requested ({error})"),
+            };
+        }
         match (self.diff_ok, self.system_ok) {
             (true, true) => "lgtm (diff + system)".into(),
             (true, false) => "changes requested on system interaction".into(),
@@ -3882,6 +3908,7 @@ impl IndependentReview {
             system_ok: false,
             notes: format!("Independent review not run: {reason}."),
             why_unavailable: None,
+            structured: None,
         }
     }
 
@@ -3897,6 +3924,7 @@ impl IndependentReview {
                 why.headline()
             ),
             why_unavailable: Some(why),
+            structured: None,
         }
     }
 
@@ -3911,6 +3939,7 @@ impl IndependentReview {
             model: self.model.clone()?,
             diff_ok: self.diff_ok,
             system_ok: self.system_ok,
+            structured: self.structured.clone(),
         })
     }
 
@@ -4130,142 +4159,54 @@ fn reviewer_pool_from(configured: Option<&str>) -> Vec<augmentagent_channel_core
 async fn independent_review(
     builder: &augmentagent_channel_core::FallbackReasoner,
     issue: &Issue,
-    summary: &str,
-    diff: &str,
+    _summary: &str,
+    _diff: &str,
     worktree: PathBuf,
-    prior_findings: Option<&str>,
+    _prior_findings: Option<&str>,
     criteria: &[String],
 ) -> IndependentReview {
-    // #1037 — the same selection the resume lane's preflight makes, so the
-    // two can never disagree about whether this draft is reviewable, or why.
-    let provider = match select_reviewer(
-        &reviewer_pool(),
-        builder.review_authors().map_err(|e| format!("{e:#}")),
-        reviewer_status,
-    ) {
-        Ok(provider) => provider,
-        Err(why) => return IndependentReview::unavailable(why),
-    };
-    let Some(reasoner) = augmentagent_channel_core::build_pinned(provider) else {
-        // Eligible a moment ago; a race, not a verdict.
-        return IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
-            reviewers: vec![provider],
-            detail: format!("{} could not be constructed", provider.name()),
-        });
-    };
-
-    // #889 — on revision rounds the reviewer sees its own prior findings, so
-    // it can converge (were they addressed?) instead of re-scoping from
-    // scratch and finding one smaller thing per round forever.
-    let prior_section = prior_findings
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| {
-            format!(
-                "\n\n## Your prior findings on the previous revision\n\
-                 The builder revised specifically against these. Judge \
-                 whether each was addressed or soundly rebutted.\n{}",
-                truncate(p, 3000)
-            )
-        })
-        .unwrap_or_default();
-    let context = format!(
-        "GitHub issue #{}: {}\n\n{}\n\nThe author model's own summary of its \
-         change:\n{}\n\nThe complete staged diff follows. The full repository \
-         is NOT browsable from here — work from what is quoted below.\n\n\
-         ```diff\n{}\n```",
-        issue.number,
-        issue.title,
-        truncate(&issue.body, 4000),
-        truncate(summary, 2000),
-        truncate(diff, 60_000),
-    );
-    let context = format!(
-        "{context}{}{prior_section}",
-        criteria_review_section(criteria)
-    );
-
-    let mut out = IndependentReview {
-        provider: Some(provider),
-        model: None,
-        available: true,
-        diff_ok: false,
-        system_ok: false,
-        notes: String::new(),
-        why_unavailable: None,
-    };
-
-    let evidence = caller_evidence(&worktree, diff).await;
-    let system_context = format!(
-        "{context}\n\n## Pre-computed call sites\n{evidence}"
-    );
-
-    let diff_system = review_system(CODEX_DIFF_REVIEW_SYSTEM, criteria);
-    let sys_system = review_system(CODEX_SYSTEM_REVIEW_SYSTEM, criteria);
-    let passes = [
-        ("focused diff review", diff_system.as_str(), &context),
-        ("system-interaction review", sys_system.as_str(), &system_context),
-    ];
-    let mut sections: Vec<String> = Vec::new();
-    for (label, system, prompt) in passes {
-        let mut opts = codex_review_opts(worktree.clone(), system);
-        if provider == augmentagent_channel_core::ProviderKind::Claude {
-            opts.model = Some(build_model());
-        }
-        let requested_model = if provider == augmentagent_channel_core::ProviderKind::Codex {
-            augmentagent_channel_core::providers::model_for(
-                provider, augmentagent_channel_core::providers::tier_of(&opts))
-        } else {
-            opts.model.clone().unwrap_or_default()
-        };
-        if requested_model.is_empty() || out.model.as_ref().is_some_and(|prior| prior != &requested_model) {
-            return IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
-                reviewers: vec![provider],
-                detail: "independent reviewer model identity changed between passes".into(),
-            });
-        }
-        out.model = Some(requested_model);
-        let review = augmentagent_channel_core::model_router::native_reviewer_scope(
-            provider, reasoner.call(&opts, prompt)).await;
-        match review {
-            Ok(raw) => {
-                let (ok, notes) = parse_codex_review(&raw);
-                info!(issue = issue.number, provider = provider.name(), pass = label, approved = ok, "independent review");
-                if label.starts_with("focused") {
-                    out.diff_ok = ok;
-                } else {
-                    out.system_ok = ok;
-                }
-                sections.push(format!("### {} — {label}\n{}", provider.name(), truncate(&notes, 1500)));
-            }
-            Err(e) => {
-                // Provider-side failure is "no independent review", never an
-                // approval and never a rejection of the diff.
-                warn!(issue = issue.number, provider = provider.name(), pass = label, "independent review failed: {e:#}");
-                // #1037 — a quota refusal latches the reviewer, and then the
-                // honest reason is "latched until <reset>", not "no capacity".
-                let why = match reviewer_status(provider) {
-                    ReviewerStatus::Latched(until) => ReviewUnavailable::Latched {
-                        until: vec![(provider.name().to_string(), until)],
-                    },
-                    _ => ReviewUnavailable::NoCapacity {
-                        reviewers: vec![provider],
-                        detail: format!("{} {label} failed: {e:#}", provider.name()),
-                    },
-                };
-                return IndependentReview::unavailable(why);
-            }
-        }
-    }
-    out.notes = sections.join("\n\n");
-    out
+    independent_review_with_context(builder, issue, worktree, criteria, true, "", 0, None, 0).await
 }
 
-/// Build the stage-2 prompt: the issue plus (when the scoping pass produced
-/// one) the implementation spec.
-/// #1012 — the builder is told what "done" means before it writes anything,
-/// and asked to name the test that proves each. An empty list delegates to
-/// [`build_fix_prompt`] verbatim, so a scoper that emits no criteria leaves
-/// this prompt byte-identical to what it was.
+/// Parent lanes pass real QA/round state; legacy callers above start a fresh
+/// aligned review, never parse approval or history from model-written prose.
+async fn independent_review_with_context(
+    builder: &augmentagent_channel_core::FallbackReasoner,
+    issue: &Issue,
+    worktree: PathBuf,
+    criteria: &[String],
+    qa_ok: bool,
+    qa_notes: &str,
+    repair_round: u32,
+    previous: Option<&crate::autoship_review::ReviewEvidence>,
+    adjudication_attempts_already_made: u32,
+) -> IndependentReview {
+    match builder.review_authors() {
+        Ok(None) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnknown),
+        Err(error) => return IndependentReview::unavailable(ReviewUnavailable::ProvenanceUnverifiable { error: format!("{error:#}") }),
+        Ok(Some(_)) => {}
+    }
+    let (compiler_ok, compiler, _) = match run("rustc", &["-vV"], &worktree).await {
+        Ok(result) => result,
+        Err(error) => return IndependentReview::not_run(format!("review environment unavailable: {error:#}")),
+    };
+    if !compiler_ok {
+        return IndependentReview::not_run("review environment compiler identity unavailable".into());
+    }
+    let lock = match std::fs::read(worktree.join("Cargo.lock")) {
+        Ok(bytes) => bytes,
+        Err(error) => return IndependentReview::not_run(format!("review dependency identity unavailable: {error}")),
+    };
+    let environment_id = crate::autoship_review::digest(&serde_json::to_vec(&(
+        compiler, crate::autoship_review::digest(&lock), std::env::consts::OS,
+        std::env::consts::ARCH,
+    )).expect("environment identity consists only of serializable strings"));
+    aligned_review::run(builder, issue, worktree, criteria, aligned_review::ReviewContext {
+        qa_ok, qa_notes, repair_round, previous, environment_id: &environment_id,
+        adjudication_attempts_already_made,
+    }).await
+}
+
 fn build_fix_prompt_with_criteria(
     issue: &Issue,
     plan: Option<&str>,
@@ -11705,6 +11646,29 @@ mod progress_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn legacy_recorded_verdict_remains_readable() {
+        let old = serde_json::json!({"provider":"codex","backend":"native","model":"pinned",
+            "diff_ok":true,"system_ok":true});
+        let verdict: super::RecordedVerdict = serde_json::from_value(old).unwrap();
+        assert!(verdict.structured.is_none());
+        assert!(super::approval_of(Some(&verdict)).reviewed);
+    }
+
+    #[test]
+    fn incomplete_structured_receipt_cannot_fall_back_to_true_legacy_flags() {
+        let evidence = crate::autoship_review::ReviewEvidence {
+            binding: crate::autoship_review::ReviewBinding { head:"head".into(),base:"base".into(),
+                environment_id:"env".into(),contract_hash:"contract".into(),evidence_hash:"evidence".into() },
+            builders: vec![], passes:vec![], adjudication:None,
+        };
+        let verdict = super::RecordedVerdict { provider:"codex".into(),backend:"native".into(),model:"pinned".into(),
+            diff_ok:true,system_ok:true,structured:Some(evidence) };
+        assert!(!super::approval_of(Some(&verdict)).reviewed);
+        let roundtrip: super::RecordedVerdict = serde_json::from_str(&serde_json::to_string(&verdict).unwrap()).unwrap();
+        assert_eq!(verdict, roundtrip);
+    }
+
+    #[test]
     fn source_inspection_presets_enforce_read_only_bridge_access() {
         use augmentagent_channel_core::codex_tools::BridgeLaunch;
         let fixture = tempfile::tempdir().unwrap();
@@ -12970,7 +12934,7 @@ CODEX-REVIEW: lgtm").0);
     #[test]
     fn independent_approval_requires_availability_and_both_passes() {
         let mk = |available, diff_ok, system_ok| IndependentReview {
-            provider: Some(augmentagent_channel_core::ProviderKind::Codex),
+            structured: None, provider: Some(augmentagent_channel_core::ProviderKind::Codex),
             model: Some("synthetic-native-model".into()),
             available,
             diff_ok,
@@ -14959,7 +14923,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             pr: 1000,
             head: "cccc333".into(),
             verdict: Some(RecordedVerdict {
-                provider: "codex".into(),
+                structured: None, provider: "codex".into(),
                 backend: String::new(),
                 model: String::new(),
                 diff_ok: true,
@@ -15115,7 +15079,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     fn verdict(provider: &str, ok: bool) -> RecordedVerdict {
         RecordedVerdict {
-            provider: provider.into(), backend: "native".into(),
+            structured: None, provider: provider.into(), backend: "native".into(),
             model: "synthetic-native-model".into(), diff_ok: ok, system_ok: ok,
         }
     }
@@ -15126,7 +15090,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     fn independent_verdict_records_native_backend_and_requested_model() {
         use augmentagent_channel_core::providers::{ModelTier, ProviderKind};
         let review = IndependentReview {
-            provider: Some(ProviderKind::Codex),
+            structured: None, provider: Some(ProviderKind::Codex),
             model: Some(augmentagent_channel_core::providers::model_for(ProviderKind::Codex, ModelTier::Quality)),
             available: true,
             diff_ok: true,
@@ -15193,7 +15157,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
         // The fresh lane holds the same facts and reaches the same answer.
         let claude = IndependentReview {
-            provider: Some(Claude),
+            structured: None, provider: Some(Claude),
             model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
@@ -15228,7 +15192,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // A rejection, a half approval, or any other provider never unlocks.
         for v in [
             verdict("codex", false),
-            RecordedVerdict { provider: "codex".into(), backend: "native".into(),
+            RecordedVerdict { structured: None, provider: "codex".into(), backend: "native".into(),
                 model: "synthetic-native-model".into(), diff_ok: true, system_ok: false },
         ] {
             assert_eq!(approval_of(Some(&v)), Approval::default(), "{v:?}");
@@ -15260,7 +15224,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_eq!(sweep_verdict(&gated_draft(approval)), SweepVerdict::Merge);
 
         let codex = IndependentReview {
-            provider: Some(Codex),
+            structured: None, provider: Some(Codex),
             model: Some("synthetic-native-model".into()),
             available: true,
             diff_ok: true,
