@@ -74,6 +74,8 @@ jobs:
         run: bash scripts/tests/install-autostart.test.sh
       - name: Pre-phone database upgrade and rollback compatibility
         run: python3 scripts/phone-upgrade-test.py
+      - name: ConversationRelay rollback preserves GPT-Live tasks and receipts
+        run: python3 scripts/phone-upgrade-test.py --live
       - name: CLI integration compiles
         run: cargo check -p augmentagent-cli --locked
       - name: Phone lint
@@ -86,4 +88,5 @@ jobs:
           path: |
             target/phone-offline/
             target/phone-upgrade/
+            target/phone-live-upgrade/
           if-no-files-found: error

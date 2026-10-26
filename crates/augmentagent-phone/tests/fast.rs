@@ -1416,6 +1416,7 @@ async fn end_call_step3_goodbye_phrases_end_without_a_model_call() {
         "bye bye",
         "Talk later.",
         "That's all.",
+        "That’s all, thanks.",
         "That’s it, thanks.",
         "Hang up",
         "End the call.",

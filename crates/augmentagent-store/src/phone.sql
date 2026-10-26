@@ -174,3 +174,87 @@ CREATE TABLE IF NOT EXISTS phone_dispatch_jobs (
     result TEXT,
     PRIMARY KEY(call_id, task_id)
 );
+
+-- One immutable provider session per durably claimed phone relay.
+CREATE TABLE IF NOT EXISTS phone_live_sessions (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    session_id TEXT NOT NULL UNIQUE,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+);
+-- Separate audio receipt: chat delivery must not erase an unheard result.
+CREATE TABLE IF NOT EXISTS phone_live_dispatches (
+    call_id TEXT NOT NULL REFERENCES phone_live_sessions(call_id),
+    delegation_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    result TEXT,
+    delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+    PRIMARY KEY(call_id,delegation_id),
+    UNIQUE(call_id,task_id),
+    FOREIGN KEY(call_id,task_id) REFERENCES phone_dispatch_jobs(call_id,task_id)
+);
+
+-- Backend choice is fixed before dialing; absent rows are legacy calls.
+CREATE TABLE IF NOT EXISTS phone_voice_backends (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    backend TEXT NOT NULL CHECK(backend IN ('conversation_relay','openai_live'))
+);
+
+-- Private transcript outbox. Text is erased after durable chat acceptance;
+-- fingerprints retain replay protection without retaining another transcript.
+CREATE TABLE IF NOT EXISTS phone_live_history_batches (
+    id TEXT PRIMARY KEY,
+    attempt_order INTEGER NOT NULL DEFAULT 0,
+    call_id TEXT NOT NULL REFERENCES phone_calls(id),
+    text TEXT,
+    delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1))
+);
+CREATE TABLE IF NOT EXISTS phone_live_transcripts (
+    call_id TEXT NOT NULL REFERENCES phone_live_sessions(call_id),
+    event_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    user INTEGER NOT NULL CHECK(user IN (0,1)),
+    text TEXT,
+    batch_id TEXT REFERENCES phone_live_history_batches(id),
+    PRIMARY KEY(call_id,event_id)
+);
+
+-- One receipt per actual Live attempt; no final event means unknown usage.
+CREATE TABLE IF NOT EXISTS phone_live_usage (
+    call_id TEXT NOT NULL REFERENCES phone_calls(id),
+    phase TEXT NOT NULL CHECK(phase IN ('preflight','conversation')),
+    session_id TEXT UNIQUE,
+    end_trigger TEXT,
+    final_reason TEXT,
+    seconds REAL CHECK(seconds IS NULL OR seconds>=0),
+    error TEXT,
+    finalization_error TEXT,
+    PRIMARY KEY(call_id,phase)
+);
+
+-- Read-only spoken-summary retries never touch the native task state.
+CREATE TABLE IF NOT EXISTS phone_live_summary_jobs (
+    call_id TEXT NOT NULL,
+    delegation_id TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT,
+    next_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(call_id,delegation_id),
+    FOREIGN KEY(call_id,delegation_id) REFERENCES phone_live_dispatches(call_id,delegation_id)
+);
+
+-- Content-free playback checkpoints; collector closure is not proof of hearing.
+CREATE TABLE IF NOT EXISTS phone_live_playback (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    evidence TEXT NOT NULL,
+    collector_closed INTEGER NOT NULL CHECK(collector_closed IN (0,1))
+);
+
+-- A content-free warning survives capacity loss or private staging expiry.
+CREATE TABLE IF NOT EXISTS phone_live_history_gaps (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    notice_delivered INTEGER NOT NULL DEFAULT 0 CHECK(notice_delivered IN (0,1)),
+    attempt_order INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS phone_live_transcripts_pending
+ON phone_live_transcripts(call_id) WHERE text IS NOT NULL;
