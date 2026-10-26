@@ -143,7 +143,7 @@ fn readmit_reset_history_unlabels_comments_and_clears_only_the_matched_records()
             ]
         });
         let comment = calls.iter().position(|c| {
-            c[..3] == ["issue", "comment", issue]
+            c.starts_with(&["issue".into(), "comment".into(), issue.into()])
                 && c.last().is_some_and(|b| b.contains(RESET_MARKER))
         });
         let unlabel = unlabel.unwrap_or_else(|| panic!("#{issue} was not unlabelled: {calls:?}"));
