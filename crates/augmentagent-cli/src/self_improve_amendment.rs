@@ -80,7 +80,14 @@ fn validate_correction(
                     .contract
                     .allowed_paths
                     .iter()
-                    .any(|old| old.contains(path)),
+                    .any(|old| old.contains(path)
+                        && !matches!(
+                            (old, scope),
+                            (
+                                crate::autoship_contract::PathScope::File(_),
+                                crate::autoship_contract::PathScope::Directory(_)
+                            )
+                        )),
             "amendment expands implementation scope"
         );
     }
@@ -347,6 +354,72 @@ pub(super) async fn try_amend(
     resume_pending(root, control, source).await
 }
 
+fn staging_path(relative: &str, contract: &str) -> Result<PathBuf> {
+    let path = Path::new(relative);
+    Ok(path
+        .parent()
+        .context("harness parent missing")?
+        .join(format!(
+            ".autoship-amend-{}",
+            digest(format!("{contract}:{relative}").as_bytes())
+        )))
+}
+
+/// Same-directory rename is atomic even when the protected journal lives on a
+/// different filesystem. The deterministic staging name is authorized by Pending
+/// so abrupt death during write can be reconciled without trusting partial bytes.
+fn install_amended_atomic(
+    root: &Path,
+    relative: &str,
+    contents: &str,
+    contract: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    ensure!(harness_path(relative), "invalid amended harness path");
+    let root = root.canonicalize()?;
+    let relative_path = Path::new(relative);
+    let mut parent = root.clone();
+    for component in relative_path
+        .parent()
+        .context("harness parent missing")?
+        .components()
+    {
+        parent.push(component);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta) => ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "amended harness parent is not a real directory"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&parent)?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let staging = root.join(staging_path(relative, contract)?);
+    if let Ok(meta) = std::fs::symlink_metadata(&staging) {
+        ensure!(
+            meta.is_file()
+                && !meta.file_type().is_symlink()
+                && meta.nlink() == 1
+                && meta.uid() == unsafe { libc::geteuid() },
+            "amendment staging path is not private regular data"
+        );
+        std::fs::remove_file(&staging)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&staging)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&staging, root.join(relative))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 pub(super) async fn resume_pending(
     root: &Path,
     control: &Path,
@@ -379,6 +452,37 @@ pub(super) async fn resume_pending(
             == BaselineResult::Reproduced,
         "pending amendment lacks red baseline"
     );
+    let approved_proposal = parse_proposal_for(
+        &format!(
+            "```autoship-contract\n{}\n```",
+            serde_json::to_string(
+                pending
+                    .authority
+                    .proposal
+                    .as_ref()
+                    .context("pending authority proposal missing")?
+            )?
+        ),
+        source,
+    )?;
+    ensure!(
+        serde_json::to_value(&approved_proposal)? == serde_json::to_value(&pending.next.proposal)?,
+        "pending proposal differs from independently approved proposal"
+    );
+    validate_correction(
+        &pending.old,
+        &pending.next.proposal,
+        pending
+            .next
+            .baseline
+            .registration
+            .candidate_environment_id(),
+    )?;
+    ensure!(
+        pending.next.baseline.registration.baseline_head()
+            == pending.old.baseline.registration.baseline_head(),
+        "amendment changed original baseline"
+    );
     let current =
         original_manifest(control, source)?.context("amendment original manifest missing")?;
     let already_active =
@@ -396,6 +500,24 @@ pub(super) async fn resume_pending(
         .chain(pending.next.proposal.files.keys())
         .cloned()
         .collect();
+    let staging: std::collections::BTreeSet<String> = pending
+        .next
+        .proposal
+        .files
+        .keys()
+        .map(|relative| {
+            Ok(
+                staging_path(relative, pending.next.baseline.registration.contract_hash())?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .collect::<Result<_>>()?;
+    let tracked = trusted_git(root, &["ls-files", "-z"]).await?;
+    ensure!(
+        !tracked.split('\0').any(|path| staging.contains(path)),
+        "amendment staging name collides with tracked source"
+    );
     if !already_active {
         let changed = trusted_git(
             root,
@@ -409,7 +531,7 @@ pub(super) async fn resume_pending(
                 .split('\0')
                 .chain(untracked.split('\0'))
                 .filter(|p| !p.is_empty())
-                .all(|p| paths.contains(p)),
+                .all(|p| paths.contains(p) || staging.contains(p)),
             "candidate implementation changed during verifier amendment; new authority required"
         );
     }
@@ -442,13 +564,12 @@ pub(super) async fn resume_pending(
             );
         }
         if let Some(contents) = pending.next.proposal.files.get(relative) {
-            if target.exists() {
-                std::fs::write(&target, contents)?
-            } else {
-                let mut single = pending.next.proposal.clone();
-                single.files.retain(|p, _| p == relative);
-                install_harness(root, &single)?;
-            }
+            install_amended_atomic(
+                root,
+                relative,
+                contents,
+                pending.next.baseline.registration.contract_hash(),
+            )?;
         } else if target.exists() {
             std::fs::remove_file(target)?;
         }
@@ -590,6 +711,12 @@ mod tests {
         next.contract.criteria[0].requirement = "Return any result".into();
         assert!(validate_correction(&old, &next, "environment-b").is_err());
         next.contract.criteria = old.proposal.contract.criteria.clone();
+        next.contract.allowed_paths = vec![PathScope::Directory("behavior.py".into())];
+        assert!(
+            validate_correction(&old, &next, "environment-b").is_err(),
+            "a literal file scope cannot become a writable subtree"
+        );
+        next.contract.allowed_paths = old.proposal.contract.allowed_paths.clone();
         next.contract
             .allowed_paths
             .push(PathScope::Directory("unrelated".into()));
@@ -609,6 +736,71 @@ mod tests {
         next.contract.pull_request = Some(42);
         assert!(validate_correction(&old, &next, "environment-a").is_err());
     }
+    #[test]
+    fn interrupted_harness_staging_recovers_without_partial_target_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = "autoship_verifiers/regression.py";
+        let target = root.path().join(relative);
+        std::fs::create_dir(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old complete verifier").unwrap();
+        let staging = root
+            .path()
+            .join(staging_path(relative, "next-contract").unwrap());
+        std::fs::write(&staging, "partial").unwrap();
+        install_amended_atomic(
+            root.path(),
+            relative,
+            "new complete verifier",
+            "next-contract",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new complete verifier"
+        );
+        assert!(!staging.exists());
+        install_amended_atomic(
+            root.path(),
+            relative,
+            "new complete verifier",
+            "next-contract",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new complete verifier"
+        );
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&staging, "").unwrap();
+        install_amended_atomic(
+            root.path(),
+            relative,
+            "new complete verifier",
+            "next-contract",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new complete verifier"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amendment_staging_cannot_follow_worker_supplied_links() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("autoship_verifiers")).unwrap();
+        assert!(install_amended_atomic(
+            root.path(),
+            "autoship_verifiers/evil.py",
+            "content",
+            "contract"
+        )
+        .is_err());
+        assert!(!outside.path().join("evil.py").exists());
+    }
+
     #[test]
     fn immutable_amendment_artifacts_cannot_be_overwritten() {
         let control = tempfile::tempdir().unwrap();
