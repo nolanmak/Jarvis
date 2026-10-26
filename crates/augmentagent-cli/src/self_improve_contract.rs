@@ -293,6 +293,7 @@ fn compiler_control_inputs(root: &Path) -> Result<Vec<(String, String)>> {
 pub(super) async fn register_and_reproduce(
     root: &Path,
     proposal: ContractProposal,
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<BaselineEvidence> {
     let status = Command::new("/usr/bin/git")
         .args(["status", "--porcelain", "--untracked-files=all"])
@@ -309,7 +310,7 @@ pub(super) async fn register_and_reproduce(
     install_harness(root, &proposal)?;
     let registration =
         RegisteredContract::register(root, proposal.contract, head, environment_id(root)?)?;
-    let receipts = execute_registered(root, &registration).await?;
+    let receipts = execute_registered(root, &registration, audit).await?;
     match registration.baseline_result(&receipts)? {
         BaselineResult::Reproduced => Ok(BaselineEvidence {
             registration,
@@ -358,6 +359,7 @@ pub(super) fn persist_baseline(
 pub(super) async fn verify_candidate(
     root: &Path,
     evidence: &BaselineEvidence,
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<VerifierReceipt>> {
     ensure!(
         evidence
@@ -387,7 +389,7 @@ pub(super) async fn verify_candidate(
                 .environment_id,
         "verifier environment changed; re-register baseline"
     );
-    let receipts = execute_registered(root, &evidence.registration).await?;
+    let receipts = execute_registered(root, &evidence.registration, audit).await?;
     let binding = evidence.registration.binding(&actual_head(root).await?)?;
     ensure!(
         evidence
@@ -402,6 +404,7 @@ pub(super) async fn verify_candidate(
 async fn execute_registered(
     root: &Path,
     registration: &RegisteredContract,
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<VerifierReceipt>> {
     let root = root.canonicalize()?;
     let head = actual_head(&root).await?;
@@ -416,7 +419,7 @@ async fn execute_registered(
     for verifier in &registration.contract().verifiers {
         registration.verify_integrity(&root)?;
         let invocation = verifier.command.invocation()?;
-        let observation = isolated_observation(committed.path(), &target, invocation).await?;
+        let observation = isolated_observation(committed.path(), &target, invocation, audit).await?;
         ensure!(
             actual_head(&root).await? == head,
             "checkout changed while verifying"
@@ -498,6 +501,7 @@ async fn isolated_observation(
     root: &Path,
     target: &Path,
     invocation: crate::autoship_contract::Invocation,
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Observation> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let canonical_target = target.canonicalize()?;
@@ -584,16 +588,9 @@ async fn isolated_observation(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
-    let mut child = cmd.spawn()?;
-    struct Group(u32);
-    impl Drop for Group {
-        fn drop(&mut self) {
-            unsafe {
-                libc::kill(-(self.0 as i32), libc::SIGKILL);
-            }
-        }
-    }
-    let _group = Group(child.id().context("verifier process has no pid")?);
+    let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&cmd, Some(audit))?;
+    resources.admit("acceptance_verifier", Some(audit)).await?;
+    drop(child.stdin.take());
     async fn bounded(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         reader
@@ -616,6 +613,7 @@ async fn isolated_observation(
         )
     })
     .await;
+    resources.record_outcome("acceptance_verifier", Some(audit))?;
     if invocation.program == "cargo" {
         attest_registry(root, &daemon_home.join(".cargo/registry")).await?;
     }
@@ -670,7 +668,7 @@ mod tests {
         }
         .invocation()
         .unwrap();
-        let observation = isolated_observation(root.path(), target.path(), invocation)
+        let observation = isolated_observation(root.path(), target.path(), invocation, &test_resource_audit(target.path()))
             .await
             .unwrap();
         assert_eq!(observation.exit_code, Some(1), "{}", observation.stderr);
@@ -683,7 +681,7 @@ mod tests {
         }
         .invocation()
         .unwrap();
-        let observation = isolated_observation(root.path(), target.path(), invocation)
+        let observation = isolated_observation(root.path(), target.path(), invocation, &test_resource_audit(target.path()))
             .await
             .unwrap();
         assert_eq!(observation.exit_code, Some(0), "{}", observation.stderr);
@@ -924,7 +922,7 @@ pub(super) async fn prepare_acceptance_for(
         let proposal_result =
             proposal_with_retry(workflow, &baseline_root, source, scope, required_criteria).await;
         let result = match proposal_result {
-            Ok(proposal) => register_and_reproduce(&baseline_root, proposal.clone())
+            Ok(proposal) => register_and_reproduce(&baseline_root, proposal.clone(), &workflow.audit_logger())
                 .await
                 .map(|baseline| (proposal, baseline)),
             Err(error) => Err(error),
@@ -1046,7 +1044,7 @@ mod workflow_tests {
         )
         .unwrap();
         let command = &proposal.contract.verifiers[0].command;
-        let red = isolated_observation(root.path(), target.path(), command.invocation().unwrap())
+        let red = isolated_observation(root.path(), target.path(), command.invocation().unwrap(), &test_resource_audit(target.path()))
             .await
             .unwrap();
         let baseline = vec![registration
@@ -1086,7 +1084,7 @@ mod workflow_tests {
         .await
         .unwrap();
         let head = actual_head(root.path()).await.unwrap();
-        let green = isolated_observation(root.path(), target.path(), command.invocation().unwrap())
+        let green = isolated_observation(root.path(), target.path(), command.invocation().unwrap(), &test_resource_audit(target.path()))
             .await
             .unwrap();
         let candidate = vec![registration
@@ -1300,8 +1298,9 @@ pub(super) async fn verify_and_persist_candidate(
     prepared: &PreparedAcceptance,
     protected_control: &Path,
     writable_roots: &[PathBuf],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<CandidateReceiptReference> {
-    let receipts = verify_candidate(candidate, &prepared.baseline).await?;
+    let receipts = verify_candidate(candidate, &prepared.baseline, audit).await?;
     let binding = prepared
         .baseline
         .registration
@@ -1606,7 +1605,7 @@ pub(super) async fn verify_with_repair_for(
         }
         let verified = async {
             let mut reference =
-                verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree))
+                verify_and_persist_candidate(worktree, prepared, control, &worker_roots(worktree), &workflow.audit_logger())
                     .await?;
             workflow.bind_acceptance(prepared)?;
             workflow
@@ -1646,6 +1645,7 @@ pub(super) async fn verify_with_repair_for(
                 return Ok(reference);
             }
             Err(error) => {
+                if workflow.audit_logger().resource_capacity_seen() { return Err(error); }
                 let detail = format!("{error:#}");
                 if round < 2 {
                     if let Some(amended) = amendment::try_amend(
@@ -1735,7 +1735,7 @@ pub(super) async fn verify_with_repair_for(
                 .await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
-                verification_gate(worktree).await?;
+                verification_gate(worktree, &workflow.audit_logger()).await?;
             }
         }
     }

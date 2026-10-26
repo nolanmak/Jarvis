@@ -262,7 +262,7 @@ async fn git_fixture(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
-async fn prepare_fixture_kind(root: &Path, control: &Path, issue: u64, seed_defect: bool) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
+async fn prepare_fixture_kind(root: &Path, control: &Path, issue: u64, seed_defect: bool, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
     git_fixture(&root, &["init", "-q"]).await?;
     git_fixture(&root, &["config", "user.name", "Synthetic Canary"]).await?;
     git_fixture(&root, &["config", "user.email", "canary@example.invalid"]).await?;
@@ -288,7 +288,7 @@ async fn prepare_fixture_kind(root: &Path, control: &Path, issue: u64, seed_defe
         ),
         issue,
     )?;
-    let baseline = acceptance::register_and_reproduce(&root, proposal.clone()).await?;
+    let baseline = acceptance::register_and_reproduce(&root, proposal.clone(), audit).await?;
     acceptance::persist_baseline(&control.join("baseline.json"), &baseline, &[root.to_path_buf()])?;
     let prepared = acceptance::PreparedAcceptance { proposal, baseline };
     std::fs::write(
@@ -304,17 +304,17 @@ async fn prepare_fixture_kind(root: &Path, control: &Path, issue: u64, seed_defe
     git_fixture(&root, &["add", "."]).await?;
     git_fixture(&root, &["commit", "-qm", "candidate"]).await?;
     let reference =
-        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.to_path_buf()])
+        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.to_path_buf()], audit)
             .await?;
     Ok((prepared,reference))
 }
 
 async fn prepare_fixture(root: &Path, control: &Path) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
-    prepare_fixture_kind(root, control, 840, true).await
+    prepare_fixture_kind(root, control, 840, true, &standalone_resource_audit(root)?).await
 }
 #[cfg(test)]
 pub(super) async fn shipping_fixture(root: &Path, control: &Path, issue: u64) -> Result<(acceptance::PreparedAcceptance, acceptance::CandidateReceiptReference)> {
-    prepare_fixture_kind(root, control, issue, false).await
+    prepare_fixture_kind(root, control, issue, false, &test_resource_audit(control)).await
 }
 
 async fn probe(id: &str) -> Result<crate::autoship_review::ReviewEvidence> {
@@ -567,7 +567,7 @@ mod tests {
         let root=dir.path().join("candidate");
         let control=dir.path().join("control");
         std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&control).unwrap();
-        let (prepared,reference)=prepare_fixture(&root,&control).await.unwrap();
+        let (prepared,reference)=prepare_fixture_kind(&root,&control,840,true,&test_resource_audit(&control)).await.unwrap();
         let call_bound=aligned_review::diagnostic_call_bound(&root).await.unwrap();
         assert!(call_bound<=12,"complete native probe, including adjudicator correction, must fit the default observation budget: {call_bound}");
         assert!(reference.alignment.is_none());

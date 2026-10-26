@@ -2160,6 +2160,45 @@ mod tests {
         assert!(git_binding(dir.path(), "C1", "rust-a", &[]).await.is_err());
     }
     #[tokio::test]
+    async fn unadmitted_verification_keeps_unpaid_capacity_checkpoint() {
+        const CHILD: &str = "AUTOSHIP_GATE_CAPACITY_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = control_dir();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::workflow::tests::unadmitted_verification_keeps_unpaid_capacity_checkpoint", "--nocapture"])
+                .env(CHILD, isolated.path())
+                .env("XDG_STATE_HOME", isolated.path().join("state"))
+                .env_remove("AUGMENTAGENT_RUN_RESOURCES")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(isolated.path().join("executed").exists());
+            return;
+        }
+        let dir = repo();
+        let control = control_dir();
+        let path = control.path().join("workflow.db");
+        let mut guard = WorkflowGuard::acquire_at(&path, Start {
+            repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+            source_issue: Some(77), pr: None, branch: "fixture", contract: "C1", environment: "test",
+        }, millis()).await.unwrap().unwrap();
+        guard.checkpoint(Stage::Verify, "candidate_committed", "verify", 0, &["protected-candidate".into()]).await.unwrap();
+        let before = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let error = super::super::run_sandboxed("/bin/sh", &["-c", "touch forbidden-execution"], dir.path(),
+            &[("PATH".into(), "/usr/bin:/bin".into())], &guard.audit_logger()).await.unwrap_err();
+        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<augmentagent_channel_core::reasoner::ReasonerError>(),
+            Some(augmentagent_channel_core::reasoner::ReasonerError::ResourceCapacity { .. }))));
+        assert!(!dir.path().join("forbidden-execution").exists());
+        assert_eq!(super::super::baseline_infra_reason(&format!("{error:#}")), Some("declared run resource capacity"));
+        let after = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.checkpoint.next.action, "await_capacity");
+        assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+        assert_eq!(after.model_calls, before.model_calls);
+        assert!(guard.validate_before_side_effect().is_err());
+        std::fs::write(PathBuf::from(std::env::var_os(CHILD).unwrap()).join("executed"), "ok").unwrap();
+    }
+
+    #[tokio::test]
     async fn capacity_exhaustion_preserves_evidence_and_blocks_paid_or_publication_work() {
         let dir=repo(); let control=control_dir(); let path=control.path().join("workflow.db");
         let start = || Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"};

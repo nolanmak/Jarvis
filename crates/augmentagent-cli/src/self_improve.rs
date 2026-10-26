@@ -708,18 +708,32 @@ pub(crate) fn env_name_is_secret(name: &str) -> bool {
 //     path operates on an ephemeral throwaway clone. Secret-stripping is the
 //     defense-in-depth control for the honest-fix path, not the sole barrier
 //     against a hostile author.
+fn standalone_resource_audit(root: &Path) -> Result<Arc<augmentagent_channel_core::AuditLogger>> {
+    let audit = workflow::workflow_audit(&workflow::path(), &format!("verification-{}", uuid::Uuid::new_v4()), Some(root))?;
+    audit.require_run_resources()?;
+    Ok(audit)
+}
+
+// Explicit fixture-only opt-out; production/live probes use required loggers.
+#[cfg(test)]
+fn test_resource_audit(control: &Path) -> Arc<augmentagent_channel_core::AuditLogger> {
+    workflow::workflow_audit(&control.join("fixture-audit-state"), &format!("fixture-{}", uuid::Uuid::new_v4()), None).unwrap()
+}
+
 async fn run_sandboxed(
     cmd: &str,
     args: &[&str],
     cwd: &Path,
     env: &[(String, String)],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<(bool, String, String)> {
-    run_sandboxed_bounded(cmd, args, cwd, env, augmentagent_channel_core::reasoner::reasoner_timeout() * 2).await
+    run_sandboxed_bounded(cmd, args, cwd, env, augmentagent_channel_core::reasoner::reasoner_timeout() * 2, audit).await
 }
 
 async fn run_sandboxed_bounded(cmd: &str, args: &[&str], cwd: &Path, env: &[(String, String)],
-    budget: std::time::Duration) -> Result<(bool, String, String)> {
-    let child = Command::new(cmd)
+    budget: std::time::Duration, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<(bool, String, String)> {
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -728,17 +742,13 @@ async fn run_sandboxed_bounded(cmd: &str, args: &[&str], cwd: &Path, env: &[(Str
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .kill_on_drop(true)
-        .process_group(0)
-        .spawn()
+        .process_group(0);
+    let (mut child, resources) = augmentagent_channel_core::run_resources::spawn_command(&command, Some(audit))
         .with_context(|| format!("spawn (sandboxed) {cmd} {args:?}"))?;
-    // Kill the whole process group on cancellation/pressure, including cargo
-    // underneath the shell pipeline. A dropped output future alone only kills
-    // the shell and can leave a writer alive after its storage lease drops.
-    struct Group(u32);
-    impl Drop for Group {
-        fn drop(&mut self) { unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) }; }
-    }
-    let _group = Group(child.id().context("spawned gate has no pid")?);
+    resources.admit("build_gate", Some(audit)).await?;
+    drop(child.stdin.take());
+    // The resource guard owns the supervised tree, including descendants that
+    // detach from the shell group. Keep it alive through output collection.
     let env_path = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, value)| {
         let path = PathBuf::from(value); if path.is_absolute() { path } else { cwd.join(path) }
     });
@@ -747,7 +757,9 @@ async fn run_sandboxed_bounded(cmd: &str, args: &[&str], cwd: &Path, env: &[(Str
     let output = async { Ok::<_, anyhow::Error>(child.wait_with_output().await?) };
     let out = tokio::time::timeout(budget,
         crate::build_storage::watch_reserve_roots(target.as_deref(), temp.as_deref(), output))
-        .await.context("verification invocation timed out; preserve candidate and retry stage")??;
+        .await.context("verification invocation timed out; preserve candidate and retry stage")?;
+    resources.record_outcome("build_gate", Some(audit))?;
+    let out = out?;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -4577,7 +4589,7 @@ fn changed_crates(paths: &str) -> Option<Vec<String>> {
 /// 30+ untouched crates after every round — ~20 of the 49 minutes of a
 /// three-round run. The FULL gate still runs exactly once before anything is
 /// pushed or merged; this trims the redundancy, not the bar.
-async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
+async fn verification_gate_targeted(worktree: &Path, crates: &[String], audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     gate_disk_guard()?;
     let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
     let mut env = gate_env();
@@ -4593,6 +4605,7 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
         &["-lc", &gate_sh(&format!("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4606,6 +4619,7 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
         ))],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4616,14 +4630,14 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
 
 /// Gate for an intermediate revision round: targeted when the diff stays
 /// inside `crates/`, full otherwise.
-async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
+async fn gate_for_round(worktree: &Path, changed_paths: &str, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     match changed_crates(changed_paths) {
-        Some(crates) => verification_gate_targeted(worktree, &crates).await,
-        None => verification_gate(worktree).await,
+        Some(crates) => verification_gate_targeted(worktree, &crates, audit).await,
+        None => verification_gate(worktree, audit).await,
     }
 }
 
-async fn verification_gate(worktree: &Path) -> Result<()> {
+async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
     gate_disk_guard()?;
     let _storage = crate::build_storage::admit(worktree, &crate::build_storage::effective_target(worktree)).await?;
     // #300 — Strip provider secrets from the gate's child env. `cargo
@@ -4638,6 +4652,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
         &["-lc", &gate_sh("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4649,6 +4664,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
         &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace -- --test-threads=1 2>&1 | tail -40")],
         worktree,
         &env,
+        audit,
     )
     .await?;
     if !ok {
@@ -4667,13 +4683,14 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
             &["-lc", &gate_sh("npm ci --no-audit --no-fund 2>&1 | tail -5")],
             worktree,
             &env,
+            audit,
         )
         .await?;
         if !ok {
             bail!("npm ci failed:\n{o}{e}", o = _o.trim());
         }
         let (ok, _o, e) =
-            run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env)
+            run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env, audit)
                 .await?;
         if !ok {
             bail!("npm run build failed:\n{o}{e}", o = _o.trim());
@@ -4945,6 +4962,7 @@ async fn baseline_failures(
     repo_root: &Path,
     pkgs: &[String],
     tests: &[String],
+    audit: &Arc<augmentagent_channel_core::AuditLogger>,
 ) -> Result<Vec<String>> {
     if pkgs.is_empty() || tests.is_empty() {
         bail!("baseline: no package or test names to target");
@@ -4989,6 +5007,7 @@ async fn baseline_failures(
         ))],
         &worktree,
         &env,
+        audit,
     )
     .await;
     reclaim_worktree(repo_root, &worktree, &branch).await;
@@ -5007,7 +5026,7 @@ async fn baseline_failures(
 /// `None` when there is nothing to compare (compile error, unparsable
 /// output, no `origin/main`, baseline could not run) — the caller then
 /// treats the failure as the diff's, exactly as before #931.
-async fn preexisting_on_main(repo_root: &Path, gate_err: &str) -> Option<BaselineVerdict> {
+async fn preexisting_on_main(repo_root: &Path, gate_err: &str, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Option<BaselineVerdict> {
     let worktree_red = failing_tests(gate_err);
     if worktree_red.is_empty() {
         return None;
@@ -5018,7 +5037,7 @@ async fn preexisting_on_main(repo_root: &Path, gate_err: &str) -> Option<Baselin
     let mut cache = BaselineCache::load(&path);
     let missing = cache.unchecked(&sha, &worktree_red);
     if !missing.is_empty() {
-        match baseline_failures(repo_root, &pkgs, &missing).await {
+        match baseline_failures(repo_root, &pkgs, &missing, audit).await {
             Ok(red) => {
                 cache.record(&sha, &missing, &red);
                 cache.save(&path);
@@ -5147,7 +5166,7 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
     if !ok {
         bail!("baseline: worktree add from origin/main failed: {e}");
     }
-    let verdict = verification_gate(&worktree).await;
+    let verdict = verification_gate(&worktree, &standalone_resource_audit(&worktree)?).await;
     reclaim_worktree(repo_root, &worktree, &branch).await;
     Ok(verdict)
 }
@@ -6913,17 +6932,18 @@ async fn resume_draft_pr(
         // (#870) — the full gate runs once more before any merge.
         workflow.transition(Stage::Verify, "verification_started", "run_verifier", 0).await?;
         let gate_result = if rounds_done == 0 {
-            verification_gate(&worktree).await
+            verification_gate(&worktree, &workflow.audit_logger()).await
         } else {
             let (_ok, names, _) =
                 run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
-            gate_for_round(&worktree, &names).await
+            gate_for_round(&worktree, &names, &workflow.audit_logger()).await
         };
         if let Err(gate_err) = gate_result {
+            if workflow.audit_logger().resource_capacity_seen() { return Err(gate_err); }
             // #931 — a failure `main` already has is not this draft's; do
             // not spend a repair round on it or count an attempt. The
             // ledger mark at the top of this fn already moves the picker on.
-            let verdict = preexisting_on_main(repo_root, &gate_err.to_string()).await;
+            let verdict = preexisting_on_main(repo_root, &gate_err.to_string(), &workflow.audit_logger()).await;
             if let Some(v) = verdict.as_ref().filter(|v| v.introduced.is_empty()) {
                 workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                 return Ok(RunReport::triage(format!(
@@ -7085,7 +7105,7 @@ async fn resume_draft_pr(
                 &issue.title, &worktree, &mut prepared_acceptance, &acceptance_control, structured, &mut workflow).await? {
                 previous_review = None; prior_qa = None; prior_notes = None;
                 resumed_criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
-                verification_gate(&worktree).await?;
+                verification_gate(&worktree, &workflow.audit_logger()).await?;
                 continue;
             }
             workflow.record_review(&format!("resume-structured-{review_attempt}"), independent.approved(),
@@ -7165,7 +7185,7 @@ async fn resume_draft_pr(
             if rounds_done > 0 {
                 // Revisions were verified crate-targeted; nothing merges
                 // without the full suite passing once (#870).
-                if let Err(gate_err) = verification_gate(&worktree).await {
+                if let Err(gate_err) = verification_gate(&worktree, &workflow.audit_logger()).await {
                     workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
                     let _ = run(
                         &gh,
@@ -8403,10 +8423,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // compiler/test output verbatim and repairs while budget remains. The
         // rounds come out of the same revise budget the review loop draws on,
         // so a run never spends more revision calls than it could before.
-        let mut gate_result = verification_gate(&worktree).await;
+        let mut gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await;
         while let Err(gate_err) = &gate_result {
+            if workflow_guard.audit_logger().resource_capacity_seen() { return Err(gate_result.unwrap_err()); }
             let gate_text = format!("{gate_err:#}");
-            let verdict = preexisting_on_main(repo_root, &gate_text).await;
+            let verdict = preexisting_on_main(repo_root, &gate_text, &workflow_guard.audit_logger()).await;
             let preexisting_only = verdict.as_ref().is_some_and(|v| v.introduced.is_empty())
                 && !is_red_main_issue(&issue.body);
             if !gate_repair_wanted(round, max_rounds, &gate_text, preexisting_only) {
@@ -8455,7 +8476,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     let names = run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?.1;
                     gated = touches_verify_gated_path(&names);
                     summary = format!("{summary}\n\nGate repair {round}: {}", truncate(&rs, 200));
-                    gate_result = verification_gate(&worktree).await;
+                    gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await;
                 }
             }
         }
@@ -8467,7 +8488,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // #931 — a failure `main` already has is not this diff's. Leave
             // unbilled and unrecorded (no attempt, no comment); the ledger mark
             // alone keeps the picker from re-buying the same build this tick.
-            if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string()).await {
+            if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string(), &workflow_guard.audit_logger()).await {
                 // #932 — except for the red-main issue itself: those failures
                 // ARE its job, so a still-red gate is a real attempt that must
                 // accumulate toward gave-up instead of retrying daily forever.
@@ -8594,7 +8615,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     acceptance_receipt = Some(acceptance::verify_with_repair(reasoner.as_ref(), &issue, &worktree,
                         &mut prepared_acceptance, &acceptance_control, &mut workflow_guard).await?);
                     criteria = prepared_acceptance.proposal.contract.criteria.iter().map(|criterion| criterion.requirement.clone()).collect();
-                    verification_gate(&worktree).await?;
+                    verification_gate(&worktree, &workflow_guard.audit_logger()).await?;
                     let (ok, revised_diff, error) = run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
                     anyhow::ensure!(ok, "amended candidate diff unavailable: {error}");
                     lines = diff_line_count(&revised_diff); full_diff = revised_diff;
@@ -8760,7 +8781,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     }
                     let (_ok, names2, _) =
                         run("git", &["diff", "--cached", "--name-only", candidate_base], &worktree).await?;
-                    if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
+                    if let Err(gate_err) = gate_for_round(&worktree, &names2, &workflow_guard.audit_logger()).await {
                         warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
                         // #873 — a red gate gets a repair round while budget
                         // remains: red→fix is the other half of TDD, and a
@@ -8930,7 +8951,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             // Intermediate rounds ran the targeted gate (#870); everything that
             // ships — or even lands as a PR claiming workspace-pass — gets the
             // FULL suite exactly once here.
-            if let Err(gate_err) = verification_gate(&worktree).await {
+            if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {
                 warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
                 let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or_else(|_| Tally::uncounted());
                 if attempts.exhausted() {
@@ -10405,7 +10426,7 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
     let _storage = crate::build_storage::admit(workspace, &crate::build_storage::effective_target(workspace)).await?;
     let mut env = gate_env();
     env.push((crate::build_storage::PARENT_LEASE_ENV.into(), _storage.parent_proof(&crate::build_storage::effective_target(workspace))?));
-    let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env).await?;
+    let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env, &standalone_resource_audit(workspace)?).await?;
     if !ok {
         bail!("build_cmd `{cmd}` failed:\n{}", truncate(&e, 1500));
     }
@@ -11337,6 +11358,8 @@ impl AttemptRecord {
 /// charged; a failure `main` already has is handled by #931 instead.
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
+        ("resource capacity", "declared run resource capacity"),
+        ("resource_capacity", "declared run resource capacity"),
         ("no space left on device", "disk full"),
         // #1407 — the pre-gate free-space floor (`disk::LOW_DISK_REFUSAL`).
         ("gate refused: low disk", "disk low"),
@@ -13112,7 +13135,7 @@ for tool, arguments in [
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("candidate"), "keep work").unwrap();
         let result = run_sandboxed_bounded("/bin/sh", &["-c", "sleep 0.2; touch late-write"],
-            dir.path(), &[("PATH".into(), "/usr/bin:/bin".into())], std::time::Duration::from_millis(20)).await;
+            dir.path(), &[("PATH".into(), "/usr/bin:/bin".into())], std::time::Duration::from_millis(20), &test_resource_audit(dir.path())).await;
         assert!(format!("{:#}", result.unwrap_err()).contains("verification invocation timed out"));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!dir.path().join("late-write").exists(), "timed-out descendant must be terminated");
@@ -18156,7 +18179,7 @@ else:
         let start = src.find("pub async fn run_once(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
-        let gate = body.find("if let Err(gate_err) = verification_gate(&worktree).await {").expect("gate arm");
+        let gate = body.find("if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {").expect("gate arm");
         // The arm's first return is #931's unbilled "red on main too" exit;
         // the charged path (after record_attempt) must be the billed one.
         let charged = gate + body[gate..].find("record_attempt(").expect("gate record");

@@ -139,7 +139,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     git(&root, &["add", "."]).await?;
     git(&root, &["commit", "-qm", "native builder candidate"]).await?;
     let mut reference =
-        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()])
+        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()], &guard.audit_logger())
             .await?;
     guard
         .checkpoint(
@@ -208,7 +208,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
         "old exact-head evidence accepted after new commit"
     );
     let seeded =
-        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()])
+        acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()], &guard.audit_logger())
             .await?;
     assert!(
         acceptance::assert_receipt_current(&root, &prepared, &seeded)

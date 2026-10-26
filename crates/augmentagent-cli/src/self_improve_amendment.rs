@@ -335,7 +335,7 @@ pub(super) async fn try_amend(
                 baseline_environment,
             )?
         };
-        let receipts = execute_registered(&baseline_root, &registration).await?;
+        let receipts = execute_registered(&baseline_root, &registration, &workflow.audit_logger()).await?;
         ensure!(
             registration.baseline_result(&receipts)? == BaselineResult::Reproduced,
             "amended verifier failed intended-red baseline: {}",
@@ -354,6 +354,7 @@ pub(super) async fn try_amend(
     let next = match reproduce {
         Ok(next) => next,
         Err(error) => {
+            if workflow.audit_logger().resource_capacity_seen() { return Err(error); }
             immutable(
                 control,
                 &format!(
@@ -918,7 +919,7 @@ pub(crate) async fn migrate_fixture(root:&Path, control:&Path, old:&PreparedAcce
     proposal.contract.revision=old.proposal.contract.revision+1;
     let scratch=tempfile::tempdir()?;let baseline=scratch.path().join("baseline");
     trusted_git(root,&["worktree","add","--detach",baseline.to_str().unwrap(),old.baseline.registration.baseline_head()]).await?;
-    let measured=register_and_reproduce(&baseline,proposal.clone()).await;
+    let measured=register_and_reproduce(&baseline,proposal.clone(), &test_resource_audit(control)).await;
     trusted_git(root,&["worktree","remove","--force",baseline.to_str().unwrap()]).await?;
     let next=PreparedAcceptance{proposal:proposal.clone(),baseline:measured?};
     augmentagent_channel_core::autoship_write_scope::register(root,old.baseline.registration.contract_hash(),old.proposal.contract.allowed_paths.iter().map(|scope| {

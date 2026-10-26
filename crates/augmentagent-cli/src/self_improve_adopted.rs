@@ -340,7 +340,7 @@ async fn execute(
             .iter()
             .map(|criterion| criterion.requirement.clone())
             .collect();
-        verification_gate(worktree).await?;
+        verification_gate(worktree, &guard.audit_logger()).await?;
         guard
             .transition(Stage::Review, "adopted_review", "collect_reviews", 0)
             .await?;
