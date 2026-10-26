@@ -1835,7 +1835,7 @@ fn ci_checks_green(raw: &str) -> Option<bool> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
     let required: Vec<_> = rows.iter().filter(|r| !is_optional_review_check(r)).collect();
     if required.is_empty() { return None; }
-    Some(required.iter().all(|r| matches!(
+    Some(required.iter().all(|r| r["autoship_advisory_identity_unknown"] != true && matches!(
         r.get("state").and_then(serde_json::Value::as_str),
         Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
     )))
@@ -1845,7 +1845,7 @@ fn ci_checks_green(raw: &str) -> Option<bool> {
 /// not findings, and a failed GitHub read never becomes an approval.
 fn failed_ci_checks(raw: &str) -> Vec<(String, Option<u64>)> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(raw).unwrap_or_default();
-    rows.iter().filter(|r| r["bucket"] == "fail" && !is_optional_review_check(r)).take(5).map(|r| {
+    rows.iter().filter(|r| r["bucket"] == "fail" && r["autoship_advisory_identity_unknown"] != true && !is_optional_review_check(r)).take(5).map(|r| {
         let name = r["name"].as_str().unwrap_or("unnamed check").to_string();
         let job = r["link"].as_str().and_then(|link| link.split_once("/job/"))
             .and_then(|(_, id)| id.parse::<u64>().ok());

@@ -89,9 +89,12 @@ fn approval_disposition(head: &str, reviewed_base: Option<&str>, remote_main: Op
     if mergeable == Some("CONFLICTING") { return Repair; }
     if remote_main.is_some_and(|base| base != reviewed_base) { return Repair; }
     let rows = checks.and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok());
-    if rows.as_ref().is_some_and(|rows| rows.iter().any(|row| !is_optional_review_check(row)
+    if rows.as_ref().is_some_and(|rows| rows.iter().any(|row| row["autoship_advisory_identity_unknown"] != true && !is_optional_review_check(row)
         && (row["bucket"] == "fail" || matches!(row["state"].as_str(),Some("FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "ERROR"))))) {
         return Repair;
+    }
+    if rows.as_ref().is_some_and(|rows|rows.iter().any(|row|row["autoship_advisory_identity_unknown"]==true)) {
+        return Free("advisory-check-evidence-unavailable");
     }
     if remote_main.is_none() || remote_head.is_none() || mergeable != Some("MERGEABLE") {
         return Free("merge-evidence-unavailable");
@@ -252,7 +255,7 @@ elif args[:2]==['pr','checks']:
  out=[{'name':'tests','state':'SUCCESS','bucket':'pass'},{'name':name,'state':'FAILURE','bucket':'fail','link':'https://github.com/o/r/actions/runs/1/job/2','autoship_optional_workflow':True}]
 elif args[0]=='api':
  endpoint=args[1]
- if mode=='unknown':out={'status':'403','message':'Forbidden'}
+ if mode in ('unknown','unknown_with_ci'):out={'status':'403','message':'Forbidden'}
  elif endpoint.endswith('/rules/branches/main'):out=[{'type':'required_status_checks','parameters':{'required_status_checks':[{'context':name}]}}] if mode=='required' else []
  elif endpoint.endswith('/branches/main/protection'):out={'status':'404','message':'Branch not protected'}
  elif endpoint.endswith('/pulls/7'):out={'head':{'sha':'head'}}
@@ -261,10 +264,11 @@ elif args[0]=='api':
  elif endpoint=='repos/{owner}/{repo}':out={'full_name':'o/r'}
  else:raise AssertionError(endpoint)
 else:raise AssertionError(args)
+if mode=='unknown_with_ci' and args[:2]==['pr','checks']:out[0].update(state='FAILURE',bucket='fail')
 print(json.dumps(out))
 "#).unwrap();
         std::fs::set_permissions(&gh,std::fs::Permissions::from_mode(0o700)).unwrap();
-        for (mode,expected) in [("optional",Free("approved-awaiting-free-merge")),("required",Repair),("different",Repair),("unknown",Repair)] {
+        for (mode,expected) in [("optional",Free("approved-awaiting-free-merge")),("required",Repair),("different",Repair),("unknown",Free("advisory-check-evidence-unavailable")),("unknown_with_ci",Repair),("optional",Free("approved-awaiting-free-merge"))] {
             std::fs::write(root.join("mode"),mode).unwrap();
             assert_eq!(disposition_from_remote(root,gh.to_str().unwrap(),"head",Some("base"),Some("base"),7).await,expected,"{mode}");
         }
@@ -272,11 +276,13 @@ print(json.dumps(out))
         assert!(calls.contains("actions/jobs/2"));
         assert!(calls.contains("rules/branches/main"));
         // A forged exemption cannot survive an unavailable policy reader.
+        std::fs::write(root.join("mode"),"unknown").unwrap();
         let raw=r#"[{"name":"Claude review (comment-only)","state":"PENDING","autoship_optional_workflow":true,"autoship_required_context":true}]"#;
         let sanitized=optional_checks::classify_with_gh(root,gh.to_str().unwrap(),7,raw).await;
         assert!(!sanitized.contains("autoship_optional_workflow"));
         assert!(!sanitized.contains("autoship_required_context"));
         assert_eq!(ci_checks_green(&sanitized),Some(false));
+        assert!(failed_ci_checks(&sanitized).is_empty(),"unknown advisory identity must not trigger paid code repair");
     }
 
     fn fixture_git(root:&Path,args:&[&str])->String {

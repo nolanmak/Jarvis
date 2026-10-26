@@ -42,6 +42,13 @@ fn optional(
     head: &str,
     required: &BTreeSet<String>,
 ) -> bool {
+    !row["name"]
+        .as_str()
+        .is_some_and(|name| required.contains(name))
+        && identity(row, job, run, repo, head)
+        && run["path"] == WORKFLOW
+}
+fn identity(row: &Value, job: &Value, run: &Value, repo: &str, head: &str) -> bool {
     let Some(name) = row["name"].as_str() else {
         return false;
     };
@@ -51,15 +58,17 @@ fn optional(
     let Some(run_id) = run["id"].as_u64() else {
         return false;
     };
-    !required.contains(name)
-        && job["name"] == name
+    job["name"] == name
         && job["run_id"] == run_id
         && run["repository"]["full_name"] == repo
         && run["head_sha"] == head
-        && run["path"] == WORKFLOW
+        && run["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with(".github/workflows/"))
         && row["link"] == format!("https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}")
 }
-/// Unknown API evidence leaves every job in the ordinary mandatory check path.
+/// Unknown advisory identity blocks merge but is a free evidence dependency,
+/// never an instruction to repair candidate code.
 /// The marker is set only here, on controller-created rows from `gh pr checks`.
 pub(super) async fn classify(root: &Path, pr: u64, raw: &str) -> String {
     classify_with_gh(root, &gh_bin(), pr, raw).await
@@ -72,6 +81,19 @@ pub(super) async fn classify_with_gh(root: &Path, gh: &str, pr: u64, raw: &str) 
         if let Some(object) = row.as_object_mut() {
             object.remove("autoship_optional_workflow");
             object.remove("autoship_required_context");
+            object.remove("autoship_advisory_identity_unknown");
+        }
+    }
+    for row in &mut rows {
+        if matches!(
+            row["name"].as_str(),
+            Some(
+                "Eligibility gate"
+                    | "Claude review (comment-only)"
+                    | "No-op (no secret configured)"
+            )
+        ) {
+            row["autoship_advisory_identity_unknown"] = true.into();
         }
     }
     let sanitized = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
@@ -87,6 +109,7 @@ pub(super) async fn classify_with_gh(root: &Path, gh: &str, pr: u64, raw: &str) 
     for row in &mut rows {
         if row["name"].as_str().is_some_and(|n| required.contains(n)) {
             row["autoship_required_context"] = true.into();
+            row["autoship_advisory_identity_unknown"] = false.into();
         }
     }
     let Some(repository) = api(root, gh, "repos/{owner}/{repo}").await else {
@@ -151,6 +174,9 @@ pub(super) async fn classify_with_gh(root: &Path, gh: &str, pr: u64, raw: &str) 
             runs.insert(run_id, run.clone());
             run
         };
+        if identity(row, &job, &run, repo, head) {
+            row["autoship_advisory_identity_unknown"] = false.into();
+        }
         if optional(row, &job, &run, repo, head, &required) {
             row["autoship_optional_workflow"] = true.into();
         }
