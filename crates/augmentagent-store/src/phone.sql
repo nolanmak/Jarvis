@@ -230,3 +230,14 @@ CREATE TABLE IF NOT EXISTS phone_live_usage (
     finalization_error TEXT,
     PRIMARY KEY(call_id,phase)
 );
+
+-- Read-only spoken-summary retries never touch the native task state.
+CREATE TABLE IF NOT EXISTS phone_live_summary_jobs (
+    call_id TEXT NOT NULL,
+    delegation_id TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT,
+    next_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(call_id,delegation_id),
+    FOREIGN KEY(call_id,delegation_id) REFERENCES phone_live_dispatches(call_id,delegation_id)
+);

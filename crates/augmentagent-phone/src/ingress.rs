@@ -38,6 +38,11 @@ pub struct AgentError;
 /// durable delivery outbox. Never create a separate phone-only model history.
 #[async_trait]
 pub trait ConversationAgent: Send + Sync {
+    /// Summarize completed result data without tools, chat history, or a new
+    /// native task. The caller enforces a deadline and a 500-byte output cap.
+    async fn summarize_live_result(&self, _call: &PhoneCall, _result: &str) -> Result<String, AgentError> {
+        Err(AgentError)
+    }
     /// Resume a persisted task or retry its result delivery, without redialing.
     async fn resume_task(&self, _call: &PhoneCall, _task_id: &str) -> Result<(), AgentError> {
         Err(AgentError)

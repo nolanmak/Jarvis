@@ -2010,7 +2010,7 @@ impl Store {
             if !live_binding(tx, call_id, session_id)? {
                 return Ok(Vec::new());
             }
-            let mut statement = tx.prepare("SELECT delegation_id,result FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 AND result IS NOT NULL ORDER BY rowid LIMIT 128")?;
+            let mut statement = tx.prepare("SELECT delegation_id,result FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 AND result IS NOT NULL AND length(CAST(result AS BLOB))<=500 ORDER BY rowid LIMIT 128")?;
             let rows = statement.query_map([call_id], |r| {
                 Ok(PhoneLiveResult {
                     delegation_id: r.get(0)?,
@@ -2120,3 +2120,7 @@ pub use live_history::{LiveHistoryBatch, LiveTranscript};
 #[path = "phone_live_usage.rs"]
 mod live_usage;
 pub use live_usage::{LiveUsageFinal, LiveUsagePhase, PhoneLiveUsage};
+
+#[path = "phone_live_summary.rs"]
+mod live_summary;
+pub use live_summary::PhoneLiveSummaryJob;

@@ -143,7 +143,7 @@ async fn conversation(
                     }
                     for result in coordinator.pending_results()? {
                         if coordinator.reply_pending(&result.delegation_id) {continue;}
-                        let content=if result.result.len()<=500 {result.result.as_str()} else {"There's an update on your task in our chat. The full result is available there."};
+                        let content=result.result.as_str();
                         let event_id=connection.commentary(&result.delegation_id,content).await?;
                         coordinator.track_reply(&event_id,&result.delegation_id)?;
                     }

@@ -307,3 +307,68 @@ async fn transcript_delivery_retries_off_audio_path_and_survives_call_end() {
     assert_eq!(attempts[0].1.matches("Check my calendar.").count(), 1);
     f.runtime.take().unwrap().shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn long_result_is_summarized_outside_audio_and_full_chat_result_is_preserved() {
+    use augmentagent_phone::ingress::{AgentError, ConversationAgent, SpeechSender};
+    use augmentagent_store::phone::PhoneCall;
+    use tokio_util::sync::CancellationToken;
+    struct Agent;
+    #[async_trait]
+    impl ConversationAgent for Agent {
+        async fn answer(
+            &self,
+            _: &PhoneCall,
+            _: &str,
+            _: &str,
+            _: SpeechSender,
+            _: CancellationToken,
+        ) -> Result<String, AgentError> {
+            panic!("summary must not rerun tools");
+        }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn summarize_live_result(
+            &self,
+            _: &PhoneCall,
+            result: &str,
+        ) -> Result<String, AgentError> {
+            assert_eq!(result, "Detailed result. ".repeat(100));
+            Ok("Three options are available; the full comparison is in chat.".into())
+        }
+    }
+    let mut f = fixture_with_agent(Some(Arc::new(Agent))).await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    call.event(&transcript()).unwrap();
+    let LiveAction::Queued { task_id } = call.event(&delegation()).unwrap() else {
+        panic!("expected task");
+    };
+    let full = "Detailed result. ".repeat(100);
+    f.store
+        .phone_finish_dispatch(&f.id, &task_id, &full)
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            let results = call.pending_results().unwrap();
+            if !results.is_empty() {
+                assert_eq!(
+                    results[0].result,
+                    "Three options are available; the full comparison is in chat."
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("separate worker must summarize completed results");
+    assert_eq!(
+        f.store.phone_pending_dispatches().unwrap()[0]
+            .result
+            .as_deref(),
+        Some(full.as_str())
+    );
+    drop(call);
+    f.runtime.take().unwrap().shutdown().await.unwrap();
+}

@@ -30,6 +30,21 @@ audible timing qualification remain in #1595/#1596.
 This is an audio backend, not another Chat Completions fast provider. Backend
 work remains in Jarvis's native session/approval harness and durable task queue.
 
+Completed results up to 500 UTF-8 bytes can go directly to Live commentary.
+Longer results wait for a separate tool-free summary worker; full chat delivery
+does not wait for it. That worker uses the existing backend's pinned fast tier,
+no tools/MCP servers, no chat history, and only the completed result as data.
+It rechecks call authority before and after generation and validates a strict
+JSON response containing a nonempty summary of at most 500 UTF-8 bytes.
+
+Summary jobs have 30-second durable leases, a 15-second model deadline, and at
+most two attempts. Retries cannot rerun the original task; stale leases cannot
+replace newer summaries. Results over 64,000 bytes are not silently truncated
+for summarization. Oversized input or exhausted attempts produce an explicit
+spoken-summary failure notice directing the caller to chat. Hangup discards
+voice delivery while preserving the full native task result and chat outbox.
+These extra backend model calls are outside the Live voice-cost estimate.
+
 ## Alternatives and evidence
 
 Twilio Agent Connect is the official integration. Its documented Python and
