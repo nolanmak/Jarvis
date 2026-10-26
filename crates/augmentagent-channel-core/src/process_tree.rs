@@ -61,6 +61,10 @@ impl ProcessGroup {
     }
 }
 
+fn cleanup_receipt_complete(bytes:&[u8])->bool {
+    bytes==b"all-descendants-reaped\n" || bytes==b"cgroup-descendants-cleared\n"
+}
+
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if !self.receipt.exists() {
@@ -75,28 +79,30 @@ impl Drop for ProcessGroup {
         if let Ok(audit)=self.resource_audit.lock() {
             if let Some((provider,logger))=audit.as_ref() { let _=self.resource_outcome(provider,Some(logger)); }
         }
-        let processes_reaped = std::fs::read_to_string(&self.receipt)
-            .is_ok_and(|value| value == "all-descendants-reaped\n");
-        let mut clean = processes_reaped;
-        if clean {
-            if let Some(marker) = &self.active_request {
-                clean = retire_request(marker, &self.receipt).is_ok();
-            }
-        }
-        self.clean.store(clean, Ordering::SeqCst);
-        if !clean {
-            // Do not falsely acknowledge cleanup. Adapters stop the chain.
-            if !processes_reaped { unsafe { libc::kill(self.id, libc::SIGKILL); } }
+        let mut processes_settled = std::fs::read(&self.receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
+        if !processes_settled {
+            unsafe { libc::kill(self.id,libc::SIGKILL); }
             if self.resource_required {
-                // A killed supervisor cannot enumerate detached children.
-                // The controller-owned cgroup identity still bounds cleanup.
-                let _=std::process::Command::new("/usr/bin/python3").arg("-I")
+                let killed=std::process::Command::new("/usr/bin/python3").arg("-I")
                     .arg(self.receipt.with_file_name("run-resource-scope.py")).arg("--cleanup")
                     .arg(self.receipt.with_file_name("resource-accounting.json"))
-                    .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                    .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()
+                    .is_ok_and(|status|status.success());
+                if killed {
+                    // This is kernel-proven quiescence, not a claim that a dead
+                    // supervisor personally reaped every process.
+                    processes_settled=(|| -> std::io::Result<()> {
+                        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.receipt)?;
+                        file.write_all(b"cgroup-descendants-cleared\n")?;file.sync_all()
+                    })().is_ok();
+                }
             }
-            tracing::error!("provider descendant cleanup is unverified; failover blocked");
         }
+        let mut clean=processes_settled;
+        if clean { if let Some(marker)=&self.active_request { clean=retire_request(marker,&self.receipt).is_ok(); } }
+        self.clean.store(clean,Ordering::SeqCst);
+        if !clean { tracing::error!("provider descendant cleanup is unverified; failover blocked"); }
+
     }
 }
 
@@ -230,7 +236,7 @@ fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 /// Proof that no descendant of the call can still be running: the supervisor's
-/// `all-descendants-reaped` receipt, or — with no receipt left — that the writer is gone
+/// a supervisor-reaped or identity-bound cgroup-quiescent receipt, or — with no receipt left — that the writer is gone
 /// (#1071). Neither subsumes the other.
 enum Proof<'a> { Reaped(&'a std::path::Path), WriterGone(&'a LivenessEnv) }
 
@@ -443,7 +449,7 @@ pub(crate) fn ensure_request_idle(journal: &std::path::Path) -> std::io::Result<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         result => result?,
     };
-    if private_read(&receipt)? != b"all-descendants-reaped\n" {
+    if !cleanup_receipt_complete(&private_read(&receipt)?) {
         return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "cleanup receipt is incomplete"));
     }
     clear_marker(&marker, Proof::Reaped(&receipt)).map(|_| ())
@@ -545,6 +551,19 @@ mod tests {
     use serde_json::{json, Value};
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[test]
+    fn kernel_quiescence_receipt_settles_interrupted_request_without_fake_reaping() {
+        let directory=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal=directory.path().join("operations.json");
+        let receipt=directory.path().join("cleanup-complete");
+        begin_request(Some(&journal),&receipt).unwrap();
+        let mut proof=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+        proof.write_all(b"cgroup-descendants-cleared\n").unwrap();proof.sync_all().unwrap();
+        ensure_request_idle(&journal).unwrap();
+        assert!(!journal.with_extension("active").exists());
+    }
 
     #[test]
     fn restart_uses_a_verified_receipt_but_never_age_or_partial_state() {

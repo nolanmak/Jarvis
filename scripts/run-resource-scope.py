@@ -131,8 +131,11 @@ def cleanup_receipt(receipt):
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink!=1
                 or info.st_uid!=os.getuid() or info.st_mode&0o077 or info.st_size>65536):
             raise RuntimeError('invalid resource cleanup receipt')
-        identity=json.load(stream).get('identity')
+        receipt_body=json.load(stream)
+        identity=receipt_body.get('identity')
     if identity is None:
+        if receipt_body.get('phase')!='admission_failed':
+            raise RuntimeError('resource cleanup identity missing')
         return
     leaf=current_group()
     path=Path(identity['path'])

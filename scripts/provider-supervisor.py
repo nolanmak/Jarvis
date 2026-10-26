@@ -73,6 +73,8 @@ def supervise(receipt, argv):
         if scope:
             resource_path.write_text(json.dumps({'phase':'launch_failed', **scope.observation()}))
             scope.close()
+        Path(receipt).write_text('all-descendants-reaped\n')
+        Path(receipt).chmod(0o600)
         raise
     status = None
     try:

@@ -106,6 +106,23 @@ subprocess.Popen(['/bin/sleep','10'],start_new_session=True,stdout=subprocess.DE
             finally:
                 if child.poll() is None: child.terminate();child.wait(timeout=5)
 
+    def test_dead_supervisor_descendants_are_reconciled_by_cgroup_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);receipt=root/'cleanup-complete';effect=root/'started'
+            env=dict(os.environ,JARVIS_RUN_RESOURCE_POLICY=json.dumps({'memory_bytes':64*1024*1024,'pids':8,'cpu_percent':20}))
+            code=f"import subprocess,time;from pathlib import Path;subprocess.Popen(['/bin/sleep','30'],start_new_session=True);Path({str(effect)!r}).touch();time.sleep(30)"
+            child=subprocess.Popen(['/usr/bin/python3','-I',str(Path(__file__).parents[1]/'provider-supervisor.py'),str(receipt),'/usr/bin/python3','-I','-c',code],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            deadline=time.monotonic()+3
+            while not effect.exists() and time.monotonic()<deadline:time.sleep(0.01)
+            self.assertTrue(effect.exists())
+            child.kill();child.wait(timeout=3)
+            proof=root/'resource-accounting.json'
+            scope=Path(json.loads(proof.read_text())['identity']['path'])
+            self.assertTrue(scope.exists())
+            resources.cleanup_receipt(proof)
+            self.assertFalse(scope.exists())
+            self.assertFalse(receipt.exists(),'a dead supervisor did not personally reap descendants')
+
     def test_denied_admission_never_dispatches_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);receipt=root/'cleanup-complete';effect=root/'effect'
