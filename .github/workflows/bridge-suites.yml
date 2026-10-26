@@ -53,5 +53,6 @@ jobs:
         run: |
           python3 scripts/test-native-provider-gateway.py
           python3 scripts/test-native-provider-vm.py
+          python3 scripts/test-native-provider-io.py
       - name: Test the PR verification gate's bridge-suite receipt rule
         run: bash scripts/tests/agent-pr-verify-gate.test.sh
