@@ -864,6 +864,39 @@
       "negative_before_fix": "/tmp/autoship-1598-resource-reservation-proof.log",
       "python_passed": 4,
       "python_skipped": 9
+    },
+    "native_runtime_union_48f611f7": {
+      "actual_dependencies": {
+        "claude": 6,
+        "codex": 0
+      },
+      "baseline_files": 643,
+      "manifest_sha256": "98d06aebbd119f738d54071fe42d6009da435ce483544301a63d7dac3177aac2",
+      "observations": [
+        {
+          "auth_mounted": false,
+          "completion_sha256": "45585ff8f660a09220f66131887a273e8187d4affb7b3b1675e3e39bee2e4fcc",
+          "executable_sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+          "gateway_exchanges": 0,
+          "help_sha256": "70d960401dfe708743865b6338dfe986663345b58cca9ca67308d041e90f4053",
+          "provider": "codex"
+        },
+        {
+          "auth_mounted": false,
+          "completion_sha256": "808aac54534949b3edc98ff5a50372632a61af3a717420a7c2e070b91e79badb",
+          "executable_sha256": "b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56",
+          "gateway_exchanges": 0,
+          "help_sha256": "b10f5c36adfe3285f6c5a0d18284f466e6c4486499de56ef62745e13312a7fbc",
+          "provider": "claude"
+        }
+      ],
+      "scope": "runtime union and actual CLI help only; no inference or shipping authority",
+      "source_policy_unchanged": true,
+      "status": "passed",
+      "union_files": 646,
+      "version": 1,
+      "log": "/tmp/autoship-1598-union-cli-smoke.log",
+      "receipt": "/tmp/autoship-native-codex-auth-dfunmr6x/union-cli-smoke/receipt.json"
     }
   },
   "remaining_cross_cutting_acceptance": [
