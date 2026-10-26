@@ -22,6 +22,18 @@ fn unavailable_from_error(provider: augmentagent_channel_core::ProviderKind, err
     })
 }
 
+#[derive(serde::Serialize,serde::Deserialize)]
+struct CompletedGroup {
+    binding: aligned::ReviewBinding,
+    role: aligned::ReviewRole,
+    original_hash: String,
+    findings: Vec<aligned::Finding>,
+    request_hashes: Vec<String>,
+    native_sessions: Vec<String>,
+    recovered_files: BTreeMap<String,String>,
+    finding_evidence: BTreeMap<String,String>,
+}
+
 pub(super) struct ReviewContext<'a> {
     pub qa_ok: bool,
     pub qa_notes: &'a str,
@@ -129,6 +141,8 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 
 #[path = "self_improve_review_plan.rs"]
 mod evidence_plan;
+#[path = "self_improve_review_callers.rs"]
+mod caller_stream;
 
 const REGRESSION_REQUIREMENT: &str = "No newly demonstrated correctness, security or acceptance regression; report a reproducible example and concrete remedy.";
 
@@ -254,7 +268,7 @@ async fn candidate_snapshot(worktree: &Path) -> Result<CandidateSnapshot> {
 
 // Resolve callers against the immutable candidate, not a mutable working tree.
 // This is a lexical Rust-symbol lookup, not a claim of semantic call-graph coverage.
-async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Result<String> {
+async fn caller_paths(worktree: &Path, head: &str, diff: &str) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     let removed_as_added = diff
         .lines()
         .filter(|line| line.starts_with('-') && !line.starts_with("---"))
@@ -293,6 +307,10 @@ async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Re
             paths.insert(path.to_owned());
         }
     }
+    Ok((symbols, paths))
+}
+async fn complete_caller_evidence(worktree: &Path, head: &str, diff: &str) -> Result<String> {
+    let (symbols, paths)=caller_paths(worktree,head,diff).await?;
     const MAX_CALLER_FILES: usize = 256;
     const MAX_CALLER_BYTES: usize = 8 * 1024 * 1024;
     if paths.len() > MAX_CALLER_FILES {
@@ -422,7 +440,14 @@ async fn run_impl(
         .acceptance_evidence
         .map(|(_, receipt)| receipt.binding.contract_hash.clone())
         .unwrap_or(aligned::digest(&serde_json::to_vec(&contract)?));
-    let callers = complete_caller_evidence(&worktree, &head, &diff).await?;
+    let (callers,caller_plan)=match complete_caller_evidence(&worktree,&head,&diff).await {
+        Ok(inline)=>(inline,None),
+        Err(error) if error.downcast_ref::<EvidenceBudget>().is_some()=>{
+            let plan=caller_stream::Plan::collect(&worktree,&head,&diff).await?;
+            (plan.manifest.clone(),Some(plan))
+        }
+        Err(error)=>return Err(error),
+    };
     let rubric = review_calibration::active()?;
     let evidence_json = serde_json::to_string(
         &serde_json::json!({"diff":diff,"files":files,"callers":callers,"rubric":rubric,"executable_acceptance":context.acceptance_evidence.map(|(_, receipt)| receipt)}),
@@ -457,20 +482,30 @@ async fn run_impl(
     let mut rendered = vec![];
     // Large files are fully delivered in bounded shards. Coverage is the union
     // of successful shard requests, never a model-supplied percentage.
-    let evidence_shards = supplied_shards(&files,&diff,&callers);
+    let caller_context=caller_plan.as_ref().map(|plan|plan.review_context()).unwrap_or_else(||callers.clone());
+    let evidence_shards = supplied_shards(&files,&diff,&caller_context);
     let subject=format!("{}\n{}",issue.title,issue.body);
     let rubric_prompt=rubric.prompt();
     let system_bytes=evidence_plan::ROLES.iter().map(|role|evidence_plan::system_prompt(*role,&rubric_prompt).len()).max().unwrap();
     let inputs=evidence_plan::Inputs {binding:&binding,issue:&subject,contract:&contract,prior:&prior,system_bytes};
-    let requests=inputs.pack(&evidence_shards)?;
+    let requests=inputs.pack_scope(&evidence_shards,caller_plan.is_none())?;
     if let Some(allow_shipping)=observation_priority {
         let workflow=context.workflow.context("diagnostic budget requires workflow")?;
         workflow.check_resource_policy()?;
-        if !workflow.reserve_canary_calls(evidence_plan::worst_case_calls(requests.len())?,allow_shipping)? {
+        let mut groups=requests.len();
+        if let Some(plan)=&caller_plan {
+            let mut stream=plan.stream(&worktree);
+            while let Some(batch)=stream.next_batch().await? { groups+=inputs.pack_scope(&batch,false)?.len(); }
+        }
+        if !workflow.reserve_canary_calls(evidence_plan::worst_case_calls(groups)?,allow_shipping)? {
             return Err(review_canary::CanaryDeferred.into());
         }
     }
+    // Diagnostic runs prove actual transport behavior and must never borrow a
+    // previous model observation from the resumable production cache.
+    let cache_guard=if diagnostic {None}else{context.workflow};
     let mut recovered_files=BTreeMap::<String,String>::new();
+    let mut finding_evidence=BTreeMap::<String,String>::new();
     for role in evidence_plan::ROLES {
         let session = format!("autoship-review:{role:?}:{}", uuid::Uuid::new_v4());
         let mut opts = codex_review_opts(worktree.clone(), &evidence_plan::system_prompt(role,&rubric_prompt));
@@ -499,7 +534,27 @@ async fn run_impl(
         let mut findings = vec![];
         let mut request_hashes = vec![];
         let mut native_sessions = vec![];
-        for (i, original_request) in requests.iter().enumerate() {
+        let mut stream=caller_plan.as_ref().map(|plan|plan.stream(&worktree));
+        let mut batch_requests=requests.clone();
+        let mut group_index=0usize;
+        loop {
+        for original_request in &batch_requests {
+            let i=group_index; group_index+=1;
+            let fragment_key=aligned::digest(&serde_json::to_vec(&(&binding,role,&actor.provider,&actor.model,&opts.system_prompt,&original_request.coverage.prompt_hash))?);
+            let cached=cache_guard.map(|guard|guard.review_fragment(&fragment_key)).transpose()?.flatten();
+            let group=if let Some(raw)=cached {
+                let cached:CompletedGroup=serde_json::from_str(&raw)?;
+                anyhow::ensure!(cached.binding==binding && cached.original_hash==original_request.coverage.prompt_hash && cached.role==role,
+                    "review fragment binding mismatch");
+                for native_id in &cached.native_sessions {
+                    let mut actual=actor.clone(); actual.session_id=native_id.clone(); actual.independent_for(&builders,&origin)?;
+                }
+                anyhow::ensure!(!cached.native_sessions.is_empty(),"cached review lacks native observation");
+                cached
+            } else {
+            let mut group_hashes=Vec::new();
+            let mut group_sessions=Vec::new();
+            let mut group_recovered=BTreeMap::new();
             let mut request=original_request.clone();
             let mut group_review=evidence_plan::GroupReview::default();
             for recovery_attempt in 0..=1 {
@@ -510,9 +565,9 @@ async fn run_impl(
                     augmentagent_channel_core::model_router::native_reviewer_scope(provider,reasoner.call(&opts,&request.prompt))).await?;
                 let mut shard_actor=actor.clone();shard_actor.session_id=native_id.clone();
                 shard_actor.independent_for(&builders,&origin)?;
-                native_sessions.push(native_id);
+                group_sessions.push(native_id);
                 let (pass,missing)=aligned::parse_review_pass_with_missing(&raw,&binding,shard_actor,role,request.coverage.clone(),&contract)?;
-                request_hashes.push(pass.coverage.prompt_hash.clone());
+                group_hashes.push(pass.coverage.prompt_hash.clone());
                 if group_review.observe(pass.completed,pass.findings).with_context(||format!("evidence group {i} still needs {missing:?}"))? { break; }
                 request=evidence_plan::recover(&inputs,&worktree,&head,original_request,&evidence_shards,&missing,group_review.pending()).await?;
                 if let Some(workflow)=context.workflow {
@@ -522,13 +577,31 @@ async fn run_impl(
                 }
                 for (path,body) in &request.files {
                     if path.starts_with("__requested_source__:") {
-                        if let Some(old)=recovered_files.insert(path.clone(),body.clone()) {
+                        if let Some(old)=group_recovered.insert(path.clone(),body.clone()) {
                             anyhow::ensure!(old==*body,"same immutable recovery path has different bytes");
                         }
                     }
                 }
             }
-            let mut shard_findings=group_review.finish()?;
+            let findings=group_review.finish()?;
+            let finding_evidence=if findings.is_empty() {BTreeMap::new()}else{request.files};
+            let completed=CompletedGroup { binding:binding.clone(),role,original_hash:original_request.coverage.prompt_hash.clone(),
+                findings,request_hashes:group_hashes,native_sessions:group_sessions,recovered_files:group_recovered,finding_evidence };
+            if let Some(guard)=cache_guard {
+                guard.audit_health().await?;
+                guard.record_review_fragment(&fragment_key,&serde_json::to_string(&completed)?)?;
+            }
+            completed
+            };
+            request_hashes.extend(group.request_hashes);
+            native_sessions.extend(group.native_sessions);
+            for (path,body) in group.recovered_files {
+                if let Some(old)=recovered_files.insert(path,body.clone()) { anyhow::ensure!(old==body,"recovered source changed across completed groups"); }
+            }
+            for (path,body) in group.finding_evidence {
+                if let Some(old)=finding_evidence.insert(path,body.clone()) { anyhow::ensure!(old==body,"finding source changed across review groups"); }
+            }
+            let mut shard_findings=group.findings;
             let known: BTreeSet<_> = prior.iter().map(|f| f.id.as_str()).collect();
             let mut remap = BTreeMap::new();
             for finding in &shard_findings {
@@ -558,6 +631,10 @@ async fn run_impl(
                     .collect();
             }
             findings.extend(shard_findings);
+        }
+        let next=match &mut stream { Some(stream)=>stream.next_batch().await?,None=>None };
+        let Some(batch)=next else {break;};
+        batch_requests=inputs.pack_scope(&batch,false)?;
         }
         let mut findings = deduplicate_findings(findings)?;
         for finding in &mut findings {
@@ -653,11 +730,23 @@ async fn run_impl(
             // Full source coverage was established above. Supply direct diff
             // and caller evidence plus the actual review receipts; explicitly
             // label the source digests as a manifest, not source read here.
+            let caller_adjudication=if caller_plan.is_some() {
+                serde_json::json!({"source_manifest_sha256":aligned::digest(callers.as_bytes()),
+                    "delivery":"Every caller blob was reviewed in completed bounded groups. This digest is a manifest reference, not source read by the adjudicator. Actual evidence from groups with findings is supplied below."})
+            } else {serde_json::Value::String(callers.clone())};
+            let review_adjudication=if caller_plan.is_some() {
+                serde_json::to_value(structured.passes.iter().map(|pass|serde_json::json!({
+                    "role":pass.role,"actor":pass.actor,"completed":pass.completed,"findings":pass.findings,
+                    "full_receipt_sha256":aligned::digest(&serde_json::to_vec(pass).expect("serialize pass")),
+                    "reviewed_request_hash":pass.coverage.prompt_hash,"additional_native_sessions":pass.additional_sessions.len()
+                })).collect::<Vec<_>>())?
+            } else {serde_json::to_value(&structured.passes)?};
             let adjudication_evidence = serde_json::to_string(&serde_json::json!({
                 "candidate_diff": diff,
-                "caller_evidence": callers,
+                "caller_evidence": caller_adjudication,
                 "source_manifest_only": files.iter().map(|(path,body)| (path,aligned::digest(body.as_bytes()))).collect::<BTreeMap<_,_>>(),
-                "completed_reviews": structured.passes,
+                "completed_reviews": review_adjudication,
+                "streamed_finding_source": if caller_plan.is_some() {Some(&finding_evidence)}else{None},
                 "supplemental_immutable_source": recovered_files,
             }))?;
             let attempts = match context.workflow {
@@ -700,10 +789,16 @@ async fn run_impl(
         "candidate changed while reviews ran"
     );
     if let Some(guard) = context.workflow {
-        let collected=if recovered_files.is_empty() {
+        let mut calibration_context=recovered_files.clone();
+        if caller_plan.is_some() {
+            // Preserve outcomes but do not treat a source manifest as replayable
+            // source bytes. A replay must reconstruct these exact Git blobs.
+            calibration_context.insert("__streamed_caller_manifest_not_source__".into(),callers.clone());
+        }
+        let collected=if calibration_context.is_empty() {
             review_calibration::collect(guard,&structured,&contract,&evidence_json)
         } else {
-            review_calibration::collect_supplemental_outcome(guard,&structured,&contract,&evidence_json,&recovered_files)
+            review_calibration::collect_supplemental_outcome(guard,&structured,&contract,&evidence_json,&calibration_context)
         };
         if let Err(error)=collected { warn!(%error,"could not collect review outcome"); }
     }

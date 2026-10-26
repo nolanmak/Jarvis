@@ -53,8 +53,11 @@ impl Inputs<'_> {
         })
     }
     pub fn pack(&self, shards: &BTreeMap<String, String>) -> Result<Vec<Request>> {
+        self.pack_scope(shards,true)
+    }
+    pub fn pack_scope(&self, shards: &BTreeMap<String, String>, complete: bool) -> Result<Vec<Request>> {
         anyhow::ensure!(!shards.is_empty(), "review has no supplied evidence");
-        if let Ok(all) = self.request(shards.clone(), true, None) {
+        if let Ok(all) = self.request(shards.clone(), complete, None) {
             return Ok(vec![all]);
         }
         // Source chunks are already UTF-8-boundary safe. Account JSON escaping,
@@ -269,6 +272,20 @@ mod tests {
             session_id: "actual-test-conversation".into(),
         }
     }
+    #[test]
+    fn streamed_batch_never_claims_whole_candidate_completion() {
+        let binding=binding();
+        let contract=BTreeMap::from([("C1".into(),"Preserve caller behavior".into())]);
+        let inputs=Inputs {binding:&binding,issue:"caller change",contract:&contract,prior:&[],system_bytes:1024};
+        let source=BTreeMap::from([("caller:fixture.rs#bytes-0-12".into(),"call_api();\n".into())]);
+        let requests=inputs.pack_scope(&source,false).unwrap();
+        assert_eq!(requests.len(),1);
+        let value:serde_json::Value=serde_json::from_str(&requests[0].prompt).unwrap();
+        assert!(value["review_scope"].as_str().unwrap().starts_with("Partial evidence group"));
+        assert_eq!(requests[0].coverage.supplied_files.len(),1);
+        assert!(requests[0].prompt.len()+inputs.system_bytes<=aligned::MAX_PROMPT_BYTES);
+    }
+
     #[test]
     fn small_complete_candidate_is_one_call_with_disjoint_namespaces() {
         let binding = binding();
