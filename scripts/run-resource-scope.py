@@ -4,6 +4,8 @@
 No wall-clock deadline and no network policy are implied. The supervising
 process stays in DelegateSubgroup=daemon; only its child enters run-*.
 """
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -34,6 +36,63 @@ def counters(path):
             (line.split() for line in path.read_text().splitlines())}
 
 
+def available_memory():
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if line.startswith('MemAvailable:'):
+            return int(line.split()[1]) * 1024
+    raise RuntimeError('host available memory unavailable')
+
+
+def headroom(parent, requested, host_available):
+    # Reserve each admitted run's full ceiling, including idle preflight runs.
+    # Unremoved groups remain reserved until verified descendant cleanup.
+    reserved = 0
+    current = 0
+    for child in parent.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            usage = int((child / 'memory.current').read_text().strip())
+            if child.name.startswith('run-'):
+                reserved += finite(child / 'memory.max')
+                current += usage
+            else:
+                reserved += usage
+                current += usage
+        except FileNotFoundError:
+            if child.exists():
+                raise RuntimeError('aggregate sibling resource accounting unavailable')
+    aggregate_current = int((parent / 'memory.current').read_text().strip())
+    # Include kernel charges not visible in child accounting.
+    reserved += max(0, aggregate_current - current)
+    needed = reserved + requested
+    if needed > finite(parent / 'memory.max'):
+        raise RuntimeError('aggregate memory reservations exhausted')
+    slack = max(0, reserved - aggregate_current)
+    if requested + slack + 256 * 1024**2 > host_available:
+        raise RuntimeError('host memory headroom unavailable')
+    ancestor = parent.parent
+    while ancestor != Path('/sys/fs/cgroup') and ancestor.is_relative_to('/sys/fs/cgroup'):
+        limit = (ancestor / 'memory.max').read_text().strip()
+        if limit != 'max' and requested + slack > int(limit) - int((ancestor / 'memory.current').read_text().strip()):
+            raise RuntimeError('ancestor memory headroom unavailable')
+        ancestor = ancestor.parent
+    return {'reserved_before_bytes': reserved, 'requested_bytes': requested,
+            'host_available_bytes': host_available, 'host_margin_bytes': 256 * 1024**2}
+
+
+@contextlib.contextmanager
+def reserve(parent, requested):
+    # cgroup directory inode is a common controller-only lock; no writable
+    # sidecar or age/PID based cleanup can release another live reservation.
+    descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield headroom(parent, requested, available_memory())
+    finally:
+        os.close(descriptor)
+
+
 class RunScope:
     def __init__(self, policy):
         if set(policy) != {'memory_bytes', 'pids', 'cpu_percent'}:
@@ -60,33 +119,34 @@ class RunScope:
         if (policy['memory_bytes'] > memory or policy['pids'] > pids
                 or policy['cpu_percent'] * period > quota * 100):
             raise RuntimeError('run ceiling exceeds aggregate service ceiling')
-        # The delegated root is empty by systemd contract. Never relocate the
-        # daemon or manipulate sibling service/slice groups to enable this.
-        (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
-        if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
-            raise RuntimeError('delegated controllers failed readback')
-        self.path = parent / ('run-' + uuid.uuid4().hex)
-        self.path.mkdir(mode=0o700)
-        self.closed = False
-        self.fd = None
-        try:
-            desired = {'memory.max': str(policy['memory_bytes']), 'memory.swap.max': '0',
-                       'memory.oom.group': '1', 'pids.max': str(policy['pids']),
-                       'cpu.max': f"{policy['cpu_percent'] * 1000} 100000"}
-            for name, value in desired.items():
-                (self.path/name).write_text(value)
-            actual = {name: (self.path/name).read_text().strip() for name in desired}
-            if actual != desired:
-                raise RuntimeError('run resource limits failed readback')
-            self.identity = {'host_sha256': hashlib.sha256(Path('/etc/machine-id').read_bytes()).hexdigest(),
-                             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-                             'path': str(self.path), 'inode': self.path.stat().st_ino,
-                             'limits': actual, 'aggregate': {'path': str(parent),
-                             'memory_bytes': memory, 'pids': pids, 'cpu_max': ' '.join(cpu)}}
-            self.fd = os.open(self.path/'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC)
-        except BaseException:
-            self.close()
-            raise
+        with reserve(parent, policy['memory_bytes']) as reservation:
+            # The delegated root is empty by systemd contract. Never relocate the
+            # daemon or manipulate sibling service/slice groups to enable this.
+            (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
+            if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
+                raise RuntimeError('delegated controllers failed readback')
+            self.path = parent / ('run-' + uuid.uuid4().hex)
+            self.path.mkdir(mode=0o700)
+            self.closed = False
+            self.fd = None
+            try:
+                desired = {'memory.max': str(policy['memory_bytes']), 'memory.swap.max': '0',
+                           'memory.oom.group': '1', 'pids.max': str(policy['pids']),
+                           'cpu.max': f"{policy['cpu_percent'] * 1000} 100000"}
+                for name, value in desired.items():
+                    (self.path/name).write_text(value)
+                actual = {name: (self.path/name).read_text().strip() for name in desired}
+                if actual != desired:
+                    raise RuntimeError('run resource limits failed readback')
+                self.identity = {'host_sha256': hashlib.sha256(Path('/etc/machine-id').read_bytes()).hexdigest(),
+                                 'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                                 'path': str(self.path), 'inode': self.path.stat().st_ino,
+                                 'limits': actual, 'reservation': reservation, 'aggregate': {'path': str(parent),
+                                 'memory_bytes': memory, 'pids': pids, 'cpu_max': ' '.join(cpu)}}
+                self.fd = os.open(self.path/'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC)
+            except BaseException:
+                self.close()
+                raise
 
     def attach_child(self):
         # preexec_fn in a single-threaded trusted supervisor. No model code has

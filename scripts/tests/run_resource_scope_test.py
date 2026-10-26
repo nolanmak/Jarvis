@@ -156,4 +156,42 @@ subprocess.Popen(['/bin/sleep','10'],start_new_session=True,stdout=subprocess.DE
             resources.RunScope({'memory_bytes':1024**3,'pids':8,'cpu_percent':20})
 
 
+class CompositionHeadroomTests(unittest.TestCase):
+    def fixture(self, root, total, daemon, run=None):
+        parent=root/'fixture.service'; parent.mkdir()
+        (parent/'memory.max').write_text(str(total))
+        (parent/'memory.current').write_text(str(daemon+(run[1] if run else 0)))
+        child=parent/'daemon';child.mkdir();(child/'memory.current').write_text(str(daemon))
+        if run:
+            child=parent/('run-'+'a'*32);child.mkdir()
+            (child/'memory.max').write_text(str(run[0]));(child/'memory.current').write_text(str(run[1]))
+        return parent
+
+    def test_full_composed_build_fits_but_second_lazy_guest_is_not_overcommitted(self):
+        gib=1024**3
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp),10*gib,gib,(2*gib,128*1024**2))
+            proof=resources.headroom(parent,6*gib,20*gib)
+            self.assertEqual(proof['reserved_before_bytes'],3*gib)
+            with self.assertRaisesRegex(RuntimeError,'reservations exhausted'):
+                resources.headroom(parent,8*gib,20*gib)
+
+    def test_insufficient_host_headroom_refuses_before_guest_admission(self):
+        gib=1024**3
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp),10*gib,gib)
+            with self.assertRaisesRegex(RuntimeError,'host memory'):
+                resources.headroom(parent,6*gib,5*gib)
+
+    def test_reservation_tracks_cleanup_not_idle_rss(self):
+        gib=1024**3
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp),8*gib,gib,(6*gib,0))
+            with self.assertRaisesRegex(RuntimeError,'reservations exhausted'):
+                resources.headroom(parent,2*gib,20*gib)
+            import shutil
+            shutil.rmtree(parent/('run-'+'a'*32))
+            self.assertEqual(resources.headroom(parent,6*gib,20*gib)['requested_bytes'],6*gib)
+
+
 if __name__ == '__main__': unittest.main(verbosity=2)

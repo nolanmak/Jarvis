@@ -238,8 +238,42 @@ fn validate_resume_owner(root:&Path,session:&Path,audit_path:&Path,current:&Runt
     Ok(())
 }
 
+fn build_memory(bridge:Option<&crate::codex_tools::BridgeLaunch>)->Result<u64> {
+    let Some(bridge)=bridge else {return Ok(0)};
+    let mut value:serde_json::Value=serde_json::from_slice(&private(&bridge.policy_path)?)?;
+    let memory=build_memory_policy(&value)?;
+    if memory>0 {
+        let original=Path::new(value["build_vm_config"].as_str().context("build VM configuration missing")?);
+        let bytes=private(original)?;
+        let config:serde_json::Value=serde_json::from_slice(&bytes)?;
+        ensure!(config["memory_mb"].as_u64()==Some(memory),"build runtime changed during composition");
+        let pinned=bridge.policy_path.parent().context("bridge policy directory missing")?
+            .join(format!("composed-build-{}.json",uuid::Uuid::new_v4()));
+        write(&pinned,&bytes)?;
+        value["build_vm_config"]=serde_json::to_value(pinned)?;
+        // This controller-owned bridge has not been spawned. Pin its complete
+        // runtime declaration so later operator edits cannot enlarge the guest.
+        let mut file=std::fs::OpenOptions::new().write(true).truncate(true).open(&bridge.policy_path)?;
+        file.write_all(&serde_json::to_vec(&value)?)?;file.sync_all()?;
+    }
+    Ok(memory)
+}
+fn build_memory_policy(value:&serde_json::Value)->Result<u64> {
+    let tools=value["allowed_tools"].as_array().context("bridge tools unavailable")?;
+    // Plain read/edit tools cannot launch a build. Bash patterns may contain
+    // wrappers, so conservatively include the VM for every Bash grant.
+    let commands=tools.iter().any(|tool|tool.as_str().is_none_or(|tool|tool=="Bash" || tool.starts_with("Bash(")));
+    if !commands {return Ok(0)}
+    let Some(path)=value["build_vm_config"].as_str() else {return Ok(0)};
+    let config:serde_json::Value=serde_json::from_slice(&private(Path::new(path))?)?;
+    let memory=config["memory_mb"].as_u64().context("build VM memory unavailable")?;
+    ensure!((512..=4096).contains(&memory),"invalid build VM memory");
+    Ok(memory)
+}
+
 pub(crate) struct Launch {
     pub command: Command,
+    pub resource_policy: serde_json::Value,
     aliases: PathBuf,
     session: PathBuf,
     ephemeral: bool,
@@ -254,6 +288,11 @@ impl Launch {
             .context("required native VM policy unavailable")?;
         let policy: Policy = serde_json::from_slice(&private(Path::new(&policy_path))?)?;
         ensure!(policy.version == 1 && (512..=4096).contains(&policy.memory_mb), "invalid native VM policy");
+        let resource_policy=match build_memory(bridge).and_then(|build_mb|
+            crate::run_resources::composed_native_policy(u64::from(policy.memory_mb),build_mb)) {
+            Ok(policy)=>policy,
+            Err(_)=>{crate::run_resources::admission_failed(provider,opts.audit_logger.as_ref(),"native_build_memory_composition")?;unreachable!()}
+        };
         let profile = policy.providers.get(provider).context("required native provider profile unavailable")?;
         let root = policy.state_root.canonicalize()?;
         let metadata = root.metadata()?;
@@ -364,7 +403,7 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, aliases, session, ephemeral:native.is_none(), _directory:directory };
+        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
         Ok(result)
     }
@@ -396,6 +435,18 @@ mod tests {
         write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap()).unwrap();
         if complete {write(&path.join("complete.json"),b"{\"generation\":\"generation-a\"}").unwrap();}
         path
+    }
+    #[test]
+    fn read_only_bridge_does_not_reserve_build_guest() {
+        let temp=tempfile::tempdir().unwrap();
+        let config=temp.path().join("runtime.json");
+        write(&config,b"{\"memory_mb\":4096}").unwrap();
+        let mut policy=serde_json::json!({"allowed_tools":["Read","Grep","Glob"],"build_vm_config":config});
+        assert_eq!(build_memory_policy(&policy).unwrap(),0);
+        policy["allowed_tools"]=serde_json::json!(["Bash(cargo *)"]);
+        assert_eq!(build_memory_policy(&policy).unwrap(),4096);
+        policy["allowed_tools"]=serde_json::json!(["Bash"]);
+        assert_eq!(build_memory_policy(&policy).unwrap(),4096);
     }
     #[test]
     fn native_auth_requires_private_declared_native_credentials_not_router_key() {

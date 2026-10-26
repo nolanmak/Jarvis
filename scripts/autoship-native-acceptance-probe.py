@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--vm-policy", type=Path, required=True,
                         help="private disposable native VM policy prepared for this probe")
+    parser.add_argument("--build-vm-config", type=Path, help="explicit build runtime; defaults to native policy runtime")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -39,6 +40,22 @@ def main():
     info = policy.stat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         parser.error("VM policy must be a private file owned by the current user")
+    declaration=json.loads(policy.read_text())
+    native_mb=declaration['memory_mb']
+    build_config=(args.build_vm_config or Path(declaration['runtime_config'])).resolve(strict=True)
+    build_info=build_config.stat()
+    if not stat.S_ISREG(build_info.st_mode) or build_info.st_uid!=os.getuid() or build_info.st_mode & 0o077:
+        parser.error("build VM configuration must be private")
+    build_mb=0 if args.probe=='adjudicator' else json.loads(build_config.read_text())['memory_mb']
+    if type(native_mb) is not int or not 512<=native_mb<=4096 or type(build_mb) is not int or (build_mb and not 512<=build_mb<=4096):
+        parser.error("invalid declared guest memory")
+    # Both QEMUs and the MCP broker share one provider subtree. Reserve the
+    # full guest declarations plus host overhead; do not shrink build memory.
+    run_memory=(native_mb+build_mb)*1024**2+1024**3
+    aggregate_memory=run_memory+2*1024**3
+    available=next((int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')),0)
+    if aggregate_memory>10*1024**3 or available<aggregate_memory+256*1024**2:
+        parser.error("insufficient host headroom for composed isolated probe; wait for capacity")
     policy_digest = hashlib.sha256(policy.read_bytes()).hexdigest()
     os.umask(0o077)
     root = Path(tempfile.mkdtemp(prefix="autoship-native-acceptance-", dir="/tmp"))
@@ -52,7 +69,8 @@ def main():
         "AUGMENTAGENT_AUTOPR_OBSERVATION_CALL_CAP": "32",
         "AUGMENTAGENT_GATE_MIN_FREE_GB": "0", "AUGMENTAGENT_GATE_BUILD_GROWTH_GB": "0",
         "AUGMENTAGENT_NATIVE_VM_POLICY": str(policy),
-        "AUGMENTAGENT_RUN_RESOURCES": "1", "AUGMENTAGENT_RUN_MEMORY_BYTES": "2147483648",
+        "AUGMENTAGENT_BUILD_VM_CONFIG": str(build_config),
+        "AUGMENTAGENT_RUN_RESOURCES": "1", "AUGMENTAGENT_RUN_MEMORY_BYTES": str(run_memory),
         "AUGMENTAGENT_RUN_PIDS": "128", "AUGMENTAGENT_RUN_CPU_PERCENT": "100",
         "CARGO_BUILD_JOBS": "1", "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0", "CARGO_INCREMENTAL": "0", "PATH": os.environ["PATH"],
@@ -70,7 +88,7 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
         env["GH_BIN"] = str(gh)
     unit = "augmentagent-native-" + root.name.removeprefix("autoship-native-acceptance-")
     command = ["systemd-run", "--user", "--quiet", "--wait", "--pipe", "--collect", f"--unit={unit}"]
-    for value in ("Delegate=cpu memory pids", "DelegateSubgroup=daemon", "MemoryMax=3G", "TasksMax=256", "CPUQuota=200%"):
+    for value in ("Delegate=cpu memory pids", "DelegateSubgroup=daemon", f"MemoryMax={aggregate_memory}", "TasksMax=256", "CPUQuota=200%"):
         command += ["-p", value]
     command += [f"--setenv={key}={value}" for key, value in env.items()]
     command += ["/usr/bin/env"]

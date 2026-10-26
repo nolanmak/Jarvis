@@ -494,18 +494,18 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false)
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None)
 }
 pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false)
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None)
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
-pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
+pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,journal,true,true,true)
+    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy))
 }
-fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool)
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>)
     -> std::io::Result<(Child, ProcessGroup)> {
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
@@ -531,7 +531,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     let receipt = directory.path().join("cleanup-complete");
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&helper)?;
     file.write_all(include_bytes!("../../../scripts/provider-supervisor.py"))?;
-    let resource_policy=crate::run_resources::declared_policy().map_err(std::io::Error::other)?;
+    let resource_policy=match composed {Some(policy)=>Some(policy.clone()),None=>crate::run_resources::declared_policy().map_err(std::io::Error::other)?};
     if required_resources && resource_policy.is_none() { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"required run resource declaration unavailable")); }
     if resource_policy.is_some() { crate::run_resources::install_helper(directory.path()).map_err(std::io::Error::other)?; }
     let mut supervised = Command::new("python3");

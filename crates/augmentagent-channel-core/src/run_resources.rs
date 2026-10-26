@@ -22,6 +22,39 @@ pub fn declared_policy() -> Result<Option<serde_json::Value>> {
     })))
 }
 
+/// The guest RAM declarations are additive: the host MCP build VM remains
+/// inside the native provider's cgroup. Never silently shrink either guest.
+pub(crate) fn composed_native_policy(native_mb:u64, build_mb:u64)->Result<serde_json::Value> {
+    let explicit=std::env::var("AUGMENTAGENT_RUN_MEMORY_BYTES").ok().map(|v|v.parse::<u64>()).transpose()?;
+    let overhead=std::env::var("AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES").ok()
+        .map(|v|v.parse::<u64>()).transpose()?.unwrap_or(1024*1024*1024);
+    let memory=composed_memory(native_mb,build_mb,overhead,explicit)?;
+    let mut policy=declared_policy()?.context("required run resource policy missing")?;
+    policy["memory_bytes"]=memory.into();
+    Ok(policy)
+}
+fn composed_memory(native_mb:u64,build_mb:u64,overhead:u64,explicit:Option<u64>)->Result<u64> {
+    anyhow::ensure!((512..=4096).contains(&native_mb) && (build_mb==0 || (512..=4096).contains(&build_mb)),"invalid composed VM memory");
+    anyhow::ensure!(overhead>=256*1024*1024 && overhead<=4*1024*1024*1024,"host overhead must be declared between 256MiB and 4GiB");
+    let needed=(native_mb+build_mb)*1024*1024+overhead;
+    let memory=explicit.unwrap_or((4*1024*1024*1024).max(needed));
+    anyhow::ensure!(memory>=needed,"declared run memory cannot cover native and build guests plus host overhead");
+    Ok(memory)
+}
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+    #[test]
+    fn builds_reserve_both_guests_but_reviews_do_not() {
+        let gib=1024*1024*1024;
+        assert_eq!(composed_memory(1024,4096,gib,None).unwrap(),6*gib);
+        assert_eq!(composed_memory(1024,0,gib,None).unwrap(),4*gib);
+        assert_eq!(composed_memory(1024,0,gib,Some(2*gib)).unwrap(),2*gib);
+        assert!(composed_memory(1024,4096,gib,Some(4*gib)).is_err());
+        assert_eq!(composed_memory(1024,4096,gib,Some(6*gib)).unwrap(),6*gib);
+    }
+}
+
 /// Required workflow enrollment cannot be disabled by omitting service env.
 /// Ordinary protected loggers used outside Autoship do not imply this policy.
 pub fn check_requirement(

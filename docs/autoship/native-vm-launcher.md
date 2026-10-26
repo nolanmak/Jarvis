@@ -223,3 +223,32 @@ The runtime store also persists an exact closed-owner tuple, so a late caller
 cannot create a new session after that owner's cleanup was acknowledged.
 Workflow model admission rejects terminal stages independently. Retirement
 never removes protected audit or review evidence.
+
+## Composed native and build memory
+
+A guarded build VM is a descendant of the host MCP bridge and shares the native
+provider's run cgroup. Admission sums the declared native guest RAM, any build
+VM reachable through the bridge, and host overhead (default 1 GiB, explicitly
+configurable with `AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES`). Without an explicit
+run-memory override, the ceiling is the greater of this sum and the existing
+4 GiB default. A 1 GiB native guest plus a 4 GiB build guest therefore requires
+6 GiB. Read-only tool profiles do not reserve a build guest.
+
+An explicitly configured smaller `AUGMENTAGENT_RUN_MEMORY_BYTES` fails with a
+capacity dependency before model dispatch; it never resizes either guest.
+Existing resource drop-ins retain their explicit settings, so an old 4 GiB
+installation needs a reviewed update before running this combined workload.
+Newly rendered defaults leave this setting unset to enable composition.
+
+Admission serializes on the delegated service cgroup and counts the full
+ceilings of other run groups, including idle guests, plus daemon usage. It also
+checks ancestor limits and available host memory. The protected resource receipt
+includes the reservation and effective limits. Reservations disappear only when
+the corresponding cgroup is removed after descendant cleanup. This prevents
+same-service lazy-RAM overcommit; unrelated host workloads can still change
+memory availability after admission, and kernel limits remain authoritative.
+
+The full native acceptance wrapper explicitly declares matching run and unit
+budgets and checks host capacity before launching. For the 1+4 GiB guest case,
+these are 6 GiB per run and 8 GiB for the isolated unit. The wrapper does not
+change the production service or launch when that host headroom is unavailable.

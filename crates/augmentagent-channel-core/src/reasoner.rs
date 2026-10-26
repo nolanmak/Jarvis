@@ -1312,7 +1312,7 @@ impl ClaudeCliReasoner {
         } else { None };
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
         let spawned = match &native_vm {
-            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref()),
+            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref(), &vm.resource_policy),
             None => crate::process_tree::spawn_admitted(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false),
         };
         let (mut child, process_group) = spawned
