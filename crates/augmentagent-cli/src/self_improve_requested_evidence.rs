@@ -108,7 +108,7 @@ async fn read_inner(
     budget: usize,
 ) -> Result<serde_json::Value> {
     anyhow::ensure!(
-        !paths.is_empty() && paths.len() <= 16 && budget >= 2048,
+        !paths.is_empty() && budget >= 2048,
         "requested evidence budget/paths invalid"
     );
     anyhow::ensure!(
@@ -266,13 +266,15 @@ mod tests {
             "autoship_verifiers/observe.py".into(),
             "print(actual_behavior())\n".into(),
         )]);
-        let paths = BTreeSet::from([
+        let mut paths = BTreeSet::from([
             "source.rs".into(),
             "autoship_verifiers/observe.py".into(),
             ".git/config".into(),
             "../outside".into(),
             "missing.rs".into(),
         ]);
+        // Several valid per-finding requests accumulate across recovery rounds.
+        paths.extend((0..18).map(|i| format!("missing-{i}.rs")));
         let result = read_inner(
             root.path(),
             None,
@@ -297,6 +299,11 @@ mod tests {
             aligned::digest(committed.as_bytes())
         );
         let states = result["source_status"].as_array().unwrap();
+        assert_eq!(
+            states.len(),
+            paths.len(),
+            "every cumulative request gets an explicit result"
+        );
         assert_eq!(
             states
                 .iter()
