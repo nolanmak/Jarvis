@@ -582,6 +582,7 @@ def main(spec_path):
                     os.fsync(stream.fileno())
                     stream.close()
                     active_export = None
+                    channel.send({'type': 'export_progress'})
                 elif kind == 'guest_fatal':
                     reason = frame.get('reason')
                     if reason not in ('stdin_write_failed', 'mcp_write_failed', 'oversized_or_truncated_frame', 'stdin_submit_failed', 'mcp_submit_failed', 'unknown_frame', 'controller_eof', 'receive_exception'):
@@ -589,7 +590,7 @@ def main(spec_path):
                     print(json.dumps({'native_guest_fatal': reason}), file=sys.stderr, flush=True)
                     raise RuntimeError('guest failed before completion')
                 elif kind == 'completion_failure':
-                    if frame.get('phase') not in ('quiescence', 'output_drain', 'runtime_export', 'exit_receipt') or frame.get('category') not in ('ValueError', 'RuntimeError', 'OSError', 'PermissionError', 'FileNotFoundError', 'BoundaryFailure'):
+                    if frame.get('phase') not in ('quiescence', 'output_drain', 'runtime_export', 'exit_receipt', 'export_ack') or frame.get('category') not in ('ValueError', 'RuntimeError', 'OSError', 'PermissionError', 'FileNotFoundError', 'BoundaryFailure'):
                         raise ValueError('invalid completion diagnostic')
                     diagnostic = {'phase': frame['phase'], 'category': frame['category']}
                     if type(frame.get('errno')) is int:
@@ -602,6 +603,11 @@ def main(spec_path):
                     exit_code = frame['code']
                     if type(exit_code) is not int or not 0 <= exit_code <= 255:
                         raise ValueError('invalid native exit status')
+                    if active_export is not None or not admitted or quiescence is None:
+                        raise ValueError('incomplete export cannot be acknowledged')
+                    # This acknowledges receipt only, not success/approval. Keep
+                    # the guest alive until every exported byte has been fsynced.
+                    channel.send({'type': 'export_received'})
                     break
                 else:
                     raise ValueError('unknown native guest frame')

@@ -25,6 +25,36 @@ GUEST = load('guest_native_io', 'native-provider-vm-guest.py')
 
 
 class NativeIoTests(unittest.TestCase):
+    def test_guest_waits_for_export_receipt_before_shutdown(self):
+        sent, received = threading.Event(), threading.Event()
+        frames = []
+        errors = []
+        def complete():
+            try:
+                GUEST.complete_worker(frames.append, [], 1000, 0, sent, received)
+            except Exception as error:
+                errors.append(error)
+        with patch.object(GUEST, 'quiesce_worker', return_value={'remaining_workers': 0}), \
+             patch.object(GUEST, 'export_home', return_value=None):
+            thread = threading.Thread(target=complete)
+            thread.start()
+            self.assertTrue(sent.wait(1))
+            self.assertTrue(thread.is_alive(), 'exit frame alone must not permit shutdown')
+            received.set()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(frames[-1], {'type': 'exit', 'code': 0})
+            class LostController:
+                def wait(self, seconds):
+                    self.seconds = seconds
+                    return False
+            lost = LostController()
+            with self.assertRaises(RuntimeError):
+                GUEST.complete_worker(frames.append, [], 1000, 0, sent, lost)
+            self.assertEqual(lost.seconds, 30)
+            self.assertEqual(frames[-1]['phase'], 'export_ack')
+
     def test_runtime_fifo_export_refuses_without_waiting_for_writer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

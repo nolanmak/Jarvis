@@ -245,6 +245,9 @@ def main():
     if job['mcp']:
         threading.Thread(target=relay_input, daemon=True).start()
     started = threading.Event()
+    export_sent = threading.Event()
+    export_received = threading.Event()
+    export_progress = threading.Event()
     child_ready = threading.Event()
     child = []
     def fatal(reason):
@@ -284,6 +287,10 @@ def main():
                 kind = frame['type']
                 if kind == 'start' and not started.is_set():
                     started.set()
+                elif kind == 'export_progress' and started.is_set():
+                    export_progress.set()
+                elif kind == 'export_received' and export_sent.is_set() and not export_received.is_set():
+                    export_received.set()
                 elif kind.startswith('gateway_'):
                     gateway.receive(frame)
                 elif kind in ('stdin', 'stdin_end'):
@@ -323,10 +330,10 @@ def main():
     for thread in threads:
         thread.start()
     code = process.wait()
-    complete_worker(send, threads, uid, code)
+    complete_worker(send, threads, uid, code, export_sent, export_received, export_progress)
 
 
-def complete_worker(send, threads, uid, code):
+def complete_worker(send, threads, uid, code, export_sent=None, export_received=None, export_progress=None):
     phase = 'quiescence'
     try:
         quiescence = quiesce_worker(uid)
@@ -339,7 +346,18 @@ def complete_worker(send, threads, uid, code):
         phase = 'runtime_export'
         export_home(send)
         phase = 'exit_receipt'
+        if export_sent is not None:
+            export_sent.set()
         send({'type': 'exit', 'code': code if code >= 0 else 128 - code})
+        phase = 'export_ack'
+        if export_received is not None:
+            deadline = time.monotonic() + 30
+            while not export_received.wait(0.05 if export_progress is not None else 30):
+                if export_progress is not None and export_progress.is_set():
+                    export_progress.clear()
+                    deadline = time.monotonic() + 30
+                if time.monotonic() >= deadline or export_progress is None:
+                    raise RuntimeError('controller export receipt absent')
     except Exception as error:
         category = type(error).__name__
         if category not in ('ValueError', 'RuntimeError', 'OSError', 'PermissionError', 'FileNotFoundError'):
