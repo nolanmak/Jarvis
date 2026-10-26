@@ -34,7 +34,7 @@ jobs:
       protected_patterns: ${{ steps.load.outputs.patterns }}
       has_secret: ${{ steps.secret.outputs.present }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
       - id: secret
@@ -67,7 +67,7 @@ jobs:
       BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
       PROTECTED_PATTERNS: ${{ needs.gate.outputs.protected_patterns }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -77,14 +77,14 @@ jobs:
           git config user.name  "github-actions[bot]"
           git checkout -b "$BRANCH_NAME"
           git push -u origin "$BRANCH_NAME"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Claude fix
         id: claude
         continue-on-error: true
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -107,15 +107,15 @@ jobs:
       ISSUE_NUM: ${{ needs.gate.outputs.issue_number }}
       BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ env.BRANCH_NAME }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Revert any edits to protected paths
         id: revert
         run: |

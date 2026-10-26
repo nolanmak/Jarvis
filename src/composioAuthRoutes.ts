@@ -35,7 +35,7 @@ function googleAttemptView(attempt: GoogleAttempt) {
   return {
     attempt_id: attempt.attempt_id, provider: "gmail", transport: "google", status,
     connected: attempt.status === "connected",
-    ...(attempt.email ? { email: attempt.email } : {}),
+    ...(attempt.email ? { email: attempt.email } : attempt.requested_email ? { email: attempt.requested_email } : {}),
     ...(attempt.entity_id ? { entity_id: attempt.entity_id } : {}),
     ...(attempt.error ? { error: attempt.error } : {}),
   };
@@ -54,7 +54,7 @@ export function createComposioAuthRouter(deps: Dependencies): Router {
         return;
       }
       const body = req.body;
-      const keys = operation === "start" ? ["provider", "entity_id"] : ["attempt_id"];
+      const keys = operation === "start" ? ["provider", "entity_id", "email"] : ["attempt_id"];
       if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => !keys.includes(key))) {
         throw new InputError("Invalid authentication arguments");
       }
@@ -83,11 +83,16 @@ export function createComposioAuthRouter(deps: Dependencies): Router {
         } else if (body.entity_id !== undefined) {
           throw new InputError("entity_id is only supported for calendar");
         }
+        if (body.email !== undefined && (provider !== "gmail" || typeof body.email !== "string"
+            || !/^[^\s@]+@[^\s@]+$/.test(body.email.trim()) || body.email.length > 254)) {
+          throw new InputError("email must be a mailbox address and is only supported for gmail");
+        }
         if (provider === "gmail" && deps.google?.configured()) {
-          const started = await deps.google.start();
+          const started = await deps.google.start(body.email);
           res.status(201).json({
             provider, transport: "google", attempt_id: started.attempt_id, auth_url: started.auth_url,
             expires_at: started.expires_at,
+            ...(started.requested_email ? { email: started.requested_email } : {}),
             // Google redirects to the dashboard's registered callback, so the
             // consent must finish in a browser that can reach it.
             note: process.env.AUGMENTAGENT_PUBLIC_URL?.trim()

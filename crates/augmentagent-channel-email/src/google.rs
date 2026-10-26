@@ -132,22 +132,27 @@ impl OAuthApp {
     /// The consent URL for one mailbox connect. `access_type=offline` plus
     /// `prompt=consent` is what makes Google return a refresh token every
     /// time, not only on the first consent for this client.
-    pub fn auth_url(&self, redirect_uri: &str, state: &str) -> String {
+    ///
+    /// `login_hint` (a mailbox address) makes Google preselect that account
+    /// in its chooser, so a caller connecting several mailboxes in a row
+    /// lands each consent on the intended one.
+    pub fn auth_url(&self, redirect_uri: &str, state: &str, login_hint: Option<&str>) -> String {
         let scope = SCOPES.join(" ");
-        let url = reqwest::Url::parse_with_params(
-            AUTH_ENDPOINT,
-            &[
-                ("client_id", self.client_id.as_str()),
-                ("redirect_uri", redirect_uri),
-                ("response_type", "code"),
-                ("scope", scope.as_str()),
-                ("access_type", "offline"),
-                ("prompt", "consent"),
-                ("include_granted_scopes", "true"),
-                ("state", state),
-            ],
-        )
-        .expect("static auth endpoint parses");
+        let mut params = vec![
+            ("client_id", self.client_id.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("response_type", "code"),
+            ("scope", scope.as_str()),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+            ("include_granted_scopes", "true"),
+            ("state", state),
+        ];
+        if let Some(hint) = login_hint.map(str::trim).filter(|h| !h.is_empty()) {
+            params.push(("login_hint", hint));
+        }
+        let url = reqwest::Url::parse_with_params(AUTH_ENDPOINT, &params)
+            .expect("static auth endpoint parses");
         url.to_string()
     }
 }
@@ -1277,9 +1282,17 @@ impl GmailMessage {
             attachments,
             subject,
             body,
-            // Epoch ms as a string; `parse_rfc2822_or_ms` reads it exactly
-            // as it reads Composio's `messageTimestamp`.
-            date: self.internal_date.unwrap_or_default(),
+            // RFC 3339, the shape Composio's `messageTimestamp` had, so
+            // listings print a readable date; `parse_rfc2822_or_ms` reads it
+            // back to the same instant.
+            date: self
+                .internal_date
+                .as_deref()
+                .and_then(|d| d.parse::<i64>().ok())
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .or(self.internal_date)
+                .unwrap_or_default(),
             account_entity_id: Some(account_entity_id.to_string()),
             platform: "gmail".into(),
             kind: "dm".into(),
@@ -1514,7 +1527,7 @@ mod tests {
     #[test]
     fn auth_url_requests_offline_access_with_forced_consent_and_every_scope() {
         let app = OAuthApp::new("cid.apps.googleusercontent.com", "s");
-        let url = app.auth_url("http://localhost:3000/oauth/google/callback", "st4te");
+        let url = app.auth_url("http://localhost:3000/oauth/google/callback", "st4te", None);
         let parsed = reqwest::Url::parse(&url).unwrap();
         let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(parsed.host_str(), Some("accounts.google.com"));
@@ -1528,6 +1541,10 @@ mod tests {
             assert!(q["scope"].split(' ').any(|s| s == *scope), "{scope} missing");
         }
         assert!(!url.contains("csecret") && !url.contains("client_secret"));
+        assert!(!q.contains_key("login_hint"));
+        let hinted = app.auth_url("http://localhost:3000/oauth/google/callback", "s", Some("me@example.com"));
+        let hq: HashMap<_, _> = reqwest::Url::parse(&hinted).unwrap().query_pairs().into_owned().collect();
+        assert_eq!(hq["login_hint"], "me@example.com");
     }
 
     #[test]
