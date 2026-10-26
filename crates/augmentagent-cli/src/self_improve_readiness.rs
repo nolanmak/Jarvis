@@ -10,6 +10,7 @@ struct Evidence { path:Option<String>, quote:String }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(tag="status",rename_all="snake_case",deny_unknown_fields)]
 enum Slot {
+    #[serde(alias="not_applicable")]
     Resolved { decision:String,evidence:Vec<Evidence> },
     ExternalDecision { question:String,alternatives:Vec<String>,evidence:Vec<Evidence> },
 }
@@ -113,9 +114,29 @@ async fn assess_source(root:&Path,source:AcceptanceSource,title:&str,body:&str,h
     let base=actual_head(root).await?;
     let current_main=workflow::remote_main_head(root,workflow.repository()).await?;
     let owner=format!("{title}\n{body}");
-    let prompt=format!("Assess codification readiness BEFORE producing a spec. For each fixed slot trigger, failure, surface, persistence, guards, rollout, resolve routine gaps from exact owner/repository evidence. A not-applicable slot still needs a grounded explanation. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON {{\"slots\":{{\"trigger\":{{\"status\":\"resolved\",\"decision\":\"...\",\"evidence\":[{{\"path\":null,\"quote\":\"exact owner text\"}}]}},...}}}}. External slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. All six slots mandatory. Owner request:\n{owner}");
-    let raw=scope_authority::assess(root,workflow.repository(),workflow,&prompt).await?;
-    let assessment=decode(&raw)?;
+    let prompt=format!("Assess codification readiness BEFORE producing a spec. For each fixed slot trigger, failure, surface, persistence, guards, rollout, resolve routine gaps from exact owner/repository evidence. A not-applicable slot MUST use status=resolved with decision explaining why it is not applicable and evidence grounding that conclusion. Never emit a separate not_applicable status. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON {{\"slots\":{{\"trigger\":{{\"status\":\"resolved\",\"decision\":\"...\",\"evidence\":[{{\"path\":null,\"quote\":\"exact owner text\"}}]}},...}}}}. External slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. All six slots mandatory. Owner request:\n{owner}");
+    let epoch=amendment::digest(serde_json::to_string(&(source,hash,&base,&current_main,&prompt)).unwrap().as_bytes());
+    let key=|attempt|amendment::digest(format!("readiness-grounding-v2:{epoch}:{attempt}").as_bytes());
+    let read_workflow=&*workflow;
+    let (assessment,gaps)=recover_assessment(&prompt,
+        |attempt|workflow.scope_stage_response(&key(attempt)),
+        |attempt,raw|workflow.record_scope_stage_response(&key(attempt),raw),
+        |request|async move {let raw=scope_authority::assess(root,read_workflow.repository(),read_workflow,&request).await?;read_workflow.audit_health().await?;Ok(raw)},
+        |raw| {let base=&base;let owner=&owner;async move {let assessment=decode(&raw)?;let gaps=validate_observed(root,base,owner,&assessment).await?;Ok((assessment,gaps))}}
+    ).await?;
+    let evidence=serde_json::to_string(&assessment)?;
+    workflow.audit_logger().record_controller(serde_json::json!({"kind":"independent_readiness","base":base,"request_hash":hash,"source":source,"assessment":assessment}))?;
+    ensure!(workflow::remote_main_head(root,workflow.repository()).await?==current_main,"main changed during readiness assessment");
+    match source {
+        AcceptanceSource::Issue(number)=>workflow.set_readiness_dependency(number,if gaps.is_empty(){None}else{Some((hash,&current_main,"external_decision",&evidence))})?,
+        AcceptanceSource::PullRequest(number)=>workflow.set_pr_readiness_dependency(number,if gaps.is_empty(){None}else{Some((hash,&current_main,&evidence))})?,
+    }
+    if gaps.is_empty() {return Ok(Decision::Ready(evidence));}
+    workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"material_external_decision_missing","await_request_or_main_change",0,&[evidence]).await?;
+    Ok(Decision::Dependency(gaps.join("\n")))
+}
+
+async fn validate_observed(root:&Path,base:&str,owner:&str,assessment:&Assessment)->Result<Vec<String>> {
     let mut files=BTreeMap::new();
     for slot in assessment.slots.values() {
         let evidence=match slot {Slot::Resolved{evidence,..}|Slot::ExternalDecision{evidence,..}=>evidence};
@@ -131,17 +152,20 @@ async fn assess_source(root:&Path,source:AcceptanceSource,title:&str,body:&str,h
             }
         }
     }
-    let gaps=validate(&assessment,&owner,&files)?;
-    let evidence=serde_json::to_string(&assessment)?;
-    workflow.audit_logger().record_controller(serde_json::json!({"kind":"independent_readiness","base":base,"request_hash":hash,"source":source,"assessment":assessment}))?;
-    ensure!(workflow::remote_main_head(root,workflow.repository()).await?==current_main,"main changed during readiness assessment");
-    match source {
-        AcceptanceSource::Issue(number)=>workflow.set_readiness_dependency(number,if gaps.is_empty(){None}else{Some((hash,&current_main,"external_decision",&evidence))})?,
-        AcceptanceSource::PullRequest(number)=>workflow.set_pr_readiness_dependency(number,if gaps.is_empty(){None}else{Some((hash,&current_main,&evidence))})?,
+    validate(assessment,owner,&files)
+}
+async fn recover_assessment<R,W,G,F,V,VF>(prompt:&str,read:R,write:W,mut generate:G,validate:V)->Result<(Assessment,Vec<String>)>
+where R:Fn(u32)->Result<Option<String>>,W:Fn(u32,&str)->Result<()>,G:FnMut(String)->F,F:std::future::Future<Output=Result<String>>,
+      V:Fn(String)->VF,VF:std::future::Future<Output=Result<(Assessment,Vec<String>)>> {
+    let mut failure=String::new();
+    for attempt in 0..2 {
+        let raw=if let Some(raw)=read(attempt)? {raw} else {
+            let request=if attempt==0 {prompt.to_owned()} else {format!("{prompt}\nYour previous completed assessment failed controller validation: {failure}. Return all six slots, each exactly resolved with decision/evidence or external_decision with question/alternatives/evidence. Not-applicable uses resolved. Cite exact supplied literal evidence. Do not invent material decisions to satisfy schema.")};
+            let raw=generate(request).await?;write(attempt,&raw)?;raw
+        };
+        match validate(raw).await {Ok(result)=>return Ok(result),Err(error)=>failure=format!("{error:#}")}
     }
-    if gaps.is_empty() {return Ok(Decision::Ready(evidence));}
-    workflow.checkpoint(crate::autoship_workflow::Stage::Scope,"material_external_decision_missing","await_request_or_main_change",0,&[evidence]).await?;
-    Ok(Decision::Dependency(gaps.join("\n")))
+    Err(scope_authority::CompletedInvalid(failure).into())
 }
 
 #[derive(Deserialize)]
@@ -221,6 +245,31 @@ pub(in crate::self_improve) async fn decompose_unverifiable(repo:&Path,root:&Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn schema_correction_is_grounded_and_completed_raw_response_survives_restart() {
+        let responses=std::sync::Mutex::new(BTreeMap::<u32,String>::new());
+        let read=|attempt|Ok(responses.lock().unwrap().get(&attempt).cloned());
+        let write=|attempt,raw:&str|{responses.lock().unwrap().insert(attempt,raw.into());Ok(())};
+        let mut alias=serde_json::to_value(resolved()).unwrap();
+        alias["slots"]["rollout"]["status"]="not_applicable".into();
+        let alias=serde_json::to_string(&alias).unwrap();
+        let calls=std::sync::atomic::AtomicUsize::new(0);
+        let validate=|raw:String|async move {
+            let assessment=decode(&raw)?;
+            let files=BTreeMap::from([("src/main.rs".into(),"fn status_cli() {}".into())]);
+            let gaps=super::validate(&assessment,"request",&files)?;Ok((assessment,gaps))
+        };
+        let (_,gaps)=recover_assessment("request",read,write,|prompt| {
+            let index=calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);let alias=alias.clone();async move {
+                if index==0 {Ok("{\"slots\":{}}".into())} else {assert!(prompt.contains("all six slots"));Ok(alias)}
+            }
+        },validate).await.unwrap();
+        assert!(gaps.is_empty());assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),2);
+        assert_eq!(responses.lock().unwrap().get(&0).unwrap(),"{\"slots\":{}}","malformed response retained privately before parsing");
+        recover_assessment("request",read,write,|_|async {panic!("completed responses must be reused")},validate).await.unwrap();
+        let mut ungrounded=serde_json::to_value(resolved()).unwrap();ungrounded["slots"]["rollout"]["evidence"]=serde_json::json!([]);
+        assert!(validate(serde_json::to_string(&ungrounded).unwrap()).await.is_err(),"status alias is not an evidence exemption");
+    }
     fn adopted()->adoption::AdoptedPr {
         adoption::AdoptedPr {repository:"owner/repo".into(),pr:970,source_issue:None,branch:"worktree/imported".into(),head:"candidate-a".into(),base:"main".into(),author:"owner".into(),title:"Expose status".into(),body:"Choose destination externally".into(),dependency:adoption::Dependency::Main}
     }
