@@ -773,6 +773,28 @@
       "reviewer": "independent review agent",
       "conclusion": "LGTM",
       "scope": "Original-owner resume checks and external audit anchor fixture; later changes require their own validation."
+    },
+    "hosted_rust_0edac218": {
+      "revision": "0edac218",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40353812369",
+      "conclusion": "success",
+      "cli_passed": 1254,
+      "cli_ignored": 21,
+      "core_passed": 637,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-0edac218-rust.log",
+      "scope": "Full listed Rust job passed; later socket, email-history and gateway-receipt changes need separate validation."
+    },
+    "managed_local_workflow_a73ac9ac": {
+      "revision": "a73ac9ac",
+      "build": "managed single-job CLI test build passed",
+      "passed": 51,
+      "ignored": 1,
+      "logs": [
+        "/tmp/autoship-1598-a73ac9ac-workflow-tests.log",
+        "/tmp/autoship-1598-a73ac9ac-guard-tests.log"
+      ],
+      "scope": "29 durable store tests and22 guard tests. Initial incorrectly named guard filter matched zero; corrected self_improve::workflow::tests filter passed22. Later code changes are not covered."
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -834,7 +856,7 @@
     {
       "severity": "P1",
       "gap": "Authenticated probe stdout alone cannot establish successful provider exchange; partial tool events could escape acceptance checks",
-      "status": "independent_review_found; host_observed_redacted_exchange_receipt_and_partial_tool_rejection_in_progress"
+      "status": "fixed_cf1cc7e6;5probe_and13gateway_tests_passed;actual_provider_acceptance_pending"
     }
   ],
   "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
