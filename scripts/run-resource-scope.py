@@ -4,6 +4,7 @@
 No wall-clock deadline and no network policy are implied. The supervising
 process stays in DelegateSubgroup=daemon; only its child enters run-*.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -77,7 +78,9 @@ class RunScope:
             actual = {name: (self.path/name).read_text().strip() for name in desired}
             if actual != desired:
                 raise RuntimeError('run resource limits failed readback')
-            self.identity = {'path': str(self.path), 'inode': self.path.stat().st_ino,
+            self.identity = {'host_sha256': hashlib.sha256(Path('/etc/machine-id').read_bytes()).hexdigest(),
+                             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                             'path': str(self.path), 'inode': self.path.stat().st_ino,
                              'limits': actual, 'aggregate': {'path': str(parent),
                              'memory_bytes': memory, 'pids': pids, 'cpu_max': ' '.join(cpu)}}
             self.fd = os.open(self.path/'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC)

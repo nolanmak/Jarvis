@@ -35,8 +35,8 @@ pub fn check_requirement(
         return Ok(());
     }
     let observation = serde_json::json!({"phase":"policy_missing","exhausted":true});
-    logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;
     logger.resource_capacity_exhausted(&observation)?;
+    logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;
     Err(crate::reasoner::ReasonerError::ResourceCapacity {
         provider: provider.into(),
         message: "required workflow run resource policy is not configured".into(),
@@ -51,8 +51,8 @@ pub(crate) fn admission_failed(
 ) -> Result<()> {
     let observation = serde_json::json!({"phase":phase,"exhausted":true});
     if let Some(logger) = logger.filter(|logger| logger.is_protected()) {
-        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;
         logger.resource_capacity_exhausted(&observation)?;
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;
     }
     Err(crate::reasoner::ReasonerError::ResourceCapacity {
         provider: provider.into(),
@@ -60,6 +60,40 @@ pub(crate) fn admission_failed(
             .into(),
     }
     .into())
+}
+
+/// Kernel evidence only: never trust a model-produced completion statement.
+/// Missing scopes on the same host are quiescent because cgroup removal requires
+/// an empty subtree. Reboot on that host also terminates every old descendant.
+pub fn verify_quiescent(identity: &serde_json::Value) -> Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let host = format!("{:x}", Sha256::digest(std::fs::read("/etc/machine-id")?));
+    anyhow::ensure!(identity["host_sha256"].as_str() == Some(host.as_str()), "resource host identity unavailable or changed");
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let old_boot = identity["boot_id"].as_str().context("resource boot identity missing")?;
+    let path = std::path::Path::new(identity["path"].as_str().context("resource path missing")?);
+    let name = path.file_name().and_then(|s| s.to_str()).context("resource group name missing")?;
+    anyhow::ensure!(path.starts_with("/sys/fs/cgroup") && name.len() == 36 && name.starts_with("run-")
+        && name[4..].bytes().all(|b| b.is_ascii_hexdigit())
+        && !path.components().any(|c| matches!(c, std::path::Component::ParentDir)), "invalid resource group path");
+    let state = if old_boot != boot.trim() { "host_rebooted" } else {
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "removed_empty_subtree",
+            Err(e) => return Err(e.into()),
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                anyhow::ensure!(path.canonicalize()? == path && meta.ino() == identity["inode"].as_u64().context("resource inode missing")?, "resource identity changed");
+                let events = std::fs::read_to_string(path.join("cgroup.events"))?;
+                anyhow::ensure!(events.lines().any(|line| line == "populated 0"), "resource descendants are still running");
+                // Remove the empty group to revoke a waiting supervisor's
+                // open cgroup.procs handle before it can release a child.
+                // A racing attachment makes rmdir fail, retaining the hold.
+                std::fs::remove_dir(path)?;
+                "kernel_empty_subtree_removed"
+            }
+        }
+    };
+    Ok(serde_json::json!({"identity":identity,"verified_state":state}))
 }
 
 /// Install alongside provider-supervisor.py in its controller-private directory.
@@ -111,10 +145,10 @@ pub fn record_outcome(
     let exhausted = observation.get("exhausted").and_then(|v| v.as_bool()) != Some(false)
         || observation.get("phase").and_then(|v| v.as_str()) != Some("completed");
     if let Some(logger) = logger.filter(|l| l.is_protected()) {
-        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;
         if exhausted {
             logger.resource_capacity_exhausted(&observation)?;
         }
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_observation","provider":provider,"observation":observation}))?;
     }
     if exhausted {
         return Err(crate::reasoner::ReasonerError::ResourceCapacity { provider:provider.into(),

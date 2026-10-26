@@ -367,6 +367,43 @@ impl std::fmt::Debug for AuditLogger {
 }
 
 impl AuditLogger {
+    /// Seal a failed generation only after a new fenced workflow lease and
+    /// independent kernel proof that no admitted worker remains alive.
+    pub fn recovery_evidence(&self, new_lease_generation: i64) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(self.pending_writers.load(std::sync::atomic::Ordering::Acquire) == 0, "audit writers still active");
+        let sink = self.anchored.as_ref().ok_or_else(|| anyhow::anyhow!("recovery requires protected audit"))?;
+        let mut tickets = Vec::new();
+        if let Some(dir) = &self.pending_dir {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                anyhow::ensure!(entry.file_type()?.is_file(), "invalid interrupted audit ticket");
+                tickets.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        tickets.sort();
+        sink.seal_for_recovery(|rows| {
+            let generation = rows.iter().filter(|r| r["actor"] == "controller")
+                .filter_map(|r| r["generation"].as_i64()).max()
+                .ok_or_else(|| anyhow::anyhow!("previous workflow lease evidence missing"))?;
+            anyhow::ensure!(generation < new_lease_generation, "recovery requires a newer fenced lease");
+            let required = rows.iter().position(|r| r["actor"] == "controller" && r["kind"] == "run_resources_required")
+                .ok_or_else(|| anyhow::anyhow!("durable required resource policy missing"))?;
+            let mut proofs = Vec::new();
+            for (index, row) in rows.iter().enumerate() {
+                if row["kind"] == "run_resource_admitted" {
+                    anyhow::ensure!(index > required && row["actor"] == "controller", "unprotected resource admission");
+                    proofs.push(crate::run_resources::verify_quiescent(&row["observation"]["identity"])?);
+                }
+                if row["kind"] == "model_call_admitted" {
+                    anyhow::ensure!(index > required && !proofs.is_empty(), "model dispatch without protected resource admission");
+                }
+            }
+            Ok(serde_json::json!({"previous_lease_generation":generation,
+                "recovery_lease_generation":new_lease_generation,"interrupted_tickets":tickets,
+                "quiescent_resources":proofs}))
+        })
+    }
+
     pub fn set_resource_capacity_observer(&self, observer: Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>) -> anyhow::Result<()> {
         *self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?=Some(observer);
         Ok(())
@@ -375,6 +412,7 @@ impl AuditLogger {
     pub fn require_run_resources(&self) -> anyhow::Result<()> {
         self.protected_health()?;
         anyhow::ensure!(self.is_protected(),"workflow resources require protected audit");
+        self.record_controller(serde_json::json!({"actor":"controller","kind":"run_resources_required","version":1}))?;
         self.run_resources_required.store(true,std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }

@@ -28,6 +28,8 @@ struct Anchor {
     sequence: u64,
     hash: String,
     pending: Option<String>,
+    #[serde(default)]
+    sealed: Option<serde_json::Value>,
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -106,6 +108,40 @@ impl AnchoredAudit {
         );
         self.append_locked(record)
     }
+    /// Validate without replaying uncertain records, then atomically prevent all
+    /// future appends. The caller validates kernel quiescence while holding the
+    /// same lock as writers. A retry returns the identical immutable proof.
+    pub fn seal_for_recovery<F>(&self, validate: F) -> Result<serde_json::Value>
+    where F: FnOnce(&[serde_json::Value]) -> Result<serde_json::Value> {
+        let lock = private_open(&self.anchor.with_extension("lock"), false)?;
+        #[cfg(unix)]
+        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "audit lock failed");
+        ensure!(self.anchor.exists() && self.log.exists(), "recovery requires existing audit evidence");
+        let file = private_open(&self.anchor, false)?;
+        ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
+        let mut anchor: Anchor = serde_json::from_reader(file)?;
+        ensure!(anchor.version == 1, "unsupported anchor");
+        let mut file = private_open(&self.log, false)?;
+        ensure!(file.metadata()?.len() <= LIMIT, "audit exceeds budget");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        ensure!(bytes.len() >= anchor.bytes, "committed audit truncated");
+        let committed = &bytes[..anchor.bytes];
+        let actual = if committed.is_empty() { String::new() } else { digest(committed) };
+        ensure!(actual == anchor.hash, "committed audit modified");
+        let tail = &bytes[anchor.bytes..];
+        ensure!(match &anchor.pending { Some(p) => p.as_bytes().starts_with(tail), None => tail.is_empty() }, "unrecognized audit tail");
+        let rows = committed.split(|b| *b == b'\n').filter(|r| !r.is_empty())
+            .map(serde_json::from_slice).collect::<std::result::Result<Vec<serde_json::Value>, _>>()?;
+        let validation = validate(&rows)?;
+        if let Some(proof) = anchor.sealed { return Ok(proof); }
+        let proof = serde_json::json!({"version":1,"committed_sha256":anchor.hash,
+            "committed_bytes":anchor.bytes,"sequence":anchor.sequence,
+            "interrupted_append":anchor.pending,"validation":validation});
+        anchor.sealed = Some(proof.clone());
+        self.save(&anchor)?;
+        Ok(proof)
+    }
     fn append_locked(&self, mut record: serde_json::Value) -> Result<()> {
         let mut anchor = if self.anchor.exists() {
             let file = private_open(&self.anchor, false)?;
@@ -121,6 +157,7 @@ impl AnchoredAudit {
             }
         };
         ensure!(anchor.version == 1, "unsupported audit anchor");
+        ensure!(anchor.sealed.is_none(), "audit generation is sealed");
         let mut file = private_open(&self.log, true)?;
         File::open(self.log.parent().unwrap())?.sync_all()?;
         ensure!(
@@ -204,6 +241,29 @@ mod tests {
         )
         .unwrap();
         (dir, sink)
+    }
+    #[test]
+    fn recovery_seal_preserves_interrupted_tail_and_blocks_late_writers() {
+        let (_dir, sink) = setup();
+        sink.append(serde_json::json!({"kind":"admitted"})).unwrap();
+        let mut anchor: Anchor = serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+        anchor.pending = Some("{\"uncertain_result\":true}\n".into());
+        sink.save(&anchor).unwrap();
+        private_open(&sink.log, true).unwrap().write_all(b"{\"uncertain").unwrap();
+        let before = fs::read(&sink.log).unwrap();
+        assert!(sink.seal_for_recovery(|_| anyhow::bail!("worker live")).is_err());
+        let proof = sink.seal_for_recovery(|rows| {
+            assert_eq!(rows.len(), 1);
+            Ok(serde_json::json!({"quiescent":true}))
+        }).unwrap();
+        assert_eq!(fs::read(&sink.log).unwrap(), before);
+        assert!(proof["interrupted_append"].as_str().unwrap().contains("uncertain_result"));
+        assert!(sink.clone().append(serde_json::json!({"late":true})).is_err());
+        assert_eq!(sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).unwrap(), proof);
+        let mut corrupted = before;
+        corrupted[2] ^= 1;
+        fs::write(&sink.log, corrupted).unwrap();
+        assert!(sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).is_err());
     }
     #[test]
     fn detects_old_record_rewrite_and_committed_truncation() {
