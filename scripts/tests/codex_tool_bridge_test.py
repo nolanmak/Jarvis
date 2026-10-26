@@ -1034,6 +1034,25 @@ print(child.pid, flush=True)
         self.assertEqual(protected.read_text(),'SYNTHETIC_METADATA_ONLY')
 
     @requires_sandbox
+    def test_explicit_git_object_readers_reject_protected_blob_names(self):
+        subprocess.run(['git','init','-q',str(self.root)],check=True)
+        (self.root/'source.txt').write_text('public fixture\n')
+        (self.root/'.env').write_text('SYNTHETIC_SECRET\n')
+        (self.root/'.ssh').mkdir()
+        (self.root/'.ssh/config').write_text('SYNTHETIC_CONTROL\n')
+        subprocess.run(['git','-C',str(self.root),'add','.'],check=True)
+        subprocess.run(['git','-C',str(self.root),'-c','user.name=Synthetic Tester',
+                        '-c','user.email=tester@example.com','commit','-qm','fixture'],check=True)
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[],'allowed_tools':['Bash(git show*)','Bash(git cat-file*)']})
+        for command in ['git show HEAD:.env','git cat-file -p HEAD:.ssh/config',
+                        'git show HEAD:sub/.env.local','git show :0:.env']:
+            with self.assertRaises(bridge.Denied):policy.run_command(command)
+        result=policy.run_command('git show HEAD:source.txt')
+        self.assertEqual(result['exit_code'],0,result)
+        self.assertIn('public fixture',result['stdout'])
+
+    @requires_sandbox
     def test_git_object_reads_do_not_disclose_protected_source_history(self):
         subprocess.run(['git','init','-q',str(self.root)],check=True)
         (self.root/'source.txt').write_text('before\n')
@@ -1052,9 +1071,8 @@ print(child.pid, flush=True)
         history=policy.run_command('git log -p')
         self.assertEqual(history['exit_code'],0,history)
         self.assertNotIn('SYNTHETIC_OLD_SECRET',history['stdout'])
-        blobs=policy.run_command('git diff HEAD:.env HEAD:source.txt')
-        self.assertNotEqual(blobs['exit_code'],0)
-        self.assertNotIn('SYNTHETIC_OLD_SECRET',blobs['stdout'])
+        with self.assertRaises(bridge.Denied):
+            policy.run_command('git diff HEAD:.env HEAD:source.txt')
 
     @requires_sandbox
     def test_real_npm_can_run_a_dependency_free_project_test(self):

@@ -1758,6 +1758,16 @@ class Policy:
                 for operand in argv[1:]:
                     if operand.startswith('-'):
                         continue
+                    # Object expressions are not filesystem paths. A future
+                    # profile allowing show/cat-file must not bypass protected
+                    # names through the separately granted Git object store.
+                    if ':' in operand:
+                        object_path = operand.split(':', 1)[1]
+                        if operand.startswith(':') and ':' in object_path and object_path.split(':', 1)[0] in {'0', '1', '2', '3'}:
+                            object_path = object_path.split(':', 1)[1]
+                        if any(part in CONTROL_PARTS or part == '.env' or part.startswith('.env.')
+                               for part in object_path.split('/')):
+                            raise Denied('credential and control object paths are excluded')
                     lexical = Path(os.path.abspath(self.cwd / operand))
                     resolved = lexical.resolve()
                     if lexical not in self.read_roots:
