@@ -67,6 +67,41 @@ fn validate_completion(value: &Value, route: &str) -> Result<()> {
     Ok(())
 }
 
+async fn initialize_fixture(root: &Path) -> Result<()> {
+    for args in [
+        vec!["init", "-q", "-b", "disposable"],
+        vec!["config", "user.name", "Disposable Transport"],
+        vec!["config", "user.email", "probe@example.invalid"],
+        vec!["commit", "--allow-empty", "-qm", "transport fixture"],
+        vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ] {
+        anyhow::ensure!(
+            Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .await?
+                .status
+                .success(),
+            "fixture git setup failed"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn routed_fixture_supports_real_workflow_git_binding_before_dispatch() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    initialize_fixture(root.path()).await?;
+    let binding =
+        workflow::git_binding(root.path(), "routed-transport-v1", "no-tools", &[]).await?;
+    anyhow::ensure!(
+        binding.head.len() == 40 && binding.evidence_hash.len() == 64,
+        "real fixture binding unavailable"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "paid production Rust operator-route VM transport; explicit central run only"]
 async fn live_native_operator_routed_transport() -> Result<()> {
@@ -130,23 +165,7 @@ async fn live_native_operator_routed_transport() -> Result<()> {
     let fixture = tempfile::Builder::new()
         .prefix("autoship-routed-transport-")
         .tempdir_in("/tmp")?;
-    for args in [
-        vec!["init", "-q", "-b", "disposable"],
-        vec!["config", "user.name", "Disposable Transport"],
-        vec!["config", "user.email", "probe@example.invalid"],
-        vec!["commit", "--allow-empty", "-qm", "transport fixture"],
-    ] {
-        anyhow::ensure!(
-            Command::new("/usr/bin/git")
-                .args(args)
-                .current_dir(fixture.path())
-                .output()
-                .await?
-                .status
-                .success(),
-            "fixture git setup failed"
-        );
-    }
+    initialize_fixture(fixture.path()).await?;
     let repository = format!("autoship-canary/routed-{}", uuid::Uuid::new_v4());
     let guard = workflow::WorkflowGuard::acquire(workflow::Start {
         repo_root: fixture.path(),
@@ -210,7 +229,13 @@ async fn live_native_operator_routed_transport() -> Result<()> {
     let session = provider_root.join(name);
     let owner = private_json(&session.join("owned.json"))?;
     anyhow::ensure!(
-        owner["owner"]["workflow_id"] == guard.id()
+        owner["owner"]
+            == serde_json::to_value(
+                guard
+                    .audit_logger()
+                    .native_runtime_owner()?
+                    .context("fenced runtime owner missing")?
+            )?
             && owner["audit_path"] == guard.audit_logger().path().to_string_lossy().as_ref(),
         "runtime owner does not match protected call"
     );
