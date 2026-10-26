@@ -202,14 +202,25 @@ fn unlabelled_evidence(case: &Case) -> Result<serde_json::Value> {
     object.remove("rubric");
     Ok(evidence)
 }
+fn source_identity(case: &Case) -> Result<serde_json::Value> {
+    let mut evidence = unlabelled_evidence(case)?;
+    // Execution receipt paths, workflow IDs and head hashes identify an
+    // observation, not different source. Keep receipts in the held-out input
+    // but never use them to admit an otherwise duplicate labelled example.
+    evidence
+        .as_object_mut()
+        .unwrap()
+        .remove("executable_acceptance");
+    Ok(evidence)
+}
 fn held_out_examples(training: &[Case], held: &Case) -> Result<String> {
-    let evidence = unlabelled_evidence(held)?;
+    let evidence = source_identity(held)?;
     let mut examples = Vec::new();
     for candidate in training {
         // Distinct workflow IDs or head hashes do not establish a distinct
         // case when the actual contract/candidate evidence is identical.
         if candidate.id == held.id
-            || (candidate.criteria == held.criteria && unlabelled_evidence(candidate)? == evidence)
+            || (candidate.criteria == held.criteria && source_identity(candidate)? == evidence)
         {
             continue;
         }
@@ -594,6 +605,19 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("rubric"));
+    }
+
+    #[test]
+    fn different_execution_receipts_do_not_make_same_source_held_out() {
+        let mut held = case("head-a", "source");
+        let mut duplicate = case("head-b", "source");
+        held.evidence=serde_json::json!({"diff":"same diff","files":[["src.py","same code"]],"callers":"same callers","rubric":{"version":"v1"},"executable_acceptance":{"binding":{"head":"a"},"artifact":"/workflow/a","receipt":"receipt-a"}}).to_string();
+        duplicate.evidence=serde_json::json!({"diff":"same diff","files":[["src.py","same code"]],"callers":"same callers","rubric":{"version":"v2"},"executable_acceptance":{"binding":{"head":"b"},"artifact":"/workflow/b","receipt":"receipt-b"}}).to_string();
+        assert_eq!(held_out_examples(&[duplicate], &held).unwrap(), "[]");
+        assert!(unlabelled_evidence(&held)
+            .unwrap()
+            .get("executable_acceptance")
+            .is_some());
     }
 
     #[test]
