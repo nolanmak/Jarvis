@@ -208,6 +208,19 @@ fn add_controller_sources(shards:&mut BTreeMap<String,String>,prepared:&acceptan
         }
     }
 }
+// Both the small direct request and overflow planner need actual immutable
+// source, not just receipt hashes. Pinned observers may be unchanged in the diff.
+fn final_source_evidence(
+    evidence: &mut serde_json::Value,
+    findings: &BTreeMap<String, String>,
+    prepared: Option<&acceptance::PreparedAcceptance>,
+) {
+    evidence["finding_source"] = serde_json::json!(findings);
+    if let Some(prepared) = prepared {
+        evidence["controller_sources"] = serde_json::json!(prepared.proposal.files);
+    }
+}
+
 fn controller_verifier_dispute(findings:&[aligned::Finding],prepared:Option<&acceptance::PreparedAcceptance>)->bool {
     let Some(prepared)=prepared else {return false;};
     findings.iter().any(|finding| {
@@ -779,18 +792,18 @@ async fn run_impl(
                     "reviewed_request_hash":pass.coverage.prompt_hash,"additional_native_sessions":pass.additional_sessions.len()
                 })).collect::<Vec<_>>())?
             } else {serde_json::to_value(&structured.passes)?};
-            let adjudication_evidence = serde_json::to_string(&serde_json::json!({
+            let mut adjudication_evidence = serde_json::json!({
                 "candidate_diff": diff,
                 "controller_acceptance":controller_context,
                 "caller_evidence": caller_adjudication,
                 "source_manifest_only": files.iter().map(|(path,body)| (path,aligned::digest(body.as_bytes()))).collect::<BTreeMap<_,_>>(),
                 "completed_reviews": review_adjudication,
-                "streamed_finding_source": if caller_plan.is_some() {Some(&finding_evidence)}else{None},
                 "supplemental_immutable_source": recovered_files,
-            }))?;
+            });
+            final_source_evidence(&mut adjudication_evidence,&finding_evidence,context.acceptance_evidence.map(|(prepared,_)|prepared));
             structured.adjudication = Some(final_authority::Input {
                 worktree:&worktree,guard:context.workflow,opts,review:&structured,contract:&contract,findings:&unresolved,
-                evidence:serde_json::from_str(&adjudication_evidence)?,source:&finding_evidence,finding_sources:&finding_source_keys,
+                evidence:adjudication_evidence,source:&finding_evidence,finding_sources:&finding_source_keys,
                 attempts_already_made:context.adjudication_attempts_already_made,diagnostic,
             }.run().await?);
     }
@@ -1065,11 +1078,22 @@ mod tests {
         let reference=acceptance::CandidateReceiptReference {schema_version:1,binding,artifact:artifact.clone(),artifact_sha256:aligned::digest(&bytes),receipt_ids:vec!["oracle".into()],alignment:None};
         let prepared=acceptance::PreparedAcceptance {proposal,baseline:acceptance::BaselineEvidence {registration,receipts:vec![red]}};
         let controller=controller_acceptance_context(&prepared,Some(&reference)).unwrap();
+        // Non-streamed, unchanged pinned observer: the diff contains no source
+        // and there are no streamed caller groups. Final authority's small
+        // fast path must still receive actual bytes, not only pin digests.
+        let mut final_evidence=serde_json::json!({"candidate_diff":"","controller_acceptance":controller});
+        let finding_sources=BTreeMap::from([("source:implementation".into(),"actual_behavior = 77".into())]);
+        final_source_evidence(&mut final_evidence,&finding_sources,Some(&prepared));
+        assert_eq!(final_evidence["controller_sources"][pin],script);
+        assert_eq!(final_evidence["finding_source"]["source:implementation"],"actual_behavior = 77");
+
         assert_eq!(controller["registered_contract"]["verifiers"][0]["command"]["oracle"]["value"],77);
         assert_eq!(controller["candidate_results"][0]["result"],"passed");
         assert_eq!(controller["pinned_source_hashes"][pin],aligned::digest(script.as_bytes()));
         let review_binding=aligned::ReviewBinding {head,base:"b".repeat(40),contract_hash:reference.binding.contract_hash.clone(),environment_id:"fixture-environment".into(),evidence_hash:aligned::digest(&bytes)};
         let contract=BTreeMap::from([("C1".into(),"Return exactly 77".into())]);
+        let direct_bytes=aligned::adjudication_prompt_bytes(&review_binding,&contract,&[],&serde_json::to_string(&final_evidence).unwrap()).unwrap();
+        assert!(direct_bytes<aligned::MAX_PROMPT_BYTES,"fixture exercises direct final authority, not overflow source recovery");
         let inputs=evidence_plan::Inputs {binding:&review_binding,issue:"behavior",contract:&contract,prior:&[],system_bytes:1024,controller_acceptance:Some(&controller)};
         let mut shards=BTreeMap::from([("source:large".into(),"x".repeat(aligned::MAX_PROMPT_BYTES))]);
         add_controller_sources(&mut shards,&prepared);
