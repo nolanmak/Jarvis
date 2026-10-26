@@ -552,3 +552,7 @@ mod tests {
         assert_eq!(gh.creates, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_github_probe.rs"]
+mod live_probe;
