@@ -1346,6 +1346,21 @@
     "evidence": null
   },
   {
+    "id": "cli:triage-calibration",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Exposes replay, disable, and enable for triage calibration. Replay uses immutable original-time evidence, independently labeled disjoint holdout cases, protected native-call accounting, and versioned promotion/rollback; operator disable fences in-flight promotion.",
+    "macos_target": "Expose the same commands and evidence, quota, pause, promotion, and rollback guards. Real macOS native-provider isolation and calibration replay remain unverified; unsupported protection must fail closed.",
+    "prerequisites": [
+      "Rust CLI and private SQLite state",
+      "Original-time triage evidence with actual provider/model provenance",
+      "Protected native provider runtime, credentials, audit, and resource admission for live replay"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1522",
+    "test_plan": "Run augmentagent triage-calibration --help and scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent triage_calibration:: on Linux and macOS. Verify original-time evidence, disjoint holdout, immutable pending corpus, operator pause CAS, protected cache, bounded daily attempts, and rollback. Separately perform controlled native replay on a real Mac with supported isolation and retain host-specific evidence before marking verified.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "cli:triage-prefilter",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent triage-prefilter; record its command-specific effects and authorization.",
