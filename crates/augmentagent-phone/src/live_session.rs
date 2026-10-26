@@ -238,6 +238,9 @@ impl LiveSession {
                 Ok(LiveInput::Closed { reason, seconds })
             }
             "session.output_audio.delta" => {
+                if self.state == LiveState::Closing {
+                    return Ok(LiveInput::Ignored);
+                }
                 if self.state != LiveState::Active {
                     return Err(LiveError::State);
                 }
