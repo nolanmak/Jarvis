@@ -4,18 +4,21 @@
 # --apply reloads/restarts the existing daemon; never run it during a build.
 set -euo pipefail
 mode="${1:---check}"
-unit="augmentagent.service"
+unit="${AUGMENTAGENT_RESOURCE_UNIT:-augmentagent.service}"
+[[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || { echo 'invalid resource service unit name' >&2; exit 2; }
+aggregate_cpu_quota="${AUGMENTAGENT_UNIT_CPU_QUOTA:-400%}"
+run_cpu_percent="${AUGMENTAGENT_RUN_CPU_PERCENT:-200}"
 case "$mode" in --check|--apply|--install|--render) ;; *) echo 'usage: configure-run-resources.sh [--check|--render|--install|--apply]' >&2; exit 2;; esac
 render() {
   cat <<EOF
 [Service]
 Delegate=cpu memory pids
 DelegateSubgroup=daemon
-CPUQuota=${AUGMENTAGENT_UNIT_CPU_QUOTA:-400%}
+CPUQuota=$aggregate_cpu_quota
 Environment=AUGMENTAGENT_RUN_RESOURCES=1
 Environment=AUGMENTAGENT_RUN_MEMORY_BYTES=${AUGMENTAGENT_RUN_MEMORY_BYTES:-4294967296}
 Environment=AUGMENTAGENT_RUN_PIDS=${AUGMENTAGENT_RUN_PIDS:-512}
-Environment=AUGMENTAGENT_RUN_CPU_PERCENT=${AUGMENTAGENT_RUN_CPU_PERCENT:-200}
+Environment=AUGMENTAGENT_RUN_CPU_PERCENT=$run_cpu_percent
 EOF
 }
 if [[ "$mode" == --render ]]; then render; exit; fi
@@ -27,6 +30,26 @@ for property in MemoryMax TasksMax; do
   value="$(systemctl --user show "$unit" --value -p "$property")"
   [[ "$value" =~ ^[0-9]+$ ]] && (( value > 0 )) || { echo "finite existing $property required" >&2; exit 1; }
 done
+# Preserve a stricter existing aggregate CPU ceiling. systemctl presents this
+# duration in human units; parse only that public property, never Environment.
+existing_cpu="$(systemctl --user show "$unit" --value -p CPUQuotaPerSecUSec)"
+limits="$(python3 - "$existing_cpu" "$aggregate_cpu_quota" "$run_cpu_percent" <<'PY_LIMITS'
+import decimal,re,sys
+existing,requested,run=sys.argv[1:]
+D=decimal.Decimal
+if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?%',requested): raise SystemExit('invalid aggregate CPU quota')
+quota=D(requested[:-1])
+if not existing: raise SystemExit('cannot verify existing aggregate CPU quota')
+if existing!='infinity':
+ units={'us':D('0.000001'),'µs':D('0.000001'),'ms':D('.001'),'s':D(1),'min':D(60),'h':D(3600),'d':D(86400)}
+ parts=re.findall(r'([0-9]+(?:\.[0-9]+)?)(us|µs|ms|min|s|h|d)',existing)
+ if not parts or ''.join(a+b for a,b in parts)!=existing.replace(' ',''): raise SystemExit('cannot verify existing aggregate CPU quota')
+ quota=min(quota,sum(D(a)*units[b] for a,b in parts)*100)
+if quota<1 or not run.isdigit() or int(run)<1: raise SystemExit('unsupported CPU resource quota')
+print(f'{quota.normalize():f}% {min(int(run),int(quota))}')
+PY_LIMITS
+)"
+read -r aggregate_cpu_quota run_cpu_percent <<< "$limits"
 if [[ "$mode" == --apply || "$mode" == --install ]]; then
   destination="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit.d"
   mkdir -p "$destination"

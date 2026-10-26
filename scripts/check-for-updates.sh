@@ -287,7 +287,7 @@ apply_update() {
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
           # #1571 — proof now includes "and it is running the binary we
           # built"; a bounce onto anything else is a pinned deploy.
-          if [ -x "$REPO_ROOT/scripts/configure-run-resources.sh" ] && ! "$REPO_ROOT/scripts/configure-run-resources.sh" --install >> "$LOG" 2>&1; then
+          if [ -x "$REPO_ROOT/scripts/configure-run-resources.sh" ] && ! AUGMENTAGENT_RESOURCE_UNIT="$SYSTEMD_UNIT" "$REPO_ROOT/scripts/configure-run-resources.sh" --install >> "$LOG" 2>&1; then
             log "resource delegation setup failed; keeping daemon and withholding build stamp"
             RESTART_FAILURES=$((RESTART_FAILURES + 1))
           elif restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then

@@ -16,6 +16,7 @@ class RolloutTests(unittest.TestCase):
             (binary/'systemctl').write_text('''#!/bin/sh
 printf '%s\\n' "$*" >> "$TEST_CALLS"
 case "$*" in
+ *CPUQuotaPerSecUSec*) echo 1s;;
  *MemoryMax*) echo 10737418240;;
  *TasksMax*) echo 2048;;
  *DelegateSubgroup*) echo daemon;;
@@ -29,18 +30,24 @@ esac
             dropin=root/'config/systemd/user/augmentagent.service.d/60-run-resources.conf'
             text=dropin.read_text()
             self.assertIn('DelegateSubgroup=daemon',text)
+            self.assertIn('CPUQuota=100%',text)
+            self.assertIn('AUGMENTAGENT_RUN_CPU_PERCENT=100',text)
             self.assertNotIn('ExecStart',text)
             self.assertNotIn('MemoryMax=',text)
             self.assertNotIn('TasksMax=',text)
             self.assertIn('daemon-reload',log.read_text())
             self.assertNotIn('restart',log.read_text())
             # An ordinary update preserves operator-tuned per-run ceilings.
-            dropin.write_text(text.replace('CPUQuota=400%','CPUQuota=300%'))
+            dropin.write_text(text.replace('AUGMENTAGENT_RUN_PIDS=512','AUGMENTAGENT_RUN_PIDS=64'))
             subprocess.run(['bash',str(SCRIPT),'--install'],env=env,check=True,capture_output=True)
-            self.assertIn('CPUQuota=300%',dropin.read_text())
+            self.assertIn('AUGMENTAGENT_RUN_PIDS=64',dropin.read_text())
             result=subprocess.run(['bash',str(SCRIPT),'--apply'],env=env,capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertIn('restart augmentagent.service',log.read_text())
+            env['AUGMENTAGENT_RESOURCE_UNIT']='augmentagent-custom.service'
+            subprocess.run(['bash',str(SCRIPT),'--install'],env=env,check=True,capture_output=True)
+            self.assertTrue((root/'config/systemd/user/augmentagent-custom.service.d/60-run-resources.conf').exists())
+            self.assertIn('show augmentagent-custom.service',log.read_text())
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
