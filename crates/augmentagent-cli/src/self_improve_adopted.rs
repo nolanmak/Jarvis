@@ -83,10 +83,10 @@ fn choose_round_robin(
             .all(|candidate| candidate.repository == repository),
         "adoption cursor cannot mix repositories"
     );
-    let _ = WorkflowStore::open(path)?;
-    let mut conn = rusqlite::Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     if dry_run {
+        let cursor = if WorkflowStore::open_read_only(path)?.is_none() { 0 } else {
+        let conn = rusqlite::Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+
         let cursor = conn
             .query_row(
                 "SELECT last_pr FROM adopted_execution_cursor WHERE repository=?1",
@@ -97,10 +97,15 @@ fn choose_round_robin(
             .ok()
             .flatten()
             .unwrap_or(0);
+        cursor
+        };
         return Ok(candidates
             .into_iter()
             .min_by_key(|candidate| (candidate.pr <= cursor, candidate.pr)));
     }
+    let _ = WorkflowStore::open(path)?;
+    let mut conn = rusqlite::Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS adopted_execution_cursor(repository TEXT PRIMARY KEY,last_pr INTEGER NOT NULL)")?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let cursor = tx
@@ -135,27 +140,32 @@ fn reserve_source_less(
 
 pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::AdoptedPr>> {
     let candidates = discover(repo, dry_run).await?;
-    let store = WorkflowStore::open(&workflow::path())?;
+    select_from_inventory(repo,candidates,dry_run,&workflow::path(),&fair_sched_path()).await
+}
+
+async fn select_from_inventory(repo:&Path,candidates:Vec<adoption::AdoptedPr>,dry_run:bool,
+    state:&Path,fair_path:&Path)->Result<Option<adoption::AdoptedPr>> {
+    let store = if dry_run {WorkflowStore::open_read_only(state)?} else {Some(WorkflowStore::open(state)?)};
     let now = chrono::Utc::now().timestamp_millis();
     let mut eligible = Vec::new();
     for candidate in candidates {
         if candidate.source_issue.is_some() || !candidate.ready_for_review() {
             continue;
         }
-        let id = store
-            .resolve_pr(&candidate.repository, candidate.pr)?
+        let id = store.as_ref().map(|store|store.resolve_pr(&candidate.repository,candidate.pr)).transpose()?.flatten()
             .unwrap_or(candidate.workflow_id()?);
-        if !workflow_available(store.snapshot(&id)?.as_ref(), now) {
+        let snapshot=store.as_ref().map(|store|store.snapshot(&id)).transpose()?.flatten();
+        if !workflow_available(snapshot.as_ref(), now) {
             continue;
         }
-        if let Some(reason) = policy_hold::adjudicated_dependency(repo, &candidate, dry_run).await {
+        if let Some(reason) = policy_hold::adjudicated_dependency_at(repo, &candidate, dry_run,state).await {
             info!(
                 pr = candidate.pr,
                 reason, "adopted PR dependency remains in free reconciliation"
             );
             continue;
         }
-        if let Some(verdict) = approved(&store, &candidate)? {
+        if let Some(verdict) = store.as_ref().map(|store|approved(store,&candidate)).transpose()?.flatten() {
             if let policy_hold::ApprovalDisposition::Free(reason) =
                 policy_hold::reconciliation_disposition(repo, &candidate, &verdict).await
             {
@@ -168,7 +178,7 @@ pub(super) async fn next(repo: &Path, dry_run: bool) -> Result<Option<adoption::
         }
         eligible.push(candidate);
     }
-    reserve_source_less(&workflow::path(), &fair_sched_path(), eligible, dry_run)
+    reserve_source_less(state, fair_path, eligible, dry_run)
 }
 
 pub(super) async fn resume(
@@ -916,6 +926,26 @@ mod fairness_tests {
             dependency: adoption::Dependency::Main,
         }
     }
+    #[tokio::test]
+    async fn full_dry_selector_never_creates_state_or_changes_existing_cursor() {
+        let dir=tempfile::tempdir().unwrap();
+        let state=dir.path().join("workflows.db");let fair=dir.path().join("fair.json");
+        let first=select_from_inventory(dir.path(),vec![candidate(20),candidate(10)],true,&state,&fair).await.unwrap().unwrap();
+        assert_eq!(first.pr,10);
+        assert!(!state.exists() && !fair.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(),0);
+        choose_round_robin(&state,vec![candidate(10),candidate(20)],false).unwrap();
+        let before=std::fs::read(&state).unwrap();
+        let metadata=std::fs::metadata(&state).unwrap();
+        for _ in 0..2 {
+            let chosen=select_from_inventory(dir.path(),vec![candidate(10),candidate(20)],true,&state,&fair).await.unwrap().unwrap();
+            assert_eq!(chosen.pr,20);
+        }
+        assert_eq!(std::fs::read(&state).unwrap(),before);
+        assert_eq!(std::fs::metadata(&state).unwrap().modified().unwrap(),metadata.modified().unwrap());
+        assert!(!fair.exists());
+    }
+
     #[test]
     fn permanently_failing_oldest_rotates_to_two_new_prs_across_restart() {
         let dir = tempfile::tempdir().unwrap();

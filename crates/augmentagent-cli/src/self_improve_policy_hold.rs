@@ -473,7 +473,7 @@ fn reopen_dependency(store: &mut crate::autoship_workflow::WorkflowStore, id: &s
 pub(super) async fn adjudicated_dependency(repo: &Path, candidate: &adoption::AdoptedPr, dry_run: bool) -> Option<&'static str> {
     adjudicated_dependency_at(repo,candidate,dry_run,&workflow::path()).await
 }
-async fn adjudicated_dependency_at(repo: &Path, candidate: &adoption::AdoptedPr, dry_run: bool, state:&Path) -> Option<&'static str> {
+pub(super) async fn adjudicated_dependency_at(repo: &Path, candidate: &adoption::AdoptedPr, dry_run: bool, state:&Path) -> Option<&'static str> {
     let mut store = if dry_run {
         match crate::autoship_workflow::WorkflowStore::open_read_only(state) {
             Ok(Some(store))=>store,Ok(None)=>return None,Err(_)=>return Some("dependency-evidence-unavailable"),
