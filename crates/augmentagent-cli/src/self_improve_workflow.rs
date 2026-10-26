@@ -898,6 +898,19 @@ impl WorkflowGuard {
         )
     }
 
+    pub(super) fn admit_epoch_attempt(
+        &self,
+        purpose: &str,
+        epoch: &str,
+        limit: u32,
+    ) -> Result<bool> {
+        self.validate_before_side_effect()?;
+        self.store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?
+            .admit_epoch_attempt(&self.lease, purpose, epoch, limit, millis())
+    }
+
     pub(super) fn admit_attempt(&self, purpose: &str, limit: u32) -> Result<bool> {
         self.validate_before_side_effect()?;
         self.store

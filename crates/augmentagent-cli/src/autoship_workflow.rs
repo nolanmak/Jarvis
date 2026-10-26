@@ -936,8 +936,14 @@ impl WorkflowStore {
             // Retain the observation time, not only cumulative totals, so a
             // seven-day report never attributes old spend to today's work.
             // This shares the receipt's insert transaction and is idempotent.
-            event(&tx, &lease.workflow, lease.generation,
-                "resource_charged", receipt_id, now_ms)?;
+            event(
+                &tx,
+                &lease.workflow,
+                lease.generation,
+                "resource_charged",
+                receipt_id,
+                now_ms,
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -980,6 +986,42 @@ impl WorkflowStore {
             "attempt_admitted",
             purpose,
             now_ms,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Strategy budgets belong to a contract/base/runner epoch, not a mutable
+    /// candidate head. Committing an unsuccessful fix cannot reset this budget.
+    pub fn admit_epoch_attempt(
+        &mut self,
+        lease: &Lease,
+        purpose: &str,
+        epoch: &str,
+        limit: u32,
+        now: i64,
+    ) -> Result<bool> {
+        ensure!(
+            !purpose.is_empty() && !epoch.is_empty() && epoch.len() <= 1024 && limit > 0,
+            "bounded epoch purpose and positive limit required"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx, lease, now)?;
+        let key = format!("epoch:{epoch}");
+        let count:u32=tx.query_row("SELECT attempts FROM bounded_attempt WHERE workflow=?1 AND purpose=?2 AND binding=?3",params![lease.workflow,purpose,key],|r|r.get(0)).optional()?.unwrap_or(0);
+        if count >= limit {
+            return Ok(false);
+        }
+        tx.execute("INSERT INTO bounded_attempt VALUES(?1,?2,?3,1) ON CONFLICT(workflow,purpose,binding) DO UPDATE SET attempts=attempts+1",params![lease.workflow,purpose,key])?;
+        event(
+            &tx,
+            &lease.workflow,
+            lease.generation,
+            "epoch_attempt_admitted",
+            &serde_json::json!({"purpose":purpose,"epoch":epoch,"attempt":count+1}).to_string(),
+            now,
         )?;
         tx.commit()?;
         Ok(true)
@@ -1657,6 +1699,43 @@ mod tests {
         assert!(store.attach_pr(&lease, 42, 37).is_ok());
         assert!(store.attach_pr(&lease, 43, 38).is_err());
     }
+    #[test]
+    fn epoch_budget_survives_candidate_commits_restart_and_fences_stale_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (mut store, lease) = setup(&path);
+        assert!(store
+            .admit_epoch_attempt(&lease, "acceptance-repair", "contract/base/runner", 2, 30)
+            .unwrap());
+        let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.binding.head = "new-failed-candidate".into();
+        store.checkpoint(&lease, &checkpoint, 31).unwrap();
+        assert!(store
+            .admit_epoch_attempt(&lease, "acceptance-repair", "contract/base/runner", 2, 32)
+            .unwrap());
+        drop(store);
+        let mut store = WorkflowStore::open(&path).unwrap();
+        let successor = store
+            .claim(&lease.workflow, "new-worker", 1021, 1000)
+            .unwrap()
+            .unwrap();
+        assert!(!store
+            .admit_epoch_attempt(
+                &successor,
+                "acceptance-repair",
+                "contract/base/runner",
+                2,
+                1022
+            )
+            .unwrap());
+        assert!(store
+            .admit_epoch_attempt(&lease, "acceptance-repair", "new-epoch", 2, 1023)
+            .is_err());
+        assert!(store
+            .admit_epoch_attempt(&successor, "acceptance-repair", "new-epoch", 2, 1023)
+            .unwrap());
+    }
+
     #[test]
     fn charge_receipts_are_idempotent_and_attempt_limits_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
