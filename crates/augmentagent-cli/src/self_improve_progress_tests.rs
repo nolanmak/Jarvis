@@ -40,13 +40,13 @@ fn publication_records_precede_draft_returns_and_never_cover_post_review_edits()
     let src = include_str!("self_improve.rs");
     let fresh = &src[src.find("pub async fn run_once(").unwrap()..];
     let published = &fresh[fresh.find("let pr_url = stdout.trim()").unwrap()..];
-    let record = published.find("record_opened_pr(").unwrap();
+    let record = published.find("opened_prs::record(").unwrap();
     assert!(record < published.find("if let Some(reason) = &park").unwrap());
     assert!(record < published.find("if !automerge").unwrap());
     assert!(published[..record].contains("qa_ok && park.is_none() && !repaired_after_review"));
     assert!(published[record..record+130].contains("published_head"));
     let resume = &src[src.find("async fn resume_draft_pr(").unwrap()..src.find("async fn reclaim_worktree(").unwrap()];
-    assert!(resume.find("record_opened_pr(").unwrap() < resume.find("if checks_green(").unwrap());
+    assert!(resume.find("opened_prs::record(").unwrap() < resume.find("if checks_green(").unwrap());
     assert!(resume.contains("\"--match-head-commit\", reviewed_head"));
 }
 
