@@ -161,6 +161,7 @@ fn environment_id(root: &Path) -> Result<String> {
     let mut hash = Sha256::new();
     hash.update(SANDBOX.as_bytes());
     hash.update(DEPENDENCY_AUDIT.as_bytes());
+    hash.update(serde_json::to_vec(&compiler_control_inputs(root)?)?);
     if root.join("Cargo.lock").exists() {
         hash.update(std::fs::read(root.join("Cargo.lock"))?);
     }
@@ -185,6 +186,57 @@ fn environment_id(root: &Path) -> Result<String> {
         }
     }
     Ok(format!("sandbox-protected-cache-v2:{:x}", hash.finalize()))
+}
+
+fn compiler_control_inputs(root: &Path) -> Result<Vec<(String, String)>> {
+    use sha2::{Digest, Sha256};
+    fn walk(
+        root: &Path,
+        directory: &Path,
+        remaining: &mut usize,
+        out: &mut Vec<(String, String)>,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            ensure!(*remaining > 0, "compiler input scan exceeds limit");
+            *remaining -= 1;
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if [
+                ".git",
+                "target",
+                "node_modules",
+                ".venv",
+                ".self-improve-worktrees",
+            ]
+            .iter()
+            .any(|excluded| name == *excluded)
+            {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(root, &path, remaining, out)?;
+            } else if name == "Cargo.toml"
+                || (path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|p| p == ".cargo")
+                    && (name == "config" || name == "config.toml"))
+            {
+                ensure!(kind.is_file(), "compiler control input cannot be a symlink");
+                out.push((
+                    path.strip_prefix(root)?.to_string_lossy().into_owned(),
+                    format!("{:x}", Sha256::digest(std::fs::read(path)?)),
+                ));
+            }
+        }
+        Ok(())
+    }
+    let mut inputs = Vec::new();
+    walk(root, root, &mut 100000, &mut inputs)?;
+    inputs.sort();
+    Ok(inputs)
 }
 
 pub(super) async fn register_and_reproduce(
@@ -1403,5 +1455,34 @@ mod verifier_cache_tests {
         std::os::unix::fs::symlink(&builder, &verifier).unwrap();
         assert!(verifier_cache_sibling(source.path(), &builder, &key).is_err());
         assert!(verifier_cache_sibling(parent.path(), &builder, &"b".repeat(64)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod compiler_input_tests {
+    use super::*;
+    #[test]
+    fn test_target_redirect_and_wrapper_invalidate_compiler_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/demo")).unwrap();
+        std::fs::write(
+            root.path().join("crates/demo/Cargo.toml"),
+            "[package]\nname='demo'\n",
+        )
+        .unwrap();
+        let before = compiler_control_inputs(root.path()).unwrap();
+        std::fs::write(
+            root.path().join("crates/demo/Cargo.toml"),
+            "[[test]]\npath='forged.rs'\n",
+        )
+        .unwrap();
+        assert_ne!(before, compiler_control_inputs(root.path()).unwrap());
+        std::fs::create_dir(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[build]\nrustc-wrapper='forged'\n",
+        )
+        .unwrap();
+        assert_eq!(compiler_control_inputs(root.path()).unwrap().len(), 2);
     }
 }
