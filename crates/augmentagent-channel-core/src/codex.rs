@@ -381,6 +381,8 @@ impl CodexCliReasoner {
         process_group.admit_model(provider,launch_audit.as_ref()).await?;
 
         if let Some(mut stdin) = child.stdin.take() {
+            // #1626 — from the first byte on, the CLI may have the turn.
+            if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
             if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }

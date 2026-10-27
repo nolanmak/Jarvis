@@ -755,6 +755,10 @@ impl EventHandler for Handler {
                     }
                 }
                 Err(e) => {
+                    // #1626 — the owner sees this text in Discord; keep it in
+                    // the daemon log too so a failed turn can be diagnosed
+                    // without correlating Discord and the store by hand.
+                    warn!(%channel_id, %msg_id, error = %e, "discord query failed");
                     let mut err_msg = format!("wiki query failed: {e}");
                     if let Some(f) = &footer {
                         err_msg.push_str("\n\n");
