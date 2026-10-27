@@ -5,7 +5,7 @@ use futures::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
-    connect_async_with_config,
+    connect_async_tls_with_config, Connector,
     tungstenite::{
         client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig, Error, Message,
     },
@@ -90,7 +90,18 @@ impl LiveConnection {
                 .max_message_size(Some(32_768))
                 .write_buffer_size(0)
                 .max_write_buffer_size(65_536);
-            let (mut socket, _) = connect_async_with_config(request, Some(config), true)
+            // Select locally: the daemon can enable both Rustls backends through
+            // unrelated clients. Never depend on process-global feature inference.
+            let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let tls = rustls::ClientConfig::builder_with_provider(
+                std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .with_safe_default_protocol_versions()
+            .map_err(|_| LiveError::Configuration)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let connector = Connector::Rustls(std::sync::Arc::new(tls));
+            let (mut socket, _) = connect_async_tls_with_config(request, Some(config), true, Some(connector))
                 .await
                 .map_err(socket_error)?;
             socket

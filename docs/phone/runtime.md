@@ -290,6 +290,26 @@ retries are exhausted. For a known provider ID, use the explicit recovery comman
 investigation. Unknown-ID association remains unresolved; no retry-reset or
 manual active-slot clearing command is provided.
 
+## Abandoned GPT-Live readiness checks
+
+A GPT-Live reservation that never completed its durable preflight has not reached
+Twilio create. Maintenance (or `phone-reconcile`) can retire it after 60 seconds
+only when it is stopped, uncertain, has no provider SID or answer evidence, and
+still has an unfinished preflight receipt. Recovery seals that receipt atomically
+so a concurrent readiness probe cannot advance to dialing. OpenAI usage stays
+unknown. A successful preflight followed by an uncertain Twilio create is **not**
+covered by this recovery and still requires provider evidence.
+
+To check the production Rust TLS and Live protocol without dialing, export
+`OPENAI_API_KEY` privately and run:
+
+```sh
+./scripts/cargo-managed.sh run -p augmentagent-phone --example live_preflight
+```
+
+This silent check prints only readiness and final reported seconds; it does not
+validate PSTN audio or conversation latency.
+
 ## Explicit provider reconciliation
 
 An operator with access to the daemon database can request one bounded,

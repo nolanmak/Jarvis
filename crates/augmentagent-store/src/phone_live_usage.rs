@@ -59,6 +59,28 @@ const ERRORS: &[&str] = &[
     "connection_lost",
 ];
 impl Store {
+    /// Release only a stopped, expired reservation that never finished Live
+    /// preflight. Dial requires a successful durable final receipt. Seal that
+    /// receipt in the same transaction so a concurrent probe cannot advance.
+    /// No Twilio usage or OpenAI usage is fabricated.
+    pub fn phone_recover_abandoned_preflight(&self, id: &str, now_ms: i64) -> PhoneResult<bool> {
+        transaction(self, |tx| {
+            let changed = tx.execute(
+                "UPDATE phone_calls SET state='failed',ended_ms=?2
+                 WHERE id=?1 AND state='uncertain' AND stop_requested=1
+                   AND provider_sid IS NULL AND answered_ms IS NULL AND ended_ms IS NULL
+                   AND created_ms<=?2-60000
+                   AND EXISTS(SELECT 1 FROM phone_voice_backends b WHERE b.call_id=?1 AND b.backend='openai_live')
+                   AND EXISTS(SELECT 1 FROM phone_live_usage u WHERE u.call_id=?1 AND u.phase='preflight' AND u.end_trigger IS NULL)",
+                params![id, now_ms],
+            )?;
+            if changed == 1 {
+                tx.execute("UPDATE phone_live_usage SET end_trigger='setup_failure',error='state' WHERE call_id=?1 AND phase='preflight' AND end_trigger IS NULL", [id])?;
+            }
+            Ok(changed == 1)
+        })
+    }
+
     /// Persist intent before contacting OpenAI. A pending row after a crash has
     /// unknown usage, never zero; a second start cannot reset the receipt.
     pub fn phone_live_usage_start(&self, call_id: &str, phase: LiveUsagePhase) -> PhoneResult<()> {
