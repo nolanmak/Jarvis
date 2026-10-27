@@ -462,3 +462,40 @@ async fn unicode_result_parts_require_each_ack_and_preserve_failures() {
     assert_eq!(received,full);
     assert!(call.pending_results().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn fragmented_request_crossing_delegation_boundary_queues_one_complete_task() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    let mut full = String::new();
+    for i in 0..80 {
+        let text = format!(" word{i}");
+        full.push_str(&text);
+        call.event(&LiveInput::Transcript {
+            event_id:format!("word-{i}"),user:true,text,
+            start_ms:(i*10) as f64,end_ms:((i+1)*10) as f64,
+        }).unwrap();
+    }
+    assert!(matches!(call.event(&LiveInput::Delegation {id:"full-request".into(),offset_ms:795.}).unwrap(),LiveAction::Queued {..}));
+    let jobs = f.store.phone_pending_dispatches().unwrap();
+    assert_eq!(jobs.len(),1);
+    assert!(jobs[0].description.contains(&full));
+}
+
+#[tokio::test]
+async fn late_word_fragments_settle_before_starting_a_task() {
+    let f = fixture().await;
+    tokio::time::pause();
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    assert!(matches!(call.event(&delegation()).unwrap(),LiveAction::None));
+    call.event(&LiveInput::Transcript {event_id:"first".into(),user:true,text:"Check".into(),start_ms:0.,end_ms:40.}).unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
+    assert!(matches!(call.poll_delegations().unwrap(),LiveAction::None));
+    call.event(&LiveInput::Transcript {event_id:"last".into(),user:true,text:" my calendar.".into(),start_ms:40.,end_ms:100.}).unwrap();
+    assert!(f.store.phone_pending_dispatches().unwrap().is_empty());
+    tokio::time::advance(std::time::Duration::from_millis(300)).await;
+    assert!(matches!(call.poll_delegations().unwrap(),LiveAction::Queued {..}));
+    let jobs = f.store.phone_pending_dispatches().unwrap();
+    assert_eq!(jobs.len(),1);
+    assert!(jobs[0].description.contains("Check my calendar."));
+}
