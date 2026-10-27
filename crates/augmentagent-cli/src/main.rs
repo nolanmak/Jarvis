@@ -2412,10 +2412,11 @@ enum GmailOp {
         /// compose --post replaces the pending follow-up card (#596).
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         allow_duplicate: bool,
-        /// Attach a local file to the draft (#417). One file; uploaded via
-        /// Composio's attachment store before the draft is created.
+        /// Attach a local file to the draft (#417). Repeat for several
+        /// (`--attach a.pdf --attach b.pdf`); each is sent byte-for-byte, in
+        /// the order given.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// Gmail messageId of the inbound message we're replying to. Used as
         /// the action row's messageId so the Approve / Revise / Skip handlers
         /// resolve the same way they do for auto-triage replies. Pass it
@@ -2478,11 +2479,11 @@ enum GmailOp {
         /// detected and preserved automatically where possible.
         #[arg(long)]
         thread_id: Option<String>,
-        /// Attach a local file to the REPLACEMENT draft (#417). Note: the
-        /// replacement carries only what you pass here — an attachment on
-        /// the old draft is NOT carried over (Composio can't read it back).
+        /// Attach a local file to the REPLACEMENT draft (#417); repeatable.
+        /// Note: the replacement carries only what you pass here — an
+        /// attachment on the old draft is NOT carried over.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// #994 — the recipient's own message, so the register check can hold
         /// this body to THEIR casing rather than trusting the drafter's
         /// receipt. Same flags as `gmail compose`; omitting them leaves the
@@ -2528,9 +2529,9 @@ enum GmailOp {
         body_file: Option<String>,
         #[arg(long)]
         thread_id: Option<String>,
-        /// Attach a local file (#417).
+        /// Attach a local file (#417); repeatable.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// #994 — the recipient's own message, so the register check can hold
         /// this body to THEIR casing rather than trusting the drafter's
         /// receipt. Same flags as `gmail compose`; omitting them leaves the
@@ -6563,27 +6564,41 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// #417 — Upload `--attach` (when given) to Composio's attachment store,
-/// printing what was attached so the operator can SEE it happened. Fails
-/// loudly on a missing/unreadable file before any draft is created.
+/// #417 — Stage every `--attach` file, printing each so the operator can SEE
+/// what was attached. Fails loudly on a missing/unreadable file before any
+/// draft is created.
 async fn upload_attach_if_given(
     gmail: &ComposioClient,
-    attach: Option<PathBuf>,
-) -> Result<Option<Attachment>> {
-    let Some(path) = attach else { return Ok(None) };
-    let meta = std::fs::metadata(&path)
-        .with_context(|| format!("attachment not found: {}", path.display()))?;
-    let att = gmail
-        .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
-        .await
-        .context("attachment upload failed")?;
-    println!(
-        "attached: {} ({} KB, {})",
-        att.name,
-        meta.len().div_ceil(1024),
-        att.mimetype
-    );
-    Ok(Some(att))
+    attach: Vec<PathBuf>,
+) -> Result<Vec<Attachment>> {
+    let mut out = Vec::with_capacity(attach.len());
+    for path in attach {
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("attachment not found: {}", path.display()))?;
+        let att = gmail
+            .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
+            .await
+            .context("attachment upload failed")?;
+        println!(
+            "attached: {} ({} KB, {})",
+            att.name,
+            meta.len().div_ceil(1024),
+            att.mimetype
+        );
+        out.push(att);
+    }
+    Ok(out)
+}
+
+/// The card's single `[attachment: …]` marker value, or `None` without any.
+fn attachment_names(attachments: &[Attachment]) -> Option<String> {
+    (!attachments.is_empty()).then(|| {
+        attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 /// Canonicalize a user-supplied `--thread-id` before any draft is created
@@ -7077,7 +7092,7 @@ async fn run_gmail_compose(
     json: bool,
     post: bool,
     allow_duplicate: bool,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_message_id: Option<String>,
     reply_to_from: Option<String>,
     reply_to_subject: Option<String>,
@@ -7180,7 +7195,7 @@ async fn run_gmail_compose(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let attachments = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -7188,7 +7203,7 @@ async fn run_gmail_compose(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -7205,7 +7220,7 @@ async fn run_gmail_compose(
             &bcc,
             &subject,
             &body_str,
-            attachment.as_ref().map(|a| a.name.as_str()),
+            attachment_names(&attachments).as_deref(),
             thread_id.as_deref(),
             reply_to_message_id.as_deref(),
             reply_to_from.as_deref(),
@@ -7256,7 +7271,8 @@ async fn run_gmail_compose(
                     "bcc": bcc,
                     "subject": subject,
                     "thread_id": thread_id,
-                    "attachment": attachment.as_ref().map(|a| a.name.clone()),
+                    "attachment": attachment_names(&attachments),
+                    "attachments": attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                     "approval_card_posted": true,
                 })
             );
@@ -7277,7 +7293,8 @@ async fn run_gmail_compose(
                 "bcc": bcc,
                 "subject": subject,
                 "thread_id": thread_id,
-                "attachment": attachment.as_ref().map(|a| a.name.clone()),
+                "attachment": attachment_names(&attachments),
+                    "attachments": attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                 "open_in_gmail": format!("https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"),
             })
         );
@@ -7292,7 +7309,7 @@ async fn run_gmail_compose(
             println!("bcc:     {}", bcc.join(", "));
         }
         println!("subject: {subject}");
-        if let Some(a) = &attachment {
+        for a in &attachments {
             println!("attachment: {} ({})", a.name, a.mimetype);
         }
         println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={draft_id}");
@@ -8148,7 +8165,7 @@ async fn run_gmail_update_draft(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
@@ -8196,7 +8213,7 @@ async fn run_gmail_update_draft(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let attachments = upload_attach_if_given(&gmail, attach).await?;
     let new_id = gmail
         .update_draft_with_attachment(
             &entity_id,
@@ -8205,7 +8222,7 @@ async fn run_gmail_update_draft(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -8275,7 +8292,7 @@ async fn run_gmail_update_draft(
                         Some(store.as_ref()),
                         action_id,
                         &row.email.from,
-                        attachment.as_ref().map(|a| a.name.as_str()),
+                        attachment_names(&attachments).as_deref(),
                     );
                     let edit = augmentagent_approval_discord::approval_edit_message(
                         action_id,
@@ -8414,7 +8431,7 @@ async fn run_gmail_send_now(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
@@ -8436,7 +8453,7 @@ async fn run_gmail_send_now(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let attachments = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -8444,7 +8461,7 @@ async fn run_gmail_send_now(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -15105,7 +15122,7 @@ impl ReplyApprover {
                 &subject,
                 &gmail_redraft,
                 draft_thread_id,
-                None,
+                &[],
                 &cc,
                 &bcc,
             )
