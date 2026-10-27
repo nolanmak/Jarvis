@@ -93,19 +93,32 @@ pub struct LiveSession {
     state: LiveState,
     instructions: String,
     greet: bool,
+    voice: crate::live_voice::LiveVoice,
     id: Option<String>,
     deadline: Option<Instant>,
     delegations: HashMap<String, f64>,
 }
 impl LiveSession {
     pub fn new(instructions: &str) -> Result<Self, LiveError> {
-        if instructions.is_empty() || instructions.len() > 16_000 {
+        Self::with_voice(instructions, crate::live_voice::LiveVoice::default(), false)
+    }
+    pub fn with_voice(
+        instructions: &str,
+        voice: crate::live_voice::LiveVoice,
+        greet: bool,
+    ) -> Result<Self, LiveError> {
+        if instructions.is_empty() {
+            return Err(LiveError::Configuration);
+        }
+        let instructions = voice.instructions(instructions);
+        if instructions.len() > 16_000 {
             return Err(LiveError::Configuration);
         }
         Ok(Self {
             state: LiveState::Created,
-            instructions: instructions.into(),
-            greet: false,
+            instructions,
+            greet,
+            voice,
             id: None,
             deadline: None,
             delegations: HashMap::new(),
@@ -162,7 +175,7 @@ impl LiveSession {
         self.deadline = Some(Instant::now() + Duration::from_secs(10));
         let mut event = json!({"type":"session.start","session":{
             "model":MODEL,"instructions":self.instructions,
-            "audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":VOICE}},
+            "audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":self.voice.wire()}},
             "delegation":{"type":"client"}}});
         if self.greet {
             event["session"]["input"] = json!([{"role":"developer","content":[{
@@ -253,7 +266,7 @@ impl LiveSession {
                 let s = &v["session"];
                 if s["model"] != MODEL
                     || s["audio"]["format"] != json!({"type":"audio/pcmu","rate":8000})
-                    || s["audio"]["output"]["voice"] != VOICE
+                    || s["audio"]["output"]["voice"] != self.voice.wire()
                     || s["delegation"]["type"] != "client"
                 {
                     return Err(LiveError::Configuration);

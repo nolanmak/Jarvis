@@ -5,11 +5,11 @@ use futures::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
-    connect_async_tls_with_config, Connector,
+    connect_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig, Error, Message,
     },
-    MaybeTlsStream, WebSocketStream,
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 
 const STARTUP: Duration = Duration::from_secs(10);
@@ -34,15 +34,14 @@ impl LiveConnection {
         Self::connect_to(ENDPOINT, key, instructions).await
     }
     pub async fn connect_for_call(key: &str, instructions: &str) -> Result<Self, LiveError> {
-        Self::connect_to_mode(ENDPOINT, key, instructions, true).await
-    }
-    #[cfg(test)]
-    pub(crate) async fn connect_call_test(
-        endpoint: &str,
-        key: &str,
-        instructions: &str,
-    ) -> Result<Self, LiveError> {
-        Self::connect_to_mode(endpoint, key, instructions, true).await
+        Self::connect_to_mode(
+            ENDPOINT,
+            key,
+            instructions,
+            true,
+            crate::live_voice::LiveVoice::default(),
+        )
+        .await
     }
     #[cfg(test)]
     pub(crate) async fn connect_test(
@@ -53,13 +52,21 @@ impl LiveConnection {
         Self::connect_to(endpoint, key, instructions).await
     }
     async fn connect_to(endpoint: &str, key: &str, instructions: &str) -> Result<Self, LiveError> {
-        Self::connect_to_mode(endpoint, key, instructions, false).await
+        Self::connect_to_mode(
+            endpoint,
+            key,
+            instructions,
+            false,
+            crate::live_voice::LiveVoice::default(),
+        )
+        .await
     }
-    async fn connect_to_mode(
+    pub(crate) async fn connect_to_mode(
         endpoint: &str,
         key: &str,
         instructions: &str,
         greet: bool,
+        voice: crate::live_voice::LiveVoice,
     ) -> Result<Self, LiveError> {
         if key.is_empty()
             || key.len() > 8192
@@ -76,11 +83,7 @@ impl LiveConnection {
             .map_err(|_| LiveError::Authentication)?;
         authorization.set_sensitive(true);
         request.headers_mut().insert("authorization", authorization);
-        let mut session = if greet {
-            LiveSession::for_call(instructions)?
-        } else {
-            LiveSession::new(instructions)?
-        };
+        let mut session = LiveSession::with_voice(instructions, voice, greet)?;
         let start = session.start()?;
         // One absolute budget includes DNS, TCP, TLS, upgrade, write and all
         // startup frames. Ping traffic cannot renew it.
@@ -92,18 +95,20 @@ impl LiveConnection {
                 .max_write_buffer_size(65_536);
             // Select locally: the daemon can enable both Rustls backends through
             // unrelated clients. Never depend on process-global feature inference.
-            let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let tls = rustls::ClientConfig::builder_with_provider(
-                std::sync::Arc::new(rustls::crypto::ring::default_provider()),
-            )
+            let roots =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
             .with_safe_default_protocol_versions()
             .map_err(|_| LiveError::Configuration)?
             .with_root_certificates(roots)
             .with_no_client_auth();
             let connector = Connector::Rustls(std::sync::Arc::new(tls));
-            let (mut socket, _) = connect_async_tls_with_config(request, Some(config), true, Some(connector))
-                .await
-                .map_err(socket_error)?;
+            let (mut socket, _) =
+                connect_async_tls_with_config(request, Some(config), true, Some(connector))
+                    .await
+                    .map_err(socket_error)?;
             socket
                 .send(Message::Text(start.to_string().into()))
                 .await
