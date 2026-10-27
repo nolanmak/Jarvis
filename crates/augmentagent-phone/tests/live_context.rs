@@ -39,13 +39,17 @@ fn task_contains_bounded_role_context_and_never_future_speech() {
     assert!(task.len() <= 12000);
 }
 #[test]
-fn missing_partial_or_already_consumed_request_needs_clarification() {
+fn missing_or_already_consumed_request_needs_clarification() {
     let mut context = LiveContext::default();
     assert!(context.request(0.).unwrap().is_none());
     context
         .push(&fragment("one", true, "Check calendar", 100., 200.))
         .unwrap();
-    assert!(context.request(150.).unwrap().is_none());
+    assert!(context
+        .request(150.)
+        .unwrap()
+        .unwrap()
+        .contains("Check calendar"));
     context
         .push(&fragment(
             "two",
@@ -96,4 +100,51 @@ fn lost_context_requires_repeat_instead_of_dispatching_a_truncated_request() {
         .push(&fragment("repeat", true, "Check calendar", 21000., 21100.))
         .unwrap();
     assert!(context.request(21200.).unwrap().is_some());
+}
+
+#[test]
+fn many_short_deltas_form_one_complete_request() {
+    let mut context = LiveContext::default();
+    let expected = (0..80).map(|i| format!(" word{i}")).collect::<String>();
+    for i in 0..80 {
+        context
+            .push(&fragment(
+                &format!("part-{i}"),
+                true,
+                &format!(" word{i}"),
+                i as f64 * 10.,
+                (i + 1) as f64 * 10.,
+            ))
+            .unwrap();
+    }
+    let task = context
+        .request(805.)
+        .unwrap()
+        .expect("word-sized deltas are not lost speech");
+    assert!(task.contains(&expected));
+    assert!(
+        context.request(810.).unwrap().is_none(),
+        "never replay consumed speech"
+    );
+}
+
+#[test]
+fn delegation_inside_a_complete_fragment_preserves_the_fragment_once() {
+    let mut context = LiveContext::default();
+    context
+        .push(&fragment(
+            "full",
+            true,
+            "Please check my inbox today.",
+            100.,
+            200.,
+        ))
+        .unwrap();
+    assert!(context
+        .request(180.)
+        .unwrap()
+        .unwrap()
+        .contains("Please check my inbox today."));
+    assert!(context.request(190.).unwrap().is_none());
+    assert!(context.request(205.).unwrap().is_none());
 }

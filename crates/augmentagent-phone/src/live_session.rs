@@ -183,8 +183,8 @@ impl LiveSession {
         Ok(json!({"type":"session.input_audio.append","audio":STANDARD.encode(audio)}))
     }
     /// Cap UTF-8 bytes conservatively: byte-level tokenization cannot exceed
-    /// this 500-byte bound. Larger results must be summarized by the backend;
-    /// never silently truncate a result or claim work completed.
+    /// this 500-byte bound. Larger results arrive as ordered, acknowledged
+    /// pieces; no extra model call or silent truncation is required.
     pub fn commentary(&mut self, delegation_id: &str, content: &str) -> Result<Value, LiveError> {
         self.check_deadline()?;
         if self.state != LiveState::Active {

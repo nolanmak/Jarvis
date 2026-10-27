@@ -31,7 +31,7 @@ fn fixture() -> (tempfile::TempDir, Store, String) {
     (dir, store, call.id)
 }
 #[test]
-fn long_result_keeps_full_chat_delivery_and_waits_for_a_spoken_summary() {
+fn legacy_summary_api_stays_compatible_while_full_result_is_available_for_voice() {
     let (dir, store, id) = fixture();
     store.phone_claim_relay(&id, "CA-test").unwrap();
     store.phone_bind_live_session(&id, "live").unwrap();
@@ -40,7 +40,7 @@ fn long_result_keeps_full_chat_delivery_and_waits_for_a_spoken_summary() {
         .unwrap();
     let full = "Detailed findings. ".repeat(100);
     store.phone_finish_dispatch(&id, &task, &full).unwrap();
-    assert!(store.phone_live_results(&id, "live").unwrap().is_empty());
+    assert_eq!(store.phone_live_results(&id, "live").unwrap()[0].result, full);
     assert_eq!(
         store.phone_pending_dispatches().unwrap()[0]
             .result
