@@ -119,6 +119,14 @@ mod tests {
             session.receive(&json!({"type":"session.started","session":confirmation}).to_string()),
             Err(LiveError::Configuration)
         ));
+        assert_eq!(session.state(), crate::live_session::LiveState::Failed);
+        let mut session = LiveSession::with_voice(
+            "Be helpful.",
+            LiveVoice::parse("voice_example", Some("Warm adult feminine American voice.")).unwrap(),
+            true,
+        )
+        .unwrap();
+        session.start().unwrap();
         confirmation["audio"]["output"]["voice"] = json!({"id":"voice_example"});
         assert!(session
             .receive(&json!({"type":"session.started","session":confirmation}).to_string())
