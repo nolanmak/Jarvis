@@ -41,8 +41,12 @@ jobs:
         env:
           AUGMENTAGENT_GH_DISABLE: '1'
         run: |
-          cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: autopr_health::
+          cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: storage_reservations:: autoship_worker:: worker_upgrade_waits_for_the_run storage_contention_is_infrastructure autopr_health::
           python3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent
+          python3 scripts/tests/update-storage-smoke.py target/debug/augmentagent
+          python3 scripts/tests/auto_pr_worker_status_test.py
+          python3 scripts/tests/autopr_worker_install_test.py
+          bash scripts/tests/update-build.test.sh
           bash scripts/tests/service-restart.test.sh
       # Every workflow here builds a per-crate SUBSET, so a crate that nothing
       # in CI compiles can break `main` while every check stays green. That is

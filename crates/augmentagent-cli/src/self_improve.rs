@@ -10786,6 +10786,7 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 /// must approve before any PR opens. Not-fixable verdicts stop after one
 /// call. Budget the daily cap accordingly.
 pub struct AutoPrLoop {
+    upgrade: Option<crate::autoship_worker::UpgradeWatch>,
     repo_root: PathBuf,
     dry_run: bool,
     interval: std::time::Duration,
@@ -11326,11 +11327,14 @@ impl AttemptRecord {
 /// charged; a failure `main` already has is handled by #931 instead.
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
+        ("storage busy:", "storage busy"),
+        ("build storage busy; retry admission", "storage busy"),
         ("resource capacity", "declared run resource capacity"),
         ("resource_capacity", "declared run resource capacity"),
         ("no space left on device", "disk full"),
         // #1407 — the pre-gate free-space floor (`disk::LOW_DISK_REFUSAL`).
         ("gate refused: low disk", "disk low"),
+        ("storage admission:", "storage unavailable"),
         ("out of memory", "out of memory"),
         ("memory allocation of", "out of memory"),
         ("signal: 9", "killed (SIGKILL)"),
@@ -11768,6 +11772,7 @@ impl AutoPrLoop {
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
             .max(300);
         Some(Self {
+            upgrade: None,
             repo_root,
             dry_run,
             interval: std::time::Duration::from_secs(interval),
@@ -11792,6 +11797,7 @@ impl AutoPrLoop {
     #[cfg(test)]
     fn for_tests(repo_root: PathBuf, daily_cap: u32, state: &Path) -> Self {
         Self {
+            upgrade: None,
             repo_root,
             dry_run: true,
             interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
@@ -11804,6 +11810,9 @@ impl AutoPrLoop {
     }
 
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
+        let state = crate::build_storage::state_dir()?;
+        let _supervisor = RunLock::try_acquire(&state.join("autopr-supervisor.lock"))?
+            .context("another auto-ship supervisor is already running")?;
         let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
         let sweep_root = root.clone();
         let canary_stop = shutdown.clone();
@@ -11843,6 +11852,18 @@ impl AutoPrLoop {
         tokio::select! { result = shipping => result, result = canary => result }
     }
 
+    pub fn with_upgrade_watch(mut self, watch: crate::autoship_worker::UpgradeWatch) -> Self {
+        self.upgrade = Some(watch);
+        self
+    }
+
+    fn upgrade_boundary(&self) -> Result<()> {
+        if self.upgrade.as_ref().map(|w| w.changed()).transpose()?.unwrap_or(false) {
+            return Err(crate::autoship_worker::UpgradeRequested.into());
+        }
+        Ok(())
+    }
+
     /// Reconciliation runs independently of a builder's lifetime and budget.
     /// Individual commands/providers own their watchdog and cleanup boundary.
     async fn run_with<F, T, S, U>(self, shutdown: tokio_util::sync::CancellationToken,
@@ -11852,11 +11873,18 @@ impl AutoPrLoop {
     {
         let interval = self.interval;
         let stop = shutdown.clone();
+        let upgrade_stop = tokio_util::sync::CancellationToken::new();
+        let reconciliation_stop = upgrade_stop.clone();
         let reconciliation = async move {
             let mut timer = tokio::time::interval(interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! { _ = stop.cancelled() => return Ok(()), _ = timer.tick() => {} }
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => return Ok(()),
+                    _ = reconciliation_stop.cancelled() => return Ok(()),
+                    _ = timer.tick() => {}
+                }
                 let swept = tokio::select! {
                     _ = stop.cancelled() => return Ok(()),
                     swept = sweep() => swept,
@@ -11864,10 +11892,19 @@ impl AutoPrLoop {
                 if swept > 0 { info!(swept, "auto-PR: reconciled approved drafts independently of builder"); }
             }
         };
+        tokio::pin!(reconciliation);
         tokio::select! {
             biased;
-            result = self.run_builds(shutdown, tick) => result,
-            result = reconciliation => result,
+            result = self.run_builds(shutdown, tick) => {
+                if result.as_ref().err().is_some_and(|error| error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some()) {
+                    // A replacement waits for the independently running merge
+                    // sweep too. Only operator shutdown cancels active work.
+                    upgrade_stop.cancel();
+                    reconciliation.await?;
+                }
+                result
+            },
+            result = &mut reconciliation => result,
         }
     }
 
@@ -11882,12 +11919,17 @@ impl AutoPrLoop {
         );
         let counter_path = self.counter_path.clone();
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("auto-PR loop stopped");
-                    return Ok(());
+            let next_tick = tokio::time::Instant::now() + self.interval;
+            loop {
+                self.upgrade_boundary()?;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!("auto-PR loop stopped");
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep_until(next_tick) => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if self.upgrade.is_some() => {}
                 }
-                _ = tokio::time::sleep(self.interval) => {}
             }
             // Triage-only outcomes are cheap and permanently label the
             // issue out of the pool, so keep going within the SAME tick
@@ -11896,6 +11938,7 @@ impl AutoPrLoop {
             // refusal, so this burst is self-limiting.
             let mut triaged = 0u32;
             loop {
+                self.upgrade_boundary()?;
                 // Reserve before spending so restart/shutdown cannot erase work.
                 let started_day = utc_day_of((self.clock)());
                 let latch = self.latch.latched_entry("claude");
@@ -11965,6 +12008,56 @@ mod progress_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_contention_is_infrastructure_without_being_low_disk() {
+        assert_eq!(super::infra_failure_reason("storage busy: another writer reserved this space"), Some("storage busy"));
+        assert_eq!(super::infra_failure_reason("gate refused: low disk: 8 GB free"), Some("disk low"));
+        assert_eq!(super::infra_failure_reason("storage admission: cleanup failed: gate refused: low disk: 8 GB free"), Some("disk low"));
+    }
+
+    #[tokio::test]
+    async fn worker_upgrade_waits_for_the_run_and_persists_its_result() {
+        use super::*;
+        let state = tempfile::tempdir().unwrap();
+        let binary = state.path().join("worker");
+        std::fs::write(&binary, "old").unwrap();
+        let _executing = std::fs::File::open(&binary).unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path())
+            .with_upgrade_watch(crate::autoship_worker::UpgradeWatch::at(&binary));
+        worker.interval = std::time::Duration::from_millis(1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let (s, f) = (started.clone(), finish.clone());
+        let sweep_started = Arc::new(tokio::sync::Notify::new());
+        let sweep_finish = Arc::new(tokio::sync::Notify::new());
+        let (ss, sf) = (sweep_started.clone(), sweep_finish.clone());
+        let task = tokio::spawn(worker.run_with(tokio_util::sync::CancellationToken::new(), move || {
+                let (s, f) = (s.clone(), f.clone());
+                async move { s.notify_one(); f.notified().await; Ok(RunReport::built("synthetic finished run".into())) }
+            }, move || {
+                let (ss, sf) = (ss.clone(), sf.clone());
+                async move { ss.notify_one(); sf.notified().await; 0 }
+            }));
+        started.notified().await;
+        sweep_started.notified().await;
+        let replacement = state.path().join("replacement");
+        std::fs::write(&replacement, "new").unwrap();
+        std::fs::rename(replacement, &binary).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "an upgrade must not cancel the active run");
+        finish.notify_one();
+        // Let the builder reach its reload boundary. The independent sweep
+        // must still finish rather than being cancelled by that reload.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!task.is_finished(), "reload must also wait for reconciliation");
+        sweep_finish.notify_one();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), task).await
+            .expect("worker did not finish after both boundaries").unwrap().unwrap_err();
+        assert!(error.downcast_ref::<crate::autoship_worker::UpgradeRequested>().is_some());
+        let counter = DailyCounter::load(&state.path().join("autopr-daily-runs.json"));
+        assert_eq!(counter.runs, 1, "finished work must be recorded before the worker reloads");
+    }
+
     #[test]
     fn legacy_recorded_verdict_remains_readable() {
         let old = serde_json::json!({"provider":"codex","backend":"native","model":"pinned",
@@ -18273,8 +18366,8 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let body = &src[start..end];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
         assert!(body.contains("counter.settle_reservation(&reservation, completed_day, billed);"));
-        assert!(body.contains("result = self.run_builds(shutdown, tick) => result"));
-        assert!(body.contains("result = reconciliation => result"));
+        assert!(body.contains("result = self.run_builds(shutdown, tick) =>"));
+        assert!(body.contains("result = &mut reconciliation => result"));
         assert!(!body.contains("timeout(max_tick"));
     }
 

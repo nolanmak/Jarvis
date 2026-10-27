@@ -23,29 +23,42 @@ pub fn state_dir() -> Result<PathBuf> {
 pub struct Lease {
     file: std::fs::File,
     targets: crate::storage_leases::TargetLeases,
+    reservation: Option<crate::storage_reservations::Reservation>,
 }
 impl Lease {
     pub fn parent_proof(&self, target: &Path) -> Result<String> {
+        let reservation = self.reservation.as_ref().context("storage reservation missing")?;
         Ok(format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             std::process::id(),
-            self.file.as_raw_fd(),
-            self.targets.directory_fd(target)?
+            reservation.fd(),
+            self.targets.directory_fd(target)?,
+            reservation.id(),
         ))
     }
 
     pub fn try_at(state: &Path) -> Result<Option<Self>> {
+        Self::try_kind_at(state, false)
+    }
+
+    fn try_kind_at(state: &Path, update: bool) -> Result<Option<Self>> {
         std::fs::create_dir_all(state)?;
+        let admission = crate::storage_reservations::Admission::lock()?;
         let f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(state.join("disk-build.lock"))?;
+            .open(state.join(if update { "disk-update.lock" } else { "disk-build.lock" }))?;
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            if update && crate::disk::lock_is_held(&state.join("disk-build.lock"))
+                && !admission.claims(None)?.has_normal_writer(state)? {
+                return Err(crate::storage_reservations::Busy("legacy writer has not declared its space reservation; retry at its next boundary".into()).into());
+            }
             Ok(Some(Self {
                 file: f,
                 targets: Default::default(),
+                reservation: Some(crate::storage_reservations::Reservation::new(&admission, state, update)?),
             }))
         } else {
             let e = std::io::Error::last_os_error();
@@ -68,10 +81,7 @@ impl Lease {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= until {
-                bail!(
-                    "{}: target lease busy; retry after the active writer exits",
-                    crate::disk::LOW_DISK_REFUSAL
-                );
+                return Err(crate::storage_reservations::Busy("target is in use; retry after its writer exits".into()).into());
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -81,6 +91,7 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         self.targets = Default::default();
+        self.reservation.take();
         unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -93,10 +104,7 @@ pub async fn acquire() -> Result<Lease> {
             return Ok(lock);
         }
         if tokio::time::Instant::now() >= until {
-            bail!(
-                "{}: build storage busy; retry admission",
-                crate::disk::LOW_DISK_REFUSAL
-            );
+            return Err(crate::storage_reservations::Busy("build lease is held; retry admission".into()).into());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -561,11 +569,11 @@ pub fn inherited_lease(target: &Path) -> Result<bool> {
 #[cfg(target_os = "linux")]
 fn verify_parent_lease(target: &Path, proof: &str) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let fields: Vec<u32> = proof
-        .split(':')
-        .map(str::parse)
+    let parts: Vec<_> = proof.split(':').collect();
+    anyhow::ensure!(matches!(parts.len(), 3 | 4), "invalid parent storage lease");
+    let fields: Vec<u32> = parts[..3].iter()
+        .map(|s| s.parse())
         .collect::<std::result::Result<_, _>>()?;
-    anyhow::ensure!(fields.len() == 3, "invalid parent storage lease");
     let owner = fields[0];
     let mut ancestor = std::process::id();
     let mut found = false;
@@ -586,8 +594,12 @@ fn verify_parent_lease(target: &Path, proof: &str) -> Result<()> {
         }
     }
     anyhow::ensure!(found, "storage lease owner is not a live ancestor");
+    let parent_lock = if let Some(id) = parts.get(3) {
+        crate::storage_reservations::Reservation::proof_mode(id, &state_dir()?)?;
+        crate::storage_reservations::Reservation::path_for(id)?
+    } else { state_dir()?.join("disk-build.lock") };
     let expected = [
-        state_dir()?.join("disk-build.lock"),
+        parent_lock,
         crate::storage_leases::TargetLeases::directory_lock_path(target)?,
     ];
     for (fd, expected) in fields[1..].iter().zip(expected) {
@@ -612,13 +624,24 @@ fn verify_parent_lease(target: &Path, proof: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn inherited_mode(target: &Path, update: bool) -> Result<bool> {
+    if !inherited_lease(target)? { return Ok(false); }
+    let proof = std::env::var(PARENT_LEASE_ENV)?;
+    let parent_update = match proof.split(':').nth(3) {
+        Some(id) => crate::storage_reservations::Reservation::proof_mode(id, &state_dir()?)?,
+        None => false,
+    };
+    anyhow::ensure!(parent_update == update, "nested managed command cannot change its parent's build scope");
+    Ok(true)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn verify_parent_lease(_target: &Path, _proof: &str) -> Result<()> {
     bail!("nested managed builds require native parent-lease evidence; use cargo directly inside the enclosing managed build")
 }
 
-pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease>) -> Result<()> {
-    let scratch = std::fs::canonicalize(target)?.join("tmp");
+pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease>, update: bool) -> Result<()> {
+    let scratch = std::fs::canonicalize(target)?.join(if update { ".augmentagent-update-tmp" } else { "tmp" });
     std::fs::create_dir_all(&scratch)?;
     let mut process = tokio::process::Command::new(&command[0]);
     process
@@ -642,7 +665,7 @@ pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease
         }
     }
     let _group = Group(child.id().context("managed build has no pid")?);
-    let result = watch_reserve(target, async {
+    let completion = async {
         let parent_alive = async {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -656,8 +679,16 @@ pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease
             _ = tokio::signal::ctrl_c() => bail!("managed build interrupted"),
             result = parent_alive => { result?; bail!("parent storage lease lost") },
         }
-    })
-    .await?;
+    };
+    let result = if update {
+        watch_with(completion, || {
+            for path in update_paths(target) {
+                let free = crate::disk::available_bytes(&path).context("cannot read update filesystem")?;
+                if let Some(why) = crate::disk::floor_refusal(free, crate::disk::gate_min_free_gb()) { bail!("{why}"); }
+            }
+            Ok(())
+        }).await?
+    } else { watch_reserve(target, completion).await? };
     if !result.success() {
         bail!("managed build failed: {result}");
     }
@@ -666,22 +697,27 @@ pub async fn run_command(target: &Path, command: &[String], lease: Option<&Lease
 
 #[cfg(target_os = "linux")]
 fn ensure_idle_target(target: &Path) -> Result<()> {
-    let canonical = match std::fs::canonicalize(target) {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
+    let mut paths = vec![target.to_path_buf()];
+    paths.extend(crate::disk::profile_dirs(target));
+    ensure_idle_paths(&paths)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_idle_paths(paths: &[PathBuf]) -> Result<()> {
     let procs = crate::disk::build_procs().context("cannot prove build target is idle")?;
     let resolve = |p: &Path| std::fs::canonicalize(p).ok();
-    if crate::disk::root_in_use(&canonical, &procs, &resolve)
-        || crate::disk::profile_dirs(&canonical).iter().any(|p| {
-            std::fs::canonicalize(p).is_ok_and(|p| crate::disk::root_in_use(&p, &procs, &resolve))
-        })
-    {
-        bail!(
-            "{}: an uncoordinated build is using the target; retry after it exits",
-            crate::disk::LOW_DISK_REFUSAL
-        );
+    for path in paths {
+        let Some(canonical) = resolve(path) else { continue; };
+        let aliases = procs.iter().any(|p| {
+            let Some(root) = p.target_arg.as_ref().or(p.target_env.as_ref()) else { return false; };
+            let root = if root.is_absolute() { root.clone() }
+                else if let Some(cwd) = &p.cwd { cwd.join(root) } else { return true; };
+            [root.clone(), root.join("debug"), root.join("release")].iter()
+                .any(|r| resolve(r).as_ref() == Some(&canonical))
+        });
+        if aliases || crate::disk::root_in_use(&canonical, &procs, &resolve) {
+            return Err(crate::storage_reservations::Busy("an uncoordinated build is using these outputs; retry after it exits".into()).into());
+        }
     }
     Ok(())
 }
@@ -714,13 +750,48 @@ pub async fn admit_session(repo: &Path, target: &Path) -> Result<Lease> {
     admit_owned(repo, target, Some(repo)).await
 }
 
+fn update_paths(target: &Path) -> Vec<PathBuf> {
+    vec![target.to_path_buf(), target.join("release"), target.join(".augmentagent-update-tmp")]
+}
+
+/// Release output is separate from auto-ship's gate cache. Account for the
+/// active writer's growth instead of waiting on its whole model call.
+pub async fn admit_update(repo: &Path, target: &Path) -> Result<Lease> {
+    #[cfg(not(target_os = "linux"))]
+    { return admit_session(repo, target).await; }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::create_dir_all(target)?;
+        let target = std::fs::canonicalize(target)?;
+        anyhow::ensure!(std::fs::canonicalize(repo.join("target"))? == target,
+            "deployment builds must use the checkout target directory");
+        let state = state_dir()?;
+        let mut lease = Lease::try_kind_at(&state, true)?
+            .ok_or_else(|| crate::storage_reservations::Busy("another deployment build is active".into()))?;
+        lease.targets = crate::storage_leases::TargetLeases::try_release_root(&target)?
+            .ok_or_else(|| crate::storage_reservations::Busy("release outputs are in use".into()))?;
+        let admission = crate::storage_reservations::Admission::lock()?;
+        let claims = admission.claims(Some(lease.reservation.as_ref().unwrap().id()))?;
+        let paths = update_paths(&target);
+        ensure_idle_paths(&paths)?;
+        let scratch = target.join(".augmentagent-update-tmp");
+        if let Ok(meta) = std::fs::symlink_metadata(&scratch) {
+            if meta.is_dir() { std::fs::remove_dir_all(&scratch)?; }
+            else { std::fs::remove_file(&scratch)?; }
+        }
+        std::fs::create_dir_all(&scratch)?;
+        let mut cleanup = Vec::new();
+        crate::disk::run_prune_with_leases(repo, &Default::default(), &mut cleanup, true, Some(&lease.targets))?;
+        reconcile_for(repo, &target, &state, admission_floor_gb(), cache_cap_mb(),
+            ReconcileContext { held: Some(&lease.targets), claims: &claims, paths: &paths, update: true },
+            &crate::disk::available_bytes)?;
+        lease.reservation.as_mut().unwrap().publish(&admission, &paths, growth_bytes())?;
+        Ok(lease)
+    }
+}
+
 async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result<Lease> {
-    let mut lease = acquire().await.with_context(|| {
-        format!(
-            "{}: storage lease unavailable",
-            crate::disk::LOW_DISK_REFUSAL
-        )
-    })?;
+    let mut lease = acquire().await.context("storage admission: lease unavailable")?;
     let state = state_dir()?;
     let state_canonical = std::fs::canonicalize(&state)?;
     let home = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok());
@@ -751,6 +822,10 @@ async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result
         }
     }
     lease.protect_targets(&protected_roots).await?;
+    let admission = crate::storage_reservations::Admission::lock()?;
+    let own = lease.reservation.as_ref().context("missing reservation")?.id();
+    let claims = admission.claims(Some(own))?;
+    let paths: Vec<_> = protected_roots.iter().flat_map(|p| monitored_paths(p)).collect();
     let gate = crate::disk::gate_target_dir();
     if owner.is_none() || std::fs::canonicalize(&gate).ok() == std::fs::canonicalize(target).ok() {
         register_shared_gate(repo, &gate, &state)?;
@@ -761,14 +836,18 @@ async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result
         // and space guard still apply, but unknown process evidence never
         // authorizes destructive cleanup.
         let mut readings = Vec::new();
-        for path in monitored_paths(target) {
+        for path in &paths {
             let free =
                 crate::disk::available_bytes(&path).context("cannot read build filesystem")?;
             if let Some(why) = crate::disk::floor_refusal(free, admission_floor_gb()) {
                 bail!("{why}");
             }
+            if free.saturating_sub(claims.reserved_on(path)?) < (admission_floor_gb() * 1024.0_f64.powi(3)) as u64 {
+                return Err(crate::storage_reservations::Busy("other writers reserved the remaining build headroom".into()).into());
+            }
             readings.push((path, free));
         }
+        lease.reservation.as_mut().unwrap().publish(&admission, &paths, growth_bytes())?;
         std::fs::create_dir_all(target.join("tmp"))?;
         atomic_json(
             &state.join("disk-reconcile.json"),
@@ -797,14 +876,9 @@ async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result
             vec![configured_gate.unwrap_or(gate)]
         };
         for scratch_target in &scratch_targets {
-            ensure_idle_target(scratch_target).with_context(|| {
-                format!(
-                    "{}: cannot safely reclaim scratch",
-                    crate::disk::LOW_DISK_REFUSAL
-                )
-            })?;
+            ensure_idle_target(scratch_target).context("storage admission: cannot reclaim active scratch")?;
             let freed = clear_scratch(scratch_target).with_context(|| {
-                format!("{}: scratch cleanup failed", crate::disk::LOW_DISK_REFUSAL)
+                "storage admission: scratch cleanup failed"
             })?;
             tracing::info!(target = %scratch_target.display(), freed_bytes = freed, "reclaimed idle build scratch before admission");
         }
@@ -816,28 +890,19 @@ async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result
             true,
             Some(&lease.targets),
         )
-        .with_context(|| {
-            format!(
-                "{}: storage reconciliation failed",
-                crate::disk::LOW_DISK_REFUSAL
-            )
-        })?;
+        .context("storage admission: reconciliation failed")?;
         tracing::info!(cleanup = %String::from_utf8_lossy(&cleanup), "abandoned build storage reconciliation");
-        reconcile(
+        reconcile_for(
             repo,
             target,
             &state_dir()?,
             admission_floor_gb(),
             cache_cap_mb(),
-            Some(&lease.targets),
+            ReconcileContext { held: Some(&lease.targets), claims: &claims, paths: &paths, update: false },
             &crate::disk::available_bytes,
         )
-        .with_context(|| {
-            format!(
-                "{}: admission cleanup failed",
-                crate::disk::LOW_DISK_REFUSAL
-            )
-        })?;
+        .context("storage admission: cleanup failed")?;
+        lease.reservation.as_mut().unwrap().publish(&admission, &paths, growth_bytes())?;
         // Pruning may have removed tmp/ even when it kept the cache root.
         // Builder subprocesses receive TMPDIR before Cargo has run, so its
         // parent must exist at the point we hand over the lease.
@@ -848,7 +913,18 @@ async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result
     }
 }
 
-#[cfg(target_os = "linux")]
+fn growth_bytes() -> u64 {
+    ((admission_floor_gb() - crate::disk::gate_min_free_gb()) * 1024.0_f64.powi(3)) as u64
+}
+
+struct ReconcileContext<'a> {
+    held: Option<&'a crate::storage_leases::TargetLeases>,
+    claims: &'a crate::storage_reservations::Claims,
+    paths: &'a [PathBuf],
+    update: bool,
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn reconcile(
     repo: &Path,
     target: &Path,
@@ -858,8 +934,17 @@ fn reconcile(
     held: Option<&crate::storage_leases::TargetLeases>,
     free_bytes: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<()> {
+    reconcile_for(repo, target, state, floor_gb, cap_mb,
+        ReconcileContext { held, claims: &Default::default(), paths: &monitored_paths(target), update: false }, free_bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_for(
+    repo: &Path, target: &Path, state: &Path, floor_gb: f64, cap_mb: u64,
+    context: ReconcileContext<'_>, free_bytes: &dyn Fn(&Path) -> Option<u64>,
+) -> Result<()> {
     std::fs::create_dir_all(target)?;
-    ensure_idle_target(target)?;
+    if context.update { ensure_idle_paths(context.paths)?; } else { ensure_idle_target(target)?; }
     let checkout_target =
         std::fs::canonicalize(repo.join("target")).ok() == std::fs::canonicalize(target).ok();
     let mut log = Vec::new();
@@ -867,10 +952,10 @@ fn reconcile(
     let free = free_bytes(target).context("cannot read build filesystem")?;
     let reserve = (floor_gb * 1024.0_f64.powi(3)) as u64;
     let total = crate::disk::disk_bytes(target);
-    let mut minimum_free = free;
-    for path in monitored_paths(target).into_iter().skip(1) {
-        minimum_free =
-            minimum_free.min(free_bytes(&path).context("cannot read build profile filesystem")?);
+    let mut minimum_free = free.saturating_sub(context.claims.reserved_on(target)?);
+    for path in context.paths {
+        minimum_free = minimum_free.min(free_bytes(path).context("cannot read build profile filesystem")?
+            .saturating_sub(context.claims.reserved_on(path)?));
     }
     let cap = cap_for_free_space(
         total,
@@ -888,11 +973,11 @@ fn reconcile(
             },
             &mut log,
             true,
-            held,
+            context.held,
         )?;
     }
     let mut readings = Vec::new();
-    for path in monitored_paths(target) {
+    for path in context.paths {
         let bytes = free_bytes(&path).context("cannot re-read build filesystem")?;
         readings.push((path, bytes));
     }
@@ -901,13 +986,17 @@ fn reconcile(
         crate::disk::floor_refusal(*bytes, floor_gb)
             .map(|why| format!("{why} [filesystem for {}]", path.display()))
     });
+    let reservations = readings.iter().map(|(path, _)| context.claims.reserved_on(path)).collect::<Result<Vec<_>>>()?;
+    let reserved_busy = readings.iter().zip(&reservations)
+        .any(|((_, free), reserved)| free.saturating_sub(*reserved) < reserve);
     let remaining = crate::disk::disk_bytes(target);
     // Retain the root's small Cargo/ownership records even for an explicit
     // zero cap. Larger unprunable files must not silently defeat the budget.
     let over_cap = !checkout_target && remaining > cap.saturating_add(1024 * 1024);
     let report = serde_json::json!({"at": chrono::Utc::now(), "target": target,
             "before_free_bytes": free, "after_free_bytes": after,
-            "required_free_bytes": reserve, "admitted": refusal.is_none() && !over_cap,
+            "required_free_bytes": reserve, "admitted": refusal.is_none() && !over_cap && !reserved_busy,
+            "reserved_by_other_writers_bytes": reservations,
             "filesystem_free_bytes": readings,
             "configured_cap_mb": cap_mb, "target_bytes": remaining,
             "cleanup": String::from_utf8_lossy(&log)});
@@ -915,6 +1004,9 @@ fn reconcile(
     tracing::info!(report = %report, "build storage reconciled before admission");
     if let Some(why) = refusal {
         bail!("{why}");
+    }
+    if reserved_busy {
+        return Err(crate::storage_reservations::Busy("other writers reserved the remaining build headroom".into()).into());
     }
     if over_cap {
         bail!("{}: cache remains over its budget after cleanup; inspect skipped or unprunable files under {}", crate::disk::LOW_DISK_REFUSAL, target.display());
@@ -925,6 +1017,41 @@ fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn updater_defers_legacy_writer_without_a_reservation() {
+        let state = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(state.path().join("disk-build.lock")).unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let error = Lease::try_kind_at(state.path(), true).err().expect("legacy writer must defer admission");
+        assert!(error.downcast_ref::<crate::storage_reservations::Busy>().is_some());
+        assert!(!error.to_string().contains(crate::disk::LOW_DISK_REFUSAL));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn other_writers_reservations_defer_but_actual_shortage_is_low_disk() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repo_path = temporary.path().join("repo");
+        repo(&repo_path);
+        let target = repo_path.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let state = temporary.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let admission = crate::storage_reservations::Admission::lock().unwrap();
+        let mut other = crate::storage_reservations::Reservation::new(&admission, &state, false).unwrap();
+        let gib = 1024u64.pow(3);
+        other.publish(&admission, &[target.clone()], 2 * gib).unwrap();
+        let claims = admission.claims(None).unwrap();
+        let paths = update_paths(&target);
+        let check = |free| reconcile_for(&repo_path, &target, &state, 2.0, u64::MAX,
+            ReconcileContext { held: None, claims: &claims, paths: &paths, update: true }, &|_| Some(free));
+        let busy = check(3 * gib).unwrap_err();
+        assert!(busy.downcast_ref::<crate::storage_reservations::Busy>().is_some(), "{busy:#}");
+        assert!(!busy.to_string().contains(crate::disk::LOW_DISK_REFUSAL));
+        let low = check(gib).unwrap_err();
+        assert!(low.to_string().contains(crate::disk::LOW_DISK_REFUSAL), "{low:#}");
+    }
+
     fn repo(p: &Path) {
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1093,7 +1220,7 @@ mod tests {
         let target = t.path().to_path_buf();
         let task = tokio::spawn(async move {
             let _lease = lease;
-            run_command(&target, &command, None).await
+            run_command(&target, &command, None, false).await
         });
         for _ in 0..100 {
             if pid_file.exists() {

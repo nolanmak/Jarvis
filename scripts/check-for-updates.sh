@@ -66,6 +66,7 @@ notify_owner() {
 # library's diagnostics land in update.log like everything else.
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
+. "$REPO_ROOT/scripts/lib/update-build.sh"
 
 # #1571 — the unit no longer runs what this script builds. A drop-in that
 # overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
@@ -142,19 +143,28 @@ apply_update() {
     #
     # If a new binary is ever referenced from production code, add it here.
     # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
-    # Once available, the deployed binary coordinates release builds with
-    # gates/pruning too. Bootstrap installs still build directly.
-    # Keep this array nonempty: macOS Bash 3.2 treats expansion of an empty
-    # array as an unbound variable under set -u.
-    local build_driver=(cargo)
-    if "$DAEMON_BINARY" disk build --help >/dev/null 2>&1; then
-      build_driver=("$DAEMON_BINARY" disk build --target-dir "$REPO_ROOT/target" -- cargo)
-    fi
-    if ! "${build_driver[@]}" build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
-      log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
-      exit 1
+    local build_status=0
+    if run_update_build "$DAEMON_BINARY" "$REPO_ROOT/target"; then
+      :
+    else
+      build_status=$?
+      case "$build_status" in
+        73|75|76) return 0 ;; # A clean deferral; never advance the stamp.
+        *) return 1 ;;
+      esac
     fi
     log "rust build ok (augmentagent + augmentagent-mcp-memory)"
+    # Install without starting a duplicate legacy loop. The worker starts
+    # after the daemon restart, and future daemon updates leave it running.
+    local worker_help=""
+    worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
+    case "$worker_help" in
+      *'Usage: augmentagent auto-pr-worker'*)
+        if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
+          log "AUTO-SHIP WORKER PROVISIONING FAILED — deployment stamp withheld"
+          return 1
+        fi ;;
+    esac
   else
     log "no rust code changed; skipping rust rebuild"
   fi

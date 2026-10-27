@@ -187,8 +187,19 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     // Plain and gzip copies coexist during compression. Include the binary,
     // compression overhead, and final free-space reserve before allocating.
-    ensure_snapshot_space(crate::disk::available_bytes(root), db_bytes, binary_bytes, reserve_gb)
-        .with_context(|| format!("snapshot filesystem under {}", root.display()))?;
+    let _space = {
+        let admission = crate::storage_reservations::Admission::lock()?;
+        let free = crate::disk::available_bytes(root);
+        ensure_snapshot_space(free, db_bytes, binary_bytes, reserve_gb)
+            .with_context(|| format!("snapshot filesystem under {}", root.display()))?;
+        let other = admission.claims(None)?.reserved_on(root)?;
+        if ensure_snapshot_space(free.map(|v| v.saturating_sub(other)), db_bytes, binary_bytes, reserve_gb).is_err() {
+            return Err(crate::storage_reservations::Busy("other writers reserved the remaining snapshot headroom".into()).into());
+        }
+        let mut space = crate::storage_reservations::Reservation::snapshot(&admission, root)?;
+        space.publish(&admission, &[root.to_path_buf()], snapshot_peak_bytes(db_bytes, binary_bytes))?;
+        space
+    };
     let name = format!("{}-{}", now.format("%Y%m%dT%H%M%SZ"), sanitize_label(label));
     let dir = root.join(&name);
     if dir.exists() {
@@ -251,13 +262,16 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
 fn ensure_snapshot_space(free: Option<u64>, db_bytes: u64, binary_bytes: u64, reserve_gb: f64) -> Result<()> {
     let free = free.context("cannot determine snapshot filesystem headroom")?;
     let reserve = (reserve_gb * GIB) as u64;
-    let need = db_bytes.saturating_mul(2).saturating_add(db_bytes / 10)
-        .saturating_add(binary_bytes).saturating_add(reserve);
+    let need = snapshot_peak_bytes(db_bytes, binary_bytes).saturating_add(reserve);
     if free < need {
         bail!("not enough room for a snapshot: {:.1} GB free, {:.1} GB needed for raw/compressed copies, the rollback binary, and free-space reserve; prune or free space first",
             free as f64 / GIB, need as f64 / GIB);
     }
     Ok(())
+}
+
+fn snapshot_peak_bytes(db_bytes: u64, binary_bytes: u64) -> u64 {
+    db_bytes.saturating_mul(2).saturating_add(db_bytes / 10).saturating_add(binary_bytes)
 }
 
 /// The database holds mail; a snapshot is as private as the original.

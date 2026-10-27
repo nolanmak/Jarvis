@@ -113,6 +113,8 @@ mod snapshot_refs;
 mod disk;
 mod build_storage;
 mod storage_leases;
+mod storage_reservations;
+mod autoship_worker;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
@@ -216,6 +218,11 @@ enum Cmd {
     },
     /// List active gmail accounts from the shared db.
     AccountsList,
+    /// Run opted-in auto-ship independently of the serving daemon.
+    AutoPrWorker {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
     /// Resolve + persist each connected Gmail's real address via Composio
     /// `GMAIL_GET_PROFILE`, so the dashboard + invoice entity picker show
     /// who's who instead of opaque IDs. Safe to re-run.
@@ -1024,6 +1031,9 @@ enum DiskOp {
     Build {
         #[arg(long)]
         target_dir: PathBuf,
+        /// Release-only deployment build; reserve space alongside auto-ship.
+        #[arg(long)]
+        update: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -2995,6 +3005,9 @@ async fn main() -> Result<()> {
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
+    if let Cmd::AutoPrWorker { dry_run } = cli.cmd {
+        return autoship_worker::run(std::env::current_dir()?, dry_run).await;
+    }
     if let Cmd::ComposioAuthTool = cli.cmd {
         return composio_auth_tool::serve().await;
     }
@@ -3104,10 +3117,36 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&record)?);
                 Ok(())
             }
-            DiskOp::Build { target_dir, command } => {
-                let lease = if build_storage::inherited_lease(target_dir)? { None }
-                    else { Some(build_storage::admit_session(&repo_root, target_dir).await?) };
-                build_storage::run_command(target_dir, command, lease.as_ref()).await
+            DiskOp::Build { target_dir, command, update } => {
+                let result = async {
+                    let admitted: Result<Option<build_storage::Lease>> = async {
+                        if build_storage::inherited_mode(target_dir, *update)? { Ok(None) }
+                        else if *update { build_storage::admit_update(&repo_root, target_dir).await.map(Some) }
+                        else { build_storage::admit_session(&repo_root, target_dir).await.map(Some) }
+                    }.await;
+                    let lease = match admitted {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            let code = if error.downcast_ref::<storage_reservations::Busy>().is_some() { 75 }
+                                else if error.chain().any(|e| e.to_string().contains(disk::LOW_DISK_REFUSAL)) { 73 }
+                                else { 76 };
+                            eprintln!("build admission deferred: {error:#}");
+                            std::process::exit(code);
+                        }
+                    };
+                    build_storage::run_command(target_dir, command, lease.as_ref(), *update).await
+                }.await;
+                if let Err(ref error) = result {
+                    if error.downcast_ref::<storage_reservations::Busy>().is_some() {
+                        eprintln!("update/build deferred: {error:#}");
+                        std::process::exit(75);
+                    }
+                    if error.chain().any(|e| e.to_string().contains(disk::LOW_DISK_REFUSAL)) {
+                        eprintln!("{error:#}");
+                        std::process::exit(73);
+                    }
+                }
+                result
             }
             DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
                 &repo_root,
@@ -3375,6 +3414,10 @@ async fn main() -> Result<()> {
             dry_run,
             no_email,
         } => {
+            let external_autopr = autoship_worker::external_enabled();
+            if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+            }
             // #1287 — a Discord configuration error must not stop the
             // surfaces that are configured (Slack alone, for one): report it
             // and run without the Discord approval broker, as an unset
@@ -4078,7 +4121,9 @@ async fn main() -> Result<()> {
             // run spawns the claude CLI on the owner's subscription (#448),
             // so it must never start billing as a side effect of a deploy.
             // Serve's --dry-run flows through: the gate runs but no PR opens.
-            match self_improve::AutoPrLoop::from_env(
+            if external_autopr {
+                info!("auto-PR loop hosted by augmentagent-autopr.service");
+            } else { match self_improve::AutoPrLoop::from_env(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 dry_run,
             ) {
@@ -4087,7 +4132,7 @@ async fn main() -> Result<()> {
                     tasks.push(tokio::spawn(async move { ap.run(sd).await }));
                 }
                 None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
-            }
+            } }
             // #427 — ShadowNote journal → wiki ingest. Self-gates on the
             // SHADOWNOTE_* keyring/env config (plus AWS creds via the SDK
             // default chain); an unconfigured box logs and moves on, same
@@ -5535,6 +5580,7 @@ async fn main() -> Result<()> {
         Cmd::Phone { op: PhoneOp::Metrics { last } } => phone_metrics::run(&store, last),
         Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
+        Cmd::AutoPrWorker { .. } => unreachable!("worker dispatch precedes database initialization"),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
