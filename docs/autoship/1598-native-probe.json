@@ -1,0 +1,22 @@
+{
+  "revision": "3383566e",
+  "test": "self_improve::native_acceptance::live_native_disposable_scope_build_verify_review_and_seed",
+  "passed": true,
+  "no_remote_publication": true,
+  "audit_log_sha256": "675e6f3bf3dfcc1dda40e610983bdceeb2de307e1defd534619afe981215b08c",
+  "audit_event_payload_sha256": "e7bcf088c09221d374ad24c239f4ff031c826b28caa18ca133cdf84200574812",
+  "native_builder_count": 1,
+  "clean_review_roles": [
+    "qa",
+    "diff",
+    "system"
+  ],
+  "seeded_review_roles": [
+    "qa",
+    "diff",
+    "system"
+  ],
+  "seeded_finding_count": 3,
+  "log": "/tmp/autoship-1598-native-probe-3383566e.log",
+  "protected_evidence_root": "/tmp/autoship-native-probe-bsayg0sy"
+}

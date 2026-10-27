@@ -166,5 +166,20 @@ run_updater 1; rc=$?
                      || bad "writes the build stamp on a healthy deploy" "stamp absent"
 rm -rf "$TMP"
 
+# Unsupported delegation must not pin unrelated deployments; genuine setup
+# failures still retain the running daemon and withhold the build stamp.
+for resource_code in 3 1; do
+  make_case
+  printf '#!/bin/sh\nexit %s\n' "$resource_code" > "$TMP/work/scripts/configure-run-resources.sh"
+  chmod +x "$TMP/work/scripts/configure-run-resources.sh"
+  run_updater 1; rc=$?
+  if [ "$resource_code" -eq 3 ]; then
+    [ "$rc" -eq 0 ] && [ -s "$STAMP_FILE" ] && ok "unsupported delegation allows unrelated daemon update" || bad "unsupported delegation allows unrelated daemon update"
+  else
+    [ "$rc" -ne 0 ] && [ ! -s "$STAMP_FILE" ] && ok "real delegation setup failure withholds deploy stamp" || bad "real delegation setup failure withholds deploy stamp"
+  fi
+  rm -rf "$TMP"
+done
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

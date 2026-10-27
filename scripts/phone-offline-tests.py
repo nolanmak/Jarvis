@@ -17,7 +17,17 @@ ROOT = Path(__file__).resolve().parents[1]
 # counts prevent silent deletion of the current required coverage.
 SUITES = [
     ("augmentagent-docs", "--test", "private_attachments", 2),
-    ("augmentagent-phone", "--lib", None, 19),
+    ("augmentagent-phone", "--lib", None, 40),
+    ("augmentagent-phone", "--test", "live_transport", 8),
+    ("augmentagent-phone", "--test", "live_session", 12),
+    ("augmentagent-phone", "--test", "live_context", 4),
+    ("augmentagent-phone", "--test", "live_dispatch", 5),
+    ("augmentagent-phone", "--test", "live_call", 9),
+    ("augmentagent-phone", "--test", "live_history", 7),
+    ("augmentagent-phone", "--test", "live_usage", 4),
+    ("augmentagent-phone", "--test", "live_goodbye", 4),
+    ("augmentagent-phone", "--test", "live_summary", 3),
+    ("augmentagent-phone", "--test", "live_playback", 5),
     ("augmentagent-phone", "--test", "relay", 24),
     ("augmentagent-phone", "--test", "service", 52),
     ("augmentagent-phone", "--test", "speech", 14),
@@ -25,10 +35,10 @@ SUITES = [
     ("augmentagent-phone", "--test", "metrics", 4),
     ("augmentagent-phone", "--test", "recovery", 7),
     ("augmentagent-phone", "--test", "mcp", 2),
-    ("augmentagent-phone", "--test", "config", 7),
-    ("augmentagent-phone", "--test", "memory", 14),
+    ("augmentagent-phone", "--test", "config", 10),
+    ("augmentagent-phone", "--test", "memory", 15),
     ("augmentagent-phone", "--test", "silence", 12),
-    ("augmentagent-phone", "--test", "runtime", 3),
+    ("augmentagent-phone", "--test", "runtime", 6),
     ("augmentagent-phone", "--test", "proposals", 19),
     ("augmentagent-proactive", "--test", "no_dial_path", 3),
     ("augmentagent-store", "--test", "phone_calls", 17),
@@ -41,7 +51,7 @@ SUITES = [
     ("augmentagent-approval-discord", "--lib", None, 255),
     ("augmentagent-approval-discord", "--test", "phone_boundary", 2),
     ("augmentagent-approval-discord", "--test", "phone_delivery", 3),
-    ("augmentagent-channel-core", "--test", "phone_agent", 18),
+    ("augmentagent-channel-core", "--test", "phone_agent", 24),
     ("augmentagent-channel-core", "--test", "capability_inventory", 9),
     ("augmentagent-channel-core", "--test", "surface_turn", 10),
     ("augmentagent-channel-slack", "--test", "interactive_surface", 20),
@@ -73,6 +83,7 @@ def validate_output(output, returncode, minimum, *, allow_filtered=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "target/phone-offline")
+    parser.add_argument("--managed", action="store_true", help="Use the repository build-storage wrapper for local acceptance runs")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, AUGMENTAGENT_GH_DISABLE="1", AUGMENTAGENT_PHONE_ENABLED="0", CARGO_TERM_COLOR="never")
@@ -82,6 +93,8 @@ def main():
         label = package + "-" + (target or "lib")
         command = ["cargo", "test", "--locked", "-p", package, selector] + ([target] if target else [])
         jobs.append((label, command, minimum, False))
+    jobs.append(("augmentagent-channel-core-phone-fast",
+                 ["cargo", "test", "--locked", "-p", "augmentagent-channel-core", "--lib", "phone_fast_tests::"], 9, True))
     # These required CLI modules share a binary with unrelated, environment-
     # dependent tests. Only unrelated tests may be filtered; zero/ignored cases
     # or fewer than the required number still fail.
@@ -99,6 +112,8 @@ def main():
                   "channel::tests::private_phone_setup_is_not_stored_or_sent_to_reasoner", "--", "--exact"], 1, True))
     try:
         for label, command, minimum, allow_filtered in jobs:
+            if args.managed:
+                command = [str(ROOT / "scripts/cargo-managed.sh"), *command[1:]]
             print("Running " + label, flush=True)
             run = subprocess.run(command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             (args.output / (label + ".log")).write_text(run.stdout)

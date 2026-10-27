@@ -97,6 +97,11 @@ mod imessage_send;
 mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
+mod autoship_contract;
+mod autoship_episode;
+mod autoship_metrics;
+mod autoship_review;
+mod autoship_workflow;
 mod channel_router;
 mod code_mode;
 mod compute_cli;
@@ -377,6 +382,8 @@ enum Cmd {
         #[command(subcommand)]
         op: ImessageOp,
     },
+    /// Independently replay owner-outcome calibration before changing triage guidance.
+    TriageCalibration { #[command(subcommand)] op: self_improve::triage_calibration::Op },
     /// Similarity triage pre-filter (#1127): calibrate, stats, reset.
     TriagePrefilter {
         #[command(subcommand)]
@@ -625,6 +632,9 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Join triage flag/pending decisions to recorded owner outcomes.
+        #[arg(long, default_value_t = false)]
+        outcomes: bool,
     },
     /// #1011 — grade the SCOPING pass against fixed, cached issues.
     ///
@@ -4247,6 +4257,13 @@ async fn main() -> Result<()> {
             // counters with no visible card is pointless.
             if !dry_run {
                 if !no_email {
+                    let calibration_store=Arc::clone(&store);
+                    let calibration_skill=cli.skill_dir.clone();
+                    let calibration_shutdown=shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        self_improve::triage_calibration::run_background(calibration_store,calibration_skill,calibration_shutdown).await;
+                        Ok(())
+                    }));
                     let assessment_store=Arc::clone(&store);
                     let assessment_reasoner=build_reasoner();
                     let assessment_wiki=cli.wiki_dir.clone();
@@ -4969,6 +4986,7 @@ async fn main() -> Result<()> {
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
+        Cmd::TriageCalibration { op } => self_improve::triage_calibration::run(store, op).await,
         Cmd::TriagePrefilter { op } => triage_prefilter_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
@@ -5479,7 +5497,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::TokenUsage { days, json } => {
+        Cmd::TokenUsage { days, json, outcomes } => {
             use augmentagent_channel_core::token_usage as tu;
             let path = tu::default_usage_log_path();
             // #1413 — a report window can straddle a rotation.
@@ -5488,10 +5506,21 @@ async fn main() -> Result<()> {
             if rolled.len() > days as usize {
                 rolled.drain(..rolled.len() - days as usize);
             }
-            if json {
+            let outcome_report = if outcomes || !json {
+                let since = chrono::Utc::now().timestamp_millis().saturating_sub(i64::from(days) * 86_400_000);
+                Some(store.triage_outcome_report(since, 20)?)
+            } else { None };
+            if json && outcomes {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"token_usage":rolled,"triage_outcomes":outcome_report}))?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&rolled)?);
             } else {
                 print!("{}", tu::format_report(&rolled));
+                if let Some(report) = outcome_report {
+                    println!("Triage outcomes: flag precision {} ({} observed owner resolutions); flagged then aged out {}; unresolved flags {}; unknown original cohort {}.",
+                        report.flag_precision.map(|v| format!("{:.1}%",v*100.0)).unwrap_or_else(|| "not observed".into()),
+                        report.observed_owner_resolutions, report.flagged_then_aged_out, report.flagged.unresolved, report.unknown_cohort.total());
+                }
                 if raw.is_empty() {
                     println!("  (log: {})", path.display());
                 }
@@ -8903,6 +8932,20 @@ async fn run_stale_draft_sweep(
     }
 }
 
+fn optional_digest_rows<T,E:std::fmt::Display>(ctx:&mut String,section:&str,result:std::result::Result<Vec<T>,E>)->Vec<T> {
+    match result { Ok(rows)=>rows,Err(error)=>{ctx.push_str(&format!("{section} unavailable: {error}\n"));vec![]} }
+}
+
+#[test]
+fn optional_digest_query_failure_preserves_other_sections() {
+    let mut ctx=String::from("Inbox evidence\n");
+    let rows:Vec<String>=optional_digest_rows(&mut ctx,"Retry failure evidence",Err("malformed row"));
+    assert!(rows.is_empty());
+    let rows=optional_digest_rows(&mut ctx,"Loop evidence",Ok::<_,&str>(vec!["successful occurrence"]));
+    ctx.push_str(rows[0]);
+    assert!(ctx.contains("Inbox evidence") && ctx.contains("Retry failure evidence unavailable") && ctx.contains("successful occurrence"));
+}
+
 async fn run_digest(
     cli: &Cli,
     store: Arc<Store>,
@@ -8941,6 +8984,60 @@ async fn run_digest(
     } else {
         for (status, n) in &counts {
             ctx.push_str(&format!("- {status}: {n}\n"));
+        }
+    }
+
+    ctx.push_str("\n## Autoship native reviewer canary\n");
+    match self_improve::review_canary_summary() {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Canary evidence unavailable: {error:#}\n")),
+    }
+    ctx.push_str("\n## Autoship observed throughput and resources\n");
+    match autoship_metrics::summary(since_ms, chrono::Utc::now().timestamp_millis()) {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Workflow evidence unavailable: {error:#}\n")),
+    }
+    ctx.push_str("\n## Autoship readiness dependencies\n");
+    match self_improve::readiness_summary() { Ok(summary)=>ctx.push_str(&summary),Err(error)=>ctx.push_str(&format!("Readiness evidence unavailable: {error}\n")) }
+    ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
+    match store.triage_outcome_report(since_ms,25) {
+        Ok(triage_outcomes) => {
+    for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending), ("unknown original cohort", &triage_outcomes.unknown_cohort)] {
+        ctx.push_str(&format!("- {cohort}: approved {}, revised {}, skipped {}, aged out {}, unresolved {}\n",
+            counts.approved, counts.revised, counts.skipped, counts.aged_out, counts.unresolved));
+    }
+    match triage_outcomes.flag_precision {
+        Some(precision) => ctx.push_str(&format!("- Flag precision among {} observed owner resolutions: {:.1}% (aged-out and unresolved excluded)\n",
+            triage_outcomes.observed_owner_resolutions, precision * 100.0)),
+        None => ctx.push_str("- Flag precision unavailable: no observed owner resolutions.\n"),
+    }
+    ctx.push_str(&format!("- Flagged then aged out: {}.\n", triage_outcomes.flagged_then_aged_out));
+    for case in &triage_outcomes.disagreement_review_set {
+        ctx.push_str(&format!("- Disagreement review case {}: {:?}; {}. Review only; no automatic policy change.\n",
+            case.action_id, case.owner_outcome, case.evidence));
+    }
+        },
+        Err(error) => ctx.push_str(&format!("Triage outcome evidence unavailable: {error}\n")),
+    }
+    ctx.push_str("\n## Retry failure memory (latest 25; full history retained)\n");
+    for failure in optional_digest_rows(&mut ctx,"Retry failure evidence",store.email_retry_failures_since(since_ms, 25)) {
+        ctx.push_str(&format!("- action {} / message {}: attempt {}, guard {}, failure {}\n",
+            failure.action_id, failure.message_id, failure.attempt_n,
+            truncate(&failure.guard, 80), truncate(&failure.failure_class, 240)));
+    }
+    ctx.push_str("\n## Email guard observations (intentional dispositions, not retry failures)\n");
+    for guard in optional_digest_rows(&mut ctx,"Email guard evidence",store.email_guards_since(since_ms,25)) {
+        ctx.push_str(&format!("- attempt {}: guard {}; disposition {}\n",guard.attempt_n,guard.guard,guard.disposition));
+    }
+    ctx.push_str("\n## Scheduled loop progress (latest 25 occurrences; full evidence retained)\n");
+    for occurrence in optional_digest_rows(&mut ctx,"Scheduled loop evidence",store.loop_occurrences_since(since_ms, 25)) {
+        let coverage = optional_digest_rows(&mut ctx,&format!("Loop {} coverage",occurrence.loop_id),store.loop_coverage(&occurrence.loop_id, 5));
+        ctx.push_str(&format!("- loop {} / occurrence {}: {}; covered observations shown {}; outcome {}\n",
+            occurrence.loop_id, occurrence.request_id, occurrence.state, coverage.len(),
+            truncate(occurrence.error.as_deref().or(occurrence.answer.as_deref()).unwrap_or("pending"), 300)));
+        for finding in coverage {
+            ctx.push_str(&format!("  - {} [evidence: {}]\n", truncate(&finding.finding, 160),
+                truncate(&finding.evidence.join(", "), 200)));
         }
     }
     ctx.push_str(&format!("\n## Pending replies (awaiting approval)\n- {pending}\n"));

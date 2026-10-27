@@ -33,7 +33,13 @@ pub async fn start(
     if dry_run {
         return Ok(None);
     }
-    let Some(settings) = Settings::from_env()? else {
+    let Some(settings) = Settings::from_lookup(|key| {
+        if key == "OPENAI_API_KEY" {
+            augmentagent_channel_core::secret_loader::load_provider_key(key)
+        } else {
+            std::env::var(key).ok()
+        }
+    })? else {
         return Ok(None);
     };
     let configured = settings.build(store.clone())?;
@@ -46,6 +52,7 @@ pub async fn start(
         listener,
     )
     .await?;
+    tracing::info!(target: "phone.health", health = ?runtime.health(), "phone runtime started");
     let endpoint = Arc::new(Endpoint {
         service: configured.service,
         tools: runtime.tools().clone(),
@@ -135,6 +142,9 @@ pub async fn supervise(runtime: PhoneRuntime, shutdown: CancellationToken) -> Re
             }
         }
     };
+    if unexpected {
+        tracing::warn!(target: "phone.health", health = ?runtime.health(), "phone runtime is unhealthy");
+    }
     let cleanup = runtime.shutdown().await;
     if unexpected || cleanup.is_err() {
         tracing::warn!("phone runtime stopped or cleanup remains pending; inspect phone status; text service remains available");

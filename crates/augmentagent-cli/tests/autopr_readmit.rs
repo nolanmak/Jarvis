@@ -26,11 +26,21 @@ with open(os.path.join(os.environ['JARVIS_1214_ROOT'], 'gh-calls.jsonl'), 'a') a
     log.write(json.dumps(args) + '\n')
 if args[:2] == ['issue', 'list']:
     print(json.dumps([
-        {'number': 1082, 'comments': [{'body': 'unrelated discussion'}]},
-        {'number': 921, 'comments': []},
-        {'number': 1143, 'comments': [{'body': '<!-- self-improve-gave-up reason=scoper:not-fixable -->\nAuto-PR gave up.'}]},
-        {'number': 1071, 'comments': []},
+        {'number': 1082, 'labels': [{'name':'agent-gave-up'}], 'comments': [{'body': 'unrelated discussion'}]},
+        {'number': 921, 'labels': [{'name':'agent-gave-up'}], 'comments': []},
+        {'number': 1143, 'labels': [{'name':'agent-gave-up'}], 'comments': [{'body': '<!-- self-improve-gave-up reason=scoper:not-fixable -->\nAuto-PR gave up.'}]},
+        {'number': 1071, 'labels': [{'name':'agent-gave-up'}], 'comments': []},
     ]))
+elif args and args[0] == 'api':
+    assert '--paginate' not in args and '--slurp' not in args
+    page=int(args[-1].split('&page=')[1])
+    issue=int(args[-1].split('/issues/')[1].split('/')[0])
+    bodies={1082:['unrelated discussion'],1143:['<!-- self-improve-gave-up reason=scoper:not-fixable -->\\nAuto-PR gave up.']}.get(issue,[])
+    if issue==1082 and os.path.exists(os.path.join(os.environ['JARVIS_1214_ROOT'],'late-comments')):
+        bodies=['<!-- self-improve-gave-up reason=gate-red -->'] + ['discussion']*99
+        bodies+=['<!-- self-improve-attempts-reset -->','<!-- self-improve-gave-up reason=review-reject -->']
+    rows=[dict(id=i+1,body=b) for i,b in enumerate(bodies)]
+    print(json.dumps(rows[(page-1)*100:page*100]))
 elif args[:2] == ['issue', 'edit'] or args[:2] == ['issue', 'comment']:
     pass
 else:
@@ -133,7 +143,7 @@ fn readmit_reset_history_unlabels_comments_and_clears_only_the_matched_records()
             ]
         });
         let comment = calls.iter().position(|c| {
-            c[..3] == ["issue", "comment", issue]
+            c.starts_with(&["issue".into(), "comment".into(), issue.into()])
                 && c.last().is_some_and(|b| b.contains(RESET_MARKER))
         });
         let unlabel = unlabel.unwrap_or_else(|| panic!("#{issue} was not unlabelled: {calls:?}"));
@@ -164,4 +174,21 @@ fn readmit_reset_history_unlabels_comments_and_clears_only_the_matched_records()
         "the unmatched issue's records must survive the rewrite unchanged, field for field"
     );
     assert!(dir.join("history.json.bak").exists(), "the atomic save keeps a .bak");
+}
+
+#[test]
+fn readmit_uses_changed_reason_after_comment_one_hundred_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path();
+    let gh = fake_gh(dir);
+    let history = dir.join("history.json");
+    fake_history(&history);
+    std::fs::write(dir.join("late-comments"),"yes").unwrap();
+    let out = readmit(dir,&gh,&history,&["--dry-run"]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(),"921");
+    let calls = std::fs::read_to_string(dir.join("gh-calls.jsonl")).unwrap();
+    assert!(calls.contains("comments?per_page=100&page=2"));
+    assert!(!calls.contains("--paginate") && !calls.contains("--slurp"));
+    assert!(!calls.contains("--remove-label") && !calls.contains("\"comment\""));
 }

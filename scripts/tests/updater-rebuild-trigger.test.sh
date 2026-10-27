@@ -145,6 +145,10 @@ expect_rebuild scripts/codex-command-sandbox.py
 expect_rebuild scripts/codex-build-vm.py
 expect_rebuild scripts/build-dependency-proxy.py
 expect_rebuild scripts/provider-supervisor.py
+expect_rebuild scripts/native-provider-vm.py
+expect_rebuild scripts/native-provider-vm-guest.py
+expect_rebuild scripts/native-provider-mcp-relay.py
+expect_rebuild scripts/native-provider-gateway.py
 expect_rebuild scripts/code-mode-compute.py
 expect_rebuild scripts/code-mode-compute-guest.py
 expect_rebuild scripts/code-mode-compute-prepare.py

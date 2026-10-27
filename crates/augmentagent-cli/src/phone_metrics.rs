@@ -1,5 +1,5 @@
 //! `augmentagent phone metrics --last N` (#1551): nearest-rank p50/p95 per
-//! latency field over the last N calls. Reads `phone_turn_metrics` only; it
+//! latency field over the last N calls, plus separate Live usage receipts. It
 //! prints no speech text, numbers or provider identifiers.
 use anyhow::Result;
 use augmentagent_store::{phone::PhoneMetricsSummary, Store};
@@ -27,6 +27,8 @@ pub fn render(summary: &PhoneMetricsSummary) -> String {
 pub fn run(store: &Store, last: usize) -> Result<()> {
     let summary = store.phone_turn_metrics_summary(last)?;
     print!("{}", render(&summary));
+    print!("{}", augmentagent_phone::live_usage::render_usage(&store.phone_live_usage(last.clamp(1, 1000))?));
+    print!("{}", augmentagent_phone::live_playback::render_playback(&store.phone_live_playback(last.clamp(1, 1000))?));
     Ok(())
 }
 
@@ -88,6 +90,8 @@ mod tests {
         let table = render(&store.phone_turn_metrics_summary(10).unwrap());
         assert!(table.starts_with("phone turn metrics: last 0 calls, 0 turns"));
         assert!(table.contains("t_first_played_ms          0      -      -"));
-        assert!(run(&store, 10).is_ok());
+        for last in [0, 10, 1000, 5000, usize::MAX] {
+            assert!(run(&store, last).is_ok(), "last={last}");
+        }
     }
 }

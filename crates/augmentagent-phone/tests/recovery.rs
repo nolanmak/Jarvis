@@ -351,3 +351,127 @@ async fn concurrent_callback_binding_cannot_be_overwritten_by_candidate_associat
     assert!(!call.state.terminal());
     assert!(store.phone_usage(&id).unwrap().is_none());
 }
+
+#[test]
+fn dispatch_intent_claim_result_and_delivery_survive_reopen() {
+    let (dir, store, id) = fixture();
+    store
+        .phone_enqueue_dispatch(&id, "task", "Synthetic task")
+        .unwrap();
+    store
+        .phone_enqueue_dispatch(&id, "task", "Synthetic task")
+        .unwrap();
+    assert!(store
+        .phone_enqueue_dispatch(&id, "task", "Different task")
+        .is_err());
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert_eq!(store.phone_pending_dispatches().unwrap().len(), 1);
+    assert!(store.phone_start_dispatch(&id, "task").unwrap());
+    assert!(!store.phone_start_dispatch(&id, "task").unwrap());
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert_eq!(
+        store.phone_pending_dispatches().unwrap()[0].state,
+        "running"
+    );
+    store
+        .phone_finish_dispatch(&id, "task", "Saved result")
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    let jobs = store.phone_pending_dispatches().unwrap();
+    assert_eq!(jobs[0].state, "ready");
+    assert_eq!(jobs[0].result.as_deref(), Some("Saved result"));
+    store.phone_dispatch_delivered(&id, "task").unwrap();
+    assert!(store.phone_pending_dispatches().unwrap().is_empty());
+    store
+        .phone_enqueue_dispatch(&id, "task", "Synthetic task")
+        .unwrap();
+    assert!(!store.phone_start_dispatch(&id, "task").unwrap());
+}
+
+struct Expired;
+impl Clock for Expired {
+    fn now_ms(&self) -> i64 { 61_000 }
+}
+#[tokio::test]
+async fn abandoned_preflight_recovery_is_atomic_and_keeps_unknown_usage() {
+    use augmentagent_store::phone::{LiveUsagePhase, LiveUsageFinal};
+    let (_dir, store, id) = fixture();
+    store.phone_set_voice_backend(&id, "openai_live").unwrap();
+    store.phone_live_usage_start(&id, LiveUsagePhase::Preflight).unwrap();
+    store.phone_mark_uncertain(&id).unwrap();
+    store.phone_request_stop("owner", &id).unwrap();
+    let provider = Provider { result: None, reads: AtomicUsize::new(0) };
+    assert_eq!(reconcile(&store, &provider, &Now, &id).await.unwrap(), RecoveryOutcome::UnknownProviderId);
+    assert_eq!(reconcile(&store, &provider, &Expired, &id).await.unwrap(), RecoveryOutcome::Finalized);
+    let call = store.phone_call("owner", &id).unwrap();
+    assert_eq!(call.state, CallState::Failed);
+    assert!(call.stop_requested);
+    assert!(call.provider_sid.is_none());
+    assert!(store.phone_usage(&id).unwrap().is_none());
+    let usage = store.phone_live_usage(1).unwrap();
+    assert_eq!(usage[0].trigger.as_deref(), Some("setup_failure"));
+    assert!(usage[0].seconds.is_none());
+    // A concurrent readiness probe cannot bind or finalize after recovery.
+    assert!(store.phone_live_usage_bind(&id, LiveUsagePhase::Preflight, "late").is_err());
+    assert!(store.phone_live_usage_finish(&id, LiveUsagePhase::Preflight, &LiveUsageFinal {
+        trigger: "preflight", reason: None, seconds: None,
+        error: Some("protocol"), finalization_error: None,
+    }).is_err());
+    assert_eq!(reconcile(&store, &provider, &Expired, &id).await.unwrap(), RecoveryOutcome::AlreadyFinalized);
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 0);
+    assert!(store.phone_reserve_call(ReserveCall { owner:"owner",request_id:"next",conversation:"chat",now_ms:61_000 }).is_ok());
+}
+
+#[tokio::test]
+async fn finalized_preflight_never_releases_an_uncertain_twilio_create() {
+    use augmentagent_store::phone::{LiveUsagePhase, LiveUsageFinal};
+    let (_dir, store, id) = fixture();
+    store.phone_set_voice_backend(&id, "openai_live").unwrap();
+    store.phone_live_usage_start(&id, LiveUsagePhase::Preflight).unwrap();
+    store.phone_live_usage_bind(&id, LiveUsagePhase::Preflight, "session").unwrap();
+    store.phone_live_usage_finish(&id, LiveUsagePhase::Preflight, &LiveUsageFinal {
+        trigger:"preflight",reason:Some("close_requested"),seconds:Some(0.),error:None,finalization_error:None,
+    }).unwrap();
+    store.phone_mark_uncertain(&id).unwrap();
+    store.phone_request_stop("owner", &id).unwrap();
+    let provider = Provider {result:None,reads:AtomicUsize::new(0)};
+    assert_eq!(reconcile(&store,&provider,&Expired,&id).await.unwrap(),RecoveryOutcome::UnknownProviderId);
+    assert_eq!(store.phone_call("owner", &id).unwrap().state,CallState::Uncertain);
+}
+
+#[test]
+fn preflight_recovery_refuses_live_or_provider_bound_reservations() {
+    use augmentagent_store::phone::LiveUsagePhase;
+    for variant in ["not_stopped", "bound", "relay", "no_receipt"] {
+        let (_dir, store, id) = fixture();
+        store.phone_set_voice_backend(&id, if variant == "relay" { "conversation_relay" } else { "openai_live" }).unwrap();
+        if variant != "no_receipt" { store.phone_live_usage_start(&id, LiveUsagePhase::Preflight).unwrap(); }
+        store.phone_mark_uncertain(&id).unwrap();
+        if variant != "not_stopped" { store.phone_request_stop("owner", &id).unwrap(); }
+        if variant == "bound" { store.phone_bind_provider(&id, "CA-synthetic").unwrap(); }
+        assert!(!store.phone_recover_abandoned_preflight(&id, 61_000).unwrap(), "{variant}");
+        assert!(!store.phone_call("owner", &id).unwrap().state.terminal());
+    }
+}
+
+#[tokio::test]
+async fn maintenance_retires_an_expired_preflight_without_provider_io() {
+    use augmentagent_store::phone::LiveUsagePhase;
+    use augmentagent_phone::{PhoneConfig, PhoneService};
+    use std::sync::Arc;
+    let (_dir, store, id) = fixture();
+    store.phone_set_voice_backend(&id, "openai_live").unwrap();
+    store.phone_live_usage_start(&id, LiveUsagePhase::Preflight).unwrap();
+    let store = Arc::new(store);
+    let provider = Arc::new(Provider {result:None,reads:AtomicUsize::new(0)});
+    let config = PhoneConfig::new(true, "https://phone.example.test", "synthetic-secret-at-least-32-bytes", vec![]).unwrap();
+    let service = PhoneService::new(store.clone(), provider.clone(), Arc::new(Expired), config);
+    service.maintenance(false).await.unwrap();
+    assert_eq!(store.phone_call("owner", &id).unwrap().state, CallState::Failed);
+    assert!(store.phone_call("owner", &id).unwrap().stop_requested);
+    service.maintenance(true).await.unwrap();
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 0);
+}

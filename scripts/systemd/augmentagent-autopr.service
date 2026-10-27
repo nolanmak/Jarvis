@@ -12,6 +12,12 @@ Environment="PATH=@SERVICE_PATH@"
 Environment=RUST_LOG=info
 @EXTRA_ENV@
 Slice=augmentagent-runtime.slice
+MemoryHigh=@MEMORY_HIGH@
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=0
+TasksMax=@TASKS_MAX@
+@CPU_QUOTA@
+@DELEGATION@
 Restart=on-failure
 SuccessExitStatus=75
 RestartForceExitStatus=75

@@ -31,7 +31,7 @@ check() {
 export FAKE_MODE=new FAKE_CODE=75 FAKE_OUTPUT='storage busy: another writer'
 check 75
 grep -q 'update deferred: storage busy' "$LOG"
-! grep -q 'RUST BUILD FAILED\|low disk' "$LOG"
+if grep -q 'RUST BUILD FAILED\|low disk' "$LOG"; then cat "$LOG"; exit 1; fi
 grep -q 'disk build --update --target-dir' "$FAKE_CALLS"
 export FAKE_CODE=73 FAKE_OUTPUT='insufficient headroom'
 check 73; grep -q 'low disk space' "$LOG"

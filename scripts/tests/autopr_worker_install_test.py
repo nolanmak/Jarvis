@@ -29,7 +29,8 @@ if 'show' in sys.argv:
  'EnvironmentFiles':'/fixture/config (ignore_errors=yes)',
  'ExecStart':'{ argv[]=/fixture/bin serve --dry-run false ; }',
  'MemoryHigh':'8589934592','MemoryMax':'10737418240',
- 'TasksMax':'2048','LimitNOFILE':'4096'}.get(key,''))
+ 'TasksMax':'2048','LimitNOFILE':'4096','CPUQuotaPerSecUSec':'4s',
+ 'Delegate':'yes','DelegateSubgroup':'daemon'}.get(key,''))
 ''')
             stub.chmod(0o700)
             env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ['PATH'],
@@ -47,6 +48,11 @@ if 'show' in sys.argv:
             self.assertNotIn('BindsTo=', worker)
             self.assertIn('MemoryMax=10737418240', (units/'augmentagent-runtime.slice').read_text())
             self.assertIn('Slice=augmentagent-runtime.slice',worker)
+            self.assertIn('DelegateSubgroup=daemon',worker)
+            self.assertIn('Delegate=cpu memory pids',worker)
+            self.assertIn('MemoryMax=10737418240',worker)
+            self.assertIn('CPUQuota=400%',worker)
+            self.assertIn('CPUQuota=400%',(units/'augmentagent-runtime.slice').read_text())
             dropin = units/'augmentagent.service.d/autoship-worker.conf'
             self.assertIn('AUGMENTAGENT_AUTOPR_EXTERNAL=1',dropin.read_text())
             self.assertNotIn('ExecStart=',dropin.read_text())

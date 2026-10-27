@@ -48,19 +48,35 @@ if dry is None:
  match=re.search(r'--dry-run\s+(true|false)',show('ExecStart'))
  dry=match.group(1) if match else 'true'
 if dry not in ('true','false'):raise RuntimeError('invalid worker dry-run setting')
+high=setting('MemoryHigh','AUGMENTAGENT_UNIT_MEMORY_HIGH','8G')
+maximum=setting('MemoryMax','AUGMENTAGENT_UNIT_MEMORY_MAX','10G')
+tasks=setting('TasksMax','AUGMENTAGENT_UNIT_TASKS_MAX','2048')
+# Keep the existing aggregate CPU ceiling across both services. systemctl
+# exposes a human duration per second, e.g. 4s means 400 percent.
+quota=show('CPUQuotaPerSecUSec') or 'infinity'
+cpu=''
+if quota!='infinity':
+ import decimal
+ units={'us':decimal.Decimal('.000001'),'µs':decimal.Decimal('.000001'),'ms':decimal.Decimal('.001'),'s':decimal.Decimal(1),'min':decimal.Decimal(60),'h':decimal.Decimal(3600)}
+ parts=re.findall(r'([0-9]+(?:\.[0-9]+)?)(us|µs|ms|min|s|h)',quota)
+ if not parts or ''.join(a+b for a,b in parts)!=quota.replace(' ',''):raise RuntimeError('cannot preserve CPU quota')
+ cpu='CPUQuota='+str(sum(decimal.Decimal(a)*units[b] for a,b in parts)*100)+'%'
+delegation=''
+if show('Delegate')=='yes':
+ if show('DelegateSubgroup')!='daemon':raise RuntimeError('cannot preserve run-resource delegation')
+ delegation='Delegate=cpu memory pids\nDelegateSubgroup=daemon'
 # Path-valued directives consume a whole path, not a shell-style quoted
 # word. ExecStart and Environment use the quoted-word parser instead.
 values={'REPO_ROOT':escaped(str(repo)), 'WORKING_DIR':str(repo).replace('%','%%'),
  'LOG_DIR':str(log_dir).replace('%','%%'),
  'SERVICE_PATH':escaped(os.environ.get('PATH','/usr/bin:/bin')), 'DRY_RUN':dry,
  'EXTRA_ENV':'\n'.join(extra),
+ 'MEMORY_HIGH':high,'MEMORY_MAX':maximum,'TASKS_MAX':tasks,
+ 'DELEGATION':delegation,'CPU_QUOTA':cpu,
  'NOFILE':setting('LimitNOFILE','AUGMENTAGENT_UNIT_NOFILE','4096')}
 template=(repo/'scripts/systemd/augmentagent-autopr.service').read_text()
 template=re.sub(r'@([A-Z_]+)@',lambda match:values[match.group(1)],template)
 write(unit_dir/'augmentagent-autopr.service',template)
-high=setting('MemoryHigh','AUGMENTAGENT_UNIT_MEMORY_HIGH','8G')
-maximum=setting('MemoryMax','AUGMENTAGENT_UNIT_MEMORY_MAX','10G')
-tasks=setting('TasksMax','AUGMENTAGENT_UNIT_TASKS_MAX','2048')
 write(unit_dir/'augmentagent-runtime.slice',f'''# Managed by ensure-autopr-worker.sh
 [Unit]
 Description=AugmentAgent daemon and auto-ship shared resource budget
@@ -69,6 +85,7 @@ MemoryHigh={high}
 MemoryMax={maximum}
 MemorySwapMax=0
 TasksMax={tasks}
+{cpu}
 ''')
 write(unit_dir/'augmentagent.service.d/autoship-worker.conf','''# Managed by ensure-autopr-worker.sh
 [Unit]

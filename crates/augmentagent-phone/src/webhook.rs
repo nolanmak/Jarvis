@@ -215,7 +215,7 @@ impl PhoneService {
         // The authenticated chat request already authorizes this owner call.
         // The signed answer callback connects it; no second DTMF consent step.
         match self.store.phone_accept(id, &sid, self.clock.now_ms()) {
-            Ok(_) => Ok(self.relay_twiml(id)),
+            Ok(_) => self.connection_twiml(id),
             Err(PhoneError::AcceptanceExpired | PhoneError::Conflict) => Ok(HANGUP.into()),
             Err(error) => Err(error.into()),
         }
@@ -244,6 +244,14 @@ impl PhoneService {
             Ok(_) => {}
             Err(PhoneError::AcceptanceExpired | PhoneError::Conflict) => return Ok(HANGUP.into()),
             Err(e) => return Err(e.into()),
+        }
+        self.connection_twiml(id)
+    }
+    fn connection_twiml(&self, id: &str) -> Result<String, Error> {
+        if self.store.phone_voice_backend(id)? == "openai_live" {
+            if self.config.live.is_none() { return Err(Error::NotConfigured); }
+            let ws = self.config.public_base.replacen("https://", "wss://", 1);
+            return Ok(format!("<Response><Connect><Stream url=\"{}/phone/relay/{id}\" /></Connect><Hangup/></Response>", xml(&ws)));
         }
         Ok(self.relay_twiml(id))
     }

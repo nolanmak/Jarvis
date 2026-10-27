@@ -35,19 +35,46 @@ fn ci_repair_uses_failed_checks_only_and_bounds_work() {
     assert_eq!(failed_ci_checks(&serde_json::to_string(&many).unwrap()).len(), 5);
 }
 
+/// A real persisted structured verdict survives a draft return but never a new head.
 #[test]
 fn publication_records_precede_draft_returns_and_never_cover_post_review_edits() {
-    let src = include_str!("self_improve.rs");
-    let fresh = &src[src.find("pub async fn run_once(").unwrap()..];
-    let published = &fresh[fresh.find("let pr_url = stdout.trim()").unwrap()..];
-    let record = published.find("opened_prs::record(").unwrap();
-    assert!(record < published.find("if let Some(reason) = &park").unwrap());
-    assert!(record < published.find("if !automerge").unwrap());
-    assert!(published[..record].contains("qa_ok && park.is_none() && !repaired_after_review"));
-    assert!(published[record..record+130].contains("published_head"));
-    let resume = &src[src.find("async fn resume_draft_pr(").unwrap()..src.find("async fn reclaim_worktree(").unwrap()];
-    assert!(resume.find("opened_prs::record(").unwrap() < resume.find("if checks_green(").unwrap());
-    assert!(resume.contains("\"--match-head-commit\", reviewed_head"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opened.json");
+    let review = synthetic_aligned_review("reviewed-head", true);
+    record_opened_pr(&path, 1, 42, "reviewed-head", review.recorded_verdict());
+    let recovered = opened_pr_for(&path, 1).unwrap();
+    assert!(recorded_approval(Some(&recovered), 42, Some("reviewed-head")).reviewed);
+    assert!(!recorded_approval(Some(&recovered), 42, Some("post-review-edit")).reviewed);
+    record_opened_pr(&path, 1, 42, "post-review-edit", review.recorded_verdict());
+    let relabeled = opened_pr_for(&path, 1).unwrap();
+    assert!(!recorded_approval(Some(&relabeled), 42, Some("post-review-edit")).reviewed,
+        "relabeling the outer record cannot move the evidence to new code");
+}
+
+pub(super) fn synthetic_aligned_review(head: &str, dismiss: bool) -> IndependentReview {
+    use crate::autoship_review::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    let binding = ReviewBinding { head: head.into(), base: "base".into(), environment_id: "test".into(),
+        contract_hash: "contract".into(), evidence_hash: "evidence".into() };
+    let actor = |provider: &str, session: &str| Actor { provider: provider.into(), backend: "native".into(),
+        model: "synthetic".into(), session_id: session.into() };
+    let finding = Finding { id: "F1".into(), criterion_id: "C1".into(), evidence_hash: "proof".into(),
+        claim: "contradictory doc requirement".into(), requested_change: "align requirement".into(),
+        conflicts_with: BTreeSet::new(), repair_target: Some(crate::autoship_review::RepairTarget::Candidate { paths: BTreeSet::from(["source.rs".into()]) }), repair_rounds: 2 };
+    let passes = [ReviewRole::Qa, ReviewRole::Diff, ReviewRole::System].into_iter().enumerate().map(|(i, role)| ReviewPass {
+            additional_sessions: vec![],
+        binding: binding.clone(), actor: actor("codex", &format!("review-{i}")), role, completed: true,
+        coverage: CoverageReceipt { binding: binding.clone(), required_paths: BTreeSet::from(["a.rs".into()]),
+            supplied_files: BTreeMap::from([("a.rs".into(), "source-hash".into())]), prompt_hash: format!("prompt-{i}") },
+        findings: if role == ReviewRole::Qa { vec![finding.clone()] } else { vec![] },
+    }).collect();
+    let adjudication = dismiss.then(|| AdjudicationReceipt { components:vec![], finding_graph_hash:None, binding: binding.clone(), actor: actor("codex", "adjudicator"),
+        finding_fingerprints: BTreeMap::from([("F1".into(), finding.fingerprint().unwrap())]),
+        rulings: BTreeMap::from([("F1".into(), Ruling::Dismiss { evidence: "proof".into(), rationale: "contract resolves contradiction".into() })]),
+        prompt_hash: "adjudication-prompt".into(), response_hash: "adjudication-response".into() });
+    IndependentReview { provider: Some(augmentagent_channel_core::ProviderKind::Codex), model: Some("synthetic".into()),
+        available: true, diff_ok: true, system_ok: true, notes: String::new(), why_unavailable: None,
+        structured: Some(ReviewEvidence { supplemental_source_hashes: Default::default(), origin: Default::default(), binding, builders: vec![actor("claude", "builder")], passes, adjudication }) }
 }
 
 #[test]
@@ -185,7 +212,7 @@ fn a_combined_lane_day_spends_slots_on_both_drafts_and_new_issues() {
 
     // ...and a slot reserved for a build with nothing to build resumes,
     // rather than idling the tick away.
-    let owing = FairSched { resume_cursor: 0, resumes_since_build: PER_BUILD };
+    let owing = FairSched { resume_cursor: 0, resumes_since_build: PER_BUILD, ..FairSched::default() };
     let draft = resumable_from(&prs, &AttemptLedger::default(), 5, &gave_up, None, None, 0);
     let (prefer_build, slot) = select(&owing, draft, None);
     assert!(prefer_build);
@@ -207,7 +234,7 @@ fn resumed_reviews_recover_latest_findings_without_minting_approval() {
 async fn approved_ready_pr_survives_pending_checks_failed_merge_and_head_change() {
     const CHILD: &str = "AUTOSHIP_PROGRESS_FIXTURE";
     if std::env::var_os(CHILD).is_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("autoship-sweep-test-").tempdir_in("/tmp").unwrap();
         let root = dir.path();
         let gh = root.join("gh.py");
         std::fs::write(&gh, r#"#!/usr/bin/env python3
@@ -219,10 +246,24 @@ s=json.loads((root/'scenario').read_text())
 if a[:2]==['pr','list']:
     assert 'is:draft' not in a
     print(json.dumps([dict(number=20,headRefName='agent-fix/issue-10',headRefOid=s['head'],isDraft=s['draft'],isCrossRepository=False,mergeable='MERGEABLE',body='Automated self-improvement for #10.\n- complexity (scoping pass): medium')]))
+elif a[:2]==['repo','view']: print('fixture-owner/project')
+elif a[:2]==['pr','view']:
+    if '--jq' in a or '-q' in a: print(s['head'])
+    else: print(json.dumps(dict(id='PR_fixture20',number=20,baseRefName='main',state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
 elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition',author=dict(login='fixture-owner'))))
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
     print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
+elif a[:2]==['api','graphql']:
+    fields=dict(value.split('=',1) for i,value in enumerate(a) if i>0 and a[i-1]=='-f')
+    assert fields['head']==s['head']
+    if s['fail_merge']: sys.exit(1)
+    (root/'merged').write_text(s['head'])
+    print(json.dumps(dict(data=dict(mergePullRequest=dict(clientMutationId=fields['request'],pullRequest=dict(id='PR_fixture20',number=20,state='MERGED',headRefOid=s['head'],mergeCommit=dict(oid='e'*40),mergedBy=dict(login='fixture-owner')))))))
+elif a[0]=='api' and '/rules/branches/main' in a[1]: print(json.dumps([dict(type='required_status_checks',ruleset_id=1,parameters=dict(strict_required_status_checks_policy=True,required_status_checks=[dict(context='rust')]))]))
+elif a[0]=='api' and '/rulesets/1' in a[1]: print(json.dumps(dict(enforcement='active',bypass_actors=[])))
+elif a[0]=='api' and '/git/ref/heads/main' in a[1]: print(s['base'])
+elif a[0]=='api' and '/issues/' in a[1]: print(json.dumps(dict(state='open')))
 elif a[0]=='api': print('[]')
 elif a[:2]==['pr','edit']: time.sleep(30)
 elif a[:2]==['pr','ready']:
@@ -234,8 +275,15 @@ elif a[:2]==['pr','merge']:
 else: raise Exception('unexpected call '+repr(a))
 "#).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(root.join("home")).unwrap();
+        std::fs::create_dir(root.join("cache")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "self_improve::progress_tests::approved_ready_pr_survives_pending_checks_failed_merge_and_head_change", "--nocapture"])
+            .env("HOME", root.join("home"))
+            .env("CARGO_TARGET_DIR", root.join("cache/builder"))
+            .env("AUGMENTAGENT_GATE_TARGET_DIR", root.join("cache/gate"))
+            .env("AUGMENTAGENT_GATE_MIN_FREE_GB", "0").env("AUGMENTAGENT_BUILD_GROWTH_GB", "0")
+            .env_remove("AUGMENTAGENT_PRUNE_TARGET_DIRS")
             .env(CHILD, root).env("GH_BIN", gh)
             .env("AUGMENTAGENT_GH_OWNER", "fixture-owner")
             .env("AUGMENTAGENT_AUTOPR_AUTOMERGE", "1")
@@ -247,42 +295,102 @@ else: raise Exception('unexpected call '+repr(a))
         assert!(root.join("merged").exists(), "child scenario must actually execute");
         return;
     }
-    let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
-    for args in [vec!["init", "-q"], vec!["remote", "add", "origin", "https://example.invalid/fixture-owner/project.git"]] {
+    let fixture_root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+    let root = fixture_root.join("repo");
+    let initial_control = fixture_root.join("initial-control");
+    std::fs::create_dir(&root).unwrap(); std::fs::create_dir(&initial_control).unwrap();
+    let (modern, _) = review_canary::shipping_fixture(&root, &initial_control, 10).await.unwrap();
+    let mut prepared = acceptance::historical_fixture(&root,&modern).unwrap();
+    let head = run("git", &["rev-parse", "HEAD"], &root).await.unwrap().1.trim().to_owned();
+    let base = prepared.baseline.registration.baseline_head().to_owned();
+    let remote = fixture_root.join("remote.git");
+    for args in [vec!["branch".into(), "-m".into(), "agent-fix/issue-10".into()],
+        vec!["clone".into(), "--bare".into(), root.to_string_lossy().into_owned(), remote.to_string_lossy().into_owned()],
+        vec!["remote".into(), "add".into(), "origin".into(), remote.to_string_lossy().into_owned()]] {
         assert!(std::process::Command::new("git").args(args).current_dir(&root).status().unwrap().success());
     }
-    let head = "a".repeat(40);
     let scenario = |checks: &str, draft: bool, fail_merge: bool, sha: &str| {
-        std::fs::write(root.join("scenario"), serde_json::to_vec(&serde_json::json!({
-            "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha
+        std::fs::write(fixture_root.join("scenario"), serde_json::to_vec(&serde_json::json!({
+            "checks":checks,"draft":draft,"fail_merge":fail_merge,"head":sha,"base":base
         })).unwrap()).unwrap();
     };
-    let verdict = || Some(RecordedVerdict {provider:"codex".into(),backend:"native".into(),model:"synthetic".into(),diff_ok:true,system_ok:true});
+    let verdict = |prepared: &acceptance::PreparedAcceptance| {
+        let mut review = synthetic_aligned_review(&head,true);
+        let evidence = review.structured.as_mut().unwrap();
+        evidence.binding.base = base.clone();
+        evidence.binding.contract_hash = prepared.baseline.registration.contract_hash().into();
+        for pass in &mut evidence.passes {
+            pass.binding = evidence.binding.clone();
+            pass.coverage.binding = evidence.binding.clone();
+        }
+        evidence.adjudication.as_mut().unwrap().binding = evidence.binding.clone();
+        assert!(review.approved(), "fixture approval must validate before sweep");
+        review.recorded_verdict()
+    };
+    let mut workflow = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root:&root, worktree:&root, repository:"fixture-owner/project", source_issue:Some(10),pr:Some(20),
+        branch:"agent-fix/issue-10",contract:"synthetic arithmetic",environment:"fixture-bootstrap",
+    }).await.unwrap().unwrap();
+    let directories = acceptance::control_directories("fixture-owner/project",workflow.id()).unwrap();
+    std::fs::create_dir_all(&directories.workflow_acceptance).unwrap();
+    acceptance::persist_fixture_registration(&directories.workflow_acceptance,&prepared).unwrap();
+    let mut receipt = acceptance::persist_historical_fixture_receipt(&root,&prepared,&directories.workflow_acceptance).await.unwrap();
+    receipt.alignment = Some(alignment::persist_shipping_fixture(&root,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());
+    assert!(format!("{:#}",acceptance::assert_receipt_current(&root,&prepared,&receipt).await.unwrap_err()).contains("legacy in-process"));
+    workflow.bind_acceptance(&prepared).unwrap();
+    workflow.checkpoint(crate::autoship_workflow::Stage::Verify,"acceptance_passed","review_verified_candidate",0,&[serde_json::to_string(&receipt).unwrap()]).await.unwrap();
+    workflow.record_review("scripted-independent-fixture",true,&serde_json::to_string(&verdict(&prepared).unwrap()).unwrap()).unwrap();
+    workflow.finish().unwrap();
     // Opening a rejected draft records ownership, but never authorizes merge.
     record_opened_pr(&opened_prs_path(), 10, 20, &head, None);
     scenario("SUCCESS", true, false, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
-    // A resumed LGTM survives a delayed check and a subsequent merge failure.
-    record_opened_pr(&opened_prs_path(), 10, 20, &head, verdict());
+    // Even an exact-head historical approval cannot authorize legacy proof.
+    record_opened_pr(&opened_prs_path(),10,20,&head,verdict(&prepared));
+    scenario("SUCCESS",false,false,&head);
+    assert_eq!(merge_sweep(&root,false).await,0);
+    assert!(workflow::requires_reverification("fixture-owner/project",20).unwrap());
+    assert!(!fixture_root.join("merged").exists());
+    let candidate = workflow::prepare_resume_worktree(&root,20,"agent-fix/issue-10").await.unwrap();
+    let mut workflow = workflow::WorkflowGuard::acquire(workflow::Start {
+        repo_root:&root,worktree:&candidate,repository:"fixture-owner/project",source_issue:Some(10),pr:Some(20),branch:"agent-fix/issue-10",contract:"synthetic migration",environment:"fixture-bootstrap",
+    }).await.unwrap().unwrap();
+    workflow.transition(crate::autoship_workflow::Stage::Scope,"legacy_verifier_proof_invalidated","migrate_behavioral_oracle",0).await.unwrap();
+    prepared=acceptance::migrate_historical_fixture(&candidate,&directories.workflow_acceptance,&prepared,modern.proposal.clone()).await.unwrap();
+    assert_eq!(prepared.proposal.contract.revision,2);
+    let mut receipt=acceptance::verify_and_persist_candidate(&candidate,&prepared,&directories.workflow_acceptance,&acceptance::worker_roots(&candidate), &test_resource_audit(&directories.workflow_acceptance)).await.unwrap();
+    receipt.alignment=Some(alignment::persist_shipping_fixture(&candidate,&prepared,&directories.workflow_acceptance,&directories.repository_policy).await.unwrap());
+    acceptance::assert_receipt_current(&candidate,&prepared,&receipt).await.unwrap();
+    workflow.bind_acceptance(&prepared).unwrap();
+    workflow.checkpoint(crate::autoship_workflow::Stage::Verify,"migration_verified","review_verified_candidate",0,&[serde_json::to_string(&receipt).unwrap()]).await.unwrap();
+    workflow.record_review("scripted-independent-migrated-fixture",true,&serde_json::to_string(&verdict(&prepared).unwrap()).unwrap()).unwrap();
+    workflow.finish().unwrap();
+    // A newly verified LGTM survives delayed checks and subsequent merge failure.
+    record_opened_pr(&opened_prs_path(), 10, 20, &head, verdict(&prepared));
     scenario("PENDING", false, false, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, true, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", true, true, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
-    let calls = std::fs::read_to_string(root.join("calls")).unwrap();
+    let calls = std::fs::read_to_string(fixture_root.join("calls")).unwrap();
     assert!(calls.lines().any(|line| line.contains("--undo")), "failed draft merge restores draft state");
     assert_eq!(ready_for_merge(&root, 20, None).await, None);
     scenario("SUCCESS", false, false, &"b".repeat(40));
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, false, &head);
+    let mut advanced: serde_json::Value = serde_json::from_slice(&std::fs::read(fixture_root.join("scenario")).unwrap()).unwrap();
+    advanced["base"] = serde_json::json!("d".repeat(40));
+    std::fs::write(fixture_root.join("scenario"),serde_json::to_vec(&advanced).unwrap()).unwrap();
+    assert_eq!(merge_sweep(&root, false).await, 0, "approval cannot cover advanced remote main");
+    scenario("SUCCESS", false, false, &head);
     assert_eq!(merge_sweep(&root, true).await, 0);
-    assert!(!root.join("merged").exists());
+    assert!(!fixture_root.join("merged").exists());
     let started = std::time::Instant::now();
     assert!(!write_optional_pr_note(&root, "20", "Optional reviewer observation").await);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(merge_sweep(&root, false).await, 1);
-    assert_eq!(std::fs::read_to_string(root.join("merged")).unwrap(), head);
+    assert_eq!(std::fs::read_to_string(fixture_root.join("merged")).unwrap(), head);
 }
 
 #[test]

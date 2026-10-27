@@ -23,12 +23,12 @@ jobs:
       # instead of skipping them (local runs still skip).
       REQUIRE_ENFORCEABLE_SANDBOX: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install renderer, syscall-filter library and ripgrep
         run: |
           sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-            poppler-utils libseccomp2 ripgrep python3-packaging
+            poppler-utils libseccomp2 ripgrep python3-packaging openssl
       - name: Report sandbox capabilities
         run: python3 scripts/tests/host_capabilities.py
       - name: Require the enforcement and compute suites
@@ -48,5 +48,16 @@ jobs:
           JARVIS_TEST_VM_CONFIG: ""
           JARVIS_TEST_LIVE_DISCOVERY: ""
         run: python3 -m unittest discover -s tests -p '*_test.py' -v
+      - name: Test native provider gateway and launcher contracts
+        # Real VM and authenticated provider acceptance run on the provisioned host.
+        run: |
+          python3 scripts/test-native-provider-gateway.py
+          python3 scripts/test-native-provider-vm.py
+          python3 scripts/test-native-provider-io.py
+          python3 scripts/test-native-provider-codex-auth-probe.py
+          python3 scripts/test-native-provider-claude-auth-probe.py
+          python3 scripts/test-autoship-native-acceptance-probe.py
+          python3 scripts/test-native-probe-routing.py
+          python3 scripts/test-provision-native-vm.py
       - name: Test the PR verification gate's bridge-suite receipt rule
         run: bash scripts/tests/agent-pr-verify-gate.test.sh

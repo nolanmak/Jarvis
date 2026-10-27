@@ -1,3 +1,6 @@
+#[path = "loop_memory.rs"]
+mod loop_memory;
+pub use loop_memory::{LoopFinding, LoopOccurrence};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,7 +14,7 @@ use crate::surface::{SurfaceConversationRef, SurfaceTurnRef};
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, EmailRetryFailure, FriendWatch, GmailRateRefusal, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SocialapiAccount,
     SocialapiWebhookEvent, SubscriptionMode, TelegramBot,
@@ -1221,6 +1224,60 @@ impl Store {
                 [],
             )?;
         }
+        // #472: NULL means legacy guard evidence must be fetched again.
+        if !column_exists(conn, "emails", "retryGuardContext")? {
+            conn.execute("ALTER TABLE emails ADD COLUMN retryGuardContext TEXT", [])?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS email_guard_observations (
+            id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT NOT NULL,
+            attempt_n INTEGER NOT NULL, guard TEXT NOT NULL, disposition TEXT NOT NULL,
+            observed_at_ms INTEGER NOT NULL,
+            UNIQUE(message_id,action_id,attempt_n,guard));
+            CREATE INDEX IF NOT EXISTS idx_email_guard_time ON email_guard_observations(observed_at_ms);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS email_retry_failures (
+            id INTEGER PRIMARY KEY, action_id TEXT NOT NULL, message_id TEXT NOT NULL,
+            attempt_n INTEGER NOT NULL, failure_class TEXT NOT NULL, guard TEXT NOT NULL,
+            detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_email_retry_failures_time ON email_retry_failures(observed_at_ms);")?;
+        conn.execute_batch("SAVEPOINT triage_calibration_migration; DROP TRIGGER IF EXISTS capture_triage_action_cohort;")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_inputs (
+            id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, prompt TEXT NOT NULL,
+            base TEXT NOT NULL, model TEXT NOT NULL, decision TEXT NOT NULL,
+            replayable INTEGER NOT NULL, observed_at_ms INTEGER NOT NULL);")?;
+        // Snapshot newly created triage cohorts atomically with the action.
+        // Existing mutable status/email labels cannot reconstruct old decisions.
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_action_cohorts (
+            action_id TEXT PRIMARY KEY, cohort TEXT NOT NULL CHECK(cohort IN ('flagged','pending')),
+            observed_at_ms INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS capture_triage_action_cohort AFTER INSERT ON actions
+            WHEN NEW.status IN ('flagged','pending')
+            BEGIN INSERT OR IGNORE INTO triage_action_cohorts(action_id,cohort,observed_at_ms) VALUES(NEW.id,NEW.status,NEW.createdAt); END;")?;
+        if !column_exists(conn, "triage_action_cohorts", "input_id")? {
+            conn.execute("ALTER TABLE triage_action_cohorts ADD COLUMN input_id INTEGER", [])?;
+        }
+        // Input identity is attached by the exact async request scope, never
+        // by a mutable latest-message lookup. Unknown history stays unknown.
+        conn.execute_batch("DROP TRIGGER IF EXISTS capture_triage_action_cohort_with_input;")?;
+        if !column_exists(conn, "triage_calibration_inputs", "evidence")? {
+            conn.execute("ALTER TABLE triage_calibration_inputs ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}'",[])?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_versions (
+            version TEXT PRIMARY KEY, base TEXT NOT NULL, model TEXT NOT NULL,
+            supplement TEXT NOT NULL, receipt TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_active (singleton INTEGER PRIMARY KEY CHECK(singleton=1),version TEXT NOT NULL,disabled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS triage_calibration_rollbacks (id INTEGER PRIMARY KEY,version TEXT NOT NULL,receipt TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_calls (request_hash TEXT PRIMARY KEY,response TEXT NOT NULL,session TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS triage_calibration_versions_immutable BEFORE UPDATE ON triage_calibration_versions BEGIN SELECT RAISE(ABORT,'immutable calibration version'); END;
+            CREATE TRIGGER IF NOT EXISTS triage_calibration_versions_retained BEFORE DELETE ON triage_calibration_versions BEGIN SELECT RAISE(ABORT,'retained calibration version'); END;")?;
+        if !column_exists(conn, "triage_calibration_versions", "serving_model")? { conn.execute("ALTER TABLE triage_calibration_versions ADD COLUMN serving_model TEXT NOT NULL DEFAULT ''",[])?; }
+        if !column_exists(conn, "triage_calibration_calls", "observed_model")? { conn.execute("ALTER TABLE triage_calibration_calls ADD COLUMN observed_model TEXT NOT NULL DEFAULT ''",[])?; }
+        for column in ["audit_workflow","audit_path","proof_hash"] { if !column_exists(conn,"triage_calibration_calls",column)? {conn.execute(&format!("ALTER TABLE triage_calibration_calls ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),[])?;} }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_call_history(body TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_control(singleton INTEGER PRIMARY KEY CHECK(singleton=1),enabled INTEGER NOT NULL,revision INTEGER NOT NULL);
+            INSERT OR IGNORE INTO triage_calibration_control VALUES(1,1,0);
+            CREATE TABLE IF NOT EXISTS triage_calibration_experiments(id TEXT PRIMARY KEY,base TEXT NOT NULL,model TEXT NOT NULL,revision INTEGER NOT NULL,source TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS triage_calibration_one_pending ON triage_calibration_experiments(base,model,revision) WHERE state='pending';
+            RELEASE triage_calibration_migration;")?;
         // Issue #27: per-channel subscription registry (platform-agnostic).
         // Rows control which Discord/Slack/etc channels the poller watches and
         // which mode (priority / digest / store_only) they route through.
@@ -1531,6 +1588,7 @@ impl Store {
                 ON user_loops(owner, status)",
             [],
         )?;
+        loop_memory::migrate(conn)?;
         // Auto-stop deadline (#104 follow-up). Nullable; pre-existing rows
         // migrate cleanly with `None` (run forever until manually stopped).
         if !column_exists(conn, "user_loops", "expires_at_ms")? {
@@ -2665,6 +2723,8 @@ impl Store {
         // the persisted copy is masked.
         let body_masked = redact::mask(&email.body);
         let body_param: &str = &body_masked;
+        let context = serde_json::to_string(&(email.to.clone(), email.cc.clone(), email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
         if existed.is_some() {
             guard.execute(
                 "UPDATE emails SET threadId = ?2, fromEmail = ?3, subject = ?4, body = ?5, receivedAt = ?6 WHERE messageId = ?1",
@@ -2677,6 +2737,7 @@ impl Store {
                     email.date,
                 ],
             )?;
+            guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
             Ok(false)
         } else {
             let now = now_millis();
@@ -2696,8 +2757,49 @@ impl Store {
                     email.kind,
                 ],
             )?;
+            guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
             Ok(true)
         }
+    }
+
+    /// Complete persisted recipient/attachment evidence, or None for legacy rows.
+    pub fn email_retry_guard_context(&self, message_id: &str) -> StoreResult<Option<(String, String, Vec<String>)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let raw: Option<String> = guard.query_row("SELECT retryGuardContext FROM emails WHERE messageId = ?1",
+            params![message_id], |r| r.get(0)).optional()?.flatten();
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|e| StoreError::InvalidInput(e.to_string()))).transpose()
+    }
+
+    pub fn record_email_retry_failure(&self, failure: &EmailRetryFailure) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute("INSERT INTO email_retry_failures(action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![failure.action_id, failure.message_id, failure.attempt_n, redact::mask(&failure.failure_class), failure.guard, redact::mask(&failure.detail), failure.observed_at_ms])?;
+        Ok(())
+    }
+
+    /// Persist the first failure and the retry context together. Retried actions
+    /// are recorded by the retry controller, which also owns escalation.
+    pub fn record_initial_email_failure(&self, failure: &EmailRetryFailure) -> StoreResult<()> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let changed = tx.execute("UPDATE actions SET status='error',errorMessage=?3,updatedAt=?4 WHERE id=?1 AND messageId=?2",
+            params![failure.action_id,failure.message_id,redact::mask(&failure.detail),failure.observed_at_ms])?;
+        if changed > 0 {
+            tx.execute("INSERT INTO email_retry_failures(action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms) SELECT ?1,?2,1,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM actions WHERE id=?1 AND COALESCE(retryCount,0)=0) AND NOT EXISTS(SELECT 1 FROM email_retry_failures WHERE action_id=?1 AND attempt_n=1)",
+                params![failure.action_id,failure.message_id,redact::mask(&failure.failure_class),failure.guard,redact::mask(&failure.detail),failure.observed_at_ms])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Digest seam: durable retry failures, newest first, with an explicit limit.
+    pub fn email_retry_failures_since(&self, since_ms: i64, limit: usize) -> StoreResult<Vec<EmailRetryFailure>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare("SELECT action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms FROM email_retry_failures WHERE observed_at_ms >= ?1 ORDER BY observed_at_ms DESC,id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![since_ms, limit as i64], |r| Ok(EmailRetryFailure {
+            action_id:r.get(0)?, message_id:r.get(1)?, attempt_n:r.get(2)?, failure_class:r.get(3)?, guard:r.get(4)?, detail:r.get(5)?, observed_at_ms:r.get(6)?
+        }))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// [`upsert_email`] variant for historical imports (#886): a *new* row's
@@ -2981,6 +3083,13 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// A retry may re-enter for its own action, never bypass a sibling action.
+    pub fn has_other_open_action(&self, message_id: &str, action_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row("SELECT EXISTS(SELECT 1 FROM actions WHERE messageId = ?1 AND id != ?2 AND status IN ('pending','error','scheduled','sending'))",
+            params![message_id, action_id], |r| r.get(0))?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn log_action(
         &self,
@@ -3035,6 +3144,7 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
         // #165: mask free-form bodies before persisting. Borrowed when no
         // secrets matched (zero-alloc fast path), owned otherwise.
         let original_body_masked = original_body.map(redact::mask);
@@ -3046,7 +3156,7 @@ impl Store {
         // populate them as 'classic' / NULL / NULL so the classic path stays
         // byte-identical post-migration. Code-mode callers use the dedicated
         // `log_action_code_mode` helper.
-        guard.execute(
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, toEmails, ccEmails, bccEmails) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, ?11, ?12, ?13)",
             params![
@@ -3065,6 +3175,8 @@ impl Store {
                 nz(bcc),
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3103,6 +3215,7 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
         // #165: mask free-form bodies + the code-mode tool-call trace
         // before persisting. `generated_source` is the LLM-emitted TS
         // program and is also caller-supplied free-form text, so it goes
@@ -3116,7 +3229,7 @@ impl Store {
         let trace_json_masked = redact::mask(trace_json);
         let generated_source_param: &str = &generated_source_masked;
         let trace_json_param: &str = &trace_json_masked;
-        guard.execute(
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, mode, generatedSource, toolCallTrace) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, 'code', ?11, ?12)",
             params![
@@ -3134,6 +3247,8 @@ impl Store {
                 trace_json_param,
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3179,7 +3294,8 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
+        let tx = guard.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'flagged', ?7, ?8, ?8, 0, NULL)",
             params![
@@ -3193,6 +3309,8 @@ impl Store {
                 now,
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -6672,7 +6790,8 @@ impl Store {
             "SELECT id, channel, channel_ref FROM user_loops \
               WHERE status = 'active' \
                 AND expires_at_ms IS NOT NULL \
-                AND expires_at_ms <= ?1",
+                AND expires_at_ms <= ?1 \
+                AND NOT EXISTS (SELECT 1 FROM loop_occurrences o WHERE o.loop_id=user_loops.id AND o.answer IS NOT NULL AND o.state IN ('answered','post_failed'))",
         )?;
         let rows = stmt.query_map(params![now_ms], |r| {
             Ok((
@@ -6693,7 +6812,8 @@ impl Store {
                         updated_at_ms = ?1 \
                   WHERE status = 'active' \
                     AND expires_at_ms IS NOT NULL \
-                    AND expires_at_ms <= ?1",
+                    AND expires_at_ms <= ?1 \
+                AND NOT EXISTS (SELECT 1 FROM loop_occurrences o WHERE o.loop_id=user_loops.id AND o.answer IS NOT NULL AND o.state IN ('answered','post_failed'))",
                 params![now_ms],
             )?;
         }
