@@ -148,3 +148,16 @@ fn delegation_inside_a_complete_fragment_preserves_the_fragment_once() {
     assert!(context.request(190.).unwrap().is_none());
     assert!(context.request(205.).unwrap().is_none());
 }
+
+#[test]
+fn delegation_clock_cannot_consume_speech_that_has_not_arrived() {
+    let mut context = LiveContext::default();
+    context.push(&fragment("first",true,"Check inbox.",0.,100.)).unwrap();
+    assert!(context.request(1000.).unwrap().is_some());
+    context.push(&fragment("later",true,"Now check calendar.",200.,300.)).unwrap();
+    let next = context.request(1100.).unwrap().expect("later received speech is still new");
+    let rows: serde_json::Value = serde_json::from_str(next.split_once('\n').unwrap().1).unwrap();
+    let new: Vec<_> = rows.as_array().unwrap().iter().filter(|r|r["new_request"]==true).collect();
+    assert_eq!(new.len(),1);
+    assert_eq!(new[0]["text"],"Now check calendar.");
+}

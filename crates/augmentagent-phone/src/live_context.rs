@@ -116,12 +116,14 @@ impl LiveContext {
         self.last_offset = offset_ms;
         // A delegation offset is a timing hint, not a cut inside a transcript
         // delta. Include a crossing fragment whole and consume it only once.
+        // Never consume up to the delegation clock: later-arriving speech can
+        // precede that timestamp and must remain eligible for the next request.
         self.consumed = self
             .fragments
             .iter()
             .filter(|f| f.user && f.start <= offset_ms)
             .map(|f| f.end)
-            .fold(self.consumed.max(offset_ms), f64::max);
+            .fold(self.consumed, f64::max);
         if self.dropped_user_end > since {
             return Ok(None);
         }
