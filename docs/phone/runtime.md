@@ -963,3 +963,22 @@ cleared marks are not played audio. The existing `scripts/phone-live-receipt.py`
 validator belongs to the separate ConversationRelay retirement gate (#1496).
 It does not validate this GPT-Live gate, and a passing legacy receipt must not
 be used to claim GPT-Live qualification.
+
+### Live task handoff (#1620)
+
+Live transcript deltas are fragments, often individual words. The handoff keeps
+up to 512 fragments / 64 KB and joins adjacent same-role fragments into the
+12 KB native task envelope. A delegation timestamp does not cut a complete
+fragment in half. Already-consumed speech is context, never a second task.
+When metadata arrives before the transcript, the audio loop waits up to two
+seconds for missing text and allows 250 ms of transcript settling before dispatch.
+Absent or genuinely lost context starts no task.
+
+Completed native results no longer require a second model call to become spoken.
+Results up to 64 KB are returned as ordered commentary pieces, each at most
+500 UTF-8 bytes, preferring sentence/whitespace boundaries. Each piece waits for
+its matching provider acceptance before advancing; only the final acceptance
+marks the voice result delivered. Provider acceptance is not proof of playback.
+The original chat result is unchanged. Oversized results receive an explicit
+voice-limit notice; they are never silently truncated. Legacy summary-job tables
+remain readable for rollback compatibility but the Live summary worker is retired.

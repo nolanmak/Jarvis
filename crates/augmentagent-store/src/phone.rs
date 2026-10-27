@@ -2013,11 +2013,13 @@ impl Store {
             if !live_binding(tx, call_id, session_id)? {
                 return Ok(Vec::new());
             }
-            let mut statement = tx.prepare("SELECT delegation_id,result FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 AND result IS NOT NULL AND length(CAST(result AS BLOB))<=500 ORDER BY rowid LIMIT 128")?;
+            let mut statement = tx.prepare("SELECT delegation_id,CASE WHEN length(CAST(result AS BLOB))>64000 THEN 'The task returned more detail than this voice session can carry. The full result is in our chat; ask for a specific part to discuss.' ELSE result END FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 AND result IS NOT NULL ORDER BY rowid LIMIT 128")?;
             let rows = statement.query_map([call_id], |r| {
+                let mut result: String = r.get(1)?;
+                if result.trim().is_empty() { result = "The task returned no readable result.".into(); }
                 Ok(PhoneLiveResult {
                     delegation_id: r.get(0)?,
-                    result: r.get(1)?,
+                    result,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
