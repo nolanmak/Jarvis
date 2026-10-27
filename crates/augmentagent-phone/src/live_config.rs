@@ -25,6 +25,7 @@ impl VoiceBackend {
 // Intentionally no Debug/Serialize: credential material stays private.
 pub struct LiveConfig {
     api_key: String,
+    voice: crate::live_voice::LiveVoice,
     #[cfg(test)]
     endpoint: Option<String>,
 }
@@ -40,6 +41,7 @@ impl LiveConfig {
         }
         Ok(Self {
             api_key,
+            voice: crate::live_voice::LiveVoice::default(),
             #[cfg(test)]
             endpoint: None,
         })
@@ -50,19 +52,35 @@ impl LiveConfig {
         config.endpoint = Some(endpoint);
         config
     }
+    pub fn with_voice(mut self, voice: crate::live_voice::LiveVoice) -> Self {
+        self.voice = voice;
+        self
+    }
+    pub fn voice_label(&self) -> &str {
+        self.voice.label()
+    }
     pub async fn connect_for_call(&self, instructions: &str) -> Result<LiveConnection, LiveError> {
-        #[cfg(test)]
-        if let Some(endpoint) = &self.endpoint {
-            return LiveConnection::connect_call_test(endpoint, &self.api_key, instructions).await;
-        }
-        LiveConnection::connect_for_call(&self.api_key, instructions).await
+        self.connect_mode(instructions, true).await
     }
     pub async fn connect(&self, instructions: &str) -> Result<LiveConnection, LiveError> {
+        self.connect_mode(instructions, false).await
+    }
+    async fn connect_mode(
+        &self,
+        instructions: &str,
+        greet: bool,
+    ) -> Result<LiveConnection, LiveError> {
+        let endpoint = crate::live_session::ENDPOINT;
         #[cfg(test)]
-        if let Some(endpoint) = &self.endpoint {
-            return LiveConnection::connect_test(endpoint, &self.api_key, instructions).await;
-        }
-        LiveConnection::connect(&self.api_key, instructions).await
+        let endpoint = self.endpoint.as_deref().unwrap_or(endpoint);
+        LiveConnection::connect_to_mode(
+            endpoint,
+            &self.api_key,
+            instructions,
+            greet,
+            self.voice.clone(),
+        )
+        .await
     }
 }
 

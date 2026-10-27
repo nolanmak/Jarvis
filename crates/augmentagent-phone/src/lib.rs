@@ -851,6 +851,7 @@ pub mod live_context;
 pub mod live_call;
 
 pub mod live_config;
+pub mod live_voice;
 
 mod live_media;
 

@@ -101,7 +101,7 @@ impl PhoneRuntime {
             running: self.is_running(),
             transport: self.service.voice_backend().as_str(),
             audio_model: live.then_some(crate::live_session::MODEL),
-            voice: if live { crate::live_session::VOICE.into() } else { self.service.config.voice.tts_voice().into() },
+            voice: if let Some(config) = &self.service.config.live { config.voice_label().into() } else { self.service.config.voice.tts_voice().into() },
             provider_readiness: if live { "requires_per_call_preflight" } else { "not_probed" },
         }
     }

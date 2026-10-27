@@ -510,3 +510,24 @@ fn live_credential_is_validated_without_exposing_its_value() {
         assert!(!error.to_string().contains("private"));
     }
 }
+
+#[test]
+fn live_voice_settings_validate_before_runtime_construction() {
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_VOICE_BACKEND", "openai_live".into());
+    env.insert("OPENAI_API_KEY", "synthetic-key".into());
+    for voice in ["gleam", "willow", "quartz", "delta"] {
+        env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", voice.into());
+        assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_ok());
+    }
+    for voice in ["", "wrong", "voice_"] {
+        env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", voice.into());
+        assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_err());
+    }
+    env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", "voice_synthetic".into());
+    assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_err());
+    env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE_DESCRIPTION", "Warm adult feminine voice.".into());
+    assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_ok());
+    env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", "gleam".into());
+    assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_err());
+}
