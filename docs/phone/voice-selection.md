@@ -29,7 +29,9 @@ seconds in total (about $0.052), excluding unrelated usage. Telephony and task
 reasoning are separate costs.
 
 Alternatives: the existing ConversationRelay route supports ElevenLabs and
-Amazon Polly voices. Those offer conventional text-to-speech selection, but
+Amazon Polly voices. ConversationRelay lists $0.07/min, with telephony charged
+separately; the application reasoning cost is also separate. Those voices offer
+conventional text-to-speech selection, but
 require the separate STT/reasoning/TTS pipeline; their TTS latency cannot be
 compared directly with full conversational session startup. They were surveyed,
 not benchmarked in this audition. Retaining GPT-Live avoids changing that pipeline
