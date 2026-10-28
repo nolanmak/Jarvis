@@ -2470,6 +2470,15 @@ fn extension_for(att: &Attachment) -> String {
     inbound::extension_for(&att.filename, att.content_type.as_deref())
 }
 
+/// #1629 — remember the owner's filename beside its opaque download, so a
+/// re-attach (`gmail compose --attach`) sends it under that name. Best-effort:
+/// the turn still works without it.
+async fn record_original_name(path: &Path, original: &str) {
+    if let Err(e) = augmentagent_docs::inbound::record_original_name(path, original).await {
+        warn!("record original name for {} failed: {e}", path.display());
+    }
+}
+
 /// Download each attachment to `/tmp/aa-img-<msg_id>-<idx>.<ext>`. Returns the
 /// paths that succeeded; failures are logged and skipped.
 async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf> {
@@ -2480,7 +2489,10 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
         match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&path, &bytes).await {
-                    Ok(()) => out.push(path),
+                    Ok(()) => {
+                        record_original_name(&path, &att.filename).await;
+                        out.push(path)
+                    }
                     Err(e) => warn!("write image tempfile {} failed: {e}", path.display()),
                 },
                 Err(e) => warn!("read image bytes from {} failed: {e}", att.url),
@@ -2523,12 +2535,15 @@ async fn download_text_files(
                 Ok(bytes) => {
                     let (to_write, truncated) = truncate_text_bytes(&bytes);
                     match augmentagent_docs::inbound::write_private_attachment(&path, to_write).await {
-                        Ok(()) => out.push(DownloadedTextFile {
-                            path,
-                            truncated,
-                            original_size: u64::from(att.size),
-                            note: None,
-                        }),
+                        Ok(()) => {
+                            record_original_name(&path, &att.filename).await;
+                            out.push(DownloadedTextFile {
+                                path,
+                                truncated,
+                                original_size: u64::from(att.size),
+                                note: None,
+                            })
+                        }
                         Err(e) => warn!("write text tempfile {} failed: {e}", path.display()),
                     }
                 }
@@ -2582,6 +2597,7 @@ async fn extract_doc_attachments(
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&in_path, &bytes).await {
                     Ok(()) => {
+                        record_original_name(&in_path, &att.filename).await;
                         if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
                             staged = stage_signable_upload(root, &att.filename, &bytes);
                         }
