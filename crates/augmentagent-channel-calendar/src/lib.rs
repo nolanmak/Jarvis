@@ -12,6 +12,7 @@ pub mod alerts;
 pub mod channel;
 pub mod filter;
 pub mod gcal;
+pub mod google_direct;
 pub mod recurrence;
 pub mod rsvp;
 pub mod trigger;
