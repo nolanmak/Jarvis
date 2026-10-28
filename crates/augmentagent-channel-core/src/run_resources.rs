@@ -24,7 +24,7 @@ pub fn declared_policy() -> Result<Option<serde_json::Value>> {
 }
 
 pub fn declared_policy_for(kind: RunKind) -> Result<Option<serde_json::Value>> {
-    policy_from(kind, std::env::var)
+    policy_from(kind, |key| std::env::var(key))
 }
 
 /// A run is a builder only when the autoship scope asked for one. Everything
