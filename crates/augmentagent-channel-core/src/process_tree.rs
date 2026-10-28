@@ -520,6 +520,12 @@ pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<Atom
     -> std::io::Result<(Child, ProcessGroup)> {
     spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None)
 }
+/// #1627 — admitted spawn under the caller's resource tier. `None` keeps the
+/// supervisor's own declaration lookup (the builder tier).
+pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, policy:Option<&serde_json::Value>)
+    -> std::io::Result<(Child, ProcessGroup)> {
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy)
+}
 /// Controller-only VM startup capability. Native code cannot run before admission.
 pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
     -> std::io::Result<(Child, ProcessGroup)> {
