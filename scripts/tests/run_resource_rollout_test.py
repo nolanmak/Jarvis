@@ -50,6 +50,19 @@ esac
             self.assertTrue((root/'config/systemd/user/augmentagent-custom.service.d/60-run-resources.conf').exists())
             self.assertIn('show augmentagent-custom.service',log.read_text())
 
+    def test_render_carries_the_text_tier_only_when_an_operator_sets_it(self):
+        # #1627 — the text tier is a separate operator knob from the builder tier.
+        base=dict(os.environ,AUGMENTAGENT_UNIT_CPU_QUOTA='400%')
+        base.pop('AUGMENTAGENT_RUN_MEMORY_BYTES',None);base.pop('AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES',None)
+        plain=subprocess.run(['bash',str(SCRIPT),'--render'],env=base,capture_output=True,text=True,check=True).stdout
+        self.assertNotIn('AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES',plain)
+        self.assertNotIn('AUGMENTAGENT_RUN_MEMORY_BYTES',plain)
+        tuned=subprocess.run(['bash',str(SCRIPT),'--render'],env=dict(base,AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES='805306368'),
+                             capture_output=True,text=True,check=True).stdout
+        self.assertIn('Environment=AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES=805306368',tuned)
+        self.assertNotIn('Environment=AUGMENTAGENT_RUN_MEMORY_BYTES=',tuned)
+        self.assertNotIn('ExecStart',tuned)
+
     def test_unsupported_host_does_not_install_or_disable_interactive_service(self):
         for version, memory, enabled, expected in [('252','10737418240','',3),
                 ('255','infinity','',3),('unknown','10737418240','',3),

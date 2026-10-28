@@ -2,24 +2,137 @@
 use anyhow::{Context, Result};
 use std::{path::Path, sync::Arc};
 
+/// What a run's descendants may do, which decides how much memory its cgroup
+/// reserves (#1627). The reservation is charged against the service ceiling
+/// for the whole run, so a text turn reserving a builder's 4 GiB starved the
+/// daemon down to one model call at a time on a 10 GiB service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    /// Reasoning with at most read/write tools; never compiles. A `claude -p`
+    /// process measures 230–320 MB RSS. Default 1 GiB, `AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES`.
+    Text,
+    /// Autoship builder runs whose descendants run cargo/rustc inside the
+    /// cgroup (`memory.oom.group=1`). Default 4 GiB, `AUGMENTAGENT_RUN_MEMORY_BYTES`.
+    Builder,
+}
+
+/// The builder-tier declaration. Composition for VM guests and the
+/// supervisor's fallback keep using this; interactive and channel calls ask
+/// for their own tier through [`declared_policy_for`].
 pub fn declared_policy() -> Result<Option<serde_json::Value>> {
-    match std::env::var("AUGMENTAGENT_RUN_RESOURCES") {
+    declared_policy_for(RunKind::Builder)
+}
+
+pub fn declared_policy_for(kind: RunKind) -> Result<Option<serde_json::Value>> {
+    policy_from(kind, |key| std::env::var(key))
+}
+
+/// A run is a builder only when the autoship scope asked for one. Everything
+/// else (triage, ingest, wiki, Discord/Slack/phone turns) is a text run.
+pub fn run_kind_for(opts: &crate::ReasonerOpts) -> RunKind {
+    if opts.env.iter().any(|(key, _)| key == crate::autoship_scope::SCOPE_ENV) {
+        RunKind::Builder
+    } else {
+        RunKind::Text
+    }
+}
+
+fn policy_from(
+    kind: RunKind,
+    lookup: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<serde_json::Value>> {
+    match lookup("AUGMENTAGENT_RUN_RESOURCES") {
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Ok(value) if value == "1" => (),
         _ => anyhow::bail!("invalid run resource policy selector"),
     }
-    fn number(key: &str, default: u64) -> Result<u64> {
-        match std::env::var(key) {
+    let number = |key: &str, default: u64| -> Result<u64> {
+        match lookup(key) {
             Err(std::env::VarError::NotPresent) => Ok(default),
             Ok(value) => value.parse().with_context(|| format!("invalid {key}")),
             Err(_) => anyhow::bail!("invalid {key}"),
         }
-    }
+    };
+    let memory_bytes = match kind {
+        RunKind::Builder => number("AUGMENTAGENT_RUN_MEMORY_BYTES", 4 * 1024 * 1024 * 1024)?,
+        RunKind::Text => number("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", 1024 * 1024 * 1024)?,
+    };
     Ok(Some(serde_json::json!({
-        "memory_bytes":number("AUGMENTAGENT_RUN_MEMORY_BYTES",4*1024*1024*1024)?,
+        "memory_bytes":memory_bytes,
         "pids":number("AUGMENTAGENT_RUN_PIDS",512)?,
         "cpu_percent":number("AUGMENTAGENT_RUN_CPU_PERCENT",200)?,
     })))
+}
+
+#[cfg(test)]
+mod policy_tier_tests {
+    //! #1627 — acceptance: each tier has its own default and override, shares
+    //! pids/cpu, and the tier is chosen from the call, not the host.
+    use super::*;
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        move |key| {
+            pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn text_runs_reserve_one_gib_and_builders_four_by_default() {
+        let declared = env(&[("AUGMENTAGENT_RUN_RESOURCES", "1")]);
+        let text = policy_from(RunKind::Text, &declared).unwrap().unwrap();
+        let builder = policy_from(RunKind::Builder, &declared).unwrap().unwrap();
+        assert_eq!(text["memory_bytes"], GIB);
+        assert_eq!(builder["memory_bytes"], 4 * GIB);
+        assert_eq!(declared_policy().ok().flatten().map(|p| p["memory_bytes"].clone()),
+            if std::env::var("AUGMENTAGENT_RUN_RESOURCES").is_ok() { Some((4 * GIB).into()) } else { None },
+            "declared_policy stays the builder tier");
+    }
+
+    #[test]
+    fn each_tier_honours_only_its_own_override() {
+        let declared = env(&[
+            ("AUGMENTAGENT_RUN_RESOURCES", "1"),
+            ("AUGMENTAGENT_RUN_MEMORY_BYTES", "6442450944"),
+            ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "805306368"),
+        ]);
+        assert_eq!(policy_from(RunKind::Builder, &declared).unwrap().unwrap()["memory_bytes"], 6 * GIB);
+        assert_eq!(policy_from(RunKind::Text, &declared).unwrap().unwrap()["memory_bytes"], 768 * 1024 * 1024);
+        let builder_only = env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_MEMORY_BYTES", "6442450944")]);
+        assert_eq!(policy_from(RunKind::Text, &builder_only).unwrap().unwrap()["memory_bytes"], GIB,
+            "a builder override never shrinks or grows text runs");
+        let text_only = env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "805306368")]);
+        assert_eq!(policy_from(RunKind::Builder, &text_only).unwrap().unwrap()["memory_bytes"], 4 * GIB,
+            "a text override never caps builders");
+        assert!(policy_from(RunKind::Text, env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_TEXT_MEMORY_BYTES", "lots")])).is_err());
+    }
+
+    #[test]
+    fn pids_and_cpu_are_shared_and_no_declaration_means_no_policy() {
+        let declared = env(&[("AUGMENTAGENT_RUN_RESOURCES", "1"), ("AUGMENTAGENT_RUN_PIDS", "64"), ("AUGMENTAGENT_RUN_CPU_PERCENT", "150")]);
+        for kind in [RunKind::Text, RunKind::Builder] {
+            let policy = policy_from(kind, &declared).unwrap().unwrap();
+            assert_eq!(policy["pids"], 64);
+            assert_eq!(policy["cpu_percent"], 150);
+            assert_eq!(policy.as_object().unwrap().len(), 3, "the supervisor rejects extra keys");
+            assert!(policy_from(kind, env(&[])).unwrap().is_none());
+            assert!(policy_from(kind, env(&[("AUGMENTAGENT_RUN_RESOURCES", "yes")])).is_err());
+        }
+    }
+
+    #[test]
+    fn channel_and_interactive_calls_are_text_runs_and_autoship_scoped_calls_are_builders() {
+        let triage = crate::reasoner::triage_opts(None);
+        assert_eq!(run_kind_for(&triage), RunKind::Text);
+        let mut discord = crate::reasoner::triage_opts(None);
+        discord.allowed_tools = vec!["Read".into(), "Write".into(), "Bash(augmentagent:*)".into()];
+        discord.env.push(("AUGMENTAGENT_SLACK_INBOUND_DIR".into(), "/state/x".into()));
+        assert_eq!(run_kind_for(&discord), RunKind::Text, "tools alone do not make a builder");
+        let mut builder = crate::reasoner::triage_opts(None);
+        builder.env.push((crate::autoship_scope::SCOPE_ENV.into(), "1".into()));
+        assert_eq!(run_kind_for(&builder), RunKind::Builder);
+    }
 }
 
 /// The guest RAM declarations are additive: the host MCP build VM remains
