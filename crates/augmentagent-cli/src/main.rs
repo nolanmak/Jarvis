@@ -6575,10 +6575,15 @@ async fn upload_attach_if_given(
     for path in attach {
         let meta = std::fs::metadata(&path)
             .with_context(|| format!("attachment not found: {}", path.display()))?;
-        let att = gmail
+        let mut att = gmail
             .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
             .await
             .context("attachment upload failed")?;
+        // #1629 — an opaque `/tmp/aa-*` download goes out under the name it
+        // arrived with, not its temp basename.
+        if let Some(original) = augmentagent_docs::inbound::recorded_original_name(&path) {
+            att.name = original;
+        }
         println!(
             "attached: {} ({} KB, {})",
             att.name,
