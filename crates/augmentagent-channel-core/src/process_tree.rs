@@ -35,7 +35,10 @@ impl ProcessGroup {
     async fn admit(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>, model:bool) -> anyhow::Result<()> {
         self.bind_resource_audit(provider,logger)?;
         let ready=self.receipt.with_file_name("launch-ready");
-        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(if self.vm_preflight { 65 } else { 5 });
+        // Admission may wait for capacity (reclaiming cache, then a sibling run
+        // finishing) before it writes launch-ready; give it that long.
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(
+            ADMISSION_WAIT_SECS+if self.vm_preflight { 65 } else { 5 });
         while !ready.exists() {
             if self.receipt.exists() || tokio::time::Instant::now()>=deadline {
                 self.resource_outcome(provider,logger)?;
@@ -509,6 +512,10 @@ fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -
     std::fs::File::open(parent)?.sync_all()?;
     Ok(Some(marker))
 }
+
+/// How long run-resource-scope.py waits for capacity before refusing
+/// (`ADMISSION_WAIT_SECONDS`); keep the two equal.
+const ADMISSION_WAIT_SECS: u64 = 120;
 
 /// Provider adapters configure piped stdio and supply their environment-clear
 /// policy explicitly; Command does not expose whether env_clear was selected.
@@ -991,5 +998,18 @@ mod tests {
         drop(child);
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert!(!marker.exists(), "provider's background tool outlived cancellation");
+    }
+}
+
+#[cfg(test)]
+mod admission_wait_tests {
+    #[test]
+    fn controller_deadline_covers_the_scope_scripts_capacity_wait() {
+        let script = include_str!("../../../scripts/run-resource-scope.py");
+        let line = script.lines().find(|l| l.starts_with("ADMISSION_WAIT_SECONDS = "))
+            .expect("run-resource-scope.py declares ADMISSION_WAIT_SECONDS");
+        let secs: u64 = line.trim_start_matches("ADMISSION_WAIT_SECONDS = ").trim().parse().unwrap();
+        assert_eq!(secs, super::ADMISSION_WAIT_SECS,
+            "a script that waits longer than the controller would be reported as launch_readiness_unavailable");
     }
 }

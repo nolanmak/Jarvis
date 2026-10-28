@@ -288,4 +288,64 @@ class CompositionHeadroomTests(unittest.TestCase):
             self.assertEqual(resources.headroom(parent,6*gib,20*gib)['reserved_before_bytes'],gib)
 
 
+class TransientAdmissionTests(unittest.TestCase):
+    def fixture(self, root):
+        parent=root/'fixture.service'; parent.mkdir()
+        (parent/'cgroup.subtree_control').write_text('')
+        return parent
+
+    def refusal(self):
+        return resources.AdmissionRefused('aggregate_reservations','aggregate memory reservations exhausted',
+            requested_bytes=4,reserved_bytes=8,current_bytes=8,limit_bytes=10)
+
+    def run_reserve(self, parent, outcomes, wait=60):
+        calls=[];sleeps=[]
+        def headroom(_parent, requested, _available):
+            calls.append(requested)
+            outcome=outcomes[min(len(calls),len(outcomes))-1]
+            if isinstance(outcome,Exception): raise outcome
+            return outcome
+        original=Path.write_text
+        def write(path, value, *args, **kwargs):
+            if path.name=='cgroup.subtree_control': value='cpu memory pids'
+            return original(path,value,*args,**kwargs)
+        with patch.object(resources,'headroom',headroom), patch.object(resources,'available_memory',return_value=1), \
+             patch.object(Path,'write_text',write):
+            with resources.reserve(parent,4,wait_seconds=wait,sleep=sleeps.append) as proof:
+                pass
+        return proof,calls,sleeps
+
+    def test_a_transient_refusal_reclaims_cache_then_admits_without_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp))
+            proof,calls,sleeps=self.run_reserve(parent,[self.refusal(),{'ok':1}])
+            self.assertEqual(proof,{'ok':1})
+            self.assertEqual(len(calls),2)
+            self.assertEqual(sleeps,[],'reclaim retries immediately')
+            self.assertEqual((parent/'memory.reclaim').read_text(),'2 swappiness=0',
+                'reclaims only the shortfall, file pages only')
+
+    def test_capacity_held_by_a_sibling_waits_with_backoff_until_it_frees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp))
+            outcomes=[self.refusal()]*4+[{'ok':1}]
+            proof,calls,sleeps=self.run_reserve(parent,outcomes)
+            self.assertEqual(proof,{'ok':1})
+            self.assertEqual(sleeps,[0.25,0.5,1.0])
+
+    def test_a_refusal_that_outlasts_the_wait_still_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp))
+            with self.assertRaisesRegex(RuntimeError,'reservations exhausted'):
+                self.run_reserve(parent,[self.refusal()],wait=0)
+
+    def test_a_ceiling_that_can_never_fit_refuses_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp))
+            never=resources.AdmissionRefused('declared_ceiling','run ceiling exceeds aggregate service ceiling')
+            with self.assertRaisesRegex(RuntimeError,'ceiling'):
+                self.run_reserve(parent,[never])
+            self.assertFalse((parent/'memory.reclaim').exists())
+
+
 if __name__ == '__main__': unittest.main(verbosity=2)

@@ -142,22 +142,78 @@ def headroom(parent, requested, host_available):
             'host_available_bytes': host_available, 'host_margin_bytes': 256 * 1024**2}
 
 
-@contextlib.contextmanager
-def reserve(parent, requested):
-    # cgroup directory inode is a common controller-only lock; no writable
-    # sidecar or age/PID based cleanup can release another live reservation.
-    descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+# Refusals that a finishing run or dropped cache can resolve. A declared
+# ceiling above the service limit, or an invalid policy, never will.
+TRANSIENT_REFUSALS = {'aggregate_reservations', 'host_headroom', 'ancestor_headroom'}
+# How long a run waits for capacity before refusing. process_tree.rs
+# (ADMISSION_WAIT_SECS) extends its launch-ready deadline by the same amount.
+ADMISSION_WAIT_SECONDS = 120
+
+
+def shortfall(refusal):
+    facts = refusal.facts
+    if refusal.code == 'aggregate_reservations':
+        return facts['reserved_bytes'] + facts['requested_bytes'] - facts['limit_bytes']
+    if refusal.code == 'host_headroom':
+        return facts['required_bytes'] - facts['available_bytes']
+    if refusal.code == 'ancestor_headroom':
+        return (facts['requested_bytes'] + facts['reservation_slack_bytes']
+                - (facts['limit_bytes'] - facts['current_bytes']))
+    return 0
+
+
+def reclaim_cache(group, wanted):
+    """Ask the kernel to drop up to `wanted` bytes of this group's page cache.
+
+    swappiness=0 restricts reclaim to file pages, so the daemon's own working
+    memory is never pushed to swap to make room. Best-effort: the kernel
+    returns EAGAIN when it reclaimed less than asked.
+    """
+    if wanted <= 0:
+        return
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        # systemd delegates controllers but an unused subtree need not have
-        # enabled them yet. Child memory.current appears only after enablement.
-        # Do this inside the same admission lock, before reading sibling usage.
-        (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
-        if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
-            raise RuntimeError('delegated controllers failed readback')
-        yield headroom(parent, requested, available_memory())
-    finally:
-        os.close(descriptor)
+        (group / 'memory.reclaim').write_text(f'{wanted} swappiness=0')
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def reserve(parent, requested, wait_seconds=ADMISSION_WAIT_SECONDS, sleep=time.sleep):
+    # A transient refusal first drops reclaimable cache, then waits (lock
+    # released) for a sibling run to finish, re-checking with backoff. Only
+    # a refusal that outlasts the wait reaches the caller.
+    deadline = time.monotonic() + wait_seconds
+    delay = 0.25
+    reclaimed = False
+    while True:
+        # cgroup directory inode is a common controller-only lock; no writable
+        # sidecar or age/PID based cleanup can release another live reservation.
+        descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            # systemd delegates controllers but an unused subtree need not have
+            # enabled them yet. Child memory.current appears only after enablement.
+            # Do this inside the same admission lock, before reading sibling usage.
+            (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
+            if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
+                raise RuntimeError('delegated controllers failed readback')
+            try:
+                proof = headroom(parent, requested, available_memory())
+            except AdmissionRefused as refusal:
+                if refusal.code not in TRANSIENT_REFUSALS or time.monotonic() >= deadline:
+                    raise
+                missing = shortfall(refusal)
+            else:
+                yield proof
+                return
+        finally:
+            os.close(descriptor)
+        if not reclaimed:
+            reclaimed = True
+            reclaim_cache(parent, missing)
+            continue
+        sleep(delay)
+        delay = min(delay * 2, 5.0)
 
 
 class RunScope:
