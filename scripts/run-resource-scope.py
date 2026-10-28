@@ -27,7 +27,7 @@ def refusal_receipt(error):
     """Never serialize error strings, filenames, policy bodies or traceback."""
     receipt={'phase':'admission_failed','exhausted':True,'refusal_code':'admission_setup_failed'}
     codes={'host_headroom','aggregate_reservations','ancestor_headroom','declared_ceiling','invalid_policy'}
-    fields={'requested_bytes','reserved_bytes','current_bytes','limit_bytes','available_bytes',
+    fields={'requested_bytes','reserved_bytes','current_bytes','reclaimable_bytes','limit_bytes','available_bytes',
             'reservation_slack_bytes','margin_bytes','required_bytes','requested_pids','limit_pids',
             'requested_cpu_percent','limit_cpu_quota','limit_cpu_period','memory_bytes','pids',
             'cpu_percent','minimum','maximum'}
@@ -72,9 +72,29 @@ def available_memory():
     raise RuntimeError('host available memory unavailable')
 
 
+def reclaimable(group):
+    """Clean page cache the kernel drops before it would OOM this group.
+
+    Run cgroups are removed after cleanup, and their page cache is reparented
+    to the service, where it lingers as `inactive_file`. Counting it as a
+    reservation refused model calls on a near-idle daemon (3.3 GiB of cache
+    beside a 278 MB daemon leaf). memory.stat is hierarchical; a group
+    without one (not yet accounted) has nothing to subtract.
+    """
+    try:
+        for line in (group / 'memory.stat').read_text().splitlines():
+            key, _, value = line.partition(' ')
+            if key == 'inactive_file':
+                return int(value)
+    except FileNotFoundError:
+        pass
+    return 0
+
+
 def headroom(parent, requested, host_available):
     # Reserve each admitted run's full ceiling, including idle preflight runs.
     # Unremoved groups remain reserved until verified descendant cleanup.
+    # Usage excludes reclaimable cache: it yields to a new run's allocations.
     reserved = 0
     current = 0
     for child in parent.iterdir():
@@ -82,6 +102,7 @@ def headroom(parent, requested, host_available):
             continue
         try:
             usage = int((child / 'memory.current').read_text().strip())
+            usage = max(0, usage - reclaimable(child))
             if child.name.startswith('run-'):
                 reserved += finite(child / 'memory.max')
                 current += usage
@@ -92,14 +113,17 @@ def headroom(parent, requested, host_available):
             if child.exists():
                 raise RuntimeError('aggregate sibling resource accounting unavailable')
     aggregate_current = int((parent / 'memory.current').read_text().strip())
+    cache = reclaimable(parent)
+    aggregate_charged = max(0, aggregate_current - cache)
     # Include kernel charges not visible in child accounting.
-    reserved += max(0, aggregate_current - current)
+    reserved += max(0, aggregate_charged - current)
     needed = reserved + requested
     limit=finite(parent / 'memory.max')
     if needed > limit:
         raise AdmissionRefused('aggregate_reservations','aggregate memory reservations exhausted',
-                               requested_bytes=requested,reserved_bytes=reserved,current_bytes=aggregate_current,limit_bytes=limit)
-    slack = max(0, reserved - aggregate_current)
+                               requested_bytes=requested,reserved_bytes=reserved,current_bytes=aggregate_current,
+                               reclaimable_bytes=cache,limit_bytes=limit)
+    slack = max(0, reserved - aggregate_charged)
     if requested + slack + 256 * 1024**2 > host_available:
         raise AdmissionRefused('host_headroom','host memory headroom unavailable',
                                requested_bytes=requested,reservation_slack_bytes=slack,margin_bytes=256*1024**2,
@@ -109,6 +133,7 @@ def headroom(parent, requested, host_available):
         limit = (ancestor / 'memory.max').read_text().strip()
         if limit != 'max':
             usage=int((ancestor / 'memory.current').read_text().strip())
+            usage=max(0, usage - reclaimable(ancestor))
             if requested + slack > int(limit) - usage:
                 raise AdmissionRefused('ancestor_headroom','ancestor memory headroom unavailable',
                                        requested_bytes=requested,reservation_slack_bytes=slack,current_bytes=usage,limit_bytes=int(limit))

@@ -259,4 +259,33 @@ class CompositionHeadroomTests(unittest.TestCase):
             self.assertEqual(resources.headroom(parent,6*gib,20*gib)['requested_bytes'],6*gib)
 
 
+    def test_reparented_page_cache_is_not_a_reservation(self):
+        # 2026-10-28: 3.3 GiB of inactive_file left by removed run groups sat
+        # on the service beside a 278 MB daemon leaf and one 4 GiB run, and a
+        # 4 GiB text turn was refused as "reservations exhausted".
+        gib=1024**3
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp),10*gib,gib,(4*gib,128*1024**2))
+            charged=int((parent/'memory.current').read_text())
+            (parent/'memory.current').write_text(str(charged+3*gib))
+            (parent/'memory.stat').write_text(f'anon {charged}\ninactive_file {3*gib}\nactive_file 0\n')
+            proof=resources.headroom(parent,4*gib,20*gib)
+            self.assertEqual(proof['reserved_before_bytes'],5*gib)
+            # Cache the kernel cannot drop yet (active) still counts.
+            (parent/'memory.stat').write_text(f'anon {charged}\ninactive_file {gib}\nactive_file {2*gib}\n')
+            with self.assertRaisesRegex(RuntimeError,'reservations exhausted') as caught:
+                resources.headroom(parent,4*gib,20*gib)
+            facts=resources.refusal_receipt(caught.exception)['facts']
+            self.assertEqual(facts['reclaimable_bytes'],gib)
+            self.assertEqual(facts['reserved_bytes'],7*gib)
+
+    def test_a_child_s_own_inactive_cache_does_not_reserve_its_usage(self):
+        gib=1024**3
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=self.fixture(Path(tmp),8*gib,3*gib)
+            (parent/'daemon'/'memory.stat').write_text(f'inactive_file {2*gib}\n')
+            (parent/'memory.stat').write_text(f'inactive_file {2*gib}\n')
+            self.assertEqual(resources.headroom(parent,6*gib,20*gib)['reserved_before_bytes'],gib)
+
+
 if __name__ == '__main__': unittest.main(verbosity=2)
