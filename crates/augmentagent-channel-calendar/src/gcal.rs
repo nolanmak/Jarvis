@@ -1,4 +1,6 @@
-//! Google Calendar client over Composio HTTP.
+//! Google Calendar client over Composio HTTP, or directly against Google for
+//! accounts connected through the operator's own OAuth client (#1584,
+//! `google_direct`).
 //!
 //! Mirrors `crates/augmentagent-channel-email/src/gmail.rs::ComposioClient`:
 //! one method per Composio action we use and the same `x-api-key` header.
@@ -88,6 +90,9 @@ pub enum CalendarError {
     Http(#[from] reqwest::Error),
     #[error("composio: {message}")]
     Composio { message: String },
+    /// A direct Google Calendar API failure (Google-connected mailbox).
+    #[error("google: {message}")]
+    Google { message: String },
     /// Composio returned 403. The user likely needs to re-consent to grant
     /// `calendar.readonly` on top of the existing Google connection. Phase 1
     /// surfaces this once per account and skips the account; Phase 2 (#400)
@@ -201,6 +206,8 @@ pub struct ComposioCalendarClient {
     api_key: String,
     /// entity → active googlecalendar connected-account id, for proxy calls.
     connected_accounts: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Direct Google client for `google:<email>` accounts, built on first use.
+    google: std::sync::OnceLock<Result<std::sync::Arc<crate::google_direct::GoogleCalendar>, String>>,
 }
 
 impl ComposioCalendarClient {
@@ -213,12 +220,40 @@ impl ComposioCalendarClient {
             base_url: "https://backend.composio.dev".into(),
             api_key,
             connected_accounts: Default::default(),
+            google: Default::default(),
         }
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
         self
+    }
+
+    /// Test hook / embedding: the direct client `google:<email>` accounts use.
+    pub fn with_google(self, google: crate::google_direct::GoogleCalendar) -> Self {
+        let _ = self.google.set(Ok(std::sync::Arc::new(google)));
+        self
+    }
+
+    /// A Google-connected account (`google:<email>`, #1584) talks to Google
+    /// Calendar directly with the mailbox's own grant, which carries the
+    /// calendar scope. Everything else stays on Composio.
+    fn google_route(
+        &self,
+        entity_id: &str,
+    ) -> Option<Result<(std::sync::Arc<crate::google_direct::GoogleCalendar>, String), CalendarError>> {
+        let email = augmentagent_channel_email::google::email_of(entity_id)?;
+        let built = self.google.get_or_init(|| {
+            augmentagent_channel_email::google::GoogleGmail::from_env()
+                .map(|g| std::sync::Arc::new(crate::google_direct::GoogleCalendar::new(std::sync::Arc::new(g))))
+                .map_err(|e| e.to_string())
+        });
+        Some(match built {
+            Ok(g) => Ok((std::sync::Arc::clone(g), email.to_string())),
+            Err(msg) => Err(CalendarError::Google {
+                message: format!("{entity_id} is Google-connected but the direct client is unavailable: {msg}"),
+            }),
+        })
     }
 
     async fn execute(
@@ -358,6 +393,10 @@ impl ComposioCalendarClient {
         query: &[(&str, &str)],
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, CalendarError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.call(&email, method, path, query, body).await;
+        }
         let result = self.proxy_once(entity_id, method, path, query, body).await;
         if result.is_err() {
             // The cached connection may be stale (re-linked in Composio);
@@ -415,7 +454,7 @@ impl ComposioCalendarClient {
 
 /// Percent-encode one URL path segment (event ids are base32hex, but an
 /// instance id carries `_` and a calendar id may carry `@`).
-fn path_segment(s: &str) -> String {
+pub(crate) fn path_segment(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
@@ -517,6 +556,10 @@ impl CalendarApi for ComposioCalendarClient {
         time_min: DateTime<Utc>,
         time_max: DateTime<Utc>,
     ) -> Result<Vec<CalendarEvent>, CalendarError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.list_events(&email, calendar_id, time_min, time_max).await;
+        }
         const MAX_PAGES: u32 = 10;
         const PAGE_SIZE: u32 = 250;
 
@@ -591,6 +634,10 @@ impl CalendarApi for ComposioCalendarClient {
         calendar_id: &str,
         draft: &EventDraft,
     ) -> Result<CreatedEvent, CalendarError> {
+        if let Some(route) = self.google_route(entity_id) {
+            let (g, email) = route?;
+            return g.create_event(&email, calendar_id, draft).await;
+        }
         // Param names per Composio's GOOGLECALENDAR_CREATE_EVENT schema
         // (snake_case, unlike EVENTS_LIST's Google-native camelCase).
         // The Composio tool expects a naive datetime plus an IANA zone.
