@@ -353,9 +353,11 @@ fn handle_of(q: &str) -> String {
     handles::canonical(q)
 }
 
-/// Candidates for a person reference. Exact matches win over partial ones;
-/// several candidates of the best kind mean the reference is ambiguous and
-/// the caller must not pick one.
+/// Candidates for a person reference. Exact matches win over partial ones,
+/// except that a single-word reference also carries every partial match
+/// (#1668): a page keyed by a bare first name (`jordan`) must not silently
+/// swallow `jordan-blake`, whose handles hold the thread. Several candidates
+/// mean the reference is ambiguous and the caller must not pick one.
 pub fn resolve_person(
     c: &Connection,
     query: &str,
@@ -406,17 +408,11 @@ pub fn resolve_person(
             exact.entry(k).or_insert(name);
         }
     }
-    if !exact.is_empty() {
-        return Ok(exact
-            .into_iter()
-            .map(|(key, name)| PersonMatch {
-                key,
-                name: Some(name),
-                kind: MatchKind::Exact,
-                resolved: true,
-                last_seen: None,
-            })
-            .collect());
+    // A multi-word reference that matches exactly is settled. A single word
+    // is only settled when nobody else's name contains that word: otherwise
+    // the bare-key page wins by accident of slug, not by evidence (#1668).
+    if !exact.is_empty() && n.contains(' ') {
+        return Ok(exact_matches(exact));
     }
     let mut partial: BTreeMap<String, String> = BTreeMap::new();
     let mut stmt = c.prepare(
@@ -427,18 +423,32 @@ pub fn resolve_person(
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })? {
         let (k, name) = row?;
-        partial.entry(k).or_insert(name);
+        if !exact.contains_key(&k) {
+            partial.entry(k).or_insert(name);
+        }
     }
-    Ok(partial
+    let mut out = exact_matches(exact);
+    out.extend(partial.into_iter().map(|(key, name)| PersonMatch {
+        key,
+        name: Some(name),
+        kind: MatchKind::Partial,
+        resolved: true,
+        last_seen: None,
+    }));
+    Ok(out)
+}
+
+fn exact_matches(exact: BTreeMap<String, String>) -> Vec<PersonMatch> {
+    exact
         .into_iter()
         .map(|(key, name)| PersonMatch {
             key,
             name: Some(name),
-            kind: MatchKind::Partial,
+            kind: MatchKind::Exact,
             resolved: true,
             last_seen: None,
         })
-        .collect())
+        .collect()
 }
 
 fn first_name_for(
@@ -678,7 +688,12 @@ mod tests {
         );
         page(w.path(), "alex-rivera", &front, "");
         page(w.path(), "sam-doe", "identities:\n  discord: \"610\"\n", "");
-        page(w.path(), "sam-park", "identities:\n  discord: \"620\"\n", "");
+        page(
+            w.path(),
+            "sam-park",
+            "identities:\n  discord: \"620\"\n",
+            "",
+        );
         w
     }
 
@@ -804,6 +819,59 @@ mod tests {
                 "unknown handles stay usable as raw handles"
             );
             assert_eq!(raw[0].key, handles::canonical("+1 (212) 555-0100"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn bare_first_name_keyed_page_does_not_swallow_longer_named_people() {
+        // #1668: `jordan.md` (key `jordan`, no phone) sat next to
+        // `jordan-blake.md`, which held the iMessage handle. `with:jordan`
+        // matched the bare key exactly, returned it alone, and the thread
+        // vanished with an empty ambiguity list.
+        let (_d, s) = store();
+        let w = tempfile::tempdir().unwrap();
+        page(
+            w.path(),
+            "jordan",
+            "identities:\n  linkedin: jordanblake\n",
+            "",
+        );
+        page(
+            w.path(),
+            "jordan-blake",
+            "identities:\n  phone: [\"+14155550177\"]\n",
+            "",
+        );
+        page(
+            w.path(),
+            "jordan-acme",
+            "identities:\n  email: [jordan@acme.example]\n",
+            "",
+        );
+        resolve_people(&s, w.path()).unwrap();
+        s.with_conn(|c| {
+            let got = resolve_person(c, "jordan")?;
+            assert_eq!(
+                got.iter()
+                    .map(|m| (m.key.as_str(), m.kind))
+                    .collect::<Vec<_>>(),
+                [
+                    ("jordan", MatchKind::Exact),
+                    ("jordan-acme", MatchKind::Partial),
+                    ("jordan-blake", MatchKind::Partial),
+                ],
+                "the bare-key page is a candidate, never the silent winner"
+            );
+            // Spelling out the full name still settles it.
+            let full = resolve_person(c, "Jordan Blake")?;
+            assert_eq!(full.len(), 1);
+            assert_eq!(full[0].key, "jordan-blake");
+            // The hyphenated key still resolves on its own.
+            let by_key = resolve_person(c, "jordan-blake")?;
+            assert_eq!(by_key.len(), 1);
+            assert_eq!(by_key[0].key, "jordan-blake");
             Ok(())
         })
         .unwrap();
