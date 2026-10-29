@@ -85,7 +85,11 @@ async fn service_call(
         );
     }
     let usage = store.phone_live_usage(1).unwrap();
-    assert_eq!(usage.len(), 1, "readiness probe must retain its own usage receipt");
+    assert_eq!(
+        usage.len(),
+        1,
+        "readiness probe must retain its own usage receipt"
+    );
     assert_eq!(usage[0].phase, "preflight");
     if result.is_ok() {
         assert_eq!(usage[0].seconds, Some(0.1));
@@ -146,4 +150,49 @@ async fn preflight_finalizes_before_dialing_and_uses_no_owner_context() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn configured_voice_reaches_probe_and_call_connections() {
+    for (name, description) in [
+        ("willow", None),
+        ("voice_synthetic", Some("Warm adult feminine voice.")),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
+        let voice = crate::live_voice::LiveVoice::parse(name, description).unwrap();
+        let expected = voice.wire();
+        let server = tokio::spawn(async move {
+            for greet in [false, true] {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(tcp).await.unwrap();
+                let start: Value =
+                    serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(start["session"]["audio"]["output"]["voice"], expected);
+                assert_eq!(start["session"]["input"].is_array(), greet);
+                let mut session = start["session"].clone();
+                session["id"] = json!("synthetic");
+                ws.send(Message::Text(
+                    json!({"type":"session.started","session":session})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        let config = LiveConfig::for_test(endpoint).with_voice(voice);
+        assert_eq!(
+            config.voice_label(),
+            if description.is_some() {
+                "custom"
+            } else {
+                name
+            }
+        );
+        drop(config.connect("Be helpful.").await.unwrap());
+        drop(config.connect_for_call("Be helpful.").await.unwrap());
+        server.await.unwrap();
+    }
 }

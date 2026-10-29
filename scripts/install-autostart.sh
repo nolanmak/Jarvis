@@ -194,6 +194,12 @@ UNIT_EOF
     log "Resource configuration failed; refusing to restart with an unverified policy."
     return 1
   fi
+  local worker_help=""
+  worker_help=$("$REPO_ROOT/target/release/augmentagent" auto-pr-worker --help 2>/dev/null) || true
+  case "$worker_help" in
+    *'Usage: augmentagent auto-pr-worker'*)
+      AUGMENTAGENT_AUTOSTART_DRY_RUN="$DRY_RUN" bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" ;;
+  esac
 
   log "Enabling + (re)starting $UNIT_NAME"
   systemctl --user enable "$UNIT_NAME" >/dev/null

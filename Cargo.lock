@@ -386,6 +386,7 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-channel-core",
+ "augmentagent-channel-email",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
@@ -1214,6 +1215,7 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "roxmltree",
+ "rustls 0.23.38",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -1228,6 +1230,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-general-category",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

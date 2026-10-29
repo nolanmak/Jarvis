@@ -410,13 +410,16 @@ async fn runtime_retries_dispatch_after_reconciliation_database_failure() {
 
 #[tokio::test]
 async fn health_reports_actual_transport_without_claiming_provider_readiness_or_exposing_keys() {
-    for live in [false, true] {
+    for selection in [None, Some("gleam"), Some("willow"), Some("voice_private")] {
+        let live = selection.is_some();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
         let provider = Arc::new(Provider::default());
         let mut config = PhoneConfig::new(true, "https://phone.example.test", "private-verification-secret-32-bytes", vec![]).unwrap();
-        if live {
-            config = config.with_live(Some(augmentagent_phone::live_config::LiveConfig::new("private-openai-key".into()).unwrap()));
+        if let Some(name) = selection {
+            let description = (name == "voice_private").then_some("Private voice description");
+            let voice = augmentagent_phone::live_voice::LiveVoice::parse(name, description).unwrap();
+            config = config.with_live(Some(augmentagent_phone::live_config::LiveConfig::new("private-openai-key".into()).unwrap().with_voice(voice)));
         }
         let service = Arc::new(PhoneService::new(store, provider.clone(), Arc::new(Time(AtomicI64::new(100))), config));
         let runtime = PhoneRuntime::start(service, Arc::new(WebhookAuth::new("AC-test", "private-twilio-token")), Arc::new(Agent), tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()).await.unwrap();
@@ -424,10 +427,10 @@ async fn health_reports_actual_transport_without_claiming_provider_readiness_or_
         assert!(health.running);
         assert_eq!(health.transport, if live { "openai_live" } else { "conversation_relay" });
         assert_eq!(health.audio_model, live.then_some("gpt-live-1"));
-        assert_eq!(health.voice, if live { "gleam" } else { augmentagent_phone::voice::DEFAULT_ELEVENLABS_VOICE });
+        assert_eq!(health.voice, match selection { Some("voice_private") => "custom", Some(name) => name, None => augmentagent_phone::voice::DEFAULT_ELEVENLABS_VOICE });
         assert_eq!(health.provider_readiness, if live { "requires_per_call_preflight" } else { "not_probed" });
         let report = format!("{health:?}");
-        for private in ["private-openai-key", "private-twilio-token", "private-verification-secret", "phone.example.test"] { assert!(!report.contains(private)); }
+        for private in ["voice_private", "Private voice description", "private-openai-key", "private-twilio-token", "private-verification-secret", "phone.example.test"] { assert!(!report.contains(private)); }
         assert_eq!(*provider.starts.lock().unwrap(), 0, "health must never dial or probe a provider");
         runtime.shutdown().await.unwrap();
     }

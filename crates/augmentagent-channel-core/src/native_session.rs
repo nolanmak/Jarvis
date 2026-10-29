@@ -16,6 +16,10 @@ struct State {
     id: Option<String>,
     active: bool,
     uncertain: bool,
+    /// #1626 — set by the active lease the moment it starts writing the
+    /// prompt to the native CLI. Before that point nothing has reached the
+    /// CLI, so a dropped lease has no native side effect to be uncertain of.
+    submission_started: bool,
     native_submitted_at_ms: Option<u64>,
     first_text_output_at_ms: Option<u64>,
 }
@@ -116,7 +120,7 @@ impl NativeSession {
         Ok(Arc::new(Self {
             provider,
             retired_vm: Mutex::new(Vec::new()),
-            state: Mutex::new(State { id, active: false, uncertain: false,
+            state: Mutex::new(State { id, active: false, uncertain: false, submission_started: false,
                 native_submitted_at_ms: None, first_text_output_at_ms: None }),
         }))
     }
@@ -136,6 +140,7 @@ impl NativeSession {
         anyhow::ensure!(!is_fresh_review() || matches!(launch, Launch::Create { .. }),
             "fresh review cannot resume an existing native conversation");
         state.active = true;
+        state.submission_started = false;
         state.native_submitted_at_ms = None;
         state.first_text_output_at_ms = None;
         Ok(Lease { session: Arc::clone(self), launch, observed_id: None, finished: false })
@@ -176,6 +181,16 @@ impl Lease {
     }
     pub fn launch(&self) -> Launch {
         self.launch.clone()
+    }
+
+    /// #1626 — the prompt is about to be written to the native CLI. From
+    /// here on the CLI may have received (part of) the turn, so a dropped
+    /// lease leaves the session uncertain. Call before the first byte.
+    pub fn mark_submitting(&self) {
+        let mut state = self.session.state.lock().expect("native session mutex poisoned");
+        if state.active {
+            state.submission_started = true;
+        }
     }
 
     /// Record when the prompt was fully written to the native CLI.
@@ -241,7 +256,14 @@ impl Drop for Lease {
         if !self.finished {
             let mut state = self.session.state.lock().expect("native session mutex poisoned");
             state.active = false;
-            state.uncertain = true;
+            // #1626 — a refusal before the prompt reached the CLI (resource
+            // capacity, hook preparation, spawn failure) ran nothing on the
+            // native side; the session stays clean and the next turn resumes
+            // it. Once submission started, or the CLI reported a session, the
+            // turn may have run and replay is blocked until inspected.
+            if state.submission_started || self.observed_id.is_some() {
+                state.uncertain = true;
+            }
         }
     }
 }
@@ -307,5 +329,69 @@ mod fresh_review_tests {
     #[tokio::test]
     async fn fresh_review_requires_cli_observed_identity() {
         assert!(fresh_review_scope(ProviderKind::Codex, async { Ok("LGTM") }).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod lease_drop_tests {
+    //! #1626 — only a turn the native CLI may have received leaves the
+    //! session uncertain. A lease dropped by a pre-spawn refusal (resource
+    //! capacity, hook preparation, spawn failure) had no native side effect
+    //! and must not latch the conversation.
+    use super::*;
+
+    #[test]
+    fn a_lease_dropped_before_submission_leaves_the_session_clean_and_resumable() {
+        let session = NativeSession::from_id(ProviderKind::Claude, Some("bound".into())).unwrap();
+        {
+            let lease = session.begin(ProviderKind::Claude).unwrap();
+            assert_eq!(lease.launch(), Launch::Resume { id: "bound".into() });
+            // Refused before any byte reached the CLI: dropped unfinished.
+        }
+        assert!(!session.is_uncertain(), "no prompt was submitted, nothing is uncertain");
+        let mut again = session.begin(ProviderKind::Claude).expect("writer released");
+        assert_eq!(again.launch(), Launch::Resume { id: "bound".into() });
+        again.observe("bound").unwrap();
+        again.finish().unwrap();
+        assert!(!session.is_uncertain());
+    }
+
+    #[test]
+    fn a_lease_dropped_after_submission_started_marks_the_session_uncertain() {
+        let session = NativeSession::from_id(ProviderKind::Codex, Some("bound".into())).unwrap();
+        {
+            let lease = session.begin(ProviderKind::Codex).unwrap();
+            lease.mark_submitting();
+            // The process died with the prompt partly or fully written.
+        }
+        assert!(session.is_uncertain(), "the CLI may have run the turn");
+        let blocked = session.begin(ProviderKind::Codex).err().expect("replay must be blocked");
+        assert!(blocked.to_string().contains("uncertain"), "{blocked}");
+    }
+
+    #[test]
+    fn a_lease_dropped_after_the_cli_reported_a_session_is_uncertain_even_without_submission() {
+        let session = NativeSession::new(ProviderKind::Claude).unwrap();
+        {
+            let mut lease = session.begin(ProviderKind::Claude).unwrap();
+            let Launch::Create { requested_id: Some(id) } = lease.launch() else { panic!("claude creates with an id") };
+            lease.observe(&id).unwrap();
+        }
+        assert!(session.is_uncertain());
+    }
+
+    #[test]
+    fn a_new_lease_starts_without_a_stale_submission_mark() {
+        let session = NativeSession::from_id(ProviderKind::Claude, Some("bound".into())).unwrap();
+        {
+            let mut lease = session.begin(ProviderKind::Claude).unwrap();
+            lease.mark_submitting();
+            lease.observe("bound").unwrap();
+            lease.finish().unwrap();
+        }
+        {
+            let _lease = session.begin(ProviderKind::Claude).unwrap();
+        }
+        assert!(!session.is_uncertain(), "the mark belongs to the finished turn, not the next lease");
     }
 }

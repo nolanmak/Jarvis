@@ -3736,5 +3736,33 @@
     "test_plan": "Exercise GET /oauth/google/start in a native Mac and Linux dashboard fixture, including unauthorized access.",
     "status": "unverified",
     "evidence": null
+  },
+  {
+    "id": "cli:auto-pr-worker",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Linux runs opted-in auto-ship in an independent process, retaining active work across serving-daemon updates.",
+    "macos_target": "Equivalent independent worker lifetime under launchd; current macOS deployments retain the embedded loop and serialized builds.",
+    "prerequisites": [
+      "Rust CLI",
+      "Native service manager"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1599",
+    "test_plan": "Run worker lifecycle, updater, installer and storage concurrency regressions on Linux. Implement and verify launchd handoff before claiming macOS parity.",
+    "status": "gap",
+    "evidence": null
+  },
+  {
+    "id": "unit:augmentagent-autopr.service",
+    "source": "scripts/systemd/augmentagent-autopr.service",
+    "linux_baseline": "Linux isolates auto-ship lifecycle from daemon restart with a shared aggregate resource budget.",
+    "macos_target": "Equivalent independent worker lifetime under launchd; current macOS deployments retain the embedded loop and serialized builds.",
+    "prerequisites": [
+      "Rust CLI",
+      "Native service manager"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1599",
+    "test_plan": "Run worker lifecycle, updater, installer and storage concurrency regressions on Linux. Implement and verify launchd handoff before claiming macOS parity.",
+    "status": "gap",
+    "evidence": null
   }
 ]

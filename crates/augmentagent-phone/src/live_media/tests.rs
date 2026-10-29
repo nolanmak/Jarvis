@@ -246,8 +246,9 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
             };
             let value: serde_json::Value = serde_json::from_str(&text).unwrap();
             if value["type"] == "session.input_audio.append" {
-                ws.send(Message::Text(json!({"type":"session.input_transcript.delta","event_id":"evt-request","delta":"Synthetic lookup","start_ms":0,"end_ms":20}).to_string().into())).await.unwrap();
                 ws.send(Message::Text(json!({"type":"session.delegation.created","event_id":"evt-work","offset_ms":20,"delegation":{"id":"del-work","type":"delegation","target":"client"}}).to_string().into())).await.unwrap();
+                ws.send(Message::Text(json!({"type":"session.input_transcript.delta","event_id":"evt-request","delta":"Synthetic lookup","start_ms":0,"end_ms":20}).to_string().into())).await.unwrap();
+
                 ws.send(Message::Text(
                     json!({"type":"session.output_audio.delta","delta":value["audio"]})
                         .to_string()
@@ -255,17 +256,20 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
                 ))
                 .await
                 .unwrap();
-                let reply = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                let reply: serde_json::Value =
-                    serde_json::from_str(reply.to_text().unwrap()).unwrap();
-                assert_eq!(reply["type"], "session.commentary.append");
-                assert_eq!(reply["delegation_id"], "del-work");
-                assert_eq!(reply["content"], "Synthetic lookup result");
-                ws.send(Message::Text(json!({"type":"session.commentary.appended","event_id":"evt-accepted","client_event_id":reply["event_id"],"start_ms":30,"end_ms":30}).to_string().into())).await.unwrap();
+                let expected = "Synthetic lookup result. ".repeat(35);
+                let mut received = String::new();
+                while received.len() < expected.len() {
+                    let reply = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+                    let reply: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+                    assert_eq!(reply["type"], "session.commentary.append");
+                    assert_eq!(reply["delegation_id"], "del-work");
+                    let content = reply["content"].as_str().unwrap();
+                    assert!(content.len() <= 500);
+                    assert!(!content.contains("repeat the complete request"));
+                    received.push_str(content);
+                    ws.send(Message::Text(json!({"type":"session.commentary.appended","event_id":format!("accepted-{}",received.len()),"client_event_id":reply["event_id"],"start_ms":30,"end_ms":30}).to_string().into())).await.unwrap();
+                }
+                assert_eq!(received, expected);
                 replayed_rx.await.unwrap();
                 assert!(tokio::time::timeout(
                     std::time::Duration::from_millis(200),
@@ -306,6 +310,11 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
     let frame: serde_json::Value = serde_json::from_str(text.to_text().unwrap()).unwrap();
     assert_eq!(frame["event"], "media");
     assert_eq!(frame["media"]["payload"], STANDARD.encode([255; 160]));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.service.store.phone_pending_dispatches().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     let jobs = f.service.store.phone_pending_dispatches().unwrap();
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].description.contains("Synthetic lookup"));
@@ -319,7 +328,7 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
         .unwrap();
     f.service
         .store
-        .phone_finish_dispatch(&f.id, &jobs[0].task_id, "Synthetic lookup result")
+        .phone_finish_dispatch(&f.id, &jobs[0].task_id, &"Synthetic lookup result. ".repeat(35))
         .unwrap();
     f.service
         .store

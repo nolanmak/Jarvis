@@ -66,7 +66,6 @@ impl PhoneRuntime {
         ));
         let memory = tokio::spawn(memory_worker(service.clone(), agent.clone(), stop.clone()));
         let history = tokio::spawn(history_worker(service.clone(), agent.clone(), stop.clone()));
-        let spoken_summaries = tokio::spawn(live_summary_worker(service.clone(), agent.clone(), stop.clone()));
         let proposals = tokio::spawn(proposal_worker(service.clone(), agent.clone(), stop.clone()));
         let router = crate::ingress::router(service.clone(), auth, agent);
         let listener_stop = stop.clone();
@@ -90,7 +89,7 @@ impl PhoneRuntime {
             service,
             tools,
             stop,
-            tasks: vec![http, watchdog, memory, proposals, dispatches, history, spoken_summaries],
+            tasks: vec![http, watchdog, memory, proposals, dispatches, history],
         })
     }
     pub fn tools(&self) -> &Arc<ToolServer> {
@@ -102,7 +101,7 @@ impl PhoneRuntime {
             running: self.is_running(),
             transport: self.service.voice_backend().as_str(),
             audio_model: live.then_some(crate::live_session::MODEL),
-            voice: if live { crate::live_session::VOICE.into() } else { self.service.config.voice.tts_voice().into() },
+            voice: if let Some(config) = &self.service.config.live { config.voice_label().into() } else { self.service.config.voice.tts_voice().into() },
             provider_readiness: if live { "requires_per_call_preflight" } else { "not_probed" },
         }
     }
@@ -376,33 +375,5 @@ async fn dispatch_worker(
                 let _ = agent.resume_task(&call, &job.task_id).await;
             }
         }
-    }
-}
-
-// Read-only result compression is isolated from audio, task execution, chat
-// delivery and post-call memory. A crash only replays this bounded model step.
-async fn live_summary_worker(service: Arc<PhoneService>, agent: Arc<dyn ConversationAgent>, stop: CancellationToken) -> Result<(), RuntimeError> {
-    let mut tick=tokio::time::interval(Duration::from_secs(1));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! { _=stop.cancelled()=>return Ok(()), _=tick.tick()=>{} }
-        tokio::select! {
-            _=stop.cancelled()=>return Ok(()),
-            result=service.prepare_live_summary(agent.as_ref())=>{
-                if result.is_err() { tracing::warn!("phone spoken summary retained for recovery"); }
-            }
-        }
-    }
-}
-impl PhoneService {
-    async fn prepare_live_summary(&self,agent:&dyn ConversationAgent)->Result<(),Error> {
-        let Some(job)=self.store.phone_claim_live_summary(self.clock.now_ms())? else {return Ok(());};
-        let call=self.store.phone_provider_call(&job.call_id)?;
-        if self.authorize_call(&call.id).is_err() {return Ok(());}
-        let summary=tokio::time::timeout(Duration::from_secs(15),agent.summarize_live_result(&call,&job.result)).await
-            .ok().and_then(Result::ok).filter(|text|!text.trim().is_empty() && text.len()<=500);
-        if self.authorize_call(&call.id).is_err() {return Ok(());}
-        self.store.phone_finish_live_summary(&job,summary.as_deref(),self.clock.now_ms())?;
-        Ok(())
     }
 }

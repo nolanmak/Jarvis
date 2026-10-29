@@ -290,6 +290,26 @@ retries are exhausted. For a known provider ID, use the explicit recovery comman
 investigation. Unknown-ID association remains unresolved; no retry-reset or
 manual active-slot clearing command is provided.
 
+## Abandoned GPT-Live readiness checks
+
+A GPT-Live reservation that never completed its durable preflight has not reached
+Twilio create. Maintenance (or `phone-reconcile`) can retire it after 60 seconds
+only when it is stopped, uncertain, has no provider SID or answer evidence, and
+still has an unfinished preflight receipt. Recovery seals that receipt atomically
+so a concurrent readiness probe cannot advance to dialing. OpenAI usage stays
+unknown. A successful preflight followed by an uncertain Twilio create is **not**
+covered by this recovery and still requires provider evidence.
+
+To check the production Rust TLS and Live protocol without dialing, export
+`OPENAI_API_KEY` privately and run:
+
+```sh
+./scripts/cargo-managed.sh run -p augmentagent-phone --example live_preflight
+```
+
+This silent check prints only readiness and final reported seconds; it does not
+validate PSTN audio or conversation latency.
+
 ## Explicit provider reconciliation
 
 An operator with access to the daemon database can request one bounded,
@@ -943,3 +963,22 @@ cleared marks are not played audio. The existing `scripts/phone-live-receipt.py`
 validator belongs to the separate ConversationRelay retirement gate (#1496).
 It does not validate this GPT-Live gate, and a passing legacy receipt must not
 be used to claim GPT-Live qualification.
+
+### Live task handoff (#1620)
+
+Live transcript deltas are fragments, often individual words. The handoff keeps
+up to 512 fragments / 64 KB and joins adjacent same-role fragments into the
+12 KB native task envelope. A delegation timestamp does not cut a complete
+fragment in half. Already-consumed speech is context, never a second task.
+When metadata arrives before the transcript, the audio loop waits up to two
+seconds for missing text and allows 250 ms of transcript settling before dispatch.
+Absent or genuinely lost context starts no task.
+
+Completed native results no longer require a second model call to become spoken.
+Results up to 64 KB are returned as ordered commentary pieces, each at most
+500 UTF-8 bytes, preferring sentence/whitespace boundaries. Each piece waits for
+its matching provider acceptance before advancing; only the final acceptance
+marks the voice result delivered. Provider acceptance is not proof of playback.
+The original chat result is unchanged. Oversized results receive an explicit
+voice-limit notice; they are never silently truncated. Legacy summary-job tables
+remain readable for rollback compatibility but the Live summary worker is retired.

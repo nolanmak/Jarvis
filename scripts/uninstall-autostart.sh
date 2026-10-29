@@ -43,6 +43,18 @@ uninstall_linux() {
     return
   fi
 
+  # The worker intentionally survives daemon restarts, but an explicit
+  # uninstall must stop it too. Preserve user-managed units and drop-ins.
+  local managed
+  for managed in augmentagent-autopr.service augmentagent-runtime.slice augmentagent.service.d/autoship-worker.conf; do
+    if [ -f "$UNIT_DIR/$managed" ] && head -1 "$UNIT_DIR/$managed" | grep -qx '# Managed by ensure-autopr-worker.sh'; then
+      if [ "$managed" = augmentagent-autopr.service ]; then
+        systemctl --user disable --now "$managed" || true
+      fi
+      rm "$UNIT_DIR/$managed"
+    fi
+  done
+
   if systemctl --user list-unit-files "$UNIT_NAME" 2>/dev/null | grep -q "$UNIT_NAME"; then
     log "Stopping + disabling $UNIT_NAME"
     systemctl --user disable --now "$UNIT_NAME" || true

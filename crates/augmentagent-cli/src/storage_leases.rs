@@ -32,7 +32,7 @@ impl Drop for Held {
 #[derive(Default)]
 pub struct TargetLeases(Vec<Held>);
 
-fn lock_directory() -> Result<PathBuf> {
+pub(crate) fn lock_directory() -> Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     let runtime = PathBuf::from(format!("/run/user/{uid}"));
     let base = if std::fs::metadata(&runtime).is_ok_and(|m| m.is_dir() && m.uid() == uid) {
@@ -108,6 +108,10 @@ impl TargetLeases {
             );
         }
         Self::try_paths(paths, held)
+    }
+
+    pub fn try_release_root(root: &Path) -> Result<Option<Self>> {
+        Self::try_paths(vec![(root.to_path_buf(), true), (root.join("release"), false)], None)
     }
 
     fn try_paths(paths: Vec<(PathBuf, bool)>, held: Option<&Self>) -> Result<Option<Self>> {

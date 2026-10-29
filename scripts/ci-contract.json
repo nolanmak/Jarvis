@@ -578,7 +578,7 @@
       ]
     },
     "platform/platform/4": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\nbash scripts/tests/service-restart.test.sh\n",
+      "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: storage_reservations:: autoship_worker:: worker_upgrade_waits_for_the_run storage_contention_is_infrastructure autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/update-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/auto_pr_worker_status_test.py\npython3 scripts/tests/autopr_worker_install_test.py\nbash scripts/tests/update-build.test.sh\nbash scripts/tests/service-restart.test.sh\n",
       "shell": "bash"
     },
     "platform/platform/5": {

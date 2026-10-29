@@ -144,8 +144,11 @@ async fn missing_context_requests_clarification_without_creating_work() {
     let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
     assert!(matches!(
         call.event(&delegation()).unwrap(),
-        LiveAction::Clarify { .. }
+        LiveAction::None
     ));
+    assert!(f.store.phone_pending_dispatches().unwrap().is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+    assert!(matches!(call.poll_delegations().unwrap(), LiveAction::Clarify { .. }));
     assert!(f.store.phone_pending_dispatches().unwrap().is_empty());
 }
 #[tokio::test]
@@ -311,7 +314,7 @@ async fn transcript_delivery_retries_off_audio_path_and_survives_call_end() {
 }
 
 #[tokio::test]
-async fn long_result_is_summarized_outside_audio_and_full_chat_result_is_preserved() {
+async fn long_result_reaches_voice_without_a_summary_model_and_full_chat_result_is_preserved() {
     use augmentagent_phone::ingress::{AgentError, ConversationAgent, SpeechSender};
     use augmentagent_store::phone::PhoneCall;
     use tokio_util::sync::CancellationToken;
@@ -336,8 +339,8 @@ async fn long_result_is_summarized_outside_audio_and_full_chat_result_is_preserv
             _: &PhoneCall,
             result: &str,
         ) -> Result<String, AgentError> {
-            assert_eq!(result, "Detailed result. ".repeat(100));
-            Ok("Three options are available; the full comparison is in chat.".into())
+            let _ = result;
+            panic!("completed results must not depend on a second model call");
         }
     }
     let mut f = fixture_with_agent(Some(Arc::new(Agent))).await;
@@ -350,21 +353,21 @@ async fn long_result_is_summarized_outside_audio_and_full_chat_result_is_preserv
     f.store
         .phone_finish_dispatch(&f.id, &task_id, &full)
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(4), async {
-        loop {
-            let results = call.pending_results().unwrap();
-            if !results.is_empty() {
-                assert_eq!(
-                    results[0].result,
-                    "Three options are available; the full comparison is in chat."
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("separate worker must summarize completed results");
+    let mut received = String::new();
+    for n in 0..100 {
+        let results = call.pending_results().unwrap();
+        if results.is_empty() { break; }
+        let part = &results[0];
+        assert!(part.result.len() <= 500);
+        received.push_str(&part.result);
+        let event = format!("reply-{n}");
+        call.track_reply(&event, &part.delegation_id).unwrap();
+        call.event(&LiveInput::CommentaryAccepted { client_event_id:event.clone() }).unwrap();
+        call.event(&LiveInput::CommentaryAccepted { client_event_id:event }).unwrap();
+        if received != full { assert!(!call.pending_results().unwrap().is_empty()); }
+    }
+    assert_eq!(received, full, "voice receives every result part without a summary call");
+    assert!(call.pending_results().unwrap().is_empty());
     assert_eq!(
         f.store.phone_pending_dispatches().unwrap()[0]
             .result
@@ -417,4 +420,82 @@ async fn incomplete_history_notice_retries_same_key_then_stops() {
     assert!(attempts[0].1.contains("incomplete"));
     assert!(f.store.phone_live_history_notices().unwrap().is_empty());
     assert!(f.store.phone_live_history_incomplete(&f.id).unwrap(), "warning delivery cannot make history complete");
+}
+
+#[tokio::test]
+async fn delegation_waits_for_late_transcript_without_repeat_or_duplicate_task() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    assert!(matches!(call.event(&delegation()).unwrap(),LiveAction::None));
+    assert!(f.store.phone_pending_dispatches().unwrap().is_empty());
+    assert!(matches!(call.event(&transcript()).unwrap(),LiveAction::None));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(matches!(call.poll_delegations().unwrap(),LiveAction::Queued {..}));
+    assert_eq!(f.store.phone_pending_dispatches().unwrap().len(),1);
+    assert!(matches!(call.poll_delegations().unwrap(),LiveAction::None));
+}
+
+#[tokio::test]
+async fn unicode_result_parts_require_each_ack_and_preserve_failures() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    call.event(&transcript()).unwrap();
+    let LiveAction::Queued {task_id} = call.event(&delegation()).unwrap() else {panic!("task expected")};
+    let full = format!("{} The email was NOT sent. Approval is required.", "Résumé café 🐕. ".repeat(100));
+    f.store.phone_finish_dispatch(&f.id,&task_id,&full).unwrap();
+    let mut received = String::new();
+    for n in 0..128 {
+        let parts = call.pending_results().unwrap();
+        if parts.is_empty() {break;}
+        let part = &parts[0];
+        assert!(part.result.len() <= 500 && !part.result.is_empty());
+        received.push_str(&part.result);
+        let event = format!("part-{n}");
+        call.track_reply(&event,&part.delegation_id).unwrap();
+        assert!(call.reply_pending(&part.delegation_id));
+        call.event(&LiveInput::CommentaryAccepted {client_event_id:"wrong".into()}).unwrap();
+        assert_eq!(call.pending_results().unwrap()[0].result,part.result);
+        assert!(call.track_reply("overlap",&part.delegation_id).is_err());
+        call.event(&LiveInput::CommentaryAccepted {client_event_id:event}).unwrap();
+        assert!(!call.reply_pending(&part.delegation_id));
+    }
+    assert_eq!(received,full);
+    assert!(call.pending_results().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fragmented_request_crossing_delegation_boundary_queues_one_complete_task() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    let mut full = String::new();
+    for i in 0..80 {
+        let text = format!(" word{i}");
+        full.push_str(&text);
+        call.event(&LiveInput::Transcript {
+            event_id:format!("word-{i}"),user:true,text,
+            start_ms:(i*10) as f64,end_ms:((i+1)*10) as f64,
+        }).unwrap();
+    }
+    assert!(matches!(call.event(&LiveInput::Delegation {id:"full-request".into(),offset_ms:795.}).unwrap(),LiveAction::Queued {..}));
+    let jobs = f.store.phone_pending_dispatches().unwrap();
+    assert_eq!(jobs.len(),1);
+    assert!(jobs[0].description.contains(&full));
+}
+
+#[tokio::test]
+async fn late_word_fragments_settle_before_starting_a_task() {
+    let f = fixture().await;
+    tokio::time::pause();
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    assert!(matches!(call.event(&delegation()).unwrap(),LiveAction::None));
+    call.event(&LiveInput::Transcript {event_id:"first".into(),user:true,text:"Check".into(),start_ms:0.,end_ms:40.}).unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
+    assert!(matches!(call.poll_delegations().unwrap(),LiveAction::None));
+    call.event(&LiveInput::Transcript {event_id:"last".into(),user:true,text:" my calendar.".into(),start_ms:40.,end_ms:100.}).unwrap();
+    assert!(f.store.phone_pending_dispatches().unwrap().is_empty());
+    tokio::time::advance(std::time::Duration::from_millis(300)).await;
+    assert!(matches!(call.poll_delegations().unwrap(),LiveAction::Queued {..}));
+    let jobs = f.store.phone_pending_dispatches().unwrap();
+    assert_eq!(jobs.len(),1);
+    assert!(jobs[0].description.contains("Check my calendar."));
 }

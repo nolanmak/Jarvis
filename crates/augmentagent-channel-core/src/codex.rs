@@ -359,9 +359,11 @@ impl CodexCliReasoner {
             Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, Some(&bridge), native_launch.as_ref())?)
         } else { None };
         if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
+        // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
+        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
         let spawned = match &native_vm {
             Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref(), &vm.resource_policy),
-            None => crate::process_tree::spawn_admitted(&cmd, true, clean, opts.handoff_path.as_deref(), false),
+            None => crate::process_tree::spawn_admitted_with_policy(&cmd, true, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
         };
         let (mut child, process_group) = spawned.map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -381,6 +383,8 @@ impl CodexCliReasoner {
         process_group.admit_model(provider,launch_audit.as_ref()).await?;
 
         if let Some(mut stdin) = child.stdin.take() {
+            // #1626 — from the first byte on, the CLI may have the turn.
+            if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
             if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }

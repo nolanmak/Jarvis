@@ -120,7 +120,7 @@ impl Settings {
             crate::live_config::VoiceBackend::OpenAiLive => Some(
                 crate::live_config::LiveConfig::new(
                     get("OPENAI_API_KEY").ok_or(Error::InvalidSetting("OPENAI_API_KEY"))?,
-                )?,
+                )?.with_voice(crate::live_voice::LiveVoice::from_lookup(&get)?),
             ),
         };
         let voice = if live.is_some() {

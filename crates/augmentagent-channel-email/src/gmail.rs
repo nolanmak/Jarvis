@@ -799,7 +799,7 @@ impl ComposioClient {
         })
     }
 
-    /// `create_draft` with an optional uploaded attachment (#417) and
+    /// `create_draft` with zero or more uploaded attachments (#417) and
     /// optional cc/bcc lists (#439). Inherent (not on the `GmailApi` trait)
     /// so test fakes and the triage channel — which never attach or cc —
     /// stay untouched.
@@ -818,16 +818,16 @@ impl ComposioClient {
         subject: &str,
         body: &str,
         thread_id: Option<&str>,
-        attachment: Option<&Attachment>,
+        attachments: &[Attachment],
         cc: &[String],
         bcc: &[String],
     ) -> Result<String, GmailError> {
         if let Some(route) = self.google_route(entity_id) {
             let (g, email) = route?;
-            let local = match attachment {
-                Some(att) => Some(local_attachment(att)?),
-                None => None,
-            };
+            let local = attachments
+                .iter()
+                .map(local_attachment)
+                .collect::<Result<Vec<_>, _>>()?;
             return g
                 .create_draft(
                     &email,
@@ -838,7 +838,7 @@ impl ComposioClient {
                         subject,
                         body,
                         thread_id,
-                        attachment: local.as_ref(),
+                        attachments: &local,
                     },
                 )
                 .await;
@@ -866,7 +866,16 @@ impl ComposioClient {
         if let Some(t) = thread_id {
             args["thread_id"] = serde_json::Value::String(t.to_string());
         }
-        if let Some(att) = attachment {
+        if attachments.len() > 1 {
+            // GMAIL_CREATE_EMAIL_DRAFT's `attachment` argument is a single
+            // object; dropping the rest silently would send less than asked.
+            return Err(GmailError::Invalid(format!(
+                "{} attachments requested, but a Composio-connected mailbox can carry only one; \
+                 connect this mailbox through the direct Google client (#1584) to send several",
+                attachments.len()
+            )));
+        }
+        if let Some(att) = attachments.first() {
             let att = self.ensure_uploaded(att).await?;
             args["attachment"] = serde_json::json!({
                 "name": att.name,
@@ -897,16 +906,16 @@ impl ComposioClient {
         subject: &str,
         body: &str,
         thread_id: Option<&str>,
-        attachment: Option<&Attachment>,
+        attachments: &[Attachment],
         cc: &[String],
         bcc: &[String],
     ) -> Result<String, GmailError> {
         if let Some(route) = self.google_route(entity_id) {
             let (g, email) = route?;
-            let local = match attachment {
-                Some(att) => Some(local_attachment(att)?),
-                None => None,
-            };
+            let local = attachments
+                .iter()
+                .map(local_attachment)
+                .collect::<Result<Vec<_>, _>>()?;
             return g
                 .update_draft(
                     &email,
@@ -918,14 +927,14 @@ impl ComposioClient {
                         subject,
                         body,
                         thread_id,
-                        attachment: local.as_ref(),
+                        attachments: &local,
                     },
                 )
                 .await;
         }
         let new_id = self
             .create_draft_with_attachment(
-                entity_id, to, subject, body, thread_id, attachment, cc, bcc,
+                entity_id, to, subject, body, thread_id, attachments, cc, bcc,
             )
             .await?;
         if let Err(e) = self.delete_draft(entity_id, draft_id).await {
@@ -2071,7 +2080,7 @@ mod tests {
                 "subj",
                 "body",
                 None,
-                None,
+                &[],
                 &["cc1@x.example.com,cc2@y.example.com".into()],
                 &["hidden@z.example.com".into()],
             )
@@ -3401,7 +3410,7 @@ impl GmailApi for ComposioClient {
         // Full logic (incl. the multi-recipient split for `recipient_email` /
         // `extra_recipients`, #439) lives in the inherent attachment-aware
         // variant (#417).
-        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None, &[], &[])
+        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, &[], &[], &[])
             .await
     }
 
@@ -3414,7 +3423,7 @@ impl GmailApi for ComposioClient {
         body: &str,
         thread_id: Option<&str>,
     ) -> Result<String, GmailError> {
-        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None, cc, &[])
+        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, &[], cc, &[])
             .await
     }
 
@@ -3469,7 +3478,7 @@ impl GmailApi for ComposioClient {
         // Google has a real `drafts.update`; Composio keeps the trait's
         // create-then-delete default. Both land in the inherent variant.
         self.update_draft_with_attachment(
-            entity_id, draft_id, to, subject, body, thread_id, None, &[], &[],
+            entity_id, draft_id, to, subject, body, thread_id, &[], &[], &[],
         )
         .await
     }

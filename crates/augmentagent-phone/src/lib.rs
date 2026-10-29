@@ -672,6 +672,9 @@ impl PhoneService {
                 self.store.phone_request_stop(&call.owner, &call.id)?;
                 if call.provider_sid.is_none() {
                     self.store.phone_mark_uncertain(&call.id)?;
+                    if self.store.phone_recover_abandoned_preflight(&call.id, now)? {
+                        continue;
+                    }
                 }
             }
             let mut inflight = self
@@ -848,6 +851,7 @@ pub mod live_context;
 pub mod live_call;
 
 pub mod live_config;
+pub mod live_voice;
 
 mod live_media;
 

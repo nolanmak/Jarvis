@@ -27,7 +27,7 @@ def refusal_receipt(error):
     """Never serialize error strings, filenames, policy bodies or traceback."""
     receipt={'phase':'admission_failed','exhausted':True,'refusal_code':'admission_setup_failed'}
     codes={'host_headroom','aggregate_reservations','ancestor_headroom','declared_ceiling','invalid_policy'}
-    fields={'requested_bytes','reserved_bytes','current_bytes','limit_bytes','available_bytes',
+    fields={'requested_bytes','reserved_bytes','current_bytes','reclaimable_bytes','limit_bytes','available_bytes',
             'reservation_slack_bytes','margin_bytes','required_bytes','requested_pids','limit_pids',
             'requested_cpu_percent','limit_cpu_quota','limit_cpu_period','memory_bytes','pids',
             'cpu_percent','minimum','maximum'}
@@ -72,9 +72,29 @@ def available_memory():
     raise RuntimeError('host available memory unavailable')
 
 
+def reclaimable(group):
+    """Clean page cache the kernel drops before it would OOM this group.
+
+    Run cgroups are removed after cleanup, and their page cache is reparented
+    to the service, where it lingers as `inactive_file`. Counting it as a
+    reservation refused model calls on a near-idle daemon (3.3 GiB of cache
+    beside a 278 MB daemon leaf). memory.stat is hierarchical; a group
+    without one (not yet accounted) has nothing to subtract.
+    """
+    try:
+        for line in (group / 'memory.stat').read_text().splitlines():
+            key, _, value = line.partition(' ')
+            if key == 'inactive_file':
+                return int(value)
+    except FileNotFoundError:
+        pass
+    return 0
+
+
 def headroom(parent, requested, host_available):
     # Reserve each admitted run's full ceiling, including idle preflight runs.
     # Unremoved groups remain reserved until verified descendant cleanup.
+    # Usage excludes reclaimable cache: it yields to a new run's allocations.
     reserved = 0
     current = 0
     for child in parent.iterdir():
@@ -82,6 +102,7 @@ def headroom(parent, requested, host_available):
             continue
         try:
             usage = int((child / 'memory.current').read_text().strip())
+            usage = max(0, usage - reclaimable(child))
             if child.name.startswith('run-'):
                 reserved += finite(child / 'memory.max')
                 current += usage
@@ -92,14 +113,17 @@ def headroom(parent, requested, host_available):
             if child.exists():
                 raise RuntimeError('aggregate sibling resource accounting unavailable')
     aggregate_current = int((parent / 'memory.current').read_text().strip())
+    cache = reclaimable(parent)
+    aggregate_charged = max(0, aggregate_current - cache)
     # Include kernel charges not visible in child accounting.
-    reserved += max(0, aggregate_current - current)
+    reserved += max(0, aggregate_charged - current)
     needed = reserved + requested
     limit=finite(parent / 'memory.max')
     if needed > limit:
         raise AdmissionRefused('aggregate_reservations','aggregate memory reservations exhausted',
-                               requested_bytes=requested,reserved_bytes=reserved,current_bytes=aggregate_current,limit_bytes=limit)
-    slack = max(0, reserved - aggregate_current)
+                               requested_bytes=requested,reserved_bytes=reserved,current_bytes=aggregate_current,
+                               reclaimable_bytes=cache,limit_bytes=limit)
+    slack = max(0, reserved - aggregate_charged)
     if requested + slack + 256 * 1024**2 > host_available:
         raise AdmissionRefused('host_headroom','host memory headroom unavailable',
                                requested_bytes=requested,reservation_slack_bytes=slack,margin_bytes=256*1024**2,
@@ -109,6 +133,7 @@ def headroom(parent, requested, host_available):
         limit = (ancestor / 'memory.max').read_text().strip()
         if limit != 'max':
             usage=int((ancestor / 'memory.current').read_text().strip())
+            usage=max(0, usage - reclaimable(ancestor))
             if requested + slack > int(limit) - usage:
                 raise AdmissionRefused('ancestor_headroom','ancestor memory headroom unavailable',
                                        requested_bytes=requested,reservation_slack_bytes=slack,current_bytes=usage,limit_bytes=int(limit))
@@ -117,22 +142,78 @@ def headroom(parent, requested, host_available):
             'host_available_bytes': host_available, 'host_margin_bytes': 256 * 1024**2}
 
 
-@contextlib.contextmanager
-def reserve(parent, requested):
-    # cgroup directory inode is a common controller-only lock; no writable
-    # sidecar or age/PID based cleanup can release another live reservation.
-    descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+# Refusals that a finishing run or dropped cache can resolve. A declared
+# ceiling above the service limit, or an invalid policy, never will.
+TRANSIENT_REFUSALS = {'aggregate_reservations', 'host_headroom', 'ancestor_headroom'}
+# How long a run waits for capacity before refusing. process_tree.rs
+# (ADMISSION_WAIT_SECS) extends its launch-ready deadline by the same amount.
+ADMISSION_WAIT_SECONDS = 120
+
+
+def shortfall(refusal):
+    facts = refusal.facts
+    if refusal.code == 'aggregate_reservations':
+        return facts['reserved_bytes'] + facts['requested_bytes'] - facts['limit_bytes']
+    if refusal.code == 'host_headroom':
+        return facts['required_bytes'] - facts['available_bytes']
+    if refusal.code == 'ancestor_headroom':
+        return (facts['requested_bytes'] + facts['reservation_slack_bytes']
+                - (facts['limit_bytes'] - facts['current_bytes']))
+    return 0
+
+
+def reclaim_cache(group, wanted):
+    """Ask the kernel to drop up to `wanted` bytes of this group's page cache.
+
+    swappiness=0 restricts reclaim to file pages, so the daemon's own working
+    memory is never pushed to swap to make room. Best-effort: the kernel
+    returns EAGAIN when it reclaimed less than asked.
+    """
+    if wanted <= 0:
+        return
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        # systemd delegates controllers but an unused subtree need not have
-        # enabled them yet. Child memory.current appears only after enablement.
-        # Do this inside the same admission lock, before reading sibling usage.
-        (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
-        if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
-            raise RuntimeError('delegated controllers failed readback')
-        yield headroom(parent, requested, available_memory())
-    finally:
-        os.close(descriptor)
+        (group / 'memory.reclaim').write_text(f'{wanted} swappiness=0')
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def reserve(parent, requested, wait_seconds=ADMISSION_WAIT_SECONDS, sleep=time.sleep):
+    # A transient refusal first drops reclaimable cache, then waits (lock
+    # released) for a sibling run to finish, re-checking with backoff. Only
+    # a refusal that outlasts the wait reaches the caller.
+    deadline = time.monotonic() + wait_seconds
+    delay = 0.25
+    reclaimed = False
+    while True:
+        # cgroup directory inode is a common controller-only lock; no writable
+        # sidecar or age/PID based cleanup can release another live reservation.
+        descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            # systemd delegates controllers but an unused subtree need not have
+            # enabled them yet. Child memory.current appears only after enablement.
+            # Do this inside the same admission lock, before reading sibling usage.
+            (parent/'cgroup.subtree_control').write_text('+cpu +memory +pids')
+            if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
+                raise RuntimeError('delegated controllers failed readback')
+            try:
+                proof = headroom(parent, requested, available_memory())
+            except AdmissionRefused as refusal:
+                if refusal.code not in TRANSIENT_REFUSALS or time.monotonic() >= deadline:
+                    raise
+                missing = shortfall(refusal)
+            else:
+                yield proof
+                return
+        finally:
+            os.close(descriptor)
+        if not reclaimed:
+            reclaimed = True
+            reclaim_cache(parent, missing)
+            continue
+        sleep(delay)
+        delay = min(delay * 2, 5.0)
 
 
 class RunScope:

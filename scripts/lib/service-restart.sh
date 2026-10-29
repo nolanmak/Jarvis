@@ -300,8 +300,22 @@ PY
 
 # Is a self-improve run holding the lock right now?
 self_improve_run_in_flight() {
-  [ -e "$SELF_IMPROVE_LOCK" ] || return 1
-  lock_is_held "$SELF_IMPROVE_LOCK"
+  local lane
+  for lane in "$SELF_IMPROVE_LOCK" "${SELF_IMPROVE_LOCK%.lock}-resume.lock"; do
+    if [ -e "$lane" ] && lock_is_held "$lane"; then return 0; fi
+  done
+  return 1
+}
+
+external_autopr_isolated() {
+  [ "$(uname -s)" = Linux ] || return 1
+  systemctl --user is-active --quiet augmentagent-autopr.service 2>/dev/null || return 1
+  local checker="${REPO_ROOT:-.}/scripts/auto-pr-worker-status.py"
+  [ -f "$checker" ] || return 1
+  python3 "$checker" --state "$AUGMENTAGENT_STATE_DIR" \
+    --daemon "$(unit_main_pid augmentagent.service)" \
+    --worker "$(unit_main_pid augmentagent-autopr.service)" \
+    --lock "$SELF_IMPROVE_LOCK" --lock "${SELF_IMPROVE_LOCK%.lock}-resume.lock" 2>/dev/null
 }
 
 # Should this restart be deferred? 0 = defer (a run owns the lock);
@@ -310,6 +324,11 @@ self_improve_run_in_flight() {
 maybe_defer_restart() {
   if ! self_improve_run_in_flight; then
     rm -f "$RESTART_DEFER_STAMP"
+    return 1
+  fi
+  if external_autopr_isolated; then
+    rm -f "$RESTART_DEFER_STAMP"
+    _sr_log "auto-ship is running in its independent worker; daemon deployment can proceed"
     return 1
   fi
   local now since
