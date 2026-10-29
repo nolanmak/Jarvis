@@ -82,14 +82,51 @@ with b.CommandStorage(json.loads(sys.argv[2]),sys.argv[3]):
         self.assertEqual(output.strip(), 'admitted')
         self.assertEqual(child.returncode, 0)
 
+    def test_update_first_blocks_native_until_update_finishes(self):
+        update = os.open(self.root / 'disk-update.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(update, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code = """import importlib.util,json,sys
+s=importlib.util.spec_from_file_location('bridge',sys.argv[1]);b=importlib.util.module_from_spec(s);s.loader.exec_module(b)
+print('starting',flush=True)
+with b.CommandStorage(json.loads(sys.argv[2]),sys.argv[3]):
+ print('admitted',flush=True)
+"""
+        child = subprocess.Popen([sys.executable, '-c', code, str(SCRIPTS / 'codex-tool-bridge.py'), json.dumps(self.config), str(self.root)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'starting')
+            time.sleep(0.15)
+            self.assertIsNone(child.poll())
+            self.assertTrue(self.available(), 'native cannot take build lock ahead of updater exclusion')
+            os.close(update); update = None
+            output, _ = child.communicate(timeout=5)
+            self.assertEqual(output.strip(), 'admitted')
+            self.assertEqual(child.returncode, 0)
+        finally:
+            if update is not None: os.close(update)
+            if child.poll() is None: child.kill(); child.wait()
+
+    def test_native_first_excludes_updater_and_rejects_unsafe_update_lock(self):
+        path = self.root / 'disk-update.lock'
+        with bridge.CommandStorage(self.config, self.root):
+            with open(path, 'r+') as update:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(update, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(path, 'r+') as update:
+            fcntl.flock(update, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        path.unlink(); path.symlink_to(self.root / 'other')
+        with self.assertRaises(OSError):
+            with bridge.CommandStorage(self.config, self.root): self.fail('unsafe lock admitted')
+        self.assertTrue(self.available())
+
     def test_cancellation_keeps_lock_until_detached_descendants_reaped(self):
         receipt = self.root / 'cleanup'
         pids = self.root / 'pids'
         worker = self.root / 'worker.py'
         worker.write_text('import os,time,sys\npid=os.fork()\nif pid==0:\n os.setsid()\n time.sleep(60)\nelse:\n open(sys.argv[1],"w").write(str(os.getpid())+" "+str(pid))\n time.sleep(60)\n')
         storage = bridge.CommandStorage(self.config, self.root).__enter__()
-        env = {'PATH': os.defpath, 'JARVIS_STORAGE_LEASE_FD': str(storage.fd)}
-        supervisor = subprocess.Popen([sys.executable, '-I', str(SCRIPTS / 'provider-supervisor.py'), str(receipt), sys.executable, str(worker), str(pids)], env=env, pass_fds=(storage.fd,))
+        env = {'PATH': os.defpath, 'JARVIS_STORAGE_LEASE_FD': str(storage.fd),
+               'JARVIS_STORAGE_LEASE_FDS': ','.join(map(str, storage.fds))}
+        supervisor = subprocess.Popen([sys.executable, '-I', str(SCRIPTS / 'provider-supervisor.py'), str(receipt), sys.executable, str(worker), str(pids)], env=env, pass_fds=tuple(storage.fds))
         try:
             deadline = time.monotonic() + 5
             while not pids.exists() and time.monotonic() < deadline:
@@ -98,10 +135,15 @@ with b.CommandStorage(json.loads(sys.argv[2]),sys.argv[3]):
             descendants = [int(pid) for pid in pids.read_text().split()]
             storage.__exit__()
             self.assertFalse(self.available(), 'closing bridge FD must not unlock the live subtree')
+            with open(self.root / 'disk-update.lock', 'r+') as update:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(update, fcntl.LOCK_EX | fcntl.LOCK_NB)
             supervisor.terminate()
             supervisor.wait(timeout=8)
             self.assertEqual(receipt.read_text(), 'all-descendants-reaped\n')
             self.assertTrue(all(not Path(f'/proc/{pid}').exists() for pid in descendants))
+            with open(self.root / 'disk-update.lock', 'r+') as update:
+                fcntl.flock(update, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertTrue(self.available())
         finally:
             storage.__exit__()
