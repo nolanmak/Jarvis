@@ -124,7 +124,12 @@ The same pass retires registered Autoship worktrees under
 resume, and per-PR run locks, requires HEAD to be reachable from `origin/main`,
 and requires a clean tracked, untracked, and ignored-file inventory. Git locks,
 process references (including working directories), and unavailable evidence
-keep the checkout. Removal uses `git worktree remove` without force and retains
+keep the checkout. Compiler inventory and readable process status/command lines
+are mandatory. For these reproducible resources only, permission-denied
+ptrace handles (`exe`, `cwd`, `fd`) from non-dumpable login/key agents are
+optional; otherwise normal SSH sessions would freeze all cleanup. Visible
+references still protect resources, and rollback snapshot retention retains
+its stricter all-reference policy. Removal uses `git worktree remove` without force and retains
 branches. External or unrecognized worktrees, unmerged commits (including
 squash-merged heads without ancestry proof), dirty work, and ignored private
 files are preserved; a deleted remote branch alone is not proof of safety.

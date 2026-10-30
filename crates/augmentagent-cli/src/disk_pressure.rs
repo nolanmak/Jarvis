@@ -39,7 +39,7 @@ pub fn reclaim(
     free_bytes: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<Vec<RootReport>> {
     let procs = crate::disk::build_procs();
-    let mut refs = crate::snapshot_refs::collect();
+    let mut refs = crate::snapshot_refs::collect_rebuildable();
     // Worktree retention must also see compilers owned by other users and
     // refuse when build-process evidence is incomplete.
     if let Some(procs) = &procs {
