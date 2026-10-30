@@ -26,6 +26,7 @@ pub struct Lease {
     targets: crate::storage_leases::TargetLeases,
     reservation: Option<crate::storage_reservations::Reservation>,
     ci_update_exclusion: Option<std::fs::File>,
+    exported: std::sync::atomic::AtomicBool,
 }
 impl Lease {
     /// Duplicates share the flock open description; unlike /proc reopening,
@@ -39,6 +40,7 @@ impl Lease {
         if let Some(reservation) = &self.reservation {
             files.push(reservation.inherited_file()?);
         }
+        self.exported.store(true, std::sync::atomic::Ordering::Release);
         Ok(files)
     }
 
@@ -85,6 +87,7 @@ impl Lease {
                 file: f,
                 targets: Default::default(),
                 ci_update_exclusion: None,
+                exported: std::sync::atomic::AtomicBool::new(false),
                 reservation: Some(crate::storage_reservations::Reservation::new(&admission, state, update)?),
             }))
         } else {
@@ -119,7 +122,15 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.targets = Default::default();
         self.reservation.take();
-        // Exported workers retain the global lock until their descriptors close.
+        // Unrelated fork/exec children can briefly inherit CLOEXEC descriptors.
+        // They must not extend private lock ownership. Intentional worker export
+        // instead retains the shared descriptions until all descendants close.
+        if !self.exported.load(std::sync::atomic::Ordering::Acquire) {
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN); }
+            if let Some(exclusion) = &self.ci_update_exclusion {
+                unsafe { libc::flock(exclusion.as_raw_fd(), libc::LOCK_UN); }
+            }
+        }
     }
 }
 
@@ -1441,6 +1452,23 @@ mod inherited_ci_storage_tests {
     use std::process::{Command, Stdio};
 
     #[test]
+    fn incidental_descriptors_do_not_extend_private_build_or_ci_exclusion() {
+        let state = tempfile::tempdir().unwrap();
+        let exclusion = ci_update_exclusion(state.path()).unwrap();
+        let mut lease = Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion = Some(exclusion);
+        // dup reproduces a fork-inherited open description without race timing.
+        let incidental_global = lease.file.try_clone().unwrap();
+        let incidental_update = lease.ci_update_exclusion.as_ref().unwrap().try_clone().unwrap();
+        assert!(Lease::try_at(state.path()).unwrap().is_none());
+        assert!(ci_update_exclusion(state.path()).is_err());
+        drop(lease);
+        assert!(Lease::try_at(state.path()).unwrap().is_some());
+        assert!(ci_update_exclusion(state.path()).is_ok());
+        drop((incidental_global, incidental_update));
+    }
+
+    #[test]
     fn ci_update_exclusion_is_nonblocking_and_exported_until_worker_closes() {
         let state = tempfile::tempdir().unwrap();
         let updater = Lease::try_kind_at(state.path(), true).unwrap().unwrap();
@@ -1456,7 +1484,14 @@ mod inherited_ci_storage_tests {
         assert!(Lease::try_kind_at(state.path(), true).unwrap().is_none(),
             "controller Drop cannot release worker's updater exclusion");
         drop(worker);
-        assert!(Lease::try_kind_at(state.path(), true).unwrap().is_some());
+        // Intentional export must remain close-only; an unrelated concurrent
+        // fork can retain these descriptors briefly until its exec completes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if Lease::try_kind_at(state.path(), true).unwrap().is_some() { break; }
+            assert!(std::time::Instant::now() < deadline, "exported updater exclusion did not release");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
