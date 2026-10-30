@@ -624,7 +624,7 @@ augmentagent calendar rsvp --event-id <event_id> --response accepted
 - For a recurring meeting add `--series true` to answer every occurrence; otherwise only that one occurrence is answered.
 - `--account <email>` picks the account when the same invite is on several; by default the first account that has it is used.
 - An error that the user "organizes this event" means there is nothing to answer — the organizer is already going.
-- Auto-accept may be on (`calendar status` shows it): the calendar poll then accepts new invites by itself (tentative when they clash) and posts a notice with a Decline button. If the user asks whether an invite was handled, check `my_response` rather than assuming.
+- Auto-accept is on by default (`calendar status` shows it per account; `calendar set-auto-accept --on false` turns it off): the calendar poll then accepts new invites by itself (tentative when they clash) and posts a notice with a Decline button. If the user asks whether an invite was handled, check `my_response` rather than assuming.
 
 ## Filing GitHub issues
 
