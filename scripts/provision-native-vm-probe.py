@@ -69,6 +69,17 @@ def copy_base_runtime(base, destination, records):
     return set(manifest.get('packages', []))
 
 
+def native_companions(native):
+    native = Path(native).resolve()
+    if native.name != 'codex':
+        return []
+    companion = native.with_name('codex-code-mode-host')
+    info = companion.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or not info.st_mode & 0o111 or info.st_size > 128 * 1024**2:
+        raise ValueError('Codex code-mode companion is not a trusted executable')
+    return [companion]
+
+
 def stage_runtime(destination, native, bases=()):
     python = Path(sys.executable).resolve()
     if not str(python).startswith('/usr/bin/python3.'):
@@ -84,12 +95,15 @@ def stage_runtime(destination, native, bases=()):
                 continue
             if path.is_file() and (path == python or path.is_relative_to(stdlib)):
                 sources.add(path)
-    binaries = [python, Path(native).resolve(), *[path for path in sources if '.so' in path.name]]
+    companions = native_companions(native)
+    binaries = [python, Path(native).resolve(), *companions, *[path for path in sources if '.so' in path.name]]
     for binary in binaries:
         sources.update(dependencies(binary))
     destination.mkdir(mode=0o700)
     records = {}
+    companion_manifest = {}
     for base in bases:
+        companion_manifest.update(json.loads((Path(base) / 'manifest.json').read_text()).get('native_companions', {}))
         packages.update(copy_base_runtime(base, destination, records))
     for source in sorted(sources):
         canonical = source.resolve()
@@ -101,7 +115,15 @@ def stage_runtime(destination, native, bases=()):
             relative = str(source).lstrip('/')
         copy_runtime_file(destination, relative, canonical, records)
     copy_runtime_file(destination, 'bin/python3', python, records)
-    manifest = {'version': 1, 'packages': sorted(packages),
+    if companions:
+        native_digest = hashlib.sha256(Path(native).resolve().read_bytes()).hexdigest()
+        mappings = []
+        for companion in companions:
+            relative = 'libexec/codex/' + native_digest + '/' + companion.name
+            copy_runtime_file(destination, relative, companion, records)
+            mappings.append({'name': companion.name, 'path': relative, 'sha256': records[relative][0]})
+        companion_manifest[native_digest] = mappings
+    manifest = {'version': 1, 'packages': sorted(packages), 'native_companions': companion_manifest,
                 'files': [{'path': path, 'sha256': details[0]} for path, details in sorted(records.items())]}
     (destination / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True))
     (destination / 'manifest.json').chmod(0o400)
@@ -226,23 +248,70 @@ def provision(args):
         os.close(lock)
 
 
+def refresh_runtime_policy(policy_path, native):
+    """Publish only a new immutable runtime pointer; never import auth/grants."""
+    policy_path = Path(policy_path)
+    if policy_path.absolute() != policy_path.resolve():
+        raise ValueError('runtime refresh policy path must be literal')
+    root = policy_path.parent
+    info = root.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError('runtime refresh root is not private')
+    runtime_helper = helper('native-provider-vm.py')
+    baseline = runtime_helper.private_bytes(policy_path, 2 * 1024**2)
+    policy = json.loads(baseline)
+    if policy.get('version') != 1 or not policy.get('providers'):
+        raise ValueError('runtime refresh requires an existing policy')
+    lock = os.open(root/'provision.lock', os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC, 0o600)
+    guest = root / ('runtime-' + uuid.uuid4().hex)
+    published = False
+    try:
+        info = os.fstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise ValueError('provisioning lock is not private')
+        fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB)
+        if runtime_helper.private_bytes(policy_path, 2*1024**2) != baseline:
+            raise ValueError('provider policy changed before runtime refresh')
+        stage_runtime(guest, native, [Path(policy['guest_runtime'])])
+        sync_runtime(guest)
+        if runtime_helper.private_bytes(policy_path, 2*1024**2) != baseline:
+            raise ValueError('provider policy changed during runtime refresh')
+        policy['guest_runtime'] = str(guest)
+        runtime_helper.atomic(policy_path, json.dumps(policy, sort_keys=True).encode())
+        published = True
+        return policy_path
+    finally:
+        os.close(lock)
+        if not published and guest.exists():
+            shutil.rmtree(guest)
+
+
 def main():
     parser = argparse.ArgumentParser()
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument('--directory', type=Path)
     target.add_argument('--extend-policy', type=Path, help='add one new profile, preserving old grants/state and unioning pinned runtime files')
+    target.add_argument('--refresh-runtime-policy', type=Path, help='refresh immutable runtime only; preserve every existing grant and state path')
     parser.add_argument('--runtime-config', type=Path)
-    parser.add_argument('--provider', choices=['codex', 'claude', 'qwen', 'glm'], required=True)
+    parser.add_argument('--provider', choices=['codex', 'claude', 'qwen', 'glm'])
     parser.add_argument('--native-executable', type=Path, required=True)
     parser.add_argument('--auth-file', type=Path)
     parser.add_argument('--allow-auth-refresh', action='store_true', help='explicit serialized token-only refresh grant')
-    parser.add_argument('--gateway-policy', type=Path, required=True,
+    parser.add_argument('--gateway-policy', type=Path,
                         help='explicit reviewed authority/method/route policy, never inferred')
     parser.add_argument('--environment-key', action='append', default=[])
     parser.add_argument('--memory-mb', type=int)
     parser.add_argument('--max-state-bytes', type=int)
     parser.add_argument('--max-sessions', type=int)
-    path = provision(parser.parse_args())
+    args = parser.parse_args()
+    if args.refresh_runtime_policy:
+        if any(value is not None for value in (args.provider,args.gateway_policy,args.auth_file,args.runtime_config,args.memory_mb,args.max_state_bytes,args.max_sessions)) or args.allow_auth_refresh or args.environment_key:
+            parser.error('runtime-only refresh cannot change provider, credentials, grants or resources')
+        path = refresh_runtime_policy(args.refresh_runtime_policy, args.native_executable)
+    else:
+        if args.provider is None or args.gateway_policy is None:
+            parser.error('provisioning requires explicit provider and gateway policy')
+        path = provision(args)
     print('Prepared private native VM policy:', path)
     print('No daemon configuration, original credential files or provider requests were changed.')
 

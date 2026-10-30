@@ -168,6 +168,7 @@ pub struct Reservation {
     path: PathBuf,
     file: File,
     claim: Claim,
+    exported: std::sync::atomic::AtomicBool,
 }
 impl Reservation {
     pub fn new(_admission: &Admission, state: &Path, update: bool) -> Result<Self> {
@@ -187,6 +188,7 @@ impl Reservation {
             id,
             path,
             file,
+            exported: std::sync::atomic::AtomicBool::new(false),
             claim: Claim {
                 version: 1,
                 state: state_key(state)?,
@@ -197,6 +199,11 @@ impl Reservation {
         };
         result.write()?;
         Ok(result)
+    }
+    pub fn inherited_file(&self) -> Result<File> {
+        let file = self.file.try_clone()?;
+        self.exported.store(true, std::sync::atomic::Ordering::Release);
+        Ok(file)
     }
     pub fn id(&self) -> &str {
         &self.id
@@ -241,8 +248,12 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        let _ = std::fs::remove_file(&self.path);
+        // Exported claims remain visible until the final worker closes them.
+        // Admission::claims reclaims the record once its flock becomes free.
+        if !self.exported.load(std::sync::atomic::Ordering::Acquire) {
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -284,6 +295,22 @@ mod tests {
         assert_eq!(claims.reserved_on_device(20), 300);
         assert_eq!(claims.reserved_on_device(30), 0);
     }
+    #[test]
+    fn exported_reservation_survives_controller_drop_until_worker_closes() {
+        let root = tempfile::tempdir().unwrap();
+        let admission = Admission::lock().unwrap();
+        let mut reservation = Reservation::new(&admission, root.path(), false).unwrap();
+        reservation.publish(&admission, &[root.path().to_path_buf()], 1234).unwrap();
+        let path = reservation.path.clone();
+        let worker = reservation.inherited_file().unwrap();
+        drop(reservation);
+        assert!(path.exists());
+        assert!(admission.claims(None).unwrap().has_normal_writer(root.path()).unwrap());
+        drop(worker);
+        assert!(!admission.claims(None).unwrap().has_normal_writer(root.path()).unwrap());
+        assert!(!path.exists());
+    }
+
     #[test]
     fn claims_span_state_directories_and_end_with_the_writer() {
         let a = tempfile::tempdir().unwrap();

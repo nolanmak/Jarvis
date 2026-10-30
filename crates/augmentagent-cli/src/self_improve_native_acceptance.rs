@@ -41,10 +41,13 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     );
     // Managed Cargo points TMPDIR inside a builder-writable cache. Keep both
     // disposable source and protected probe state outside that shared cache.
+    // Keep source beside this explicit probe's evidence even on error: a failed
+    // builder/gate must remain inspectable, never disappear during unwinding.
     let fixture = tempfile::Builder::new()
         .prefix("autoship-native-source-")
-        .tempdir_in("/tmp")?;
-    let root = fixture.path().join("candidate");
+        .tempdir_in(state_home.parent().context("probe evidence parent unavailable")?)?
+        .keep();
+    let root = fixture.join("candidate");
     std::fs::create_dir(&root)?;
     git(&root, &["init", "-q", "-b", "disposable"]).await?;
     git(&root, &["config", "user.name", "Disposable Autoship Probe"]).await?;
@@ -55,6 +58,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     )?;
     std::fs::write(root.join("rules.rs"),"pub fn checks_complete(done: usize, total: usize) -> bool { total > 0 && done == total }\n")?;
     std::fs::write(root.join("shipping.rs"),"// Empty check sets must never authorize shipping.\npub fn should_ship(done: usize, total: usize) -> bool { crate::rules::checks_complete(done, total) }\n")?;
+    shared_ci::fixture::install(&root)?;
     git(&root, &["add", "."]).await?;
     git(&root, &["commit", "-qm", "red arithmetic baseline"]).await?;
     let base = git(&root, &["rev-parse", "HEAD"]).await?;
@@ -129,7 +133,17 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     let mut opts = fix_opts(root.clone());
     opts.audit_logger = Some(guard.audit_logger());
     let session = augmentagent_channel_core::native_session::FreshBuilderSessions::new();
-    session.scope(builder.call(&opts,"Fix arithmetic.py so add(a,b) returns the arithmetic sum. Use the guarded file tools to edit the actual file. Do not modify verifier files, rules.rs, shipping.rs, or Git metadata. Do not invoke cargo/npm or install anything; controller runs the Python verifier and commits. Return a concise summary after editing.")).await?;
+    let builder_response = session.scope(builder.call(&opts,"Fix arithmetic.py so add(a,b) returns the arithmetic sum. Use the guarded file tools to edit the actual file. Do not modify verifier files, rules.rs, shipping.rs, or Git metadata. Do not invoke cargo/npm or install anything; controller runs the Python verifier and commits. Return a concise summary after editing.")).await?;
+    // Private synthetic diagnostic evidence, outside candidate write admission.
+    // Retain an honest tool-startup refusal instead of discarding it as success.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut response = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(fixture.join("builder-response.txt"))?;
+        response.write_all(builder_response.as_bytes())?;
+        response.sync_all()?;
+    }
     guard.audit_health().await?;
     guard.record_episode_sessions(&session)?;
     let builders = session.observed();
@@ -145,6 +159,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     assert_eq!(std::fs::read_to_string(root.join("rules.rs"))?,"pub fn checks_complete(done: usize, total: usize) -> bool { total > 0 && done == total }\n");
     git(&root, &["add", "."]).await?;
     git(&root, &["commit", "-qm", "native builder candidate"]).await?;
+    shared_ci::fixture::scope(&root, verification_gate(&root, &guard.audit_logger())).await??;
     let mut reference =
         acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()], &guard.audit_logger())
             .await?;
@@ -248,7 +263,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
         serde_json::to_string(&seed)?
     );
     guard.audit_health().await?;
-    guard.audit_logger().record_controller(serde_json::json!({"kind":"disposable_native_acceptance_passed","native_builders":builders.iter().map(|b|serde_json::json!({"provider":b.provider.name(),"session_id":b.id,"uncertain":b.uncertain})).collect::<Vec<_>>(),"clean_review":evidence,"seeded_review":seed,"no_remote_publication":true}))?;
+    guard.audit_logger().record_controller(serde_json::json!({"kind":"disposable_native_acceptance_passed","ci_authority":"compiled disposable arithmetic fixture; not full Jarvis CI","full_jarvis_ci_pass":false,"native_builders":builders.iter().map(|b|serde_json::json!({"provider":b.provider.name(),"session_id":b.id,"uncertain":b.uncertain})).collect::<Vec<_>>(),"clean_review":evidence,"seeded_review":seed,"no_remote_publication":true}))?;
     guard.finish()?;
     Ok(())
 }

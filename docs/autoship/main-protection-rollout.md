@@ -1,4 +1,4 @@
-# Main protection rollout proposal
+# Main protection rollout
 
 Read-only observation on 2026-10-26: canonical repository `nolanmak/Jarvis`
 (origin `MyAgentAssistant` redirects there), legacy main protection returns
@@ -24,9 +24,12 @@ protection now exists, do not blindly PUT this template: preserve existing
 required contexts/apps, review requirements, restrictions, and other guards;
 reconcile any external-review requirement explicitly with the owner's policy.
 Recheck the two named CI contexts actually execute for all intended PR types.
-This document is a proposed settings diff, not evidence that settings changed.
+The policy was applied on 2026-10-26 and read back: strict checks `privacy` and
+`node-release`, both GitHub Actions app15368, admin enforcement enabled, no
+required PR reviews. Existing ruleset25861241 remained active and unchanged.
+This establishes configuration only; autonomous merge acceptance remains open.
 
 After application, read back legacy strict checks/admin enforcement and verify
 ruleset25861241 remains unchanged. Run the existing controlled merge-boundary
-probe to verify a changed base cannot use stale approval. No remote settings
-were written during preparation of this proposal.
+probe to verify a changed base cannot use stale approval. The original preparation was read-only; the subsequent applied configuration
+is recorded in `1598-evidence.json` under `main_protection_rollout`.

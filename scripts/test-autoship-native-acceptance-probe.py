@@ -41,7 +41,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(len(probe.verify_test_inventory(binary,expected)),64)
 
     def test_reviewer_probes_do_not_reserve_unreachable_build_vm(self):
-        for name in ('writer','adjudicator','routed_transport'):
+        for name in ('writer','adjudicator','routed_transport','file_edit'):
             build=probe.reachable_build_memory(name,4096)
             self.assertEqual(build,0)
             budget=probe.resource_budget(1024,build,3*GIB)

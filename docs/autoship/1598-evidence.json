@@ -1105,6 +1105,45 @@
       "result": "/tmp/autoship-native-acceptance-z239adcm/result.json",
       "operator_route_unchanged": true,
       "scope": "Actual packaged production Rust routed constructor, protected owner and host Responses exchange after OAuth/helper teardown changes. Transport only; refresh disabled, no full issue/adoption or live token renewal claim."
+    },
+    "main_protection_rollout": {
+      "observed_at": "2026-10-26T19:58:31.361132+00:00",
+      "status": "applied_and_read_back",
+      "repository": "nolanmak/Jarvis",
+      "branch": "main",
+      "strict": true,
+      "enforce_admins": true,
+      "checks": [
+        {
+          "context": "privacy",
+          "app_id": 15368
+        },
+        {
+          "context": "node-release",
+          "app_id": 15368
+        }
+      ],
+      "required_pull_request_reviews": null,
+      "preserved_ruleset": 25861241,
+      "preserved_rules": [
+        "non_fast_forward",
+        "deletion"
+      ],
+      "scope": "Remote branch configuration only. Does not prove daemon deployment or autonomous shipping. Exact Actions app identities confirmed on passing b2098d5e checks."
+    },
+    "production_native_profile_staged": {
+      "status": "staged_not_activated",
+      "policy_sha256": "291e94f729b8216b1ededcb72a9d190e1f10588040375a349035b53646069fd2",
+      "runtime_manifest_sha256": "98d06aebbd119f738d54071fe42d6009da435ce483544301a63d7dac3177aac2",
+      "providers": [
+        "claude",
+        "codex"
+      ],
+      "grants_match_proven_operator_profile": true,
+      "refresh_enabled": false,
+      "outside_worker_roots": true,
+      "scope": "Stable owner-private runtime/profile provisioned with exact previously exercised routes, environment names and read-only original credentials. No daemon environment mutation, provider request or credential renewal. Actual acceptance on this stable profile and daemon activation pending.",
+      "runtime_manifest_validation": "passed_actual_file_digests"
     }
   },
   "remaining_cross_cutting_acceptance": [
@@ -1187,7 +1226,7 @@
     {
       "severity": "P1",
       "gap": "Live main lacks strict required-status-check protection required by the new publisher for atomic integration",
-      "status": "read_only_confirmed_2026_10_26; preservation_aware_rollout_proposal_prepared; remote_configuration_unmodified"
+      "status": "resolved_configuration_2026_10_26; strict_privacy_node_release_app15368_admin_enforced_read_back; existing_ruleset25861241_preserved; actual_autonomous_merge_pending"
     },
     {
       "severity": "P1",

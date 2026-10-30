@@ -313,12 +313,22 @@ fn clear_provider_environment(opts: &ReasonerOpts, scoped: bool) -> bool {
     opts.restrict_env || scoped
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    // Fault-injection deadlines must never change unrelated concurrent tests.
+    static TEST_REASONER_TIMEOUT: std::time::Duration;
+}
+
 /// Watchdog timeout for one spawned reasoner CLI call (#656). Env-tunable
 /// without a rebuild; the default is deliberately generous because agentic
 /// presets (wiki-ask, auto-PR build) legitimately run many minutes. The
 /// point is not tight latency — it's that "hung forever" becomes a typed,
 /// failover-eligible error instead of a silently stuck pipeline.
 pub fn reasoner_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(timeout) = TEST_REASONER_TIMEOUT.try_with(|timeout| *timeout) {
+        return timeout;
+    }
     let secs = std::env::var("AUGMENTAGENT_REASONER_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -3066,6 +3076,25 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "SCOPED_ENV_OK");
     }
 
+    #[tokio::test]
+    async fn injected_watchdog_is_local_to_its_future_and_never_changes_siblings() {
+        let ambient = reasoner_timeout();
+        let injected = TEST_REASONER_TIMEOUT.scope(std::time::Duration::from_secs(17), async {
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
+            // A separately spawned provider call must retain normal configuration.
+            assert_eq!(tokio::spawn(async { reasoner_timeout() }).await.unwrap(), ambient);
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
+        });
+        let sibling = async {
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), ambient);
+        };
+        tokio::join!(injected, sibling);
+        assert_eq!(reasoner_timeout(), ambient);
+    }
+
     fn dummy_opts() -> ReasonerOpts {
         ReasonerOpts {
             system_prompt: "stub".into(),
@@ -4782,9 +4811,6 @@ mod ask_mode_social_card_allowlist_tests {
 mod failover_error_tests {
     use super::*;
 
-    /// Since #954 the reasoner timeout also bounds gate waits.
-    static TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn dummy_opts() -> ReasonerOpts {
         ReasonerOpts {
             system_prompt: "stub".into(),
@@ -5040,7 +5066,6 @@ sleep 0.15
 "
             ),
         );
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
         let gate = Arc::new(CliGate::new(3));
         let reasoner = Arc::new(ClaudeCliReasoner {
             bin,
@@ -5317,17 +5342,14 @@ sleep 5
         // A day's budget, so only the caller's own 1 s watchdog bounds the wait.
         let day = std::time::Duration::from_secs(86_400);
         let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
-        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin: "never-spawned".into(),
             gate: Arc::clone(&gate),
         };
-        let err = reasoner
-            .call(&dummy_opts(), "hi")
+        let err = TEST_REASONER_TIMEOUT
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("the permit is held");
-        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         let typed = ReasonerError::find_in(&err).unwrap_or_else(|| panic!("untyped: {err:?}"));
         let ReasonerError::GateTimeout { provider, .. } = typed else {
             panic!("{typed:?}")
@@ -5459,18 +5481,15 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         // Keep the watchdog fixture to one process; orphaned shell children can
         // legitimately produce CleanupUnverified on busy CI hosts.
         let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nexec sleep 600\n");
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
-        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin,
             gate: CliGate::global(),
         };
         let started = std::time::Instant::now();
-        let err = reasoner
-            .call(&dummy_opts(), "hi")
+        let err = TEST_REASONER_TIMEOUT
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("must time out");
-        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
             "watchdog must fire promptly, took {:?}",

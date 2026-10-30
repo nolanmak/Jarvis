@@ -67,14 +67,20 @@ impl Drop for VoiceToolGrant {
     }
 }
 
+// Unix socket paths have a small fixed kernel limit. Build TMPDIR can be
+// arbitrarily deep; socket-only state uses a fresh private short directory.
+fn private_tool_listener() -> std::io::Result<(tempfile::TempDir, PathBuf, UnixListener)> {
+    let directory = tempfile::Builder::new().prefix("jarvis-voice-tool-").tempdir_in("/tmp")?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let socket = directory.path().join("control.sock");
+    let listener = UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok((directory, socket, listener))
+}
+
 impl VoiceToolService {
     pub async fn start(bridge: &Arc<VoiceBridge>) -> Result<Arc<Self>> {
-        let directory = tempfile::Builder::new()
-            .prefix("jarvis-voice-tool-")
-            .tempdir()?;
-        let socket_path = directory.path().join("control.sock");
-        let listener = UnixListener::bind(&socket_path)?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+        let (directory, socket_path, listener) = private_tool_listener()?;
         let service = Arc::new(Self {
             bridge: Arc::downgrade(bridge),
             socket_path,
@@ -296,5 +302,36 @@ impl VoiceToolService {
             }
             _ => anyhow::bail!("Unknown voice tool method"),
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    #[tokio::test]
+    async fn long_build_temp_root_does_not_break_private_tool_socket() {
+        const CHILD: &str = "JARVIS_SHORT_TOOL_SOCKET_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            let long = root.path().join("nested-build-cache-".repeat(10));
+            std::fs::create_dir(&long).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "voice_tool::socket_tests::long_build_temp_root_does_not_break_private_tool_socket", "--nocapture"])
+                .env(CHILD, "1").env("TMPDIR", &long).output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "socket fixture must execute");
+            return;
+        }
+        assert!(std::env::temp_dir().as_os_str().len() > 108);
+        let (first, path, listener) = private_tool_listener().unwrap();
+        let (second, other, _other_listener) = private_tool_listener().unwrap();
+        assert_ne!(path, other);
+        assert!(path.as_os_str().len() < 104);
+        assert_eq!(std::fs::metadata(first.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(listener); drop(first);
+        assert!(!path.exists());
+        assert!(other.exists());
+        drop(second);
     }
 }

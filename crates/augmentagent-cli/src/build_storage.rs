@@ -2,6 +2,7 @@
 //! grants permission to remove another project's output.
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -24,8 +25,25 @@ pub struct Lease {
     file: std::fs::File,
     targets: crate::storage_leases::TargetLeases,
     reservation: Option<crate::storage_reservations::Reservation>,
+    ci_update_exclusion: Option<std::fs::File>,
+    exported: std::sync::atomic::AtomicBool,
 }
 impl Lease {
+    /// Duplicates share the flock open description; unlike /proc reopening,
+    /// they retain storage/prune exclusion if the controller dies first.
+    pub fn inherited_files(&self) -> Result<Vec<std::fs::File>> {
+        let mut files = vec![self.file.try_clone()?];
+        files.extend(self.targets.inherited_files()?);
+        if let Some(exclusion) = &self.ci_update_exclusion {
+            files.push(exclusion.try_clone()?);
+        }
+        if let Some(reservation) = &self.reservation {
+            files.push(reservation.inherited_file()?);
+        }
+        self.exported.store(true, std::sync::atomic::Ordering::Release);
+        Ok(files)
+    }
+
     pub fn parent_proof(&self, target: &Path) -> Result<String> {
         let reservation = self.reservation.as_ref().context("storage reservation missing")?;
         Ok(format!(
@@ -49,8 +67,18 @@ impl Lease {
             .truncate(false)
             .read(true)
             .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(state.join(if update { "disk-update.lock" } else { "disk-build.lock" }))?;
+        let metadata = f.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("build admission lock must be an owned regular single-link file");
+        }
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // Migrate historical umask-derived 0664 locks through the held inode.
+            // Never replace the lock, chmod a pathname, or alter another holder.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.sync_all()?;
             if update && crate::disk::lock_is_held(&state.join("disk-build.lock"))
                 && !admission.claims(None)?.has_normal_writer(state)? {
                 return Err(crate::storage_reservations::Busy("legacy writer has not declared its space reservation; retry at its next boundary".into()).into());
@@ -58,6 +86,8 @@ impl Lease {
             Ok(Some(Self {
                 file: f,
                 targets: Default::default(),
+                ci_update_exclusion: None,
+                exported: std::sync::atomic::AtomicBool::new(false),
                 reservation: Some(crate::storage_reservations::Reservation::new(&admission, state, update)?),
             }))
         } else {
@@ -92,7 +122,15 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.targets = Default::default();
         self.reservation.take();
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        // Unrelated fork/exec children can briefly inherit CLOEXEC descriptors.
+        // They must not extend private lock ownership. Intentional worker export
+        // instead retains the shared descriptions until all descendants close.
+        if !self.exported.load(std::sync::atomic::Ordering::Acquire) {
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN); }
+            if let Some(exclusion) = &self.ci_update_exclusion {
+                unsafe { libc::flock(exclusion.as_raw_fd(), libc::LOCK_UN); }
+            }
+        }
     }
 }
 
@@ -746,6 +784,40 @@ pub async fn admit(repo: &Path, target: &Path) -> Result<Lease> {
     admit_owned(repo, target, None).await
 }
 
+// CI's sparse VM cache can grow beyond the generic writer reservation.
+// Serialize it with updater writes until that growth has a dedicated reservation.
+// Exclusion is acquired before normal admission, never while holding Admission.
+pub async fn admit_ci(repo: &Path, target: &Path) -> Result<Lease> {
+    let state = state_dir()?;
+    let exclusion = ci_update_exclusion(&state)?;
+    let mut lease = Lease::try_at(&state)?
+        .ok_or_else(|| crate::storage_reservations::Busy("build lease is held; retry CI admission".into()))?;
+    lease.ci_update_exclusion = Some(exclusion);
+    admit_with_lease(repo, target, None, lease).await
+}
+
+fn ci_update_exclusion(state: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(state)?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false)
+        .read(true).write(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(state.join("disk-update.lock"))?;
+    let info = file.metadata()?;
+    anyhow::ensure!(info.is_file() && info.nlink() == 1 && info.uid() == unsafe { libc::geteuid() },
+        "CI updater exclusion must be an owned regular single-link file");
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(crate::storage_reservations::Busy("deployment build is active; retry CI admission".into()).into());
+        }
+        return Err(error.into());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.sync_all()?;
+    // File close only: the exported open description can outlive this controller.
+    Ok(file)
+}
+
 pub async fn admit_session(repo: &Path, target: &Path) -> Result<Lease> {
     admit_owned(repo, target, Some(repo)).await
 }
@@ -791,7 +863,11 @@ pub async fn admit_update(repo: &Path, target: &Path) -> Result<Lease> {
 }
 
 async fn admit_owned(repo: &Path, target: &Path, owner: Option<&Path>) -> Result<Lease> {
-    let mut lease = acquire().await.context("storage admission: lease unavailable")?;
+    let lease = acquire().await.context("storage admission: lease unavailable")?;
+    admit_with_lease(repo, target, owner, lease).await
+}
+
+async fn admit_with_lease(repo: &Path, target: &Path, owner: Option<&Path>, mut lease: Lease) -> Result<Lease> {
     let state = state_dir()?;
     let state_canonical = std::fs::canonicalize(&state)?;
     let home = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok());
@@ -1365,5 +1441,119 @@ mod tests {
         std::fs::remove_dir_all(&first).unwrap();
         assert_eq!(registered(&other, &state).len(), 1);
         assert!(register(&other, &target, None, &state).unwrap().shared);
+    }
+}
+
+#[cfg(test)]
+mod inherited_ci_storage_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn incidental_descriptors_do_not_extend_private_build_or_ci_exclusion() {
+        let state = tempfile::tempdir().unwrap();
+        let exclusion = ci_update_exclusion(state.path()).unwrap();
+        let mut lease = Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion = Some(exclusion);
+        // dup reproduces a fork-inherited open description without race timing.
+        let incidental_global = lease.file.try_clone().unwrap();
+        let incidental_update = lease.ci_update_exclusion.as_ref().unwrap().try_clone().unwrap();
+        assert!(Lease::try_at(state.path()).unwrap().is_none());
+        assert!(ci_update_exclusion(state.path()).is_err());
+        drop(lease);
+        assert!(Lease::try_at(state.path()).unwrap().is_some());
+        assert!(ci_update_exclusion(state.path()).is_ok());
+        drop((incidental_global, incidental_update));
+    }
+
+    #[test]
+    fn ci_update_exclusion_is_nonblocking_and_exported_until_worker_closes() {
+        let state = tempfile::tempdir().unwrap();
+        let updater = Lease::try_kind_at(state.path(), true).unwrap().unwrap();
+        let error = ci_update_exclusion(state.path()).unwrap_err();
+        assert!(error.downcast_ref::<crate::storage_reservations::Busy>().is_some());
+        drop(updater);
+        let exclusion = ci_update_exclusion(state.path()).unwrap();
+        let mut ci = Lease::try_at(state.path()).unwrap().unwrap();
+        ci.ci_update_exclusion = Some(exclusion);
+        assert!(Lease::try_kind_at(state.path(), true).unwrap().is_none());
+        let worker = ci.inherited_files().unwrap();
+        drop(ci);
+        assert!(Lease::try_kind_at(state.path(), true).unwrap().is_none(),
+            "controller Drop cannot release worker's updater exclusion");
+        drop(worker);
+        // Intentional export must remain close-only; an unrelated concurrent
+        // fork can retain these descriptors briefly until its exec completes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if Lease::try_kind_at(state.path(), true).unwrap().is_some() { break; }
+            assert!(std::time::Instant::now() < deadline, "exported updater exclusion did not release");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn ci_update_exclusion_rejects_symlinks_without_touching_target() {
+        let state = tempfile::tempdir().unwrap();
+        let target = state.path().join("unrelated");
+        std::fs::write(&target, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, state.path().join("disk-update.lock")).unwrap();
+        assert!(ci_update_exclusion(state.path()).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    #[tokio::test]
+    async fn inherited_descendant_keeps_global_and_target_leases_after_parent_drop() {
+        let state = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let exclusion = ci_update_exclusion(state.path()).unwrap();
+        let mut lease = Lease::try_at(state.path()).unwrap().unwrap();
+        lease.ci_update_exclusion = Some(exclusion);
+        lease.protect_targets(&[cache.path().to_owned()]).await.unwrap();
+        let files = lease.inherited_files().unwrap();
+        let descriptors: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        let mut command = Command::new("/usr/bin/python3");
+        command.args(["-I", "-c", r#"
+import os,sys
+if os.fork():
+    os._exit(0)
+print('descendant-ready',flush=True)
+sys.stdin.readline()
+os._exit(0)
+"#]).stdin(Stdio::piped()).stdout(Stdio::piped());
+        unsafe { command.pre_exec(move || {
+            for fd in &descriptors {
+                let flags = libc::fcntl(*fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }); }
+        let mut child = command.spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "descendant-ready");
+        assert!(child.wait().unwrap().success(), "original worker has exited");
+        drop(lease);
+        drop(files);
+        assert!(Lease::try_kind_at(state.path(), true).unwrap().is_none(), "descendant retains CI updater exclusion too");
+        assert!(Lease::try_at(state.path()).unwrap().is_none(), "descendant must retain global prune exclusion");
+        assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_none(), "target inode/path exclusion must survive too");
+        input.write_all(b"exit\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(lease) = Lease::try_at(state.path()).unwrap() {
+                assert!(crate::storage_leases::TargetLeases::try_directory(cache.path()).unwrap().is_some());
+                drop(lease);
+                assert!(Lease::try_kind_at(state.path(), true).unwrap().is_some());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "descendant did not release inherited storage");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
