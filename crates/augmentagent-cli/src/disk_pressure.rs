@@ -51,7 +51,20 @@ pub fn reclaim(
     } else {
         refs.reliable = false;
     }
-    let mut reports = crate::autoship_worktree_cleanup::prune(repo, dry_run, &refs)?;
+    // Worktree retirement is optional reclamation. Broken Git metadata or an
+    // unreadable lane lock must keep those worktrees without preventing safe,
+    // independently leased Cargo caches from restoring build headroom.
+    let mut reports = match crate::autoship_worktree_cleanup::prune(repo, dry_run, &refs) {
+        Ok(reports) => reports,
+        Err(error) => vec![RootReport {
+            label: "Autoship worktree".into(),
+            path: repo.join(".self-improve-worktrees").display().to_string(),
+            outcome: format!("kept: worktree cleanup unavailable: {error:#}"),
+            removed: 0,
+            freed_bytes: 0,
+            full_drop: false,
+        }],
+    };
     let roots = crate::disk::discover_roots(
         repo,
         &crate::disk::extra_roots_from(
