@@ -97,6 +97,7 @@ pub(crate) fn reclaim_roots(
     headroom: &dyn Fn(&Path) -> Result<u64>,
 ) -> Result<Vec<RootReport>> {
     let mut reports = Vec::new();
+    let mut projected_freed = std::collections::BTreeMap::<u64, u64>::new();
     for root in roots {
         // Discovery proves ownership; layout evidence prevents a replaced
         // checkout target from turning source or arbitrary data into a cache.
@@ -106,7 +107,16 @@ pub(crate) fn reclaim_roots(
         // A linked profile is not authority to pressure-delete its destination.
         // Independently registered targets can be reclaimed in their own turn.
         for profile in root.profiles.iter().filter(|p| p.starts_with(&root.path)) {
-            if !profile.exists() || headroom(profile)? >= required {
+            if !profile.exists() {
+                continue;
+            }
+            let device = std::fs::metadata(profile)?.dev();
+            let simulated = if dry_run {
+                projected_freed.get(&device).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            if headroom(profile)?.saturating_add(simulated) >= required {
                 continue;
             }
             let mut report = RootReport {
@@ -167,8 +177,7 @@ pub(crate) fn reclaim_roots(
                 reports.push(report);
                 continue;
             }
-            let mut projected = headroom(profile)?;
-            let device = std::fs::metadata(profile)?.dev();
+            let mut projected = headroom(profile)?.saturating_add(simulated);
             for name in ["incremental", "build", "deps", ".fingerprint"] {
                 let before = if dry_run {
                     projected
@@ -216,6 +225,9 @@ pub(crate) fn reclaim_roots(
                 required.saturating_sub(after),
                 if dry_run { " (estimated)" } else { "" }
             );
+            if dry_run {
+                projected_freed.insert(device, simulated.saturating_add(report.freed_bytes));
+            }
             reports.push(report);
         }
     }
@@ -443,5 +455,28 @@ mod tests {
         std::fs::write(f.root.path.join("Cargo.toml"), "[package]").unwrap();
         f.run(false, None, Some(&[]), &f.refs);
         assert!(f.deps.exists());
+    }
+
+    #[test]
+    fn dry_run_carries_estimated_headroom_between_caches_on_the_same_filesystem() {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        let reports = reclaim_roots(
+            &[first.root.clone(), second.root.clone()],
+            65536,
+            None,
+            true,
+            Some(&[]),
+            &first.refs,
+            &|_| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(
+            reports.len(),
+            1,
+            "the first cache already supplies the estimated deficit"
+        );
+        assert!(first.deps.exists());
+        assert!(second.deps.exists());
     }
 }
