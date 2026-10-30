@@ -114,6 +114,12 @@ impl TargetLeases {
         Self::try_paths(vec![(root.to_path_buf(), true), (root.join("release"), false)], None)
     }
 
+    /// Pressure cleanup holds only the selected physical profile plus its
+    /// root, so an unrelated linked debug volume need not block release cleanup.
+    pub fn try_profile(root: &Path, profile: &Path, held: Option<&Self>) -> Result<Option<Self>> {
+        Self::try_paths(vec![(root.to_path_buf(), true), (profile.to_path_buf(), true)], held)
+    }
+
     fn try_paths(paths: Vec<(PathBuf, bool)>, held: Option<&Self>) -> Result<Option<Self>> {
         let mut identities = Vec::new();
         for (path, required) in paths {

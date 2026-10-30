@@ -1010,14 +1010,27 @@ fn reconcile(
     held: Option<&crate::storage_leases::TargetLeases>,
     free_bytes: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<()> {
-    reconcile_for(repo, target, state, floor_gb, cap_mb,
-        ReconcileContext { held, claims: &Default::default(), paths: &monitored_paths(target), update: false }, free_bytes)
+    reconcile_with_pressure(repo, target, state, floor_gb, cap_mb,
+        ReconcileContext { held, claims: &Default::default(), paths: &monitored_paths(target), update: false }, free_bytes,
+        &|_| Ok(Vec::new()))
 }
 
 #[cfg(target_os = "linux")]
 fn reconcile_for(
     repo: &Path, target: &Path, state: &Path, floor_gb: f64, cap_mb: u64,
     context: ReconcileContext<'_>, free_bytes: &dyn Fn(&Path) -> Option<u64>,
+) -> Result<()> {
+    let pressure = |required| crate::disk_pressure::reclaim(repo, required, context.held, false,
+        context.claims, free_bytes);
+    reconcile_with_pressure(repo, target, state, floor_gb, cap_mb,
+        ReconcileContext { ..context }, free_bytes, &pressure)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_with_pressure(
+    repo: &Path, target: &Path, state: &Path, floor_gb: f64, cap_mb: u64,
+    context: ReconcileContext<'_>, free_bytes: &dyn Fn(&Path) -> Option<u64>,
+    pressure: &dyn Fn(u64) -> Result<Vec<crate::disk::RootReport>>,
 ) -> Result<()> {
     std::fs::create_dir_all(target)?;
     if context.update { ensure_idle_paths(context.paths)?; } else { ensure_idle_target(target)?; }
@@ -1051,6 +1064,11 @@ fn reconcile_for(
             true,
             context.held,
         )?;
+    }
+    if minimum_free < reserve {
+        let pressure = pressure(reserve)?;
+        use std::io::Write;
+        writeln!(&mut log, "pressure reclamation: {}", serde_json::to_string(&pressure)?)?;
     }
     let mut readings = Vec::new();
     for path in context.paths {
@@ -1093,6 +1111,40 @@ fn reconcile_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pressure_reclamation_admits_checkout_release_and_retains_its_binary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repo_path = temporary.path().join("repo");
+        repo(&repo_path);
+        let target = repo_path.join("target");
+        let deps = target.join("release/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(target.join("CACHEDIR.TAG"), CACHE_TAG).unwrap();
+        std::fs::write(deps.join("warm.rlib"), vec![1; 65536]).unwrap();
+        let binary = target.join("release/augmentagent");
+        std::fs::write(&binary, b"deployed").unwrap();
+        let state = temporary.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let paths = update_paths(&target);
+        let claims = Default::default();
+        let lease = crate::storage_leases::TargetLeases::try_release_root(&target).unwrap().unwrap();
+        let free = |_: &Path| Some(if deps.exists() { 0 } else { 65536 });
+        let check = |cleanup: &dyn Fn(u64) -> Result<Vec<crate::disk::RootReport>>|
+            reconcile_with_pressure(&repo_path, &target, &state, 65536.0 / 1024.0_f64.powi(3), u64::MAX,
+                ReconcileContext { held: Some(&lease), claims: &claims, paths: &paths, update: true }, &free, cleanup);
+        assert!(check(&|_| Ok(Vec::new())).unwrap_err().to_string().contains(crate::disk::LOW_DISK_REFUSAL));
+        let root = crate::disk::Root::at("checkout", &target);
+        let refs = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        check(&|required| crate::disk_pressure::reclaim_roots(std::slice::from_ref(&root), required,
+            Some(&lease), false, Some(&[]), &refs, &|p| Ok(free(p).unwrap()))).unwrap();
+        assert!(!deps.exists());
+        assert_eq!(std::fs::read(binary).unwrap(), b"deployed");
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("disk-reconcile.json")).unwrap()).unwrap();
+        assert_eq!(report["admitted"], true);
+        assert!(report["cleanup"].as_str().unwrap().contains("pressure reclamation"));
+    }
+
     #[test]
     fn updater_defers_legacy_writer_without_a_reservation() {
         let state = tempfile::tempdir().unwrap();
@@ -1119,8 +1171,9 @@ mod tests {
         other.publish(&admission, &[target.clone()], 2 * gib).unwrap();
         let claims = admission.claims(None).unwrap();
         let paths = update_paths(&target);
-        let check = |free| reconcile_for(&repo_path, &target, &state, 2.0, u64::MAX,
-            ReconcileContext { held: None, claims: &claims, paths: &paths, update: true }, &|_| Some(free));
+        let check = |free| reconcile_with_pressure(&repo_path, &target, &state, 2.0, u64::MAX,
+            ReconcileContext { held: None, claims: &claims, paths: &paths, update: true }, &|_| Some(free),
+            &|_| Ok(Vec::new()));
         let busy = check(3 * gib).unwrap_err();
         assert!(busy.downcast_ref::<crate::storage_reservations::Busy>().is_some(), "{busy:#}");
         assert!(!busy.to_string().contains(crate::disk::LOW_DISK_REFUSAL));

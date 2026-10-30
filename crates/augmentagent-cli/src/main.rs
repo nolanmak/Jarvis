@@ -1,6 +1,8 @@
 //! `augmentagent` binary.
 
 mod approval_context;
+mod disk_pressure;
+mod autoship_worktree_cleanup;
 mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
