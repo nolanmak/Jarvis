@@ -20,7 +20,7 @@ async fn live_shared_ci_vm_smoke() -> Result<()> {
     let target = crate::build_storage::effective_target(&root);
     // Invoke the already-built test binary directly, after cargo-managed exits:
     // nesting this admission inside its global lease would deadlock.
-    let storage = crate::build_storage::admit(&root, &target).await?;
+    let storage = crate::build_storage::admit_ci(&root, &target).await?;
     let inherited = storage.inherited_files()?;
     ensure!(inherited.len() >= 2, "global and target lease descriptors required");
     let identities: Vec<_> = inherited.iter().map(|file| {

@@ -361,7 +361,7 @@ pub(super) async fn verify(
 ) -> Result<()> {
     let binding_before = binding(root).await?;
     let target = crate::build_storage::effective_target(root);
-    let storage = crate::build_storage::admit(root, &target).await?;
+    let storage = crate::build_storage::admit_ci(root, &target).await?;
     let vm = vm::Session::prepare(root, &target)
         .context("shared CI prerequisite unavailable: prepare isolated CI runtime")?;
     let names = git(
@@ -513,7 +513,7 @@ async fn iteration(
     );
     let before = binding(root).await?;
     let target = crate::build_storage::effective_target(root);
-    let storage = crate::build_storage::admit(root, &target).await?;
+    let storage = crate::build_storage::admit_ci(root, &target).await?;
     let vm = vm::Session::prepare(root, &target)
         .context("shared CI prerequisite unavailable: prepare isolated iteration")?;
     let source = snapshot(root, &before, &target).await?;
@@ -584,7 +584,7 @@ pub(super) async fn repository(
     let base_ref = format!("origin/{base_branch}");
     let before = binding_at(root, &base_ref).await?;
     let target = crate::build_storage::effective_target(root);
-    let storage = crate::build_storage::admit(root, &target).await?;
+    let storage = crate::build_storage::admit_ci(root, &target).await?;
     let vm = vm::Session::prepare(root, &target)
         .context("shared CI prerequisite unavailable: prepare owner repository gate")?;
     let source = snapshot(root, &before, &target).await?;
