@@ -1166,7 +1166,7 @@ pub fn prune_root(
     report
 }
 
-fn lane_locks() -> Vec<PathBuf> {
+pub(crate) fn lane_locks() -> Vec<PathBuf> {
     let base = std::env::var("AUGMENTAGENT_SELFIMPROVE_LOCK")
         .ok()
         .filter(|p| !p.trim().is_empty())
@@ -1272,6 +1272,13 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
     // #1411 — only on a discovering run: `--root` names target dirs.
     if opts.roots.is_empty() {
         reports.push(sweep_temp_dir(&std::env::temp_dir(), opts.dry_run, now));
+        if !admission {
+            let allocation = crate::storage_reservations::Admission::lock()?;
+            let claims = allocation.claims(None)?;
+            let required = (crate::build_storage::admission_floor_gb() * GIB) as u64;
+            reports.extend(crate::disk_pressure::reclaim(repo_root, required, held,
+                opts.dry_run, &claims, &available_bytes)?);
+        }
     }
 
     if opts.json {

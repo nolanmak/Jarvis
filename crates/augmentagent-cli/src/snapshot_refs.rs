@@ -71,6 +71,11 @@ pub fn collect() -> References {
             Err(_) => {}
         }
         // Command arguments include script paths and configured rollback dirs.
+        match std::fs::read_link(p.join("cwd")) {
+            Ok(cwd) => out.paths.push(cwd),
+            Err(_) if p.exists() => out.reliable = false,
+            Err(_) => {}
+        }
         if let Ok(args) = std::fs::read(p.join("cmdline")) {
             out.config.push_str(&String::from_utf8_lossy(&args));
             out.config.push('\n');

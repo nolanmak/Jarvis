@@ -100,6 +100,35 @@ exclusion and report deferral when a build owns the lease. The updater uses
 `disk build` for release builds once the deployed binary
 supports it, and never falls back to deleting a cache outside the pruner's lease.
 
+When age-based cleanup leaves a filesystem below its admission threshold,
+managed admission and discovering `disk prune` runs reclaim rebuildable Cargo
+cache directories from idle owned targets on that filesystem. This includes
+recent cache data: `incremental`, `build`, `deps`, and `.fingerprint`, in that
+order. The pass measures free space after each removal and stops once the
+reserve plus build growth and other writers' reservations fit. Scheduled
+housekeeping uses the same policy before the next build needs the space.
+
+Pressure cleanup preserves the profile directory and everything directly in
+it, including deployed and rollback binaries. It does not traverse linked
+cache directories or linked external profiles, touch source/state/snapshot
+directories, or remove a cache used by a build or a detected process/service
+reference. Missing process/reference evidence and held physical leases keep
+the cache. Reports record pressure removals and any remaining deficit; dry-run
+reports estimates without deleting. If protected or unrelated data consumes
+the disk, admission still refuses rather than lowering the reserve. Reclaimed
+dependencies can make the next build slower, but do not require relocating or
+replacing the deployed executable.
+
+The same pass retires registered Autoship worktrees under
+`.self-improve-worktrees` after 24 hours without writes. It holds the fresh,
+resume, and per-PR run locks, requires HEAD to be reachable from `origin/main`,
+and requires a clean tracked, untracked, and ignored-file inventory. Git locks,
+process references (including working directories), and unavailable evidence
+keep the checkout. Removal uses `git worktree remove` without force and retains
+branches. External or unrecognized worktrees, unmerged commits (including
+squash-merged heads without ancestry proof), dirty work, and ignored private
+files are preserved; a deleted remote branch alone is not proof of safety.
+
 ## Updates during auto-ship (Linux)
 
 The updater provisions `augmentagent-autopr.service` and a daemon drop-in without
