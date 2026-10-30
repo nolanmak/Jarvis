@@ -94,6 +94,21 @@ fn recognized(name: &str) -> bool {
     })
 }
 
+fn merged_head(repo: &Path, worktree: &Path, expected: &str) -> Result<bool> {
+    // Inventory precedes lane acquisition. A run may finish with a new HEAD
+    // in that gap; never use its old ancestry to delete the new checkout.
+    let current = command(worktree, &["rev-parse", "--verify", "HEAD"])?;
+    if !current.status.success() || std::str::from_utf8(&current.stdout)?.trim() != expected {
+        return Ok(false);
+    }
+    Ok(command(
+        repo,
+        &["merge-base", "--is-ancestor", expected, "origin/main"],
+    )?
+    .status
+    .success())
+}
+
 fn prune_at(
     repo: &Path,
     dry_run: bool,
@@ -193,8 +208,10 @@ fn prune_at(
                 "--ignored=matching",
             ],
         )?;
-        let merged = command(repo, &["merge-base", "--is-ancestor", &head, "origin/main"])?;
-        if !status.status.success() || !status.stdout.is_empty() || !merged.status.success() {
+        if !status.status.success()
+            || !status.stdout.is_empty()
+            || !merged_head(repo, &path, &head)?
+        {
             report.outcome = "kept: dirty, ignored, unmerged, or unverifiable work".into();
             reports.push(report);
             continue;
@@ -394,5 +411,17 @@ mod tests {
         assert!(f.worktree.exists());
         assert!(external.exists());
         assert!(unknown.exists());
+    }
+
+    #[test]
+    fn changed_head_cannot_reuse_old_inventory_merge_proof() {
+        let f = Fixture::new();
+        let old = command(&f.worktree, &["rev-parse", "HEAD"]).unwrap();
+        let old = std::str::from_utf8(&old.stdout).unwrap().trim();
+        assert!(merged_head(f.dir.path(), &f.worktree, old).unwrap());
+        std::fs::write(f.worktree.join("tracked"), "new work").unwrap();
+        git(&f.worktree, &["commit", "-am", "finished after inventory"]);
+        assert!(!merged_head(f.dir.path(), &f.worktree, old).unwrap());
+        assert!(f.worktree.exists());
     }
 }

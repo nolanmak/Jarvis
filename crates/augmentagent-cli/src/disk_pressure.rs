@@ -134,8 +134,23 @@ pub(crate) fn reclaim_roots(
                     .iter()
                     .any(|p| crate::disk::lock_is_held(p))
                 && !held.is_some_and(|h| h.owns_directory(&root.path));
-            if lease.is_none() || !stable || compiler_busy || lane_busy || !refs.reliable {
-                report.outcome = "pressure skipped: target lease, active writer, or unavailable reference evidence".into();
+            let blocked = if lease.is_none() {
+                Some("target lease is held")
+            } else if !stable {
+                Some("target/profile path changed")
+            } else if procs.is_none() {
+                Some("build-process evidence unavailable")
+            } else if compiler_busy {
+                Some("compiler is using this target")
+            } else if lane_busy {
+                Some("Autoship lane is using the gate cache")
+            } else if !refs.reliable {
+                Some("process/service reference evidence unavailable")
+            } else {
+                None
+            };
+            if let Some(reason) = blocked {
+                report.outcome = format!("pressure skipped: {reason}");
                 reports.push(report);
                 continue;
             }
