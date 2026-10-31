@@ -51,9 +51,11 @@ Deployed/browser verification remains a separate delivery gate. Do not close
 
 ## Verification commands
 
-Use `scripts/cargo-managed.sh` for local runs. The platform CI contract runs the
+Use `scripts/cargo-managed.sh` for local runs. The dedicated LinkedIn CI contract runs the
 LinkedIn crate, recall libraries, CLI integration and parsed-dispatch/approval
-tests, and reasoner allowlist tests on Linux and macOS. CI inventory validation:
+tests, reasoner allowlist tests, and affected store/auth contracts on Linux and
+macOS. It runs independently of the general platform suite, with the same
+LinkedIn commands and no live credentials. CI inventory validation:
 `python3 scripts/ci-contract.py verify`.
 
 ## Required host receipt
