@@ -221,3 +221,49 @@ fn expired_claim_recovers_and_an_old_guard_cannot_release_its_replacement() {
     drop(replacement);
     assert_eq!(live::pending(&store, OWNER).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn stored_live_candidates_survive_inventory_and_index_failures() {
+    use augmentagent_channel_linkedin::{archive::ArchiveReader, LinkedInAuth};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    for inventory_fails in [true, false] {
+        let store = Store::open(":memory:").unwrap();
+        live::initialize(&store, OWNER, 1000).unwrap();
+        import(&store, false, false, 2000);
+        live::admit(&store, OWNER, 9000).unwrap();
+        if !inventory_fails {
+            store.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_index BEFORE INSERT ON message_index BEGIN SELECT RAISE(ABORT,'synthetic index failure'); END;")).unwrap();
+        }
+        let server = MockServer::start().await;
+        let response = if inventory_fails {
+            ResponseTemplate::new(503)
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"messengerMailboxCountsByMailbox":{"elements":[{"category":"PRIMARY_INBOX"}]}}}))
+        };
+        Mock::given(method("GET"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = LinkedInAuth {
+            member_urn: OWNER.into(),
+            cookies: std::collections::BTreeMap::from([
+                ("li_at".into(), "SYNTHETIC".into()),
+                ("JSESSIONID".into(), "ajax:test".into()),
+            ]),
+            user_agent: "test".into(),
+            harvested_at_ms: 0,
+        };
+        let reader = ArchiveReader::for_test(auth, server.uri()).unwrap();
+        let pending = live::poll(
+            &reader,
+            &store,
+            1,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id, "message:2000:2");
+    }
+}

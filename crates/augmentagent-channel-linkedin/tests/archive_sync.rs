@@ -320,7 +320,8 @@ async fn inventory_throttle_is_durable_before_any_category_is_known() {
     assert!(
         augmentagent_channel_linkedin::archive_live::poll(&reader, &s, 100, &cancel)
             .await
-            .is_err()
+            .unwrap()
+            .is_empty()
     );
     drop(s);
     let s = Store::open(f.path()).unwrap();
@@ -572,4 +573,73 @@ async fn archive_live_poll_discovery(reader: &ArchiveReader, store: &Store) {
     .await
     .unwrap()
     .is_empty());
+}
+
+#[tokio::test]
+async fn commit_failure_is_deferred_without_starving_other_threads() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(respond)
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let s = Store::open(":memory:").unwrap();
+    s.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_one_history BEFORE INSERT ON linkedin_archive_messages WHEN NEW.conversation='thread:0' BEGIN SELECT RAISE(ABORT,'synthetic commit failure'); END;")).unwrap();
+    let report = archive_sync::sync_with_clock(
+        &reader,
+        &s,
+        "PRIMARY_INBOX",
+        100,
+        &CancellationToken::new(),
+        &|| 1000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.stopped, "retry_deferred");
+    assert_eq!(report.coverage.messages, 150);
+    let pending = db::pending_threads(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, "thread:0");
+    assert_eq!(pending[0].1.retry_at_ms, 61000);
+    s.with_conn(|c| c.execute_batch("DROP TRIGGER reject_one_history"))
+        .unwrap();
+    let retry = archive_sync::sync_with_clock(
+        &reader,
+        &s,
+        "PRIMARY_INBOX",
+        100,
+        &CancellationToken::new(),
+        &|| 61000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.coverage.messages, 153);
+    assert_eq!(retry.pages, 1);
+}
+
+#[tokio::test]
+async fn mailbox_commit_failure_records_scope_and_keeps_cursor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(respond)
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let s = Store::open(":memory:").unwrap();
+    s.with_conn(|c| c.execute_batch("CREATE TRIGGER reject_inventory_page BEFORE INSERT ON linkedin_archive_conversations BEGIN SELECT RAISE(ABORT,'synthetic commit failure'); END;")).unwrap();
+    let report = archive_sync::sync_with_clock(
+        &reader,
+        &s,
+        "PRIMARY_INBOX",
+        100,
+        &CancellationToken::new(),
+        &|| 1000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.pages, 1);
+    assert_eq!(report.coverage.conversations, 0);
+    let cp = db::checkpoint(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    assert_eq!(cp.cursor, None);
+    assert_eq!(cp.retry_at_ms, 61000);
 }

@@ -819,11 +819,10 @@ impl PrivateFileCredentialStore {
             use std::os::unix::fs::PermissionsExt;
             if meta.permissions().mode() & 0o077 != 0 {
                 if !repair {
-                    return Err(corrupt(
-                        platform,
-                        account,
-                        "credential permissions require repair; read-only mode cannot change them",
-                    ));
+                    return Err(io_err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "credential permissions require repair; set the credential file mode to 0600 (chmod 600), or run a normal credential-loading command before retrying read-only mode",
+                    )));
                 }
                 tracing::warn!(
                     platform,
@@ -1206,7 +1205,10 @@ mod read_only_tests {
         store.put("linkedin", "default", b"synthetic").unwrap();
         let path = store.path_for("linkedin", "default").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(store.get_read_only("linkedin", "default").is_err());
+        let error = store.get_read_only("linkedin", "default").unwrap_err().to_string();
+        assert!(error.contains("0600"));
+        assert!(error.contains("chmod 600"));
+        assert!(!error.contains("corrupt"));
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o644

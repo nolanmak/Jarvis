@@ -74,7 +74,14 @@ pub async fn sync_with_clock(
             match fetched {
                 Ok(page) => {
                     db::clear_account_failure(store, account, request_started)?;
-                    db::commit_conversations(store, account, category, &cp, &page, now())?;
+                    if db::commit_conversations(store, account, category, &cp, &page, now()).is_err() {
+                        // The page transaction rolled back. Keep its cursor and
+                        // persist a sanitized scope failure outside that transaction.
+                        db::record_failure(store, account, category, false,
+                            "archive page commit failed", retry_at(&ArchiveError::Transport, now()))?;
+                        stopped = "archive page commit failed".into();
+                        break;
+                    }
                 }
                 Err(e) => {
                     account_deferred = defer_account(store, account, &e, now())?;
@@ -117,7 +124,11 @@ pub async fn sync_with_clock(
             match fetched {
                 Ok(page) => {
                     db::clear_account_failure(store, account, request_started)?;
-                    db::commit_messages(store, account, &thread, &cp, &page, now())?;
+                    if db::commit_messages(store, account, &thread, &cp, &page, now()).is_err() {
+                        db::record_failure(store, account, &thread, true,
+                            "archive page commit failed", retry_at(&ArchiveError::Transport, now()))?;
+                        // Other threads can still make progress during backoff.
+                    }
                 }
                 Err(e) => {
                     account_deferred = defer_account(store, account, &e, now())?;

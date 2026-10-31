@@ -77,3 +77,23 @@ async fn confirmed_direct_send_preserves_target_and_body() {
     assert_eq!(sent["message"]["body"]["text"], "synthetic reply 🦀");
     assert_eq!(sent["mailboxUrn"], support::OWNER);
 }
+
+#[tokio::test]
+async fn membership_auth_failure_preserves_login_signal_without_sending() {
+    use augmentagent_channel_linkedin::LinkedInError;
+    for status in [401, 403, 302] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = VoyagerClient::for_test(support::auth(), server.uri()).unwrap();
+        let error = client
+            .send_message("thread:0", "synthetic reply")
+            .await
+            .unwrap_err();
+        assert_eq!(matches!(error, LinkedInError::AuthExpired), status != 302);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}

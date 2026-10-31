@@ -130,7 +130,11 @@ pub fn claim(
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis((CLAIM_TTL_MS/3) as u64)).await;
                     let renewed=store.with_conn(|c|c.execute("UPDATE linkedin_archive_live_queue SET claimed_at_ms=?3 WHERE stored_id=?1 AND claim_token=?2",params![message_id,token,clock_ms()]));
-                    if !matches!(renewed,Ok(1)){break;}
+                    match renewed {
+                        Ok(0) => break,
+                        Ok(_) => {},
+                        Err(_) => tracing::warn!("LinkedIn live claim renewal failed; retrying"),
+                    }
                 }
             })
         });
@@ -151,8 +155,13 @@ pub async fn poll(
     if max_pages == 0 || cancel.is_cancelled() {
         return pending(store, reader.mailbox());
     }
-    let Some(categories) = crate::archive_sync::categories(reader, store, cancel).await? else {
-        return pending(store, reader.mailbox());
+    let categories = match crate::archive_sync::categories(reader, store, cancel).await {
+        Ok(Some(categories)) => categories,
+        Ok(None) => return pending(store, reader.mailbox()),
+        Err(_) => {
+            tracing::warn!("LinkedIn category discovery failed; serving durable candidates");
+            return pending(store, reader.mailbox());
+        }
     };
     let mut remaining = max_pages - 1;
     for category in categories {
@@ -165,13 +174,21 @@ pub async fn poll(
         {
             crate::archive_store::refresh_mailbox(store, reader.mailbox(), &category)?;
         }
-        let report = crate::archive_sync::sync(reader, store, &category, remaining, cancel).await?;
+        let report = match crate::archive_sync::sync(reader, store, &category, remaining, cancel).await {
+            Ok(report) => report,
+            Err(_) => {
+                tracing::warn!("LinkedIn archive reconciliation failed; serving durable candidates");
+                break;
+            }
+        };
         remaining = remaining.saturating_sub(report.pages);
         if report.account_deferred {
             break;
         }
     }
-    augmentagent_messages::index::drain(store, 100, std::time::Duration::ZERO)?;
+    if augmentagent_messages::index::drain(store, 100, std::time::Duration::ZERO).is_err() {
+        tracing::warn!("LinkedIn search indexing failed; durable triage remains available");
+    }
     admit(store, reader.mailbox(), now())?;
     pending(store, reader.mailbox())
 }

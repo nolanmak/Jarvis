@@ -269,7 +269,10 @@ impl LinkedInApi for VoyagerClient {
         self.archive_reader()?
             .ok_or_else(|| LinkedInError::Config("archive reader unavailable".into()))?
             .require_direct(conversation_urn).await
-            .map_err(|e| LinkedInError::Config(e.to_string()))?;
+            .map_err(|e| match e {
+                crate::archive::ArchiveError::Auth => LinkedInError::AuthExpired,
+                other => LinkedInError::Config(other.to_string()),
+            })?;
         let url = format!("{}/voyagerMessagingDashMessengerMessages?action=createMessage",
             self.test_send_base.as_deref().unwrap_or("https://www.linkedin.com/voyager/api"));
 

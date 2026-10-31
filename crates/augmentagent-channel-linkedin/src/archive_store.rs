@@ -105,13 +105,13 @@ pub fn commit_messages(
             let stored_id=if let Some((_, id)) = archived { id } else if existing.as_ref().is_none_or(|value|value.as_deref().is_some_and(|a|a==format!("linkedin:{account}")||a==account)){m.urn.clone()}else{format!("linkedin-archive:{account}:{}",m.urn)};
             // Validate the chosen key too: a scoped fallback can itself collide
             // with legacy data. Never overwrite another account/platform/thread.
-            let target: Option<(Option<String>, String, String)> = tx.query_row(
+            let target: Option<(Option<String>, String, Option<String>)> = tx.query_row(
                 "SELECT accountEntityId,platform,threadId FROM emails WHERE messageId=?1",
                 [&stored_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
             ).optional()?;
             if target.is_some_and(|(owner, platform, thread)|
                 !owner.as_deref().is_some_and(|a| a == account || a == format!("linkedin:{account}"))
-                || platform != "linkedin" || thread != conversation
+                || platform != "linkedin" || thread.as_deref() != Some(conversation)
             ) {
                 return Err(augmentagent_store::rusqlite::Error::InvalidParameterName("stored message identity conflicts with archive scope".into()));
             }
