@@ -109,7 +109,7 @@ fn load_seed_at(
     latest: bool,
 ) -> anyhow::Result<ContextSeed> {
     let mut seed = ContextSeed {
-        audience: serde_json::json!({"platform":current.platform,"account_id":current.account_entity_id,"kind":current.kind,"thread_id":current.thread_id,"trigger_message_id":current.message_id,"to":current.to,"cc":current.cc,"stored_recipients":store.email_recipients(&current.message_id)?,"audience_note":"The sender identity is not a complete participant list. Preserve the platform thread and explicit To/CC; do not infer a private one-to-one audience from kind or sender alone."}),
+        audience: serde_json::json!({"platform":current.platform,"account_id":current.account_entity_id,"kind":current.kind,"thread_id":current.thread_id,"trigger_message_id":current.message_id,"source_to":current.to,"source_cc":current.cc,"stored_source_recipients":store.email_recipients(&current.message_id)?,"audience_note":"These are source-message headers, not instructions to change outbound recipients. The existing approval envelope and platform thread determine the reply audience. The sender identity is not a complete participant list; do not infer a private one-to-one audience from kind or sender alone."}),
         messages: Vec::new(),
         person_slug: None,
         wiki: Vec::new(),
