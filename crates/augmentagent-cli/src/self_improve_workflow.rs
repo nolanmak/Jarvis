@@ -622,7 +622,13 @@ impl WorkflowGuard {
         Self::acquire_at(state, start, millis()).await
     }
 
+    pub(super) async fn acquire_owner_turn(start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(&path(),start,millis(),true).await
+    }
     async fn acquire_at(state: &Path, start: Start<'_>, now: i64) -> Result<Option<Self>> {
+        Self::acquire_mode_at(state,start,now,false).await
+    }
+    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,owner_turn:bool)->Result<Option<Self>> {
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -657,11 +663,13 @@ impl WorkflowGuard {
         {
             binding = git_binding(start.worktree, start.contract, start.environment, &[]).await?;
         }
-        store.register(&id, start.branch, binding.clone(), now)?;
-        let owner = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
-        let Some(lease) = store.claim_productive(&id, &owner, now, LEASE_MS)? else {
-            return Ok(None);
-        };
+        if owner_turn {
+            anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
+        } else {store.register(&id,start.branch,binding.clone(),now)?;}
+        let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
+        let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
+            else {store.claim_productive(&id,&owner,now,LEASE_MS)?};
+        let Some(lease)=lease else {return Ok(None);};
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
         }
@@ -1749,6 +1757,24 @@ mod tests {
         ]);
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         dir
+    }
+    #[tokio::test]
+    async fn claimed_owner_guard_admits_native_work_without_granting_shipping() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");let now=millis();
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Pr(42),provider:Some(durable::submission::Provider::Codex),until:durable::submission::Milestone::Merged};
+        let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),now).unwrap().admission.workflow;
+        let binding=git_binding(dir.path(),"C1","rust-a",&[]).await.unwrap();store.register(&id,"candidate",binding,now).unwrap();
+        store.enqueue_owner_message(&durable::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Fix the test",None,now).unwrap();drop(store);
+        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),true).await.unwrap().unwrap();
+        guard.audit_logger().dispatch_allowed().unwrap();guard.audit_logger().model_call_admitted("codex").unwrap();
+        assert!(guard.intent(OperationKind::Push).is_err());assert!(guard.intent(OperationKind::MergePr).is_err());
+        let mut store=WorkflowStore::open(&path).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
+        store.set_owner_pause(&id,"owner",revision,true,millis()).unwrap();
+        assert!(guard.audit_logger().dispatch_allowed().is_err());assert!(guard.audit_logger().model_call_admitted("codex").is_err());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
+        assert_eq!(std::fs::read_to_string(dir.path().join("code.txt")).unwrap(),"baseline\n");guard.finish().unwrap();
     }
     #[tokio::test]
     async fn real_git_binding_changes_with_dirty_code_environment_and_contract() {

@@ -1205,7 +1205,7 @@ impl WorkflowStore {
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
         } else {
-            if charge.model_calls>0 {owner_control::require_dispatch(&tx,&lease.workflow)?;}
+            if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
@@ -1450,7 +1450,7 @@ impl WorkflowStore {
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
-        owner_control::require_dispatch(&tx,&lease.workflow)?;
+        owner_turn::require_native_dispatch(&tx,lease,now)?;
         tx.commit()?;Ok(())
     }
 

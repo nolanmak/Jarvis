@@ -51,6 +51,20 @@ impl WorkflowStore {
         tx.commit()?;Ok(())
     }
 }
+// Only model/verifier admission uses this exception. Publication and merge
+// retain the ordinary owner-pause checks even for an active owner turn.
+pub(super) fn require_native_dispatch(tx:&Transaction<'_>,lease:&Lease,now:i64)->Result<()> {
+    let turn:Option<(String,i64,String)>=tx.query_row("SELECT request_id,pause_revision,binding FROM workflow_owner_turn WHERE workflow=?1 AND owner=?2 AND lease_generation=?3 AND state='claimed'",params![lease.workflow,lease.owner,lease.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((request,revision,raw))=turn else {return super::owner_control::require_dispatch(tx,&lease.workflow);};
+    let binding:Binding=serde_json::from_str(&raw)?;require_binding(tx,lease,&binding,now)?;
+    let control=super::owner_control::read(tx,&lease.workflow)?.context("owner control missing")?;
+    ensure!(control.paused && control.revision==revision,"owner intent changed during turn");
+    let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_message WHERE request_id=?1 AND workflow=?2 AND state='pending')",params![request,lease.workflow],|r|r.get(0))?;
+    ensure!(pending,"owner input no longer pending");
+    let checkpoint:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|r|r.get(0))?;
+    ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Held|Stage::Merged|Stage::Retired),"owner turn checkpoint blocked");
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +137,20 @@ mod tests {
         store.claim_owner_turn(&id,"consumer",8,100).unwrap().unwrap();
         assert_eq!(store.conn.query_row("SELECT count(*) FROM review WHERE workflow=?1",[&id],|r|r.get::<_,i64>(0)).unwrap(),0);
         assert!(store.events(&id).unwrap().iter().any(|(_,kind,_,_)|kind=="review_recorded"));
+    }
+
+    #[test]
+    fn owner_turn_native_dispatch_is_scoped_and_never_grants_publication() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,id)=setup(&dir.path().join("state.db"));
+        let turn=store.claim_owner_turn(&id,"consumer",4,100).unwrap().unwrap();
+        store.validate_dispatch(&turn.lease,&turn.binding,5).expect("claimed owner turn cannot dispatch its native work");
+        store.charge(&turn.lease,"owner-call",ResourceCharge {model_calls:1,..Default::default()},5).unwrap();
+        assert!(store.begin_operation(&turn.lease,OperationKind::Push,&turn.binding,5).is_err());
+        assert!(store.begin_operation(&turn.lease,OperationKind::MergePr,&turn.binding,5).is_err());
+        store.set_owner_pause(&id,"owner",turn.pause_revision,true,6).unwrap();
+        assert!(store.validate_dispatch(&turn.lease,&turn.binding,7).is_err());
+        assert!(store.charge(&turn.lease,"stale-owner-call",ResourceCharge {model_calls:1,..Default::default()},7).is_err());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1);
     }
 
 }
