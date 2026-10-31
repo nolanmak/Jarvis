@@ -100,9 +100,11 @@ pub fn commit_messages(
             if archived.as_ref().is_some_and(|(thread, _)| thread != conversation) {
                 return Err(augmentagent_store::rusqlite::Error::InvalidParameterName("message identity belongs to another conversation".into()));
             }
-            let existing:Option<Option<String>>=tx.query_row("SELECT accountEntityId FROM emails WHERE messageId=?1",[&m.urn],|r|r.get(0)).optional()?;
-            // Preserve existing primary-account references; scope a collision.
-            let stored_id=if let Some((_, id)) = archived { id } else if existing.as_ref().is_none_or(|value|value.as_deref().is_some_and(|a|a==format!("linkedin:{account}")||a==account)){m.urn.clone()}else{format!("linkedin-archive:{account}:{}",m.urn)};
+            let existing:Option<(Option<String>, String)>=tx.query_row("SELECT accountEntityId,platform FROM emails WHERE messageId=?1",[&m.urn],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            // Preserve references only for an existing LinkedIn row owned by
+            // this account. Older imports can retain the default Gmail label;
+            // preserve those rows/actions and scope the canonical archive ID.
+            let stored_id=if let Some((_, id)) = archived { id } else if existing.as_ref().is_none_or(|(owner, platform)|platform == "linkedin" && owner.as_deref().is_some_and(|a|a==format!("linkedin:{account}")||a==account)){m.urn.clone()}else{format!("linkedin-archive:{account}:{}",m.urn)};
             // Validate the chosen key too: a scoped fallback can itself collide
             // with legacy data. Never overwrite another account/platform/thread.
             let target: Option<(Option<String>, String, Option<String>)> = tx.query_row(

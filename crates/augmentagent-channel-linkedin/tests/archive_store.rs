@@ -998,3 +998,79 @@ fn coverage_counts_only_committed_pages_and_preserves_totals_across_refresh() {
     assert_eq!(json["mailbox_pages"]["current_cycle"], 0);
     assert_eq!(json["scope"], "all_accessible_history");
 }
+
+#[test]
+fn legacy_default_platform_keeps_its_row_and_action_while_archive_uses_scoped_id() {
+    let s = Store::open(":memory:").unwrap();
+    let account = format!("linkedin:{OWNER}");
+    s.with_conn(|c| {
+        c.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,accountEntityId,firstSeenAt,platform,kind) VALUES('message:0:0','thread:0','legacy sender','','preserve legacy body','',?1,1,'gmail','dm')", [&account])?;
+        Ok(())
+    }).unwrap();
+    let action = s
+        .log_action(
+            "message:0:0",
+            Some("thread:0"),
+            "legacy sender",
+            "",
+            Some("preserve legacy body"),
+            Some("preserve draft"),
+            augmentagent_store::ActionStatus::Pending,
+        )
+        .unwrap();
+    for cycle in 0..2 {
+        if cycle > 0 {
+            refresh_mailbox(&s, OWNER, "PRIMARY_INBOX").unwrap();
+        }
+        let cp = checkpoint(&s, OWNER, "PRIMARY_INBOX").unwrap();
+        let mut conversation = conversation(0);
+        conversation.last_activity_ms += cycle;
+        commit_conversations(
+            &s,
+            OWNER,
+            "PRIMARY_INBOX",
+            &cp,
+            &Page {
+                items: vec![conversation],
+                next: None,
+            },
+            10000 + cycle,
+        )
+        .unwrap();
+        let cp = pending_threads(&s, OWNER, "PRIMARY_INBOX")
+            .unwrap()
+            .remove(0)
+            .1;
+        assert!(commit_messages(
+            &s,
+            OWNER,
+            "thread:0",
+            &cp,
+            &Page {
+                items: vec![message(0, 0)],
+                next: None
+            },
+            10000 + cycle
+        )
+        .unwrap());
+        augmentagent_messages::index::drain(&s, 100, std::time::Duration::ZERO).unwrap();
+        assert!(coverage(&s, OWNER, "PRIMARY_INBOX").unwrap().complete);
+        s.with_conn(|c| {
+            let original: (String, String, String) = c.query_row("SELECT platform,body,threadId FROM emails WHERE messageId='message:0:0'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(original, ("gmail".into(), "preserve legacy body".into(), "thread:0".into()));
+            let archived: String = c.query_row("SELECT stored_id FROM linkedin_archive_messages WHERE account=?1 AND urn='message:0:0'", [OWNER], |r| r.get(0))?;
+            assert_eq!(archived, format!("linkedin-archive:{OWNER}:message:0:0"));
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get::<_,i64>(0))?, 2);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM linkedin_archive_messages", [], |r| r.get::<_,i64>(0))?, 1);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM message_index WHERE platform='linkedin'", [], |r| r.get::<_,i64>(0))?, 1);
+            Ok(())
+        }).unwrap();
+        let preserved = s.get_action_with_email(&action).unwrap().unwrap();
+        assert_eq!(preserved.action.status, "pending");
+        assert_eq!(
+            preserved.action.draft_body.as_deref(),
+            Some("preserve draft")
+        );
+        assert_eq!(preserved.email.body, "preserve legacy body");
+    }
+}
