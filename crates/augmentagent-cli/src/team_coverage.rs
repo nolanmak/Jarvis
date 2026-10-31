@@ -193,8 +193,13 @@ pub struct Summary {
 }
 
 pub fn summarize(rows: &[augmentagent_store::team_coverage::TeamCoverageReportRow]) -> Summary {
-    let _ = rows;
-    Summary::default()
+    Summary {
+        decisions: rows.len(),
+        reviewed: rows.iter().filter(|r| r.review.is_some()).count(),
+        wrong: rows.iter().filter(|r| r.review.as_deref() == Some("wrong")).count(),
+        replied_anyway: rows.iter().filter(|r| r.owner_replied_anyway).count(),
+        first_decided_ms: rows.iter().map(|r| r.decision.decided_at_ms).min(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,14 +215,44 @@ pub const GATE_SPARSE_MIN_DAYS: i64 = 14;
 
 /// The #1702 gate for switching the default from `shadow` to `on`.
 pub fn gate(s: &Summary, now_ms: i64) -> Gate {
-    let _ = (s, now_ms);
-    Gate { pass: false, reasons: vec![] }
+    let Some(first) = s.first_decided_ms else {
+        return Gate { pass: false, reasons: vec!["no shadow decisions yet".into()] };
+    };
+    let days = (now_ms - first).max(0) / 86_400_000;
+    let mut reasons = Vec::new();
+    if days < GATE_MIN_DAYS {
+        reasons.push(format!("shadow for {days} day(s); need {GATE_MIN_DAYS}"));
+    }
+    if s.decisions < GATE_MIN_DECISIONS && days < GATE_SPARSE_MIN_DAYS {
+        reasons.push(format!(
+            "only {} decision(s); need {GATE_MIN_DECISIONS}, or {GATE_SPARSE_MIN_DAYS} days of shadow",
+            s.decisions
+        ));
+    }
+    if s.reviewed < s.decisions {
+        reasons.push(format!("{}/{} decision(s) reviewed; need all", s.reviewed, s.decisions));
+    }
+    if s.wrong > 0 {
+        reasons.push(format!("{} decision(s) marked wrong", s.wrong));
+    }
+    if s.replied_anyway > 0 {
+        reasons.push(format!("owner replied anyway on {} decision(s)", s.replied_anyway));
+    }
+    Gate { pass: reasons.is_empty(), reasons }
 }
 
 /// One-line health summary (autopr-health style).
-pub fn summary_line(s: &Summary, g: &Gate) -> String {
-    let _ = (s, g);
-    String::new()
+pub fn summary_line(s: &Summary, g: &Gate, now_ms: i64) -> String {
+    let days = s.first_decided_ms.map_or(0, |f| (now_ms - f).max(0) / 86_400_000);
+    format!(
+        "team-coverage: {} decision(s), {} reviewed, {} wrong, {} replied-anyway, shadow {} day(s) — gate {}",
+        s.decisions,
+        s.reviewed,
+        s.wrong,
+        s.replied_anyway,
+        days,
+        if g.pass { "PASS" } else { "FAIL" }
+    )
 }
 
 #[cfg(test)]
@@ -507,7 +542,7 @@ mod tests {
         );
         let g = gate(&s, 20 * DAY);
         assert_eq!(
-            summary_line(&s, &g),
+            summary_line(&s, &g, 20 * DAY),
             "team-coverage: 3 decision(s), 2 reviewed, 1 wrong, 1 replied-anyway, shadow 17 day(s) — gate FAIL"
         );
     }
