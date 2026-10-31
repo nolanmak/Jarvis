@@ -19,7 +19,7 @@ def escaped(value):
  return value.replace('\\','\\\\').replace('"','\\"').replace('%','%%')
 def environment_file(path,optional=False,literal=False):
  # This directive consumes the whole path; embedded shell quotes become
- # literal filename characters. Only systemd specifiers need escaping.
+ # literal filename characters. Preserve inherited glob patterns below.
  if not pathlib.Path(path).is_absolute() or any(c in path for c in '\n\r\0'):
   raise RuntimeError('environment file must be an absolute single-line path')
  if path.endswith('\\'):
