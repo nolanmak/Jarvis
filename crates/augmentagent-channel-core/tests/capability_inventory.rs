@@ -968,7 +968,7 @@ fn imessage_compose_matches_social_card_scope_and_forbids_send_controls() {
         let has=|s:&str|opts.allowed_tools.iter().any(|t|t==s);
         assert_eq!(has("Bash(augmentagent imessage compose *)"),has("Bash(augmentagent socialapi dm *)"));
         assert_eq!(has("Bash(augmentagent imessage allowlist)"),has("Bash(augmentagent socialapi dm *)"));
-        for forbidden in ["imessage *","imessage approve *","imessage allow-outbound *","imessage alerts *","imessage outbox *"] {
+        for forbidden in ["imessage *","imessage approve *","imessage allow-outbound *","imessage alerts *","imessage outbox *","imessage contact-defaults *"] {
             assert!(!opts.allowed_tools.iter().any(|t|t.ends_with(&format!(" {forbidden})"))));
         }
     }

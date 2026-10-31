@@ -1616,7 +1616,15 @@ enum ImessageOp {
     AllowInbound { identifier: String },
     /// Stop drafting reply cards for a conversation.
     DenyInbound { identifier: String },
-    /// Print both allowlists.
+    /// Owner policy for existing and future one-to-one iMessage contacts.
+    /// Every outgoing message still requires approval; explicit denials win.
+    ContactDefaults {
+        #[arg(long, required = true, action = clap::ArgAction::Set)]
+        inbound: bool,
+        #[arg(long, required = true, action = clap::ArgAction::Set)]
+        outbound: bool,
+    },
+    /// Print both allowlists, contact defaults, and explicit exclusions.
     Allowlist,
     /// Approve one pending iMessage card from the terminal: the same checks
     /// and outbox queueing as the card's Approve button.
@@ -5026,6 +5034,10 @@ async fn main() -> Result<()> {
             }
             ImessageOp::DenyInbound { identifier } => {
                 imessage_send::set_allowlist(&store, false, false, identifier)
+            }
+            ImessageOp::ContactDefaults { inbound, outbound } => {
+                store.set_imessage_contact_defaults(*inbound, *outbound)?;
+                imessage_send::print_allowlists(&store)
             }
             ImessageOp::Allowlist => imessage_send::print_allowlists(&store),
             ImessageOp::Approve { action_id } => {

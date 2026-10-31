@@ -166,7 +166,9 @@ print(json.dumps({'type':'result','result':answer}))
             assert!(pending.is_empty());
         } else {
             assert_eq!(pending.len(), 1);
-            let ids = store.pending_action_ids_for_thread_kind(&format!("imessage:{PHONE}"), "compose").unwrap();
+            let ids = store
+                .pending_action_ids_for_thread_kind(&format!("imessage:{PHONE}"), "compose")
+                .unwrap();
             assert_eq!(ids.len(), 1);
             assert!(answer.contains(&ids[0][..8]), "{answer}");
             ok(cmd(root)
@@ -176,4 +178,58 @@ print(json.dumps({'type':'result','result':answer}))
             assert!(store.pending_actions().unwrap().is_empty());
         }
     }
+}
+
+#[test]
+fn owner_contact_defaults_enable_cards_but_denials_still_block_approval() {
+    let dir = fixture();
+    let root = dir.path();
+    let store = Store::open(root.join("agent.db")).unwrap();
+    store
+        .with_conn(|c| c.execute("DELETE FROM imessage_outbound_allowlist", []))
+        .unwrap();
+    ok(cmd(root)
+        .args([
+            "imessage",
+            "contact-defaults",
+            "--inbound",
+            "true",
+            "--outbound",
+            "true",
+        ])
+        .output()
+        .unwrap());
+    assert!(store.is_imessage_inbound_allowed(PHONE).unwrap());
+    let record: serde_json::Value = serde_json::from_str(&ok(cmd(root)
+        .args([
+            "imessage",
+            "compose",
+            "--to",
+            "Synthetic Jane",
+            "--body",
+            "hello world",
+            "--post",
+            "--json",
+        ])
+        .output()
+        .unwrap()))
+    .unwrap();
+    let id = record["action_id"].as_str().unwrap();
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+    ok(cmd(root)
+        .args(["imessage", "deny-outbound", PHONE])
+        .output()
+        .unwrap());
+    let out = cmd(root)
+        .args(["imessage", "approve", id])
+        .output()
+        .unwrap();
+    assert!(format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .contains("allow-outbound"));
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+    ok(cmd(root).args(["imessage", "skip", id]).output().unwrap());
 }

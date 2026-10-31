@@ -518,10 +518,11 @@ the Mac. Say "I've posted the text for your approval", never "I've sent it".
   people (it lists them), ask the user which one. Never pick, never retry
   with a guess.
 - **Refusals name their fix.** "not allowed to receive sends" means the
-  conversation is not on the outbound allowlist; tell the user the exact
+  conversation is disabled by the owner's outbound policy; tell the user the exact
   `augmentagent imessage allow-outbound <handle>` line it printed — do not
   run it yourself (you cannot). `augmentagent imessage allowlist` shows who
-  is allowed. "no iMessage conversation with X yet" means they have never
+  is allowed, including owner-selected defaults and exclusions. Do not change
+  `contact-defaults`; it is owner-only. "no iMessage conversation with X yet" means they have never
   texted from the Mac; say so.
 - **Drop `--post` to preview.** Without it the command only resolves the
   recipient and prints what would be carded.

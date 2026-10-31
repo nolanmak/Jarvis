@@ -342,6 +342,22 @@ names what to do:
 - the conversation must be on `allow-outbound`, and
   `AUGMENTAGENT_IMESSAGE_SEND_ENABLED=1` must be set.
 
+The owner can opt all existing and future one-to-one iMessage conversations into
+incoming reply drafting and outgoing approval cards with:
+
+```sh
+augmentagent imessage contact-defaults --inbound true --outbound true
+```
+
+This policy persists in the database. Both defaults are off until explicitly
+selected by the owner. `deny-inbound <handle>` and `deny-outbound <handle>` are
+persistent exceptions, even while the defaults are on; `allow-inbound` and
+`allow-outbound` remove the corresponding exception. `imessage allowlist` shows
+the defaults and exceptions. Set both flags to `false` to return to explicit
+allowlists. Groups still require explicit permission; compose remains 1:1 only.
+Neither this policy nor composing bypasses Approve or the global send switch.
+The agent cannot change this policy from an ask session.
+
 Only after every check passes is one pending card stored. A second compose to
 the same person while the first is still pending replaces it. The card is
 labelled *New message · iMessage* with a **To** field; Revise redrafts against your
