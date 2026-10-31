@@ -12,7 +12,7 @@ name: Rust dependency cache
 
 on:
   push:
-    branches: [main, ci/shared-rust-cache]  # TEMP: validate keys before merge
+    branches: [main]
   schedule:
     # Absorb runner image updates that land between main pushes.
     - cron: '23 7 * * *'

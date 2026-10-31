@@ -16,7 +16,7 @@ name: Rust suites
 on:
   pull_request:
   push:
-    branches: [main, ci/shared-rust-cache]  # TEMP: measure with warm cache before merge
+    branches: [main]
   workflow_dispatch:
 
 permissions:

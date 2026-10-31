@@ -1628,7 +1628,7 @@
     ".github/workflows/rust-cache.yml": {
       "reason": "main-branch Rust dependency cache warming, not PR validation",
       "role": "excluded",
-      "sha256": "43d182508d451d31d0c0593c1b180a0fd1e5473c60d0a05cf6ca145aa3e8b0ef"
+      "sha256": "629674fb00c111eb4b107e68b2dcc3fdddd61e97d1f89edb38d3a58c9e63b8d8"
     },
     ".github/workflows/rust.yml": {
       "defaults": {},
@@ -1637,8 +1637,7 @@
         "pull_request": null,
         "push": {
           "branches": [
-            "main",
-            "ci/shared-rust-cache"
+            "main"
           ]
         },
         "workflow_dispatch": null
@@ -2160,7 +2159,7 @@
         }
       },
       "role": "validation",
-      "sha256": "0e76a504f979c88ac6de3b86a723d76158f78fe2c87807125507f3b72882353a"
+      "sha256": "cabdeb05d09f99c8b59f3d69902857af44371ef2f3199264d89fa068d4b75f05"
     }
   }
 }
