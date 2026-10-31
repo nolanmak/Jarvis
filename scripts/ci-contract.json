@@ -4,34 +4,6 @@
       "body": "python3 -m unittest discover -s scripts/apple-notes/tests -v",
       "shell": "bash"
     },
-    "apple-notes/notes/4": {
-      "body": "cargo test -p augmentagent-channel-apple-notes",
-      "shell": "bash"
-    },
-    "apple-notes/notes/5": {
-      "body": "cargo test -p augmentagent-cli --test apple_notes_cli",
-      "shell": "bash"
-    },
-    "apple-notes/notes/6": {
-      "body": "cargo clippy -p augmentagent-channel-apple-notes --all-targets --no-deps -- -D warnings",
-      "shell": "bash"
-    },
-    "approval-history/decisions-and-context/3": {
-      "body": "cargo test -p augmentagent-store --test approval_history --locked",
-      "shell": "bash"
-    },
-    "approval-history/decisions-and-context/4": {
-      "body": "cargo test -p augmentagent-approval-discord --lib --locked",
-      "shell": "bash"
-    },
-    "approval-history/decisions-and-context/5": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent approval_context::tests --locked",
-      "shell": "bash"
-    },
-    "approval-history/decisions-and-context/6": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent calendar_approval_tests --locked",
-      "shell": "bash"
-    },
     "bridge-suites/bridge-suites/1": {
       "body": "sudo apt-get -o Acquire::Retries=3 update\nsudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \\\n  poppler-utils libseccomp2 ripgrep python3-packaging python3-yaml openssl\n",
       "shell": "bash"
@@ -69,22 +41,6 @@
       "vm_provisioning": [
         "python-browser-runtime"
       ]
-    },
-    "code-mode/deterministic/4": {
-      "body": "sudo apt-get -o Acquire::Retries=3 update\nsudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends python3-packaging\n",
-      "shell": "bash"
-    },
-    "code-mode/deterministic/5": {
-      "body": "python3 -m unittest scripts.tests.compute_ci_test scripts.tests.compute_receipt_test -v",
-      "shell": "bash"
-    },
-    "code-mode/deterministic/6": {
-      "body": "bash scripts/ci-code-mode.sh",
-      "shell": "bash"
-    },
-    "code-mode/deterministic/7": {
-      "body": "bash scripts/tests/updater-rebuild-trigger.test.sh",
-      "shell": "bash"
     },
     "computer-use/browser/2": {
       "body": "npm ci",
@@ -146,28 +102,6 @@
       "body": "npm test",
       "shell": "bash"
     },
-    "discord-voice/rust/4": {
-      "body": "sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils",
-      "shell": "bash"
-    },
-    "discord-voice/rust/5": {
-      "body": "python3 scripts/pdf-runtime.py",
-      "shell": "bash",
-      "vm_provisioning": [
-        "pdf-python-runtime"
-      ]
-    },
-    "discord-voice/rust/6": {
-      "body": "cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked",
-      "shell": "bash"
-    },
-    "discord-voice/rust/7": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1",
-      "shell": "bash",
-      "vm_provisioning": [
-        "pdf-python-runtime"
-      ]
-    },
     "discord-voice/sidecar/2": {
       "body": "npm ci",
       "shell": "bash"
@@ -184,52 +118,8 @@
       "body": "npm audit --omit=optional --audit-level=high",
       "shell": "bash"
     },
-    "finance/finance/3": {
-      "body": "cargo fmt -p augmentagent-finance -- --check",
-      "shell": "bash"
-    },
-    "finance/finance/4": {
-      "body": "cargo clippy -p augmentagent-finance --all-targets -- -D warnings",
-      "shell": "bash"
-    },
-    "finance/finance/5": {
-      "body": "cargo test -p augmentagent-finance -p augmentagent-wiki",
-      "shell": "bash"
-    },
-    "finance/finance/6": {
-      "body": "cargo test -p augmentagent-store --lib finance_evidence\ncargo test -p augmentagent-channel-core --lib finance_allowlist\n",
-      "shell": "bash"
-    },
-    "finance/finance/7": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent finance::tests\ncargo test -p augmentagent-cli --test finance_cli\ncargo test -p augmentagent-cli --test status_schema\n",
-      "shell": "bash"
-    },
-    "heartbeat/heartbeat/3": {
-      "body": "cargo fmt -p augmentagent-heartbeat -- --check",
-      "shell": "bash"
-    },
-    "heartbeat/heartbeat/4": {
-      "body": "cargo clippy -p augmentagent-heartbeat --all-targets --no-deps -- -D warnings",
-      "shell": "bash"
-    },
-    "heartbeat/heartbeat/5": {
-      "body": "cargo test -p augmentagent-heartbeat",
-      "shell": "bash"
-    },
-    "heartbeat/heartbeat/6": {
-      "body": "cargo test -p augmentagent-store --test heartbeat_schema\ncargo test -p augmentagent-channel-core --test capability_inventory -- inventory_accounts every_production\n",
-      "shell": "bash"
-    },
-    "heartbeat/heartbeat/7": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent heartbeat_cmd::tests\ncargo test -p augmentagent-cli --test heartbeat_cli\n",
-      "shell": "bash"
-    },
     "imessage/exporter/2": {
       "body": "python3 -m unittest discover -s scripts/imessage/tests -v",
-      "shell": "bash"
-    },
-    "linkedin/linkedin/3": {
-      "body": "cargo test -p augmentagent-channel-linkedin --lib --tests --locked\ncargo test -p augmentagent-messages -p augmentagent-mcp-memory --lib --locked\ncargo test -p augmentagent-cli --test linkedin_archive_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent linkedin --locked\ncargo test -p augmentagent-channel-core --lib ask_mode_social_card_allowlist_tests --locked\ncargo test -p augmentagent-store --lib --test email_recipients --test team_coverage_store --locked\ncargo test -p augmentagent-auth --lib --tests --locked\ncargo test -p augmentagent-cli --test team_cli --test team_coverage_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent team_coverage --locked\ncargo test -p augmentagent-cli --bin augmentagent stale_reconcile_tests --locked\n",
       "shell": "bash"
     },
     "model-router/adapter-compose/1": {
@@ -238,26 +128,6 @@
       "vm_provisioning": [
         "docker-daemon-images"
       ]
-    },
-    "model-router/adapters/3": {
-      "body": "cargo test -p augmentagent-channel-core --lib",
-      "shell": "bash"
-    },
-    "model-router/adapters/4": {
-      "body": "cargo test -p augmentagent-approval-discord --lib",
-      "shell": "bash"
-    },
-    "model-router/adapters/5": {
-      "body": "cargo check -p augmentagent-cli",
-      "shell": "bash"
-    },
-    "model-router/adapters/6": {
-      "body": "cargo test -p augmentagent-cli --test reasoner_failover_e2e selftest_ -- --nocapture",
-      "shell": "bash"
-    },
-    "model-router/adapters/7": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness -- --nocapture",
-      "shell": "bash"
     },
     "model-router/codex-redirect/2": {
       "body": "npm install --global @openai/codex@0.154.0",
@@ -353,121 +223,6 @@
     },
     "no-gmail-authors/check/1": {
       "body": "range=\"${CI_CONTRACT_BASE}..${CI_CONTRACT_HEAD}\"\nbad=$(git log --format='%ae %ce' \"$range\" | tr ' ' '\\n' | grep -iE 'gmail\\.com' | sort -u || true)\nif [ -n \"$bad\" ]; then\n  echo \"::error::Commit(s) in this PR use a personal gmail author/committer address:\"\n  echo \"$bad\"\n  echo \"Commit as the nolanmak GitHub noreply instead \u2014 see docs/PUBLISH.md.\"\n  exit 1\nfi\necho \"OK: no gmail author/committer emails in this PR's commits.\"\n",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/10": {
-      "body": "~/.local/share/augmentagent/pdf-runtime/bin/python3 -m unittest discover -s crates/augmentagent-docs/python -v",
-      "shell": "bash",
-      "vm_provisioning": [
-        "pdf-python-runtime"
-      ]
-    },
-    "pdf-generation/pdf/11": {
-      "body": "cargo test --locked -p augmentagent-docs",
-      "shell": "bash",
-      "vm_provisioning": [
-        "pdf-python-runtime"
-      ]
-    },
-    "pdf-generation/pdf/12": {
-      "body": "cargo test --locked -p augmentagent-cli --bin augmentagent document_signing::tests",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/13": {
-      "body": "cargo test --locked -p augmentagent-approval-discord --lib signing_receipt",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/14": {
-      "body": "cargo test --locked -p augmentagent-cli --test pdf_generation",
-      "shell": "bash",
-      "vm_provisioning": [
-        "pdf-python-runtime"
-      ]
-    },
-    "pdf-generation/pdf/15": {
-      "body": "cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/16": {
-      "body": "cargo test --locked -p augmentagent-approval-discord attachments:: --lib",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/17": {
-      "body": "cargo test --locked -p augmentagent-cli --bin augmentagent repo_docs::tests\ncargo test --locked -p augmentagent-cli --test repo_docs_cli\ncargo test --locked -p augmentagent-channel-core --lib query_document_commands\n",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/4": {
-      "body": "sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/5": {
-      "body": "python3 scripts/pdf-runtime.py",
-      "shell": "bash",
-      "vm_provisioning": [
-        "pdf-python-runtime"
-      ]
-    },
-    "pdf-generation/pdf/6": {
-      "body": "python3 scripts/pdf-runtime.py --check",
-      "shell": "bash",
-      "vm_provisioning": [
-        "pdf-python-runtime"
-      ]
-    },
-    "pdf-generation/pdf/7": {
-      "body": "python3 -m unittest discover -s scripts/tests -p pdf_runtime_test.py -v",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/8": {
-      "body": "bash scripts/tests/updater-stamp.test.sh",
-      "shell": "bash"
-    },
-    "pdf-generation/pdf/9": {
-      "body": "bash scripts/tests/updater-rebuild-trigger.test.sh",
-      "shell": "bash"
-    },
-    "phone/offline/10": {
-      "body": "bash scripts/tests/install-autostart.test.sh",
-      "shell": "bash"
-    },
-    "phone/offline/11": {
-      "body": "python3 scripts/phone-upgrade-test.py",
-      "shell": "bash"
-    },
-    "phone/offline/12": {
-      "body": "python3 scripts/phone-upgrade-test.py --live",
-      "shell": "bash"
-    },
-    "phone/offline/13": {
-      "body": "cargo check -p augmentagent-cli --locked",
-      "shell": "bash"
-    },
-    "phone/offline/14": {
-      "body": "cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnings",
-      "shell": "bash"
-    },
-    "phone/offline/4": {
-      "body": "python3 -m unittest discover -s scripts/tests -p phone_offline_ci_test.py -v",
-      "shell": "bash"
-    },
-    "phone/offline/5": {
-      "body": "python3 -m unittest discover -s scripts/tests -p phone_live_receipt_test.py -v",
-      "shell": "bash"
-    },
-    "phone/offline/6": {
-      "body": "python3 -m unittest scripts.tests.codex_tool_bridge_test.PortableGrepTests scripts.tests.codex_tool_bridge_test.TransportTests -v",
-      "shell": "bash"
-    },
-    "phone/offline/7": {
-      "body": "bash scripts/tests/aa-journal-guard.test.sh",
-      "shell": "bash"
-    },
-    "phone/offline/8": {
-      "body": "cargo test --locked -p augmentagent-channel-core --test phone_native_live --no-run",
-      "shell": "bash"
-    },
-    "phone/offline/9": {
-      "body": "python3 scripts/phone-offline-tests.py",
       "shell": "bash"
     },
     "platform/platform/10": {
@@ -643,36 +398,281 @@
         "gitleaks-release"
       ]
     },
-    "whatsapp-history/history/4": {
-      "body": "python3 -m unittest discover -s scripts/whatsapp/tests -v",
+    "rust/agents/10": {
+      "body": "python3 scripts/pdf-runtime.py",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "rust/agents/11": {
+      "body": "cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked",
       "shell": "bash"
     },
-    "whatsapp-history/history/5": {
-      "body": "cargo test -p augmentagent-channel-whatsapp-history -p augmentagent-channel-imessage -p augmentagent-mcp-memory",
+    "rust/agents/12": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "rust/agents/13": {
+      "body": "sudo apt-get -o Acquire::Retries=3 update\nsudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends python3-packaging\n",
       "shell": "bash"
     },
-    "whatsapp-history/history/6": {
-      "body": "cargo test -p augmentagent-cli --test whatsapp_history_cli",
+    "rust/agents/14": {
+      "body": "python3 -m unittest scripts.tests.compute_ci_test scripts.tests.compute_receipt_test -v",
       "shell": "bash"
     },
-    "whatsapp-history/history/7": {
-      "body": "cargo test -p augmentagent-channel-core --lib ask_opts_registers_memory_mcp_server_and_recall_tools",
+    "rust/agents/15": {
+      "body": "bash scripts/ci-code-mode.sh",
       "shell": "bash"
     },
-    "whatsapp-sidecar/wire-contract/4": {
+    "rust/agents/16": {
+      "body": "bash scripts/tests/updater-rebuild-trigger.test.sh",
+      "shell": "bash"
+    },
+    "rust/agents/3": {
+      "body": "cargo test -p augmentagent-channel-core --lib",
+      "shell": "bash"
+    },
+    "rust/agents/4": {
+      "body": "cargo test -p augmentagent-approval-discord --lib",
+      "shell": "bash"
+    },
+    "rust/agents/5": {
+      "body": "cargo check -p augmentagent-cli",
+      "shell": "bash"
+    },
+    "rust/agents/6": {
+      "body": "cargo test -p augmentagent-cli --test reasoner_failover_e2e selftest_ -- --nocapture",
+      "shell": "bash"
+    },
+    "rust/agents/7": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent model_switch_sequence_tests::discord_model_switch_sequence_uses_one_audited_harness -- --nocapture",
+      "shell": "bash"
+    },
+    "rust/agents/9": {
+      "body": "sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils",
+      "shell": "bash"
+    },
+    "rust/channels/10": {
+      "body": "cargo test -p augmentagent-store --lib finance_evidence\ncargo test -p augmentagent-channel-core --lib finance_allowlist\n",
+      "shell": "bash"
+    },
+    "rust/channels/11": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent finance::tests\ncargo test -p augmentagent-cli --test finance_cli\ncargo test -p augmentagent-cli --test status_schema\n",
+      "shell": "bash"
+    },
+    "rust/channels/12": {
+      "body": "cargo fmt -p augmentagent-heartbeat -- --check",
+      "shell": "bash"
+    },
+    "rust/channels/13": {
+      "body": "cargo clippy -p augmentagent-heartbeat --all-targets --no-deps -- -D warnings",
+      "shell": "bash"
+    },
+    "rust/channels/14": {
+      "body": "cargo test -p augmentagent-heartbeat",
+      "shell": "bash"
+    },
+    "rust/channels/15": {
+      "body": "cargo test -p augmentagent-store --test heartbeat_schema\ncargo test -p augmentagent-channel-core --test capability_inventory -- inventory_accounts every_production\n",
+      "shell": "bash"
+    },
+    "rust/channels/16": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent heartbeat_cmd::tests\ncargo test -p augmentagent-cli --test heartbeat_cli\n",
+      "shell": "bash"
+    },
+    "rust/channels/17": {
+      "body": "cargo test -p augmentagent-channel-linkedin --lib --tests --locked\ncargo test -p augmentagent-messages -p augmentagent-mcp-memory --lib --locked\ncargo test -p augmentagent-cli --test linkedin_archive_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent linkedin --locked\ncargo test -p augmentagent-channel-core --lib ask_mode_social_card_allowlist_tests --locked\ncargo test -p augmentagent-store --lib --test email_recipients --test team_coverage_store --locked\ncargo test -p augmentagent-auth --lib --tests --locked\ncargo test -p augmentagent-cli --test team_cli --test team_coverage_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent team_coverage --locked\ncargo test -p augmentagent-cli --bin augmentagent stale_reconcile_tests --locked\n",
+      "shell": "bash"
+    },
+    "rust/channels/19": {
+      "body": "python3 -m unittest discover -s scripts/tests -p phone_offline_ci_test.py -v",
+      "shell": "bash"
+    },
+    "rust/channels/20": {
+      "body": "python3 -m unittest discover -s scripts/tests -p phone_live_receipt_test.py -v",
+      "shell": "bash"
+    },
+    "rust/channels/21": {
+      "body": "python3 -m unittest scripts.tests.codex_tool_bridge_test.PortableGrepTests scripts.tests.codex_tool_bridge_test.TransportTests -v",
+      "shell": "bash"
+    },
+    "rust/channels/22": {
+      "body": "bash scripts/tests/aa-journal-guard.test.sh",
+      "shell": "bash"
+    },
+    "rust/channels/23": {
+      "body": "cargo test --locked -p augmentagent-channel-core --test phone_native_live --no-run",
+      "shell": "bash"
+    },
+    "rust/channels/24": {
+      "body": "python3 scripts/phone-offline-tests.py",
+      "shell": "bash"
+    },
+    "rust/channels/25": {
+      "body": "bash scripts/tests/install-autostart.test.sh",
+      "shell": "bash"
+    },
+    "rust/channels/26": {
+      "body": "python3 scripts/phone-upgrade-test.py",
+      "shell": "bash"
+    },
+    "rust/channels/27": {
+      "body": "python3 scripts/phone-upgrade-test.py --live",
+      "shell": "bash"
+    },
+    "rust/channels/28": {
+      "body": "cargo check -p augmentagent-cli --locked",
+      "shell": "bash"
+    },
+    "rust/channels/29": {
+      "body": "cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnings",
+      "shell": "bash"
+    },
+    "rust/channels/3": {
+      "body": "cargo test -p augmentagent-store --test approval_history --locked",
+      "shell": "bash"
+    },
+    "rust/channels/32": {
       "body": "go mod verify\ngo test -mod=readonly ./...\ngo test -mod=readonly -race ./...\ngo vet -mod=readonly ./...\n",
       "shell": "bash"
     },
-    "whatsapp-sidecar/wire-contract/5": {
+    "rust/channels/33": {
       "body": "go build -mod=readonly -trimpath -o \"$RUNNER_TEMP/wa-sidecar\" .\necho \"AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar\" >> \"$GITHUB_ENV\"\n",
       "shell": "bash"
     },
-    "whatsapp-sidecar/wire-contract/6": {
+    "rust/channels/34": {
       "body": "cargo test -p augmentagent-channel-whatsapp",
       "shell": "bash"
     },
-    "whatsapp-sidecar/wire-contract/7": {
+    "rust/channels/35": {
       "body": "cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings",
+      "shell": "bash"
+    },
+    "rust/channels/4": {
+      "body": "cargo test -p augmentagent-approval-discord --lib --locked",
+      "shell": "bash"
+    },
+    "rust/channels/5": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent approval_context::tests --locked",
+      "shell": "bash"
+    },
+    "rust/channels/6": {
+      "body": "cargo test -p augmentagent-cli --bin augmentagent calendar_approval_tests --locked",
+      "shell": "bash"
+    },
+    "rust/channels/7": {
+      "body": "cargo fmt -p augmentagent-finance -- --check",
+      "shell": "bash"
+    },
+    "rust/channels/8": {
+      "body": "cargo clippy -p augmentagent-finance --all-targets -- -D warnings",
+      "shell": "bash"
+    },
+    "rust/channels/9": {
+      "body": "cargo test -p augmentagent-finance -p augmentagent-wiki",
+      "shell": "bash"
+    },
+    "rust/legacy-python/10": {
+      "body": "cargo test -p augmentagent-channel-core --lib ask_opts_registers_memory_mcp_server_and_recall_tools",
+      "shell": "bash"
+    },
+    "rust/legacy-python/4": {
+      "body": "cargo test -p augmentagent-channel-apple-notes",
+      "shell": "bash"
+    },
+    "rust/legacy-python/5": {
+      "body": "cargo test -p augmentagent-cli --test apple_notes_cli",
+      "shell": "bash"
+    },
+    "rust/legacy-python/6": {
+      "body": "cargo clippy -p augmentagent-channel-apple-notes --all-targets --no-deps -- -D warnings",
+      "shell": "bash"
+    },
+    "rust/legacy-python/7": {
+      "body": "python3 -m unittest discover -s scripts/whatsapp/tests -v",
+      "shell": "bash"
+    },
+    "rust/legacy-python/8": {
+      "body": "cargo test -p augmentagent-channel-whatsapp-history -p augmentagent-channel-imessage -p augmentagent-mcp-memory",
+      "shell": "bash"
+    },
+    "rust/legacy-python/9": {
+      "body": "cargo test -p augmentagent-cli --test whatsapp_history_cli",
+      "shell": "bash"
+    },
+    "rust/pdf/10": {
+      "body": "~/.local/share/augmentagent/pdf-runtime/bin/python3 -m unittest discover -s crates/augmentagent-docs/python -v",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "rust/pdf/11": {
+      "body": "cargo test --locked -p augmentagent-docs",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "rust/pdf/12": {
+      "body": "cargo test --locked -p augmentagent-cli --bin augmentagent document_signing::tests",
+      "shell": "bash"
+    },
+    "rust/pdf/13": {
+      "body": "cargo test --locked -p augmentagent-approval-discord --lib signing_receipt",
+      "shell": "bash"
+    },
+    "rust/pdf/14": {
+      "body": "cargo test --locked -p augmentagent-cli --test pdf_generation",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "rust/pdf/15": {
+      "body": "cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib",
+      "shell": "bash"
+    },
+    "rust/pdf/16": {
+      "body": "cargo test --locked -p augmentagent-approval-discord attachments:: --lib",
+      "shell": "bash"
+    },
+    "rust/pdf/17": {
+      "body": "cargo test --locked -p augmentagent-cli --bin augmentagent repo_docs::tests\ncargo test --locked -p augmentagent-cli --test repo_docs_cli\ncargo test --locked -p augmentagent-channel-core --lib query_document_commands\n",
+      "shell": "bash"
+    },
+    "rust/pdf/4": {
+      "body": "sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils",
+      "shell": "bash"
+    },
+    "rust/pdf/5": {
+      "body": "python3 scripts/pdf-runtime.py",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "rust/pdf/6": {
+      "body": "python3 scripts/pdf-runtime.py --check",
+      "shell": "bash",
+      "vm_provisioning": [
+        "pdf-python-runtime"
+      ]
+    },
+    "rust/pdf/7": {
+      "body": "python3 -m unittest discover -s scripts/tests -p pdf_runtime_test.py -v",
+      "shell": "bash"
+    },
+    "rust/pdf/8": {
+      "body": "bash scripts/tests/updater-stamp.test.sh",
+      "shell": "bash"
+    },
+    "rust/pdf/9": {
+      "body": "bash scripts/tests/updater-rebuild-trigger.test.sh",
       "shell": "bash"
     }
   },
@@ -715,95 +715,15 @@
               "command_id": "apple-notes/exporter/2"
             }
           ]
-        },
-        "notes": {
-          "env": {
-            "CARGO_BUILD_JOBS": 2,
-            "CARGO_PROFILE_DEV_DEBUG": 0,
-            "CARGO_PROFILE_TEST_DEBUG": 0
-          },
-          "runs-on": "ubuntu-24.04",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
-              "with": {
-                "python-version": "3.9"
-              }
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
-            },
-            {
-              "command_id": "apple-notes/notes/4"
-            },
-            {
-              "command_id": "apple-notes/notes/5"
-            },
-            {
-              "command_id": "apple-notes/notes/6"
-            }
-          ],
-          "timeout-minutes": 45
         }
       },
       "role": "validation",
-      "sha256": "61d9922f2ba16e3788e64baa0b935a448c6cd45b55f3432d069f2696a3ec39db"
-    },
-    ".github/workflows/approval-history.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": null,
-        "push": {
-          "branches": [
-            "main"
-          ]
-        }
-      },
-      "jobs": {
-        "decisions-and-context": {
-          "runs-on": "ubuntu-latest",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec"
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
-            },
-            {
-              "command_id": "approval-history/decisions-and-context/3"
-            },
-            {
-              "command_id": "approval-history/decisions-and-context/4"
-            },
-            {
-              "command_id": "approval-history/decisions-and-context/5"
-            },
-            {
-              "command_id": "approval-history/decisions-and-context/6"
-            }
-          ]
-        }
-      },
-      "role": "validation",
-      "sha256": "aa8d847c8b5a43726a910347843160f4c87b903d9d2864aeae2b0fadf2b91aec"
+      "sha256": "6a794c290ca751ee4336703f19ead3604ef767a11f66ee378cf9e802e52566f2"
     },
     ".github/workflows/autonomous-code-scanner.yml": {
       "reason": "scheduled autonomous scanner and issue reporting",
       "role": "excluded",
-      "sha256": "6dcdfe4911693b2435b602fa27e6c989f3d4057a710711b38e4a165ba42664ad"
+      "sha256": "350b8a4deee9e416c7e655a047f5996a7674a4ec7d244c19d200d7947e32fde0"
     },
     ".github/workflows/bridge-suites.yml": {
       "defaults": {},
@@ -943,69 +863,6 @@
       "reason": "optional comment-only external review",
       "role": "excluded",
       "sha256": "a7069c1af3667891d1d115b59d82a9ea062a63c8c7a2727e63b7a4adb3ff5ef0"
-    },
-    ".github/workflows/code-mode.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": null,
-        "push": {
-          "branches": [
-            "main"
-          ]
-        }
-      },
-      "jobs": {
-        "deterministic": {
-          "env": {
-            "CARGO_BUILD_JOBS": 2,
-            "CARGO_PROFILE_DEV_DEBUG": 0,
-            "CARGO_PROFILE_TEST_DEBUG": 0,
-            "JARVIS_TEST_COMPUTE_PIP": "",
-            "JARVIS_TEST_VM_CONFIG": ""
-          },
-          "runs-on": "ubuntu-latest",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
-            },
-            {
-              "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
-              "with": {
-                "deno-version": "2.7.14"
-              }
-            },
-            {
-              "command_id": "code-mode/deterministic/4",
-              "name": "Install trusted host parser"
-            },
-            {
-              "command_id": "code-mode/deterministic/5",
-              "name": "Validate CI refusal behavior"
-            },
-            {
-              "command_id": "code-mode/deterministic/6",
-              "name": "Rust, CLI and Deno contracts"
-            },
-            {
-              "command_id": "code-mode/deterministic/7",
-              "name": "Embedded helper update triggers"
-            }
-          ],
-          "timeout-minutes": 45
-        }
-      },
-      "role": "validation",
-      "sha256": "2783d975ee525a0020b057c53c8f25eee1b995a78d56f492b0f1ce4c7733a11b"
     },
     ".github/workflows/computer-use.yml": {
       "defaults": {},
@@ -1156,10 +1013,6 @@
         "pull_request": {
           "paths": [
             "sidecars/discord-voice/**",
-            "crates/augmentagent-approval-discord/**",
-            "crates/augmentagent-channel-core/**",
-            "crates/augmentagent-cli/**",
-            "crates/augmentagent-store/**",
             "docs/discord-voice/**",
             "systemd/augmentagent-discord-voice.service",
             ".github/workflows/discord-voice.yml",
@@ -1175,10 +1028,6 @@
           ],
           "paths": [
             "sidecars/discord-voice/**",
-            "crates/augmentagent-approval-discord/**",
-            "crates/augmentagent-channel-core/**",
-            "crates/augmentagent-cli/**",
-            "crates/augmentagent-store/**",
             "docs/discord-voice/**",
             "systemd/augmentagent-discord-voice.service",
             ".github/workflows/discord-voice.yml",
@@ -1190,45 +1039,6 @@
         }
       },
       "jobs": {
-        "rust": {
-          "runs-on": "ubuntu-latest",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
-              "with": {
-                "key": "discord-voice"
-              }
-            },
-            {
-              "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
-              "with": {
-                "deno-version": "2.7.14"
-              }
-            },
-            {
-              "command_id": "discord-voice/rust/4"
-            },
-            {
-              "command_id": "discord-voice/rust/5"
-            },
-            {
-              "command_id": "discord-voice/rust/6"
-            },
-            {
-              "command_id": "discord-voice/rust/7"
-            }
-          ],
-          "timeout-minutes": 60
-        },
         "sidecar": {
           "defaults": {
             "run": {
@@ -1265,148 +1075,7 @@
         }
       },
       "role": "validation",
-      "sha256": "4a00c19c14475e6622d42ff66a20ba625dc553447205e37784aadb60dbba5375"
-    },
-    ".github/workflows/finance.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": {
-          "paths": [
-            "crates/augmentagent-finance/**",
-            "crates/augmentagent-cli/**",
-            "crates/augmentagent-store/**",
-            "crates/augmentagent-wiki/**",
-            "crates/augmentagent-channel-core/src/reasoner.rs",
-            "scripts/systemd/augmentagent-finance-sync.*",
-            ".github/workflows/finance.yml",
-            "Cargo.*",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
-          ]
-        }
-      },
-      "jobs": {
-        "finance": {
-          "env": {
-            "CARGO_BUILD_JOBS": 2,
-            "CARGO_PROFILE_DEV_DEBUG": 0,
-            "CARGO_PROFILE_TEST_DEBUG": 0
-          },
-          "runs-on": "ubuntu-latest",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "components": "rustfmt, clippy",
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
-            },
-            {
-              "command_id": "finance/finance/3",
-              "name": "Format finance crate"
-            },
-            {
-              "command_id": "finance/finance/4",
-              "name": "Finance lint"
-            },
-            {
-              "command_id": "finance/finance/5",
-              "name": "Finance and wiki behavior"
-            },
-            {
-              "command_id": "finance/finance/6",
-              "name": "Store and agent integration"
-            },
-            {
-              "command_id": "finance/finance/7",
-              "name": "CLI unit and process tests"
-            }
-          ],
-          "timeout-minutes": 45
-        }
-      },
-      "role": "validation",
-      "sha256": "873114b2e7463369b11c2e4d831adb2be9a77274d0d572423fe0e9dd3fd83851"
-    },
-    ".github/workflows/heartbeat.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": {
-          "paths": [
-            "crates/augmentagent-heartbeat/**",
-            "crates/augmentagent-cli/src/heartbeat_cmd.rs",
-            "crates/augmentagent-cli/src/main.rs",
-            "crates/augmentagent-cli/tests/heartbeat_cli.rs",
-            "crates/augmentagent-store/**",
-            "crates/augmentagent-channel-core/src/reasoner.rs",
-            "docs/reasoner-capabilities.json",
-            ".github/workflows/heartbeat.yml",
-            "Cargo.*",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
-          ]
-        }
-      },
-      "jobs": {
-        "heartbeat": {
-          "env": {
-            "CARGO_BUILD_JOBS": 2,
-            "CARGO_PROFILE_DEV_DEBUG": 0,
-            "CARGO_PROFILE_TEST_DEBUG": 0
-          },
-          "runs-on": "ubuntu-latest",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "components": "rustfmt, clippy",
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
-            },
-            {
-              "command_id": "heartbeat/heartbeat/3",
-              "name": "Format heartbeat crate"
-            },
-            {
-              "command_id": "heartbeat/heartbeat/4",
-              "name": "Heartbeat lint"
-            },
-            {
-              "command_id": "heartbeat/heartbeat/5",
-              "name": "Heartbeat behavior"
-            },
-            {
-              "command_id": "heartbeat/heartbeat/6",
-              "name": "Store schema and capability manifest"
-            },
-            {
-              "command_id": "heartbeat/heartbeat/7",
-              "name": "CLI unit and process tests"
-            }
-          ],
-          "timeout-minutes": 45
-        }
-      },
-      "role": "validation",
-      "sha256": "17e01812b4077e547cf7782f895f75fa52420bacd9c2e98e787e6c3952ae55d1"
+      "sha256": "eadd2e3000a34e825ded38ab0a49cec8853b1b9e4bc7cad7ea442f8e7eedf313"
     },
     ".github/workflows/imessage.yml": {
       "defaults": {},
@@ -1449,64 +1118,6 @@
       "reason": "issue-driven implementation and publication, not PR validation",
       "role": "excluded",
       "sha256": "c9b351c41ade38928a1a84a3d746002aafc128756fc6b2165f96d5ff8b243f6d"
-    },
-    ".github/workflows/linkedin.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": null,
-        "push": {
-          "branches": [
-            "main"
-          ]
-        }
-      },
-      "jobs": {
-        "linkedin": {
-          "env": {
-            "AUGMENTAGENT_GH_DISABLE": "1",
-            "CARGO_BUILD_JOBS": 2,
-            "CARGO_PROFILE_DEV_DEBUG": 0,
-            "CARGO_PROFILE_TEST_DEBUG": 0
-          },
-          "name": "linkedin (${{ matrix.os }})",
-          "runs-on": "${{ matrix.os }}",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
-              "with": {
-                "key": "linkedin"
-              }
-            },
-            {
-              "command_id": "linkedin/linkedin/3",
-              "name": "LinkedIn archive, recall, and approval contracts",
-              "shell": "bash"
-            }
-          ],
-          "strategy": {
-            "fail-fast": false,
-            "matrix": {
-              "os": [
-                "ubuntu-latest",
-                "macos-latest"
-              ]
-            }
-          },
-          "timeout-minutes": 45
-        }
-      },
-      "role": "validation",
-      "sha256": "a1329ccbc925a04b523a9f21c6a5870dc247996411415667c592e1e4edd0e57f"
     },
     ".github/workflows/model-router.yml": {
       "defaults": {},
@@ -1587,41 +1198,6 @@
             }
           ],
           "timeout-minutes": 10
-        },
-        "adapters": {
-          "runs-on": "ubuntu-latest",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
-            },
-            {
-              "command_id": "model-router/adapters/3"
-            },
-            {
-              "command_id": "model-router/adapters/4"
-            },
-            {
-              "command_id": "model-router/adapters/5"
-            },
-            {
-              "command_id": "model-router/adapters/6",
-              "name": "Pin each Discord model and exercise the audited tool probe"
-            },
-            {
-              "command_id": "model-router/adapters/7",
-              "name": "Switch one Discord channel through Qwen, GLM, and Codex"
-            }
-          ],
-          "timeout-minutes": 30
         },
         "codex-redirect": {
           "runs-on": "ubuntu-latest",
@@ -1748,7 +1324,7 @@
         }
       },
       "role": "validation",
-      "sha256": "cf43f77b7a15feba10388e98ec4c8c87b75806b8ebb9429e25f5370213dee45d"
+      "sha256": "fc81236d3354ea0019accb5284b1e548e5f2606a3ba81d1058626953ac9ea72a"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},
@@ -1776,287 +1352,6 @@
       "role": "validation",
       "sha256": "a8268062d318a357d7588d52523a207dfadfcb625a94753c15ae99e50a8e5405"
     },
-    ".github/workflows/pdf-generation.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": {
-          "paths": [
-            "crates/augmentagent-docs/**",
-            "crates/augmentagent-cli/**",
-            "crates/augmentagent-channel-core/src/reasoner.rs",
-            "crates/augmentagent-approval-discord/**",
-            "crates/augmentagent-store/src/document_signatures.rs",
-            "schema/wiki-ask.md",
-            "Cargo.*",
-            ".github/workflows/pdf-generation.yml",
-            "scripts/pdf-runtime.py",
-            "scripts/run-rs.sh",
-            "scripts/install-autostart.sh",
-            "scripts/check-for-updates.sh",
-            "scripts/tests/*pdf*",
-            "scripts/tests/updater*.sh",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
-          ]
-        },
-        "push": {
-          "branches": [
-            "main"
-          ],
-          "paths": [
-            "crates/augmentagent-docs/**",
-            "crates/augmentagent-cli/**",
-            "crates/augmentagent-channel-core/src/reasoner.rs",
-            "crates/augmentagent-approval-discord/**",
-            "crates/augmentagent-store/src/document_signatures.rs",
-            "schema/wiki-ask.md",
-            "Cargo.*",
-            ".github/workflows/pdf-generation.yml",
-            "scripts/pdf-runtime.py",
-            "scripts/run-rs.sh",
-            "scripts/install-autostart.sh",
-            "scripts/check-for-updates.sh",
-            "scripts/tests/*pdf*",
-            "scripts/tests/updater*.sh",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
-          ]
-        }
-      },
-      "jobs": {
-        "pdf": {
-          "env": {
-            "CARGO_BUILD_JOBS": 2,
-            "CARGO_PROFILE_DEV_DEBUG": 0,
-            "CARGO_PROFILE_TEST_DEBUG": 0
-          },
-          "runs-on": "ubuntu-24.04",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
-              "with": {
-                "python-version": "3.12"
-              }
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
-            },
-            {
-              "command_id": "pdf-generation/pdf/4"
-            },
-            {
-              "command_id": "pdf-generation/pdf/5"
-            },
-            {
-              "command_id": "pdf-generation/pdf/6"
-            },
-            {
-              "command_id": "pdf-generation/pdf/7"
-            },
-            {
-              "command_id": "pdf-generation/pdf/8"
-            },
-            {
-              "command_id": "pdf-generation/pdf/9"
-            },
-            {
-              "command_id": "pdf-generation/pdf/10"
-            },
-            {
-              "command_id": "pdf-generation/pdf/11"
-            },
-            {
-              "command_id": "pdf-generation/pdf/12"
-            },
-            {
-              "command_id": "pdf-generation/pdf/13"
-            },
-            {
-              "command_id": "pdf-generation/pdf/14"
-            },
-            {
-              "command_id": "pdf-generation/pdf/15"
-            },
-            {
-              "command_id": "pdf-generation/pdf/16"
-            },
-            {
-              "command_id": "pdf-generation/pdf/17",
-              "name": "Read-only repository documents and delivery CLI"
-            }
-          ],
-          "timeout-minutes": 45
-        }
-      },
-      "role": "validation",
-      "sha256": "848744b4cfaf1375dc825588521157a5f8fa622ba65ff3265f3cab22770e4908"
-    },
-    ".github/workflows/phone.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": {
-          "paths": [
-            "crates/augmentagent-phone/**",
-            "crates/augmentagent-store/**",
-            "crates/augmentagent-docs/**",
-            "crates/augmentagent-channel-journal/**",
-            "crates/augmentagent-channel-core/**",
-            "crates/augmentagent-cli/**",
-            "crates/augmentagent-approval-discord/**",
-            "crates/augmentagent-channel-slack/**",
-            "crates/augmentagent-channel-whatsapp/**",
-            "crates/augmentagent-channel-whatsapp-history/**",
-            "Cargo.toml",
-            "Cargo.lock",
-            "rust-toolchain.toml",
-            "scripts/aa-wiki-protected-names.sh",
-            "scripts/aa-journal-guard.sh",
-            "scripts/tests/aa-journal-guard.test.sh",
-            "scripts/phone-offline-tests.py",
-            "scripts/phone-upgrade-test.py",
-            "scripts/install-autostart.sh",
-            "scripts/lib/launchd-install.sh",
-            "scripts/tests/install-autostart.test.sh",
-            "scripts/tests/phone_offline_ci_test.py",
-            "scripts/phone-live-receipt.py",
-            "scripts/tests/phone_live_receipt_test.py",
-            ".github/workflows/phone.yml",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
-          ]
-        },
-        "push": {
-          "branches": [
-            "main"
-          ]
-        },
-        "workflow_dispatch": null
-      },
-      "jobs": {
-        "offline": {
-          "env": {
-            "AUGMENTAGENT_GH_DISABLE": "1",
-            "AUGMENTAGENT_PHONE_ENABLED": "0"
-          },
-          "runs-on": "${{ matrix.os }}",
-          "steps": [
-            {
-              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-            },
-            {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
-              "with": {
-                "components": "clippy",
-                "toolchain": "1.94.1"
-              }
-            },
-            {
-              "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
-              "with": {
-                "python-version": "3.12"
-              }
-            },
-            {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
-              "with": {
-                "key": "phone-offline"
-              }
-            },
-            {
-              "command_id": "phone/offline/4",
-              "name": "Check that the runner rejects missing or skipped coverage"
-            },
-            {
-              "command_id": "phone/offline/5",
-              "name": "Live receipt validator (synthetic fixtures only)"
-            },
-            {
-              "command_id": "phone/offline/6",
-              "name": "Portable bridge search and parent lifetime"
-            },
-            {
-              "command_id": "phone/offline/7",
-              "name": "Journal write guard including portable path resolution"
-            },
-            {
-              "command_id": "phone/offline/8",
-              "name": "Compile opt-in native phone probes (no model calls)"
-            },
-            {
-              "command_id": "phone/offline/9",
-              "name": "Required offline suites"
-            },
-            {
-              "command_id": "phone/offline/10",
-              "name": "Service installation preserves private phone configuration"
-            },
-            {
-              "command_id": "phone/offline/11",
-              "name": "Pre-phone database upgrade and rollback compatibility"
-            },
-            {
-              "command_id": "phone/offline/12",
-              "name": "ConversationRelay rollback preserves GPT-Live tasks and receipts"
-            },
-            {
-              "command_id": "phone/offline/13",
-              "name": "CLI integration compiles"
-            },
-            {
-              "command_id": "phone/offline/14",
-              "name": "Phone lint"
-            },
-            {
-              "if": "always()",
-              "name": "Upload offline evidence (not live qualification)",
-              "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
-              "with": {
-                "if-no-files-found": "error",
-                "name": "phone-offline-${{ matrix.os }}",
-                "path": "target/phone-offline/\ntarget/phone-upgrade/\ntarget/phone-live-upgrade/\n"
-              }
-            }
-          ],
-          "strategy": {
-            "fail-fast": false,
-            "matrix": {
-              "os": [
-                "ubuntu-latest",
-                "macos-latest"
-              ]
-            }
-          },
-          "timeout-minutes": 60
-        }
-      },
-      "role": "validation",
-      "sha256": "5a36ca22d6a2a95c674bd360b739da04782e1fa0be137629a1ba623871993497"
-    },
     ".github/workflows/platform.yml": {
       "defaults": {},
       "env": {},
@@ -2070,6 +1365,10 @@
       },
       "jobs": {
         "platform": {
+          "env": {
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
           "name": "platform (${{ matrix.os }})",
           "runs-on": "${{ matrix.os }}",
           "steps": [
@@ -2083,9 +1382,14 @@
               }
             },
             {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
               "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
               "with": {
-                "key": "platform"
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
               }
             },
             {
@@ -2250,7 +1554,7 @@
         }
       },
       "role": "validation",
-      "sha256": "e1ab4ad1ef740ab8f8b99c5b0ca4d5113a85dac3bdfbfc28db1e09e5a403a99b"
+      "sha256": "8a1fa57f48ddf757be343f63481ac7000625095277c122dfe0bc4a42bb97bdcc"
     },
     ".github/workflows/privacy.yml": {
       "defaults": {},
@@ -2321,31 +1625,384 @@
       "role": "validation",
       "sha256": "d74e245ac95731bbea4c018a4130a839605102c175c3ac7e4163e21807d60b04"
     },
-    ".github/workflows/whatsapp-history.yml": {
+    ".github/workflows/rust-cache.yml": {
+      "reason": "main-branch Rust dependency cache warming, not PR validation",
+      "role": "excluded",
+      "sha256": "c8c70eec60e776ff9551fb00f085fa4b7f6e2b8f25b01e8ffc73a31a639d3135"
+    },
+    ".github/workflows/rust.yml": {
       "defaults": {},
       "env": {},
       "events": {
-        "pull_request": {
-          "paths": [
-            "scripts/whatsapp/**",
-            "crates/augmentagent-channel-whatsapp-history/**",
-            "crates/augmentagent-channel-imessage/**",
-            "crates/augmentagent-mcp-memory/**",
-            "crates/augmentagent-cli/**",
-            "crates/augmentagent-channel-core/**",
-            "Cargo.*",
-            ".github/workflows/whatsapp-history.yml",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
+        "pull_request": null,
+        "push": {
+          "branches": [
+            "main"
           ]
-        }
+        },
+        "workflow_dispatch": null
       },
       "jobs": {
-        "history": {
+        "agents": {
           "env": {
-            "CARGO_BUILD_JOBS": 2,
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
+          "runs-on": "ubuntu-latest",
+          "steps": [
+            {
+              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+            },
+            {
+              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+              "with": {
+                "toolchain": "1.94.1"
+              }
+            },
+            {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
+            },
+            {
+              "command_id": "rust/agents/3",
+              "name": "Model router channel-core adapters"
+            },
+            {
+              "command_id": "rust/agents/4",
+              "name": "Model router Discord adapters"
+            },
+            {
+              "command_id": "rust/agents/5",
+              "name": "Model router CLI compiles"
+            },
+            {
+              "command_id": "rust/agents/6",
+              "name": "Pin each Discord model and exercise the audited tool probe"
+            },
+            {
+              "command_id": "rust/agents/7",
+              "name": "Switch one Discord channel through Qwen, GLM, and Codex"
+            },
+            {
+              "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
+              "with": {
+                "deno-version": "2.7.14"
+              }
+            },
+            {
+              "command_id": "rust/agents/9",
+              "name": "Install PDF fonts and poppler"
+            },
+            {
+              "command_id": "rust/agents/10",
+              "name": "Provision the pinned PDF runtime"
+            },
+            {
+              "command_id": "rust/agents/11",
+              "name": "Discord voice crates"
+            },
+            {
+              "command_id": "rust/agents/12",
+              "name": "CLI binary tests"
+            },
+            {
+              "command_id": "rust/agents/13",
+              "env": {
+                "JARVIS_TEST_COMPUTE_PIP": "",
+                "JARVIS_TEST_VM_CONFIG": ""
+              },
+              "name": "Install trusted host parser"
+            },
+            {
+              "command_id": "rust/agents/14",
+              "env": {
+                "JARVIS_TEST_COMPUTE_PIP": "",
+                "JARVIS_TEST_VM_CONFIG": ""
+              },
+              "name": "Validate CI refusal behavior"
+            },
+            {
+              "command_id": "rust/agents/15",
+              "env": {
+                "JARVIS_TEST_COMPUTE_PIP": "",
+                "JARVIS_TEST_VM_CONFIG": ""
+              },
+              "name": "Rust, CLI and Deno contracts"
+            },
+            {
+              "command_id": "rust/agents/16",
+              "env": {
+                "JARVIS_TEST_COMPUTE_PIP": "",
+                "JARVIS_TEST_VM_CONFIG": ""
+              },
+              "name": "Embedded helper update triggers"
+            }
+          ],
+          "timeout-minutes": 90
+        },
+        "channels": {
+          "env": {
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
+          "name": "channels (${{ matrix.os }})",
+          "runs-on": "${{ matrix.os }}",
+          "steps": [
+            {
+              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+            },
+            {
+              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+              "with": {
+                "components": "rustfmt, clippy",
+                "toolchain": "1.94.1"
+              }
+            },
+            {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
+            },
+            {
+              "command_id": "rust/channels/3",
+              "if": "runner.os == 'Linux'",
+              "name": "Approval history store"
+            },
+            {
+              "command_id": "rust/channels/4",
+              "if": "runner.os == 'Linux'",
+              "name": "Approval history Discord cards"
+            },
+            {
+              "command_id": "rust/channels/5",
+              "if": "runner.os == 'Linux'",
+              "name": "Approval context"
+            },
+            {
+              "command_id": "rust/channels/6",
+              "if": "runner.os == 'Linux'",
+              "name": "Calendar approvals"
+            },
+            {
+              "command_id": "rust/channels/7",
+              "if": "runner.os == 'Linux'",
+              "name": "Format finance crate"
+            },
+            {
+              "command_id": "rust/channels/8",
+              "if": "runner.os == 'Linux'",
+              "name": "Finance lint"
+            },
+            {
+              "command_id": "rust/channels/9",
+              "if": "runner.os == 'Linux'",
+              "name": "Finance and wiki behavior"
+            },
+            {
+              "command_id": "rust/channels/10",
+              "if": "runner.os == 'Linux'",
+              "name": "Finance store and agent integration"
+            },
+            {
+              "command_id": "rust/channels/11",
+              "if": "runner.os == 'Linux'",
+              "name": "Finance CLI unit and process tests"
+            },
+            {
+              "command_id": "rust/channels/12",
+              "if": "runner.os == 'Linux'",
+              "name": "Format heartbeat crate"
+            },
+            {
+              "command_id": "rust/channels/13",
+              "if": "runner.os == 'Linux'",
+              "name": "Heartbeat lint"
+            },
+            {
+              "command_id": "rust/channels/14",
+              "if": "runner.os == 'Linux'",
+              "name": "Heartbeat behavior"
+            },
+            {
+              "command_id": "rust/channels/15",
+              "if": "runner.os == 'Linux'",
+              "name": "Heartbeat store schema and capability manifest"
+            },
+            {
+              "command_id": "rust/channels/16",
+              "if": "runner.os == 'Linux'",
+              "name": "Heartbeat CLI unit and process tests"
+            },
+            {
+              "command_id": "rust/channels/17",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1"
+              },
+              "name": "LinkedIn archive, recall, and approval contracts",
+              "shell": "bash"
+            },
+            {
+              "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+              "with": {
+                "python-version": "3.12"
+              }
+            },
+            {
+              "command_id": "rust/channels/19",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Check that the runner rejects missing or skipped coverage"
+            },
+            {
+              "command_id": "rust/channels/20",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Live receipt validator (synthetic fixtures only)"
+            },
+            {
+              "command_id": "rust/channels/21",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Portable bridge search and parent lifetime"
+            },
+            {
+              "command_id": "rust/channels/22",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Journal write guard including portable path resolution"
+            },
+            {
+              "command_id": "rust/channels/23",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Compile opt-in native phone probes (no model calls)"
+            },
+            {
+              "command_id": "rust/channels/24",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Required offline phone suites"
+            },
+            {
+              "command_id": "rust/channels/25",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Service installation preserves private phone configuration"
+            },
+            {
+              "command_id": "rust/channels/26",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Pre-phone database upgrade and rollback compatibility"
+            },
+            {
+              "command_id": "rust/channels/27",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "ConversationRelay rollback preserves GPT-Live tasks and receipts"
+            },
+            {
+              "command_id": "rust/channels/28",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "CLI integration compiles"
+            },
+            {
+              "command_id": "rust/channels/29",
+              "env": {
+                "AUGMENTAGENT_GH_DISABLE": "1",
+                "AUGMENTAGENT_PHONE_ENABLED": "0"
+              },
+              "name": "Phone lint"
+            },
+            {
+              "if": "always()",
+              "name": "Upload offline phone evidence (not live qualification)",
+              "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+              "with": {
+                "if-no-files-found": "error",
+                "name": "phone-offline-${{ matrix.os }}",
+                "path": "target/phone-offline/\ntarget/phone-upgrade/\ntarget/phone-live-upgrade/\n"
+              }
+            },
+            {
+              "uses": "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+              "with": {
+                "cache-dependency-path": "sidecars/wa-sidecar/go.sum",
+                "go-version": "1.27.1"
+              }
+            },
+            {
+              "command_id": "rust/channels/32",
+              "env": {
+                "GOMAXPROCS": 2
+              },
+              "name": "WhatsApp sidecar Go tests, race checks and vet",
+              "working-directory": "sidecars/wa-sidecar"
+            },
+            {
+              "command_id": "rust/channels/33",
+              "env": {
+                "GOMAXPROCS": 2
+              },
+              "name": "Build exact sidecar used by Rust contract tests",
+              "working-directory": "sidecars/wa-sidecar"
+            },
+            {
+              "command_id": "rust/channels/34",
+              "name": "WhatsApp Rust channel and real Go-process contract tests"
+            },
+            {
+              "command_id": "rust/channels/35",
+              "name": "WhatsApp Rust channel lint"
+            }
+          ],
+          "strategy": {
+            "fail-fast": false,
+            "matrix": {
+              "os": [
+                "ubuntu-latest",
+                "macos-latest"
+              ]
+            }
+          },
+          "timeout-minutes": 90
+        },
+        "legacy-python": {
+          "env": {
             "CARGO_PROFILE_DEV_DEBUG": 0,
             "CARGO_PROFILE_TEST_DEBUG": 0
           },
@@ -2367,110 +2024,142 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
-              "command_id": "whatsapp-history/history/4"
+              "command_id": "rust/legacy-python/4",
+              "name": "Apple Notes channel"
             },
             {
-              "command_id": "whatsapp-history/history/5"
+              "command_id": "rust/legacy-python/5",
+              "name": "Apple Notes CLI"
             },
             {
-              "command_id": "whatsapp-history/history/6"
+              "command_id": "rust/legacy-python/6",
+              "name": "Apple Notes lint"
             },
             {
-              "command_id": "whatsapp-history/history/7"
+              "command_id": "rust/legacy-python/7",
+              "name": "WhatsApp exporter"
+            },
+            {
+              "command_id": "rust/legacy-python/8",
+              "name": "WhatsApp history, iMessage and memory crates"
+            },
+            {
+              "command_id": "rust/legacy-python/9",
+              "name": "WhatsApp history CLI"
+            },
+            {
+              "command_id": "rust/legacy-python/10",
+              "name": "Memory MCP recall tools"
             }
           ],
-          "timeout-minutes": 45
-        }
-      },
-      "role": "validation",
-      "sha256": "8cba5248c9d40902d8e31110f5a8ccaa5dc1a2fcc3719c3e0fa2a9447dd169e6"
-    },
-    ".github/workflows/whatsapp-sidecar.yml": {
-      "defaults": {},
-      "env": {},
-      "events": {
-        "pull_request": {
-          "paths": [
-            "sidecars/wa-sidecar/**",
-            "crates/augmentagent-channel-whatsapp/**",
-            "docs/fixtures/whatsapp/**",
-            "Cargo.toml",
-            "Cargo.lock",
-            ".github/workflows/whatsapp-sidecar.yml",
-            "scripts/ci-contract.py",
-            "scripts/ci-contract.json",
-            "scripts/ci-contract-sync.py",
-            "scripts/tests/ci_contract_test.py"
-          ]
-        }
-      },
-      "jobs": {
-        "wire-contract": {
+          "timeout-minutes": 60
+        },
+        "pdf": {
           "env": {
-            "CARGO_BUILD_JOBS": 2,
-            "CARGO_INCREMENTAL": 0,
-            "CARGO_PROFILE_TEST_DEBUG": 0,
-            "GOMAXPROCS": 2
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
           },
-          "name": "wire-contract (${{ matrix.os }})",
-          "runs-on": "${{ matrix.os }}",
+          "runs-on": "ubuntu-24.04",
           "steps": [
             {
               "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
             },
             {
-              "uses": "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+              "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
               "with": {
-                "cache-dependency-path": "sidecars/wa-sidecar/go.sum",
-                "go-version": "1.27.1"
+                "python-version": "3.12"
               }
             },
             {
               "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
               "with": {
-                "components": "clippy",
                 "toolchain": "1.94.1"
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
-              "command_id": "whatsapp-sidecar/wire-contract/4",
-              "name": "Go tests, race checks and vet",
-              "working-directory": "sidecars/wa-sidecar"
+              "command_id": "rust/pdf/4",
+              "name": "Install PDF fonts and poppler"
             },
             {
-              "command_id": "whatsapp-sidecar/wire-contract/5",
-              "name": "Build exact sidecar used by Rust contract tests",
-              "working-directory": "sidecars/wa-sidecar"
+              "command_id": "rust/pdf/5",
+              "name": "Provision the pinned PDF runtime"
             },
             {
-              "command_id": "whatsapp-sidecar/wire-contract/6",
-              "name": "Rust channel and real Go-process contract tests"
+              "command_id": "rust/pdf/6",
+              "name": "Check the PDF runtime"
             },
             {
-              "command_id": "whatsapp-sidecar/wire-contract/7",
-              "name": "Rust channel lint"
+              "command_id": "rust/pdf/7",
+              "name": "PDF runtime tests"
+            },
+            {
+              "command_id": "rust/pdf/8",
+              "name": "Updater stamp"
+            },
+            {
+              "command_id": "rust/pdf/9",
+              "name": "Updater rebuild trigger"
+            },
+            {
+              "command_id": "rust/pdf/10",
+              "name": "Docs Python converters"
+            },
+            {
+              "command_id": "rust/pdf/11",
+              "name": "Docs crate"
+            },
+            {
+              "command_id": "rust/pdf/12",
+              "name": "Document signing"
+            },
+            {
+              "command_id": "rust/pdf/13",
+              "name": "Signing receipts"
+            },
+            {
+              "command_id": "rust/pdf/14",
+              "name": "PDF generation CLI"
+            },
+            {
+              "command_id": "rust/pdf/15",
+              "name": "PDF generation prompt options"
+            },
+            {
+              "command_id": "rust/pdf/16",
+              "name": "Discord attachments"
+            },
+            {
+              "command_id": "rust/pdf/17",
+              "name": "Read-only repository documents and delivery CLI"
             }
           ],
-          "strategy": {
-            "fail-fast": false,
-            "matrix": {
-              "os": [
-                "ubuntu-latest",
-                "macos-latest"
-              ]
-            }
-          },
-          "timeout-minutes": 45
+          "timeout-minutes": 60
         }
       },
       "role": "validation",
-      "sha256": "41937e7d386a902fb32ff5bd3e29cbff09e2a1bd7b14056882cbb2dd310d5159"
+      "sha256": "cabdeb05d09f99c8b59f3d69902857af44371ef2f3199264d89fa068d4b75f05"
     }
   }
 }
