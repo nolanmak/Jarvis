@@ -407,10 +407,13 @@ mod tests {
             // Exercise the same dispatcher and CLI adapter used by WikiQuerier,
             // with a scripted transport and real durable workflow storage.
             use augmentagent_approval_discord::{autoship as gateway,QueryHandler};
-            struct Adapter {repo:PathBuf,path:PathBuf}
+            struct Adapter {repo:PathBuf,path:PathBuf,progress:std::sync::atomic::AtomicBool}
             #[async_trait::async_trait]
             impl QueryHandler for Adapter {
                 async fn answer(&self,_:&augmentagent_approval_discord::AuditCtx,_:&str)->Result<String> {panic!("autoship reached ordinary chat")}
+                fn autoship_progress_pending(&self,b:u64,o:u64)->Result<Vec<gateway::ProgressDelivery>> {if self.progress.load(std::sync::atomic::Ordering::SeqCst) {crate::autoship_discord_command::progress_pending(&self.path,b,o)} else {Ok(Vec::new())}}
+                fn autoship_progress_claim(&self,d:&gateway::ProgressDelivery)->Result<Option<gateway::Reply>> {crate::autoship_discord_command::progress_claim(&self.path,d)}
+                fn autoship_progress_confirm(&self,d:&gateway::ProgressDelivery,m:u64)->Result<()> {crate::autoship_discord_command::progress_confirm(&self.path,d,m)}
                 fn autoship_bound(&self,c:&gateway::Context)->Result<bool> {crate::autoship_discord_command::gateway_bound(&self.path,c)}
                 async fn autoship_command(&self,c:&gateway::Context,t:&str)->Result<Option<gateway::Reply>> {
                     crate::autoship_discord_command::gateway_command(&self.repo,&self.path,c,t).await
@@ -419,18 +422,18 @@ mod tests {
                 fn autoship_pending(&self,b:u64,o:u64)->Result<Vec<gateway::Context>> {crate::autoship_discord_command::gateway_pending(&self.path,b,o)}
                 fn autoship_claim_ack(&self,c:&gateway::Context)->Result<Option<gateway::Reply>> {crate::autoship_discord_command::gateway_claim_ack(&self.path,c)}
             }
-            struct Wire(std::sync::atomic::AtomicUsize);
+            struct Wire(std::sync::atomic::AtomicUsize,std::sync::atomic::AtomicBool);
             #[async_trait::async_trait]
             impl gateway::Transport for Wire {
                 async fn verify_owner_dm(&self,_:&gateway::Context)->Result<bool> {Ok(true)}
                 async fn send(&self,_:&gateway::Context,r:&gateway::Reply)->Result<u64> {
                     self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
                     assert!(r.content.contains("Completion has not been observed") || r.content.contains("has not edited the PR") || r.content.starts_with("Autoship"));
-                    Ok(55)
+                    anyhow::ensure!(!self.1.load(std::sync::atomic::Ordering::SeqCst),"lost response");Ok(55)
                 }
             }
-            let adapter=Adapter {repo:root.clone(),path:workflow::path()};
-            let wire=Wire(std::sync::atomic::AtomicUsize::new(0));
+            let adapter=Adapter {repo:root.clone(),path:workflow::path(),progress:std::sync::atomic::AtomicBool::new(false)};
+            let wire=Wire(std::sync::atomic::AtomicUsize::new(0),std::sync::atomic::AtomicBool::new(false));
             let gateway_context=gateway::Context {bot:11,owner:Some(22),author:22,channel:33,message:44,guild:None};
             assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
             assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
@@ -484,6 +487,21 @@ mod tests {
             let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
             assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap(),paused);
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),8);
+            drop(store);adapter.progress.store(true,std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),1);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
+            let mut store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.progress_delivery(&discord.admission.workflow).unwrap().state,"delivery-confirmed");
+            store.set_owner_pause(&discord.admission.workflow,"owner",1,true,200).unwrap();
+            // An unchanged pause dedupes; a real new resume request advances progress.
+            store.set_owner_pause(&discord.admission.workflow,"owner",2,false,201).unwrap();drop(store);
+            wire.1.store(true,std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),10);
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.progress_delivery(&discord.admission.workflow).unwrap().state,"delivery-uncertain");
+
 
             return;
         }

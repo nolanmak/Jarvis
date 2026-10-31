@@ -12,6 +12,8 @@ pub struct Context {
     pub guild: Option<u64>,
 }
 
+pub struct ProgressDelivery {pub context:Context,pub workflow:String,pub sequence:i64}
+
 pub struct Reply {
     pub content: String,
     /// Present only after a durable, single-use acknowledgement claim.
@@ -78,6 +80,20 @@ pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport,
             Ok(false) => {},
             Err(_) => tracing::warn!("autoship acknowledgement recovery failed; uncertain sends remain parked"),
         }
+    }
+    for delivery in handler.autoship_progress_pending(bot,owner)? {
+        let context=&delivery.context;
+        if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 {continue;}
+        let attempt=async {
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            let Some(reply)=handler.autoship_progress_claim(&delivery)? else {return Ok(false);};
+            anyhow::ensure!(reply.nonce.is_some(),"progress requires durable dispatch claim");
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            let message=transport.send(context,&reply).await?;
+            handler.autoship_progress_confirm(&delivery,message)?;
+            Ok::<_,anyhow::Error>(true)
+        }.await;
+        match attempt {Ok(true)=>delivered+=1,Ok(false)=>{},Err(_)=>tracing::warn!("autoship progress delivery failed; uncertain sends remain parked")}
     }
     Ok(delivered)
 }

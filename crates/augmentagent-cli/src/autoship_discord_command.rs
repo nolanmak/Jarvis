@@ -173,6 +173,21 @@ pub(crate) fn gateway_acknowledged(path:&Path,context:&GatewayContext,message:u6
     WorkflowStore::open(path)?.confirm_discord_ack(&origin,message,chrono::Utc::now().timestamp_millis())
 }
 
+pub(crate) fn progress_pending(path:&Path,bot:u64,owner:u64)->Result<Vec<augmentagent_approval_discord::autoship::ProgressDelivery>> {
+    if WorkflowStore::open_read_only(path)?.is_none() {return Ok(Vec::new());}
+    Ok(WorkflowStore::open(path)?.pending_progress(bot,owner)?.into_iter().map(|(origin,workflow,sequence)|augmentagent_approval_discord::autoship::ProgressDelivery {
+        context:GatewayContext {bot:origin.bot,owner:Some(origin.owner),author:origin.owner,channel:origin.channel,message:origin.message,guild:None},workflow,sequence,
+    }).collect())
+}
+pub(crate) fn progress_claim(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->Result<Option<GatewayReply>> {
+    let origin=gateway_origin(&delivery.context)?;
+    Ok(WorkflowStore::open(path)?.claim_progress(&origin,&delivery.workflow,delivery.sequence,chrono::Utc::now().timestamp_millis())?.map(|(nonce,content)|GatewayReply {content,nonce:Some(nonce)}))
+}
+pub(crate) fn progress_confirm(path:&Path,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->Result<()> {
+    let origin=gateway_origin(&delivery.context)?;
+    WorkflowStore::open(path)?.confirm_progress(&origin,&delivery.workflow,delivery.sequence,message,chrono::Utc::now().timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

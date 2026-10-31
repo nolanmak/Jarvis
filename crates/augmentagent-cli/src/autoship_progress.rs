@@ -35,12 +35,49 @@ impl WorkflowStore {
         let rows=stmt.query_map([workflow],|r|r.get::<_,String>(0))?;
         rows.map(|row|Ok(serde_json::from_str(&row?)?)).collect()
     }
+    pub fn pending_progress(&self,bot:u64,owner:u64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64)>> {
+        ensure!(bot>0 && owner>0,"progress recovery identity missing");
+        if !exists(&self.conn)? {return Ok(Vec::new());}
+        let mut stmt=self.conn.prepare("SELECT b.channel,b.workflow,s.sequence FROM discord_workflow_binding b JOIN workflow_progress_state s ON s.workflow=b.workflow WHERE b.bot=?1 AND b.owner=?2 AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND (d.state='uncertain' OR d.sequence>=s.sequence)) ORDER BY s.workflow,b.channel LIMIT 128")?;
+        let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?;
+        rows.map(|row| {let (channel,workflow,sequence)=row?;Ok((super::discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1},workflow,sequence))}).collect()
+    }
+    pub fn claim_progress(&mut self,origin:&super::discord_ingress::DiscordOrigin,workflow:&str,sequence:i64,now:i64)->Result<Option<(String,String)>> {
+        origin.validate()?;
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::discord_ingress::bound_workflow(&tx,origin,Some(workflow))?;
+        let raw:Option<(i64,String)>=tx.query_row("SELECT sequence,payload FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((current,raw))=raw else {return Ok(None);};
+        if current!=sequence {return Ok(None);}
+        let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND (state='uncertain' OR sequence>=?5))",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|r.get(0))?;
+        if blocked {return Ok(None);}
+        let progress:Progress=serde_json::from_str(&raw)?;
+        let nonce=format!("{:x}",Sha256::digest(serde_json::to_vec(&(workflow,origin.bot,origin.owner,origin.channel,sequence))?))[..24].to_string();
+        let content=format!("Autoship {workflow} · update {sequence}: {}. Stage: {:?}. Reason: {}. Next: {} (eligible at: {:?}). PR: {:?}. Requested provider: {:?}; actual provider: {}. Merge: {}. Deployment: {}. Evidence digest: {}. [autoship:{nonce}]",
+            progress.kind,progress.stage,progress.reason,progress.next_action,progress.eligible_at_ms,progress.pr,progress.requested_provider,progress.actual_provider.as_deref().unwrap_or("unknown"),progress.merge_state,progress.deployment_state,progress.evidence_digest);
+        ensure!(content.chars().count()<=1900,"progress message exceeds Discord bound");
+        tx.execute("INSERT INTO workflow_progress_delivery(workflow,bot,owner,channel,sequence,nonce,content,state,dispatched_at) VALUES(?1,?2,?3,?4,?5,?6,?7,'uncertain',?8)",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,nonce,content,now])?;
+        tx.commit()?;Ok(Some((nonce,content)))
+    }
+    pub fn confirm_progress(&mut self,origin:&super::discord_ingress::DiscordOrigin,workflow:&str,sequence:i64,message:u64,now:i64)->Result<()> {
+        origin.validate()?;ensure!(message>0,"progress remote message missing");
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::discord_ingress::bound_workflow(&tx,origin,Some(workflow))?;
+        let (state,prior):(String,Option<String>)=tx.query_row("SELECT state,message FROM workflow_progress_delivery WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND sequence=?5",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if state=="confirmed" {ensure!(prior.as_deref()==Some(message.to_string().as_str()),"progress receipt conflict");return Ok(());}
+        ensure!(state=="uncertain","progress was never dispatched");
+        tx.execute("UPDATE workflow_progress_delivery SET state='confirmed',message=?6,confirmed_at=?7 WHERE workflow=?1 AND bot=?2 AND owner=?3 AND channel=?4 AND sequence=?5",params![workflow,origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string(),sequence,message.to_string(),now])?;
+        tx.commit()?;Ok(())
+    }
     pub fn progress_delivery(&self,workflow:&str)->Result<DeliveryStatus> {
         if !exists(&self.conn)? {return Ok(DeliveryStatus {state:"not-observed".into(),pending_events:0,oldest_pending_at_ms:None,latest_sequence:None});}
-        let (pending,oldest,latest):(i64,Option<i64>,Option<i64>)=self.conn.query_row(
-            "SELECT count(*),min(created_at),max(sequence) FROM workflow_progress_event WHERE workflow=?1 AND delivery_state='queued'",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let delivery_table:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_delivery')",[],|r|r.get(0))?;
+        let query=if delivery_table {"SELECT count(*),min(e.created_at),max(e.sequence) FROM workflow_progress_event e WHERE e.workflow=?1 AND (NOT EXISTS(SELECT 1 FROM discord_workflow_binding b WHERE b.workflow=e.workflow) OR EXISTS(SELECT 1 FROM discord_workflow_binding b WHERE b.workflow=e.workflow AND NOT EXISTS(SELECT 1 FROM workflow_progress_delivery d WHERE d.workflow=b.workflow AND d.bot=b.bot AND d.owner=b.owner AND d.channel=b.channel AND d.state='confirmed' AND d.sequence>=e.sequence)))"}
+            else {"SELECT count(*),min(created_at),max(sequence) FROM workflow_progress_event WHERE workflow=?1"};
+        let (pending,oldest,latest):(i64,Option<i64>,Option<i64>)=self.conn.query_row(query,[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         let bound:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM discord_workflow_binding WHERE workflow=?1)",[workflow],|r|r.get(0))?;
-        Ok(DeliveryStatus {state:if pending==0 {"not-observed"} else if bound {"delivery-pending"} else {"delivery-unconfigured"}.into(),
+        let uncertain=delivery_table && self.conn.query_row("SELECT EXISTS(SELECT 1 FROM workflow_progress_delivery WHERE workflow=?1 AND state='uncertain')",[workflow],|r|r.get::<_,bool>(0))?;
+        Ok(DeliveryStatus {state:if uncertain {"delivery-uncertain"} else if pending==0 {"delivery-confirmed"} else if bound {"delivery-pending"} else {"delivery-unconfigured"}.into(),
             pending_events:pending,oldest_pending_at_ms:oldest,latest_sequence:latest})
     }
 }
@@ -206,6 +243,39 @@ mod tests {
         assert_eq!(event.kind,"resume-requested");assert_eq!(event.stage,Some(Stage::Held));
         assert_eq!(event.reason,"owner-resume-accepted");assert_eq!(event.actual_provider,None);
         assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint,checkpoint);
+    }
+
+    #[test]
+    fn bound_progress_is_claimed_once_and_unknown_send_blocks_later_updates() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");let mut store=WorkflowStore::open(&path).unwrap();
+        let origin=super::super::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(42),provider:None,until:submission::Milestone::Merged};
+        let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),1).unwrap().admission.workflow;
+        assert!(store.claim_progress(&origin,&id,1,2).unwrap().is_some(),"bound progress never reaches delivery claim");
+        drop(store);let mut store=WorkflowStore::open(&path).unwrap();
+        assert!(store.claim_progress(&origin,&id,1,3).unwrap().is_none());
+        store.set_owner_pause(&id,"owner",0,true,4).unwrap();
+        assert!(store.claim_progress(&origin,&id,2,5).unwrap().is_none(),"unknown older send must reconcile before another update");
+    }
+
+    #[test]
+    fn receipt_is_bound_and_confirmation_compacts_history_without_erasing_events() {
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let origin=super::super::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Pr(42),provider:None,until:submission::Milestone::Merged};
+        let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),1).unwrap().admission.workflow;
+        store.set_owner_pause(&id,"owner",0,true,2).unwrap();
+        assert!(store.claim_progress(&origin,&id,1,3).unwrap().is_none(),"stale selection cannot send history");
+        let mut foreign=origin.clone();foreign.channel=99;
+        assert!(store.claim_progress(&foreign,&id,2,4).is_err());
+        assert!(store.claim_progress(&origin,&id,2,4).unwrap().unwrap().1.contains("owner-pause-requested"));
+        assert_eq!(store.progress_delivery(&id).unwrap().state,"delivery-uncertain");
+        assert!(store.confirm_progress(&foreign,&id,2,55,5).is_err());
+        store.confirm_progress(&origin,&id,2,55,5).unwrap();store.confirm_progress(&origin,&id,2,55,6).unwrap();
+        assert!(store.confirm_progress(&origin,&id,2,56,7).is_err());
+        assert!(store.pending_progress(11,22).unwrap().is_empty());
+        assert_eq!(store.progress_delivery(&id).unwrap().pending_events,0);
+        assert_eq!(store.progress_events(&id).unwrap().len(),2);
     }
 
 }
