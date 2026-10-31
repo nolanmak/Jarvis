@@ -13826,7 +13826,22 @@ impl ReplyApprover {
                     message: format!("could not claim LinkedIn approval: {error}"),
                 },
             }
-            match linkedin.send_message(conv_urn, body).await {
+            let send = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                linkedin.send_message(conv_urn, body),
+            ).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let msg = "LinkedIn send timed out after 30s; delivery is unknown. Check the conversation before resending.";
+                    let _ = self.store.finish_send_error(
+                        action_id, msg,
+                        Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
+                        "linkedin-approval",
+                    );
+                    return ApprovalActionOutcome::Failed { message: msg.into() };
+                }
+            };
+            match send {
                 Ok(_) => {
                     if !matches!(self.store.finish_send_sent(action_id, "linkedin-approval"), Ok(true)) {
                         return ApprovalActionOutcome::Failed {
@@ -13869,13 +13884,13 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        let _ = self.store.reset_nudge_schedule(action_id);
+        match self.store.revise_pending_action(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(error) => return ApprovalActionOutcome::Failed {
+                message: format!("could not persist LinkedIn revision: {error}"),
+            },
+        }
         tracing::info!(action_id, "linkedin revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -13889,12 +13904,15 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         // Nothing to delete server-side — LinkedIn has no draft concept.
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Rejected,
-            None,
-            Some("skipped by approver"),
-        );
+        match self.store.try_resolve_action(
+            action_id, ActionStatus::Rejected, "linkedin-approval", Some("skipped by approver"),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(error) => return ApprovalActionOutcome::Failed {
+                message: format!("could not skip LinkedIn approval: {error}"),
+            },
+        }
         let _ = self
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -23330,18 +23348,18 @@ mod linkedin_composed_card_dispatch_tests {
                 other => panic!("{label}: schedule must be refused, got {other:?}"),
             }
 
-            // Skip's outcome is `Skipped` on both arms; the tell is that the
-            // platform arms resolve via `update_action_status` (no
-            // `status_source`) while the Gmail arm goes through
-            // `try_resolve_action`, which stamps the deciding surface.
+            // LinkedIn now uses a pending-only transition with its own
+            // source marker. Other platform arms retain their existing
+            // unstamped resolve path; neither may fall through to Gmail.
             assert!(matches!(
                 approver.run_skip(&id).await,
                 ApprovalActionOutcome::Skipped
             ));
             assert_eq!(
                 store.action_status_source(&id).unwrap(),
-                None,
-                "{label}: skip took the Gmail CAS path"
+                augmentagent_channel_linkedin::is_linkedin_email(&email)
+                    .then(|| "linkedin-approval".to_string()),
+                "{label}: skip took the wrong platform resolve path"
             );
         }
     }

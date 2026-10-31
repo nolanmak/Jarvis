@@ -3338,6 +3338,19 @@ impl Store {
         Ok(())
     }
 
+    /// Replace a draft and defer its next nudge only while it remains pending.
+    /// A redraft that finishes after an approval claim must not reopen the send.
+    pub fn revise_pending_action(&self, action_id: &str, draft_body: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE actions SET draftBody = ?2, nextNudgeAtMs = ?3, updatedAt = ?4 \
+             WHERE id = ?1 AND status = 'pending'",
+            params![action_id, draft_body, now + NUDGE_INTERVAL_MS, now],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Persist a (draft, feedback, revised_draft) triple for action `action_id`
     /// (#37 — draft-quality feedback loop).
     ///

@@ -158,3 +158,187 @@ async fn concurrent_direct_approvals_cannot_send_twice() {
     let _ = tokio::join!(a.run_approve(&id), b.run_approve(&id));
     assert_eq!(posts(&server).await, 1);
 }
+
+struct ClaimDuringRedraft {
+    store: Arc<Store>,
+    id: String,
+    claim: bool,
+}
+#[async_trait]
+impl augmentagent_channel_core::Reasoner for ClaimDuringRedraft {
+    async fn call(
+        &self,
+        _: &augmentagent_channel_core::ReasonerOpts,
+        _: &str,
+    ) -> anyhow::Result<String> {
+        if self.claim {
+            assert!(self.store.claim_action_for_send(
+                &self.id,
+                ActionStatus::Pending,
+                "concurrent-approval"
+            )?);
+        }
+        Ok("replacement draft".into())
+    }
+}
+
+#[tokio::test]
+async fn linkedin_revision_cannot_reopen_a_claimed_send() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(temp.path().join("db")).unwrap());
+    let id = seed(&store);
+    let mut approver = crate::test_support::approver_with_store(store.clone());
+    approver.reasoner = Arc::new(FallbackReasoner::for_tests(
+        vec![(
+            augmentagent_channel_core::providers::ProviderKind::Claude,
+            Arc::new(ClaimDuringRedraft {
+                store: store.clone(),
+                id: id.clone(),
+                claim: true,
+            }),
+        )],
+        augmentagent_channel_core::CooldownLatch::at(temp.path().join("cooldown")),
+    ));
+    let before = store.get_action_with_email(&id).unwrap().unwrap();
+    let outcome = approver.revise_linkedin(&id, "shorter", before).await;
+    assert!(matches!(
+        outcome,
+        ApprovalActionOutcome::AlreadyResolved { .. }
+    ));
+    let after = store.get_action_with_email(&id).unwrap().unwrap();
+    assert_eq!(after.action.status, "sending");
+    assert_eq!(
+        after.action.draft_body.as_deref(),
+        Some("Approved synthetic reply")
+    );
+    assert!(!store
+        .claim_action_for_send(&id, ActionStatus::Pending, "replay")
+        .unwrap());
+}
+
+#[test]
+fn linkedin_skip_cannot_overwrite_a_claimed_or_completed_send() {
+    for finish in [false, true] {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let id = seed(&store);
+        let stale = store.get_action_with_email(&id).unwrap().unwrap();
+        assert!(store
+            .claim_action_for_send(&id, ActionStatus::Pending, "approval")
+            .unwrap());
+        if finish {
+            assert!(store.finish_send_sent(&id, "approval").unwrap());
+        }
+        let approver = crate::test_support::approver_with_store(store.clone());
+        assert!(matches!(
+            approver.skip_linkedin(&id, stale),
+            ApprovalActionOutcome::AlreadyResolved { .. }
+        ));
+        assert_eq!(
+            store
+                .get_action_with_email(&id)
+                .unwrap()
+                .unwrap()
+                .action
+                .status,
+            if finish { "sent" } else { "sending" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn linkedin_stalled_send_is_unknown_and_cannot_automatically_retry() {
+    let server = server(Arc::new(AtomicBool::new(false))).await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(120))
+                .set_body_json(serde_json::json!({"backendUrn":"late:synthetic"})),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(Store::open(":memory:").unwrap());
+    let id = seed(&store);
+    let approver = Arc::new(approver(store.clone(), &server));
+    let worker = approver.clone();
+    let action_id = id.clone();
+    let task = tokio::spawn(async move { worker.run_approve(&action_id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while posts(&server).await == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("mock POST must have started before advancing fake time");
+    tokio::time::pause();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(61), task).await;
+    assert!(
+        result.is_ok(),
+        "send must terminate before the outer test deadline"
+    );
+    assert!(matches!(
+        result.unwrap().unwrap(),
+        ApprovalActionOutcome::Failed { .. }
+    ));
+    let action = store.get_action_with_email(&id).unwrap().unwrap().action;
+    assert_eq!(action.status, "error");
+    assert!(action.error_message.as_deref().unwrap().contains("unknown"));
+    assert!(store
+        .list_retryable_replies(
+            "linkedin",
+            chrono::Utc::now().timestamp_millis() + 60_000,
+            86_400_000,
+            0,
+            5,
+            10
+        )
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        approver.run_approve(&id).await,
+        ApprovalActionOutcome::AlreadyResolved { .. }
+    ));
+    assert_eq!(posts(&server).await, 1);
+}
+
+#[tokio::test]
+async fn linkedin_pending_revision_and_skip_still_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(temp.path().join("db")).unwrap());
+    let id = seed(&store);
+    let mut approver = crate::test_support::approver_with_store(store.clone());
+    approver.reasoner = Arc::new(FallbackReasoner::for_tests(
+        vec![(
+            augmentagent_channel_core::providers::ProviderKind::Claude,
+            Arc::new(ClaimDuringRedraft {
+                store: store.clone(),
+                id: id.clone(),
+                claim: false,
+            }),
+        )],
+        augmentagent_channel_core::CooldownLatch::at(temp.path().join("cooldown")),
+    ));
+    assert!(matches!(
+        approver.run_revise(&id, "shorter").await,
+        ApprovalActionOutcome::Revised { .. }
+    ));
+    let revised = store.get_action_with_email(&id).unwrap().unwrap();
+    assert_eq!(revised.action.status, "pending");
+    assert_eq!(
+        revised.action.draft_body.as_deref(),
+        Some("replacement draft")
+    );
+    assert!(matches!(
+        approver.run_skip(&id).await,
+        ApprovalActionOutcome::Skipped
+    ));
+    assert_eq!(
+        store
+            .get_action_with_email(&id)
+            .unwrap()
+            .unwrap()
+            .action
+            .status,
+        "rejected"
+    );
+}

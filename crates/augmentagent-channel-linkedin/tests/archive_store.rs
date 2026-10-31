@@ -256,13 +256,14 @@ fn thread_continuation_reconstructs_unicode_and_excludes_new_arrivals() {
         .1;
     let mut original = (0..9).map(|j| message(42, j)).collect::<Vec<_>>();
     original[0].body = "🌍你好é\n".repeat(2001);
+    original[1].delivered_at_ms = original[0].delivered_at_ms;
     commit_messages(
         &s,
         OWNER,
         "thread:42",
         &cp,
         &Page {
-            items: original.clone(),
+            items: original.iter().rev().cloned().collect(),
             next: None,
         },
         10000,
@@ -277,6 +278,7 @@ fn thread_continuation_reconstructs_unicode_and_excludes_new_arrivals() {
     let mut offset = 0;
     let mut body_offset = 0;
     let mut snapshot = None;
+    let mut ordered_ids = Vec::<String>::new();
     let mut reconstructed = std::collections::BTreeMap::<String, String>::new();
     let account = format!("linkedin:{OWNER}");
     for n in 0..30 {
@@ -300,6 +302,10 @@ fn thread_continuation_reconstructs_unicode_and_excludes_new_arrivals() {
         snapshot = page["snapshot_max_rowid"].as_i64();
         for m in page["messages"].as_array().unwrap() {
             assert_eq!(m["imported_at_ms"], 10000);
+            let id = m["message_id"].as_str().unwrap().to_string();
+            if ordered_ids.last() != Some(&id) {
+                ordered_ids.push(id);
+            }
             reconstructed
                 .entry(m["message_id"].as_str().unwrap().into())
                 .or_default()
@@ -316,6 +322,11 @@ fn thread_continuation_reconstructs_unicode_and_excludes_new_arrivals() {
         body_offset = page["next_body_offset"].as_u64().unwrap();
     }
     assert_eq!(reconstructed.len(), 9);
+    assert_eq!(
+        ordered_ids,
+        original.iter().map(|m| m.urn.clone()).collect::<Vec<_>>(),
+        "stored thread/body continuations must preserve source order after reversed ingestion"
+    );
     for m in original {
         assert_eq!(reconstructed[&m.urn], m.body);
     }

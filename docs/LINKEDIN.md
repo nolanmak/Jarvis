@@ -252,8 +252,10 @@ does not establish complete coverage.
 For stored messages, use `search_messages` with `with:<name-or-stable-identity>`
 and `in:linkedin`, then `read_conversation_thread`. Membership includes silent
 participants; `from:` restricts actual authorship. Equal display names return
-ambiguity. Continue stored thread reads using `next_offset`, `next_body_offset`,
-`account_id`, and `snapshot_max_rowid` to reconstruct full Unicode text. Inspect
+ambiguity. For the next stored-thread request, pass response `next_offset` as `offset`
+and `next_body_offset` as `body_offset`, retaining `account_id` and
+`snapshot_max_rowid`. Stop when `next_offset` is null. This reconstructs full
+Unicode text. Inspect
 the returned coverage state and observation time before describing a thread as
 complete or an introduction as unanswered.
 
@@ -321,3 +323,8 @@ the stored rows rather than claiming that missing upstream history was recovered
 that the database contains no older message rows. Legacy LinkedIn rows use their
 stored `receivedAt` source timestamp when parseable, while import time remains
 separately labeled. Their history coverage stays unverified until reconciled.
+
+Direct approval sends have a 30-second deadline. A timeout records unknown
+delivery and prevents automatic retry; inspect the conversation before
+resending. Revise and Skip only change pending actions, so a stale operation
+cannot reopen or overwrite a claimed send.

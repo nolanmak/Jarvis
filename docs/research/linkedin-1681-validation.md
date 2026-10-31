@@ -43,7 +43,7 @@ Deployed/browser verification remains a separate delivery gate. Do not close
 | #1684 C6 | Parsed live CLI argument dispatch: [CLI dispatch][cli-read]; actual status binary: [CLI integration][cli]; registered MCP workflow: [recovery][recovery]; scoped allowlist: [permissions][permissions]. |
 | #1685 D1, D2 | Historical/group/owner negative paths and live direct burst with full context: [live routing][routing], [archive_live][live]. |
 | #1685 D3, D5 | Fresh membership guards reject group, unknown, unowned, wrong-thread and forged direct responses before POST: [send_guard][send]. Persisted/reloaded direct-to-group card is rejected by the real approver: [approval tests][approval]. |
-| #1685 D4 | Three-message direct burst produces one card and no send: [live routing][routing]. Real approved send is exactly once across concurrent connections and restart replay: [approval tests][approval]. |
+| #1685 D4 | Three-message direct burst produces one card and no send: [live routing][routing]. An approved send produces one mocked POST across concurrent approvals and replay after recorded success; this does not establish crash-safe exactly-once delivery: [approval tests][approval]. |
 | #1685 D6 | Sender/direction/source assertions: [sync][sync], [recovery][recovery], [CLI dispatch][cli-read]. Membership gates use authoritative participants, not a user-supplied label. |
 | #1686 V1–V4 | Combined HTTP → transactions → index → parsed CLI / registered MCP evidence above; real status binary distinguishes partial threads and index backlog. Full-history scope is explicit; source-date query filtering does not change archival scope. |
 | #1686 V5–V7 | **Pending deployed backfill, browser reconciliation, replay, and subsequent incremental cycle.** |
