@@ -967,3 +967,23 @@ fn account_failure_clear_cannot_erase_a_concurrent_throttle() {
         .unwrap();
     assert!(status.last_error.is_none());
 }
+
+#[test]
+fn coverage_counts_only_committed_pages_and_preserves_totals_across_refresh() {
+    let s = Store::open(":memory:").unwrap();
+    let cp = checkpoint(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    let page = Page {
+        items: vec![conversation(0)],
+        next: None,
+    };
+    assert!(commit_conversations(&s, OWNER, "PRIMARY_INBOX", &cp, &page, 10000).unwrap());
+    assert!(!commit_conversations(&s, OWNER, "PRIMARY_INBOX", &cp, &page, 10001).unwrap());
+    let json = serde_json::to_value(coverage(&s, OWNER, "PRIMARY_INBOX").unwrap()).unwrap();
+    assert_eq!(json["mailbox_pages"]["committed"], 1);
+    assert_eq!(json["mailbox_pages"]["current_cycle"], 1);
+    refresh_mailbox(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    let json = serde_json::to_value(coverage(&s, OWNER, "PRIMARY_INBOX").unwrap()).unwrap();
+    assert_eq!(json["mailbox_pages"]["committed"], 1);
+    assert_eq!(json["mailbox_pages"]["current_cycle"], 0);
+    assert_eq!(json["scope"], "all_accessible_history");
+}

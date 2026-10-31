@@ -287,8 +287,22 @@ mailbox category has been discovered. Per-category results expose last success,
 last error, retry time, failed thread count, and search-index health.
 
 `archive-status` reads persisted state without requiring working cookies. Its
-version-1 response contains `category` and `coverage`, covering recorded accounts
-in the requested category. A missing progress record is `not_synced`, not proof
+version-1 response contains `category`, `coverage`, and `threads`, covering
+recorded accounts in the requested category. Each thread reports `history_state`
+(`unknown`, `partial`, `failed`, or `complete_at_observation`), direct/group kind,
+source-time bounds, counts by direction and text/non-text kind, last success/error,
+retry time, continuation presence, and separate index-health counts. History
+exhaustion does not imply that indexing is finished. Opaque cursor values and
+message bodies are omitted.
+
+`mailbox_pages` and each thread's `pages` count durable page commits, including
+replayed pages during reconciliation. `committed` is cumulative since tracking
+began; `current_cycle` resets on an explicit mailbox refresh or newly observed
+thread activity. Rejected transactions and a concurrent importer's losing page
+do not count. A rejected-cursor restart retains the cycle count. Null counters
+mean no page receipt was recorded; they are not invented from message totals.
+The coverage `scope` is `all_accessible_history`, with source-date bounds describing
+the stored rows rather than claiming that missing upstream history was recovered. A missing progress record is `not_synced`, not proof
 that the database contains no older message rows. Legacy LinkedIn rows use their
 stored `receivedAt` source timestamp when parseable, while import time remains
 separately labeled. Their history coverage stays unverified until reconciled.

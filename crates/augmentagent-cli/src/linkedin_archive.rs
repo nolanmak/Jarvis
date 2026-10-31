@@ -218,10 +218,17 @@ pub fn status(store: &Store, category: &str) -> Result<()> {
     if coverage.scopes.is_empty() {
         coverage.state = "not_synced";
     }
+    let threads = store.with_conn(|c| {
+        augmentagent_store::linkedin_archive::thread_status(
+            c,
+            category,
+            augmentagent_messages::EXTRACTOR_VERSION,
+        )
+    })?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"schema_version":1,"category":category,"coverage":coverage})
+            &serde_json::json!({"schema_version":1,"category":category,"coverage":coverage,"threads":threads})
         )?
     );
     Ok(())

@@ -65,3 +65,9 @@ CREATE TABLE IF NOT EXISTS linkedin_archive_restarts (
 CREATE TABLE IF NOT EXISTS linkedin_archive_accounts (
  account TEXT PRIMARY KEY, last_error TEXT, retry_at_ms INTEGER NOT NULL DEFAULT 0
 );
+-- Counts are updated inside page commits; failed or lost-CAS pages never count.
+CREATE TABLE IF NOT EXISTS linkedin_archive_page_stats (
+ account TEXT NOT NULL, scope TEXT NOT NULL,
+ committed INTEGER NOT NULL, current_cycle INTEGER NOT NULL,
+ PRIMARY KEY(account,scope)
+);

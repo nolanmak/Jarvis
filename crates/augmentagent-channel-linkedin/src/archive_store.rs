@@ -35,6 +35,7 @@ pub fn commit_conversations(
         let tx=c.unchecked_transaction()?;
         let changed=tx.execute("UPDATE linkedin_archive_mailboxes SET cursor=?4,complete=?5,revision=revision+1,last_success_ms=?6,last_error=NULL,retry_at_ms=0 WHERE account=?1 AND category=?2 AND revision=?3 AND complete=0",params![account,category,expected.revision,page.next,page.next.is_none(),now])?;
         if changed==0 { return Ok(false); }
+        count_page(&tx, account, &format!("mailbox:{category}"))?;
         if let Some(next)=&page.next {
             tx.execute("INSERT INTO linkedin_archive_cursors(account,scope,cursor) VALUES(?1,?2,?3)",params![account,format!("mailbox:{category}"),next])?;
         }
@@ -43,6 +44,7 @@ pub fn commit_conversations(
             // the previous traversal must not poison this cycle's loop ledger.
             tx.execute("DELETE FROM linkedin_archive_cursors WHERE account=?1 AND scope=?2 AND EXISTS(SELECT 1 FROM linkedin_archive_conversations WHERE account=?1 AND urn=?3 AND latest_ms<?4)",params![account,format!("thread:{}",conv.urn),conv.urn,conv.last_activity_ms])?;
             tx.execute("DELETE FROM linkedin_archive_restarts WHERE account=?1 AND scope=?2 AND EXISTS(SELECT 1 FROM linkedin_archive_conversations WHERE account=?1 AND urn=?3 AND latest_ms<?4)",params![account,format!("thread:{}",conv.urn),conv.urn,conv.last_activity_ms])?;
+            tx.execute("UPDATE linkedin_archive_page_stats SET current_cycle=0 WHERE account=?1 AND scope=?2 AND EXISTS(SELECT 1 FROM linkedin_archive_conversations WHERE account=?1 AND urn=?3 AND latest_ms<?4)",params![account,format!("thread:{}",conv.urn),conv.urn,conv.last_activity_ms])?;
             tx.execute("INSERT INTO linkedin_archive_conversations(account,urn,title,group_chat,latest_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(account,urn) DO UPDATE SET title=excluded.title,group_chat=excluded.group_chat,latest_ms=MAX(latest_ms,excluded.latest_ms),complete=CASE WHEN excluded.latest_ms>latest_ms THEN 0 ELSE complete END,cursor=CASE WHEN excluded.latest_ms>latest_ms THEN NULL ELSE cursor END,revision=revision+1",params![account,conv.urn,conv.title,conv.group,conv.last_activity_ms])?;
             tx.execute("INSERT OR IGNORE INTO linkedin_archive_categories(account,category,conversation) VALUES(?1,?2,?3)",params![account,category,conv.urn])?;
             // Membership is the latest observed snapshot, not invented history.
@@ -85,6 +87,7 @@ pub fn commit_messages(
         let tx=c.unchecked_transaction()?;
         let changed=tx.execute("UPDATE linkedin_archive_conversations SET cursor=?4,complete=?5,revision=revision+1,last_success_ms=?6,last_error=NULL,retry_at_ms=0 WHERE account=?1 AND urn=?2 AND revision=?3 AND complete=0",params![account,conversation,expected.revision,page.next,page.next.is_none(),now])?;
         if changed==0{return Ok(false);}
+        count_page(&tx, account, &format!("thread:{conversation}"))?;
         if let Some(next)=&page.next{
             tx.execute("INSERT INTO linkedin_archive_cursors(account,scope,cursor) VALUES(?1,?2,?3)",params![account,format!("thread:{conversation}"),next])?;
         }
@@ -148,6 +151,7 @@ pub fn refresh_mailbox(store: &Store, account: &str, category: &str) -> anyhow::
         tx.execute("INSERT INTO linkedin_archive_mailboxes(account,category) VALUES(?1,?2) ON CONFLICT(account,category) DO UPDATE SET cursor=NULL,complete=0,revision=revision+1,last_error=NULL",params![account,category])?;
         tx.execute("DELETE FROM linkedin_archive_cursors WHERE account=?1 AND scope=?2",params![account,format!("mailbox:{category}")])?;
         tx.execute("DELETE FROM linkedin_archive_restarts WHERE account=?1 AND scope=?2",params![account,format!("mailbox:{category}")])?;
+        tx.execute("UPDATE linkedin_archive_page_stats SET current_cycle=0 WHERE account=?1 AND scope=?2",params![account,format!("mailbox:{category}")])?;
         tx.commit()
     })?;
     Ok(())
@@ -241,5 +245,14 @@ pub fn clear_account_failure(
         c.execute("UPDATE linkedin_archive_accounts SET last_error=NULL,retry_at_ms=0 WHERE account=?1 AND retry_at_ms<=?2",params![account,request_started_ms])?;
         Ok(())
     })?;
+    Ok(())
+}
+
+fn count_page(
+    tx: &augmentagent_store::rusqlite::Transaction<'_>,
+    account: &str,
+    scope: &str,
+) -> augmentagent_store::rusqlite::Result<()> {
+    tx.execute("INSERT INTO linkedin_archive_page_stats(account,scope,committed,current_cycle) VALUES(?1,?2,1,1) ON CONFLICT(account,scope) DO UPDATE SET committed=committed+1,current_cycle=current_cycle+1", params![account,scope])?;
     Ok(())
 }
