@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 
-/// Shared with message indexing so source chronology has one parser.
+/// Common timestamp formats shared with message indexing.
 pub fn parse_source_timestamp_ms(raw: &str) -> Option<i64> {
     let r = raw.trim();
     if r.is_empty() {
@@ -34,7 +34,7 @@ pub fn parse_source_timestamp_ms(raw: &str) -> Option<i64> {
 
 pub fn conversation_timestamp_ms(platform: &str, raw: &str) -> Option<i64> {
     parse_source_timestamp_ms(raw).or_else(|| {
-        (platform == "slack")
+        matches!(platform, "slack" | "telegram")
             .then(|| crate::slack_ingest::ts_to_ms(raw.trim()))
             .flatten()
     })

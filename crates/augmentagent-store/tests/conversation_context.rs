@@ -89,11 +89,12 @@ fn context_source_restores_normalized_recipients_without_retry_context() {
 }
 
 #[test]
-fn window_orders_slack_and_email_source_times_instead_of_backfill_order() {
+fn window_orders_native_source_times_instead_of_backfill_order() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("db")).unwrap();
     for (platform, early, late) in [
         ("slack", "1767225600.000001", "1767225660.000001"),
+        ("telegram", "1767225600", "1767225660"),
         (
             "gmail",
             "Thu, 01 Jan 2026 00:00:00 +0000",

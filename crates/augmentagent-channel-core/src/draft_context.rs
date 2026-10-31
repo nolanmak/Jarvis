@@ -180,7 +180,9 @@ fn load_seed_at(
                 message.message_id
             ));
         }
-        if message.timestamp.is_none() {
+        if message.timestamp.as_deref().and_then(|raw|
+            augmentagent_store::conversation_context::conversation_timestamp_ms(&message.platform, raw)
+        ).is_none() {
             seed.gaps.push(format!(
                 "Message timestamp unavailable: {}",
                 message.message_id
