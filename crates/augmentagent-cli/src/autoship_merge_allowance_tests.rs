@@ -3,6 +3,97 @@ use super::*;
 const DAY: i64 = 86_400_000;
 
 #[test]
+fn corrupt_terminal_proof_cannot_starve_other_confirmed_workflows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    for pr in 1..=2 {
+        let (lease,op) = fixture(&mut store,pr,now);
+        reserve(&mut store,&lease,&op,pr,now).unwrap();
+        store.dispatch_merge(&lease,&op,now,5).unwrap();
+        store.confirm_merge_dispatch(&op,&receipt(&op,pr,now),now).unwrap();
+        store.release(&lease,now).unwrap();
+        if pr == 1 {
+            store.conn.execute("UPDATE merge_mutation_receipt SET receipt='{}' WHERE operation=?1",[&op.id]).unwrap();
+        }
+    }
+    assert_eq!(store.reconcile_confirmed_workflows("owner/repo",now+1).unwrap(),1);
+    assert_ne!(store.snapshot("owner/repo#1").unwrap().unwrap().checkpoint.stage,Stage::Merged);
+    assert_eq!(store.snapshot("owner/repo#2").unwrap().unwrap().checkpoint.stage,Stage::Merged);
+    assert_eq!(store.reconcile_confirmed_workflows("owner/repo",now+2).unwrap(),0);
+}
+
+#[test]
+fn confirmed_merge_reconciles_terminal_state_only_after_worker_quiescence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let now = 100 * DAY;
+    let (lease, op) = fixture(&mut store, 1, now);
+    store.register_native_owner(&lease,"/synthetic/audit",now).unwrap();
+    store.charge(&lease,"paid-work",ResourceCharge { wall_ms:2500,model_calls:2,tokens:300 },now).unwrap();
+    reserve(&mut store,&lease,&op,1,now).unwrap();
+    store.dispatch_merge(&lease,&op,now,5).unwrap();
+    assert!(!store.reconcile_confirmed_workflow(&op.id,now).unwrap(), "dispatch is not confirmation");
+    store.confirm_merge_dispatch(&op,&receipt(&op,1,now),now).unwrap();
+    let before = store.snapshot(&op.workflow).unwrap().unwrap();
+    assert!(!store.reconcile_confirmed_workflow(&op.id,now).unwrap(), "active worker owns its checkpoint");
+    assert_eq!(store.snapshot(&op.workflow).unwrap().unwrap(),before);
+    store.release(&lease,now).unwrap();
+    drop(store);
+    let mut store = WorkflowStore::open(&path).unwrap();
+    assert_eq!(store.reconcile_confirmed_workflows("other/repo",now+DAY).unwrap(),0);
+    assert_eq!(store.reconcile_confirmed_workflows("Owner/Repo",now+DAY).unwrap(),1);
+    let after = store.snapshot(&op.workflow).unwrap().unwrap();
+    assert_eq!(after.checkpoint.stage,Stage::Merged);
+    assert_eq!(after.checkpoint.next.action,"complete");
+    assert_eq!((after.wall_ms,after.model_calls,after.tokens),(before.wall_ms,before.model_calls,before.tokens));
+    assert!(after.generation > before.generation);
+    assert!(store.heartbeat(&lease,now+1,1000).is_err());
+    let completed:String = store.conn.query_row("SELECT receipt FROM operation WHERE id=?1",[&op.id],|r|r.get(0)).unwrap();
+    assert_eq!(completed,format!("github:pr:1:merged:{}",op.binding.head));
+    let retirement:(Option<String>,Option<i64>) = store.conn.query_row("SELECT retirement_reason,retired_at FROM workflow_native_owner",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert!(retirement.0.is_some());
+    assert!(retirement.1.is_none(), "resource cleanup must still verify actual child retirement");
+    assert!(!store.reconcile_confirmed_workflow(&op.id,now+DAY+1).unwrap());
+    assert_eq!(store.reconcile_confirmed_workflows("owner/repo",now+DAY+1).unwrap(),0);
+    assert_eq!(store.snapshot(&op.workflow).unwrap().unwrap(),after);
+    assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,1);
+    assert_eq!(crate::autoship_metrics::read(&path,now,now+DAY).unwrap().autonomous_merges,1);
+    assert_eq!(crate::autoship_metrics::read(&path,now+DAY,now+DAY*2).unwrap().autonomous_merges,0);
+}
+
+#[test]
+fn confirmed_merge_never_overwrites_newer_binding_pr_or_retirement() {
+    for changed in ["head","contract","evidence","pr","retired"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let now = 100 * DAY;
+        let (lease,op) = fixture(&mut store,1,now);
+        reserve(&mut store,&lease,&op,1,now).unwrap();
+        store.dispatch_merge(&lease,&op,now,5).unwrap();
+        store.confirm_merge_dispatch(&op,&receipt(&op,1,now),now).unwrap();
+        let mut cp = store.snapshot(&op.workflow).unwrap().unwrap().checkpoint;
+        match changed {
+            "head" => cp.binding.head = "c".repeat(40),
+            "contract" => cp.binding.contract = "new-contract".into(),
+            "evidence" => cp.binding.evidence_hash = "new-proof".into(),
+            // The public attach API forbids rebinding. Simulate inconsistent
+            // migrated state to ensure recovery still cannot close another PR.
+            "pr" => { store.conn.execute("UPDATE workflow SET pr=2 WHERE id=?1",[&op.workflow]).unwrap(); },
+            "retired" => cp.stage = Stage::Retired,
+            _ => unreachable!(),
+        }
+        store.checkpoint(&lease,&cp,now).unwrap();
+        store.release(&lease,now).unwrap();
+        let before = store.snapshot(&op.workflow).unwrap().unwrap();
+        assert!(!store.reconcile_confirmed_workflow(&op.id,now+1).unwrap(), "{changed}");
+        assert_eq!(store.snapshot(&op.workflow).unwrap().unwrap(),before);
+        assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,1);
+    }
+}
+
+#[test]
 fn marked_dispatch_fences_and_commits_proof_atomically() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();

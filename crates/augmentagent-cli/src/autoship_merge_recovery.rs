@@ -342,6 +342,7 @@ pub async fn resolve(
                     .context("response digest missing")?,
                 now,
             )?;
+            store.reconcile_confirmed_workflow(&record.operation.id, now)?;
         } else {
             store.resolve_merge_without_debit(
                 &record.operation,

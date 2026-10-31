@@ -129,6 +129,65 @@ fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
 }
 
 impl WorkflowStore {
+    pub fn reconcile_confirmed_workflow(&mut self, operation: &str, now: i64) -> Result<bool> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String,String,String,Option<String>,u64,String,i64,String,String,Option<u64>,i64,i64)> = tx.query_row(
+            "SELECT o.workflow,o.kind,o.binding,o.receipt,d.pr,d.pr_node_id,d.merged_at_ms,m.receipt,w.checkpoint,w.pr,w.lease_until,w.generation
+             FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation JOIN workflow w ON w.id=o.workflow
+             JOIN merge_mutation_receipt m ON m.operation=o.id WHERE d.operation=?1 AND d.state='confirmed'",
+            [operation], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?))).optional()?;
+        let Some((workflow,kind,binding,completed,pr,node,merged_at,proof,checkpoint,current_pr,until,generation)) = row else { return Ok(false); };
+        let binding: Binding = serde_json::from_str(&binding)?;
+        let mut checkpoint: Checkpoint = serde_json::from_str(&checkpoint)?;
+        if until > now || checkpoint.stage == Stage::Retired || checkpoint.binding != binding || current_pr != Some(pr) {
+            return Ok(false);
+        }
+        ensure!(serde_json::from_str::<OperationKind>(&kind)? == OperationKind::MergePr, "confirmed receipt is not a merge operation");
+        let proof: serde_json::Value = serde_json::from_str(&proof)?;
+        validate_merge_receipt_identity(&tx,operation,&proof)?;
+        ensure!(proof["expected_head"].as_str() == Some(binding.head.as_str())
+            && proof["pr_number"].as_u64() == Some(pr) && proof["pr_node_id"].as_str() == Some(node.as_str())
+            && chrono::DateTime::parse_from_rfc3339(proof["merged_at"].as_str().context("confirmation time missing")?)?.timestamp_millis() == merged_at,
+            "confirmed workflow proof differs from dispatch");
+        let observed = format!("github:pr:{pr}:merged:{}",binding.head);
+        ensure!(completed.as_deref().is_none_or(|value| value == observed), "completed operation contradicts confirmed merge");
+        if checkpoint.stage == Stage::Merged && completed.is_some() { return Ok(false); }
+        let generation = generation.checked_add(1).context("workflow generation overflow")?;
+        if completed.is_none() {
+            tx.execute("UPDATE operation SET receipt=?2 WHERE id=?1",params![operation,observed])?;
+            // Throughput belongs to the remote merge window, even when its
+            // proof arrives after restart or midnight.
+            event(&tx,&workflow,generation,"operation_completed",operation,merged_at)?;
+        }
+        checkpoint.stage = Stage::Merged;
+        checkpoint.next = NextAction { reason:"confirmed_merge_reconciled".into(), action:"complete".into(), eligible_at_ms:0 };
+        let raw = serde_json::to_string(&checkpoint)?;
+        tx.execute("UPDATE workflow SET checkpoint=?2,owner=NULL,lease_until=0,generation=?3,progress_at=?4 WHERE id=?1",
+            params![workflow,raw,generation,now])?;
+        event(&tx,&workflow,generation,"checkpoint",&raw,now)?;
+        // Mark cleanup intent only. Runtime retirement must still verify that
+        // children are gone; historical resource charges are never erased.
+        tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'terminal_workflow') WHERE workflow=?1 AND retired_at IS NULL",[&workflow])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn reconcile_confirmed_workflows(&mut self, repository: &str, now: i64) -> Result<usize> {
+        let ids = self.conn.prepare("SELECT d.operation FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation JOIN workflow w ON w.id=o.workflow
+            WHERE d.repository=?1 AND d.state='confirmed' AND w.lease_until<=?2
+            AND json_extract(w.checkpoint,'$.stage')<>'retired'
+            AND (json_extract(w.checkpoint,'$.stage')<>'merged' OR o.receipt IS NULL) ORDER BY d.operation")?
+            .query_map(params![repository.to_ascii_lowercase(),now],|r|r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut completed = 0;
+        for operation in ids {
+            match self.reconcile_confirmed_workflow(&operation,now) {
+                Ok(changed) => completed += usize::from(changed),
+                Err(error) => tracing::warn!(operation=%operation,"confirmed workflow reconciliation remains unresolved: {error:#}"),
+            }
+        }
+        Ok(completed)
+    }
     pub fn pending_merge_dispatches(&self, repository: &str) -> Result<Vec<MergeDispatchRecord>> {
         let ids = self.conn.prepare("SELECT operation FROM merge_allowance_dispatch WHERE repository=?1 AND state='dispatched' ORDER BY dispatched_at_ms,operation")?
             .query_map([repository], |row| row.get::<_,String>(0))?

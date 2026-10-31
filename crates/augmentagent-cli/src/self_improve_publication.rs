@@ -477,16 +477,32 @@ async fn recover_dispatched_merge(
 }
 
 async fn reconcile_merge_records(github: &mut impl Github, store: &mut crate::autoship_workflow::WorkflowStore, repository: &str) -> Result<usize> {
+    use sha2::{Digest, Sha256};
     let mut confirmed = 0;
     // The ledger, not the open-PR inventory, owns uncertain dispatch recovery.
     // Dispatch capacity bounds this set; accounting recovery spends no model calls.
     for record in store.pending_merge_dispatches(repository)? {
-        match tokio::time::timeout(std::time::Duration::from_secs(30), recover_dispatched_merge(github, &record, store)).await {
-            Ok(Ok(_)) => confirmed += 1,
+        let reconcile = async {
+            if let Some((raw,_)) = store.merge_response(&record.operation,&record.repository,record.pr)? {
+                if crate::autoship_workflow::merge_request_not_executed(&raw) {
+                    store.resolve_merge_without_debit(&record.operation,"not-merged","autoship",
+                        &crate::autoship_workflow::MergeReleaseProof::RequestNotExecuted {
+                            response_sha256:format!("{:x}",Sha256::digest(raw.as_bytes()))
+                        },chrono::Utc::now().timestamp_millis())?;
+                    return Ok::<bool,anyhow::Error>(false);
+                }
+            }
+            recover_dispatched_merge(github, &record, store).await?;
+            Ok(true)
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(30), reconcile).await {
+            Ok(Ok(true)) => confirmed += 1,
+            Ok(Ok(false)) => (),
             Ok(Err(error)) => warn!(operation=%record.operation.id, "merge dispatch remains unresolved: {error:#}"),
             Err(_) => warn!(operation=%record.operation.id, "merge dispatch reconciliation timed out; capacity retained"),
         }
     }
+    store.reconcile_confirmed_workflows(repository, chrono::Utc::now().timestamp_millis())?;
     Ok(confirmed)
 }
 
@@ -705,6 +721,30 @@ mod tests {
         assert!(merge_transport_output(false,"".into(),"timeout",true).is_err());
         assert!(merge_transport_output(false,"bad JSON".into(),"failure",true).is_err());
         assert!(merge_transport_output(false,raw.into(),"non-GraphQL failure",false).is_err());
+    }
+
+    #[tokio::test]
+    async fn periodic_recovery_releases_proven_request_rejection_after_worker_exit() {
+        use crate::autoship_workflow::{WorkflowStore, Binding};
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let binding = Binding { head:"head".into(),contract:"contract".into(),evidence_hash:"proof".into() };
+        store.register("owner/repo#12","fixture",binding.clone(),now).unwrap();
+        let lease = store.claim("owner/repo#12","fixture",now,60_000).unwrap().unwrap();
+        store.attach_pr(&lease,12,now).unwrap();
+        let op = store.begin_operation(&lease,OperationKind::MergePr,&binding,now).unwrap();
+        store.reserve_merge(&lease,&op,"owner/repo",12,"PR_fixture",now,5).unwrap();
+        store.dispatch_marked_merge(&lease,&op,now,5).unwrap();
+        store.record_merge_response(&op,r#"{"errors":[{"message":"Unknown field","locations":[{"line":1,"column":1}]}]}"#,now).unwrap();
+        let mut github = MergeFake { replies:VecDeque::new(),calls:vec![] };
+        assert_eq!(reconcile_merge_records(&mut github,&mut store,"owner/repo").await.unwrap(),0);
+        assert_eq!(store.merge_allowance(now,5).unwrap().pending,1,"active worker retains its lease");
+        store.release(&lease,now).unwrap();
+        assert_eq!(reconcile_merge_records(&mut github,&mut store,"owner/repo").await.unwrap(),0);
+        assert_eq!(store.merge_allowance(now,5).unwrap().pending,0);
+        assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,0);
+        assert!(github.calls.is_empty());
     }
 
     #[tokio::test]

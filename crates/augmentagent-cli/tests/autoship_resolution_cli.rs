@@ -127,6 +127,12 @@ fn cli_resolves_original_accepted_response_once_without_mutation() {
         })
         .unwrap();
     assert_eq!(n, 1);
+    let checkpoint:String = conn.query_row("SELECT checkpoint FROM workflow",[],|r|r.get(0)).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&checkpoint).unwrap()["stage"],"merged");
+    let status = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .current_dir(dir.path()).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",dir.path().join("workflow.db"))
+        .args(["autopr","status","--workflow","owner/repo#12","--json"]).output().unwrap();
+    assert_eq!(assert_code(&status,0)["complete"],true);
     assert!(
         !dir.path().join("state").exists(),
         "no unrelated application initialization"
