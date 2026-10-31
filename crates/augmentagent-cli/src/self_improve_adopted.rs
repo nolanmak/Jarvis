@@ -40,15 +40,7 @@ fn publication_review(
     let Some(snapshot) = store.snapshot(&id)? else {
         return Ok(None);
     };
-    let review = store
-        .events(&id)?
-        .into_iter()
-        .rev()
-        .take_while(|(_, kind, _, _)| kind != "audit_generation_recovered")
-        .filter(|(_, kind, _, _)| kind == "review_recorded")
-        .filter_map(|(_, _, raw, _)| {
-            serde_json::from_str::<crate::autoship_workflow::Review>(&raw).ok()
-        })
+    let review=store.current_review_history(&id)?.into_iter()
         .find(|r| {
             r.binding == snapshot.checkpoint.binding
                 && r.binding.head == candidate.head
@@ -210,7 +202,7 @@ pub(super) async fn resume(
     let Some(_lock) = RunLock::try_acquire(&lock_path)? else {
         return Ok(RunReport::held("adopted PR worktree busy".into()));
     };
-    let worktree = workflow::prepare_resume_worktree(repo, pr.pr, &pr.branch).await?;
+    let worktree = workflow::prepare_resume_worktree_at_head(repo, pr.pr, &pr.branch,Some(&pr.head)).await?;
     let request = format!("Pull request #{}: {}\n{}", pr.pr, pr.title, pr.body);
     let environment = recovery::environment_identity(&worktree).await?;
     let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
@@ -229,7 +221,7 @@ pub(super) async fn resume(
             "adopted PR workflow busy or deferred".into(),
         ));
     };
-    guard.bind_reasoner(reasoner.as_ref())?;
+    guard.bind_builder(reasoner.as_ref())?;
     reasoner.track_review_history(repo, &pr.branch, true)?;
     let prior_checkpoint = WorkflowStore::open(&workflow::path())?
         .snapshot(guard.id())?
@@ -435,6 +427,9 @@ async fn execute(
         if review.approved() {
             guard.push(&pr.branch).await?;
             acceptance::assert_receipt_current(worktree, &prepared, &receipt).await?;
+            if guard.published_pr_ready(pr.pr,&review).await? {
+                return Ok(RunReport::built(format!("PR #{}: validated revision published; PR milestone complete",pr.pr)));
+            }
             let (_, names, _) = run(
                 "git",
                 &["diff", "--name-only", "origin/main...HEAD"],
@@ -461,9 +456,9 @@ async fn execute(
             if !allowed || checks_green(repo, pr.pr).await != Some(true) {
                 guard
                     .transition(
-                        Stage::Held,
-                        "adopted_approved_pending_policy_or_ci",
-                        "reconcile_approved_pr",
+                        if allowed { Stage::AwaitChecks } else { Stage::Held },
+                        if allowed { "adopted_ci_pending" } else { "adopted_merge_policy_blocked" },
+                        if allowed { "reconcile_approved_pr" } else { "await_merge_authorization" },
                         chrono::Utc::now().timestamp_millis() + 300_000,
                     )
                     .await?;
@@ -526,7 +521,7 @@ async fn execute(
             guard.validate_binding(&binding).await?;
             let intent = guard.intent(OperationKind::MergePr)?;
             let mutation =
-                publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent).await;
+                publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent, &guard.merge_lease()?).await;
             if let Ok(Some(receipt)) = &mutation {
                 guard.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
             }
@@ -615,6 +610,10 @@ async fn execute(
 /// Free reconciliation remains available while a different PR's builder runs.
 pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
     let candidates = discover(repo, dry_run).await?;
+    sweep_candidates(repo, dry_run, candidates).await
+}
+
+pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec<adoption::AdoptedPr>) -> Result<usize> {
     let store = WorkflowStore::open(&workflow::path())?;
     let mut merged = 0;
     for pr in candidates
@@ -690,7 +689,7 @@ pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
         let intent = lease.merge_intent()?;
         let mutation =
-            publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent).await;
+            publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent, &lease.merge_lease()?).await;
         if let Ok(Some(receipt)) = &mutation {
             lease.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
         }
@@ -761,7 +760,7 @@ async fn reconcile_parent(repo: &Path, pr: &adoption::AdoptedPr, dry_run: bool) 
     let Some(_lock) = RunLock::try_acquire(&lock_path)? else {
         return Ok(false);
     };
-    let worktree = workflow::prepare_resume_worktree(repo, pr.pr, &pr.branch).await?;
+    let worktree = workflow::prepare_resume_worktree_at_head(repo, pr.pr, &pr.branch,Some(&pr.head)).await?;
     let contract = format!(
         "Retarget authorized child PR #{} after merged parent {}",
         pr.pr, pr.base
@@ -938,6 +937,18 @@ mod fairness_tests {
             body: "Preserve existing behavior".into(),
             dependency: adoption::Dependency::Main,
         }
+    }
+    #[test]
+    fn owner_input_invalidates_adopted_publication_on_unchanged_head() {
+        use crate::autoship_workflow::{Binding,Review,discord_ingress::DiscordOrigin,submission::{Request,Target,Milestone}};
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();let candidate=candidate(42);
+        let origin=DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        let id=store.submit_discord_authorized(&origin,&Request {repository:candidate.repository.clone(),target:Target::Pr(42),provider:None,until:Milestone::Merged},&"a".repeat(64),1).unwrap().admission.workflow;
+        let binding=Binding {head:candidate.head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(&id,&candidate.branch,binding.clone(),2).unwrap();let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();store.attach_pr_in_repo(&lease,&candidate.repository,42,4).unwrap();
+        store.record_review(&lease,&Review {reviewer:"adopted-publication-old".into(),binding,approved:true,evidence:"old structured receipt".into()},5).unwrap();assert!(publication_review(&store,&candidate).unwrap().is_some());
+        store.enqueue_owner_message(&DiscordOrigin {message:45,..origin},&id,"Change the behavior",None,6).unwrap();
+        assert!(publication_review(&store,&candidate).unwrap().is_none(),"historical review survived owner input despite unchanged head");
     }
     #[test]
     fn recovered_audit_cannot_revive_adopted_publication_approval() {

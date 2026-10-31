@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1714,
+    1713
+  ],
+  "status": "bounded-progress-history-reconciliation-verified-not-deployed",
+  "parent_commit": "6b4dc47d1e0b8a92de63b0f4227058873cf7d190",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-progress-reconcile.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "History recovery returned no receipt for the exact bot-authored bound message."
+    },
+    "initial_http_fixture_failure": {
+      "log": "/tmp/autoship-1703-green-progress-reconcile-gateway.log",
+      "cargo_exit": 101,
+      "reason": "Mock endpoint query matching did not match the client query serialization; replaced with explicit UrlEncoded matcher."
+    },
+    "full_cli_green": {
+      "log": "/tmp/autoship-1703-green-progress-reconcile-cli.log",
+      "exit": 0,
+      "passed": 1476,
+      "failed": 0,
+      "ignored": 25,
+      "compiled_cli_passed": 43
+    },
+    "http_gateway_green": {
+      "log": "/tmp/autoship-1703-green-progress-reconcile-http.log",
+      "exit": 0,
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "verified": [
+    "Uncertain progress attempts are loaded only for the configured bot/owner and their still-bound workflow conversation; wrong owner query returns no attempt.",
+    "Reconnect recovery checks live private destination authority, retrieves at most the most recent 100 messages under a 15-second deadline, then checks destination again before confirmation.",
+    "Only one exact content and marker match authored by the configured bot in the bound channel yields a receipt. Foreign author/channel, altered content, duplicates and empty history produce no receipt. HTTP history permission failure propagates without fabricating evidence.",
+    "Recovery records the exact remote ID using the existing transactional bound receipt service. It never sends a replacement message. Repeated recovery after confirmation is inert.",
+    "Production gateway-adapter regression verifies lost-response uncertainty, successful subsequent history reconciliation, zero additional send count and delivery-confirmed status."
+  ],
+  "limits": [
+    "History is limited to the most recent 100 messages. Missing or ambiguous history leaves the attempt uncertain; older evidence needs future explicit resolution.",
+    "This reconciles progress deliveries only; uncertain command acknowledgements still need recovery integration.",
+    "Typed 429/backoff, degraded/dead-letter handling, explicit event resolution and duplicate-authorized resend, operational destination/rebind, editable status and deployment projection remain open.",
+    "No production rollout, live Discord/native acceptance, hosted CI acceptance or soak completion. No issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-approval-discord/src/autoship.rs",
+      "sha256": "bd3c95247931796698857f743d8fcbcddbde91c62098d2d0e4fd77b766df8a8d"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/lib.rs",
+      "sha256": "789b05430b510a41c87eee208600ec6f78ed00e8318a79d737c7dcbeff35b5ca"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "c30d295e4c056c1e1fa645b73c0ce066a3ddcfb6188d187c105fad723c89bd78"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_progress.rs",
+      "sha256": "f1186b95b37bba8d6b8b56031dfa6339f0186591c86337e1e0698bab165da4da"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "d0056127c1154a8081df760e115715fe85b7faaf64a5e41746259bb4ebe31cd8"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "dfcd109794373ed982fbb77a1c9a3f4216eb20dab4634e1734970d113d4bb908"
+    }
+  ]
+}

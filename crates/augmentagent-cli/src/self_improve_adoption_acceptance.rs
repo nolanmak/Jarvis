@@ -25,10 +25,11 @@ def git(*args):
  return subprocess.check_output(['/usr/bin/git','--git-dir',c['origin'],*args],text=True).strip()
 head=git('rev-parse','refs/heads/'+c['branch']); state='MERGED' if (root/'merged').exists() else 'OPEN'
 draft=not (root/'ready').exists()
+merge_commit=(root/'merge-commit').read_text() if state=='MERGED' else None
 row=dict(number=841,id='PR_disposable_adoption',url='https://github.com/'+c['repository']+'/pull/841',
  headRefName=c['branch'],headRefOid=head,baseRefName='main',isCrossRepository=False,isDraft=draft,
  author={'login':'autoship-canary'},title=c['title'],body=c['body'],closingIssuesReferences=[],state=state,
- mergeable='MERGEABLE',mergeCommit={'oid':head} if state=='MERGED' else None,
+ mergeable='MERGEABLE',mergeCommit={'oid':merge_commit,'message':git('show','-s','--format=%B',merge_commit)} if state=='MERGED' else None,
  files=[{'path':p} for p in git('diff','--name-only',c['base'],head,'--').splitlines()])
 with (root/'gh-calls.jsonl').open('a') as stream:stream.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view']: print(c['repository'])
@@ -46,14 +47,19 @@ elif a[:2]==['api','graphql']:
  for i,value in enumerate(a):
   if value in ['-f','-F'] and i+1<len(a) and '=' in a[i+1]:
    key,val=a[i+1].split('=',1);fields[key]=val
+ if fields.get('query','').startswith('query AutoshipDirectMergePolicy'):
+  print(json.dumps({'data':{'repository':{'mergeQueue':None}}}));sys.exit(0)
  assert 'AutoshipMerge' in fields.get('query',''), 'only merge mutation is simulated'
  assert fields['head']==head and fields['id']==row['id']
  assert state=='OPEN' and not draft and (root/'ci-green').exists()
  subprocess.run(['/usr/bin/git','--git-dir',c['origin'],'merge-base','--is-ancestor','refs/heads/main',head],check=True)
- git('update-ref','refs/heads/main',head)
+ parent=git('rev-parse','refs/heads/main')
+ merge_commit=subprocess.check_output(['/usr/bin/git','--git-dir',c['origin'],'-c','user.name=Autoship fixture','-c','user.email=fixture@example.invalid','commit-tree',git('rev-parse',head+'^{tree}'),'-p',parent],input=fields['body']+'\n',text=True).strip()
+ git('update-ref','refs/heads/main',merge_commit,parent)
+ (root/'merge-commit').write_text(merge_commit)
  (root/'merged').write_text(head)
  with (root/'merge-mutations.jsonl').open('a') as stream:stream.write(json.dumps(fields)+'\n')
- row.update(state='MERGED',mergeCommit={'oid':head},mergedBy={'login':'autoship-canary'})
+ row.update(state='MERGED',mergedAt=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),mergeCommit={'oid':merge_commit,'message':git('show','-s','--format=%B',merge_commit)},mergedBy={'login':'autoship-canary'})
  print(json.dumps({'data':{'mergePullRequest':{'clientMutationId':fields['request'],'pullRequest':row}}}))
 elif a[:1]==['api'] and '/git/ref/heads/main' in a[1]:print(git('rev-parse','refs/heads/main'))
 elif a[:1]==['api'] and '/branches/main/protection' in a[1]:
@@ -267,13 +273,7 @@ async fn run_pipeline() -> Result<()> {
         after.model_calls == calls,
         "CI-only reconciliation rebilled native work"
     );
-    let events = store.events(&id)?;
-    anyhow::ensure!(
-        events
-            .iter()
-            .any(|(_, kind, _, _)| kind == "merge_mutation_accepted"),
-        "merge lacks accepted own mutation attribution"
-    );
+    verify_merge_attribution(&store, &id)?;
     anyhow::ensure!(
         std::fs::read_to_string(root.join("merge-mutations.jsonl"))?
             .lines()
@@ -297,5 +297,104 @@ async fn run_pipeline() -> Result<()> {
         "workflow":id,"source":"pull_request:841","imported_head":imported,"approved_head":after.checkpoint.binding.head,
         "model_calls_before_ci":calls,"model_calls_after_ci":after.model_calls,"merge_mutations":1,"passed":true}))?,
     )?;
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn adoption_boundary_preserves_policy_and_immutable_merge_marker() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let repo = root.path().join("origin");
+    std::fs::create_dir(&repo)?;
+    fixture_git(&repo, &["init", "-b", "main"]).await?;
+    fixture_git(&repo, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"]).await?;
+    let before = fixture_git(&repo, &["rev-parse", "HEAD"]).await?;
+    std::fs::write(root.path().join("fixture.json"), serde_json::json!({
+        "origin":repo.join(".git"),"branch":"main","repository":"fixture/project",
+        "base":before,"title":"fixture","body":"fixture"
+    }).to_string())?;
+    let script = root.path().join("github.py");
+    std::fs::write(&script, GH_FIXTURE)?;
+    let output = Command::new("/usr/bin/python3").arg(script)
+        .args(["api", "graphql", "-f", "query=query AutoshipDirectMergePolicy($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){mergeQueue(branch:\"main\"){id}}}", "-f", "owner=fixture", "-f", "repo=project"])
+        .env("AUTOSHIP_ADOPTION_ACCEPTANCE_CHILD", root.path()).output().await?;
+    anyhow::ensure!(output.status.success(), "read-only policy query failed: {}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(value.pointer("/data/repository/mergeQueue").is_some_and(serde_json::Value::is_null), "missing explicit direct-merge policy");
+    anyhow::ensure!(!root.path().join("merged").exists() && !root.path().join("merge-mutations.jsonl").exists(), "policy query mutated merge state");
+    anyhow::ensure!(fixture_git(&repo, &["rev-parse", "HEAD"]).await? == before, "policy query moved main");
+    fixture_git(&repo, &["checkout", "-b", "repair"]).await?;
+    fixture_git(&repo, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "repair"]).await?;
+    let head=fixture_git(&repo, &["rev-parse", "HEAD"]).await?;
+    let path=root.path().join("fixture.json");
+    let mut config:serde_json::Value=serde_json::from_slice(&std::fs::read(&path)?)?;
+    config["branch"]="repair".into();std::fs::write(path,serde_json::to_vec(&config)?)?;
+    std::fs::write(root.path().join("ready"),"ready")?;
+    std::fs::write(root.path().join("ci-green"),"green")?;
+    let body="synthetic controller commit marker";
+    let output=Command::new("/usr/bin/python3").arg(root.path().join("github.py"))
+        .args(["api","graphql","-f","query=mutation AutoshipMerge","-f","id=PR_disposable_adoption","-f",&format!("head={head}"),"-f","request=fixture-request","-f",&format!("body={body}")])
+        .env("AUTOSHIP_ADOPTION_ACCEPTANCE_CHILD",root.path()).output().await?;
+    anyhow::ensure!(output.status.success(),"fixture merge failed");
+    let response:serde_json::Value=serde_json::from_slice(&output.stdout)?;
+    let commit=&response["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"];
+    anyhow::ensure!(commit["message"].as_str().is_some_and(|message|message.trim()==body),"fixture must return immutable merge message for attribution");
+    let oid=commit["oid"].as_str().context("merge commit missing")?;
+    anyhow::ensure!(fixture_git(&repo,&["show","-s","--format=%B",oid]).await?==body,"response marker must exist in real Git commit");
+    anyhow::ensure!(fixture_git(&repo,&["rev-parse","main"]).await?==oid,"main must point at the fixture squash commit");
+    anyhow::ensure!(fixture_git(&repo,&["rev-parse",&format!("{oid}^{{tree}}")]).await?==fixture_git(&repo,&["rev-parse",&format!("{head}^{{tree}}")]).await?,"squash must preserve approved candidate tree");
+    Ok(())
+}
+
+
+fn verify_merge_attribution(store:&crate::autoship_workflow::WorkflowStore,id:&str)->Result<()> {
+    let events=store.events(id)?;
+    let confirmations:Vec<_>=events.iter().filter(|(_,kind,_,_)|kind=="autonomous_merge_confirmed").collect();
+    anyhow::ensure!(confirmations.len()==1,"expected exactly one autonomous confirmation");
+    let payload:serde_json::Value=serde_json::from_str(&confirmations[0].2)?;
+    let operation=payload["operation"].as_str().context("confirmed operation missing")?;
+    let receipt=store.confirmed_merge_receipt(operation)?.context("confirmed durable receipt missing")?;
+    store.validate_confirmed_merge_proof(operation,&receipt)?;
+    let at=chrono::DateTime::parse_from_rfc3339(receipt["merged_at"].as_str().context("merge time missing")?)?.timestamp_millis();
+    let allowance=store.merge_allowance(at,5)?;
+    anyhow::ensure!(allowance.confirmed==1 && allowance.pending==0 && allowance.remaining==4 && allowance.available==4,"wrong confirmed allowance or unresolved hold");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "verify final assertions against an explicit retained disposable native adoption run; no model calls"]
+async fn verify_retained_adoption_completion() -> Result<()> {
+    let root=PathBuf::from(std::env::var_os("AUTOSHIP_ADOPTION_COMPLETION_ROOT").context("retained fixture root required")?).canonicalize()?;
+    anyhow::ensure!(root.starts_with("/tmp") && root.file_name().unwrap().to_string_lossy().starts_with("autoship-source-less-acceptance-"),"not a retained adoption fixture");
+    let script=root.join("github-fixture.py");
+    anyhow::ensure!(std::fs::read_to_string(&script)?==GH_FIXTURE,"retained GitHub boundary differs from current fixture");
+    let config:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("fixture.json"))?)?;
+    let repository=config["repository"].as_str().context("repository missing")?;
+    let origin=PathBuf::from(config["origin"].as_str().context("origin missing")?).canonicalize()?;
+    anyhow::ensure!(origin.starts_with(&root),"fixture origin escaped retained root");
+    let path=root.join("state/augmentagent/workflow.db");
+    anyhow::ensure!(workflow::path()==path,"completion replay must use retained workflow state");
+    anyhow::ensure!(PathBuf::from(std::env::var_os("GH_BIN").context("fixture GitHub boundary required")?).canonicalize()?==script.canonicalize()?,"completion replay must use retained GitHub fixture");
+    anyhow::ensure!(PathBuf::from(std::env::var_os("AUTOSHIP_ADOPTION_ACCEPTANCE_CHILD").context("fixture environment required")?).canonicalize()?==root,"completion fixture environment differs");
+    let id=crate::autoship_workflow::pr_workflow_id(repository,841)?;
+    let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path)?.context("retained workflow missing")?;
+    let before=store.snapshot(&id)?.context("retained snapshot missing")?;
+    anyhow::ensure!(before.checkpoint.stage==crate::autoship_workflow::Stage::Merged,"workflow not merged");
+    verify_merge_attribution(&store,&id)?;
+    let mutations=std::fs::read(root.join("merge-mutations.jsonl"))?;
+    anyhow::ensure!(mutations.split(|b|*b==b'\n').filter(|line|!line.is_empty()).count()==1,"mutation repeated");
+    anyhow::ensure!(std::fs::read_to_string(root.join("merged"))?==before.checkpoint.binding.head,"merged candidate differs");
+    let repo=root.join("repository");
+    anyhow::ensure!(repo.canonicalize()?.starts_with(&root),"fixture repository escaped root");
+    anyhow::ensure!(adopted_execution::sweep(&repo,false).await?==0,"completed merge replayed");
+    anyhow::ensure!(std::fs::read(root.join("merge-mutations.jsonl"))?==mutations,"replay changed mutation history");
+    let after=store.snapshot(&id)?.context("workflow disappeared")?;
+    anyhow::ensure!(after.model_calls==before.model_calls,"reconciliation spent model calls");
+    verify_merge_attribution(&store,&id)?;
+    std::fs::write(root.join("completion-verification.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "passed":true,"workflow":id,"head":after.checkpoint.binding.head,"model_calls":after.model_calls,
+        "confirmed_merges":1,"pending_merges":0,"remaining":4,"replay_mutations":0,
+        "scope":"terminal assertions on retained real-native/local-Git/scripted-GitHub run; not production or fresh full rerun"
+    }))?)?;
     Ok(())
 }

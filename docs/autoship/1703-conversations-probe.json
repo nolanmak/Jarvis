@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1713,
+    1712
+  ],
+  "status": "durable-builder-conversation-mapping-and-native-restoration-verified-owner-consumer-not-connected",
+  "parent_commit": "ae693709d3d3c859097061029131f82a1d1b8fd6",
+  "tests": {
+    "initial_red_compile_error": {
+      "log": "/tmp/autoship-1703-red-session-restore.log",
+      "cargo_exit": 101,
+      "reason": "Test compared owned Launch to a reference; corrected before behavioral red."
+    },
+    "behavioral_red": {
+      "log": "/tmp/autoship-1703-red-session-restore-final.log",
+      "cargo_exit": 101,
+      "assertion": "Persisted native conversations cannot be restored."
+    },
+    "initial_green_fixture_failure": {
+      "log": "/tmp/autoship-1703-green-session-restore-core.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "reason": "Fresh Claude fixture returned a different ID from its requested native UUID; corrected to obey provider protocol."
+    },
+    "core_package_green": {
+      "log": "/tmp/autoship-1703-green-session-restore-core-final.log",
+      "exit": 0,
+      "unit_passed": 670,
+      "unit_failed": 0,
+      "unit_ignored": 14,
+      "scope": "Full core package including integration and doc tests; counts above are unit suite only."
+    },
+    "full_cli_green": {
+      "log": "/tmp/autoship-1703-green-conversations-cli.log",
+      "exit": 0,
+      "passed": 1486,
+      "failed": 0,
+      "ignored": 25,
+      "compiled_cli_passed": 43
+    }
+  },
+  "verified": [
+    "Production record_episode_sessions now writes controller-observed builder conversation IDs into the workflow store as well as the protected audit. Native IDs are distinct from independent reviewer conversations.",
+    "Permanent provider/session ownership survives current-session rotation and prevents cross-workflow reuse. Current mapping, permanent ownership and digest-only workflow audit event commit atomically; injected audit failure rolls back new ownership.",
+    "Owner-turn conversation lookup validates the turn, immutable stored body, lease, pause revision and requested provider before exposing its workflow-bound current identity. Uncertain current conversation refuses restoration.",
+    "FreshBuilderSessions restoration resumes recorded Codex and Claude identities through the existing native session protocol. Explicit fresh-review scopes override restored builders and create independent reviewer sessions.",
+    "Duplicate provider entries, malformed IDs and uncertain observations are refused by restoration. Protocol fixtures are synthetic, not evidence of paid provider execution."
+  ],
+  "limits": [
+    "Owner-triggered native dispatch is not connected. Workspace selection/provenance, native quiescence integration, actual guarded edit/test, scope/contract revision and independent re-review still remain required.",
+    "Session identity is not proof that native provider execution succeeded. No live Codex/Claude owner session was run or accepted by this change.",
+    "Historical audit-only conversations are not automatically backfilled; absent durable mapping needs a future validated fresh handoff. Uncertain sessions need explicit reconciliation.",
+    "No production rollout, live Discord/native acceptance, hosted CI acceptance or soak completion. No child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "01bab7d821cf6459a39f87e1794275f9d73e2aa238b7d8b66eeb57edaa0600e6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "c344e70d6fcc9eeacd6ab6dbdaa9d480f6f66e032b6b966efddba5d937bd2539"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "fa49f73d33791dd8ebd8cdc56a5a0f108acde81ec21bfe0cc5423f533b0337ff"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_conversations.rs",
+      "sha256": "e0ff823d064a55275812322b5088513dbdc3262de6693790854544bd8e64198c"
+    }
+  ]
+}

@@ -25,6 +25,7 @@ pub mod owner_alerts;
 // #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
 pub mod owner_commands;
 pub mod phone;
+pub mod autoship;
 pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
@@ -437,6 +438,20 @@ pub trait ApprovalActionHandler: Send + Sync {
 /// there (#132 / #201).
 #[async_trait]
 pub trait QueryHandler: Send + Sync {
+    fn autoship_bound(&self, _context: &autoship::Context) -> anyhow::Result<bool> { Ok(false) }
+    /// Called only after the gateway verifies the configured owner's private DM.
+    /// A durable acknowledgement must be claimed before returning its nonce.
+    async fn autoship_command(&self, _context: &autoship::Context, _text: &str) -> anyhow::Result<Option<autoship::Reply>> {
+        Ok(Some(autoship::Reply { content: "Autoship is unavailable in this connection.".into(), nonce: None }))
+    }
+    fn autoship_acknowledged(&self, _context: &autoship::Context, _message: u64) -> anyhow::Result<()> { Ok(()) }
+    fn autoship_pending(&self, _bot: u64, _owner: u64) -> anyhow::Result<Vec<autoship::Context>> { Ok(Vec::new()) }
+    fn autoship_claim_ack(&self, _context: &autoship::Context) -> anyhow::Result<Option<autoship::Reply>> { Ok(None) }
+    fn autoship_ack_uncertain(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::UncertainAcknowledgement>> {Ok(Vec::new())}
+    fn autoship_progress_uncertain(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::UncertainProgress>> {Ok(Vec::new())}
+    fn autoship_progress_pending(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::ProgressDelivery>> {Ok(Vec::new())}
+    fn autoship_progress_claim(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<Option<autoship::Reply>> {Ok(None)}
+    fn autoship_progress_confirm(&self,_delivery:&autoship::ProgressDelivery,_message:u64)->anyhow::Result<()> {Ok(())}
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
 
     /// Attach the private voice-tool endpoint after the Discord gateway has

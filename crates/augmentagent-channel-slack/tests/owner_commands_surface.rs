@@ -414,37 +414,31 @@ async fn slash_help_and_an_unknown_command_are_answered_from_the_registry() {
     let running = start(surface);
     let mut server = Server::accept(&mut servers).await;
 
+    // Registry help may span multiple delivery parts. Wait for its final
+    // paragraph before issuing the next command, then inspect the whole reply.
+    async fn help_reply(h:&Harness,start:usize)->String {
+        eventually("complete help reply", || {
+            h.answers(DM,None).get(start..).and_then(|parts|parts.last())
+                .is_some_and(|part|part.contains("shows one command."))
+        }).await;
+        h.answers(DM,None)[start..].join("\n")
+    }
     server.deliver(&slash("s1", OWNER, DM, "help")).await;
-    eventually("help", || h.answers(DM, None).len() == 1).await;
+    let help=help_reply(&h,0).await;
+    let next=h.answers(DM,None).len();
     server
-        .deliver(&owner_dm(
-            "m1",
-            "!frobnicate the thing",
-            "1700000001.000100",
-        ))
+        .deliver(&owner_dm("m1","!frobnicate the thing","1700000001.000100"))
         .await;
-    eventually("unknown", || h.answers(DM, None).len() == 2).await;
+    let unknown=help_reply(&h,next).await;
+    let next=h.answers(DM,None).len();
     server.deliver(&slash("s2", OWNER, DM, "")).await;
-    eventually("empty slash", || h.answers(DM, None).len() == 3).await;
-
-    let answers = h.answers(DM, None);
-    assert!(
-        answers[0].contains("Jarvis owner commands"),
-        "{}",
-        answers[0]
-    );
-    assert!(answers[0].contains("#1298"), "{}", answers[0]);
-    assert!(answers[1].contains("Unknown command"), "{}", answers[1]);
-    assert!(
-        answers[1].contains("Jarvis owner commands"),
-        "{}",
-        answers[1]
-    );
-    assert!(
-        answers[2].contains("Jarvis owner commands"),
-        "{}",
-        answers[2]
-    );
+    let empty=help_reply(&h,next).await;
+    assert!(help.contains("Jarvis owner commands"),"{help}");
+    assert!(help.contains("#1298"),"{help}");
+    assert!(help.contains("autoship") && help.contains("#1713"),"{help}");
+    assert!(unknown.contains("Unknown command"),"{unknown}");
+    assert!(unknown.contains("Jarvis owner commands"),"{unknown}");
+    assert!(empty.contains("Jarvis owner commands"),"{empty}");
     assert_eq!(agent.calls(), 0, "commands never reach the agent");
     running.stop().await;
 }

@@ -59,6 +59,16 @@ impl FreshBuilderSessions {
     pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
         FRESH_BUILDERS.scope(Arc::clone(self), call).await
     }
+    pub fn from_observed(observed:&[ObservedConversation])->anyhow::Result<Arc<Self>> {
+        let mut restored:Vec<Arc<NativeSession>>=Vec::new();
+        for observation in observed {
+            anyhow::ensure!(!observation.uncertain,"uncertain builder conversation requires reconciliation");
+            anyhow::ensure!(!observation.id.is_empty() && observation.id.len()<=512 && observation.id.bytes().all(|b|b.is_ascii_graphic()),"invalid native conversation identity");
+            anyhow::ensure!(!restored.iter().any(|s|s.provider()==observation.provider),"duplicate builder provider conversation");
+            restored.push(NativeSession::from_id(observation.provider,Some(observation.id.clone()))?);
+        }
+        Ok(Arc::new(Self {sessions:Mutex::new(restored)}))
+    }
     pub fn observed(&self) -> Vec<ObservedConversation> {
         self.sessions.lock().expect("builder sessions mutex poisoned").iter().filter_map(|session| {
             session.id().map(|id| ObservedConversation { provider: session.provider(), id, uncertain: session.is_uncertain() })
@@ -394,4 +404,32 @@ mod lease_drop_tests {
         }
         assert!(!session.is_uncertain(), "the mark belongs to the finished turn, not the next lease");
     }
+}
+
+#[cfg(test)]
+mod builder_restore_tests {
+    use super::*;
+    #[tokio::test]
+    async fn restored_builder_sessions_resume_their_provider_and_independent_review_stays_fresh() {
+        for provider in [ProviderKind::Codex,ProviderKind::Claude] {
+            let recorded=ObservedConversation {provider,id:format!("recorded-{}",provider.name()),uncertain:false};
+            let sessions=FreshBuilderSessions::from_observed(&[recorded.clone()]).expect("persisted native conversations cannot be restored");
+            sessions.scope(async {
+                let session=current_for(provider).unwrap().unwrap();let mut lease=session.begin(provider).unwrap();
+                assert_eq!(lease.launch(),Launch::Resume {id:recorded.id.clone()});lease.observe(&recorded.id).unwrap();lease.finish().unwrap();
+                let (_,id)=fresh_review_scope(provider,async {
+                    let session=current_for(provider)?.unwrap();let mut lease=session.begin(provider)?;
+                    let id=match lease.launch() {Launch::Create {requested_id:Some(id)}=>id,Launch::Create {requested_id:None}=>"independent-review".into(),_=>panic!("review reused a builder conversation")};lease.observe(&id)?;lease.finish()?;Ok(())
+                }).await.unwrap();assert_ne!(id,recorded.id);
+            }).await;
+        }
+    }
+    #[test]
+    fn uncertain_duplicate_and_invalid_restorations_are_refused() {
+        let mut observation=ObservedConversation {provider:ProviderKind::Codex,id:"native-one".into(),uncertain:true};
+        assert!(FreshBuilderSessions::from_observed(&[observation.clone()]).is_err());observation.uncertain=false;
+        assert!(FreshBuilderSessions::from_observed(&[observation.clone(),observation.clone()]).is_err());
+        observation.id="native id with whitespace".into();assert!(FreshBuilderSessions::from_observed(&[observation]).is_err());
+    }
+
 }

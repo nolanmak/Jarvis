@@ -452,6 +452,7 @@ dependencies = [
  "augmentagent-phone",
  "augmentagent-store",
  "augmentagent-wiki",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "futures",

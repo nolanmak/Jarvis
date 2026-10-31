@@ -102,6 +102,9 @@ mod imessage_compose;
 mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
+mod autoship_commands;
+mod autoship_discord_command;
+mod autoship_deployment;
 mod autoship_contract;
 mod autoship_episode;
 mod autoship_metrics;
@@ -1097,6 +1100,30 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Stop new dispatches; active-work teardown remains separately verified.
+    Pause(autoship_commands::control_command::Args),
+    /// Clear only the explicit owner pause after access and readiness checks.
+    Resume(autoship_commands::control_command::Args),
+    /// Execute one admitted workflow attempt through the normal gates.
+    Work(autoship_commands::work_command::WorkArgs),
+    /// Durably submit an explicit issue or PR; acceptance does not mean execution.
+    Run(autoship_commands::run_command::RunArgs),
+    /// Inspect native credential declarations; no provider calls or refresh.
+    Readiness { #[arg(long)] json: bool },
+    /// Resolve a pending merge using bound controller and GitHub evidence.
+    ResolveMerge {
+        #[arg(long)] operation: String,
+        #[arg(long, value_parser = ["autonomous", "manual", "not-merged"])] classification: String,
+        #[arg(long)] evidence: PathBuf,
+        #[arg(long)] json: bool,
+    },
+    /// Inspect a durable workflow without starting work or changing state.
+    Status {
+        #[arg(long)]
+        workflow: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Put `agent-gave-up` issues back in the pool by recorded reason code
     /// (`stuck:gate-red:<fp>`, `attempts:review-reject`, `scoper:not-fixable`,
     /// …). `--reason` matches the whole code or any whole `:` segment of it.
@@ -3073,6 +3100,32 @@ async fn main() -> Result<()> {
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
+    if let Cmd::Autopr { op: AutoprOp::ResolveMerge { ref operation, ref classification, ref evidence, json } } = cli.cmd {
+        std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Work(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::work_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Pause(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::control_command::run(args,true).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Resume(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::control_command::run(args,false).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Run(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::run_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Readiness { json } } = cli.cmd {
+        let root=match tokio::process::Command::new("git").args(["rev-parse","--show-toplevel"]).output().await {
+            Ok(output) if output.status.success()=>String::from_utf8(output.stdout).ok()
+                .map(|root|PathBuf::from(root.trim())).filter(|root|root.is_absolute()),
+            _=>None,
+        };
+        std::process::exit(autoship_commands::run_readiness(root.as_deref(),json).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Status { ref workflow, json } } = cli.cmd {
+        std::process::exit(autoship_commands::run_status(workflow, json));
+    }
     if let Cmd::AutoPrWorker { dry_run } = cli.cmd {
         return autoship_worker::run(std::env::current_dir()?, dry_run).await;
     }
@@ -3486,8 +3539,15 @@ async fn main() -> Result<()> {
             no_email,
         } => {
             let external_autopr = autoship_worker::external_enabled();
-            if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
-                warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+            match autoship_deployment::record("daemon", dry_run, external_autopr).await {
+                Ok(()) => {
+                    // A second serve must preserve both live configuration
+                    // evidence and the updater's matching isolation receipt.
+                    if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                        warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+                    }
+                }
+                Err(error) => warn!(%error, "could not publish effective autoship configuration; preserving existing host evidence"),
             }
             // #1287 — a Discord configuration error must not stop the
             // surfaces that are configured (Slack alone, for one): report it
@@ -5635,6 +5695,12 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
+        Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Run(..) } => unreachable!("submission precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Readiness { .. } } => unreachable!("readiness precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             for n in self_improve::readmit(&root, &reason, dry_run, reset_history).await? {
@@ -11494,6 +11560,27 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    fn autoship_bound(&self, context: &augmentagent_approval_discord::autoship::Context) -> anyhow::Result<bool> {
+        autoship_discord_command::gateway_bound(&autoship_workflow::default_path(), context)
+    }
+    async fn autoship_command(&self, context: &augmentagent_approval_discord::autoship::Context, text: &str)
+        -> anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {
+        autoship_discord_command::gateway_command(&self.repo_root, &autoship_workflow::default_path(), context, text).await
+    }
+    fn autoship_acknowledged(&self, context: &augmentagent_approval_discord::autoship::Context, message: u64) -> anyhow::Result<()> {
+        autoship_discord_command::gateway_acknowledged(&autoship_workflow::default_path(), context, message)
+    }
+    fn autoship_ack_uncertain(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::UncertainAcknowledgement>> {autoship_discord_command::ack_uncertain(&autoship_workflow::default_path(),bot,owner)}
+    fn autoship_progress_uncertain(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::UncertainProgress>> {autoship_discord_command::progress_uncertain(&autoship_workflow::default_path(),bot,owner)}
+    fn autoship_progress_pending(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::ProgressDelivery>> {autoship_discord_command::progress_pending(&autoship_workflow::default_path(),bot,owner)}
+    fn autoship_progress_claim(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {autoship_discord_command::progress_claim(&autoship_workflow::default_path(),delivery)}
+    fn autoship_progress_confirm(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->anyhow::Result<()> {autoship_discord_command::progress_confirm(&autoship_workflow::default_path(),delivery,message)}
+    fn autoship_pending(&self, bot: u64, owner: u64) -> anyhow::Result<Vec<augmentagent_approval_discord::autoship::Context>> {
+        autoship_discord_command::gateway_pending(&autoship_workflow::default_path(), bot, owner)
+    }
+    fn autoship_claim_ack(&self, context: &augmentagent_approval_discord::autoship::Context) -> anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {
+        autoship_discord_command::gateway_claim_ack(&autoship_workflow::default_path(), context)
+    }
     fn attach_voice_tools(&self, service: Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>) {
         let _ = self.voice_tools.set(service);
     }

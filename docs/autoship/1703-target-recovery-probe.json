@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1705,
+    1706,
+    1708,
+    1712
+  ],
+  "status": "targeted-merge-accounting-recovery-verified-not-deployed",
+  "parent_commit": "73fce6fcdf42be4c522e82d871ec979d18925f68",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_commands.rs": "7838c35c7a5f8d25d55610f77522daf3ee978f16b4100973f271e311e1a82f22",
+    "crates/augmentagent-cli/src/autoship_merge_allowance.rs": "bce2698ffb34627ba2b8b04ddd05aaab2c3ef6802269f03e97e987af508e0497",
+    "crates/augmentagent-cli/src/autoship_merge_allowance_tests.rs": "acb70a1b47acd80f8d1f281650a24a62c2a28442f348615f8b69d962e5a43406",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "635d1bb86fcbf752d36309b00d1e3c460e394ea7ffda12dfb57cd285664b84b8",
+    "crates/augmentagent-cli/src/self_improve_publication.rs": "f390e2f4d7b0e34257d86aabeae6bd675a1247bc4c488a821f70ca653f13571c",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "bdc87417f2c5a42edf775aacff5b463de98c31559ed15e02879f71c8f05abbdc",
+    "crates/augmentagent-cli/tests/autoship_submit_cli.rs": "c40b5c308c95f000de013a20beec7966be8ff6e54587a8f344b489e2e2e63dd3"
+  },
+  "tests": {
+    "target_recovery_red": {
+      "log": "/tmp/autoship-1703-red-target-recovery.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "work-once leaves valid immutable merge proof unresolved"
+    },
+    "completed_operation_red": {
+      "log": "/tmp/autoship-1703-red-completed-operation-recovery.log",
+      "cargo_exit": 101,
+      "failed": 2,
+      "assertions": [
+        "Completed generic operation hid recoverable dispatch.",
+        "Merged checkpoint falsely reported complete while autonomous accounting remained unresolved."
+      ]
+    },
+    "claim_red": {
+      "log": "/tmp/autoship-1703-red-completed-operation-claim.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Completed operation admitted productive claim despite uncertain dispatch."
+    },
+    "fixture_correction": {
+      "log": "/tmp/autoship-1703-target-recovery-fixture-correction.log",
+      "note": "Initial two-job fixture reused a unique private nonce; corrected before recording behavioral red evidence."
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-target-recovery.log",
+      "exit": 0,
+      "submission_work_passed": 11,
+      "status_readiness_passed": 13,
+      "resolution_passed": 10,
+      "failed": 0
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-target-recovery-unit.log",
+      "exit": 0,
+      "passed": 1438,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 129.3,
+      "scope": "Ledger, status, scoped recovery and transactional admission. Final compiled tests also cover reuse of the already authenticated repository identity instead of a redundant lookup."
+    }
+  },
+  "verified": [
+    "Work-once recovers only the selected workflow through the shared durable merge reconciler; no model runtime or merge mutation is required.",
+    "Immutable receipt proof completes the bound workflow and debits once, including when its generic operation was already completed.",
+    "Unrelated pending dispatches and confirmed workflow checkpoints remain unchanged.",
+    "Unknown remote state retains capacity and active leases prevent command recovery.",
+    "Status includes dispatched operations independently of generic completion and never reports complete while attribution is unresolved.",
+    "Productive lease admission transactionally blocks uncertain dispatches even when generic operation completion would otherwise hide them."
+  ],
+  "limits": [
+    "Compiled tests use real temporary Git/SQLite and scripted GitHub boundaries, not a new live hosted merge.",
+    "Approved but unmerged PRs still require targeted free CI/merge reconciliation wiring.",
+    "Automatic command queue consumption, wait/control commands, Discord sessions/updates, production rollout and required soaks remain open."
+  ]
+}

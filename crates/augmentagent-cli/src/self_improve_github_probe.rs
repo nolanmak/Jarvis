@@ -73,7 +73,7 @@ async fn disposable_github_merge_boundary() -> Result<()> {
     anyhow::ensure!(metadata["description"] == "Synthetic autoship acceptance fixture; no production source or credentials.", "fixture marker missing");
     let state = root.join(format!("probe-{pr}-{mode}.sqlite3"));
     let mut store = WorkflowStore::open(&state)?;
-    let id = format!("github-probe/{repository}/{pr}/{mode}/{}",uuid::Uuid::new_v4());
+    let id = format!("{repository}/pr/{pr}/{mode}/{}",uuid::Uuid::new_v4());
     let binding = Binding {head:head.clone(),contract:"synthetic-publication-boundary".into(),evidence_hash:head.clone()};
     let now = chrono::Utc::now().timestamp_millis();
     store.register(&id,"fixture",binding.clone(),now)?;
@@ -108,7 +108,7 @@ async fn disposable_github_merge_boundary() -> Result<()> {
         println!("stale boundary evidence: {}",serde_json::json!({"behind_by":compare["behind_by"],"head":head,"main":main["sha"],"mergeable_state":pull["mergeable_state"],
             "required_checks_previously_green":["privacy","node-release"],"strict_admin_protection":true}));
     }
-    let result = merge_mutation(&mut transport,&repository,pr,&head,&operation.id).await;
+    let result = merge_mutation(&mut transport,&repository,pr,&head,&operation,&lease,&mut store,5).await;
     if matches!(mode.as_str(),"stale"|"head-race") {
         let error = result.expect_err("GitHub accepted forbidden mutation").to_string();
         let lower = error.to_ascii_lowercase();
@@ -142,7 +142,8 @@ async fn disposable_github_merge_boundary() -> Result<()> {
             _ => anyhow::bail!("unknown probe mode"),
         }
         for _ in 0..2 {
-            anyhow::ensure!(merge_mutation(&mut transport,&repository,pr,&head,&operation.id).await?.is_none(),"reconciliation replayed merge");
+            let recovered = merge_mutation(&mut transport,&repository,pr,&head,&operation,&lease,&mut store,5).await?;
+            anyhow::ensure!(recovered.is_some() == (mode == "accepted"), "reconciliation changed attribution");
         }
         let observed:serde_json::Value=serde_json::from_str(&transport.call(&["pr","view",&pr.to_string(),"--json","state,headRefOid"]).await?)?;
         anyhow::ensure!(observed["state"]=="MERGED" && observed["headRefOid"]==head,"exact merged head unconfirmed");

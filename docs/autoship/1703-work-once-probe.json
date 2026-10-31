@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1712,
+  "status": "public-work-once-gates-verified-not-native-acceptance",
+  "parent_commit": "087021105cbc0178e923fda1bd1df835c9eb44c4",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_commands.rs": "721931fd9da048acec97e5cc56a9d5ce1b4ac82dcbea1f7b0d0d0e97453a9fbe",
+    "crates/augmentagent-cli/src/autoship_work_command.rs": "c3ce8b1dc05207b1331af4bf5f5f49b28e7567d132ea6177e31a2efe67082bdf",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "283f49688c9cd5b5b1c890abe22f41a20b91058c4c55af00002feb8cd43fe01a",
+    "crates/augmentagent-cli/src/main.rs": "ad4e7852081554d9eb6e61142fc458a01af8c23c6642e86b249f3134fa89bd0c",
+    "crates/augmentagent-cli/src/self_improve.rs": "f7d6e51471de55151c7b41d6b63a1959efa9730b21c3c184d76678c8987f2798",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "2e9dfa6c79591bc62d274dc40a9a0f3169419ebe94275455aa126306d9eba68b",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "8522134f3e4303637c21b969ddcc75e50ced9443a418f5850a268cf50d1c9cd1",
+    "crates/augmentagent-cli/tests/autoship_submit_cli.rs": "df866fabe8bba2121baf6cd25d01133dc4011d4180a589407dcc93672a90093c"
+  },
+  "tests": {
+    "cli_red": {
+      "log": "/tmp/autoship-1703-red-work-once.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "missing work command emits parser error rather than structured missing-job result"
+    },
+    "claim_red": {
+      "log": "/tmp/autoship-1703-red-command-claim.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "test adapter delegating existing claim admitted a late Held checkpoint"
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-work-once.log",
+      "exit": 0,
+      "submission_work_passed": 9,
+      "status_readiness_passed": 13,
+      "failed": 0
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-work-once-unit.log",
+      "exit": 0,
+      "passed": 1436,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 130.17,
+      "scope": "Shared execution and lease changes; the final rejected-authorization accepted flag is additionally verified by the compiled-command suite."
+    }
+  },
+  "verified": [
+    "Public autopr work --once resolves an admitted job and invokes the existing targeted execution entry before unrelated application database initialization.",
+    "Current repository write authority is required before execution. Missing runtime returns typed exit 3; unknown job and revoked authority return exit 2.",
+    "Active ownership, future eligibility, holds, retirement, waiting checks and terminal merged state preserve checkpoint/database bytes.",
+    "Productive lease acquisition transactionally rechecks command-owned holds and pending merge operations; a late hold cannot be bypassed by stale CLI preview.",
+    "An unbound existing PR defers execution without duplicate worktree creation."
+  ],
+  "limits": [
+    "Full native issue/PR-to-merge runs through the compiled command remain unverified.",
+    "Approved/waiting command jobs currently defer to reconciliation; targeted free reconciliation is not wired into work-once yet.",
+    "Automatic queue consumption and wait/pause/resume/cancel/model controls remain open.",
+    "This change protects productive command execution; it is not completion of all cross-channel pause/cancel or free-reconciliation hold policies.",
+    "Discord initiation/sessions/updates, production rollout and required soaks remain open."
+  ]
+}

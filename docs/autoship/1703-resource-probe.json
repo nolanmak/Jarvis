@@ -1,0 +1,34 @@
+{
+  "packaged_cli_resource_observations": [
+    {
+      "status": "capacity-unverified",
+      "created_state": false,
+      "changed_cgroups": false,
+      "ready": false
+    },
+    {
+      "status": "available",
+      "created_state": false,
+      "changed_cgroups": false,
+      "ready": false
+    }
+  ],
+  "live_provider_calls": 0,
+  "binary_sha256": "f2d4a0c5142174ac5e78fda159373b1f0c4dd1bc14a078df31b6264fbdd23a2b",
+  "implementation": "resource readiness following 396ca5a4",
+  "isolated_kernel_tests": {
+    "readiness": 2,
+    "existing_resource_supervisor": 21
+  },
+  "production_changes": false,
+  "limitations": [
+    "No real provider, build VM or remote PR operation executed.",
+    "The CLI inspected its disposable service, not the production daemon or worker.",
+    "Current deployed policy/config equality and full production acceptance remain unverified."
+  ],
+  "evidence_logs": [
+    "/tmp/autoship-1703-live-resource-readiness.log",
+    "/tmp/autoship-1703-live-resource-regression.log",
+    "/tmp/autoship-1703-live-resource-cli.log"
+  ]
+}

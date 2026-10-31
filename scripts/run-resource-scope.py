@@ -216,34 +216,77 @@ def reserve(parent, requested, wait_seconds=ADMISSION_WAIT_SECONDS, sleep=time.s
         delay = min(delay * 2, 5.0)
 
 
+def validate_policy(policy):
+    if set(policy) != {'memory_bytes', 'pids', 'cpu_percent'}:
+        raise AdmissionRefused('invalid_policy','invalid declared run resource policy')
+    for key, low, high in [('memory_bytes', 64*1024*1024, 64*1024**3),
+                           ('pids', 8, 4096), ('cpu_percent', 1, 1600)]:
+        if type(policy[key]) is not int or not low <= policy[key] <= high:
+            raise AdmissionRefused('invalid_policy','invalid declared run resource limit', **{key:policy[key],'minimum':low,'maximum':high})
+
+
+def delegated_limits(policy):
+    leaf = current_group()
+    parent = leaf.parent
+    if (leaf.name != 'daemon' or not parent.name.endswith('.service')
+            or parent.resolve() != parent
+            or parent.stat().st_uid != os.getuid()
+            or parent.joinpath('cgroup.procs').read_text().strip()):
+        raise RuntimeError('run resources require delegated service with daemon leaf')
+    if not CONTROLLERS <= set((parent/'cgroup.controllers').read_text().split()):
+        raise RuntimeError('required delegated resource controllers unavailable')
+    memory = finite(parent/'memory.max')
+    pids = finite(parent/'pids.max')
+    cpu = (parent/'cpu.max').read_text().split()
+    if len(cpu) != 2 or not all(v.isdigit() for v in cpu):
+        raise RuntimeError('aggregate CPU quota is not finite')
+    quota, period = map(int, cpu)
+    if (policy['memory_bytes'] > memory or policy['pids'] > pids
+            or policy['cpu_percent'] * period > quota * 100):
+        raise AdmissionRefused('declared_ceiling','run ceiling exceeds aggregate service ceiling',
+                               requested_bytes=policy['memory_bytes'],limit_bytes=memory,requested_pids=policy['pids'],
+                               limit_pids=pids,requested_cpu_percent=policy['cpu_percent'],limit_cpu_quota=quota,limit_cpu_period=period)
+    return parent, memory, pids, cpu
+
+
+def inspect(policy):
+    """Observe admission without enabling controllers, reclaiming or reserving."""
+    def result(status, permits=False, **facts):
+        return {'status':status,'permits_attempt':permits,'live_verified':False,**facts}
+    try:
+        validate_policy(policy)
+    except Exception as error:
+        return result('declaration-invalid',refusal=refusal_receipt(error))
+    try:
+        parent, memory, pids, cpu = delegated_limits(policy)
+    except Exception as error:
+        status='declaration-exceeds-service' if isinstance(error,AdmissionRefused) and error.code=='declared_ceiling' else 'delegation-unavailable'
+        return result(status,refusal=refusal_receipt(error))
+    descriptor=None
+    try:
+        descriptor=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        fcntl.flock(descriptor,fcntl.LOCK_SH|fcntl.LOCK_NB)
+        aggregate={'memory_bytes':memory,'pids':pids,'cpu_max':' '.join(cpu)}
+        if not CONTROLLERS <= set((parent/'cgroup.subtree_control').read_text().split()):
+            # Only actual locked admission may initialize child accounting.
+            # This permits setup, never a live-ready claim or model admission.
+            return result('capacity-unverified',True,reason='controller-initialization-required',aggregate=aggregate)
+        proof=headroom(parent,policy['memory_bytes'],available_memory())
+        return result('available',True,aggregate=aggregate,capacity=proof)
+    except BlockingIOError:
+        return result('inspection-busy')
+    except AdmissionRefused as error:
+        return result('capacity-exhausted',refusal=refusal_receipt(error))
+    except Exception as error:
+        return result('inspection-unavailable',refusal=refusal_receipt(error))
+    finally:
+        if descriptor is not None:os.close(descriptor)
+
+
 class RunScope:
     def __init__(self, policy):
-        if set(policy) != {'memory_bytes', 'pids', 'cpu_percent'}:
-            raise AdmissionRefused('invalid_policy','invalid declared run resource policy')
-        for key, low, high in [('memory_bytes', 64*1024*1024, 64*1024**3),
-                               ('pids', 8, 4096), ('cpu_percent', 1, 1600)]:
-            if type(policy[key]) is not int or not low <= policy[key] <= high:
-                raise AdmissionRefused('invalid_policy','invalid declared run resource limit', **{key:policy[key],'minimum':low,'maximum':high})
-        leaf = current_group()
-        parent = leaf.parent
-        if (leaf.name != 'daemon' or not parent.name.endswith('.service')
-                or parent.resolve() != parent
-                or parent.stat().st_uid != os.getuid()
-                or parent.joinpath('cgroup.procs').read_text().strip()):
-            raise RuntimeError('run resources require delegated service with daemon leaf')
-        if not CONTROLLERS <= set((parent/'cgroup.controllers').read_text().split()):
-            raise RuntimeError('required delegated resource controllers unavailable')
-        memory = finite(parent/'memory.max')
-        pids = finite(parent/'pids.max')
-        cpu = (parent/'cpu.max').read_text().split()
-        if len(cpu) != 2 or not all(v.isdigit() for v in cpu):
-            raise RuntimeError('aggregate CPU quota is not finite')
-        quota, period = map(int, cpu)
-        if (policy['memory_bytes'] > memory or policy['pids'] > pids
-                or policy['cpu_percent'] * period > quota * 100):
-            raise AdmissionRefused('declared_ceiling','run ceiling exceeds aggregate service ceiling',
-                                   requested_bytes=policy['memory_bytes'],limit_bytes=memory,requested_pids=policy['pids'],
-                                   limit_pids=pids,requested_cpu_percent=policy['cpu_percent'],limit_cpu_quota=quota,limit_cpu_period=period)
+        validate_policy(policy)
+        parent, memory, pids, cpu = delegated_limits(policy)
         with reserve(parent, policy['memory_bytes']) as reservation:
             self.path = parent / ('run-' + uuid.uuid4().hex)
             self.path.mkdir(mode=0o700)
@@ -341,6 +384,9 @@ def cleanup_receipt(receipt):
 
 if __name__=='__main__':
     import sys
+    if len(sys.argv)==3 and sys.argv[1]=='--inspect':
+        print(json.dumps(inspect(json.loads(sys.argv[2])),sort_keys=True))
+        raise SystemExit(0)
     if len(sys.argv)!=3 or sys.argv[1]!='--cleanup':
         raise SystemExit('expected --cleanup receipt')
     cleanup_receipt(sys.argv[2])

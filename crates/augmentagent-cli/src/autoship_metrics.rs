@@ -83,7 +83,7 @@ pub fn read(path: &Path, since: i64, until: i64) -> Result<Window> {
             if receipt == format!("github:pr:{pr}:merged:{}", binding.head) {
                 if let Some(mutation) = mutation {
                     let proof: serde_json::Value = serde_json::from_str(&mutation)?;
-                    if proof["client_mutation_id"].as_str() == Some(operation.as_str())
+                    if crate::autoship_workflow::validate_merge_receipt_identity(&conn, &operation, &proof).is_ok()
                         && proof["expected_head"].as_str() == Some(binding.head.as_str())
                         && proof["pr_number"].as_u64() == Some(pr)
                     {
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn only_response_bound_accepted_merges_count_toward_autonomous_throughput() {
-        for accepted in [false, true] {
+        for proof_kind in ["manual", "response", "marker"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("workflow.db");
             let mut store = WorkflowStore::open(&path).unwrap();
@@ -206,11 +206,19 @@ mod tests {
             let op = store
                 .begin_operation(&lease, OperationKind::MergePr, &binding, 25)
                 .unwrap();
-            if accepted {
-                store.record_merge_mutation(&lease, &op.id, &serde_json::json!({
+            if proof_kind != "manual" {
+                let mut proof = serde_json::json!({
                     "client_mutation_id":op.id,"expected_head":binding.head,"pr_number":42,
                     "pr_node_id":"PR_fixture","merge_commit":"b".repeat(40),"merged_by":"fixture"
-                }), 30).unwrap();
+                });
+                if proof_kind == "marker" {
+                    store.reserve_merge(&lease,&op,"owner/repo",42,"PR_fixture",25,5).unwrap();
+                    let marker = store.dispatch_marked_merge(&lease,&op,25,5).unwrap();
+                    proof.as_object_mut().unwrap().remove("client_mutation_id");
+                    proof["commit_marker_operation"] = op.id.clone().into();
+                    proof["merge_message"] = marker.into();
+                }
+                store.record_merge_mutation(&lease,&op.id,&proof,30).unwrap();
             }
             store
                 .complete_operation(
@@ -222,7 +230,7 @@ mod tests {
                 .unwrap();
             let report = read(&path, 0, 100).unwrap();
             assert_eq!(report.confirmed_merge_operations, 1);
-            assert_eq!(report.autonomous_merges, usize::from(accepted));
+            assert_eq!(report.autonomous_merges, usize::from(proof_kind != "manual"), "{proof_kind}");
             assert_eq!(read(&path, 50, 100).unwrap().autonomous_merges, 0);
         }
     }
