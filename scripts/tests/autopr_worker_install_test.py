@@ -72,6 +72,8 @@ if 'show' in sys.argv:
                 verify=subprocess.run(['systemd-analyze','--user','verify',str(units/'augmentagent-autopr.service')],
                     env=dict(env,SYSTEMD_UNIT_PATH=str(units)+':'),capture_output=True,text=True)
                 self.assertEqual(verify.returncode,0,verify.stderr)
+                self.assertNotIn('EnvironmentFile= path is not absolute',verify.stderr,
+                    'systemd must accept every generated environment file path')
             # Explicit install dry-run wins; configuration cannot silently
             # enable write actions when reinstalling a dry-run daemon.
             subprocess.run(command, env=dict(env,AUGMENTAGENT_AUTOSTART_DRY_RUN='true'),check=True)
