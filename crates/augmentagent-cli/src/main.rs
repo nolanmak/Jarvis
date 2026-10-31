@@ -1,6 +1,7 @@
 //! `augmentagent` binary.
 
 mod approval_context;
+mod team_coverage;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
 mod document_signing;
@@ -8894,6 +8895,13 @@ fn team_list(json: bool) -> Result<()> {
 /// One reconciliation pass. Returns how many cards were retired. Split out from
 /// the loop so it is directly unit-testable.
 fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
+    reconcile_stale_approvals_tick_with(store, &team_coverage::Config::from_env(store))
+}
+
+/// [`reconcile_stale_approvals_tick`] with an explicit teammate-coverage
+/// config (#1700), so tests don't depend on the process environment.
+fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Config) -> Result<usize> {
+    let _ = team;
     let pending = store.pending_actions_for_reconcile()?;
     let scheduled = store.scheduled_actions_for_reconcile()?;
     if pending.is_empty() && scheduled.is_empty() {
