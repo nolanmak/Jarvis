@@ -969,14 +969,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_not_on_inbound_allowlist_costs_nothing_even_if_a_member_is() {
+    async fn group_without_allowlist_or_defaults_costs_nothing_even_if_a_member_is() {
         let f = fx();
         f.store.allow_imessage_inbound(MEMBER).unwrap();
-        f.store.set_imessage_contact_defaults(true, false).unwrap();
         let d = delta(group(Some(GUID)), &[(MEMBER, "Sam?")], false);
         ingest(&f.store, &d);
         let r = Scripted::new(&[REPLY, "x"]);
         assert_eq!(replier(&f, r.clone()).handle_deltas(&[d]).await, ReplyStats::default());
+        assert_eq!(r.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn owner_inbound_defaults_draft_groups_with_no_per_group_step_unless_denied() {
+        let f = fx();
+        f.store.set_imessage_contact_defaults(true, false).unwrap();
+        let d = delta(group(Some(GUID)), &[(MEMBER, "Sam, you in?")], false);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[REPLY, "in"])).handle_deltas(&[d]).await;
+        assert_eq!(stats.cards, 1);
+        f.store.deny_imessage_inbound(GROUP).unwrap();
+        let mut d2 = delta(group(Some(GUID)), &[(MEMBER, "Sam??")], false);
+        d2.new_entries[0].0 = 20;
+        ingest(&f.store, &d2);
+        let r = Scripted::new(&[REPLY, "x"]);
+        assert_eq!(replier(&f, r.clone()).handle_deltas(&[d2]).await.cards, 0);
         assert_eq!(r.calls(), 0);
     }
 
