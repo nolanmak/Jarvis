@@ -663,9 +663,13 @@ impl EventHandler for Handler {
             let mut downloaded_txts = download_text_files(&text_files, msg_id.get()).await;
             let signable_root = signable_root(wiki_root.as_deref(), allowed_user_id);
             let extracted_docs = extract_doc_attachments(&docs, msg_id.get(), signable_root).await;
-            downloaded_txts.extend(extracted_docs);
+            downloaded_txts.extend(extracted_docs.text.iter().cloned());
 
             let mut current = build_prompt(&user_text, &downloaded_imgs, &downloaded_txts);
+            for notice in &extracted_docs.notices {
+                current.push('\n');
+                current.push_str(notice);
+            }
             let compute_inputs = match crate::compute_inputs::download(&compute_files).await {
                 Ok(inputs) => inputs,
                 Err(_) => {
@@ -2555,29 +2559,56 @@ async fn download_text_files(
     out
 }
 
-/// Download PDF / DOCX / DOC attachments, run the shared two-stage pipeline
-/// (pdftotext / pandoc, then Mistral OCR when a PDF has no text layer and
-/// `MISTRAL_API_KEY` is configured — #939), truncate the extracted text to
-/// `MAX_TEXT_BYTES`, and write the result to `/tmp/aa-doc-<msg_id>-<idx>.txt`.
-///
-/// A scanned PDF with no OCR key still lands (empty) — with a `note` telling
-/// the reasoner why, per the owner rule that a missing key degrades to a
-/// clear signal rather than a silent blank.
-///
-/// Returns `DownloadedTextFile`s so the converted output flows through the
-/// same prompt-builder annotation as a regular text attachment. The original
-/// binary tempfile is removed after conversion regardless of outcome.
-///
-/// Partial success is fine — failures (binary missing, conversion error,
-/// non-UTF-8 stdout) are logged and the attachment is skipped, matching the
-/// `download_*` pattern elsewhere in this file.
-async fn extract_doc_attachments(
-    attachments: &[Attachment],
-    msg_id: u64,
-    signable_root: Option<&Path>,
-) -> Vec<DownloadedTextFile> {
-    let mut out = Vec::with_capacity(attachments.len());
-    // One key lookup per message, not per attachment. `None` ⇒ OCR skipped.
+/// Keep owner documents through the conversation history window and active turn.
+/// The original path includes the Discord message ID, so revisions cannot collide.
+struct DownloadedDocs {
+    text: Vec<DownloadedTextFile>,
+    originals: Vec<std::sync::Arc<tempfile::TempPath>>,
+    notices: Vec<String>,
+}
+
+fn original_doc_path(att: &Attachment, msg_id: u64) -> Option<PathBuf> {
+    let ext = match doc_kind_for(att)? {
+        DocKind::Pdf => "pdf",
+        DocKind::Docx => "docx",
+        DocKind::Doc => "doc",
+    };
+    Some(PathBuf::from(format!(
+        "/tmp/aa-doc-{msg_id}-{}.{ext}",
+        att.id
+    )))
+}
+
+fn original_doc_history_note(att: &Attachment, msg_id: u64) -> Option<String> {
+    let path = original_doc_path(att, msg_id)?;
+    Some(if path.is_file() {
+        format!("Owner-supplied original {:?}: {} (Discord drop {msg_id}, attachment {}). Attach directly; prefer the newest drop for revisions.", att.filename, path.display(), att.id)
+    } else {
+        format!("Original {:?} from Discord drop {msg_id} unavailable or expired; request another upload, never silently reconstruct it.", att.filename)
+    })
+}
+
+// The task owns one reference through the history window; an active answer owns
+// another. Cleanup occurs only after both finish, including runtime cancellation.
+fn retain_original(
+    path: tempfile::TempPath,
+    ttl: std::time::Duration,
+) -> std::sync::Arc<tempfile::TempPath> {
+    let path = std::sync::Arc::new(path);
+    let retained = path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(ttl).await;
+        drop(retained);
+    });
+    path
+}
+
+async fn extract_doc_attachments(attachments: &[Attachment], msg_id: u64, signable_root: Option<&Path>) -> DownloadedDocs {
+    let mut out = DownloadedDocs {
+        text: Vec::new(),
+        originals: Vec::new(),
+        notices: Vec::new(),
+    };
     let ocr = if attachments.iter().any(|a| doc_kind_for(a).is_some()) {
         OcrClient::from_env()
     } else {
@@ -2587,77 +2618,73 @@ async fn extract_doc_attachments(
         let Some(kind) = doc_kind_for(att) else {
             continue;
         };
-        let in_ext = extension_for(att);
-        let in_path = PathBuf::from(format!("/tmp/aa-doc-{msg_id}-{idx}.{in_ext}"));
+        let in_path = original_doc_path(att, msg_id).expect("document kind checked");
         let out_path = PathBuf::from(format!("/tmp/aa-doc-{msg_id}-{idx}.txt"));
-
-        // Download binary.
-        let mut staged: Option<String> = None;
-        let download_ok = match reqwest::get(&att.url).await {
-            Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&in_path, &bytes).await {
-                    Ok(()) => {
-                        record_original_name(&in_path, &att.filename).await;
-                        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
-                            staged = stage_signable_upload(root, &att.filename, &bytes);
-                        }
-                        true
-                    }
-                    Err(e) => {
-                        warn!("write doc tempfile {} failed: {e}", in_path.display());
-                        false
-                    }
-                },
-                Err(e) => {
-                    warn!("read doc bytes from {} failed: {e}", att.url);
-                    false
-                }
-            },
+        let download = async {
+            use std::io::Write;
+            let mut resp = reqwest::get(&att.url).await?.error_for_status()?;
+            let mut file = tempfile::NamedTempFile::new_in("/tmp")?;
+            let mut size = 0u64;
+            while let Some(chunk) = resp.chunk().await? {
+                size += chunk.len() as u64;
+                anyhow::ensure!(
+                    size <= inbound::MAX_DOWNLOAD_BYTES,
+                    "document exceeds download limit"
+                );
+                file.write_all(&chunk)?;
+            }
+            anyhow::ensure!(
+                size == u64::from(att.size),
+                "document download size mismatch"
+            );
+            file.persist_noclobber(&in_path)?;
+            let file = tempfile::TempPath::try_from_path(&in_path)?;
+            Ok::<_, anyhow::Error>(file)
+        }
+        .await;
+        let original = match download {
+            Ok(file) => file,
             Err(e) => {
-                warn!("download doc {} failed: {e}", att.url);
-                false
+                warn!("download document failed: {e:#}");
+                out.notices.push(format!("Original document {:?} from Discord drop {msg_id} unavailable: {e}. Do not silently reconstruct it or claim it is attached; ask for another upload.", att.filename));
+                continue;
             }
         };
-
-        if download_ok {
-            match extract_text(kind, &in_path, ocr.as_ref()).await {
-                Ok(extracted) => {
-                    let text = extracted.text;
-                    let note = match (extracted.ocr.note(), staged) {
-                        (Some(ocr), Some(saved)) => Some(format!("{ocr}; {saved}")),
-                        (ocr, saved) => ocr.or(saved),
-                    };
-                    if let Some(n) = &note {
-                        info!(file = %att.filename, "{n}");
-                    }
-                    let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
-                    let extracted_len = text.len() as u64;
-                    match augmentagent_docs::inbound::write_private_attachment(&out_path, to_write).await {
-                        Ok(()) => out.push(DownloadedTextFile {
-                            path: out_path,
-                            truncated,
-                            original_size: extracted_len,
-                            note,
-                        }),
-                        Err(e) => {
-                            warn!("write doc text tempfile {} failed: {e}", out_path.display())
-                        }
-                    }
-                }
-                Err(e) => warn!(
-                    "convert {} ({:?}) failed: {e:#}",
-                    att.filename, kind
-                ),
+        record_original_name(&in_path, &att.filename).await;
+        // Preserve main's owner-only signing workflow alongside retained originals.
+        if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
+            match tokio::fs::read(&in_path).await {
+                Ok(bytes) => if let Some(note) = stage_signable_upload(root, &att.filename, &bytes) {
+                    out.notices.push(note);
+                },
+                Err(e) => warn!("could not read original for signing stage: {e}"),
             }
         }
-
-        // Best-effort: clean up the binary tempfile regardless of conversion
-        // outcome. The .txt tempfile is cleaned up by the handler.
-        if let Err(e) = tokio::fs::remove_file(&in_path).await {
-            // Missing-file is benign (download may have failed before write).
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("remove doc tempfile {} failed: {e}", in_path.display());
+        out.notices.push(format!("Owner-supplied original {:?}: {} (Discord drop {msg_id}, attachment {}). Pass this original path directly to gmail --attach; never re-render the extraction. Prefer the newest drop when revising. Original is retained for the two-hour conversation history window and any active answer; request another upload if the path has expired.", att.filename, in_path.display(), att.id));
+        // Keep the TempPath alive until the caller has finished using the file.
+        out.originals.push(retain_original(
+            original,
+            std::time::Duration::from_secs(MAX_AGE_SECS as u64),
+        ));
+        match extract_text(kind, &in_path, ocr.as_ref()).await {
+            Ok(extracted) => {
+                let (to_write, truncated) = truncate_text_bytes(extracted.text.as_bytes());
+                match augmentagent_docs::inbound::write_private_attachment(&out_path, to_write).await {
+                    Ok(()) => out.text.push(DownloadedTextFile {
+                        path: out_path,
+                        truncated,
+                        original_size: extracted.text.len() as u64,
+                        note: extracted.ocr.note(),
+                    }),
+                    Err(e) => out.notices.push(format!(
+                        "Text extraction could not be saved: {e}. The original remains attachable."
+                    )),
+                }
             }
+            Err(e) => out.notices.push(format!(
+                "Text extraction failed for {:?}: {e:#}. The original remains attachable.",
+                att.filename
+            )),
         }
     }
     out
@@ -2811,6 +2838,14 @@ pub async fn fetch_owner_history(
                 body.push('\n');
             }
             body.push_str(attachment_kind_label(&m.attachments));
+            if role == "user" {
+                for attachment in &m.attachments {
+                    if let Some(note) = original_doc_history_note(attachment, m.id.get()) {
+                        body.push('\n');
+                        body.push_str(&note);
+                    }
+                }
+            }
         }
         if body.is_empty() {
             continue;
@@ -3822,6 +3857,128 @@ mod tests {
             "ephemeral": false,
         });
         serde_json::from_value(json).expect("attachment fixture should deserialize")
+    }
+
+    #[tokio::test]
+    async fn document_original_survives_failed_extraction_and_revisions_are_distinct() {
+        let mut server = mockito::Server::new_async().await;
+        let first_bytes = b"original binary\x00\xff revision one";
+        let second_bytes = b"original binary\x00\xff revision two";
+        let first_mock = server
+            .mock("GET", "/first")
+            .with_body(first_bytes)
+            .create_async()
+            .await;
+        let second_mock = server
+            .mock("GET", "/second")
+            .with_body(second_bytes)
+            .create_async()
+            .await;
+        let mut first = att("agreement.doc", Some("application/msword"));
+        first.url = format!("{}/first", server.url());
+        first.size = first_bytes.len() as u32;
+        let mut second = first.clone();
+        second.url = format!("{}/second", server.url());
+        second.size = second_bytes.len() as u32;
+        let id = (uuid::Uuid::new_v4().as_u128() >> 64) as u64;
+        let old = extract_doc_attachments(std::slice::from_ref(&first), id, None).await;
+        let new = extract_doc_attachments(&[second], id.wrapping_add(1), None).await;
+        assert_eq!(old.originals.len(), 1);
+        assert_eq!(new.originals.len(), 1);
+        assert_ne!(
+            old.originals[0].to_path_buf(),
+            new.originals[0].to_path_buf()
+        );
+        assert_eq!(std::fs::read(&*old.originals[0]).unwrap(), first_bytes);
+        assert_eq!(std::fs::read(&*new.originals[0]).unwrap(), second_bytes);
+        let history_note = original_doc_history_note(&first, id).unwrap();
+        assert!(history_note.contains(&old.originals[0].display().to_string()));
+        assert!(history_note.contains("prefer the newest drop"));
+        assert!(original_doc_history_note(&first, id.wrapping_add(2))
+            .unwrap()
+            .contains("unavailable or expired"));
+        assert!(old.text.is_empty());
+        assert!(old
+            .notices
+            .iter()
+            .any(|n| n.contains("Text extraction failed")));
+        assert!(old.notices[0].contains(&format!("Discord drop {id}")));
+        assert!(old.notices[0].contains("never re-render"));
+        let original_path = old.originals[0].to_path_buf();
+        drop(old);
+        assert!(
+            original_path.exists(),
+            "follow-up turns retain the original"
+        );
+        first_mock.assert_async().await;
+        second_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn document_original_cleanup_waits_for_retention_and_active_answer() {
+        let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let name = file.to_path_buf();
+        let active = retain_original(file, std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(name.exists(), "active answer still owns the original");
+        drop(active);
+        assert!(!name.exists(), "expired original is cleaned up");
+
+        let file = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let name = file.to_path_buf();
+        drop(retain_original(file, std::time::Duration::from_millis(10)));
+        assert!(name.exists(), "retained for follow-up turns");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!name.exists(), "unused original is cleaned up after expiry");
+    }
+
+    #[tokio::test]
+    async fn document_download_failure_is_explicit_and_never_attachable() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/missing")
+            .with_status(404)
+            .with_body("not a PDF")
+            .create_async()
+            .await;
+        let mut attachment = att("agreement.pdf", Some("application/pdf"));
+        attachment.url = format!("{}/missing", server.url());
+        let result = extract_doc_attachments(&[attachment], 14570001, None).await;
+        assert!(result.originals.is_empty());
+        assert!(result.text.is_empty());
+        assert!(result.notices[0].contains("unavailable"));
+        assert!(result.notices[0].contains("Do not silently reconstruct"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn document_original_is_preserved_alongside_successful_text_extraction() {
+        if std::process::Command::new("pdftotext")
+            .arg("-v")
+            .output()
+            .is_err()
+        {
+            return; // converter integration is also exercised by augmentagent-docs
+        }
+        let bytes = include_bytes!("../../augmentagent-docs/tests/fixtures/text.pdf");
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/doc")
+            .with_body(bytes)
+            .create_async()
+            .await;
+        // MIME identifies the format even when the uploaded extension is misleading.
+        let mut attachment = att("agreement.txt", Some("application/pdf"));
+        attachment.url = format!("{}/doc", server.url());
+        attachment.size = bytes.len() as u32;
+        let id = (uuid::Uuid::new_v4().as_u128() >> 64) as u64;
+        let result = extract_doc_attachments(&[attachment], id, None).await;
+        assert_eq!(result.text.len(), 1);
+        assert!(result.originals[0].ends_with(format!("aa-doc-{id}-1.pdf")));
+        assert_eq!(std::fs::read(&*result.originals[0]).unwrap(), bytes);
+        assert!(!std::fs::read(&result.text[0].path).unwrap().is_empty());
+        std::fs::remove_file(&result.text[0].path).unwrap();
+        mock.assert_async().await;
     }
 
     #[test]

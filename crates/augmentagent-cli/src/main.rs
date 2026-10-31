@@ -6572,29 +6572,116 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 async fn upload_attach_if_given(
     gmail: &ComposioClient,
     attach: Vec<PathBuf>,
-) -> Result<Vec<Attachment>> {
+) -> Result<(
+    Vec<Attachment>,
+    Option<String>,
+    Vec<tempfile::NamedTempFile>,
+)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
     let mut out = Vec::with_capacity(attach.len());
+    let mut reviews = Vec::with_capacity(attach.len());
+    let mut snapshots = Vec::with_capacity(attach.len());
     for path in attach {
-        let meta = std::fs::metadata(&path)
+        anyhow::ensure!(
+            std::fs::metadata(&path)?.is_file(),
+            "attachment is not a regular file: {}",
+            path.display()
+        );
+        let bytes = std::fs::read(&path)
             .with_context(|| format!("attachment not found: {}", path.display()))?;
+        // Both direct Google and Composio read at draft time. Keep a private
+        // snapshot alive through draft creation so its review digest cannot drift.
+        let suffix = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_default();
+        let mut snapshot = tempfile::Builder::new().suffix(&suffix).tempfile()?;
+        snapshot.write_all(&bytes)?;
         let mut att = gmail
-            .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
+            .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", snapshot.path())
             .await
             .context("attachment upload failed")?;
-        // #1629 — an opaque `/tmp/aa-*` download goes out under the name it
-        // arrived with, not its temp basename.
-        if let Some(original) = augmentagent_docs::inbound::recorded_original_name(&path) {
-            att.name = original;
-        }
-        println!(
-            "attached: {} ({} KB, {})",
+        att.name = augmentagent_docs::inbound::recorded_original_name(&path).unwrap_or_else(|| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let review = format!(
+            "{}; source path: {}; {} bytes; SHA-256: {:x}",
             att.name,
-            meta.len().div_ceil(1024),
-            att.mimetype
+            path.display(),
+            bytes.len(),
+            Sha256::digest(&bytes)
         );
+        println!("attached: {review}");
+        reviews.push(review);
         out.push(att);
+        snapshots.push(snapshot);
     }
-    Ok(out)
+    let review = (!reviews.is_empty()).then(|| reviews.join(" | "));
+    Ok((out, review, snapshots))
+}
+
+#[cfg(test)]
+mod original_attachment_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn upload_preserves_binary_bytes_and_review_identifies_each_revision() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"%PDF-1.7\n\x00\xff original signed layout";
+        let client = ComposioClient::new("test".into());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aa-doc-1457-1.pdf");
+        let second = dir.path().join("second.pdf");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(&second, b"second document").unwrap();
+        augmentagent_docs::inbound::record_original_name(&path, "Signed agreement.pdf")
+            .await
+            .unwrap();
+        let (attached, review, snapshots) =
+            upload_attach_if_given(&client, vec![path.clone(), second])
+                .await
+                .unwrap();
+        let review = review.unwrap();
+        assert_eq!(attached.len(), 2);
+        assert_eq!(attached[0].name, "Signed agreement.pdf");
+        assert_eq!(attached[1].name, "second.pdf");
+        assert!(review.contains("aa-doc-1457-1.pdf"));
+        assert!(review.contains(&format!("SHA-256: {:x}", Sha256::digest(bytes))));
+        assert!(review.contains("second.pdf"));
+        let body = augmentagent_approval_discord::append_envelope_markers(
+            "email body".into(),
+            None,
+            "action",
+            "sender@example.com",
+            Some(&review),
+        );
+        assert!(body.contains(&review));
+        std::fs::write(&path, b"corrected revision").unwrap();
+        assert_eq!(
+            std::fs::read(attached[0].path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        let (_, revised_review, _new_snapshots) =
+            upload_attach_if_given(&client, vec![path.clone()])
+                .await
+                .unwrap();
+        assert_ne!(Some(review), revised_review);
+        let snapshot_path = attached[0].path.clone().unwrap();
+        drop(snapshots);
+        assert!(!snapshot_path.exists());
+        assert!(
+            upload_attach_if_given(&client, vec![dir.path().join("missing.pdf")])
+                .await
+                .is_err()
+        );
+        let (empty, review, guards) = upload_attach_if_given(&client, vec![]).await.unwrap();
+        assert!(empty.is_empty() && review.is_none() && guards.is_empty());
+    }
 }
 
 /// The card's single `[attachment: …]` marker value, or `None` without any.
@@ -7202,7 +7289,7 @@ async fn run_gmail_compose(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachments = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -7227,7 +7314,7 @@ async fn run_gmail_compose(
             &bcc,
             &subject,
             &body_str,
-            attachment_names(&attachments).as_deref(),
+            attachment_review.as_deref(),
             thread_id.as_deref(),
             reply_to_message_id.as_deref(),
             reply_to_from.as_deref(),
@@ -8220,7 +8307,7 @@ async fn run_gmail_update_draft(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachments = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let new_id = gmail
         .update_draft_with_attachment(
             &entity_id,
@@ -8299,7 +8386,7 @@ async fn run_gmail_update_draft(
                         Some(store.as_ref()),
                         action_id,
                         &row.email.from,
-                        attachment_names(&attachments).as_deref(),
+                        attachment_review.as_deref(),
                     );
                     let edit = augmentagent_approval_discord::approval_edit_message(
                         action_id,
@@ -8460,7 +8547,7 @@ async fn run_gmail_send_now(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachments = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, _attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
