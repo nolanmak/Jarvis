@@ -221,6 +221,7 @@ async fn discord_model_switch_sequence_child() {
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: false,
         phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     };
     let file = root.join("wiki/probe.txt");

@@ -99,16 +99,39 @@ class AgentCli:
             self.remote, remote_cmd,
         ], None
 
-    def _run(self, args):
+    def _run(self, args, input_text=None):
         cmd, cwd = self.command(args)
         try:
+            extra = {"input": input_text} if input_text is not None else {}
             done = self.runner(cmd, cwd=cwd, capture_output=True, text=True,
-                               timeout=self.timeout)
+                               timeout=self.timeout, **extra)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise AgentError(f"agent command failed: {e}") from e
         if done.returncode != 0:
             raise AgentError(f"agent exited {done.returncode}: {(done.stderr or '').strip()[:300]}")
         return done.stdout
+
+    def owner_binding(self):
+        try:
+            data = json.loads(self._run(["owner", "status"]).strip().splitlines()[-1])
+            if data.get("version") != 1:
+                raise ValueError("unsupported owner protocol")
+            return data.get("binding")
+        except (ValueError, IndexError) as error:
+            raise AgentError("invalid owner binding response") from error
+
+    def owner_events(self, batch):
+        # Private event bodies are stdin, never process arguments or log output.
+        out = self._run(["owner", "ingest"], input_text=json.dumps(batch))
+        try:
+            data = json.loads(out.strip().splitlines()[-1])
+            if data.get("version") != 1 or data.get("watermark") != batch["watermark"]:
+                raise ValueError("owner capture was not acknowledged")
+        except (ValueError, IndexError) as error:
+            raise AgentError("invalid owner capture acknowledgment") from error
+
+    def owner_capture_error(self, message):
+        self._run(["owner", "capture-error", "--message", message])
 
     def claim(self):
         out = self._run(["outbox", "claim", "--json"])

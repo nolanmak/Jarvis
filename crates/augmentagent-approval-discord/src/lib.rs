@@ -9,6 +9,8 @@
 //! still `pending`, across daemon restarts, unlimited timeouts.
 
 pub mod attachments;
+pub mod imessage_owner;
+pub mod imessage_owner_control;
 pub mod compute_inputs;
 pub mod conversation;
 pub mod interaction;
@@ -64,7 +66,7 @@ pub use layout::{scheduled_notice_message, schedule_modal, SCHEDULE_CUSTOM_VALUE
 pub use layout::reminder_buttons;
 pub use layout::auto_rsvp_notice_message;
 pub use loops::{
-    handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
+    handle_loop_command_with_model, handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
     validate_tz, LoopCommandParser, LoopPoster, LoopRunner, LoopScheduler, ParsedLoop,
 };
@@ -170,6 +172,13 @@ pub enum ApprovalError {
 /// Discord API round-trip finishes, not when the user clicks a button.
 #[async_trait]
 pub trait ApprovalBroker: Send + Sync {
+    /// Dynamic surfaces must not count a disabled transport as successful delivery.
+    fn is_available(&self)->bool {true}
+    /// A mirror may use Discord's native output IDs for generic notifications.
+    fn can_post_notices(&self)->bool {true}
+    async fn post_imessage_owner_health(&self,id:i64,status:&str)->Result<(),ApprovalError> {
+        self.post_digest("iMessage delivery needs attention",&imessage_owner::health_description(id,status)).await
+    }
     async fn post_owner_alert(&self, _notice: &augmentagent_store::alert_schedule::AlertNotice)
         -> Result<String,ApprovalError> {
         Err(ApprovalError::Discord("owner alerts are not supported by this broker".into()))
@@ -438,6 +447,11 @@ pub trait ApprovalActionHandler: Send + Sync {
 /// there (#132 / #201).
 #[async_trait]
 pub trait QueryHandler: Send + Sync {
+    fn turn_cancellation(&self,_session_id:&str)->Option<tokio_util::sync::CancellationToken> {None}
+    /// A deterministic command from an already authenticated owner surface.
+    async fn owner_command(&self,ctx:&AuditCtx,text:&str)->Option<String> {
+        if let Some(channel)=ctx.channel_id {self.model_command_in_guild(ctx.guild_id,channel.get(),text).await} else {None}
+    }
     fn autoship_bound(&self, _context: &autoship::Context) -> anyhow::Result<bool> { Ok(false) }
     /// Called only after the gateway verifies the configured owner's private DM.
     /// A durable acknowledgement must be claimed before returning its nonce.
@@ -512,6 +526,7 @@ pub trait QueryHandler: Send + Sync {
 /// real notifier from these bits, since this crate cannot depend on
 /// `augmentagent-channel-core`'s `AuditNotifier` trait without a
 /// workspace cycle.
+#[derive(Clone)]
 pub struct AuditCtx {
     pub session_id: String,
     pub guild_id: Option<u64>,
@@ -534,3 +549,5 @@ impl AuditCtx {
         }
     }
 }
+
+pub use process_loops::handle as handle_process_command;
