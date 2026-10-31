@@ -94,11 +94,26 @@ fn parse_proposal_data(
         parts.next().is_none(),
         "multiple executable contract proposals"
     );
-    let json = body
-        .split_once("```")
-        .context("unterminated contract proposal")?
-        .0;
-    let mut proposal: ContractProposal = serde_json::from_str(json)?;
+    // Decode the object before finding its closing fence: pinned file strings
+    // can legitimately contain backticks. Model output can also spell the
+    // fence-separating whitespace as escapes. Only accept those padding tokens
+    // after the complete object; never rewrite values or ignore extra data.
+    let mut objects = serde_json::Deserializer::from_str(body).into_iter::<ContractProposal>();
+    let mut proposal = objects.next().transpose()?.context("missing executable contract object")?;
+    let mut trailing = &body[objects.byte_offset()..];
+    loop {
+        trailing = trailing.trim_start();
+        if let Some(rest) = trailing.strip_prefix(r"\n")
+            .or_else(|| trailing.strip_prefix(r"\r"))
+            .or_else(|| trailing.strip_prefix(r"\t"))
+        {
+            trailing = rest;
+        } else {
+            break;
+        }
+    }
+    ensure!(trailing.starts_with("```"),
+        "unterminated contract proposal or non-whitespace trailing data");
     proposal.contract.validate()?;
     ensure!(
         !require_controller
