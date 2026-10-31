@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1704,
+  "source_behavior_commit": "b084ed4f2ceb73e27ab409a76162bca2af7d51db",
+  "scope": "Native Claude guarded file-edit acceptance; no Discord, continuation, independent review, full issue, merge, deployment or soak claim",
+  "red": [
+    {
+      "commit": "a9d86d7d",
+      "command": "python3 scripts/test-autoship-native-acceptance-probe.py",
+      "exit_code": 1,
+      "passed": 8,
+      "failed": 1,
+      "reason": "missing Claude exact ignored-test entry point"
+    },
+    {
+      "commit": "5a164ac3",
+      "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent file_edit_audit_checks_provider_namespace_and_keeps_shells_forbidden -- --test-threads=1",
+      "wrapper_exit_code": 1,
+      "test_exit_code": 101,
+      "passed": 0,
+      "failed": 1,
+      "reason": "Claude MCP audit names rejected as undeclared tools"
+    }
+  ],
+  "green": {
+    "launcher_tests": {
+      "passed": 9,
+      "exit_code": 0
+    },
+    "rust_route_tests": {
+      "passed": 4,
+      "ignored_paid_tests": 3,
+      "exit_code": 0
+    },
+    "live_claude": {
+      "evidence_root": "/tmp/autoship-native-acceptance-45qbca30",
+      "binary_sha256": "7533c529a82ccf03ec96ea466be5195e426dfa6af782d4609b83b3b8eb00c23e",
+      "policy_sha256": "6d5cb55374ebc2df8f9f9ff6bbdcfcf145bd160c015184b166926f47f8b1e564",
+      "exit_code": 0,
+      "test_completed": true,
+      "model_dispatches": 1,
+      "exact_edit": true,
+      "guarded_write_receipt": true,
+      "remaining_workers": 0,
+      "quiet_scans": 2
+    }
+  },
+  "retained_failed_live_attempt": {
+    "evidence_root": "/tmp/autoship-native-acceptance-_b5pvekx",
+    "exit_code": 101,
+    "reason": "test verifier did not recognize Claude MCP tool namespace",
+    "not_reclassified": true
+  },
+  "policy_selected": false,
+  "issue_closed": false,
+  "source_files": [
+    {
+      "path": "scripts/autoship-native-acceptance-probe.py",
+      "sha256": "37b5b10f863c60948b5123f33b294d84f460bfd1f7be0012814da2f5640ede2b"
+    },
+    {
+      "path": "scripts/test-autoship-native-acceptance-probe.py",
+      "sha256": "703851020ea41ac21b81889eb564d349cd7f72aec493098801e1b1320d881d36"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_native_route_acceptance.rs",
+      "sha256": "f949553dc1d533efee66c6843940a30e80cf837b69440f280d89fd8f94da7e6e"
+    }
+  ]
+}
