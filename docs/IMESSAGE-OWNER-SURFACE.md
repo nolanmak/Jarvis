@@ -213,7 +213,10 @@ marks an alert seen. None of these three states substitutes for another.
   unconfirmed and parks the conversation until recovery. Cancel-all retires waiting ordinary chat,
   never approval decisions or scheduled loops. Reset refuses live turns and
   resolves interrupted query receipts without replay or action-fence release.
-  Voice/calling stays on the existing phone/Discord transports.
+  Voice/calling stays on the existing phone/Discord transports. The autoship
+  workflow merged upstream in #1723 requires its verified private Discord DM
+  binding (#1713); iMessage mirrors its notices but directs `!autoship` controls
+  back to that DM without invoking chat or fabricating Discord authority.
 - Capture runs independently of outbound sending. A disabled or re-enrolled
   control conversation stays excluded from the contact auto-replier, preventing
   owner control text from being drafted as a third-party conversation.

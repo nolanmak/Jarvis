@@ -1017,7 +1017,20 @@ impl OwnerSurface {
                 HELP,
                 crate::owner_commands::OWNER_COMMANDS
                     .iter()
-                    .map(|c| c.usage)
+                    .map(|c| format!(
+                        "{}{}{}",
+                        if c.plain == crate::owner_commands::PlainText::Sigil {
+                            "!"
+                        } else {
+                            ""
+                        },
+                        c.usage,
+                        if c.name == "autoship" {
+                            " (private Discord only)"
+                        } else {
+                            ""
+                        }
+                    ))
                     .collect::<Vec<_>>()
                     .join("\n")
             )),

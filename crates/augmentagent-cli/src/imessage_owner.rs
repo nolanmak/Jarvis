@@ -81,6 +81,9 @@ pub(crate) async fn owner_command(
     }
     let text = text.trim();
     let lower = text.to_ascii_lowercase();
+    if augmentagent_approval_discord::autoship::recognizes(&lower) {
+        return Some("Use your private Discord conversation for autoship controls; that workflow is bound there.".into());
+    }
     let store = query.conversation_store.as_deref();
     let channel = ctx.channel_id.map(|c| c.get()).unwrap_or(0);
     if lower == "model" || lower.starts_with("model ") {
@@ -517,6 +520,10 @@ mod tests {
         ctx.channel_id = Some(serenity::all::ChannelId::new(10));
         ctx.owner_authorized = true;
         ctx.session_id = "active-native-turn".into();
+        assert!(owner_command(&query, &ctx, "!autoship status")
+            .await
+            .unwrap()
+            .contains("private Discord"));
         let (token, guard) = begin_turn(&query, &ctx);
         assert!(!token.is_cancelled());
         let b = store

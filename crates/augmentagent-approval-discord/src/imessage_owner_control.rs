@@ -51,12 +51,14 @@ impl Verb {
 /// starting with an ordinary word is promoted to owner authority by a model.
 pub fn immediate_command(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "status" | "cancel" | "cancel all" | "reset" | "new" | "pending" | "presets"
-    ) || ["model", "loop", "pending", "alert"]
-        .iter()
-        .any(|word| lower == *word || lower.starts_with(&format!("{word} ")))
+    crate::autoship::recognizes(&lower)
+        || matches!(
+            lower.as_str(),
+            "status" | "cancel" | "cancel all" | "reset" | "new" | "pending" | "presets"
+        )
+        || ["model", "loop", "pending", "alert"]
+            .iter()
+            .any(|word| lower == *word || lower.starts_with(&format!("{word} ")))
         || ["!journal", "!loops", "!processes", "!voice"]
             .iter()
             .any(|word| lower == *word || lower.starts_with(&format!("{word} ")))
@@ -145,6 +147,13 @@ pub fn parse(text: &str, reply_guid: Option<&str>) -> Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bound_autoship_commands_never_fall_through_to_chat() {
+        assert!(immediate_command("!autoship status"));
+        assert!(immediate_command(
+            "!autoship https://github.com/example/project/pull/1"
+        ));
+    }
     #[test]
     fn approval_never_guesses_a_pending_draft() {
         for text in ["approve", "skip", "revise: shorter", "👍", "👍🏽"] {
