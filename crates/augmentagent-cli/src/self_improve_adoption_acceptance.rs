@@ -25,10 +25,11 @@ def git(*args):
  return subprocess.check_output(['/usr/bin/git','--git-dir',c['origin'],*args],text=True).strip()
 head=git('rev-parse','refs/heads/'+c['branch']); state='MERGED' if (root/'merged').exists() else 'OPEN'
 draft=not (root/'ready').exists()
+merge_commit=(root/'merge-commit').read_text() if state=='MERGED' else None
 row=dict(number=841,id='PR_disposable_adoption',url='https://github.com/'+c['repository']+'/pull/841',
  headRefName=c['branch'],headRefOid=head,baseRefName='main',isCrossRepository=False,isDraft=draft,
  author={'login':'autoship-canary'},title=c['title'],body=c['body'],closingIssuesReferences=[],state=state,
- mergeable='MERGEABLE',mergeCommit={'oid':head} if state=='MERGED' else None,
+ mergeable='MERGEABLE',mergeCommit={'oid':merge_commit,'message':git('show','-s','--format=%B',merge_commit)} if state=='MERGED' else None,
  files=[{'path':p} for p in git('diff','--name-only',c['base'],head,'--').splitlines()])
 with (root/'gh-calls.jsonl').open('a') as stream:stream.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view']: print(c['repository'])
@@ -52,10 +53,13 @@ elif a[:2]==['api','graphql']:
  assert fields['head']==head and fields['id']==row['id']
  assert state=='OPEN' and not draft and (root/'ci-green').exists()
  subprocess.run(['/usr/bin/git','--git-dir',c['origin'],'merge-base','--is-ancestor','refs/heads/main',head],check=True)
- git('update-ref','refs/heads/main',head)
+ parent=git('rev-parse','refs/heads/main')
+ merge_commit=subprocess.check_output(['/usr/bin/git','--git-dir',c['origin'],'-c','user.name=Autoship fixture','-c','user.email=fixture@example.invalid','commit-tree',git('rev-parse',head+'^{tree}'),'-p',parent],input=fields['body']+'\n',text=True).strip()
+ git('update-ref','refs/heads/main',merge_commit,parent)
+ (root/'merge-commit').write_text(merge_commit)
  (root/'merged').write_text(head)
  with (root/'merge-mutations.jsonl').open('a') as stream:stream.write(json.dumps(fields)+'\n')
- row.update(state='MERGED',mergedAt=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),mergeCommit={'oid':head},mergedBy={'login':'autoship-canary'})
+ row.update(state='MERGED',mergedAt=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),mergeCommit={'oid':merge_commit,'message':git('show','-s','--format=%B',merge_commit)},mergedBy={'login':'autoship-canary'})
  print(json.dumps({'data':{'mergePullRequest':{'clientMutationId':fields['request'],'pullRequest':row}}}))
 elif a[:1]==['api'] and '/git/ref/heads/main' in a[1]:print(git('rev-parse','refs/heads/main'))
 elif a[:1]==['api'] and '/branches/main/protection' in a[1]:
@@ -304,7 +308,7 @@ async fn run_pipeline() -> Result<()> {
 
 
 #[tokio::test]
-async fn adoption_boundary_answers_direct_merge_policy_without_mutation() -> Result<()> {
+async fn adoption_boundary_preserves_policy_and_immutable_merge_marker() -> Result<()> {
     let root = tempfile::tempdir()?;
     let repo = root.path().join("origin");
     std::fs::create_dir(&repo)?;
@@ -325,5 +329,25 @@ async fn adoption_boundary_answers_direct_merge_policy_without_mutation() -> Res
     anyhow::ensure!(value.pointer("/data/repository/mergeQueue").is_some_and(serde_json::Value::is_null), "missing explicit direct-merge policy");
     anyhow::ensure!(!root.path().join("merged").exists() && !root.path().join("merge-mutations.jsonl").exists(), "policy query mutated merge state");
     anyhow::ensure!(fixture_git(&repo, &["rev-parse", "HEAD"]).await? == before, "policy query moved main");
+    fixture_git(&repo, &["checkout", "-b", "repair"]).await?;
+    fixture_git(&repo, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "repair"]).await?;
+    let head=fixture_git(&repo, &["rev-parse", "HEAD"]).await?;
+    let path=root.path().join("fixture.json");
+    let mut config:serde_json::Value=serde_json::from_slice(&std::fs::read(&path)?)?;
+    config["branch"]="repair".into();std::fs::write(path,serde_json::to_vec(&config)?)?;
+    std::fs::write(root.path().join("ready"),"ready")?;
+    std::fs::write(root.path().join("ci-green"),"green")?;
+    let body="synthetic controller commit marker";
+    let output=Command::new("/usr/bin/python3").arg(root.path().join("github.py"))
+        .args(["api","graphql","-f","query=mutation AutoshipMerge","-f","id=PR_disposable_adoption","-f",&format!("head={head}"),"-f","request=fixture-request","-f",&format!("body={body}")])
+        .env("AUTOSHIP_ADOPTION_ACCEPTANCE_CHILD",root.path()).output().await?;
+    anyhow::ensure!(output.status.success(),"fixture merge failed");
+    let response:serde_json::Value=serde_json::from_slice(&output.stdout)?;
+    let commit=&response["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"];
+    anyhow::ensure!(commit["message"].as_str().is_some_and(|message|message.trim()==body),"fixture must return immutable merge message for attribution");
+    let oid=commit["oid"].as_str().context("merge commit missing")?;
+    anyhow::ensure!(fixture_git(&repo,&["show","-s","--format=%B",oid]).await?==body,"response marker must exist in real Git commit");
+    anyhow::ensure!(fixture_git(&repo,&["rev-parse","main"]).await?==oid,"main must point at the fixture squash commit");
+    anyhow::ensure!(fixture_git(&repo,&["rev-parse",&format!("{oid}^{{tree}}")]).await?==fixture_git(&repo,&["rev-parse",&format!("{head}^{{tree}}")]).await?,"squash must preserve approved candidate tree");
     Ok(())
 }

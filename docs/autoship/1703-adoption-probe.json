@@ -71,12 +71,26 @@
   },
   "citation_followup": {
     "root": "/tmp/autoship-native-acceptance-5fns0vx5",
-    "status": "running-not-accepted",
+    "status": "failed-fixture-merge-attribution",
     "change": "Name offending readiness slot/source; prefer short literal citations; at most two corrections after initial response, preserving all completed outputs",
     "local_acceptance_tests_passed": 31,
     "logs": [
       "/tmp/autoship-1703-red-readiness-citation.log",
       "/tmp/autoship-1703-green-readiness-citation.log"
-    ]
+    ],
+    "exit_code": 101,
+    "model_calls": 9,
+    "elapsed_seconds": 563.85,
+    "verified_progress": "Readiness, contract, repair checkpoint, shared CI, independent review, publication, and simulated merge observation completed. Fixture omitted immutable merge message; strict ledger retained pending attribution."
+  },
+  "marker_fixture_fix": {
+    "change": "Create real local squash commit with supplied commitBody; return immutable commit message, preserving approved tree",
+    "regression": "red missing immutable merge message; green real Git commit message/tree/main binding",
+    "red_log": "/tmp/autoship-1703-red-adoption-marker.log",
+    "green_log": "/tmp/autoship-1703-green-adoption-marker.log"
+  },
+  "marker_fixture_followup": {
+    "root": "/tmp/autoship-native-acceptance-l18ykhkg",
+    "status": "running-not-accepted"
   }
 }
