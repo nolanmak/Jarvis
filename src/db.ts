@@ -335,15 +335,35 @@ function buildActionStatusSet(
   return { sets, vals };
 }
 
+// The owner text dispatcher reserves the exact presentation across its handler
+// call. Acquire the SQLite writer lock before checking that shared reservation,
+// so the Node API cannot slip a draft/recipient edit between check and update.
+export class OwnerDecisionConflict extends Error {}
+
+function ownerActionWrite<T>(id: string, write: (connection: Database.Database) => T): T {
+  const connection = getDb();
+  return connection.transaction(() => {
+    const migrated = connection.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='imessage_owner_action_leases'"
+    ).get();
+    if (migrated && connection.prepare(
+      "SELECT 1 FROM imessage_owner_action_leases WHERE action_id=?"
+    ).get(id)) {
+      throw new OwnerDecisionConflict("Action has an unresolved owner text decision");
+    }
+    return write(connection);
+  }).immediate();
+}
+
 export function updateActionStatus(
   id: string,
   status: ActionStatus,
   extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
 ): void {
   const { sets, vals } = buildActionStatusSet(status, extra);
-  getDb()
+  ownerActionWrite(id, (connection) => connection
     .prepare(`UPDATE actions SET ${sets.join(", ")} WHERE id = ?`)
-    .run(...vals, id);
+    .run(...vals, id));
 }
 
 // #500: CAS variant for the API mutation route — flips status only while the
@@ -357,11 +377,11 @@ export function resolveActionIfPending(
   extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
 ): boolean {
   const { sets, vals } = buildActionStatusSet(status, extra);
-  const result = getDb()
+  const result = ownerActionWrite(id, (connection) => connection
     .prepare(
       `UPDATE actions SET ${sets.join(", ")} WHERE id = ? AND status = 'pending'`
     )
-    .run(...vals, id);
+    .run(...vals, id));
   return result.changes > 0;
 }
 
@@ -369,9 +389,9 @@ export function resolveActionIfPending(
 // keeps the action's status untouched (still pending) and only swaps the
 // recipient. Returns true if a row was updated.
 export function updateActionRecipient(id: string, recipientEmail: string): boolean {
-  const res = getDb()
+  const res = ownerActionWrite(id, (connection) => connection
     .prepare("UPDATE actions SET recipientEmail = ?, updatedAt = ? WHERE id = ?")
-    .run(recipientEmail, Date.now(), id);
+    .run(recipientEmail, Date.now(), id));
   return res.changes > 0;
 }
 

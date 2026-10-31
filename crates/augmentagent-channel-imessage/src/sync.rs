@@ -338,6 +338,9 @@ pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollD
     )?;
 
     for conv in conversations {
+        if conv.chat_guid.as_deref().is_some_and(|guid|store.is_imessage_owner_conversation(guid).unwrap_or(true)) {
+            continue;
+        }
         let seen = store.get_imessage_entries_seen(&conv.identifier)? as usize;
         let entries = match bundle.entries(&conv) {
             Ok(e) => e,

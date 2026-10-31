@@ -74,7 +74,12 @@ fn downgrade(path: &std::path::Path, store: Store) {
     store
         .with_conn(|c| {
             c.execute_batch(
-                "ALTER TABLE emails DROP COLUMN toAddrs; ALTER TABLE emails DROP COLUMN ccAddrs;",
+                // These guards postdate the historical schema being simulated.
+                // SQLite correctly refuses dropping columns referenced by a trigger.
+                "DROP TRIGGER IF EXISTS imessage_owner_email_epoch;
+                 DROP TRIGGER IF EXISTS owner_email_scope_guard;
+                 DROP TRIGGER IF EXISTS owner_action_write_guard;
+                 ALTER TABLE emails DROP COLUMN toAddrs; ALTER TABLE emails DROP COLUMN ccAddrs;",
             )
         })
         .unwrap();

@@ -429,3 +429,93 @@ fn cli_approve_refuses_non_imessage_actions() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not an iMessage"));
     assert_eq!(action_status(&store, &id).0, "pending");
 }
+
+#[test]
+fn owner_transport_is_durable_and_history_does_not_cross_enrollments() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let bound = run(
+        dir.path(),
+        false,
+        &[
+            "owner",
+            "bind",
+            "--chat-guid",
+            "owner-chat",
+            "--owner-handle",
+            "owner@example.invalid",
+            "--current-rowid",
+            "100",
+        ],
+    );
+    let binding: serde_json::Value = serde_json::from_str(&stdout(&bound)).unwrap();
+    let revision = binding["binding"]["revision"].as_i64().unwrap();
+    let event = serde_json::json!({"binding_revision":revision,"rowid":101,"created_at_ms":chrono::Utc::now().timestamp_millis()+1000,
+        "guid":"synthetic-owner-guid","chat_guid":"owner-chat","sender":"owner@example.invalid","from_me":false,"kind":"text","target_guid":null,"body":"Synthetic owner question"});
+    let batch =
+        serde_json::json!({"revision":revision,"watermark":101,"events":[event]}).to_string();
+    for expected in [1, 0] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+            .current_dir(dir.path())
+            .env("AUGMENTAGENT_DB", dir.path().join("agent.db"))
+            .args(["imessage", "owner", "ingest"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(batch.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(receipt["accepted"], expected);
+    }
+    let history = run(
+        dir.path(),
+        false,
+        &[
+            "owner",
+            "history",
+            "--guid",
+            "synthetic-owner-guid",
+            "--limit",
+            "8000",
+        ],
+    );
+    let history: serde_json::Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert_eq!(history["found"], true);
+    assert!(history["body"]
+        .as_str()
+        .unwrap()
+        .contains("Synthetic owner question"));
+    stdout(&run(dir.path(), false, &["owner", "disable"]));
+    stdout(&run(
+        dir.path(),
+        false,
+        &[
+            "owner",
+            "bind",
+            "--chat-guid",
+            "new-owner-chat",
+            "--owner-handle",
+            "new-owner@example.invalid",
+            "--current-rowid",
+            "101",
+        ],
+    ));
+    let history = run(
+        dir.path(),
+        false,
+        &["owner", "history", "--guid", "synthetic-owner-guid"],
+    );
+    let history: serde_json::Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert_eq!(
+        history["found"], false,
+        "a known old GUID must not expose an earlier enrollment"
+    );
+}

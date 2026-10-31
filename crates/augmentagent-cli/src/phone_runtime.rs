@@ -667,6 +667,7 @@ pub(crate) async fn native_text_turn(
         audit.session_id.clone(),
     )?;
     let cwd = wiki.to_string_lossy();
+    let cancel=query.turn_cancellation(&audit.session_id);
     let outcome = run_surface_turn(
         store,
         SurfaceTurnRequest {
@@ -688,7 +689,7 @@ pub(crate) async fn native_text_turn(
             );
             Ok(selected)
         },
-        None,
+        cancel.as_ref(),
         |prompt| async move {
             let _grant = tools.grant(&origin.owner, &origin.conversation, None)?;
             anyhow::ensure!(
