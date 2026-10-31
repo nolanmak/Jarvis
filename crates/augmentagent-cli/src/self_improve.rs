@@ -7491,7 +7491,7 @@ impl RunReport {
             resumed: false,
         }
     }
-    fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         self.held || self.message == IDLE_MSG
     }
 }
@@ -7533,6 +7533,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // Read-only, before lock/state creation, issue selection or model spend.
         // Hashing runs off the async executor; launches still revalidate their
         // own declarations and retain existing runtime generations.
+        let readiness: Result<()> = async {
         tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
             .await.context("native runtime preflight task failed")??;
         if let Some(selected)=&selected {
@@ -7545,6 +7546,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         if mode == targeted::ExecutionMode::Background {
             crate::autoship_deployment::inspect(repo_root).await.preflight()?;
         }
+        Ok(())
+        }.await;
+        readiness.context(targeted::CommandFailure { code:3, reason:"execution-readiness-blocked" })?;
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.

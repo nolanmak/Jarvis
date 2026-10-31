@@ -559,6 +559,13 @@ impl WorkflowStore {
 
     /// Returns None for an occupied/not-yet-eligible/terminal workflow. Claims
     /// increment a fencing generation even when the same owner resumes.
+    /// Productive workers cannot restart command-owned holds or spend models on
+    /// work awaiting free reconciliation. Recheck inside the claim transaction;
+    /// an earlier status projection is not authorization to resume.
+    pub fn claim_productive(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, true)
+    }
+
     pub fn claim(
         &mut self,
         workflow: &str,
@@ -566,6 +573,10 @@ impl WorkflowStore {
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<Option<Lease>> {
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, false)
+    }
+
+    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, productive: bool) -> Result<Option<Lease>> {
         ensure!(
             !owner.is_empty() && ttl_ms > 0,
             "owner and positive lease ttl required"
@@ -585,6 +596,16 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
+        if productive {
+            let commanded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)", [workflow], |r| r.get(0))?;
+            if commanded {
+                let pending_merge: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND kind=?2 AND receipt IS NULL)",
+                    params![workflow, serde_json::to_string(&OperationKind::MergePr)?], |r| r.get(0))?;
+                if matches!(cp.stage, Stage::Held | Stage::AwaitChecks | Stage::Merge) || pending_merge {
+                    return Ok(None);
+                }
+            }
+        }
         if leased > now_ms
             || cp.next.eligible_at_ms > now_ms
             || matches!(cp.stage, Stage::Merged | Stage::Retired)
@@ -1712,6 +1733,26 @@ mod tests {
             .unwrap();
         (store, lease)
     }
+    #[test]
+    fn command_claim_rechecks_late_holds_and_pending_merges_atomically() {
+        for stage in [Stage::Held, Stage::AwaitChecks, Stage::Merge, Stage::Build] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let (mut controller,lease)=setup(&path);
+            controller.submit_authorized("command","owner",&submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged},21).unwrap();
+            let mut command=WorkflowStore::open(&path).unwrap();
+            assert_eq!(command.snapshot(&lease.workflow).unwrap().unwrap().checkpoint.stage,Stage::Intake);
+            let mut checkpoint=controller.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage=stage;checkpoint.next.reason="late-owner-hold".into();
+            controller.checkpoint(&lease,&checkpoint,30).unwrap();
+            if stage==Stage::Build {controller.begin_operation(&lease,OperationKind::MergePr,&binding(),31).unwrap();}
+            controller.release(&lease,32).unwrap();
+            let before=command.snapshot(&lease.workflow).unwrap().unwrap();
+            assert!(command.claim_productive(&lease.workflow,"command",40,1000).unwrap().is_none(), "command bypassed {stage:?}");
+            let after=command.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.generation,before.generation);
+        }
+    }
+
     #[test]
     fn terminal_runtime_retirement_intent_survives_crash_and_settles_once() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");

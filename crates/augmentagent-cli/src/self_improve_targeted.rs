@@ -153,6 +153,16 @@ pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> 
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CommandFailure {
+    pub code: i32,
+    pub reason: &'static str,
+}
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.reason) }
+}
+impl std::error::Error for CommandFailure {}
+
 /// A local operator executes the same durable job without depending on a
 /// daemon/worker process pair. It still passes every runtime and workflow gate.
 pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
@@ -161,6 +171,25 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
     let mut request = store
         .command_request(id)?
         .context("no queued command for workflow")?;
+    authorize_command(repo, &request).await.context(CommandFailure {code:2, reason:"target-authorization-failed"})?;
+    if let Some(snapshot) = store.snapshot(id)? {
+        use crate::autoship_workflow::Stage;
+        if snapshot.checkpoint.stage == Stage::Merged {
+            return Ok(RunReport::triage("Workflow is already merged".into()));
+        }
+        if snapshot.lease_until_ms > chrono::Utc::now().timestamp_millis() {
+            return Ok(RunReport::held("Workflow has an active owner lease".into()));
+        }
+        if matches!(snapshot.checkpoint.stage, Stage::Held | Stage::Retired | Stage::AwaitChecks | Stage::Merge) {
+            return Ok(RunReport::held(format!("Preserved {:?}: {}", snapshot.checkpoint.stage, snapshot.checkpoint.next.reason)));
+        }
+        if snapshot.checkpoint.next.eligible_at_ms > chrono::Utc::now().timestamp_millis() {
+            return Ok(RunReport::held("Workflow retry is not eligible yet".into()));
+        }
+        if store.pending_operations(id)?.iter().any(|op| op.kind == crate::autoship_workflow::OperationKind::MergePr) {
+            return Ok(RunReport::held("Pending merge requires reconciliation before execution".into()));
+        }
+    }
     let source_issue = if let Target::Issue(n) = request.target {
         Some(n)
     } else {
@@ -173,7 +202,7 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
     if let Some(pr) = store.snapshot(id)?.and_then(|state| state.pr) {
         request.target = Target::Pr(pr);
     }
-    let mut selected = resolve(repo, &request).await?;
+    let mut selected = resolve(repo, &request).await.context(CommandFailure {code:2, reason:"invalid-target"})?;
     if let (Some(issue), Resolved::Pr(pr)) = (source_issue, &mut selected) {
         anyhow::ensure!(
             pr.source_issue.is_none_or(|n| n == issue),
@@ -182,10 +211,10 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
         pr.source_issue = Some(issue);
     }
     if let Resolved::Issue(issue) = &selected {
-        anyhow::ensure!(
-            !has_open_agent_pr(repo, issue.number).await?,
-            "target issue already has an unbound PR; reconcile or select that PR"
-        );
+        if has_open_agent_pr(repo, issue.number).await? {
+            return Err(anyhow::anyhow!("target issue has an unbound or unverified PR; reconcile or select that PR")
+                .context(CommandFailure {code:3, reason:"target-pr-reconciliation-required"}));
+        }
     }
     drop(store);
     COMMAND_LANE

@@ -1,3 +1,5 @@
+#[path = "autoship_work_command.rs"]
+pub(crate) mod work_command;
 #[path = "autoship_run_command.rs"]
 pub(crate) mod run_command;
 #[path = "autoship_merge_recovery.rs"]

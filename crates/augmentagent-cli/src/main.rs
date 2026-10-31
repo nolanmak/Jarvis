@@ -1099,6 +1099,8 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Execute one admitted workflow attempt through the normal gates.
+    Work(autoship_commands::work_command::WorkArgs),
     /// Durably submit an explicit issue or PR; acceptance does not mean execution.
     Run(autoship_commands::run_command::RunArgs),
     /// Inspect native credential declarations; no provider calls or refresh.
@@ -3095,6 +3097,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Autopr { op: AutoprOp::ResolveMerge { ref operation, ref classification, ref evidence, json } } = cli.cmd {
         std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Work(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::work_command::run(args).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Run(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::run_command::run(args).await);
@@ -5671,6 +5676,7 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Run(..) } => unreachable!("submission precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readiness { .. } } => unreachable!("readiness precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),

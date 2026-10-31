@@ -657,7 +657,7 @@ impl WorkflowGuard {
         }
         store.register(&id, start.branch, binding.clone(), now)?;
         let owner = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
-        let Some(lease) = store.claim(&id, &owner, now, LEASE_MS)? else {
+        let Some(lease) = store.claim_productive(&id, &owner, now, LEASE_MS)? else {
             return Ok(None);
         };
         if let Some(pr) = start.pr {
