@@ -329,8 +329,13 @@ impl Store {
                 params![b.revision,guid],|r|r.get::<_,Option<String>>(0)).optional()?.flatten();
             let Some(raw)=token else {return Ok(0)};
             let event:OwnerEvent=serde_json::from_str(&raw).map_err(|_|rusqlite::Error::InvalidQuery)?;
-            let reserved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM imessage_owner_action_leases WHERE token=?1)",[event_token(&event)],|r|r.get(0))?;
-            if reserved {return Err(rusqlite::Error::InvalidQuery)}
+            let reserved:Option<String>=tx.query_row("SELECT action_id FROM imessage_owner_action_leases WHERE token=?1",[event_token(&event)],|r|r.get(0)).optional()?;
+            if let Some(action)=reserved {
+                let finished:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM approval_history WHERE action_id=?1 AND surface='imessage'
+                    AND interaction_id=?2 AND finished_at IS NOT NULL)",params![action,format!("{}:{}:{}",event.binding_revision,event.guid,event.kind)],|r|r.get(0))?;
+                if !finished {return Err(rusqlite::Error::InvalidQuery)}
+                tx.execute("DELETE FROM imessage_owner_action_leases WHERE token=?1",[event_token(&event)])?;
+            }
             let count=tx.execute("UPDATE imessage_owner_events SET state='ignored',updated_at_ms=?3 WHERE revision=?1 AND guid=?2 AND state IN ('quarantined','uncertain')",
                 params![b.revision,guid,chrono::Utc::now().timestamp_millis()])?;
             tx.commit()?;Ok(count)
@@ -609,7 +614,7 @@ impl Store {
             let tx=c.unchecked_transaction()?;
             let Some(b)=binding(&tx)?.filter(|b|b.enabled) else {return Ok(None)};
             let row=tx.query_row("SELECT a.messageId,a.threadId,a.fromEmail,
-                COALESCE(a.envelopeSubject,a.subject),a.draftBody,e.platform,e.kind,e.body,e.receivedAt,e.accountEntityId,
+                COALESCE(a.envelopeSubject,a.subject),COALESCE(a.draftBody,''),e.platform,e.kind,e.body,e.receivedAt,e.accountEntityId,
                 COALESCE(NULLIF(a.recipientEmail,''),NULLIF(a.toEmails,''),a.fromEmail),
                 COALESCE(a.ccEmails,''),COALESCE(a.bccEmails,''),a.scheduledAtMs
                 FROM actions a JOIN emails e ON e.messageId=a.messageId
@@ -742,6 +747,36 @@ impl Store {
         self.with_conn(|c| snapshot(c, action))
     }
 
+    pub fn imessage_owner_cards_needing_status(&self) -> StoreResult<Vec<String>> {
+        self.with_conn(|c| {
+            let Some(b)=binding(c)?.filter(|b|b.enabled) else {return Ok(vec![])};
+            let mut stmt=c.prepare("SELECT DISTINCT a.id FROM imessage_owner_deliveries d JOIN actions a ON a.id=d.action_id
+                WHERE d.revision=?1 AND a.status!='pending' AND NOT EXISTS(SELECT 1 FROM imessage_owner_deliveries s
+                WHERE s.revision=d.revision AND s.origin_key='state:' || a.id || ':' || a.status)
+                ORDER BY a.id LIMIT 100")?;
+            let rows=stmt.query_map([b.revision],|r|r.get(0))?;rows.collect()
+        })
+    }
+    /// A status notification has no approval association; its guard only
+    /// prevents a stale state caption from being queued after a newer state.
+    pub fn enqueue_imessage_owner_state(
+        &self,
+        revision: i64,
+        action: &str,
+        status: &str,
+        digest: &str,
+        body: &str,
+        now: i64,
+    ) -> StoreResult<usize> {
+        self.enqueue_imessage_owner_output_inner(
+            revision,
+            &format!("state:{action}:{status}"),
+            body,
+            None,
+            Some((action, status, digest)),
+            now,
+        )
+    }
     /// Atomically enqueue all parts. A repeated origin is either identical or
     /// refused, never a different message hidden under an idempotency key.
     pub fn enqueue_imessage_owner_output(
@@ -750,6 +785,17 @@ impl Store {
         origin: &str,
         body: &str,
         card: Option<(&str, &str, &str)>,
+        now: i64,
+    ) -> StoreResult<usize> {
+        self.enqueue_imessage_owner_output_inner(revision, origin, body, card, None, now)
+    }
+    fn enqueue_imessage_owner_output_inner(
+        &self,
+        revision: i64,
+        origin: &str,
+        body: &str,
+        card: Option<(&str, &str, &str)>,
+        guard: Option<(&str, &str, &str)>,
         now: i64,
     ) -> StoreResult<usize> {
         if origin.is_empty()
@@ -762,6 +808,10 @@ impl Store {
         self.with_conn(|c| {
             let tx=c.unchecked_transaction()?;
             let Some(b)=binding(&tx)?.filter(|b|b.enabled && b.revision==revision) else {return Ok(0)};
+            if let Some((action,status,digest))=guard {
+                let current:Option<String>=tx.query_row("SELECT status FROM actions WHERE id=?1",[action],|r|r.get(0)).optional()?;
+                if current.as_deref()!=Some(status) || snapshot(&tx,action)?.as_deref()!=Some(digest) {return Ok(0)}
+            }
             let content_hash=format!("{:x}",Sha256::digest(body.as_bytes()));
             let digest=if let Some((action,draft,expected_digest))=card {
                 let current:Option<String>=tx.query_row("SELECT draftBody FROM actions WHERE id=?1

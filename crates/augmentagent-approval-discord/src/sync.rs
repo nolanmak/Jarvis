@@ -229,6 +229,13 @@ fn any_ok<T>(
 
 #[async_trait]
 impl ApprovalBroker for MultiSurfaceBroker {
+    async fn post_imessage_owner_health(&self,id:i64,status:&str)->Result<(),ApprovalError> {
+        let mut results=Vec::new();
+        for (name,broker) in &self.surfaces {
+            if broker.is_available() && broker.can_post_notices() {results.push((*name,broker.post_imessage_owner_health(id,status).await));}
+        }
+        any_ok("owner iMessage health",results).map(|_|())
+    }
     async fn post_owner_alert(&self,notice:&augmentagent_store::alert_schedule::AlertNotice)
         ->Result<String,ApprovalError> {
         let Some((_,discord))=self.surfaces.iter().find(|(name,_)|*name=="discord") else {

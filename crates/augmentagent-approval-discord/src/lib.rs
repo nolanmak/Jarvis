@@ -175,6 +175,9 @@ pub trait ApprovalBroker: Send + Sync {
     fn is_available(&self)->bool {true}
     /// A mirror may use Discord's native output IDs for generic notifications.
     fn can_post_notices(&self)->bool {true}
+    async fn post_imessage_owner_health(&self,id:i64,status:&str)->Result<(),ApprovalError> {
+        self.post_digest("iMessage delivery needs attention",&imessage_owner::health_description(id,status)).await
+    }
     async fn post_owner_alert(&self, _notice: &augmentagent_store::alert_schedule::AlertNotice)
         -> Result<String,ApprovalError> {
         Err(ApprovalError::Discord("owner alerts are not supported by this broker".into()))

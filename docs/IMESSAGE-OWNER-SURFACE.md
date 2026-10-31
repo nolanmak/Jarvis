@@ -42,7 +42,8 @@ the prose archive is not an authority source. Discord remains available during r
 6. Mirror every owner-visible application output on the configured Discord
    control/query surfaces, including notifications, cards, answers, progress,
    scheduled outcomes, and errors. Exclude third-party messages and internal
-   logs. Inventory direct Serenity posts as well as ApprovalBroker methods.
+   logs. Delivery-health fallbacks stay on Discord to avoid mirroring into the
+   failing transport. Inventory direct Serenity posts as well as ApprovalBroker methods.
    Deduplicate events by stable origin ID/revision and chunk index. Do not mirror
    mirrored content back into itself. Mirror failure must not block Discord.
 7. iMessage cannot edit a delivered card: append a compact resolution/update,
@@ -126,9 +127,11 @@ Needs-input/material-warning and existing refusal gates remain in effect.
 
 Owner recovery distinguishes input from delivery. `discard-input <event>` changes
 a quarantined/uncertain inbound receipt to ignored, retains its replay tombstone,
-and never releases it for execution. An input with an unresolved presentation
-reservation must first use the existing approval recovery path; discard refuses
-that case. Claimed work must first be stopped through
+and never releases it for execution. If the input holds a presentation
+reservation, discard requires a finished approval-history receipt for that exact
+native interaction and action before releasing the reservation. An unfinished or
+unconfirmed operation stays reserved until its provider outcome is reconciled;
+discard cannot manufacture completion evidence. Claimed work must first be stopped through
 the existing cancellation/journal recovery path. This operation neither settles
 nor retries an outbound delivery. An uncertain delivery is resolved only by a
 verified native GUID or a verified terminal rejection from the Mac sender; if
@@ -234,7 +237,13 @@ recent edit window, plus a rotating check of older known messages. Original mess
 edit can produce an update. Attachment URLs retain Discord's access/expiry rules;
 native iMessage media transfer is not included.
 
-A disabled mirror is excluded from fan-out success accounting. Generic notices
+A disabled mirror is excluded from fan-out success accounting. Action completion is also reconciled from stored state every fifteen seconds,
+including Mac sender and dashboard transitions that do not create a Discord
+message. State notifications validate their observed version atomically with
+queueing and never become approval targets. Failed/uncertain mirror deliveries
+produce a rate-limited Discord fallback with the dedicated “iMessage delivery
+status” footer. Ingress excludes that fallback from native mirroring, preventing
+a failure-notice loop; disabling/rebinding cancellations do not raise this alert. Generic notices
 use the real Discord ingress and cannot falsely count as a successful independent
 notification if Discord fails. Native cards still use the durable iMessage outbox.
 

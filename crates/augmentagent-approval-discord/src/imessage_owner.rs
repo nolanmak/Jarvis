@@ -16,6 +16,25 @@ pub fn owner_chat_active() -> bool {
     OWNER_CHAT.try_with(|v| *v).unwrap_or(false)
 }
 
+const HEALTH_FOOTER: &str = "iMessage delivery status";
+pub fn health_description(id: i64, status: &str) -> String {
+    format!("Owner iMessage output {id}: {status}. Inspect `augmentagent imessage owner status` and the Mac sender before retrying. Uncertain deliveries are never automatically resent. Discord remains available.")
+}
+pub fn health_message(id: i64, status: &str) -> serenity::all::CreateMessage {
+    serenity::all::CreateMessage::new()
+        .embed(
+            serenity::all::CreateEmbed::new()
+                .title("iMessage delivery needs attention")
+                .description(health_description(id, status))
+                .footer(serenity::all::CreateEmbedFooter::new(HEALTH_FOOTER)),
+        )
+        .nonce(serenity::all::Nonce::String(format!(
+            "owner-imessage-health-{id}"
+        )))
+        .enforce_nonce(true)
+        .allowed_mentions(serenity::all::CreateAllowedMentions::new())
+}
+
 pub const HELP:&str="Reply to a draft with approve, 👍, skip, or revise: your changes. Or use approve <ref>, skip <ref>, revise <ref>: changes. A native 👍 reaction approves only that exact pending draft. Revised drafts need fresh approval. Other card controls: fill <ref>: missing values; refine <ref>: preset-id; schedule <ref>: time; reschedule <ref>: time; send-now <ref>; cancel-schedule <ref>; back-to-queue <ref>; recompose <ref>; decline <ref> (calendar auto-RSVP). Send presets to list refinements. For ordinary questions, just text me.";
 
 /// Only owner-visible fields; transport metadata and component IDs stay private.
@@ -315,6 +334,15 @@ impl OwnerSurface {
         if !in_scope {
             return Ok(());
         }
+        // A failed delivery's fallback must not be mirrored into the same
+        // failing transport, recursively creating more failure notifications.
+        if message
+            .embeds
+            .iter()
+            .any(|e| e.footer.as_ref().is_some_and(|f| f.text == HEALTH_FOOTER))
+        {
+            return Ok(());
+        }
         let Some(binding) = self
             .store
             .imessage_owner_binding()
@@ -502,6 +530,15 @@ impl OwnerSurface {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .map_err(|e| ApprovalError::Discord(format!("owner iMessage queue: {e}")))?;
+        }
+        Ok(())
+    }
+    pub async fn reconcile_action_states(&self) -> anyhow::Result<()> {
+        if !self.active() {
+            return Ok(());
+        }
+        for action in self.store.imessage_owner_cards_needing_status()? {
+            self.redraw_cards(&action, "store-reconcile").await;
         }
         Ok(())
     }
@@ -1086,19 +1123,21 @@ impl ApprovalCardSurface for OwnerSurface {
                 let _ = self.post_card(id, &a.email, &draft);
             }
         } else {
+            let Ok(Some(p)) = self
+                .store
+                .imessage_owner_presentation_in_state(id, &a.action.status)
+            else {
+                return;
+            };
             let _ = self.post_state_card(id);
-            let _ = self.output(
-                self.store
-                    .imessage_owner_binding()
-                    .ok()
-                    .flatten()
-                    .map(|b| b.revision)
-                    .unwrap_or(0),
-                &format!("state:{id}:{}", a.action.status),
-                &format!(
-                    "{} · {}: {}.",
-                    a.email.subject, a.email.platform, a.action.status
-                ),
+            let body = format!("{} · {}: {}.", p.email.subject, p.email.platform, p.status);
+            let _ = self.store.enqueue_imessage_owner_state(
+                p.revision,
+                id,
+                &p.status,
+                &p.digest,
+                &body,
+                chrono::Utc::now().timestamp_millis(),
             );
         }
     }

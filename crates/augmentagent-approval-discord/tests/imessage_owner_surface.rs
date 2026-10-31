@@ -332,6 +332,20 @@ fn discord_output_is_owner_scoped_and_idempotent() {
     m.id = MessageId::new(m.id.get() + 1);
     surface.mirror_discord(&m, Some(10), None).unwrap();
     assert_eq!(s.list_imessage_outbox(100).unwrap().len(), 1);
+    m.author.id = UserId::new(99);
+    m.id = MessageId::new(m.id.get() + 1);
+    let health = serde_json::to_value(
+        augmentagent_approval_discord::imessage_owner::health_message(1, "unknown"),
+    )
+    .unwrap();
+    m.content = String::new();
+    m.embeds = serde_json::from_value(health["embeds"].clone()).unwrap();
+    surface.mirror_discord(&m, Some(10), None).unwrap();
+    assert_eq!(
+        s.list_imessage_outbox(100).unwrap().len(),
+        1,
+        "delivery health must not mirror into its own failing transport"
+    );
 }
 
 #[tokio::test]
@@ -421,4 +435,40 @@ async fn approvals_remain_available_during_a_long_query_and_a_large_chat_backlog
     assert_eq!(query.calls.load(Ordering::SeqCst), 1);
     query.release.notify_one();
     assert!(chat.await.unwrap());
+}
+
+#[tokio::test]
+async fn native_send_completion_is_reconciled_without_a_discord_event() {
+    let (s, surface, runtime, a, email) = fixture();
+    surface.post_card(&a, &email, "hello").unwrap();
+    let card = deliver(&s);
+    input(&s, 1, "like_add", "", Some(card));
+    surface
+        .dispatch_one(&runtime, &runtime, AuditCtx::empty())
+        .await
+        .unwrap();
+    surface.reconcile_action_states().await.unwrap();
+    assert_eq!(
+        s.get_action_with_email(&a).unwrap().unwrap().action.status,
+        "sending"
+    );
+    deliver(&s);
+    // The CLI completion adapter performs this transition after recording the
+    // primitive outbox receipt; no Discord event accompanies it.
+    s.update_action_status(&a, ActionStatus::Sent, None, None)
+        .unwrap();
+    assert_eq!(
+        s.get_action_with_email(&a).unwrap().unwrap().action.status,
+        "sent"
+    );
+    surface.reconcile_action_states().await.unwrap();
+    let count = s.list_imessage_outbox(100).unwrap().len();
+    surface.reconcile_action_states().await.unwrap();
+    assert_eq!(s.list_imessage_outbox(100).unwrap().len(), count);
+    let sent=s.with_conn(|c|c.query_row("SELECT o.body,d.action_id FROM imessage_owner_deliveries d JOIN imessage_outbox o ON o.id=d.outbox_id WHERE d.origin_key=?1",[format!("state:{a}:sent")],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))).unwrap();
+    assert!(sent.0.ends_with(": sent."));
+    assert!(
+        sent.1.is_none(),
+        "a resolution notice is not an approvable card"
+    );
 }

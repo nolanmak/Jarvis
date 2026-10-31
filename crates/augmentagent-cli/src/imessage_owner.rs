@@ -384,6 +384,9 @@ pub fn start_runtime(
             if tick % 3 != 1 {
                 continue;
             }
+            if let Err(error) = mirror.reconcile_action_states().await {
+                tracing::warn!("owner iMessage state reconciliation failed: {error}");
+            }
             let result = mirror.catch_up(&mirror_http, offset).await;
             let error = result.as_ref().err().map(ToString::to_string);
             let _ = mirror.store.report_imessage_owner_runtime(

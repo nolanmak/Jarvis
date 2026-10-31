@@ -498,6 +498,15 @@ pub(crate) async fn notify_outbox_failures(
         posted += 1;
     }
     for row in store.unnotified_imessage_outbox_failures()? {
+        if row.action_id.starts_with("owner-surface:") {
+            if matches!(row.error_detail.as_deref(),Some("owner surface disabled"|"owner binding changed")) {
+                store.mark_imessage_outbox_notified(row.id)?;continue;
+            }
+            if !store.claim_owner_text_failure_notice(now,600_000)? {continue;}
+            broker.post_imessage_owner_health(row.id,row.status.as_str()).await?;
+            store.mark_imessage_outbox_notified(row.id)?;posted+=1;continue;
+        }
+
         let Some(action) = store.get_action_with_email(&row.action_id)? else {
             if let Some(alert) = store.owner_alert_for_outbox(row.id)? {
                 let status = store.owner_alert_text_status(&alert.id)?.unwrap_or_default();
@@ -924,5 +933,31 @@ mod tests {
         assert!(posted.iter().any(|m| m.contains("imessage error 22")), "{posted:?}");
         assert!(posted.iter().any(|m| m.contains("may or may not")), "{posted:?}");
         assert_eq!(notify_outbox_failures(&f.store, &broker).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod owner_surface_failure_tests {
+    use super::*;
+    use augmentagent_store::Email;
+    #[tokio::test]
+    async fn an_owner_surface_failure_notifies_once_without_a_contact_action() {
+        let store=Store::open(":memory:").unwrap();
+        let b=store.bind_imessage_owner("owner-chat","owner@example.invalid",false,0).unwrap();
+        store.enqueue_imessage_owner_output(b.revision,"synthetic-notice","test",None,1).unwrap();
+        let item=store.claim_imessage_outbox().unwrap().unwrap();
+        store.complete_imessage_outbox(item.id,&ImessageSendOutcome::Unknown{reason:"synthetic uncertainty".into()}).unwrap();
+        struct Sink(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl augmentagent_approval_discord::ApprovalBroker for Sink {
+            async fn post_approval(&self,_:&str,_:&Email,_:&str)->Result<(),augmentagent_approval_discord::ApprovalError>{unreachable!()}
+            async fn post_flag_notice(&self,_:&Email,body:&str)->Result<(),augmentagent_approval_discord::ApprovalError>{
+                assert!(body.contains("uncertain")||body.contains("Uncertain"));self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(())
+            }
+        }
+        let sink=Sink(Default::default());
+        assert_eq!(notify_outbox_failures(&store,&sink).await.unwrap(),1);
+        assert_eq!(notify_outbox_failures(&store,&sink).await.unwrap(),0);
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst),1);
     }
 }

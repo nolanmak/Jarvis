@@ -452,3 +452,68 @@ fn claim(s: &Store, now: i64) -> augmentagent_store::StoreResult<Option<OwnerEve
     }
     s.claim_imessage_owner_event(now)
 }
+
+#[test]
+fn a_stale_status_caption_cannot_follow_a_newer_action_state() {
+    let s = Store::open(":memory:").unwrap();
+    let rev = bind(&s, 0);
+    let a = action(&s);
+    let p = s.imessage_owner_presentation(&a).unwrap().unwrap();
+    s.update_action_status(&a, augmentagent_store::ActionStatus::Sent, None, None)
+        .unwrap();
+    assert_eq!(
+        s.enqueue_imessage_owner_state(rev, &a, "pending", &p.digest, "still pending", 1)
+            .unwrap(),
+        0
+    );
+    assert!(s.list_imessage_outbox(100).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn discarding_a_reserved_control_requires_its_exact_finished_operation_receipt() {
+    use augmentagent_store::approval_history::DecisionContext;
+    let s = Store::open(":memory:").unwrap();
+    let rev = bind(&s, 0);
+    let a = action(&s);
+    let p = s.imessage_owner_presentation(&a).unwrap().unwrap();
+    output(&s, "card", "hello", Some((&a, "hello", &p.digest)), 1).unwrap();
+    deliver(&s);
+    let e = event(rev, 1);
+    s.accept_imessage_owner_events(rev, 1, &[e.clone()], 2)
+        .unwrap();
+    claim(&s, 3).unwrap();
+    s.lease_imessage_owner_action(&e, Some(&p.reference), None)
+        .unwrap();
+    let seq = augmentagent_store::imessage_owner::with_owner_decision(&e, async {
+        let ctx = DecisionContext {
+            surface: "imessage".into(),
+            actor: e.sender.clone(),
+            conversation: e.chat_guid.clone(),
+            interaction_id: format!("{}:{}:{}", rev, e.guid, e.kind),
+            revision: None,
+        };
+        s.begin_approval(
+            &a,
+            &ctx,
+            "revise",
+            "fixture",
+            "fixture",
+            "Synthetic revision",
+        )
+        .unwrap()
+        .unwrap()
+    })
+    .await;
+    s.interrupt_imessage_owner_events(4).unwrap();
+    assert!(s.discard_imessage_owner_input(&e.guid).is_err());
+    s.finish_approval(seq, "completed", "Synthetic handler completed before crash")
+        .unwrap();
+    assert_eq!(s.discard_imessage_owner_input(&e.guid).unwrap(), 1);
+    assert!(s
+        .revise_pending_action(&a, "fresh owner-authorized revision")
+        .unwrap());
+    assert!(
+        claim(&s, 5).unwrap().is_none(),
+        "the retired command never replays"
+    );
+}
