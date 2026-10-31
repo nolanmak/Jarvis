@@ -313,8 +313,14 @@ fn owner_contact_defaults_cover_future_handles_and_persist_explicit_exclusions()
     store.set_imessage_contact_defaults(true, true).unwrap();
     assert!(store.is_imessage_outbound_allowed(HANDLE).unwrap());
     assert!(store.is_imessage_inbound_allowed("future@example.com").unwrap());
-    assert!(!store.is_imessage_outbound_allowed("chat123456").unwrap());
+    // #1738 — groups follow the defaults by chat identifier; guids never do.
+    assert!(store.is_imessage_outbound_allowed("chat123456").unwrap());
+    assert!(store.is_imessage_inbound_allowed("01052e1cb4f44dba881fe97c5729e1ca").unwrap());
     assert!(!store.is_imessage_outbound_allowed("iMessage;+;chat123456").unwrap());
+    assert!(!store.is_imessage_outbound_allowed("any;+;01052e1cb4f44dba881fe97c5729e1ca").unwrap());
+    assert!(!store.is_imessage_outbound_allowed("chat").unwrap());
+    store.deny_imessage_inbound("chat123456").unwrap();
+    assert!(!store.is_imessage_inbound_allowed("chat123456").unwrap());
     store.deny_imessage_outbound(HANDLE).unwrap();
     assert!(!store.is_imessage_outbound_allowed(HANDLE).unwrap());
     assert!(store.is_imessage_inbound_allowed(HANDLE).unwrap());

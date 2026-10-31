@@ -387,7 +387,8 @@ impl Store {
         })
     }
 
-    /// Owner-selected defaults apply to existing and future direct handles.
+    /// Owner-selected defaults apply to existing and future direct handles
+    /// and group chats (#1738).
     /// Compose/approve still validate the bundle, service and global send switch.
     pub fn set_imessage_contact_defaults(&self, inbound: bool, outbound: bool) -> StoreResult<()> {
         self.with_conn(|c| {
@@ -435,7 +436,11 @@ impl Store {
     }
 
     fn is_imessage_allowed(&self, outbound: bool, identifier: &str) -> StoreResult<bool> {
-        let direct = identifier.strip_prefix('+').is_some_and(|digits| {
+        // #1738 — owner defaults cover groups too (by chat identifier:
+        // `chat<digits>` or a 32-hex id), never a raw guid or malformed id.
+        let group = identifier.strip_prefix("chat").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            || (identifier.len() == 32 && identifier.bytes().all(|b| b.is_ascii_hexdigit()));
+        let direct = group || identifier.strip_prefix('+').is_some_and(|digits| {
             (8..=15).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
         }) || (identifier.contains('@')
             && !identifier.contains(';')

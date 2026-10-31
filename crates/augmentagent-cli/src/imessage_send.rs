@@ -66,12 +66,9 @@ impl ReplyApprover {
             Ok(t) => t,
             Err(e) => return failed(format!("cannot send: {e}")),
         };
-        let allowed = if target.kind == augmentagent_store::ImessageTargetKind::ChatGuid {
-            // Contact defaults never opt groups in.
-            self.store.list_imessage_allowlist(true).map(|ids| ids.contains(&target.conversation))
-        } else {
-            self.store.is_imessage_outbound_allowed(&target.conversation)
-        };
+        // Keyed on the chat identifier for groups too, so owner defaults and
+        // denials apply the same way (#1738); the guid is only the target.
+        let allowed = self.store.is_imessage_outbound_allowed(&target.conversation);
         match allowed {
             Ok(true) => {}
             Ok(false) => {
@@ -416,7 +413,7 @@ pub(crate) fn set_allowlist(
 
 pub(crate) fn print_allowlists(store: &Store) -> anyhow::Result<()> {
     for (label, outbound) in [("outbound", true), ("inbound", false)] {
-        println!("{label} defaults\t{}", if store.imessage_contact_default(outbound)? { "all one-to-one iMessage contacts (approval required for sends)" } else { "explicit allowlist only" });
+        println!("{label} defaults\t{}", if store.imessage_contact_default(outbound)? { "all iMessage conversations, groups included (approval required for sends)" } else { "explicit allowlist only" });
         for id in store.list_imessage_denials(outbound)? {
             println!("{label} denied\t{id}");
         }
@@ -751,11 +748,6 @@ mod tests {
         let msg = failed_message(f.approver.run_approve(&id).await);
         assert!(msg.contains("allow-outbound chat901"), "{msg}");
         assert_eq!(outbox_len(&f.store), 0);
-        // #1738 — contact defaults cover 1:1 handles only, never a group.
-        f.store.set_imessage_contact_defaults(true, true).unwrap();
-        let msg = failed_message(f.approver.run_approve(&id).await);
-        assert!(msg.contains("allow-outbound chat901"), "{msg}");
-        assert_eq!(outbox_len(&f.store), 0);
         f.store.allow_imessage_outbound("chat901").unwrap();
         assert!(matches!(
             f.approver.run_approve(&id).await,
@@ -764,6 +756,22 @@ mod tests {
         let row = f.store.list_imessage_outbox(1).unwrap().remove(0);
         assert_eq!(row.target, "any;+;chat901");
         assert_eq!(row.target_kind, ImessageTargetKind::ChatGuid);
+    }
+
+    #[tokio::test]
+    async fn owner_defaults_let_a_group_send_by_guid_unless_denied() {
+        let f = fixture(true);
+        f.store.set_imessage_contact_defaults(true, true).unwrap();
+        f.store.deny_imessage_outbound("chat901").unwrap();
+        let id = seed(&f.store, "chat901", "see you all there");
+        let msg = failed_message(f.approver.run_approve(&id).await);
+        assert!(msg.contains("allow-outbound chat901"), "{msg}");
+        assert_eq!(outbox_len(&f.store), 0);
+        f.store.allow_imessage_outbound("chat901").unwrap(); // lifts the denial
+        f.store.deny_imessage_outbound(PHONE).unwrap();
+        assert!(matches!(f.approver.run_approve(&id).await, ApprovalActionOutcome::Approved));
+        let row = f.store.list_imessage_outbox(1).unwrap().remove(0);
+        assert_eq!((row.target.as_str(), row.target_kind), ("any;+;chat901", ImessageTargetKind::ChatGuid));
     }
 
     #[tokio::test]
