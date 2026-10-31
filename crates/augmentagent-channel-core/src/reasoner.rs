@@ -2108,6 +2108,19 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // session's `/tmp/aa-imsg/<session>/` (allowlist + 25 MB cap in the CLI). Only this verb: `sync --apply` writes.
     let bash_imessage_fetch_abs = format!("Bash({} imessage fetch-attachment *)", bin.display());
     let bash_imessage_fetch_bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
+    // #1635 — `imessage compose --to … --body … --post` starts a text to a
+    // person as an approval card. Same safety argument as `socialapi dm` and
+    // `gmail compose --post`: the verb never touches Messages; its only
+    // externally visible effect is one card in the approval channel, and it
+    // refuses before storing anything unless the conversation is on
+    // `allow-outbound` and the kill-switch is set. Deliberately NOT
+    // `imessage *`: that would also hand the agent `approve`, `allow-outbound`,
+    // `alerts` and `outbox complete`. `imessage allowlist` is read-only and
+    // lets the agent explain a refusal instead of guessing.
+    let bash_imessage_compose_abs = format!("Bash({} imessage compose *)", bin.display());
+    let bash_imessage_compose_bare = "Bash(augmentagent imessage compose *)".to_string();
+    let bash_imessage_allowlist_abs = format!("Bash({} imessage allowlist)", bin.display());
+    let bash_imessage_allowlist_bare = "Bash(augmentagent imessage allowlist)".to_string();
     // #1061 — the same for the Apple Notes bundle, into the same session dir.
     let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
     let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
@@ -2355,6 +2368,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_comment_bare,
             bash_imessage_fetch_abs,
             bash_imessage_fetch_bare,
+            bash_imessage_compose_abs,
+            bash_imessage_compose_bare,
+            bash_imessage_allowlist_abs,
+            bash_imessage_allowlist_bare,
             bash_notes_fetch_abs,
             bash_notes_fetch_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
