@@ -125,6 +125,8 @@ async fn prepare_at(
                 gaps: Vec::new(),
                 reads: Vec::new(),
                 complete: false,
+                elapsed_ms: 0,
+                model_decisions: 0,
             },
             receipt_id: String::new(),
         });
@@ -198,5 +200,6 @@ fn receipt(seed: &ContextSeed, evidence: &EvidenceOutcome) -> Value {
         })).collect::<Vec<_>>(),
         "fact_sources":evidence.facts.iter().map(|f|&f.source_ids).collect::<Vec<_>>(),
         "gaps":evidence.gaps,"review_finished":evidence.complete,
+        "elapsed_ms":evidence.elapsed_ms,"model_decisions":evidence.model_decisions,"source_operations":evidence.reads.len(),
     })
 }

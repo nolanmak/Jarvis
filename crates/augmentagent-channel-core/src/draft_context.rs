@@ -109,7 +109,7 @@ fn load_seed_at(
     latest: bool,
 ) -> anyhow::Result<ContextSeed> {
     let mut seed = ContextSeed {
-        audience: serde_json::json!({"platform":current.platform,"kind":current.kind,"thread_id":current.thread_id,"trigger_message_id":current.message_id,"to":current.to,"cc":current.cc}),
+        audience: serde_json::json!({"platform":current.platform,"account_id":current.account_entity_id,"kind":current.kind,"thread_id":current.thread_id,"trigger_message_id":current.message_id,"to":current.to,"cc":current.cc,"audience_note":"The sender identity is not a complete participant list. Preserve the platform thread and explicit To/CC; do not infer a private one-to-one audience from kind or sender alone."}),
         messages: Vec::new(),
         person_slug: None,
         wiki: Vec::new(),

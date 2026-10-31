@@ -78,6 +78,10 @@ pub struct EvidenceOutcome {
     pub gaps: Vec<String>,
     pub reads: Vec<EvidenceRead>,
     pub complete: bool,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub model_decisions: usize,
 }
 
 const CONTRACT: &str = r#"You select evidence for a messaging draft; you do not write or send it.
@@ -107,6 +111,8 @@ pub async fn gather(
         gaps: Vec::new(),
         reads: Vec::new(),
         complete: false,
+        elapsed_ms: 0,
+        model_decisions: 0,
     };
     let mut readable: BTreeSet<String> =
         seed.messages.iter().map(|m| m.message_id.clone()).collect();
@@ -132,6 +138,7 @@ pub async fn gather(
             break;
         }
         let remaining = std::time::Duration::from_secs(90).saturating_sub(started.elapsed());
+        out.model_decisions += 1;
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
         let raw = match response {
             Ok(Ok(raw)) => raw,
@@ -167,6 +174,7 @@ pub async fn gather(
                 out.facts = facts;
                 out.gaps.extend(gaps);
                 out.complete = true;
+                out.elapsed_ms = started.elapsed().as_millis() as u64;
                 return out;
             }
             EvidenceDecision::Search {
@@ -223,7 +231,9 @@ pub async fn gather(
             EvidenceDecision::SearchWiki { query, reason } => {
                 let result = match wiki_root {
                     Some(root) => match augmentagent_wiki::search::search(root, &query) {
-                        Ok(result) => serde_json::to_value(result).unwrap_or(Value::Null),
+                        Ok(result) => {
+                            json!({"paths":result.paths,"incomplete":result.incomplete,"interpreted_as":query})
+                        }
                         Err(_) => json!({"error":"Wiki search unavailable"}),
                     },
                     None => json!({"error":"Wiki unavailable"}),
@@ -252,6 +262,7 @@ pub async fn gather(
         out.gaps
             .push("Retrieval step limit reached; evidence review unfinished".into());
     }
+    out.elapsed_ms = started.elapsed().as_millis() as u64;
     out
 }
 
