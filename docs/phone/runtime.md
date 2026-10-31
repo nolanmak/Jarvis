@@ -191,7 +191,7 @@ cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnin
 The runner produces `target/phone-offline/receipt.json` and per-suite logs. It
 rejects missing targets, zero/insufficient executed tests, skipped required tests
 and nonzero exits. Entire integration targets must be unfiltered; explicitly
-named CLI test modules may filter only unrelated tests in the shared binary. `.github/workflows/phone.yml` runs the required targets on
+named CLI test modules may filter only unrelated tests in the shared binary. The `channels` job in `.github/workflows/rust.yml` runs the required targets on
 Linux and macOS. A workflow definition is not a passing CI run; neither offline
 CI nor local sockets substitute for the issue's live acceptance matrix.
 

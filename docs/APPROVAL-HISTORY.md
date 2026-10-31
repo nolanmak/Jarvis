@@ -87,7 +87,7 @@ cargo test -p augmentagent-cli --bin augmentagent calendar_approval_tests
 cargo test -p augmentagent-approval-discord -p augmentagent-channel-slack -p augmentagent-channel-whatsapp
 ```
 
-`.github/workflows/approval-history.yml` runs the deterministic regression gate.
+The `channels` job in `.github/workflows/rust.yml` runs the deterministic regression gate.
 The Calendar live self-invite procedure in `CALENDAR-CREATE-QA.md` exercises the
 same approver against Google. Its diagnostic accounts must belong to the owner;
 external meeting participants must not be used for QA. Record provider readback,

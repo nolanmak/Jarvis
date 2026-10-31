@@ -10,7 +10,8 @@ ROOT=Path(__file__).resolve().parents[1]
 CONTRACT=ROOT/'scripts/ci-contract.json'
 EXCLUDED={'autonomous-code-scanner.yml':'scheduled autonomous scanner and issue reporting',
           'issue-to-pr.yml':'issue-driven implementation and publication, not PR validation',
-          'claude-pr-review.yml':'optional comment-only external review'}
+          'claude-pr-review.yml':'optional comment-only external review',
+          'rust-cache.yml':'main-branch Rust dependency cache warming, not PR validation'}
 
 PR_CONCURRENCY = {
  'group': "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}",
