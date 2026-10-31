@@ -1041,9 +1041,13 @@ mod tests {
     impl augmentagent_channel_core::Reasoner for ReviseFixture {
         async fn call(
             &self,
-            _: &augmentagent_channel_core::reasoner::ReasonerOpts,
+            opts: &augmentagent_channel_core::reasoner::ReasonerOpts,
             prompt: &str,
         ) -> anyhow::Result<String> {
+            if opts.system_prompt.contains("You select evidence") {
+                assert!(prompt.contains("hello world") && prompt.contains("make it warmer"));
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             assert!(prompt.contains("editing an iMessage text"));
             assert!(prompt.contains("<previous_draft>\nhello world\n</previous_draft>"));
             assert!(prompt.contains("make it warmer"));
@@ -1075,6 +1079,7 @@ mod tests {
         );
         let row = f.store.get_action_with_email(&action_id).unwrap().unwrap();
         assert_eq!(row.action.draft_body.as_deref(), Some("hello world!"));
+        assert_eq!(f.store.draft_context_receipts(&action_id).unwrap().len(), 1);
         assert_eq!(row.email.kind, "compose");
         f.store
             .mark_pending_superseded_by_ids(&[action_id.clone()], "synthetic replacement")

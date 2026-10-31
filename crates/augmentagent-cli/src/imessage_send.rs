@@ -553,7 +553,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Reasoner for Redraft {
-        async fn call(&self, _o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+        async fn call(&self, opts: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+            if opts.system_prompt.contains("You select evidence") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             Ok("a better reply".into())
         }
     }
@@ -821,6 +824,7 @@ mod tests {
         let a = f.store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(a.action.status, "pending");
         assert_eq!(a.action.draft_body.as_deref(), Some("a better reply"));
+        assert_eq!(f.store.draft_context_receipts(&id).unwrap().len(), 1);
         assert_eq!(outbox_len(&f.store), 0);
     }
 

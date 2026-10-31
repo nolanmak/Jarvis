@@ -133,8 +133,27 @@ async fn live_cross_platform_fact_changes_draft_and_missing_source_is_disclosed(
             .all(|f| !f.source_ids.iter().any(|s| s == "synthetic-email")),
         "cited missing email"
     );
+    let missing_draft = reasoner
+        .call(
+            &options,
+            &format!("Incoming text: {}\n{}", inbound.body, missing.prompt()),
+        )
+        .await
+        .unwrap();
+    let lower = missing_draft.to_lowercase();
+    assert!(
+        missing_draft.contains('?')
+            || lower.contains("resend")
+            || lower.contains("could you")
+            || lower.contains("unable to confirm"),
+        "Missing evidence did not produce a clarification: {missing_draft}"
+    );
+    let guarded = missing.guard_draft(&missing_draft);
+    assert!(!augmentagent_approval_discord::split_needs_input(&guarded)
+        .1
+        .is_empty());
     println!(
-        "missing-evidence: material gap disclosed; {} reads",
+        "missing-evidence: clarification draft and material card gap; {} reads",
         missing.evidence.reads.len()
     );
 }
