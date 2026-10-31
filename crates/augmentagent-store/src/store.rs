@@ -171,7 +171,7 @@ const COMPACTABLE_BODY_FROM: &str = "FROM actions a \
       AND e.body = a.originalBody";
 
 pub struct Store {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     path: std::path::PathBuf,
 }
 
@@ -1228,6 +1228,8 @@ impl Store {
         if !column_exists(conn, "emails", "retryGuardContext")? {
             conn.execute("ALTER TABLE emails ADD COLUMN retryGuardContext TEXT", [])?;
         }
+        // #1699 — after retryGuardContext: the backfill reads it.
+        crate::recipients::migrate(conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS email_guard_observations (
             id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT NOT NULL,
             attempt_n INTEGER NOT NULL, guard TEXT NOT NULL, disposition TEXT NOT NULL,
@@ -2738,6 +2740,8 @@ impl Store {
                 ],
             )?;
             guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
+            let (to_addrs, cc_addrs) = crate::recipients::columns(&email.platform, &email.to, &email.cc);
+            guard.execute("UPDATE emails SET toAddrs = ?2, ccAddrs = ?3 WHERE messageId = ?1", params![email.message_id, to_addrs, cc_addrs])?;
             Ok(false)
         } else {
             let now = now_millis();
@@ -2758,6 +2762,8 @@ impl Store {
                 ],
             )?;
             guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
+            let (to_addrs, cc_addrs) = crate::recipients::columns(&email.platform, &email.to, &email.cc);
+            guard.execute("UPDATE emails SET toAddrs = ?2, ccAddrs = ?3 WHERE messageId = ?1", params![email.message_id, to_addrs, cc_addrs])?;
             Ok(true)
         }
     }
