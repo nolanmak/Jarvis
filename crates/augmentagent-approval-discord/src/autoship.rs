@@ -12,6 +12,8 @@ pub struct Context {
     pub guild: Option<u64>,
 }
 
+pub struct UncertainAcknowledgement {pub context:Context,pub reply:Reply}
+
 pub struct UncertainProgress {pub delivery:ProgressDelivery,pub nonce:String,pub content:String}
 
 pub struct ProgressDelivery {pub context:Context,pub workflow:String,pub sequence:i64}
@@ -26,6 +28,7 @@ pub struct Reply {
 pub trait Transport: Send + Sync {
     async fn verify_owner_dm(&self, context: &Context) -> Result<bool>;
     async fn send(&self, context: &Context, reply: &Reply) -> Result<u64>;
+    async fn find_acknowledgement(&self,_context:&Context,_reply:&Reply)->Result<Option<u64>> {Ok(None)}
     async fn find_progress(&self,_context:&Context,_nonce:&str,_content:&str)->Result<Option<u64>> {Ok(None)}
 }
 
@@ -66,6 +69,18 @@ pub struct DiscordTransport(pub std::sync::Arc<serenity::http::Http>);
 pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport, bot: u64, owner: u64) -> Result<usize> {
     anyhow::ensure!(bot > 0 && owner > 0, "autoship recovery identity missing");
     let mut delivered = 0;
+    for uncertain in handler.autoship_ack_uncertain(bot,owner)? {
+        let context=&uncertain.context;
+        if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 || context.message==0 {continue;}
+        let attempt=async {
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            let Some(message)=transport.find_acknowledgement(context,&uncertain.reply).await? else {return Ok(false);};
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            handler.autoship_acknowledged(context,message)?;
+            Ok::<_,anyhow::Error>(true)
+        }.await;
+        match attempt {Ok(true)=>delivered+=1,Ok(false)=>{},Err(_)=>tracing::warn!("autoship acknowledgement reconciliation unavailable; delivery remains uncertain")}
+    }
     for uncertain in handler.autoship_progress_uncertain(bot,owner)? {
         let delivery=&uncertain.delivery;let context=&delivery.context;
         if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 {continue;}
@@ -113,6 +128,16 @@ pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport,
     Ok(delivered)
 }
 
+impl DiscordTransport {
+    async fn find_exact_message(&self,context:&Context,content:&str)->Result<Option<u64>> {
+        let messages=tokio::time::timeout(std::time::Duration::from_secs(15),
+            serenity::all::ChannelId::new(context.channel).messages(&self.0,serenity::all::GetMessages::new().limit(100))).await??;
+        let mut matches=messages.iter().filter(|m|m.channel_id.get()==context.channel && m.author.id.get()==context.bot && m.author.bot && m.content==content && m.id.get()>0);
+        let found=matches.next().map(|m|m.id.get());
+        Ok(if matches.next().is_some() {None} else {found})
+    }
+}
+
 #[async_trait::async_trait]
 impl Transport for DiscordTransport {
     async fn verify_owner_dm(&self, context: &Context) -> Result<bool> {
@@ -126,12 +151,14 @@ impl Transport for DiscordTransport {
     async fn find_progress(&self,context:&Context,nonce:&str,content:&str)->Result<Option<u64>> {
         anyhow::ensure!(!nonce.is_empty() && nonce.len()<=64 && nonce.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-'),"invalid progress marker");
         anyhow::ensure!(content.contains(&format!("[autoship:{nonce}]")),"progress marker missing from stored content");
-        let messages=tokio::time::timeout(std::time::Duration::from_secs(15),
-            serenity::all::ChannelId::new(context.channel).messages(&self.0,serenity::all::GetMessages::new().limit(100))).await??;
-        let mut matches=messages.iter().filter(|m|m.channel_id.get()==context.channel && m.author.id.get()==context.bot && m.author.bot && m.content==content && m.id.get()>0);
-        let found=matches.next().map(|m|m.id.get());
-        Ok(if matches.next().is_some() {None} else {found})
+        self.find_exact_message(context,content).await
     }
+    async fn find_acknowledgement(&self,context:&Context,reply:&Reply)->Result<Option<u64>> {
+        anyhow::ensure!(reply.nonce.is_some(),"acknowledgement lacks durable nonce");
+        anyhow::ensure!(reply.content.ends_with(&format!("Request: discord:{}:{}",context.bot,context.message)),"acknowledgement request marker mismatch");
+        self.find_exact_message(context,&reply.content).await
+    }
+
     async fn send(&self, context: &Context, reply: &Reply) -> Result<u64> {
         use serenity::all::{ChannelId, CreateAllowedMentions, CreateMessage, Nonce};
         let mut request = CreateMessage::new().content(&reply.content).allowed_mentions(
@@ -180,6 +207,18 @@ mod tests {
     fn handler(bound: bool) -> Handler { Handler { bound, claimed: AtomicBool::new(false), calls: AtomicUsize::new(0), confirmed: AtomicUsize::new(0) } }
     fn wire(verified: bool, fail: bool) -> Wire { Wire { verified, fail, sends: AtomicUsize::new(0) } }
 
+    #[tokio::test]
+    async fn acknowledgement_history_is_bound_to_its_original_request() {
+        let mut server=mockito::Server::new_async().await;
+        let http=serenity::http::HttpBuilder::new("test-only-token").proxy(server.url()).ratelimiter_disabled(true).build();
+        let transport=DiscordTransport(std::sync::Arc::new(http));
+        let reply=Reply {content:"Autoship pause recorded. Request: discord:11:44".into(),nonce:Some("durable-nonce".into())};
+        let wrong=Context {message:45,..context()};
+        assert!(transport.find_acknowledgement(&wrong,&reply).await.is_err());
+        let message=serde_json::json!({"id":"55","channel_id":"33","author":{"id":"11","username":"fixture","discriminator":"0","avatar":null,"bot":true},"content":reply.content,"timestamp":"2026-10-31T00:00:00+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0});
+        let mock=server.mock("GET","/api/v10/channels/33/messages").match_query(mockito::Matcher::UrlEncoded("limit".into(),"100".into())).with_status(200).with_header("content-type","application/json").with_body(serde_json::json!([message]).to_string()).create_async().await;
+        assert_eq!(transport.find_acknowledgement(&context(),&reply).await.unwrap(),Some(55));mock.assert_async().await;
+    }
     #[tokio::test]
     async fn unavailable_history_never_fabricates_a_delivery_receipt() {
         let mut server=mockito::Server::new_async().await;

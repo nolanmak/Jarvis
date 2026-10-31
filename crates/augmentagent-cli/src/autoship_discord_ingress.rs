@@ -40,6 +40,25 @@ fn ack_table(conn:&Connection,id:&str)->Result<Option<&'static str>> {
     Ok(found)
 }
 impl WorkflowStore {
+    pub fn uncertain_discord_acks(&self,bot:u64,owner:u64)->Result<Vec<(DiscordOrigin,DiscordReply)>> {
+        ensure!(bot>0 && owner>0,"Discord recovery identity missing");
+        let mut pending=Vec::new();
+        for table in ["discord_command_ingress","discord_control_request"] {
+            let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[table],|r|r.get(0))?;
+            if !exists {continue;}
+            let query=if table=="discord_command_ingress" {"SELECT i.origin,i.response,i.request_id FROM discord_command_ingress i JOIN command_request r ON r.request_id=i.request_id WHERE i.state='uncertain' AND r.principal=?1 ORDER BY i.created_at,i.request_id LIMIT 128"}
+                else {"SELECT origin,response,request_id FROM discord_control_request WHERE state='uncertain' AND principal=?1 ORDER BY created_at,request_id LIMIT 128"};
+            let mut stmt=self.conn.prepare(query)?;
+            let rows=stmt.query_map([format!("discord:{bot}:{owner}")],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?;
+            for row in rows {
+                let (origin,response,id)=row?;let origin:DiscordOrigin=serde_json::from_str(&origin)?;let response:DiscordReply=serde_json::from_str(&response)?;
+                origin.validate()?;ensure!(origin.bot==bot && origin.owner==owner && origin.request_id()==id && response.request_id==id,"Discord recovery identity mismatch");
+                ensure!(ack_table(&self.conn,&id)?==Some(table),"Discord recovery identity collision");
+                pending.push((origin,response));
+            }
+        }
+        Ok(pending)
+    }
     pub fn queued_discord_acks(&self,bot:u64,owner:u64)->Result<Vec<DiscordOrigin>> {
         ensure!(bot>0 && owner>0,"Discord recovery identity missing");
         let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_command_ingress')",[],|r|r.get(0))?;
@@ -157,6 +176,22 @@ mod tests {
     use crate::autoship_workflow::submission::{Milestone,Provider,Target};
     fn origin()->DiscordOrigin {DiscordOrigin {bot:11,owner:22,channel:33,message:44}}
     fn request()->Request {Request {repository:"owner/repo".into(),target:Target::Pr(42),provider:Some(Provider::Codex),until:Milestone::Merged}}
+    #[test]
+    fn uncertain_admission_and_control_replies_recover_without_reapplying_commands() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id=store.submit_discord_authorized(&origin(),&request(),&"a".repeat(64),1).unwrap().admission.workflow;
+        let mut control_origin=origin();control_origin.message=45;
+        store.commit_discord_control(&control_origin,&"b".repeat(64),&super::super::discord_controls::PreparedControl {workflow:id.clone(),action:super::super::discord_controls::Action::Pause,explicit:true,revision:0,refusal:None,status:None},2).unwrap();
+        store.claim_discord_ack(&origin(),3).unwrap();store.claim_discord_ack(&control_origin,4).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let pending=store.uncertain_discord_acks(11,22).unwrap();assert_eq!(pending.len(),2,"lost admission/control acknowledgements are invisible to recovery");
+        assert!(store.uncertain_discord_acks(11,99).unwrap().is_empty());
+        for (context,reply) in pending {assert_eq!(context.request_id(),reply.request_id);store.confirm_discord_ack(&context,55+context.message,5).unwrap();}
+        assert!(store.uncertain_discord_acks(11,22).unwrap().is_empty());
+        assert_eq!(store.owner_control(&id).unwrap().unwrap().revision,1);
+        assert!(store.claim_discord_ack(&control_origin,6).unwrap().is_none());
+    }
     #[test]
     fn discord_ingress_rolls_back_job_binding_and_request_when_ack_cannot_commit() {
         let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();

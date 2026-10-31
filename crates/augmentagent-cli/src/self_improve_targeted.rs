@@ -411,6 +411,7 @@ mod tests {
             #[async_trait::async_trait]
             impl QueryHandler for Adapter {
                 async fn answer(&self,_:&augmentagent_approval_discord::AuditCtx,_:&str)->Result<String> {panic!("autoship reached ordinary chat")}
+                fn autoship_ack_uncertain(&self,b:u64,o:u64)->Result<Vec<gateway::UncertainAcknowledgement>> {crate::autoship_discord_command::ack_uncertain(&self.path,b,o)}
                 fn autoship_progress_uncertain(&self,b:u64,o:u64)->Result<Vec<gateway::UncertainProgress>> {if self.progress.load(std::sync::atomic::Ordering::SeqCst) {crate::autoship_discord_command::progress_uncertain(&self.path,b,o)} else {Ok(Vec::new())}}
                 fn autoship_progress_pending(&self,b:u64,o:u64)->Result<Vec<gateway::ProgressDelivery>> {if self.progress.load(std::sync::atomic::Ordering::SeqCst) {crate::autoship_discord_command::progress_pending(&self.path,b,o)} else {Ok(Vec::new())}}
                 fn autoship_progress_claim(&self,d:&gateway::ProgressDelivery)->Result<Option<gateway::Reply>> {crate::autoship_discord_command::progress_claim(&self.path,d)}
@@ -427,6 +428,7 @@ mod tests {
             #[async_trait::async_trait]
             impl gateway::Transport for Wire {
                 async fn verify_owner_dm(&self,_:&gateway::Context)->Result<bool> {Ok(true)}
+                async fn find_acknowledgement(&self,_:&gateway::Context,_:&gateway::Reply)->Result<Option<u64>> {Ok(self.2.load(std::sync::atomic::Ordering::SeqCst).then_some(55))}
                 async fn find_progress(&self,_:&gateway::Context,_:&str,_:&str)->Result<Option<u64>> {Ok(self.2.load(std::sync::atomic::Ordering::SeqCst).then_some(55))}
                 async fn send(&self,_:&gateway::Context,r:&gateway::Reply)->Result<u64> {
                     self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
@@ -509,6 +511,21 @@ mod tests {
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),10,"reconciliation must never send another message");
             let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
             assert_eq!(store.progress_delivery(&discord.admission.workflow).unwrap().state,"delivery-confirmed");
+            drop(store);adapter.progress.store(false,std::sync::atomic::Ordering::SeqCst);
+            wire.2.store(false,std::sync::atomic::Ordering::SeqCst);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(105),"!autoship pause").await.is_err());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let revision=store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision;
+            assert_eq!(store.uncertain_discord_acks(11,22).unwrap().len(),1);drop(store);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
+            wire.2.store(true,std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),1);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),11);
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert!(store.uncertain_discord_acks(11,22).unwrap().is_empty());
+            assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision);
+
 
 
 
