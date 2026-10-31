@@ -77,3 +77,13 @@ fn window_orders_instants_not_offset_strings_and_reports_missing_timestamp() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn context_source_restores_normalized_recipients_without_retry_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    store.with_conn(|c|c.execute("INSERT INTO emails(messageId,fromEmail,subject,body,firstSeenAt,platform,kind,toAddrs,ccAddrs) VALUES ('source','peer@example.invalid','test','body',1,'gmail','dm',?1,?2)", params![r#"["owner@example.invalid"]"#,r#"["collaborator@example.invalid"]"#])).unwrap();
+    let source = store.context_source("source").unwrap().unwrap();
+    assert_eq!(source.to, "owner@example.invalid");
+    assert_eq!(source.cc, "collaborator@example.invalid");
+}

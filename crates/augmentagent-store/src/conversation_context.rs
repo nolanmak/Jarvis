@@ -45,6 +45,10 @@ impl Store {
                 email.cc = cc;
                 email.attachments = attachments;
             }
+            if let Some(recipients) = self.email_recipients(message_id)? {
+                email.to = recipients.to.join(", ");
+                email.cc = recipients.cc.join(", ");
+            }
         }
         Ok(source)
     }
