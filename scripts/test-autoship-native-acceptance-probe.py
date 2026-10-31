@@ -19,6 +19,21 @@ MIB=1024**2
 
 
 class Tests(unittest.TestCase):
+    def test_claude_guarded_edit_requires_its_own_ignored_test_and_file_only_budget(self):
+        expected='self_improve::native_route_acceptance::live_native_guarded_claude_file_edit'
+        self.assertEqual(probe.TESTS.get('claude_file_edit'),expected,
+                         'Claude must execute its guarded native edit test, not the Codex test or transport helper')
+        with tempfile.TemporaryDirectory() as temporary:
+            binary=Path(temporary)/'compiled-inventory-fixture'
+            binary.write_text('#!/usr/bin/python3\nimport sys\nassert sys.argv[1:]=='+repr(['--list','--ignored','--exact',expected])+"\nprint(sys.argv[-1]+': test')\nprint('1 test, 0 benchmarks')\n")
+            binary.chmod(0o700)
+            self.assertEqual(len(probe.verify_test_inventory(binary,probe.TESTS['claude_file_edit'])),64)
+            with self.assertRaises(ValueError):probe.verify_test_inventory(binary,probe.TESTS['file_edit'])
+        self.assertEqual(probe.reachable_build_memory('claude_file_edit',4096),0)
+        budget=probe.resource_budget(1024,probe.reachable_build_memory('claude_file_edit',4096),3*GIB)
+        self.assertEqual(budget['run_memory_bytes'],2*GIB)
+        self.assertEqual(budget['final_admission'],'RunScope')
+
     def test_service_stop_without_bound_test_completion_is_not_success(self):
         test=probe.TESTS['adoption'];nonce='fixture-generation'
         passed=f"test {test} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"

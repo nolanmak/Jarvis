@@ -505,3 +505,21 @@ and verifies limits before provider admission. The snapshot is not a reservation
 and CPU/PID ceilings are declarations, not a promise of future throughput.
 A CLI run outside a delegated service reports its own missing delegation; it does
 not infer the serving worker's effective configuration or capacity.
+
+## Guarded file-edit probes for each native provider
+
+Build the CLI test artifact through `scripts/cargo-managed.sh`, then run either
+`file_edit` (Codex) or `claude_file_edit` with
+`scripts/autoship-native-acceptance-probe.py PROBE --binary MANAGED_TEST_BINARY
+--vm-policy PRIVATE_POLICY`. Each entry point uses the normal pinned provider
+constructor and the operator's configured routing. Do not remove declared
+environment routing keys to make a transport-only helper accept the profile.
+
+Both probes require the exact file change, an observed native conversation,
+matching workflow ownership, a guarded Write/Edit receipt, exactly one model
+dispatch, and completed descendant quiescence. Claude's guarded MCP audit names
+use `mcp__jarvis__`; Codex's bridge records canonical names. The verifier accepts
+only the provider's exact namespace and the five declared file tools. Shell and
+foreign MCP names remain forbidden. These probes do not authorize a build, prove
+native continuation, exercise independent review, or establish issue-to-merge
+acceptance. The full workflow probes remain separate.
