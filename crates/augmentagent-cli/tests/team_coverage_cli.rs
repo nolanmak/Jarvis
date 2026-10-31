@@ -36,7 +36,7 @@ fn report_review_and_gate_round_trip() {
     assert_eq!(v["rows"][0]["teammate"], "Ana");
     assert_eq!(v["rows"][0]["review"], serde_json::Value::Null);
     assert_eq!(v["summary"]["decisions"], 1);
-    assert_eq!(v["gate"]["pass"], false);
+    assert!(v.get("gate").is_none());
 
     // Unknown decision / verdict fail loudly.
     assert!(!cli(home.path()).args(["team-coverage", "review", "nope", "correct"]).output().unwrap().status.success());
@@ -49,9 +49,6 @@ fn report_review_and_gate_round_trip() {
     assert!(text.contains("act-1"), "{text}");
     assert!(text.contains("team-coverage: 1 decision(s), 1 reviewed, 0 wrong, 0 replied-anyway"), "{text}");
 
-    // Gate: too young and too few — exits non-zero and says why.
-    let g = cli(home.path()).args(["team-coverage", "gate"]).output().unwrap();
-    assert!(!g.status.success());
-    let g = String::from_utf8_lossy(&g.stdout);
-    assert!(g.contains("FAIL") && g.contains("need 7"), "{g}");
+    // The rollout gate is gone: the rule is on by default.
+    assert!(!cli(home.path()).args(["team-coverage", "gate"]).output().unwrap().status.success());
 }

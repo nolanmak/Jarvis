@@ -539,11 +539,45 @@ mod tests {
     }
 
     #[test]
-    fn mode_parse_defaults_to_shadow() {
-        assert_eq!(Mode::parse(None), Mode::Shadow);
-        assert_eq!(Mode::parse(Some(" ON ")), Mode::On);
+    fn mode_parse_defaults_to_on() {
+        assert_eq!(Mode::parse(None), Mode::On);
+        assert_eq!(Mode::parse(Some(" SHADOW ")), Mode::Shadow);
         assert_eq!(Mode::parse(Some("off")), Mode::Off);
-        assert_eq!(Mode::parse(Some("bogus")), Mode::Shadow);
+        assert_eq!(Mode::parse(Some("bogus")), Mode::On);
+    }
+
+    fn triage(store: &Store, id: &str, t: augmentagent_store::TriageResult) {
+        store.mark_email_processed(id, t).unwrap();
+    }
+
+    #[test]
+    fn agent_judged_no_reply_needed_covers_even_when_owner_is_named() {
+        let (_d, store) = temp_store();
+        let card = seed_card(&store, "m-in", T0);
+        teammate_reply(&store, "dana@labs.example.com, owner@example.com", AFTER, "Looping Sam in; Dana, attached."); // pii-ok
+        triage(&store, "m-team", augmentagent_store::TriageResult::Flag);
+        assert_eq!(tick(&store, &cfg(Mode::On)), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
+    }
+
+    #[test]
+    fn agent_judged_owner_must_reply_blocks_coverage() {
+        let (_d, store) = temp_store();
+        let card = seed_card(&store, "m-in", T0);
+        teammate_reply(&store, "dana@labs.example.com, owner@example.com", AFTER, "Over to you for pricing."); // pii-ok
+        triage(&store, "m-team", augmentagent_store::TriageResult::Reply);
+        assert_eq!(tick(&store, &cfg(Mode::On)), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
+    #[test]
+    fn agent_skip_verdict_also_covers() {
+        let (_d, store) = temp_store();
+        let card = seed_card(&store, "m-in", T0);
+        teammate_reply(&store, "dana@labs.example.com", AFTER, "Sam is cc'd, all handled."); // pii-ok
+        triage(&store, "m-team", augmentagent_store::TriageResult::Skip);
+        assert_eq!(tick(&store, &cfg(Mode::On)), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
     }
 
     #[test]
@@ -564,43 +598,6 @@ mod tests {
     // ---- #1702 ----
 
     const DAY: i64 = 86_400_000;
-
-    fn summary(decisions: usize, reviewed: usize, wrong: usize, anyway: usize, age_days: i64) -> (Summary, i64) {
-        let now = 100 * DAY;
-        (
-            Summary { decisions, reviewed, wrong, replied_anyway: anyway, first_decided_ms: Some(now - age_days * DAY) },
-            now,
-        )
-    }
-
-    #[test]
-    fn gate_check_passes_when_all_criteria_met() {
-        let (s, now) = summary(10, 10, 0, 0, 7);
-        assert_eq!(gate(&s, now), Gate { pass: true, reasons: vec![] });
-        // Fewer than 10 decisions is fine once 14 days have passed.
-        let (s, now) = summary(3, 3, 0, 0, 14);
-        assert!(gate(&s, now).pass);
-    }
-
-    #[test]
-    fn gate_check_fails_on_any_wrong_or_replied_anyway() {
-        let (s, now) = summary(12, 12, 1, 0, 9);
-        assert_eq!(gate(&s, now).reasons, vec!["1 decision(s) marked wrong".to_string()]);
-        let (s, now) = summary(12, 12, 0, 2, 9);
-        assert_eq!(gate(&s, now).reasons, vec!["owner replied anyway on 2 decision(s)".to_string()]);
-    }
-
-    #[test]
-    fn gate_check_fails_on_time_volume_and_review_coverage() {
-        let (s, now) = summary(10, 10, 0, 0, 6);
-        assert_eq!(gate(&s, now).reasons, vec!["shadow for 6 day(s); need 7".to_string()]);
-        let (s, now) = summary(4, 4, 0, 0, 9);
-        assert_eq!(gate(&s, now).reasons, vec!["only 4 decision(s); need 10, or 14 days of shadow".to_string()]);
-        let (s, now) = summary(10, 9, 0, 0, 8);
-        assert_eq!(gate(&s, now).reasons, vec!["9/10 decision(s) reviewed; need all".to_string()]);
-        let none = Summary::default();
-        assert_eq!(gate(&none, 100 * DAY).reasons, vec!["no shadow decisions yet".to_string()]);
-    }
 
     #[test]
     fn report_rows_summarize_and_render_a_summary_line() {
@@ -625,10 +622,9 @@ mod tests {
             s,
             Summary { decisions: 3, reviewed: 2, wrong: 1, replied_anyway: 1, first_decided_ms: Some(3 * DAY) }
         );
-        let g = gate(&s, 20 * DAY);
         assert_eq!(
-            summary_line(&s, &g, 20 * DAY),
-            "team-coverage: 3 decision(s), 2 reviewed, 1 wrong, 1 replied-anyway, shadow 17 day(s) — gate FAIL"
+            summary_line(&s),
+            "team-coverage: 3 decision(s), 2 reviewed, 1 wrong, 1 replied-anyway"
         );
     }
 
