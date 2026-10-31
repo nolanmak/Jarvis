@@ -297,7 +297,13 @@ start its controller at 6.5 GiB available memory while retaining the 8 GiB unit
 ceiling. The allowance is an estimate, not a guaranteed controller memory bound.
 Every real dispatch still passes RunScope's sibling, ancestor and host checks;
 controller growth or other workloads may cause a subsequent capacity refusal.
-The wrapper records these preliminary budgets with its result.
+The wrapper records these preliminary budgets with its result. A zero systemd exit
+status alone is not a passing probe: stopping a service can return zero before
+the test completes. The wrapper requires a fresh, private completion receipt
+from the process supervising the exact test, plus its one-test passing summary.
+An interrupted run without that receipt is failed/incomplete, even if systemd
+reports success. Retain the transcript, result, and completion receipt together.
+
 
 Probe budgets follow reachable capabilities: `issue` and `adoption` include the
 configured build guest because they exercise builders/repairs. `writer` and

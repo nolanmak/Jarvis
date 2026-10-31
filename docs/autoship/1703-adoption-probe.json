@@ -1,0 +1,29 @@
+{
+  "status": "live-probe-running-not-accepted",
+  "implementation": "adoption fixture and acceptance completion corrections after 87e8f8be",
+  "invalidated_probe": {
+    "root": "/tmp/autoship-native-acceptance-_kg99_md",
+    "reason": "Explicitly stopped before test completion; systemd exit zero was not passing evidence."
+  },
+  "current_probe": "/tmp/autoship-native-acceptance-at6ayoj7",
+  "test_boundaries": {
+    "models": "real native",
+    "git": "real local bare repository",
+    "github": "scripted fixture",
+    "full_jarvis_ci": false,
+    "production_changes": false
+  },
+  "verification": {
+    "read_only_merge_policy_fixture": "red assertion only merge mutation is simulated; green with no Git or merge mutation",
+    "completion_wrapper_tests_passed": 8,
+    "updater_tests_passed": 76
+  },
+  "logs": [
+    "/tmp/autoship-1703-red-adoption-policy.log",
+    "/tmp/autoship-1703-green-adoption-policy.log",
+    "/tmp/autoship-1703-red-probe-completion.log",
+    "/tmp/autoship-1703-green-probe-completion.log",
+    "/tmp/autoship-1703-pdf-ci-failure.log",
+    "/tmp/autoship-1703-green-deployment-rebuild.log"
+  ]
+}

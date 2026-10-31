@@ -46,6 +46,8 @@ elif a[:2]==['api','graphql']:
  for i,value in enumerate(a):
   if value in ['-f','-F'] and i+1<len(a) and '=' in a[i+1]:
    key,val=a[i+1].split('=',1);fields[key]=val
+ if fields.get('query','').startswith('query AutoshipDirectMergePolicy'):
+  print(json.dumps({'data':{'repository':{'mergeQueue':None}}}));sys.exit(0)
  assert 'AutoshipMerge' in fields.get('query',''), 'only merge mutation is simulated'
  assert fields['head']==head and fields['id']==row['id']
  assert state=='OPEN' and not draft and (root/'ci-green').exists()
@@ -297,5 +299,31 @@ async fn run_pipeline() -> Result<()> {
         "workflow":id,"source":"pull_request:841","imported_head":imported,"approved_head":after.checkpoint.binding.head,
         "model_calls_before_ci":calls,"model_calls_after_ci":after.model_calls,"merge_mutations":1,"passed":true}))?,
     )?;
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn adoption_boundary_answers_direct_merge_policy_without_mutation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let repo = root.path().join("origin");
+    std::fs::create_dir(&repo)?;
+    fixture_git(&repo, &["init", "-b", "main"]).await?;
+    fixture_git(&repo, &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"]).await?;
+    let before = fixture_git(&repo, &["rev-parse", "HEAD"]).await?;
+    std::fs::write(root.path().join("fixture.json"), serde_json::json!({
+        "origin":repo.join(".git"),"branch":"main","repository":"fixture/project",
+        "base":before,"title":"fixture","body":"fixture"
+    }).to_string())?;
+    let script = root.path().join("github.py");
+    std::fs::write(&script, GH_FIXTURE)?;
+    let output = Command::new("/usr/bin/python3").arg(script)
+        .args(["api", "graphql", "-f", "query=query AutoshipDirectMergePolicy($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){mergeQueue(branch:\"main\"){id}}}", "-f", "owner=fixture", "-f", "repo=project"])
+        .env("AUTOSHIP_ADOPTION_ACCEPTANCE_CHILD", root.path()).output().await?;
+    anyhow::ensure!(output.status.success(), "read-only policy query failed: {}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(value.pointer("/data/repository/mergeQueue").is_some_and(serde_json::Value::is_null), "missing explicit direct-merge policy");
+    anyhow::ensure!(!root.path().join("merged").exists() && !root.path().join("merge-mutations.jsonl").exists(), "policy query mutated merge state");
+    anyhow::ensure!(fixture_git(&repo, &["rev-parse", "HEAD"]).await? == before, "policy query moved main");
     Ok(())
 }
