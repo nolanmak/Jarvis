@@ -35,6 +35,12 @@ impl WorkflowStore {
         let rows=stmt.query_map([workflow],|r|r.get::<_,String>(0))?;
         rows.map(|row|Ok(serde_json::from_str(&row?)?)).collect()
     }
+    pub fn uncertain_progress(&self,bot:u64,owner:u64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64,String,String)>> {
+        ensure!(bot>0 && owner>0,"progress recovery identity missing");
+        let mut stmt=self.conn.prepare("SELECT d.channel,d.workflow,d.sequence,d.nonce,d.content FROM workflow_progress_delivery d JOIN discord_workflow_binding b ON b.workflow=d.workflow AND b.bot=d.bot AND b.owner=d.owner AND b.channel=d.channel WHERE d.bot=?1 AND d.owner=?2 AND d.state='uncertain' ORDER BY d.dispatched_at,d.workflow LIMIT 128")?;
+        let rows=stmt.query_map(params![bot.to_string(),owner.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?;
+        rows.map(|row| {let (channel,workflow,sequence,nonce,content)=row?;Ok((super::discord_ingress::DiscordOrigin {bot,owner,channel:channel.parse()?,message:1},workflow,sequence,nonce,content))}).collect()
+    }
     pub fn pending_progress(&self,bot:u64,owner:u64)->Result<Vec<(super::discord_ingress::DiscordOrigin,String,i64)>> {
         ensure!(bot>0 && owner>0,"progress recovery identity missing");
         if !exists(&self.conn)? {return Ok(Vec::new());}
@@ -270,6 +276,8 @@ mod tests {
         assert!(store.claim_progress(&foreign,&id,2,4).is_err());
         assert!(store.claim_progress(&origin,&id,2,4).unwrap().unwrap().1.contains("owner-pause-requested"));
         assert_eq!(store.progress_delivery(&id).unwrap().state,"delivery-uncertain");
+        assert!(store.uncertain_progress(11,99).unwrap().is_empty());
+        let uncertain=store.uncertain_progress(11,22).unwrap();assert_eq!(uncertain.len(),1);assert_eq!(uncertain[0].0.channel,33);assert_eq!(uncertain[0].1,id);
         assert!(store.confirm_progress(&foreign,&id,2,55,5).is_err());
         store.confirm_progress(&origin,&id,2,55,5).unwrap();store.confirm_progress(&origin,&id,2,55,6).unwrap();
         assert!(store.confirm_progress(&origin,&id,2,56,7).is_err());

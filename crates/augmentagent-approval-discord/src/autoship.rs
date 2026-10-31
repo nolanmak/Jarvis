@@ -12,6 +12,8 @@ pub struct Context {
     pub guild: Option<u64>,
 }
 
+pub struct UncertainProgress {pub delivery:ProgressDelivery,pub nonce:String,pub content:String}
+
 pub struct ProgressDelivery {pub context:Context,pub workflow:String,pub sequence:i64}
 
 pub struct Reply {
@@ -24,6 +26,7 @@ pub struct Reply {
 pub trait Transport: Send + Sync {
     async fn verify_owner_dm(&self, context: &Context) -> Result<bool>;
     async fn send(&self, context: &Context, reply: &Reply) -> Result<u64>;
+    async fn find_progress(&self,_context:&Context,_nonce:&str,_content:&str)->Result<Option<u64>> {Ok(None)}
 }
 
 pub fn recognizes(text: &str) -> bool {
@@ -63,6 +66,18 @@ pub struct DiscordTransport(pub std::sync::Arc<serenity::http::Http>);
 pub async fn drain_queued(handler: &dyn QueryHandler, transport: &dyn Transport, bot: u64, owner: u64) -> Result<usize> {
     anyhow::ensure!(bot > 0 && owner > 0, "autoship recovery identity missing");
     let mut delivered = 0;
+    for uncertain in handler.autoship_progress_uncertain(bot,owner)? {
+        let delivery=&uncertain.delivery;let context=&delivery.context;
+        if context.bot!=bot || context.owner!=Some(owner) || context.author!=owner || context.guild.is_some() || context.channel==0 {continue;}
+        let attempt=async {
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            let Some(message)=transport.find_progress(context,&uncertain.nonce,&uncertain.content).await? else {return Ok(false);};
+            if !transport.verify_owner_dm(context).await? {return Ok(false);}
+            handler.autoship_progress_confirm(delivery,message)?;
+            Ok::<_,anyhow::Error>(true)
+        }.await;
+        match attempt {Ok(true)=>delivered+=1,Ok(false)=>{},Err(_)=>tracing::warn!("autoship progress reconciliation unavailable; delivery remains uncertain")}
+    }
     for context in handler.autoship_pending(bot, owner)? {
         if context.bot != bot || context.owner != Some(owner) || context.author != owner
             || context.guild.is_some() || context.channel == 0 || context.message == 0 { continue; }
@@ -107,6 +122,15 @@ impl Transport for DiscordTransport {
         Ok(matches!(channel, Channel::Private(dm) if dm.kind == ChannelType::Private
             && dm.id.get() == context.channel && Some(dm.recipient.id.get()) == context.owner
             && !dm.recipient.bot))
+    }
+    async fn find_progress(&self,context:&Context,nonce:&str,content:&str)->Result<Option<u64>> {
+        anyhow::ensure!(!nonce.is_empty() && nonce.len()<=64 && nonce.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-'),"invalid progress marker");
+        anyhow::ensure!(content.contains(&format!("[autoship:{nonce}]")),"progress marker missing from stored content");
+        let messages=tokio::time::timeout(std::time::Duration::from_secs(15),
+            serenity::all::ChannelId::new(context.channel).messages(&self.0,serenity::all::GetMessages::new().limit(100))).await??;
+        let mut matches=messages.iter().filter(|m|m.channel_id.get()==context.channel && m.author.id.get()==context.bot && m.author.bot && m.content==content && m.id.get()>0);
+        let found=matches.next().map(|m|m.id.get());
+        Ok(if matches.next().is_some() {None} else {found})
     }
     async fn send(&self, context: &Context, reply: &Reply) -> Result<u64> {
         use serenity::all::{ChannelId, CreateAllowedMentions, CreateMessage, Nonce};
@@ -156,6 +180,35 @@ mod tests {
     fn handler(bound: bool) -> Handler { Handler { bound, claimed: AtomicBool::new(false), calls: AtomicUsize::new(0), confirmed: AtomicUsize::new(0) } }
     fn wire(verified: bool, fail: bool) -> Wire { Wire { verified, fail, sends: AtomicUsize::new(0) } }
 
+    #[tokio::test]
+    async fn unavailable_history_never_fabricates_a_delivery_receipt() {
+        let mut server=mockito::Server::new_async().await;
+        let http=serenity::http::HttpBuilder::new("test-only-token").proxy(server.url()).ratelimiter_disabled(true).build();
+        let transport=DiscordTransport(std::sync::Arc::new(http));
+        let mock=server.mock("GET","/api/v10/channels/33/messages").match_query(mockito::Matcher::UrlEncoded("limit".into(),"100".into())).with_status(403).with_header("content-type","application/json").with_body(r#"{"code":50013,"message":"Missing Permissions"}"#).create_async().await;
+        assert!(transport.find_progress(&context(),"fixture-marker","Autoship [autoship:fixture-marker]").await.is_err());
+        mock.assert_async().await;
+    }
+    #[tokio::test]
+    async fn history_recovers_only_one_exact_bot_authored_bound_progress_message() {
+        let mut server=mockito::Server::new_async().await;
+        let http=serenity::http::HttpBuilder::new("test-only-token").proxy(server.url()).ratelimiter_disabled(true).build();
+        let transport=DiscordTransport(std::sync::Arc::new(http));
+        let content="Autoship update [autoship:fixture-marker]";
+        let message=|id:u64,author:u64,channel:u64,text:&str|serde_json::json!({"id":id.to_string(),"channel_id":channel.to_string(),"author":{"id":author.to_string(),"username":"fixture","discriminator":"0","avatar":null,"bot":true},"content":text,"timestamp":"2026-10-31T00:00:00+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0});
+        for (messages,expected) in [
+            (vec![message(55,11,33,content)],Some(55)),
+            (vec![message(55,99,33,content)],None),
+            (vec![message(55,11,99,content)],None),
+            (vec![message(55,11,33,"changed [autoship:fixture-marker]")],None),
+            (vec![message(55,11,33,content),message(56,11,33,content)],None),
+            (vec![],None),
+        ] {
+            let mock=server.mock("GET","/api/v10/channels/33/messages").match_query(mockito::Matcher::UrlEncoded("limit".into(),"100".into())).with_status(200).with_header("content-type","application/json").with_body(serde_json::to_string(&messages).unwrap()).create_async().await;
+            assert_eq!(transport.find_progress(&context(),"fixture-marker",content).await.unwrap(),expected);
+            mock.assert_async().await;mock.remove_async().await;
+        }
+    }
     #[tokio::test]
     async fn transport_verifies_live_private_channel_recipient() {
         let mut server=mockito::Server::new_async().await;

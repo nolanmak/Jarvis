@@ -447,6 +447,7 @@ pub trait QueryHandler: Send + Sync {
     fn autoship_acknowledged(&self, _context: &autoship::Context, _message: u64) -> anyhow::Result<()> { Ok(()) }
     fn autoship_pending(&self, _bot: u64, _owner: u64) -> anyhow::Result<Vec<autoship::Context>> { Ok(Vec::new()) }
     fn autoship_claim_ack(&self, _context: &autoship::Context) -> anyhow::Result<Option<autoship::Reply>> { Ok(None) }
+    fn autoship_progress_uncertain(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::UncertainProgress>> {Ok(Vec::new())}
     fn autoship_progress_pending(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::ProgressDelivery>> {Ok(Vec::new())}
     fn autoship_progress_claim(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<Option<autoship::Reply>> {Ok(None)}
     fn autoship_progress_confirm(&self,_delivery:&autoship::ProgressDelivery,_message:u64)->anyhow::Result<()> {Ok(())}

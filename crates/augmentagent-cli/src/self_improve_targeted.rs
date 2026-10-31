@@ -411,6 +411,7 @@ mod tests {
             #[async_trait::async_trait]
             impl QueryHandler for Adapter {
                 async fn answer(&self,_:&augmentagent_approval_discord::AuditCtx,_:&str)->Result<String> {panic!("autoship reached ordinary chat")}
+                fn autoship_progress_uncertain(&self,b:u64,o:u64)->Result<Vec<gateway::UncertainProgress>> {if self.progress.load(std::sync::atomic::Ordering::SeqCst) {crate::autoship_discord_command::progress_uncertain(&self.path,b,o)} else {Ok(Vec::new())}}
                 fn autoship_progress_pending(&self,b:u64,o:u64)->Result<Vec<gateway::ProgressDelivery>> {if self.progress.load(std::sync::atomic::Ordering::SeqCst) {crate::autoship_discord_command::progress_pending(&self.path,b,o)} else {Ok(Vec::new())}}
                 fn autoship_progress_claim(&self,d:&gateway::ProgressDelivery)->Result<Option<gateway::Reply>> {crate::autoship_discord_command::progress_claim(&self.path,d)}
                 fn autoship_progress_confirm(&self,d:&gateway::ProgressDelivery,m:u64)->Result<()> {crate::autoship_discord_command::progress_confirm(&self.path,d,m)}
@@ -422,10 +423,11 @@ mod tests {
                 fn autoship_pending(&self,b:u64,o:u64)->Result<Vec<gateway::Context>> {crate::autoship_discord_command::gateway_pending(&self.path,b,o)}
                 fn autoship_claim_ack(&self,c:&gateway::Context)->Result<Option<gateway::Reply>> {crate::autoship_discord_command::gateway_claim_ack(&self.path,c)}
             }
-            struct Wire(std::sync::atomic::AtomicUsize,std::sync::atomic::AtomicBool);
+            struct Wire(std::sync::atomic::AtomicUsize,std::sync::atomic::AtomicBool,std::sync::atomic::AtomicBool);
             #[async_trait::async_trait]
             impl gateway::Transport for Wire {
                 async fn verify_owner_dm(&self,_:&gateway::Context)->Result<bool> {Ok(true)}
+                async fn find_progress(&self,_:&gateway::Context,_:&str,_:&str)->Result<Option<u64>> {Ok(self.2.load(std::sync::atomic::Ordering::SeqCst).then_some(55))}
                 async fn send(&self,_:&gateway::Context,r:&gateway::Reply)->Result<u64> {
                     self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
                     assert!(r.content.contains("Completion has not been observed") || r.content.contains("has not edited the PR") || r.content.starts_with("Autoship"));
@@ -433,7 +435,7 @@ mod tests {
                 }
             }
             let adapter=Adapter {repo:root.clone(),path:workflow::path(),progress:std::sync::atomic::AtomicBool::new(false)};
-            let wire=Wire(std::sync::atomic::AtomicUsize::new(0),std::sync::atomic::AtomicBool::new(false));
+            let wire=Wire(std::sync::atomic::AtomicUsize::new(0),std::sync::atomic::AtomicBool::new(false),std::sync::atomic::AtomicBool::new(false));
             let gateway_context=gateway::Context {bot:11,owner:Some(22),author:22,channel:33,message:44,guild:None};
             assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
             assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
@@ -501,6 +503,13 @@ mod tests {
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),10);
             let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
             assert_eq!(store.progress_delivery(&discord.admission.workflow).unwrap().state,"delivery-uncertain");
+            drop(store);wire.2.store(true,std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),1);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),10,"reconciliation must never send another message");
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.progress_delivery(&discord.admission.workflow).unwrap().state,"delivery-confirmed");
+
 
 
             return;

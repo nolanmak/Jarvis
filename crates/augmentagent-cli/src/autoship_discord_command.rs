@@ -173,6 +173,12 @@ pub(crate) fn gateway_acknowledged(path:&Path,context:&GatewayContext,message:u6
     WorkflowStore::open(path)?.confirm_discord_ack(&origin,message,chrono::Utc::now().timestamp_millis())
 }
 
+pub(crate) fn progress_uncertain(path:&Path,bot:u64,owner:u64)->Result<Vec<augmentagent_approval_discord::autoship::UncertainProgress>> {
+    if WorkflowStore::open_read_only(path)?.is_none() {return Ok(Vec::new());}
+    Ok(WorkflowStore::open(path)?.uncertain_progress(bot,owner)?.into_iter().map(|(origin,workflow,sequence,nonce,content)|augmentagent_approval_discord::autoship::UncertainProgress {
+        delivery:augmentagent_approval_discord::autoship::ProgressDelivery {context:GatewayContext {bot:origin.bot,owner:Some(origin.owner),author:origin.owner,channel:origin.channel,message:origin.message,guild:None},workflow,sequence},nonce,content,
+    }).collect())
+}
 pub(crate) fn progress_pending(path:&Path,bot:u64,owner:u64)->Result<Vec<augmentagent_approval_discord::autoship::ProgressDelivery>> {
     if WorkflowStore::open_read_only(path)?.is_none() {return Ok(Vec::new());}
     Ok(WorkflowStore::open(path)?.pending_progress(bot,owner)?.into_iter().map(|(origin,workflow,sequence)|augmentagent_approval_discord::autoship::ProgressDelivery {
