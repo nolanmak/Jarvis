@@ -1,3 +1,5 @@
+#[path = "autoship_run_command.rs"]
+pub(crate) mod run_command;
 #[path = "autoship_merge_recovery.rs"]
 pub(crate) mod merge_recovery;
 // Shared command projections. Read paths never create state or launch work.

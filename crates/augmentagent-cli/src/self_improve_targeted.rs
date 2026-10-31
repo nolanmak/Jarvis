@@ -27,7 +27,7 @@ async fn read(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(out)
 }
 
-pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> {
+async fn authorized_repository(repo: &Path, request: &Request) -> Result<String> {
     let request = request.normalized()?;
     let repository = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -55,6 +55,26 @@ pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> 
         matches!(permission.trim(), "ADMIN" | "MAINTAIN" | "WRITE"),
         "repository write access required"
     );
+    Ok(repository)
+}
+
+/// Authenticate before looking up a replay; closed targets may replay their
+/// original admission, but a revoked repository grant may not.
+pub(crate) async fn authorize_command(repo: &Path, request: &Request) -> Result<String> {
+    authorized_repository(repo, request).await?;
+    let actor = read(repo, &["api", "user", "--jq", ".login"]).await?;
+    let actor = actor.trim();
+    anyhow::ensure!(!actor.is_empty() && actor.len() <= 100 && actor.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid authenticated GitHub actor");
+    Ok(format!("github:{}", actor.to_ascii_lowercase()))
+}
+
+pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<()> {
+    resolve(repo, request).await.map(|_| ())
+}
+
+pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> {
+    let request = request.normalized()?;
+    let repository = authorized_repository(repo, &request).await?;
     let mut allowed = trusted_authors(repo).await;
     if let Some(owner) = repository.split('/').next() {
         allowed.push(owner.into());

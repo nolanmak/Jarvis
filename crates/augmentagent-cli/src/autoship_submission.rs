@@ -97,6 +97,29 @@ fn policy(conn: &Connection, workflow: &str) -> Result<Option<(Milestone, Option
 }
 
 impl WorkflowStore {
+    /// Read the original admission before revalidating a possibly closed target.
+    /// The channel must first authenticate and recheck repository authority.
+    pub fn replay_authorized(&self, request_id: &str, principal: &str, request: &Request) -> Result<Option<Admission>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_request')", [], |row| row.get(0))?;
+        if !exists { return Ok(None); }
+        let prior: Option<(String,String,String)> = self.conn.query_row(
+            "SELECT principal,payload,admission FROM command_request WHERE request_id=?1", [request_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        prior.map(|(actor,payload,admission)| {
+            ensure!(actor == principal && payload == serde_json::to_string(&request.normalized()?)?, "request-id-conflict");
+            Ok(serde_json::from_str(&admission)?)
+        }).transpose()
+    }
+
+    /// Commit a generated client ID before dispatching its admission. A client
+    /// lost before receiving the response can recover the ID and exact payload.
+    pub fn persist_client_intent(&self, request_id: &str, principal: &str, request: &Request, now: i64) -> Result<()> {
+        self.conn.execute("INSERT INTO command_client_intent(request_id,principal,payload,created_at) VALUES(?1,?2,?3,?4)",
+            params![request_id, principal, serde_json::to_string(&request.normalized()?)?, now])?;
+        Ok(())
+    }
+
     pub fn command_request(&self, workflow: &str) -> Result<Option<Request>> {
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_job')",
@@ -703,4 +726,34 @@ mod tests {
             .unwrap();
         assert!(store.command_request(&admitted.workflow).is_err());
     }
+    #[test]
+    fn generated_client_intent_survives_exit_before_admission_dispatch() {
+        const CHILD: &str = "AUTOSHIP_CLIENT_INTENT_EXIT_FIXTURE";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let store = WorkflowStore::open(Path::new(&path)).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            store.persist_client_intent(&id,"github:owner",&request(Milestone::Pr),10).unwrap();
+            unsafe { libc::_exit(73) }
+        }
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("state.db");
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","autoship_workflow::submission::tests::generated_client_intent_survives_exit_before_admission_dispatch","--nocapture"])
+            .env(CHILD,&path).output().unwrap();
+        assert_eq!(output.status.code(),Some(73));
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let (id,actor,payload):(String,String,String)=store.conn.query_row(
+            "SELECT request_id,principal,payload FROM command_client_intent",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let recovered:Request=serde_json::from_str(&payload).unwrap();
+        assert_eq!(recovered,request(Milestone::Pr).normalized().unwrap());
+        assert!(store.replay_authorized(&id,&actor,&recovered).unwrap().is_none());
+        let admission=store.submit_authorized(&id,&actor,&recovered,20).unwrap();
+        assert!(admission.accepted && !admission.joined && !admission.complete);
+        drop(store);
+        let before=std::fs::read(&path).unwrap();
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(store.replay_authorized(&id,&actor,&recovered).unwrap(),Some(admission));
+        assert_eq!(std::fs::read(&path).unwrap(),before);
+    }
+
 }
