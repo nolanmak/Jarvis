@@ -98,11 +98,14 @@ fixtures or private results without publishing real communication content.
 
 ## Rollout gates and measured limits
 
-Before deployment, require green platform CI, existing adapter regressions,
+A binary may deploy through the normal protected-branch updater with context
+policy `off` while hosted checks finish. Before enabling the workflow on the
+Linux host, require green Linux platform CI, existing adapter regressions,
 shared source/receipt/revision contracts, CLI no-send and policy-off checks,
 and an actual-model evidence-present/evidence-missing pair. Stage iMessage,
-Gmail and WhatsApp first, inspect a grounded approval card and its receipt,
-then enable the remaining migrated adapters. Every send still needs its
+Gmail and WhatsApp first and inspect a grounded approval card and its receipt.
+Require the remaining native macOS checks before declaring full acceptance and
+enabling the remaining migrated adapters. Every send still needs its
 existing approval. Revert the context policy to `off` if a card invents a
 material fact or exposes private evidence.
 
