@@ -100,3 +100,48 @@ fn mailbox_spans_every_entity_id_of_the_same_address() {
     ids.sort();
     assert_eq!(ids, ["m-new", "m-old"]);
 }
+
+fn decision(action: &str, thread: &str, covered_at_ms: i64, decided_at_ms: i64) -> TeamCoverageDecision {
+    TeamCoverageDecision {
+        action_id: action.into(),
+        mode: "shadow".into(),
+        teammate: "Ana".into(),
+        covering_message_id: format!("cover-{action}"),
+        thread_id: thread.into(),
+        covered_at_ms,
+        decided_at_ms,
+    }
+}
+
+#[test]
+fn report_flags_owner_replied_anyway_and_platform() {
+    let (_d, store) = temp_store();
+    store.upsert_email(&email("m1", "T1", "acc", "asker@example.org", "owner@example.com")).unwrap();
+    let a1 = store
+        .log_action("m1", Some("T1"), "asker@example.org", "s", None, Some("d"), augmentagent_store::ActionStatus::Pending)
+        .unwrap();
+    store.record_team_coverage_decision(&decision(&a1, "T1", 1_000, 2_000)).unwrap();
+    store.record_team_coverage_decision(&decision("a-gone", "T2", 1_000, 3_000)).unwrap();
+    // The owner answered T1 by hand after the teammate did.
+    store.record_outbound_thread_event("acc", "owner-msg", Some("T1"), 1_500).unwrap();
+    // A reply BEFORE the teammate's message is not "anyway".
+    store.record_outbound_thread_event("acc", "early", Some("T2"), 900).unwrap();
+
+    let rows = store.team_coverage_report(0).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].platform.as_str(), rows[0].owner_replied_anyway), ("gmail", true));
+    assert_eq!((rows[1].platform.as_str(), rows[1].owner_replied_anyway), ("", false));
+    assert_eq!(rows[0].review, None);
+    assert_eq!(store.team_coverage_report(2_500).unwrap().len(), 1);
+}
+
+#[test]
+fn review_marks_persist_replace_and_validate() {
+    let (_d, store) = temp_store();
+    store.record_team_coverage_decision(&decision("a1", "T1", 1_000, 2_000)).unwrap();
+    assert!(store.review_team_coverage("a1", "wrong").unwrap());
+    assert!(store.review_team_coverage("a1", "correct").unwrap());
+    assert_eq!(store.team_coverage_report(0).unwrap()[0].review.as_deref(), Some("correct"));
+    assert!(!store.review_team_coverage("nope", "correct").unwrap(), "unknown decision");
+    assert!(store.review_team_coverage("a1", "maybe").is_err(), "unknown verdict");
+}

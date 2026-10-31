@@ -404,6 +404,12 @@ enum Cmd {
         #[command(subcommand)]
         op: TeamOp,
     },
+    /// Teammate-coverage shadow report, owner review and rollout gate
+    /// (#1702). The gate must PASS before `AUGMENTAGENT_TEAM_COVERAGE=on`.
+    TeamCoverage {
+        #[command(subcommand)]
+        op: TeamCoverageOp,
+    },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
         #[command(subcommand)]
@@ -4535,6 +4541,7 @@ async fn main() -> Result<()> {
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::Team { .. } => unreachable!("handled before database initialization"),
+        Cmd::TeamCoverage { op } => team_coverage_cmd(&store, op),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
@@ -8866,6 +8873,95 @@ async fn run_stale_approval_reconcile(
             }
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum TeamCoverageOp {
+    /// Every coverage decision in the window, with the summary and gate.
+    Report {
+        /// Only decisions from the last N days.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Mark a decision `correct` or `wrong` (re-reviewing replaces it).
+    Review { action_id: String, verdict: String },
+    /// Evaluate the rollout gate over all decisions; exit 1 unless it passes.
+    Gate,
+}
+
+fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
+    use team_coverage::{gate, summarize, summary_line};
+    let now = chrono::Utc::now().timestamp_millis();
+    match op {
+        TeamCoverageOp::Report { days, json } => {
+            let rows = store.team_coverage_report(now - i64::from(days) * 86_400_000)?;
+            let s = summarize(&rows);
+            let g = gate(&s, now);
+            if json {
+                let v = serde_json::json!({
+                    "rows": rows.iter().map(|r| serde_json::json!({
+                        "action_id": r.decision.action_id,
+                        "mode": r.decision.mode,
+                        "platform": r.platform,
+                        "teammate": r.decision.teammate,
+                        "covering_message_id": r.decision.covering_message_id,
+                        "thread_id": r.decision.thread_id,
+                        "covered_at_ms": r.decision.covered_at_ms,
+                        "decided_at_ms": r.decision.decided_at_ms,
+                        "owner_replied_anyway": r.owner_replied_anyway,
+                        "review": r.review,
+                    })).collect::<Vec<_>>(),
+                    "summary": {
+                        "decisions": s.decisions,
+                        "reviewed": s.reviewed,
+                        "wrong": s.wrong,
+                        "replied_anyway": s.replied_anyway,
+                        "first_decided_ms": s.first_decided_ms,
+                    },
+                    "gate": { "pass": g.pass, "reasons": g.reasons },
+                });
+                println!("{v}");
+            } else {
+                for r in &rows {
+                    let at = chrono::DateTime::from_timestamp_millis(r.decision.covered_at_ms)
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    println!(
+                        "{}\t{}\t{}\tteammate={}\tcovered={}\tmsg={}\treplied-anyway={}\treview={}",
+                        r.decision.action_id,
+                        r.decision.mode,
+                        r.platform,
+                        r.decision.teammate,
+                        at,
+                        r.decision.covering_message_id,
+                        r.owner_replied_anyway,
+                        r.review.as_deref().unwrap_or("-"),
+                    );
+                }
+                println!("{}", summary_line(&s, &g, now));
+            }
+        }
+        TeamCoverageOp::Review { action_id, verdict } => {
+            if !store.review_team_coverage(&action_id, &verdict)? {
+                anyhow::bail!("no team-coverage decision for action {action_id}");
+            }
+            println!("reviewed {action_id}: {verdict}");
+        }
+        TeamCoverageOp::Gate => {
+            let s = summarize(&store.team_coverage_report(0)?);
+            let g = gate(&s, now);
+            println!("{}", summary_line(&s, &g, now));
+            for r in &g.reasons {
+                println!("  - {r}");
+            }
+            if !g.pass {
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
