@@ -89,9 +89,28 @@ pub fn commit_messages(
         }
         let (title,group):(String,bool)=tx.query_row("SELECT title,group_chat FROM linkedin_archive_conversations WHERE account=?1 AND urn=?2",params![account,conversation],|r|Ok((r.get(0)?,r.get(1)?)))?;
         for m in &page.items{
+            let archived: Option<(String, String)> = tx.query_row(
+                "SELECT conversation,stored_id FROM linkedin_archive_messages WHERE account=?1 AND urn=?2",
+                params![account,m.urn], |r| Ok((r.get(0)?,r.get(1)?)),
+            ).optional()?;
+            if archived.as_ref().is_some_and(|(thread, _)| thread != conversation) {
+                return Err(augmentagent_store::rusqlite::Error::InvalidParameterName("message identity belongs to another conversation".into()));
+            }
             let existing:Option<Option<String>>=tx.query_row("SELECT accountEntityId FROM emails WHERE messageId=?1",[&m.urn],|r|r.get(0)).optional()?;
             // Preserve existing primary-account references; scope a collision.
-            let stored_id=if existing.as_ref().is_none_or(|value|value.as_deref().is_some_and(|a|a==format!("linkedin:{account}")||a==account)){m.urn.clone()}else{format!("linkedin-archive:{account}:{}",m.urn)};
+            let stored_id=if let Some((_, id)) = archived { id } else if existing.as_ref().is_none_or(|value|value.as_deref().is_some_and(|a|a==format!("linkedin:{account}")||a==account)){m.urn.clone()}else{format!("linkedin-archive:{account}:{}",m.urn)};
+            // Validate the chosen key too: a scoped fallback can itself collide
+            // with legacy data. Never overwrite another account/platform/thread.
+            let target: Option<(Option<String>, String, String)> = tx.query_row(
+                "SELECT accountEntityId,platform,threadId FROM emails WHERE messageId=?1",
+                [&stored_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).optional()?;
+            if target.is_some_and(|(owner, platform, thread)|
+                !owner.as_deref().is_some_and(|a| a == account || a == format!("linkedin:{account}"))
+                || platform != "linkedin" || thread != conversation
+            ) {
+                return Err(augmentagent_store::rusqlite::Error::InvalidParameterName("stored message identity conflicts with archive scope".into()));
+            }
             let name:String=tx.query_row("SELECT name FROM linkedin_archive_participants WHERE account=?1 AND conversation=?2 AND urn=?3",params![account,conversation,m.sender],|r|r.get(0)).optional()?.unwrap_or_else(||m.sender.clone());
             let sender=format!("{name} <linkedin:{}>",m.sender);
             let date=time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(m.delivered_at_ms)*1_000_000).ok().and_then(|d|d.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_default();

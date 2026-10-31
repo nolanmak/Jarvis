@@ -814,3 +814,133 @@ fn legacy_linkedin_read_and_date_filter_use_received_time_when_available() {
     assert_eq!(page["messages"][0]["imported_at_ms"], 1900000000000i64);
     assert_eq!(page["coverage"]["state"], "unverified");
 }
+
+#[test]
+fn reused_message_identity_cannot_move_a_message_or_commit_any_of_the_page() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    let cp = checkpoint(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    commit_conversations(
+        &s,
+        OWNER,
+        "PRIMARY_INBOX",
+        &cp,
+        &Page {
+            items: vec![conversation(0), conversation(1)],
+            next: None,
+        },
+        10000,
+    )
+    .unwrap();
+    let pending = pending_threads(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    let cp0 = &pending.iter().find(|(id, _)| id == "thread:0").unwrap().1;
+    commit_messages(
+        &s,
+        OWNER,
+        "thread:0",
+        cp0,
+        &Page {
+            items: vec![message(0, 1)],
+            next: None,
+        },
+        10001,
+    )
+    .unwrap();
+    let cp1 = &pending.iter().find(|(id, _)| id == "thread:1").unwrap().1;
+    let mut reused = message(1, 2);
+    reused.urn = "message:0:1".into();
+    assert!(
+        commit_messages(
+            &s,
+            OWNER,
+            "thread:1",
+            cp1,
+            &Page {
+                items: vec![message(1, 1), reused],
+                next: Some("next".into()),
+            },
+            10002
+        )
+        .is_err(),
+        "a stable identity cannot switch conversations"
+    );
+    let remaining = pending_threads(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].1.revision, cp1.revision);
+    assert!(remaining[0].1.cursor.is_none());
+    s.with_conn(|c| {
+        let row: (String, String) = c.query_row(
+            "SELECT threadId,body FROM emails WHERE messageId='message:0:1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(row, ("thread:0".into(), "Message 1".into()));
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM linkedin_archive_cursors WHERE scope='thread:thread:1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            0
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn scoped_fallback_identity_cannot_overwrite_unowned_legacy_data() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    let fallback = format!("linkedin-archive:{OWNER}:message:0:0");
+    s.with_conn(|c| {
+        for id in ["message:0:0", fallback.as_str()] {
+            c.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,firstSeenAt,platform,kind) VALUES(?1,'legacy-thread','unknown','','preserve me','',1,'linkedin','dm')", [id])?;
+        }
+        Ok(())
+    }).unwrap();
+    let cp = checkpoint(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    commit_conversations(
+        &s,
+        OWNER,
+        "PRIMARY_INBOX",
+        &cp,
+        &Page {
+            items: vec![conversation(0)],
+            next: None,
+        },
+        10000,
+    )
+    .unwrap();
+    let cp = pending_threads(&s, OWNER, "PRIMARY_INBOX")
+        .unwrap()
+        .remove(0)
+        .1;
+    assert!(commit_messages(
+        &s,
+        OWNER,
+        "thread:0",
+        &cp,
+        &Page {
+            items: vec![message(0, 0)],
+            next: None,
+        },
+        10001
+    )
+    .is_err());
+    s.with_conn(|c| {
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM emails WHERE body='preserve me' AND accountEntityId IS NULL AND threadId='legacy-thread'", [], |r| r.get::<_, i64>(0))?, 2);
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM linkedin_archive_messages", [], |r| r.get::<_, i64>(0))?, 0);
+        Ok(())
+    }).unwrap();
+    assert_eq!(
+        pending_threads(&s, OWNER, "PRIMARY_INBOX").unwrap()[0]
+            .1
+            .revision,
+        cp.revision
+    );
+}
