@@ -40,6 +40,8 @@ struct Provider {
 
 #[path = "native_readiness.rs"]
 pub mod readiness;
+#[path = "native_owner_transfer.rs"]
+pub mod ownership;
 
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
