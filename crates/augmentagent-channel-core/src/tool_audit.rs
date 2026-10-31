@@ -369,6 +369,11 @@ impl std::fmt::Debug for AuditLogger {
 }
 
 impl AuditLogger {
+    /// Healthy runtime ownership handoff, distinct from interrupted recovery.
+    pub fn handoff_evidence(&self,request_sha256:&str,destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
+        let _=request_sha256;
+        self.recovery_evidence(destination.lease_generation)
+    }
     /// Seal a failed generation only after a new fenced workflow lease and
     /// independent kernel proof that no admitted worker remains alive.
     pub fn recovery_evidence(&self, new_lease_generation: i64) -> anyhow::Result<serde_json::Value> {
@@ -1384,6 +1389,28 @@ mod tests {
         let anchor = dir.path().join("anchors/workflow.json");
         let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
         (dir, logger, log, anchor)
+    }
+
+    #[test]
+    fn healthy_handoff_seals_once_and_replays_after_late_rejection() {
+        let (_dir,logger,log,anchor)=protected_fixture();
+        let source=crate::native_vm::RuntimeOwner {workflow_id:"owner/repo#pr42".into(),lease_generation:1};
+        let destination=crate::native_vm::RuntimeOwner {lease_generation:2,..source.clone()};
+        logger.set_native_runtime_owner(source.clone()).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":source.workflow_id,"generation":1})).unwrap();
+        logger.require_run_resources().unwrap();
+        let request="a".repeat(64);
+        let proof=logger.handoff_evidence(&request,&destination).expect("healthy runtime has no handoff seal path");
+        assert_eq!(proof["validation"]["handoff_context"]["request_sha256"],request);
+        assert!(logger.record_controller(serde_json::json!({"actor":"controller","kind":"late"})).is_err());
+        let sealed_bytes=std::fs::read(&anchor).unwrap();
+        let reopened=AuditLogger::protected(log.clone(),anchor.clone(),&[]).unwrap();
+        reopened.set_native_runtime_owner(source).unwrap();
+        assert_eq!(reopened.handoff_evidence(&request,&destination).unwrap(),proof);
+        assert_eq!(std::fs::read(&anchor).unwrap(),sealed_bytes,"replay rewrote the sealed anchor");
+        assert!(reopened.handoff_evidence(&"b".repeat(64),&destination).is_err());
+        std::fs::write(log,b"changed committed audit").unwrap();
+        assert!(reopened.handoff_evidence(&request,&destination).is_err(),"replay accepted modified committed bytes");
     }
 
     #[tokio::test]
