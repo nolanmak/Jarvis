@@ -140,7 +140,7 @@ async fn live_cross_platform_fact_changes_draft_and_missing_source_is_disclosed(
         )
         .await
         .unwrap();
-    let lower = missing_draft.to_lowercase();
+    let lower = missing_draft.to_lowercase().replace('’', "'");
     assert!(
         missing_draft.contains('?')
             || lower.contains("resend")

@@ -106,11 +106,15 @@ then enable the remaining migrated adapters. Every send still needs its
 existing approval. Revert the context policy to `off` if a card invents a
 material fact or exposes private evidence.
 
-The synthetic model run on 2026-10-31 read the referenced email and used its
-updated day/time (two source operations; 66 seconds including drafting).
-The matched missing-email run finished with a material gap after two searches.
-These are individual observations, not population estimates of recall or
-faithfulness. There is no measured before/after owner-edit rate yet; collect
+Explicit Claude and Codex synthetic evaluations on 2026-10-31 both read the
+referenced email and used its updated day/time despite an older wiki note and
+an embedded untrusted instruction. Each present-evidence case used two source
+operations; Claude took 37 seconds including drafting and Codex took 21 seconds.
+Both matched missing-email cases finished with an honest disclosure and a
+material card gap after two searches. The complete pairs took 99.80 seconds
+and 44.48 seconds respectively. These are individual observations, not population
+estimates of recall or faithfulness, and do not establish live behavior for
+other providers. There is no measured before/after owner-edit rate yet; collect
 that through existing revision records rather than inventing a success metric.
 
 Receipts cover the shared context step. Existing channel-specific draft tools
