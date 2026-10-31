@@ -73,7 +73,7 @@ request=json.loads(sys.stdin.read())
 assert len(request['baseline']['wiki']) == 2
 assert request['baseline']['person_slug'] == 'peer'
 assert '--tools' in sys.argv and sys.argv[sys.argv.index('--tools')+1] == ''
-answer=json.dumps({'action':'ready','facts':[],'gaps':[]})
+answer=json.dumps({'action':'ready','facts':[],'gaps':['The referenced email is unavailable.']})
 print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':answer}]}}))
 print(json.dumps({'type':'result','result':answer}))
 "#,
@@ -97,6 +97,18 @@ print(json.dumps({'type':'result','result':answer}))
     assert_eq!(result["enabled"], true);
     assert_eq!(result["context"]["person_slug"], "peer");
     assert_eq!(result["evidence"]["complete"], true);
+    let notice = result["approval_context_notice"].as_str().unwrap();
+    assert_eq!(
+        augmentagent_approval_discord::split_needs_input(notice)
+            .1
+            .len(),
+        1
+    );
+    assert!(
+        augmentagent_approval_discord::strip_assumes_for_send(notice)
+            .trim()
+            .is_empty()
+    );
     let store = Store::open(root.join("db")).unwrap();
     assert!(store.pending_actions().unwrap().is_empty());
     assert!(store.list_imessage_outbox(10).unwrap().is_empty());
@@ -160,12 +172,129 @@ fn metadata_commands_do_not_approve_and_reject_a_different_action() {
             "--receipt-id",
             &receipt,
             "--action-id",
-            &action,
+            &action[..8],
         ])
         .output()
         .unwrap();
     assert!(!result.status.success());
     assert_eq!(store.pending_actions().unwrap().len(), 1);
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+}
+
+#[test]
+fn short_card_reference_attaches_and_inspects_a_same_conversation_compose() {
+    let dir = fixture();
+    let root = dir.path();
+    let store = Store::open(root.join("db")).unwrap();
+    let receipt = store
+        .save_draft_context_receipt("source", &serde_json::json!({"version":1}))
+        .unwrap();
+    let mut compose = store.context_source("source").unwrap().unwrap();
+    compose.message_id = "imessage:compose:synthetic".into();
+    compose.kind = "compose".into();
+    store.upsert_email(&compose).unwrap();
+    let action = store
+        .log_action(
+            &compose.message_id,
+            compose.thread_id.as_deref(),
+            &compose.from,
+            &compose.subject,
+            None,
+            Some("Draft"),
+            ActionStatus::Pending,
+        )
+        .unwrap();
+    let short = action[..8].to_uppercase();
+    let attached = output(
+        command(root)
+            .args([
+                "messages",
+                "context-attach",
+                "--receipt-id",
+                &receipt,
+                "--action-id",
+                &short,
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(attached["action_id"], action);
+    let receipts = output(
+        command(root)
+            .args(["messages", "context-receipts", "--action-id", &short])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(receipts.as_array().unwrap().len(), 1);
+    assert_eq!(store.pending_actions().unwrap().len(), 1);
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+}
+
+#[test]
+fn ambiguous_card_references_do_not_attach_or_disclose_receipts() {
+    let dir = fixture();
+    let root = dir.path();
+    let store = Store::open(root.join("db")).unwrap();
+    let receipt = store
+        .save_draft_context_receipt("source", &serde_json::json!({"version":1}))
+        .unwrap();
+    let ids = [
+        "abcdef01-0000-4000-8000-000000000001",
+        "abcdef01-0000-4000-8000-000000000002",
+    ];
+    for id in ids {
+        let generated = store
+            .log_action(
+                "source",
+                Some("imessage:peer@example.invalid"),
+                "peer@example.invalid",
+                "test",
+                None,
+                Some("Draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        store
+            .with_conn(|c| c.execute("UPDATE actions SET id=?1 WHERE id=?2", [id, &generated]))
+            .unwrap();
+    }
+    let attached = command(root)
+        .args([
+            "messages",
+            "context-attach",
+            "--receipt-id",
+            &receipt,
+            "--action-id",
+            "abcdef01",
+        ])
+        .output()
+        .unwrap();
+    assert!(!attached.status.success());
+    assert!(String::from_utf8_lossy(&attached.stderr).contains("ambiguous"));
+    let inspected = command(root)
+        .args(["messages", "context-receipts", "--action-id", "abcdef01"])
+        .output()
+        .unwrap();
+    assert!(!inspected.status.success());
+    for id in ids {
+        assert!(store.draft_context_receipts(id).unwrap().is_empty());
+    }
+    output(
+        command(root)
+            .args([
+                "messages",
+                "context-attach",
+                "--receipt-id",
+                &receipt,
+                "--action-id",
+                ids[0],
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(store.draft_context_receipts(ids[0]).unwrap().len(), 1);
+    assert!(store.draft_context_receipts(ids[1]).unwrap().is_empty());
+    assert_eq!(store.pending_actions().unwrap().len(), 2);
     assert!(store.list_imessage_outbox(10).unwrap().is_empty());
 }
 
@@ -189,6 +318,7 @@ fn rollout_off_returns_explicit_disabled_context_without_calling_a_provider() {
     );
     assert_eq!(result["enabled"], false);
     assert_eq!(result["receipt_id"], "");
+    assert_eq!(result["approval_context_notice"], "");
     let store = Store::open(dir.path().join("db")).unwrap();
     assert!(store.pending_actions().unwrap().is_empty());
     assert!(store.list_imessage_outbox(10).unwrap().is_empty());

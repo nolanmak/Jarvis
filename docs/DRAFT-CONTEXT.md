@@ -44,6 +44,11 @@ augmentagent messages context-receipts --action-id '<action-id>'
 ```
 
 Attachment refuses a different platform, account or conversation. The context
+attachment and inspection commands accept full action IDs or unique short card
+references; ambiguous references are refused. `approval_context_notice` is the
+shared workflow's private warning markup: owner-requested drafts append it to
+the compose body so material gaps appear on the approval card and are stripped
+before sending. The context
 command's arguments and evidence output are omitted from ordinary tool audit
 notices. Receipt inspection is private. Explicit verbatim messages do not
 require generation or evidence retrieval.
