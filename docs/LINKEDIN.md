@@ -177,3 +177,154 @@ browser fallback.
 - **Account**: LinkedIn's ToS discourages automated access. Conservative poll cadence + jitter keeps the footprint small, but there's always non-zero risk your account gets flagged. Don't send dozens of replies per day; don't run this on an account you can't afford to lose.
 - **Cookie theft**: if `linkedin-auth.json` leaks (git commit, backup, shared drive), the attacker has full DM read + send until you log out of linkedin.com. Rotate by logging out + re-harvesting.
 - **queryId rotation**: LinkedIn can change the `messengerConversations.xxx` id any deploy. When that happens, re-capture it via Chrome network tab and export `AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID`.
+
+## Archive reads and backfill
+
+`linkedin recent-dms --limit 40 --json` follows mailbox pages and includes group
+conversations and conversations whose newest message is yours. `--category`
+selects the mailbox category (default `INBOX`); `--max-pages` bounds requests.
+A limit of zero performs no requests. A page budget of zero returns a resumable
+partial result. Limits above the mailbox size stop at server exhaustion.
+
+The JSON contract is version 2: an object with `schema_version`, `account_id`, `conversations`,
+`category`, `pages`, `complete`, and `next_cursor`, replacing the old flat DM
+array. Each conversation contains its stable `urn`, `title`, `group` flag,
+`participants`, and source `last_activity_ms`. These are conversation records,
+not message snippets or proof of complete message history. Agent integrations
+must read `conversations` and inspect `complete` instead of counting text lines.
+
+Pass the returned `next_cursor` unchanged with the same category to resume.
+Continuation retains seen IDs across overlapping pages and is bound to the
+signed-in account. If a partially consumed page changes order or membership,
+the command reports that the listing must restart; it does not silently skip
+messages. A continuation is read state, not authentication material.
+
+```sh
+augmentagent linkedin recent-dms --limit 40 --category PRIMARY_INBOX --json
+augmentagent linkedin recent-dms --limit 40 --category PRIMARY_INBOX --cursor '<returned-cursor>' --json
+augmentagent linkedin thread '<conversation-urn>' --max-pages 10 --json
+augmentagent linkedin backfill --max-pages 100
+augmentagent linkedin backfill --dry-run --max-pages 100
+augmentagent linkedin archive-status --category PRIMARY_INBOX
+```
+
+A rejected continuation (HTTP 400 or 410 on a request carrying a cursor) gets
+one automatic restart per mailbox or thread reconciliation. The restart keeps
+stored messages and deduplicates replayed IDs. Its allowance is durable across
+process restarts; a repeated rejection records an error and defers retries
+instead of restarting indefinitely. This is a conservative recovery policy,
+not a claim that every 400 response means an expired LinkedIn cursor. A first-page
+failure, authentication error, or throttle does not trigger this recovery.
+Conflicting copies of one message ID, or an explicit message conversation ID
+that disagrees with the requested thread, fail the page instead of choosing an
+arbitrary copy. Identical copies are deduplicated. Cancellation leaves committed
+checkpoints intact; a started read still consumes the invocation's request budget,
+while durable page counters advance only after a successful transaction.
+
+Authentication, redirect, and rate-limit failures pause archival reads for the
+whole account, including category discovery. The pause survives restarts and
+explicit category changes; `Retry-After` controls throttling, with a 60-second
+backoff for session failures. Inventory failures also persist a backoff.
+Search/status coverage includes `accounts` with the last error and retry time,
+even when discovery failed before any category was recorded. Successful reads
+begun after the pause clear its error; older concurrent requests cannot clear
+a newer pause.
+
+Backfill defaults to all categories exposed by the account's mailbox inventory.
+It stores group and owner messages without drafting, raising cards or sending.
+`--dry-run` performs the same bounded live reads and indexing in a fresh in-memory
+database. It does not open or migrate the configured database, advance durable
+checkpoints, migrate credentials, or repair credential-file permissions. Its
+counts describe a fresh traversal, not the number of new rows relative to an
+existing archive. JSON identifies `dry_run`, `persistent_writes`, the
+`all_accessible_history` scope, request `pages`, and completion. Category discovery
+consumes one request from `--max-pages`; a zero budget performs no requests or
+credential reads and reports incomplete coverage. Missing credentials fail
+without creating database or credential files.
+Repeat bounded invocations to resume durable progress; `--refresh` reconciles
+mailbox heads while preserving imported history. Each invocation with a positive page budget indexes at most 1,000 queued
+entries, checking cancellation between batches. Remaining LinkedIn index work
+keeps coverage incomplete; another bounded invocation resumes it. A zero-page
+budget performs no indexing. Completion requires mailbox
+and thread exhaustion and a healthy search index. A successful request alone
+does not establish complete coverage.
+
+For stored messages, use `search_messages` with `with:<name-or-stable-identity>`
+and `in:linkedin`, then `read_conversation_thread`. Membership includes silent
+participants; `from:` restricts actual authorship. Equal display names return
+ambiguity. For the next stored-thread request, pass response `next_offset` as `offset`
+and `next_body_offset` as `body_offset`, retaining `account_id` and
+`snapshot_max_rowid`. Stop when `next_offset` is null. This reconstructs full
+Unicode text. Inspect
+the returned coverage state and observation time before describing a thread as
+complete or an introduction as unanswered.
+
+### Live ingestion and approval
+
+Production polling uses the same paginated archive reader as backfill. Each
+poll has a 100-request budget, including category discovery, and resumes
+unfinished histories before admitting their messages for triage. Completed
+mailbox scopes are reconciled again on later polls to find changed threads.
+
+The first live poll persists an activation timestamp. Historical messages stay
+archive-only, including after restart; newly received messages are eligible
+based on their source timestamps. A separate seen-ID ledger handles equal-time
+arrivals. Completed direct threads queue one candidate per burst and pass their
+stored, source-ordered history to triage and drafting. Pending candidates survive
+restart, and a durable claim prevents concurrent workers from triaging the same
+candidate. Claims renew while a worker runs, release on normal exit, and expire
+after an hour without renewal following a crash.
+
+Group messages and owner-latest threads are stored and indexed without entering
+triage. Direct eligibility requires two known participants, including the owner
+and the actual sender. Reclassification retires undispatched candidates.
+Authoritative conversation metadata is checked before archived candidates enter
+triage, and the send API checks direct membership again before an approved reply
+is posted. Approval atomically claims the pending action before attempting a
+send, so simultaneous clicks or a replay after restart cannot send that action
+twice. A stale direct-message card is refused if current membership identifies
+a group or is unknown. The read and backfill commands never grant group-send
+permission. A `linkedin dm` invocation without `--post` only prints the supplied
+text; it neither generates a draft nor needs credentials. Direct membership is
+validated before any approval card is persisted and again before sending.
+
+### Search coverage and account identity
+
+Both `search_messages` and the memory tool's `search_conversation_history`
+return `account_id` with hits. Pass that identity with `thread_id` when reading
+stored threads. Search responses include `linkedin_coverage` whenever LinkedIn
+is in scope, including zero-hit results. Its scope is explicitly
+`known_categories_only`; recorded categories do not prove that every current
+mailbox category has been discovered. A successful category discovery persists
+its `inventory.categories` and `inventory.observed_at_ms` on the account, and
+creates incomplete progress records even when no request budget remains for
+those categories. The inventory is an observation, not a guarantee that today's
+API category set is unchanged. Previously stored categories and messages remain
+available when absent from a later inventory. Per-category results expose last success,
+last error, retry time, failed thread count, and search-index health.
+
+`archive-status` reads persisted state without requiring working cookies. Its
+version-1 response contains `category`, `coverage`, and `threads`, covering
+recorded accounts in the requested category. Each thread reports `history_state`
+(`unknown`, `partial`, `failed`, or `complete_at_observation`), direct/group kind,
+source-time bounds, counts by direction and text/non-text kind, last success/error,
+retry time, continuation presence, and separate index-health counts. History
+exhaustion does not imply that indexing is finished. Opaque cursor values and
+message bodies are omitted.
+
+`mailbox_pages` and each thread's `pages` count durable page commits, including
+replayed pages during reconciliation. `committed` is cumulative since tracking
+began; `current_cycle` resets on an explicit mailbox refresh or newly observed
+thread activity. Rejected transactions and a concurrent importer's losing page
+do not count. A rejected-cursor restart retains the cycle count. Null counters
+mean no page receipt was recorded; they are not invented from message totals.
+The coverage `scope` is `all_accessible_history`, with source-date bounds describing
+the stored rows rather than claiming that missing upstream history was recovered. A missing progress record is `not_synced`, not proof
+that the database contains no older message rows. Legacy LinkedIn rows use their
+stored `receivedAt` source timestamp when parseable, while import time remains
+separately labeled. Their history coverage stays unverified until reconciled.
+
+Direct approval sends have a 30-second deadline. A timeout records unknown
+delivery and prevents automatic retry; inspect the conversation before
+resending. Revise and Skip only change pending actions, so a stale operation
+cannot reopen or overwrite a claimed send.

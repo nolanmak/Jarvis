@@ -279,6 +279,7 @@ pub struct Ambiguity {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Hit {
+    pub account_id: Option<String>,
     pub message_id: String,
     pub thread_id: String,
     pub platform: String,
@@ -295,6 +296,8 @@ pub struct Hit {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchResponse {
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub linkedin_coverage: Option<augmentagent_store::linkedin_archive::SearchCoverage>,
     pub hits: Vec<Hit>,
     pub total_estimate: i64,
     pub next_offset: Option<usize>,
@@ -439,6 +442,25 @@ fn narrow_to_households(
     Ok(())
 }
 
+// Membership names complement wiki identities, including silent participants.
+fn resolve_people_and_members(c: &Connection, reference: &str) -> augmentagent_store::rusqlite::Result<Vec<PersonMatch>> {
+    let mut found = people::resolve_person(c, reference)?;
+    let needle = reference.trim().to_lowercase();
+    if needle.is_empty() || reference.contains(':') { return Ok(found); }
+    let mut q = c.prepare("SELECT DISTINCT urn,name FROM linkedin_archive_participants")?;
+    let rows = q.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
+    for row in rows {
+        let (urn,name) = row?;
+        let normalized = name.to_lowercase();
+        if normalized != needle && !normalized.split_whitespace().any(|word| word == needle) { continue; }
+        for mut candidate in people::resolve_person(c, &format!("linkedin:{urn}"))? {
+            if candidate.name.is_none() { candidate.name = Some(name.clone()); }
+            if !found.iter().any(|f|f.key == candidate.key) { found.push(candidate); }
+        }
+    }
+    Ok(found)
+}
+
 /// Resolve every person reference in the query, then narrow by household.
 fn person_refs(c: &Connection, q: &Query) -> augmentagent_store::rusqlite::Result<Vec<PersonRef>> {
     let mut refs = Vec::new();
@@ -456,7 +478,7 @@ fn person_refs(c: &Connection, q: &Query) -> augmentagent_store::rusqlite::Resul
         );
     for (reference, slot) in listed {
         refs.push(PersonRef {
-            matches: people::resolve_person(c, reference)?,
+            matches: resolve_people_and_members(c, reference)?,
             reference: reference.clone(),
             slot,
         });
@@ -489,8 +511,16 @@ pub fn plan(
     let conversation_clause = |sql: &mut Sql, handles: &[String]| {
         let list = sql.in_list(handles);
         sql.filters.push(format!(
-            "mi.conversation_id IN (SELECT conversation_id FROM message_index \
-             WHERE sender_handle IN ({list}) OR counterpart_handle IN ({list}))"
+            "((NOT EXISTS(SELECT 1 FROM linkedin_archive_messages known WHERE known.stored_id=mi.message_id) \
+              AND EXISTS(SELECT 1 FROM message_index peer \
+                JOIN emails pe ON pe.messageId=peer.message_id \
+                JOIN emails own ON own.messageId=mi.message_id \
+                WHERE peer.platform=mi.platform AND peer.conversation_id=mi.conversation_id \
+                AND pe.accountEntityId IS own.accountEntityId \
+                AND (peer.sender_handle IN ({list}) OR peer.counterpart_handle IN ({list})))) OR \
+             (mi.platform='linkedin' AND EXISTS(SELECT 1 FROM linkedin_archive_messages am \
+              JOIN linkedin_archive_participants ap ON ap.account=am.account AND ap.conversation=am.conversation \
+              WHERE am.stored_id=mi.message_id AND ('linkedin:' || ap.urn) IN ({list}))))"
         ));
     };
 
@@ -590,7 +620,7 @@ pub fn plan(
     let rows_sql = format!(
         "SELECT mi.rowid, mi.message_id, mi.conversation_id, mi.platform, mi.conv_kind, \
                 mi.conversation_title, mi.container, mi.sender_label, mi.sender_handle, \
-                mp.person_key, mi.from_me, mi.ts_ms \
+                mp.person_key, mi.from_me, mi.ts_ms, (SELECT e.accountEntityId FROM emails e WHERE e.messageId=mi.message_id) \
          {from} LEFT JOIN message_people mp ON mp.handle = mi.sender_handle{where_clause} \
          ORDER BY {order} LIMIT {} OFFSET {}",
         limit,
@@ -604,6 +634,7 @@ fn row_to_hit(row: &Row<'_>) -> augmentagent_store::rusqlite::Result<(i64, Hit)>
     Ok((
         row.get(0)?,
         Hit {
+            account_id: row.get(12)?,
             message_id: row.get(1)?,
             thread_id: row.get(2)?,
             platform: row.get(3)?,
@@ -633,8 +664,12 @@ pub fn search(
     let (rows_sql, count_sql, params, ambiguous, unresolved) = plan(c, &q, limit, offset)?;
     let archive_newest_entry = crate::archive::newest_entries(c, &q.platforms)?;
     let stale_platforms = crate::archive::stale_platforms(&archive_newest_entry, q.after);
+    let linkedin_coverage=if (q.platforms.is_empty() || q.platforms.iter().any(|p|p=="linkedin")) && !q.not_platforms.iter().any(|p|p=="linkedin") {
+        Some(augmentagent_store::linkedin_archive::search_coverage(c,crate::EXTRACTOR_VERSION)?)
+    } else {None};
     if !ambiguous.is_empty() {
         return Ok(SearchResponse {
+            linkedin_coverage,
             hits: Vec::new(),
             total_estimate: 0,
             next_offset: None,
@@ -675,6 +710,7 @@ pub fn search(
     let next_offset = (!q.latest && hits.len() == limit && (offset + limit) < total as usize)
         .then_some(offset + limit);
     Ok(SearchResponse {
+        linkedin_coverage,
         hits,
         total_estimate: total,
         next_offset,

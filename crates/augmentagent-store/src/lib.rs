@@ -15,6 +15,7 @@ pub mod daemon_report;
 pub mod delivery;
 pub mod imessage;
 pub mod models;
+pub mod linkedin_archive;
 pub mod notes;
 pub mod owner;
 pub mod phone;

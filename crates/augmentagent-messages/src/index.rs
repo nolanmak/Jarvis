@@ -233,6 +233,19 @@ fn drain_in_tx(c: &Connection, batch: usize) -> augmentagent_store::rusqlite::Re
             Some(row) => {
                 body_bytes += row.body.len();
                 let mut f = extract(&row, &owner);
+                if row.platform == "linkedin" {
+                    let archived = c.query_row(
+                        "SELECT m.from_me,m.source_ms,c.title FROM linkedin_archive_messages m JOIN linkedin_archive_conversations c ON c.account=m.account AND c.urn=m.conversation WHERE m.stored_id=?1",
+                        [&row.message_id], |r| Ok((r.get::<_,bool>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)),
+                    ).optional()?;
+                    if let Some((from_me, source_ms, title)) = archived {
+                        f.from_me = from_me;
+                        f.ts_ms = source_ms;
+                        f.ts_fallback = false;
+                        f.conversation_title = Some(title);
+                        if from_me { f.counterpart_handle = None; }
+                    }
+                }
                 if row.platform == "slack" && row.kind != "compose" {
                     slack_directory(c, &row, &mut f);
                 }
