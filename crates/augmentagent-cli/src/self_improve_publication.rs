@@ -307,6 +307,20 @@ fn merge_transport_output(ok: bool, out: String, error: &str, graphql: bool) -> 
     Ok(out)
 }
 
+/// Queue/auto-merge protocols may ignore supplied commit messages. Receipt
+/// markers require the direct mergePullRequest commitBody contract.
+async fn require_direct_merge_protocol(github: &mut impl Github, repository: &str) -> Result<()> {
+    let (owner,name) = repository.split_once('/').context("invalid merge repository")?;
+    let query = "query AutoshipDirectMergePolicy($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){mergeQueue(branch:\"main\"){id}}}";
+    let raw = github.call(&["api","graphql","-f",&format!("query={query}"),"-f",&format!("owner={owner}"),"-f",&format!("repo={name}")])
+        .await.context("merge-dependency:direct-merge-protocol: policy unavailable")?;
+    let policy:serde_json::Value = serde_json::from_str(&raw).context("merge-dependency:direct-merge-protocol: invalid policy")?;
+    anyhow::ensure!(policy.get("errors").is_none_or(|errors|errors.is_null() || errors.as_array().is_some_and(|errors|errors.is_empty()))
+        && policy.pointer("/data/repository").is_some_and(|repo|repo.is_object() && repo.get("mergeQueue").is_some_and(serde_json::Value::is_null)),
+        "merge-dependency:direct-merge-protocol: merge queue must be explicitly absent; no queued or automatic merge fallback");
+    Ok(())
+}
+
 /// A head-only CAS cannot bind main. Require GitHub to atomically reject
 /// out-of-date branches, including administrator callers, during the mutation.
 async fn require_strict_integration(github: &mut impl Github, repository: &str) -> Result<()> {
@@ -590,6 +604,7 @@ async fn merge_mutation(
         .as_str()
         .filter(|s| !s.is_empty())
         .context("missing PR node identity")?;
+    require_direct_merge_protocol(github, repository).await?;
     require_strict_integration(github, repository).await?;
     store.reserve_merge(lease, operation, repository, pr, node, chrono::Utc::now().timestamp_millis(), cap)?;
     let marker = store.dispatch_marked_merge(lease, operation, chrono::Utc::now().timestamp_millis(), cap)?;
@@ -726,6 +741,7 @@ mod tests {
         MergeFake {
             replies: VecDeque::from([
                 Ok(merge_before("OPEN")),
+                Ok(r#"{"data":{"repository":{"mergeQueue":null}}}"#.into()),
                 Ok(strict_rules()),
                 Ok(r#"{"enforcement":"active","bypass_actors":[]}"#.into()),
                 response,
@@ -740,6 +756,28 @@ mod tests {
         assert!(merge_transport_output(false,"".into(),"timeout",true).is_err());
         assert!(merge_transport_output(false,"bad JSON".into(),"failure",true).is_err());
         assert!(merge_transport_output(false,raw.into(),"non-GraphQL failure",false).is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_merge_protocol_requires_explicit_queue_absence() {
+        for (response,allowed) in [
+            (Ok(r#"{"data":{"repository":{"mergeQueue":null}}}"#.into()),true),
+            (Ok(r#"{"data":{"repository":{"mergeQueue":{"id":"queue"}}}}"#.into()),false),
+            (Ok(r#"{"data":{"repository":{}}}"#.into()),false),
+            (Ok(r#"{"data":{"repository":{"mergeQueue":null}},"errors":[{"message":"partial response"}]}"#.into()),false),
+            (Err(anyhow::anyhow!("unavailable")),false),
+        ] {
+            let mut github = MergeFake { replies:VecDeque::from([response]),calls:vec![] };
+            assert_eq!(require_direct_merge_protocol(&mut github,"owner/repo").await.is_ok(),allowed);
+            assert_eq!(github.calls.len(),1);
+            assert!(github.calls[0].iter().any(|arg|arg.contains("query AutoshipDirectMergePolicy")));
+            assert!(github.calls[0].iter().all(|arg|!arg.contains("mutation")));
+        }
+        let mut github = mutation_fake(Ok(mutation_response().to_string()));
+        github.replies[1] = Ok(r#"{"data":{"repository":{"mergeQueue":{"id":"queue"}}}}"#.into());
+        let error = merge_test(&mut github,"owner/repo",12,"head","op-1").await.unwrap_err();
+        assert!(error.to_string().starts_with("merge-dependency:direct-merge-protocol"));
+        assert_eq!(github.calls.len(),2,"stop after candidate identity and read-only queue policy");
     }
 
     #[tokio::test]
@@ -945,6 +983,7 @@ mod tests {
             let mut github = MergeFake {
                 replies: VecDeque::from([
                     Ok(merge_before("OPEN")),
+                    Ok(r#"{"data":{"repository":{"mergeQueue":null}}}"#.into()),
                     Ok(strict_rules()),
                     Ok(ruleset.into()),
                     Err(anyhow::anyhow!("no legacy protection")),
@@ -960,7 +999,7 @@ mod tests {
             assert!(!github
                 .calls
                 .iter()
-                .any(|call| call.get(1).is_some_and(|s| s == "graphql")));
+                .any(|call| call.iter().any(|arg|arg.contains("mutation AutoshipMerge"))));
         }
     }
 
