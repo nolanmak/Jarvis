@@ -22,6 +22,7 @@ pub mod owner;
 pub mod phone;
 mod local_chat;
 pub mod owner_alerts;
+pub mod recipients;
 pub mod redact;
 // #1290 — Slack contact send targets and the per-action send ledger.
 pub mod slack_contact;
@@ -64,6 +65,7 @@ pub use store::{
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write
 /// `Store::with_conn` closures without taking a direct `rusqlite` dep that
 /// could drift from the version this crate links.
+pub use recipients::Recipients;
 pub use rusqlite;
 
 mod triage_calibration;
