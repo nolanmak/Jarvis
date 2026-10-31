@@ -53,7 +53,7 @@ elif a[:2]==['api','graphql']:
  git('update-ref','refs/heads/main',head)
  (root/'merged').write_text(head)
  with (root/'merge-mutations.jsonl').open('a') as stream:stream.write(json.dumps(fields)+'\n')
- row.update(state='MERGED',mergeCommit={'oid':head},mergedBy={'login':'autoship-canary'})
+ row.update(state='MERGED',mergedAt=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),mergeCommit={'oid':head},mergedBy={'login':'autoship-canary'})
  print(json.dumps({'data':{'mergePullRequest':{'clientMutationId':fields['request'],'pullRequest':row}}}))
 elif a[:1]==['api'] and '/git/ref/heads/main' in a[1]:print(git('rev-parse','refs/heads/main'))
 elif a[:1]==['api'] and '/branches/main/protection' in a[1]:

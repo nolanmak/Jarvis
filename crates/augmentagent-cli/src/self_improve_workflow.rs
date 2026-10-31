@@ -552,6 +552,10 @@ impl SweepGuard {
         inner.validate_before_side_effect()
     }
 
+    pub(super) fn merge_lease(&self) -> Result<Lease> {
+        self.inner.as_ref().context("released sweep lease")?.merge_lease()
+    }
+
     pub(super) fn record_merge_mutation(
         &self,
         operation: &Operation,
@@ -1103,6 +1107,11 @@ impl WorkflowGuard {
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
             .pending_operations(&self.lease.workflow)
+    }
+
+    pub(super) fn merge_lease(&self) -> Result<Lease> {
+        self.validate_before_side_effect()?;
+        Ok(self.lease.clone())
     }
 
     pub(super) fn record_merge_mutation(

@@ -526,7 +526,7 @@ async fn execute(
             guard.validate_binding(&binding).await?;
             let intent = guard.intent(OperationKind::MergePr)?;
             let mutation =
-                publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent).await;
+                publication::merge_exact(repo, &pr.repository, pr.pr, &binding.head, &intent, &guard.merge_lease()?).await;
             if let Ok(Some(receipt)) = &mutation {
                 guard.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
             }
@@ -690,7 +690,7 @@ pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
         lease.validate_remote(repo, pr.pr, &pr.head).await?;
         let intent = lease.merge_intent()?;
         let mutation =
-            publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent).await;
+            publication::merge_exact(repo, &pr.repository, pr.pr, &pr.head, &intent, &lease.merge_lease()?).await;
         if let Ok(Some(receipt)) = &mutation {
             lease.record_merge_mutation(&intent, &serde_json::to_value(receipt)?)?;
         }

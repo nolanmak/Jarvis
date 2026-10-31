@@ -231,7 +231,7 @@ fn resumed_reviews_recover_latest_findings_without_minting_approval() {
 }
 
 #[tokio::test]
-async fn approved_ready_pr_survives_pending_checks_failed_merge_and_head_change() {
+async fn approved_ready_pr_preserves_review_but_never_replays_uncertain_merge() {
     const CHILD: &str = "AUTOSHIP_PROGRESS_FIXTURE";
     if std::env::var_os(CHILD).is_none() {
         let dir = tempfile::Builder::new().prefix("autoship-sweep-test-").tempdir_in("/tmp").unwrap();
@@ -259,7 +259,7 @@ elif a[:2]==['api','graphql']:
     assert fields['head']==s['head']
     if s['fail_merge']: sys.exit(1)
     (root/'merged').write_text(s['head'])
-    print(json.dumps(dict(data=dict(mergePullRequest=dict(clientMutationId=fields['request'],pullRequest=dict(id='PR_fixture20',number=20,state='MERGED',headRefOid=s['head'],mergeCommit=dict(oid='e'*40),mergedBy=dict(login='fixture-owner')))))))
+    print(json.dumps(dict(data=dict(mergePullRequest=dict(clientMutationId=fields['request'],pullRequest=dict(id='PR_fixture20',number=20,state='MERGED',headRefOid=s['head'],mergedAt=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),mergeCommit=dict(oid='e'*40),mergedBy=dict(login='fixture-owner')))))))
 elif a[0]=='api' and '/rules/branches/main' in a[1]: print(json.dumps([dict(type='required_status_checks',ruleset_id=1,parameters=dict(strict_required_status_checks_policy=True,required_status_checks=[dict(context='rust')]))]))
 elif a[0]=='api' and '/rulesets/1' in a[1]: print(json.dumps(dict(enforcement='active',bypass_actors=[])))
 elif a[0]=='api' and '/git/ref/heads/main' in a[1]: print(s['base'])
@@ -278,7 +278,7 @@ else: raise Exception('unexpected call '+repr(a))
         std::fs::create_dir(root.join("home")).unwrap();
         std::fs::create_dir(root.join("cache")).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "self_improve::progress_tests::approved_ready_pr_survives_pending_checks_failed_merge_and_head_change", "--nocapture"])
+            .args(["--exact", "self_improve::progress_tests::approved_ready_pr_preserves_review_but_never_replays_uncertain_merge", "--nocapture"])
             .env("HOME", root.join("home"))
             .env("CARGO_TARGET_DIR", root.join("cache/builder"))
             .env("AUGMENTAGENT_GATE_TARGET_DIR", root.join("cache/gate"))
@@ -292,7 +292,7 @@ else: raise Exception('unexpected call '+repr(a))
             .env_remove("DISCORD_WEBHOOK_URL")
             .output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(root.join("merged").exists(), "child scenario must actually execute");
+        assert!(root.join("reconciliation-verified").exists(), "child scenario must actually execute");
         return;
     }
     let fixture_root = PathBuf::from(std::env::var_os(CHILD).unwrap());
@@ -389,8 +389,16 @@ else: raise Exception('unexpected call '+repr(a))
     let started = std::time::Instant::now();
     assert!(!write_optional_pr_note(&root, "20", "Optional reviewer observation").await);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert_eq!(merge_sweep(&root, false).await, 1);
-    assert_eq!(std::fs::read_to_string(fixture_root.join("merged")).unwrap(), head);
+    assert_eq!(merge_sweep(&root, false).await, 0, "uncertain merge requires explicit reconciliation before another mutation");
+    assert!(!fixture_root.join("merged").exists());
+    let calls = std::fs::read_to_string(fixture_root.join("calls")).unwrap();
+    let mutations = calls.lines().filter(|line| line.contains(r#"["api", "graphql""#)).count();
+    assert_eq!(mutations, 1, "all later sweeps must preserve the original pending mutation");
+    let allowance = merge_allowance_status().unwrap();
+    assert_eq!((allowance.confirmed, allowance.pending, allowance.remaining, allowance.available), (0, 1, 5, 4));
+    assert!(recorded_approval(opened_pr_for(&opened_prs_path(), 10).as_ref(), 20, Some(&head)).reviewed,
+        "waiting for reconciliation must retain reviewed evidence");
+    std::fs::write(fixture_root.join("reconciliation-verified"), b"pending retained; no replay").unwrap();
 }
 
 #[test]

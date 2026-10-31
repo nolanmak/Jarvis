@@ -121,19 +121,11 @@ pub struct HealthInputs {
     pub unreviewable_drafts: Vec<(u64, String, String, u32)>,
     /// Recently reconciled approved heads awaiting a named policy dependency.
     pub policy_held_drafts: Vec<(u64, String)>,
-    /// #1215 — today's engaged runs against today's cap.
-    pub runs_today: Option<RunsToday>,
+    /// Confirmed autonomous merges and separately held dispatch capacity.
+    pub merge_allowance: Option<crate::autoship_workflow::MergeAllowance>,
+    pub merge_allowance_error: Option<String>,
     /// #1214 — open `agent-gave-up` issues grouped by reason code.
     pub gave_up_by_reason: Option<Vec<(String, u32)>>,
-}
-
-/// #1215 — how much of today's run budget is spent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunsToday {
-    pub runs: u32,
-    /// Today's cap, after the quota brake.
-    pub cap: u32,
-    pub braked: bool,
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -384,6 +376,24 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
+    if let Some(error) = &i.merge_allowance_error {
+        out.push(Finding { severity: Severity::Alert, code: "merge-accounting-unavailable",
+            detail: format!("Cannot read authoritative merge allowance: {error}"),
+            fix: "Inspect the workflow store and restore access; never reset the ledger to regain capacity.".into() });
+    }
+    if let Some(a) = i.merge_allowance {
+        if a.last_merged_at_ms.is_none() {
+            out.push(Finding { severity: Severity::Warn, code: "autonomous-progress-unproven",
+                detail: "No confirmed autonomous merge is recorded since allowance activation; main commits do not prove autoship progress.".into(),
+                fix: "Check provider readiness and workflow blockers; verify an accepted autonomous merge receipt.".into() });
+        }
+        if a.oldest_pending_at_ms.is_some_and(|at| now.timestamp_millis().saturating_sub(at) >= 15 * 60_000) {
+            out.push(Finding { severity: Severity::Alert, code: "merge-reconciliation-required",
+                detail: format!("{} pending merge capacity hold(s); oldest unresolved for at least 15 minutes. These are not confirmed shipments.", a.pending),
+                fix: "Inspect the durable merge intent and remote evidence before resolving; do not replay an uncertain mutation.".into() });
+        }
+    }
+
     // A quota pause stops merges too, so it explains this one as well.
     if let Some(last) = i.last_merge.filter(|_| !held_recently) {
         let days = (now - last).num_days();
@@ -392,7 +402,7 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 severity: Severity::Warn,
                 code: "no-progress",
                 detail: format!(
-                    "nothing has merged to main for {days} days (last {})",
+                    "no confirmed autonomous merge for {days} days (last {})",
                     last.format("%Y-%m-%d")
                 ),
                 fix: "Read the last few `auto-PR:` lines in stderr.log — the loop \
@@ -492,9 +502,11 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
 /// budget, which is the first thing a reader asks when nothing shipped.
 pub fn render_text(findings: &[Finding], i: &HealthInputs) -> String {
     let mut out = report(findings).unwrap_or_else(|| "✓ auto-PR loop healthy".to_string());
-    if let Some(r) = i.runs_today {
-        let brake = if r.braked { " (brake: on)" } else { "" };
-        out.push_str(&format!("\nruns today: {} of {}{brake}", r.runs, r.cap));
+    if let Some(r) = i.merge_allowance {
+        out.push_str(&format!("\nconfirmed auto-merges today (UTC): {} of {}; remaining allowance: {}; pending capacity holds: {}; available to dispatch: {}",
+            r.confirmed, r.cap, r.remaining, r.pending, r.available));
+    } else if let Some(error) = &i.merge_allowance_error {
+        out.push_str(&format!("\nmerge allowance unavailable: {error}"));
     }
     if let Some(groups) = &i.gave_up_by_reason {
         let total: u32 = groups.iter().map(|(_, n)| n).sum();
@@ -611,6 +623,7 @@ pub fn scan_repeated_refusals(log: &str, since: DateTime<Utc>) -> Vec<(u64, Stri
             continue;
         }
         // Normalise away the trailing run counters so identical verdicts group.
+        let tail = tail.split_once(" attempts_today").map_or(tail, |(reason, _)| reason);
         let reason = tail
             .split(" runs_today")
             .next()
@@ -811,18 +824,6 @@ fn deploy_state(repo_root: &Path, state_dir: &Path) -> (Option<bool>, Option<i64
     (Some(false), lag)
 }
 
-fn last_merge(repo_root: &Path) -> Option<DateTime<Utc>> {
-    let out = std::process::Command::new("git")
-        .args(["log", "-1", "--format=%cI", "origin/main"])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    DateTime::parse_from_rfc3339(&s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-}
-
 /// #1571 — a binary rebuilt under a running process reads as
 /// `/path (deleted)`; that is a pending restart, not a different binary.
 fn strip_deleted(exe: PathBuf) -> PathBuf {
@@ -917,6 +918,10 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         DISK_DROP_WINDOW_HOURS,
     );
     crate::disk::save_readings(&filesystems, now);
+    let (merge_allowance, merge_allowance_error) = match crate::self_improve::merge_allowance_status() {
+        Ok(status) => (Some(status), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     HealthInputs {
         now_or_epoch: Some(now),
         daemon_active: daemon_active(),
@@ -925,7 +930,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         // #1030 — the loop logs this exact phrase when every provider cleared
         // for the build preset is on a quota cooldown.
         last_provider_hold: last_timestamp_with(&log, "auto-PR held: no provider can serve"),
-        last_merge: last_merge(repo_root),
+        last_merge: merge_allowance.and_then(|a| a.last_merged_at_ms).and_then(DateTime::from_timestamp_millis),
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
         running_binary,
@@ -946,10 +951,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         draft_ages_days: open_draft_ages(now),
         unreviewable_drafts: crate::self_improve::unreviewable_drafts(),
         policy_held_drafts: crate::self_improve::policy_held_drafts(),
-        runs_today: {
-            let (runs, cap, braked) = crate::self_improve::runs_today_status();
-            Some(RunsToday { runs, cap, braked })
-        },
+        merge_allowance,
+        merge_allowance_error,
         gave_up_by_reason: crate::self_improve::gave_up_breakdown_live(repo_root),
     }
 }
@@ -1034,18 +1037,27 @@ mod tests {
         assert!(!analyze(&closed, &Thresholds::default()).iter().any(|f| f.code == "policy-held"));
     }
 
-    /// #1215 C5 — the text report always says how much of today's budget
-    /// is spent, healthy or not.
     #[test]
-    fn text_output_reports_runs_against_the_cap() {
-        let mut i = HealthInputs::default();
-        i.runs_today = Some(RunsToday { runs: 2, cap: 5, braked: false });
-        assert!(render_text(&[], &i).contains("runs today: 2 of 5"), "{}", render_text(&[], &i));
-        assert!(render_text(&[], &i).contains("✓ auto-PR loop healthy"));
-        i.runs_today = Some(RunsToday { runs: 3, cap: 3, braked: true });
-        assert!(render_text(&[], &i).contains("runs today: 3 of 3 (brake: on)"));
-        i.runs_today = None;
-        assert!(!render_text(&[], &i).contains("runs today"));
+    fn allowance_report_separates_confirmed_pending_and_remaining() {
+        let mut i = healthy();
+        i.merge_allowance = Some(crate::autoship_workflow::MergeAllowance {
+            confirmed: 2, pending: 1, remaining: 3, available: 2, cap: 5,
+            oldest_pending_at_ms: Some(t0().timestamp_millis()),
+            last_merged_at_ms: Some(t0().timestamp_millis()),
+        });
+        let report = render_text(&analyze(&i, &Thresholds::default()), &i);
+        for expected in ["confirmed auto-merges today (UTC): 2 of 5", "remaining allowance: 3",
+            "pending capacity holds: 1", "available to dispatch: 2"] {
+            assert!(report.contains(expected), "{report}");
+        }
+        i.merge_allowance.as_mut().unwrap().oldest_pending_at_ms = Some((t0() - chrono::Duration::minutes(15)).timestamp_millis());
+        assert!(codes(&analyze(&i, &Thresholds::default())).contains(&"merge-reconciliation-required"));
+        i.merge_allowance.as_mut().unwrap().last_merged_at_ms = None;
+        i.last_merge = Some(t0()); // A recent unrelated main commit cannot prove autoship.
+        assert!(codes(&analyze(&i, &Thresholds::default())).contains(&"autonomous-progress-unproven"));
+        i.merge_allowance = None;
+        i.merge_allowance_error = Some("ledger unreadable".into());
+        assert!(codes(&analyze(&i, &Thresholds::default())).contains(&"merge-accounting-unavailable"));
     }
 
     /// #1214 C6 — the report groups labelled issues by reason, and the
@@ -1085,6 +1097,12 @@ mod tests {
     }
     use chrono::Duration;
 
+    #[test]
+    fn refusal_grouping_accepts_legacy_and_attempt_telemetry() {
+        let log = "2026-09-14T12:00:00Z INFO auto-PR: PR #42: resume refused — checks pending runs_today=1\n2026-09-14T12:30:00Z INFO auto-PR: PR #42: resume refused — checks pending attempts_today=2 merge_cap=5";
+        assert_eq!(scan_repeated_refusals(log, t0()), vec![(42, "resume refused — checks pending".into(), 2)]);
+    }
+
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-09-14T12:00:00Z")
             .unwrap()
@@ -1114,7 +1132,8 @@ mod tests {
             draft_ages_days: vec![(990, 0)],
             unreviewable_drafts: vec![],
             policy_held_drafts: vec![],
-            runs_today: None,
+            merge_allowance: None,
+            merge_allowance_error: None,
             gave_up_by_reason: None,
         }
     }

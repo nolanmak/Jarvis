@@ -279,6 +279,8 @@ pub(super) struct MergeMutationReceipt {
     pub merge_commit: String,
     pub merged_by: String,
     pub client_mutation_id: String,
+    #[serde(default)]
+    pub merged_at: String,
 }
 struct MergeTransport<'a>(&'a Path);
 #[async_trait::async_trait]
@@ -375,8 +377,15 @@ async fn merge_mutation(
     repository: &str,
     pr: u64,
     head: &str,
-    operation_id: &str,
+    operation: &crate::autoship_workflow::Operation,
+    lease: &crate::autoship_workflow::Lease,
+    store: &mut crate::autoship_workflow::WorkflowStore,
+    cap: u32,
 ) -> Result<Option<MergeMutationReceipt>> {
+    let operation_id = operation.id.as_str();
+    if let Some(receipt) = store.confirmed_merge_receipt(operation_id)? {
+        return Ok(Some(serde_json::from_value(receipt)?));
+    }
     let raw = github
         .call(&[
             "pr",
@@ -403,7 +412,9 @@ async fn merge_mutation(
         .filter(|s| !s.is_empty())
         .context("missing PR node identity")?;
     require_strict_integration(github, repository).await?;
-    let query="mutation AutoshipMerge($id:ID!,$head:GitObjectID!,$request:String!){mergePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,mergeMethod:SQUASH,clientMutationId:$request}){clientMutationId pullRequest{id number state headRefOid mergeCommit{oid} mergedBy{login}}}}";
+    store.reserve_merge(lease, operation, repository, pr, node, chrono::Utc::now().timestamp_millis(), cap)?;
+    store.dispatch_merge(lease, operation, chrono::Utc::now().timestamp_millis(), cap)?;
+    let query="mutation AutoshipMerge($id:ID!,$head:GitObjectID!,$request:String!){mergePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,mergeMethod:SQUASH,clientMutationId:$request}){clientMutationId pullRequest{id number state headRefOid mergedAt mergeCommit{oid} mergedBy{login}}}}";
     let raw = github
         .call(&[
             "api",
@@ -446,14 +457,19 @@ async fn merge_mutation(
         .as_str()
         .filter(|s| !s.is_empty())
         .context("merge response lacks actor")?;
-    Ok(Some(MergeMutationReceipt {
+    let merged_at = result["mergedAt"].as_str().context("merge response lacks remote completion time")?;
+    chrono::DateTime::parse_from_rfc3339(merged_at).context("invalid remote merge time")?;
+    let receipt = MergeMutationReceipt {
         expected_head: head.into(),
         pr_number: pr,
         pr_node_id: node.into(),
         merge_commit: commit.into(),
         merged_by: actor.into(),
         client_mutation_id: operation_id.into(),
-    }))
+        merged_at: merged_at.into(),
+    };
+    store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
+    Ok(Some(receipt))
 }
 
 pub(super) async fn merge_exact(
@@ -462,17 +478,22 @@ pub(super) async fn merge_exact(
     pr: u64,
     head: &str,
     operation: &crate::autoship_workflow::Operation,
+    lease: &crate::autoship_workflow::Lease,
 ) -> Result<Option<MergeMutationReceipt>> {
     anyhow::ensure!(
         operation.kind == OperationKind::MergePr && operation.binding.head == head,
         "merge intent is not bound to reviewed head"
     );
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
     merge_mutation(
         &mut MergeTransport(root),
         repository,
         pr,
         head,
-        &operation.id,
+        operation,
+        lease,
+        &mut store,
+        AutoPrLoop::cap_from(std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref()),
     )
     .await
 }
@@ -503,6 +524,26 @@ pub(super) async fn merged_exact(root: &Path, number: u64, head: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    // Scripted GitHub boundary, real production admission and durable store.
+    async fn merge_test(github: &mut impl Github, repo: &str, pr: u64, head: &str, id: &str) -> Result<Option<MergeMutationReceipt>> {
+        use crate::autoship_workflow::{WorkflowStore, Binding, OperationKind};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("workflow.db");
+        let mut store = WorkflowStore::open(&path)?;
+        let workflow = format!("{repo}#{pr}");
+        let binding = Binding { head: head.into(), contract: "contract".into(), evidence_hash: "evidence".into() };
+        let now = chrono::Utc::now().timestamp_millis();
+        store.register(&workflow, "fixture", binding.clone(), now)?;
+        let lease = store.claim(&workflow, "fixture", now, 60_000)?.unwrap();
+        store.attach_pr(&lease, pr, now)?;
+        let mut operation = store.begin_operation(&lease, OperationKind::MergePr, &binding, now)?;
+        // Stable fixture identity permits malformed echo tests below.
+        rusqlite::Connection::open(&path)?.execute("UPDATE operation SET id=?1 WHERE id=?2", rusqlite::params![id,operation.id])?;
+        operation.id = id.into();
+        merge_mutation(github, repo, pr, head, &operation, &lease, &mut store, 5).await
+    }
+
     struct MergeFake {
         replies: VecDeque<Result<String>>,
         calls: Vec<Vec<String>>,
@@ -522,7 +563,7 @@ mod tests {
         serde_json::json!([{"type":"required_status_checks","ruleset_id":1,"parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"tests"}]}}]).to_string()
     }
     fn mutation_response() -> serde_json::Value {
-        serde_json::json!({"data":{"mergePullRequest":{"clientMutationId":"op-1","pullRequest":{"id":"PR_fixture","number":12,"state":"MERGED","headRefOid":"head","mergeCommit":{"oid":"a".repeat(40)},"mergedBy":{"login":"controller"}}}}})
+        serde_json::json!({"data":{"mergePullRequest":{"clientMutationId":"op-1","pullRequest":{"id":"PR_fixture","number":12,"state":"MERGED","headRefOid":"head","mergedAt":"2026-10-31T00:00:00Z","mergeCommit":{"oid":"a".repeat(40)},"mergedBy":{"login":"controller"}}}}})
     }
     fn mutation_fake(response: Result<String>) -> MergeFake {
         MergeFake {
@@ -538,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn successful_merge_records_only_matching_accepted_mutation() {
         let mut github = mutation_fake(Ok(mutation_response().to_string()));
-        let receipt = merge_mutation(&mut github, "owner/repo", 12, "head", "op-1")
+        let receipt = merge_test(&mut github, "owner/repo", 12, "head", "op-1")
             .await
             .unwrap()
             .unwrap();
@@ -556,6 +597,7 @@ mod tests {
             "state",
             "mergeCommit",
             "mergedBy",
+            "mergedAt",
         ] {
             let mut wrong = mutation_response();
             if field == "clientMutationId" {
@@ -564,7 +606,7 @@ mod tests {
                 wrong["data"]["mergePullRequest"]["pullRequest"][field] = serde_json::Value::Null;
             }
             assert!(
-                merge_mutation(
+                merge_test(
                     &mut mutation_fake(Ok(wrong.to_string())),
                     "owner/repo",
                     12,
@@ -584,13 +626,13 @@ mod tests {
             calls: vec![],
         };
         assert!(
-            merge_mutation(&mut already, "owner/repo", 12, "head", "op-1")
+            merge_test(&mut already, "owner/repo", 12, "head", "op-1")
                 .await
                 .unwrap()
                 .is_none()
         );
         assert_eq!(already.calls.len(), 1);
-        assert!(merge_mutation(
+        assert!(merge_test(
             &mut mutation_fake(Err(anyhow::anyhow!("lost response"))),
             "owner/repo",
             12,
@@ -601,7 +643,7 @@ mod tests {
         .is_err());
     }
     #[tokio::test]
-    async fn absent_or_bypassable_strict_protection_prevents_merge_mutation() {
+    async fn absent_or_bypassable_strict_protection_prevents_merge_test() {
         for ruleset in [
             r#"{"enforcement":"active","bypass_actors":[{"actor_type":"RepositoryRole"}]}"#,
             r#"{"enforcement":"evaluate","bypass_actors":[]}"#,
@@ -615,7 +657,7 @@ mod tests {
                 ]),
                 calls: vec![],
             };
-            let error = merge_mutation(&mut github, "owner/repo", 12, "head", "op-1")
+            let error = merge_test(&mut github, "owner/repo", 12, "head", "op-1")
                 .await
                 .unwrap_err();
             assert!(error

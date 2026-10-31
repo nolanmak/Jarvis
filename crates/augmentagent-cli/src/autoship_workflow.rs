@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path = "autoship_merge_allowance.rs"]
+mod merge_allowance;
+pub use merge_allowance::MergeAllowance;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -310,6 +314,16 @@ impl WorkflowStore {
                 kind TEXT NOT NULL, binding TEXT NOT NULL, receipt TEXT, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS merge_mutation_receipt (
                 operation TEXT PRIMARY KEY REFERENCES operation(id), receipt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS merge_allowance_dispatch (
+                operation TEXT PRIMARY KEY REFERENCES operation(id), repository TEXT NOT NULL,
+                pr INTEGER NOT NULL, pr_node_id TEXT NOT NULL, head TEXT NOT NULL,
+                generation INTEGER NOT NULL, reserved_at_ms INTEGER NOT NULL,
+                dispatched_at_ms INTEGER, merged_at_ms INTEGER, resolution TEXT,
+                state TEXT NOT NULL CHECK(state IN ('reserved','dispatched','confirmed','released')));
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_pr
+                ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node
+                ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
             CREATE TABLE IF NOT EXISTS review (
                 workflow TEXT NOT NULL REFERENCES workflow(id), reviewer TEXT NOT NULL,
                 binding TEXT NOT NULL, approved INTEGER NOT NULL, evidence TEXT NOT NULL,

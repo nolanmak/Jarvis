@@ -1754,7 +1754,11 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
                 if let Err(error) = sweep_lease.validate_remote(repo_root, pr, &head).await {
                     warn!(pr, "merge sweep ownership/head changed before merge: {error:#}"); continue;
                 }
-                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent).await;
+                let lease = match sweep_lease.merge_lease() {
+                    Ok(lease) => lease,
+                    Err(error) => { warn!(pr, "merge lease unavailable: {error:#}"); continue; }
+                };
+                let mutation = publication::merge_exact(repo_root,&repository,pr,&head,&merge_intent,&lease).await;
                 if let Ok(Some(receipt)) = &mutation {
                     if let Err(error) = sweep_lease.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt).expect("serializable mutation receipt")) {
                         warn!(pr,"merge response could not be recorded; retain intent: {error:#}");
@@ -7136,7 +7140,7 @@ async fn resume_draft_pr(
             acceptance::assert_receipt_current(&worktree, &prepared_acceptance, &acceptance_receipt).await?;
             let merge_intent = workflow.intent(OperationKind::MergePr)?;
             workflow.validate_binding(&reviewed_binding).await?;
-            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent).await;
+            let mutation = publication::merge_exact(repo_root,workflow.repository(),pr,reviewed_head,&merge_intent,&workflow.merge_lease()?).await;
             if let Ok(Some(receipt)) = &mutation {
                 workflow.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
             }
@@ -9268,7 +9272,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     acceptance::assert_receipt_current(&worktree, &prepared_acceptance,
         acceptance_receipt.as_ref().context("merge lacks executable acceptance receipt")?).await?;
     let merge_intent = workflow_guard.intent(crate::autoship_workflow::OperationKind::MergePr)?;
-    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent).await;
+    let mutation = publication::merge_exact(repo_root,workflow_guard.repository(),pr_number.unwrap(),published_head,&merge_intent,&workflow_guard.merge_lease()?).await;
     if let Ok(Some(receipt)) = &mutation {
         workflow_guard.record_merge_mutation(&merge_intent,&serde_json::to_value(receipt)?)?;
     }
@@ -10653,11 +10657,11 @@ pub struct AutoPrLoop {
     /// Where the daily counter persists (#814); injectable so a loop test
     /// never touches the owner's state.
     counter_path: PathBuf,
+    /// The same authoritative merge ledger used by every publication lane.
+    workflow_path: PathBuf,
     /// Where the fair-scheduling state persists (#1532); injectable for the
     /// same reason as `counter_path`.
     fair_path: PathBuf,
-    /// The provider cooldown latch the quota brake reads (#1215).
-    latch: augmentagent_channel_core::CooldownLatch,
     /// Wall clock, injectable so a whole UTC day can be scripted (#1215).
     clock: LoopClock,
 }
@@ -10668,25 +10672,23 @@ pub(crate) type LoopClock = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send
 /// Engaged-run counter with UTC-day rollover. Pure so it's testable;
 /// [`load`](Self::load) / [`save`](Self::save) add the durability.
 ///
-/// #1215 — it also carries the day's quota-brake state and the spread gate,
-/// because the loop's success path restarts the daemon (every merged PR
-/// touching `crates/` triggers a rebuild): anything kept in memory would be
-/// forgotten after each win, exactly as the run count was before #814.
+/// Legacy quota-brake and spacing fields remain readable as historical
+/// telemetry only. Shipping authority lives in WorkflowStore merge receipts.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct DailyCounter {
     day: u64,
     runs: u32,
-    /// Distinct Claude quota latches seen today.
+    /// Historical quota telemetry; no longer controls shipping capacity.
     #[serde(default)]
     claude_latches: u32,
     /// Reset instant of the last latch counted, so one latch seen on many
     /// ticks counts once.
     #[serde(default)]
     last_claude_latch: Option<i64>,
-    /// `runs` at the moment the brake engaged; the cap is frozen one past it.
+    /// Historical brake point, never applied to the shipping allowance.
     #[serde(default)]
     brake_runs: Option<u32>,
-    /// No new run starts before this instant (unix seconds): the spread gate.
+    /// Historical spacing field; cleared when an attempt settles.
     #[serde(default)]
     not_before: Option<i64>,
     #[serde(default)]
@@ -10718,29 +10720,6 @@ impl DailyCounter {
             self.record(completed);
         }
         self.not_before = None; // migrate obsolete calendar spacing away
-    }
-
-    /// #1215 — feed the current Claude latch, if any: `(reset, reason)`.
-    fn observe_claude_latch(&mut self, day: u64, latch: Option<(i64, &str)>) {
-        let _ = self.runs_today(day);
-        let Some((reset, reason)) = latch else { return };
-        if !is_quota_latch(reason) || self.last_claude_latch == Some(reset) {
-            return;
-        }
-        self.last_claude_latch = Some(reset);
-        self.claude_latches += 1;
-        if self.claude_latches >= QUOTA_BRAKE_LATCHES && self.brake_runs.is_none() {
-            self.brake_runs = Some(self.runs);
-        }
-    }
-
-    /// #1215 — today's cap after the quota brake.
-    fn cap_today(&mut self, day: u64, cap: u32) -> u32 {
-        let _ = self.runs_today(day);
-        match self.brake_runs {
-            Some(at) => effective_cap(cap, at, self.claude_latches),
-            None => cap,
-        }
     }
 
     fn record(&mut self, day: u64) {
@@ -10787,14 +10766,12 @@ impl DailyCounter {
         Ok(result)
     }
 
-    fn reserve(&mut self, day: u64, cap: u32, latch: Option<(i64, &str)>) -> Option<String> {
-        self.observe_claude_latch(day, latch);
-        let cap = self.cap_today(day, cap);
-        if self.runs_today(day) >= cap { return None; }
+    /// Attempt telemetry only. It cannot consume or restrict shipping capacity.
+    fn begin_attempt(&mut self, day: u64) -> String {
         self.record(day);
         let id = uuid::Uuid::new_v4().to_string();
         self.reservations.insert(id.clone(), day);
-        Some(id)
+        id
     }
 
     fn settle_reservation(&mut self, id: &str, completed: u64, billed: bool) {
@@ -11548,39 +11525,15 @@ fn daily_counter_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("autopr-daily-runs.json"))
 }
 
-/// #1215 — Claude quota latches in one UTC day that engage the brake.
-const QUOTA_BRAKE_LATCHES: u32 = 2;
-
-/// #1215 — the quota brake. Two Claude session-limit latches in one UTC day
-/// mean the loop is competing with the owner for the same Max quota (#448):
-/// allow one more run past where the brake engaged, then stop for the day.
-fn effective_cap(cap: u32, runs_so_far: u32, claude_latches_today: u32) -> u32 {
-    if claude_latches_today >= QUOTA_BRAKE_LATCHES {
-        cap.min(runs_so_far + 1)
-    } else {
-        cap
-    }
-}
-
-/// #1215 — a latch written for a quota refusal (`ReasonerError::RateLimited`
-/// displays as "<provider> rate limit: ..."), not an outage or a timeout.
-fn is_quota_latch(reason: &str) -> bool {
-    reason.contains("rate limit")
-}
-
 fn utc_day_of(now: chrono::DateTime<chrono::Utc>) -> u64 {
     now.timestamp().div_euclid(86_400) as u64
 }
 
-/// #1215 — `(runs today, today's cap after the brake, brake engaged)`, for
-/// the health watchdog.
-pub(crate) fn runs_today_status() -> (u32, u32, bool) {
-    let mut counter = DailyCounter::load(&daily_counter_path());
+/// Shipping allowance is read from durable accepted merge receipts, never attempts.
+pub(crate) fn merge_allowance_status() -> Result<crate::autoship_workflow::MergeAllowance> {
     let cap = AutoPrLoop::cap_from(std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref());
-    let day = utc_day_now();
-    let runs = counter.runs_today(day);
-    let today = counter.cap_today(day, cap);
-    (runs, today, counter.brake_runs.is_some())
+    crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+        .merge_allowance(chrono::Utc::now().timestamp_millis(), cap)
 }
 
 fn utc_day_now() -> u64 {
@@ -11592,8 +11545,7 @@ fn utc_day_now() -> u64 {
 
 impl AutoPrLoop {
     const DEFAULT_INTERVAL_SECS: u64 = 1_800;
-    /// #1215 — 5, up from 3: issues were filed faster than three serial
-    /// runs a day could ship them. Spend stays bounded by the quota brake.
+    /// Confirmed autonomous merges per UTC day; provider budgets are separate.
     const DEFAULT_DAILY_CAP: u32 = 5;
     /// How many consecutive triage-only refusals one tick may clear.
     const MAX_TRIAGE_PER_TICK: u32 = 5;
@@ -11638,8 +11590,8 @@ impl AutoPrLoop {
             interval: std::time::Duration::from_secs(interval),
             daily_cap: Self::cap_from(daily_cap),
             counter_path: daily_counter_path(),
+            workflow_path: workflow::path(),
             fair_path: fair_sched_path(),
-            latch: augmentagent_channel_core::CooldownLatch::system(),
             clock: Arc::new(chrono::Utc::now),
         })
     }
@@ -11663,8 +11615,8 @@ impl AutoPrLoop {
             interval: std::time::Duration::from_secs(Self::DEFAULT_INTERVAL_SECS),
             daily_cap,
             counter_path: state.join("autopr-daily-runs.json"),
+            workflow_path: state.join("autopr-workflow.sqlite3"),
             fair_path: state.join("autopr-fair.json"),
-            latch: augmentagent_channel_core::CooldownLatch::at(state.join("reasoner-cooldowns.json")),
             clock: Arc::new(chrono::Utc::now),
         }
     }
@@ -11801,13 +11753,15 @@ impl AutoPrLoop {
                 self.upgrade_boundary()?;
                 // Reserve before spending so restart/shutdown cannot erase work.
                 let started_day = utc_day_of((self.clock)());
-                let latch = self.latch.latched_entry("claude");
-                let reservation = DailyCounter::update(&counter_path, |counter| Ok(counter.reserve(
-                    started_day, self.daily_cap, latch.as_ref().map(|(at, reason)| (*at, reason.as_str())))))?;
-                let Some(reservation) = reservation else {
-                    info!("auto-PR: shared daily resource/quota cap reached");
+                let allowance = crate::autoship_workflow::WorkflowStore::open(&self.workflow_path)?
+                    .merge_allowance((self.clock)().timestamp_millis(), self.daily_cap)?;
+                if allowance.available == 0 {
+                    info!(confirmed=allowance.confirmed, pending=allowance.pending, cap=allowance.cap,
+                        "auto-PR: merge allowance has no available dispatch capacity");
                     break;
-                };
+                }
+                let reservation = DailyCounter::update(&counter_path,
+                    |counter| Ok(counter.begin_attempt(started_day)))?;
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
@@ -11832,7 +11786,7 @@ impl AutoPrLoop {
                         // Persisted, so it survives the post-merge daemon
                         // restart exactly as the run count does (#814).
                         FairSched::update_persist(&self.fair_path, |f| f.record_billed(r.resumed));
-                        info!(runs_today, daily_cap = self.daily_cap, "auto-PR: {r}");
+                        info!(attempts_today=runs_today, merge_cap=self.daily_cap, "auto-PR: {r}");
                         break;
                     }
                     Ok(r) => {
@@ -11868,6 +11822,31 @@ mod progress_tests;
 
 #[cfg(test)]
 mod tests {
+    // #1705: an infrastructure fault must never exhaust the shipping allowance.
+    #[tokio::test(start_paused = true)]
+    async fn failed_attempts_do_not_exhaust_shipping_allowance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = tempfile::tempdir().unwrap();
+        let mut worker = super::AutoPrLoop::for_tests("/nonexistent".into(), 5, state.path());
+        worker.interval = std::time::Duration::from_secs(300);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        let timer = async move {
+            tokio::time::sleep(std::time::Duration::from_secs(300 * 8 + 1)).await;
+            stop.cancel();
+        };
+        let run = worker.run_with(shutdown, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::bail!("no provider is cleared for FullAgentic") }
+        }, || async { 0 });
+        let (result, ()) = tokio::join!(run, timer);
+        result.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 8,
+            "configuration failures must not stop scheduling after five attempts");
+    }
+
     #[test]
     fn storage_contention_is_infrastructure_without_being_low_disk() {
         assert_eq!(super::infra_failure_reason("storage busy: another writer reserved this space"), Some("storage busy"));
@@ -12421,41 +12400,33 @@ for tool, arguments in [
         assert_eq!(AutoPrLoop::DEFAULT_DAILY_CAP, 5);
     }
 
-    /// C2 — the brake engages on the second Claude session-limit latch of the
-    /// day and freezes the cap one run past where it engaged.
     #[test]
-    fn quota_brake_caps_the_day_after_two_claude_latches() {
-        assert_eq!(effective_cap(5, 2, 2), 3);
-        assert_eq!(effective_cap(5, 2, 1), 5);
-        assert_eq!(effective_cap(5, 0, 0), 5);
-        assert_eq!(effective_cap(2, 4, 3), 2, "never above the configured cap");
+    fn historical_quota_brakes_are_telemetry_not_shipping_limits() {
+        let mut counter: DailyCounter = serde_json::from_value(serde_json::json!({
+            "day":100,"runs":5,"claude_latches":2,"last_claude_latch":123,"brake_runs":3
+        })).unwrap();
+        let id = counter.begin_attempt(100);
+        assert_eq!(counter.runs_today(100), 6);
+        counter.settle_reservation(&id, 100, false);
+        assert_eq!(counter.runs_today(100), 5, "retain historical attempts without inventing ships");
     }
 
-    /// C2, stateful half: distinct latches are counted once each, only
-    /// quota latches count, the brake freezes at the runs seen when it
-    /// engaged, and a new UTC day starts clean.
-    #[test]
-    fn claude_latch_observation_counts_distinct_quota_latches_per_day() {
-        let mut c = DailyCounter::default();
-        let (day, cap) = (200, 5);
-        c.record(day);
-        c.record(day);
-        let reset_a = utc("2026-09-26T09:30:00Z").timestamp();
-        let reset_b = utc("2026-09-26T14:30:00Z").timestamp();
-        // An outage latch is not a quota wall.
-        c.observe_claude_latch(day, Some((reset_a, "claude unavailable: exit 1")));
-        assert_eq!(c.cap_today(day, cap), 5);
-        c.observe_claude_latch(day, Some((reset_a, "claude rate limit: You've hit your session limit")));
-        // The same latch seen on the next tick is still one latch.
-        c.observe_claude_latch(day, Some((reset_a, "claude rate limit: You've hit your session limit")));
-        assert_eq!(c.cap_today(day, cap), 5, "one latch is not a pattern");
-        c.observe_claude_latch(day, None);
-        c.observe_claude_latch(day, Some((reset_b, "claude rate limit: You've hit your session limit")));
-        assert_eq!(c.cap_today(day, cap), 3, "braked at runs(2) + 1");
-        c.record(day);
-        assert_eq!(c.cap_today(day, cap), 3, "the brake does not creep up with later runs");
-        assert_eq!(c.cap_today(day + 1, cap), 5, "a new UTC day starts clean");
-        assert_eq!(c.runs_today(day + 1), 0);
+    fn confirm_test_merge(path: &Path, pr: u64, at: chrono::DateTime<chrono::Utc>) {
+        use crate::autoship_workflow::{Binding, OperationKind, WorkflowStore};
+        let now = at.timestamp_millis();
+        let mut store = WorkflowStore::open(path).unwrap();
+        let id = format!("owner/repo#{pr}");
+        let binding = Binding { head: "a".repeat(40), contract: "contract".into(), evidence_hash: "verified".into() };
+        store.register(&id, "fixture", binding.clone(), now).unwrap();
+        let lease = store.claim(&id, "fixture", now, 60_000).unwrap().unwrap();
+        store.attach_pr(&lease, pr, now).unwrap();
+        let op = store.begin_operation(&lease, OperationKind::MergePr, &binding, now).unwrap();
+        let node = format!("PR_{pr}");
+        store.reserve_merge(&lease, &op, "owner/repo", pr, &node, now, 5).unwrap();
+        store.dispatch_merge(&lease, &op, now, 5).unwrap();
+        store.confirm_merge_dispatch(&op, &serde_json::json!({"client_mutation_id":op.id,
+            "expected_head":binding.head,"pr_number":pr,"pr_node_id":node,
+            "merge_commit":"b".repeat(40),"merged_by":"owner","merged_at":at.to_rfc3339()}), now).unwrap();
     }
 
     /// C4 — a scripted UTC day with every candidate green: exactly `cap`
@@ -12479,8 +12450,10 @@ for tool, arguments in [
         let asked = Arc::new(AtomicU32::new(0));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (seen, stop, runs, now) = (Arc::clone(&built), shutdown.clone(), Arc::clone(&asked), Arc::clone(&clock));
+        let ledger = lp.workflow_path.clone();
         let run = lp.run_with(shutdown, move || {
             let (seen, stop, runs, now) = (Arc::clone(&seen), stop.clone(), Arc::clone(&runs), Arc::clone(&now));
+            let ledger = ledger.clone();
             async move {
                 let at = now();
                 if at >= utc("2026-09-26T23:59:00Z") {
@@ -12489,6 +12462,7 @@ for tool, arguments in [
                 }
                 let nth = runs.fetch_add(1, SeqCst) + 1;
                 seen.lock().unwrap().push(at);
+                confirm_test_merge(&ledger, nth as u64, at);
                 Ok(RunReport::built(format!("issue #{nth}: PR auto-merged")))
             }
         }, || async { 0 });
@@ -12508,20 +12482,6 @@ for tool, arguments in [
         for pair in built.windows(2) {
             assert_eq!(pair[1] - pair[0], chrono::Duration::minutes(30));
         }
-    }
-
-    /// The brake reads the real latch file shape: a quota latch written by
-    /// the fallback chain is what `observe_claude_latch` is fed.
-    #[test]
-    fn loop_reads_the_claude_latch_with_its_reason() {
-        let dir = tempfile::tempdir().unwrap();
-        let latch = augmentagent_channel_core::CooldownLatch::at(dir.path().join("c.json"));
-        let until = chrono::Utc::now() + chrono::Duration::hours(2);
-        latch.latch("claude", until, "claude rate limit: You've hit your session limit");
-        let (ts, reason) = latch.latched_entry("claude").expect("latched");
-        assert_eq!(ts, until.timestamp());
-        assert!(is_quota_latch(&reason));
-        assert!(!is_quota_latch("claude unavailable: exit 1"));
     }
 
     #[test]
@@ -12991,7 +12951,7 @@ for tool, arguments in [
     }
 
     #[test]
-    fn concurrent_lanes_share_one_daily_cap_and_settle_idempotently() {
+    fn concurrent_attempt_telemetry_never_caps_shipping_and_settles_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daily.json");
         let barrier = Arc::new(std::sync::Barrier::new(12));
@@ -12999,11 +12959,11 @@ for tool, arguments in [
             let (path, barrier) = (path.clone(), barrier.clone());
             std::thread::spawn(move || {
                 barrier.wait();
-                DailyCounter::update(&path, |counter| Ok(counter.reserve(100, 5, None))).unwrap()
+                DailyCounter::update(&path, |counter| Ok(counter.begin_attempt(100))).unwrap()
             })
         }).collect();
-        let reservations: Vec<_> = threads.into_iter().filter_map(|thread| thread.join().unwrap()).collect();
-        assert_eq!(reservations.len(), 5);
+        let reservations: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(reservations.len(), 12);
         let threads: Vec<_> = reservations.into_iter().map(|id| {
             let path = path.clone();
             std::thread::spawn(move || {
@@ -13014,10 +12974,10 @@ for tool, arguments in [
         }).collect();
         for thread in threads { thread.join().unwrap(); }
         let mut counter = DailyCounter::load_checked(&path).unwrap();
-        assert_eq!(counter.runs_today(100), 5);
-        assert_eq!(counter.runs_today(101), 5);
+        assert_eq!(counter.runs_today(100), 12);
+        assert_eq!(counter.runs_today(101), 12);
         assert!(counter.reservations.is_empty());
-        assert!(DailyCounter::update(&path, |counter| Ok(counter.reserve(101, 5, None))).unwrap().is_none());
+        assert!(DailyCounter::update(&path, |counter| Ok(counter.begin_attempt(101))).is_ok());
     }
 
     #[test]
@@ -13025,7 +12985,7 @@ for tool, arguments in [
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daily.json");
         std::fs::write(&path, "partial").unwrap();
-        assert!(DailyCounter::update(&path, |counter| Ok(counter.reserve(100, 5, None))).is_err());
+        assert!(DailyCounter::update(&path, |counter| Ok(counter.begin_attempt(100))).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "partial");
     }
 
@@ -15689,9 +15649,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let state = tempfile::tempdir().unwrap();
         let mut lp = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 1, state.path());
         lp.interval = std::time::Duration::from_secs(5);
-        let mut counter = DailyCounter::default();
-        counter.record(utc_day_now());
-        counter.persist(&lp.counter_path).unwrap();
+        confirm_test_merge(&lp.workflow_path, 1, chrono::Utc::now());
         let stop = tokio_util::sync::CancellationToken::new();
         let swept = Arc::new(AtomicUsize::new(0));
         let seen = swept.clone();
