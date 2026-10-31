@@ -47,8 +47,12 @@
   "limits": [
     "Caller and remote-target authorization remain obligations of the not-yet-connected CLI/Discord adapters.",
     "The durable queue is not yet consumed by targeted execution; no new run command is exposed by this change.",
-    "Provider pins are stored, but builder selection, work-once, wait, pause, cancel, resume, model changes and delivery controls remain to be connected.",
+    "Work-once, wait, pause, cancel, resume, model changes and delivery controls remain to be connected. See the builder-pin follow-up for execution enforcement.",
     "Late alias conflicts preserve state and require explicit resolution; automatic handoff is not implemented here.",
     "No production rollout, real GitHub mutation, native model call or Discord delivery occurred in these tests."
-  ]
+  ],
+  "followup": {
+    "builder_pin": "docs/autoship/1703-builder-pin-probe.json",
+    "status": "Stored pins are now enforced by existing fresh/resumed/adopted execution; targeted CLI/Discord dispatch remains unconnected."
+  }
 }

@@ -142,6 +142,7 @@ struct ReviewLifecycle {
 pub struct FallbackReasoner {
     entries: Vec<Entry>,
     profile_enabled: fn(ProviderKind) -> bool,
+    builder_pin: Option<ProviderKind>,
     /// Adapters registered only for dashboard routing; direct mode excludes them.
     gateway_only: Vec<ProviderKind>,
     workflow_native_only: bool,
@@ -316,6 +317,7 @@ fn build_reasoner_inner(workflow:bool)->Arc<FallbackReasoner> {
     Arc::new(FallbackReasoner {
         entries,
         profile_enabled: crate::model_selection::runtime_profile_enabled,
+        builder_pin: None,
         gateway_only,
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
@@ -340,6 +342,16 @@ fn build_reasoner_inner(workflow:bool)->Arc<FallbackReasoner> {
 /// closed. There is no chain here, so failover cannot silently occur either.
 pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> { build_pinned_inner(kind,false) }
 pub fn build_workflow_pinned(kind:ProviderKind)->Option<Arc<FallbackReasoner>> {build_pinned_inner(kind,true)}
+/// An explicit workflow builder selection is immutable for this instance. It
+/// overrides the interactive selection only during its own calls; independently
+/// constructed reviewers and adjudicators retain their separate selection.
+pub fn build_workflow_builder(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
+    if !matches!(kind, ProviderKind::Claude | ProviderKind::Codex) { return None; }
+    let mut builder = build_pinned_inner(kind, true)?;
+    Arc::get_mut(&mut builder)?.builder_pin = Some(kind);
+    Some(builder)
+}
+
 fn build_pinned_inner(kind:ProviderKind,workflow:bool)->Option<Arc<FallbackReasoner>> {
     let native = if workflow {workflow_entry_for(kind)} else {entry_for(kind)};
     let gateway_only = if native.is_none() { vec![kind] } else { Vec::new() };
@@ -351,6 +363,7 @@ fn build_pinned_inner(kind:ProviderKind,workflow:bool)->Option<Arc<FallbackReaso
         Arc::new(FallbackReasoner {
             entries: vec![entry],
             profile_enabled: crate::model_selection::runtime_profile_enabled,
+        builder_pin: None,
             gateway_only,
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
@@ -378,12 +391,19 @@ pub enum LaneAvailability {
 }
 
 impl FallbackReasoner {
+    pub fn builder_provider_pin(&self) -> Option<ProviderKind> { self.builder_pin }
+
+    fn selected_profile(&self) -> anyhow::Result<Option<ProviderKind>> {
+        Ok(self.builder_pin.or(crate::model_selection::current()?))
+    }
+
     /// Claude-only composite — behaviorally identical to the pre-#655
     /// `ClaudeCliReasoner` construction it replaces.
     pub fn claude_only() -> Self {
         FallbackReasoner {
             gateway_only: Vec::new(),
             profile_enabled: crate::model_selection::runtime_profile_enabled,
+        builder_pin: None,
             entries: vec![Entry {
                 kind: ProviderKind::Claude,
                 reasoner: Arc::new(ClaudeCliReasoner::new()),
@@ -406,6 +426,7 @@ impl FallbackReasoner {
         FallbackReasoner {
             gateway_only: Vec::new(),
             profile_enabled: |_| true,
+            builder_pin: None,
             entries: chain
                 .into_iter()
                 .map(|(kind, reasoner)| Entry { kind, reasoner })
@@ -447,7 +468,7 @@ impl FallbackReasoner {
     /// with identities retained for read-only workflow role checks.
     pub fn lane_provider_availability(&self, class: crate::providers::CapabilityClass)
         -> Vec<(ProviderKind, Option<chrono::DateTime<chrono::Utc>>)> {
-        let Ok(selected) = crate::model_selection::current() else { return vec![]; };
+        let Ok(selected) = self.selected_profile() else { return vec![]; };
         let Ok(config) = crate::model_router::current() else { return vec![]; };
         let required=self.workflow_native_only || self.workflow_audit.lock().ok().and_then(|logger|logger.clone()).is_some_and(|logger|logger.run_resources_required());
         let Ok(routing) = crate::model_router::select_profile_for_workflow(config, selected, required) else { return vec![]; };
@@ -623,7 +644,7 @@ impl FallbackReasoner {
         // Bind the selected profile and router mode together for this logical
         // call. Unscoped callers can change the selection file after this
         // read; dispatch_snapshot must not pick up their newer model.
-        let selected = crate::model_selection::current()?;
+        let selected = self.selected_profile()?;
         let config = crate::model_router::select_profile_for_workflow(config, selected, required)?;
         #[cfg(test)]
         let _ = AFTER_ROUTE_SELECTION.try_with(|hook| hook());
@@ -948,6 +969,38 @@ impl Reasoner for FallbackReasoner {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn workflow_builder_pin_overrides_selection_without_affecting_reviewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = Scripted::ok("claude"); let codex = Scripted::ok("codex");
+        let mut builder = FallbackReasoner::for_tests(vec![(ProviderKind::Claude,claude.clone()),(ProviderKind::Codex,codex.clone())], latch_in(&dir));
+        builder.builder_pin = Some(ProviderKind::Codex);
+        let reviewer = FallbackReasoner::for_tests(vec![(ProviderKind::Claude,claude.clone()),(ProviderKind::Codex,codex.clone())], latch_in(&dir));
+        crate::model_selection::SELECTED_PROFILE.scope(Some(ProviderKind::Claude), crate::model_router::SNAPSHOT.scope(None, async {
+            assert_eq!(builder.call(&text_only_opts(), "build").await.unwrap(), "codex");
+            assert_eq!(builder.lane_provider_availability(crate::providers::CapabilityClass::TextOnly).iter().map(|(p,_)|*p).collect::<Vec<_>>(),vec![ProviderKind::Codex]);
+            assert_eq!(crate::model_selection::current().unwrap(), Some(ProviderKind::Claude));
+            assert_eq!(reviewer.call(&text_only_opts(), "review").await.unwrap(), "claude");
+        })).await;
+        assert_eq!(codex.count(),1); assert_eq!(claude.count(),1);
+    }
+
+    #[tokio::test]
+    async fn workflow_builder_pin_never_falls_back_on_failure_or_pause() {
+        for paused in [false,true] {
+            let dir = tempfile::tempdir().unwrap();
+            let claude = Scripted::ok("must not be used");
+            let codex = Scripted::err(|| anyhow::Error::new(ReasonerError::Unavailable {provider:"codex".into(),message:"fixture unavailable".into()}));
+            let mut builder = FallbackReasoner::for_tests(vec![(ProviderKind::Claude,claude.clone()),(ProviderKind::Codex,codex.clone())], latch_in(&dir));
+            builder.builder_pin = Some(ProviderKind::Codex);
+            if paused { builder.profile_enabled = |kind|kind != ProviderKind::Codex; }
+            let result = crate::model_selection::SELECTED_PROFILE.scope(None, crate::model_router::SNAPSHOT.scope(None,
+                builder.call(&text_only_opts(), "build"))).await;
+            assert!(result.is_err(), "pinned builder silently used fallback");
+            assert_eq!(claude.count(),0); assert_eq!(codex.count(),usize::from(!paused));
+        }
+    }
 
     #[tokio::test]
     async fn unscoped_dispatch_keeps_route_and_model_on_one_selection_snapshot() {

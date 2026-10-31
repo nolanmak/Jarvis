@@ -97,6 +97,29 @@ fn policy(conn: &Connection, workflow: &str) -> Result<Option<(Milestone, Option
 }
 
 impl WorkflowStore {
+    /// Read-only and compatible with stores created before command admission.
+    pub fn command_builder(&self, workflow: &str) -> Result<Option<Provider>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_job')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        Ok(policy(&self.conn, workflow)?.and_then(|(_, provider)| provider))
+    }
+
+    pub fn require_command_builder(&self, workflow: &str, actual: Option<Provider>) -> Result<()> {
+        if let Some(expected) = self.command_builder(workflow)? {
+            ensure!(
+                actual == Some(expected),
+                "workflow-builder-provider-mismatch"
+            );
+        }
+        Ok(())
+    }
+
     /// The caller has authenticated the principal and authorized this target.
     /// One immediate transaction serializes CLI, Discord and worker joins. No
     /// workflow lease, model, Git operation or merge capacity is acquired here.
@@ -584,5 +607,44 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+    #[test]
+    fn queued_builder_pin_is_read_only_and_cannot_bind_another_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let admission = WorkflowStore::open(&path)
+            .unwrap()
+            .submit_authorized("pinned", "owner", &request(Milestone::Merged), 1)
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let store = WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(
+            store.command_builder(&admission.workflow).unwrap(),
+            Some(Provider::Codex)
+        );
+        assert!(store
+            .require_command_builder(&admission.workflow, None)
+            .is_err());
+        assert!(store
+            .require_command_builder(&admission.workflow, Some(Provider::Claude))
+            .is_err());
+        store
+            .require_command_builder(&admission.workflow, Some(Provider::Codex))
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn pre_command_state_has_no_implicit_builder_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let store = WorkflowStore::open(&path).unwrap();
+        store.conn.execute("DROP TABLE command_job", []).unwrap();
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        let store = WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(store.command_builder("owner/repo#1").unwrap(), None);
+        store.require_command_builder("owner/repo#1", None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

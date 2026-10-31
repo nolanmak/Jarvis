@@ -229,7 +229,7 @@ pub(super) async fn resume(
             "adopted PR workflow busy or deferred".into(),
         ));
     };
-    guard.bind_reasoner(reasoner.as_ref())?;
+    guard.bind_builder(reasoner.as_ref())?;
     reasoner.track_review_history(repo, &pr.branch, true)?;
     let prior_checkpoint = WorkflowStore::open(&workflow::path())?
         .snapshot(guard.id())?

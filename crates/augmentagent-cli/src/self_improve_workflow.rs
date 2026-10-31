@@ -810,6 +810,20 @@ impl WorkflowGuard {
             }
         }))
     }
+    /// Builder identity is checked independently of audit binding so reviewer
+    /// and diagnostic reasoners are never forced onto the builder's provider.
+    pub(super) fn bind_builder(&self, reasoner: &FallbackReasoner) -> Result<()> {
+        use crate::autoship_workflow::submission::Provider;
+        let actual = match reasoner.builder_provider_pin() {
+            Some(augmentagent_channel_core::providers::ProviderKind::Claude) => Some(Provider::Claude),
+            Some(augmentagent_channel_core::providers::ProviderKind::Codex) => Some(Provider::Codex),
+            _ => None,
+        };
+        self.store.lock().map_err(|_| anyhow::anyhow!("workflow store poisoned"))?
+            .require_command_builder(self.id(), actual)?;
+        self.bind_reasoner(reasoner)
+    }
+
     pub(super) fn bind_reasoner(&self, reasoner: &FallbackReasoner) -> Result<()> {
         // The guard installs exactly one observer at acquisition. Rebinding a
         // builder or attaching a separately constructed reviewer cannot double charge.

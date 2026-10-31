@@ -6469,7 +6469,7 @@ async fn resume_draft_pr(
     };
     let capacity_accounting = workflow.capacity_accounting(true)?;
     let outcome = async {
-    workflow.bind_reasoner(reasoner.as_ref())?;
+    workflow.bind_builder(reasoner.as_ref())?;
     let acceptance_control = acceptance::control_directories(&repository, workflow.id())?.workflow_acceptance;
     let (base_ok, resume_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok, "resume acceptance baseline unavailable");
@@ -7499,6 +7499,25 @@ impl std::fmt::Display for RunReport {
     }
 }
 
+/// Select the persisted command's builder without mutating the global model
+/// profile or the independent review pool. Admission is still checked per call.
+async fn workflow_builder(repo: &Path, target: crate::autoship_workflow::submission::Target) -> Result<Arc<FallbackReasoner>> {
+    use crate::autoship_workflow::{submission::{Provider,Target}, WorkflowStore};
+    let Some(store) = WorkflowStore::open_read_only(&workflow::path())? else { return Ok(build_reasoner()); };
+    let repository = workflow::canonical_repository(repo).await?;
+    let id = match target {
+        Target::Issue(n) => crate::autoship_workflow::workflow_id(&repository,n)?,
+        Target::Pr(n) => store.resolve_pr(&repository,n)?.unwrap_or(crate::autoship_workflow::pr_workflow_id(&repository,n)?),
+    };
+    let Some(provider) = store.command_builder(&id)? else { return Ok(build_reasoner()); };
+    let kind = match provider {
+        Provider::Claude => augmentagent_channel_core::providers::ProviderKind::Claude,
+        Provider::Codex => augmentagent_channel_core::providers::ProviderKind::Codex,
+    };
+    augmentagent_channel_core::build_workflow_builder(kind)
+        .context("requested builder has no eligible native runtime or credentials")
+}
+
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
@@ -7564,7 +7583,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                             find_resumable_draft(repo_root, Some(n), dry_run).await
                         {
                             info!(sha = %short, pr, issue = issue_no, "main is red; resuming its fix PR first");
-                            let reasoner = build_reasoner();
+                            let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
                             return resume_draft_pr(
                                 repo_root,
                                 &reasoner,
@@ -7617,7 +7636,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     );
     if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() && !prefer_build {
         if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
-            let reasoner = build_reasoner();
+            let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
                 .await
                 .map(|mut r| {
@@ -7628,7 +7647,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if red_main_issue.is_none() && lane != Lane::Build && !prefer_build {
         if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
-            return adopted_execution::resume(repo_root, &build_reasoner(), candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
+            return adopted_execution::resume(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
         }
     }
     if lane == Lane::Resume {
@@ -7646,7 +7665,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     if let Some((pr, issue_no, resume_branch)) =
                         find_resumable_draft(repo_root, None, dry_run).await
                     {
-                        let reasoner = build_reasoner();
+                        let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
                         return resume_draft_pr(
                             repo_root,
                             &reasoner,
@@ -7662,7 +7681,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         });
                     }
                     if let Some(candidate) = adopted_execution::next(repo_root, dry_run).await? {
-                        return adopted_execution::resume(repo_root, &build_reasoner(), candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
+                        return adopted_execution::resume(repo_root, &workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(candidate.pr)).await?, candidate, dry_run).await.map(|mut report| { report.resumed = true; report });
                     }
                 }
                 return Ok(RunReport::idle());
@@ -7715,7 +7734,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
 
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
-    let reasoner = build_reasoner();
+    let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Issue(issue.number)).await?;
     reasoner.track_review_history(repo_root, &branch, false)?;
     // Keep each issue's checkout stable across interruption. Other issues can
     // advance without deleting this candidate or its compiler fixture paths.
@@ -7734,7 +7753,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     };
     let capacity_accounting = workflow_guard.capacity_accounting(false)?;
     let outcome = async {
-    workflow_guard.bind_reasoner(reasoner.as_ref())?;
+    workflow_guard.bind_builder(reasoner.as_ref())?;
     workflow_guard.transition(crate::autoship_workflow::Stage::Scope, "trusted_request_acquired", "scope_request", chrono::Utc::now().timestamp_millis()).await?;
     let (base_ok, candidate_base, _) = run("git", &["merge-base", "origin/main", "HEAD"], &worktree).await?;
     anyhow::ensure!(base_ok && !candidate_base.trim().is_empty(), "candidate baseline unavailable");
