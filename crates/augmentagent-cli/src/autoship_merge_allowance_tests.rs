@@ -773,3 +773,58 @@ fn allowance_confirmation_audit_rejects_substituted_operation_identity() {
     store.record_confirmed_merge_resolution(&op, "owner", &digest, now).unwrap();
     assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 1);
 }
+
+#[test]
+fn same_head_external_merge_requires_private_protocol_and_no_contradictory_proof() {
+    for case in ["valid", "legacy", "own_marker", "embedded_marker", "wrong_head", "wrong_commit", "journal_marker", "journal_commit", "already_merged_response", "partial_response", "new_binding", "new_pr", "retired"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let now = 100 * DAY;
+        let (lease,op) = fixture(&mut store,1,now);
+        reserve(&mut store,&lease,&op,1,now).unwrap();
+        let marker = if case == "legacy" {
+            store.dispatch_merge(&lease,&op,now,5).unwrap(); String::new()
+        } else { store.dispatch_marked_merge(&lease,&op,now,5).unwrap() };
+        let mut proof = receipt(&op,1,now);
+        proof.as_object_mut().unwrap().remove("client_mutation_id");
+        proof["commit_marker_operation"] = op.id.clone().into();
+        proof["merge_message"] = "Manually merged by owner".into();
+        match case {
+            "own_marker" => proof["merge_message"] = marker.clone().into(),
+            "embedded_marker" => proof["merge_message"] = format!("prefix {marker} suffix").into(),
+            "wrong_head" => proof["expected_head"] = "b".repeat(40).into(),
+            "wrong_commit" => proof["merge_commit"] = "invalid".into(),
+            _ => (),
+        }
+        if matches!(case,"journal_marker"|"journal_commit"|"already_merged_response"|"partial_response") {
+            let journal = if case == "partial_response" { serde_json::json!({"data":null,"errors":[{"message":"timeout"}]}) }
+                else { serde_json::json!({"data":{"mergePullRequest":{"pullRequest":{"state":"MERGED",
+                    "mergeCommit":{"oid":if case=="journal_commit" {"d".repeat(40)} else {proof["merge_commit"].as_str().unwrap().to_owned()},
+                    "message":if case=="journal_marker" {marker.clone()} else {"Manual merge".into()}}}}}}) };
+            store.conn.execute("INSERT INTO merge_transport_response(operation,response,observed_at_ms) VALUES(?1,?2,?3)",params![op.id,journal.to_string(),now]).unwrap();
+        }
+        let valid = matches!(case,"valid"|"already_merged_response"|"partial_response"|"new_binding"|"new_pr"|"retired");
+        assert_eq!(store.validate_external_merge(&op,&proof).is_ok(),valid,"{case}");
+        let release = MergeReleaseProof::ExternalMarkedMerge {receipt:proof};
+        assert!(store.resolve_merge_without_debit(&op,"manual","autoship",&release,now).is_err(),"active worker must remain fenced");
+        store.release(&lease,now).unwrap();
+        let mut checkpoint = store.snapshot(&op.workflow).unwrap().unwrap().checkpoint;
+        if case == "new_binding" { checkpoint.binding.contract = "new contract".into(); }
+        if case == "retired" { checkpoint.stage = Stage::Retired; }
+        store.conn.execute("UPDATE workflow SET checkpoint=?2,pr=?3 WHERE id=?1",params![op.workflow,serde_json::to_string(&checkpoint).unwrap(),if case=="new_pr" {2} else {1}]).unwrap();
+        assert_eq!(store.resolve_merge_without_debit(&op,"manual","autoship",&release,now).is_ok(),valid,"{case}");
+        assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,0);
+        assert_eq!(store.merge_allowance(now,5).unwrap().pending,if valid {0} else {1});
+        if valid {
+            let actual = store.snapshot(&op.workflow).unwrap().unwrap().checkpoint;
+            if matches!(case,"new_binding"|"new_pr"|"retired") {
+                assert_eq!(serde_json::to_value(actual).unwrap(),serde_json::to_value(checkpoint).unwrap());
+            } else {
+                assert_eq!(actual.stage,Stage::Merged);
+                assert_eq!(actual.next.reason,"external_merge_reconciled");
+            }
+            store.resolve_merge_without_debit(&op,"manual","autoship",&release,now+1).unwrap();
+            assert!(store.confirm_merge_dispatch(&op,&receipt(&op,1,now),now).is_err());
+        }
+    }
+}

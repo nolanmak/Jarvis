@@ -193,9 +193,15 @@ pub async fn resolve(
         !merge_request_not_executed(raw) && crate::self_improve::accepted_merge_response(
             raw,node,record.pr,&record.operation.binding.head,operation).is_err()
     });
-    let immutable_proof = if needs_immutable_proof {
+    let needs_external_proof = classification == "manual"
+        && (record.state == "dispatched" || (record.state == "released" && record.resolution.as_deref()
+            .and_then(|raw|serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|decision|decision["proof"]["kind"] == "external_marked_merge")))
+        && remote["head"]["sha"].as_str() == Some(record.operation.binding.head.as_str())
+        && journal.as_ref().is_none_or(|(raw,_)|!merge_request_not_executed(raw));
+    let immutable_proof = if needs_immutable_proof || needs_external_proof {
         let checked = (async {
-            ensure!(matches!(record.state.as_str(),"dispatched"|"confirmed")
+            ensure!((matches!(record.state.as_str(),"dispatched"|"confirmed") || needs_external_proof)
                 && remote["merged"] == true,
                 "immutable recovery requires a dispatched intent and merged PR");
             match &journal {
@@ -212,7 +218,11 @@ pub async fn resolve(
                 "manifest differs from immutable merge observation");
             let commit = github(&format!("repos/{}/git/commits/{sha}",record.repository)).await?;
             let receipt = crate::self_improve::immutable_merge_proof(&record,&remote,&commit)?;
-            store.validate_merge_receipt_marker(operation,&receipt)?;
+            if needs_external_proof {
+                store.validate_external_merge(&record.operation,&receipt)?;
+            } else {
+                store.validate_merge_receipt_marker(operation,&receipt)?;
+            }
             if record.state == "confirmed" {
                 store.validate_confirmed_merge_proof(operation,&receipt)?;
             }
@@ -290,6 +300,11 @@ pub async fn resolve(
                 }
                 _ => (),
             }
+        }
+        if needs_external_proof {
+            return Ok((None,Some(MergeReleaseProof::ExternalMarkedMerge {
+                receipt:immutable_proof.clone().context("external immutable proof missing")?
+            })));
         }
         ensure!(
             remote["merged"].as_bool() == Some(classification == "manual"),

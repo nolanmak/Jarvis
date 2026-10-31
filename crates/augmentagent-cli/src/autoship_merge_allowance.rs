@@ -30,6 +30,7 @@ pub enum MergeReleaseProof {
     RequestNotExecuted {
         response_sha256: String,
     },
+    ExternalMarkedMerge { receipt: serde_json::Value },
     DifferentMergedHead {
         node: String,
         pr: u64,
@@ -152,6 +153,49 @@ fn validate_undispatched_resolution(conn:&Connection, op:&Operation) -> Result<(
     Ok(())
 }
 
+fn validate_external_merge(conn: &Connection, op: &Operation, receipt: &serde_json::Value) -> Result<()> {
+    let (workflow,kind,binding,state,node,pr,dispatched):(String,String,String,String,String,u64,Option<i64>) = conn.query_row(
+        "SELECT o.workflow,o.kind,o.binding,d.state,d.pr_node_id,d.pr,d.dispatched_at_ms
+         FROM operation o JOIN merge_allowance_dispatch d ON d.operation=o.id WHERE o.id=?1",[&op.id],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+    ensure!(workflow == op.workflow && op.kind == OperationKind::MergePr
+        && serde_json::from_str::<OperationKind>(&kind)? == op.kind
+        && serde_json::from_str::<Binding>(&binding)? == op.binding,
+        "external merge intent differs");
+    ensure!(matches!(state.as_str(),"dispatched"|"released") && dispatched.is_some(),
+        "external merge requires an unconfirmed dispatched intent");
+    ensure!(receipt["expected_head"].as_str() == Some(op.binding.head.as_str())
+        && receipt["pr_number"].as_u64() == Some(pr) && receipt["pr_node_id"].as_str() == Some(node.as_str())
+        && receipt["commit_marker_operation"].as_str() == Some(op.id.as_str())
+        && receipt.get("client_mutation_id").is_none(),"external immutable proof identity differs");
+    let commit = receipt["merge_commit"].as_str().context("external commit missing")?;
+    ensure!(matches!(commit.len(),40|64) && commit.bytes().all(|b|b.is_ascii_hexdigit()),"invalid external commit");
+    ensure!(chrono::DateTime::parse_from_rfc3339(receipt["merged_at"].as_str().context("external merge time missing")?)?.timestamp_millis() >= 0
+        && receipt["merged_by"].as_str().is_some_and(|s|!s.trim().is_empty()),"invalid external completion");
+    let (protocol,nonce):(i64,String) = conn.query_row(
+        "SELECT protocol,nonce FROM merge_private_marker WHERE operation=?1",[&op.id],|r|Ok((r.get(0)?,r.get(1)?)))
+        .context("legacy dispatch cannot prove external attribution")?;
+    ensure!(protocol == 1 && nonce.len() == 64 && nonce.bytes().all(|b|b.is_ascii_hexdigit()),"invalid private merge protocol");
+    let expected = format!("Autoship-Receipt: v1:{}:{nonce}",op.id);
+    let message = receipt["merge_message"].as_str().context("complete immutable message missing")?;
+    ensure!(serde_json::to_vec(receipt)?.len() <= 16*1024 && !message.contains(&expected),
+        "immutable message contains this dispatch or exceeds proof bound");
+    let raw:Option<String> = conn.query_row("SELECT response FROM merge_transport_response WHERE operation=?1",[&op.id],|r|r.get(0)).optional()?;
+    if let Some(raw) = raw {
+        ensure!(!raw.contains(&expected),"journal contains this private dispatch proof");
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let remote = &value["data"]["mergePullRequest"]["pullRequest"];
+            ensure!(remote["mergeCommit"]["message"].as_str().is_none_or(|message|!message.contains(&expected)),
+                "decoded journal contains private dispatch proof");
+            if remote["state"] == "MERGED" {
+                ensure!(remote["mergeCommit"]["oid"].as_str().is_none_or(|sha|sha == commit),
+                    "journal contradicts external immutable commit");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
     ensure!(now >= 0 && cap > 0, "invalid merge allowance day or cap");
     let start = now.div_euclid(86_400_000) * 86_400_000;
@@ -183,6 +227,9 @@ fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
 }
 
 impl WorkflowStore {
+    pub fn validate_external_merge(&self, op: &Operation, receipt: &serde_json::Value) -> Result<()> {
+        validate_external_merge(&self.conn, op, receipt)
+    }
     pub fn validate_undispatched_resolution(&self, op:&Operation) -> Result<()> {
         validate_undispatched_resolution(&self.conn,op)
     }
@@ -388,6 +435,10 @@ impl WorkflowStore {
             );
         }
         match proof {
+            MergeReleaseProof::ExternalMarkedMerge { receipt } => {
+                ensure!(classification == "manual", "external merge requires manual classification");
+                validate_external_merge(&tx,op,receipt)?;
+            }
             MergeReleaseProof::NeverDispatched => validate_undispatched_resolution(&tx,op)?,
             MergeReleaseProof::RequestNotExecuted { response_sha256 } => {
                 let raw: String = tx.query_row(
@@ -464,6 +515,18 @@ impl WorkflowStore {
         } else {
             generation
         };
+        if matches!(proof,MergeReleaseProof::ExternalMarkedMerge { .. }) {
+            let (raw,current_pr):(String,Option<u64>) = tx.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[&workflow],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let mut checkpoint:Checkpoint = serde_json::from_str(&raw)?;
+            if checkpoint.binding == op.binding && current_pr == Some(pr) && checkpoint.stage != Stage::Retired {
+                checkpoint.stage = Stage::Merged;
+                checkpoint.next = NextAction {reason:"external_merge_reconciled".into(),action:"complete".into(),eligible_at_ms:0};
+                let raw = serde_json::to_string(&checkpoint)?;
+                tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![workflow,raw,now])?;
+                event(&tx,&workflow,event_generation,"checkpoint",&raw,now)?;
+                tx.execute("UPDATE workflow_native_owner SET retirement_reason=COALESCE(retirement_reason,'terminal_workflow') WHERE workflow=?1 AND retired_at IS NULL",[&workflow])?;
+            }
+        }
         event(&tx,&workflow,event_generation,"merge_capacity_resolved",&serde_json::json!({"operation":op.id,"decision":serde_json::from_str::<serde_json::Value>(&decision)?}).to_string(),now)?;
         tx.commit()?;
         Ok(())

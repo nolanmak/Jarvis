@@ -437,3 +437,39 @@ fn cli_rejects_stale_or_contradictory_proof_without_writing_state() {
         );
     }
 }
+
+#[test]
+fn cli_settles_same_head_external_merge_only_with_immutable_private_protocol_proof() {
+    for scenario in ["valid","partial","accepted_external","own_marker","legacy","wrong_commit","active","wrong_digest"] {
+        let response = match scenario {
+            "partial"|"wrong_digest" => Some(json!({"data":null,"errors":[{"message":"timeout"}]})),
+            "accepted_external" => Some(accepted()),
+            _ => None,
+        };
+        let dir = fixture(response,true,&"a".repeat(40)); let root=dir.path();
+        let conn = rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+        if scenario != "legacy" {
+            conn.execute_batch("CREATE TABLE merge_private_marker(operation TEXT PRIMARY KEY,protocol INTEGER,nonce TEXT);").unwrap();
+            conn.execute("INSERT INTO merge_private_marker VALUES('op-pending',1,?1)",["f".repeat(64)]).unwrap();
+        }
+        if scenario=="active" { conn.execute_batch("UPDATE workflow SET owner='worker',lease_until=9999999999999;").unwrap(); }
+        drop(conn);
+        std::fs::write(root.join("commit.json"),json!({"sha":if scenario=="wrong_commit" {"d".repeat(40)} else {"c".repeat(40)},
+            "message":if scenario=="own_marker" {format!("Autoship-Receipt: v1:op-pending:{}","f".repeat(64))} else {"Manually merged".into()}}).to_string()).unwrap();
+        if scenario=="wrong_digest" {
+            let path=root.join("evidence.json"); let mut v:Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            v["response_sha256"]="0".repeat(64).into(); std::fs::write(path,v.to_string()).unwrap();
+        }
+        let before=Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap());
+        if !matches!(scenario,"valid"|"partial"|"accepted_external") {
+            assert_code(&invoke(root,"manual"),3);
+            assert_eq!(Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap()),before,"{scenario}");
+        } else {
+            assert_code(&invoke(root,"manual"),0); assert_code(&invoke(root,"manual"),0);
+            let conn=rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+            let state:String=conn.query_row("SELECT state FROM merge_allowance_dispatch",[],|r|r.get(0)).unwrap();
+            assert_eq!(state,"released");
+            let count:i64=conn.query_row("SELECT count(*) FROM merge_mutation_receipt",[],|r|r.get(0)).unwrap(); assert_eq!(count,0);
+        }
+    }
+}
