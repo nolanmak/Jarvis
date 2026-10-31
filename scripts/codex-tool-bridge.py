@@ -313,6 +313,8 @@ class CommandStorage:
     """
     def __init__(self, config, scratch):
         self.config, self.scratch, self.fd = config, Path(scratch), None
+        self.fds = []
+        self.identities = {}
 
     def __enter__(self):
         if self.config is None:
@@ -330,23 +332,34 @@ class CommandStorage:
                 info = os.fstat(parent)
                 if info.st_uid != os.getuid() or info.st_mode & 0o022:
                     raise ValueError('storage state is not daemon owned')
-                self.fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+                # Take update exclusion first. Updater never waits for the build
+                # lock while holding its lock: it either accounts a declared
+                # writer or refuses legacy contention. No admission mutex is
+                # held during these waits. This conservative bridge does not
+                # pretend to publish a Rust storage reservation.
+                deadline = time.monotonic() + 300
+                for name in ('disk-update.lock', path.name):
+                    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+                    self.fds.append(fd)
+                    info = os.fstat(fd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                            or info.st_nlink != 1 or info.st_mode & 0o022):
+                        raise ValueError('invalid storage lease inode')
+                    self.identities[path.parent / name] = (info.st_dev, info.st_ino)
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise Readiness('build_storage_busy')
+                            time.sleep(0.1)
+                self.fd = self.fds[-1]
+                # The global build descriptor remains first in the supervisor
+                # protocol; both descriptions survive controller cancellation.
+                self.fds.reverse()
             finally:
                 os.close(parent)
-            info = os.fstat(self.fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_nlink != 1 or info.st_mode & 0o022):
-                raise ValueError('invalid storage lease inode')
-            self.path, self.identity = path, (info.st_dev, info.st_ino)
-            deadline = time.monotonic() + 300
-            while True:
-                try:
-                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        raise Readiness('build_storage_busy')
-                    time.sleep(0.1)
             self.check(admission)
             return self
         except BaseException:
@@ -356,20 +369,21 @@ class CommandStorage:
     def check(self, required=None):
         if self.fd is None:
             return
-        info = os.stat(self.path, follow_symlinks=False)
-        if (info.st_dev, info.st_ino) != self.identity:
-            raise Denied('storage lease inode changed')
+        for path, identity in self.identities.items():
+            info = os.stat(path, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) != identity:
+                raise Denied('storage lease inode changed')
         required = self.config['floor_bytes'] if required is None else required
         vfs = os.statvfs(self.scratch)
         if vfs.f_bavail * vfs.f_frsize < required:
             raise Readiness('build_storage_reserve')
 
     def __exit__(self, *_):
-        if self.fd is not None:
-            # Never LOCK_UN: the supervisor/QEMU may still own this same open
-            # description while cleaning descendants after bridge cancellation.
-            os.close(self.fd)
-            self.fd = None
+        # Close only: inherited supervisor/QEMU copies retain both locks.
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []
+        self.fd = None
 
 
 class ReconciliationRequired(Denied):

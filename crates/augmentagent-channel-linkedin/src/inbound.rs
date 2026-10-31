@@ -1,21 +1,8 @@
-//! `InboundSource` adapter for LinkedIn DMs (#25, partial).
-//!
-//! Wraps `LinkedInApi::fetch_recent_dms` into the generic [`WorkItem`] shape
-//! so LinkedIn can be driven by [`augmentagent_channel_core::ChannelRunner`].
-//! Mirrors the Gmail `GmailInbound` and Telegram `TelegramBotInbound`
-//! adapters.
-//!
-//! Scope note (`#25 — complete`): this raw-inbox view is now the *production*
-//! source. [`LinkedInChannel::run_arc`](crate::LinkedInChannel) wraps it in an
-//! `InboundMessageTrigger` and drives it via `ChannelRunner` +
-//! `LinkedInWorkHandler`, which feeds each rehydrated DM through the channel's
-//! shared `process_email` (the same triage → draft → approve → ingest
-//! dispatch the old bespoke 4h-jitter loop ran). `poll_once` is kept for the
-//! CLI `linkedin poll-once` subcommand and the existing channel tests, and
-//! shares that same `process_email` path so the two are behavior-equivalent.
-//!
-//! Outbound (self-sent) messages are filtered here so the adapter's contract
-//! matches `poll_once`, which skips `dm.is_outbound(member_urn)` before triage.
+//! Production LinkedIn source: reconcile full archive pages, then emit durable
+//! direct-message triage candidates. Groups and owner messages stay archived.
+//! The runner and `poll_once` share the same archive admission boundary.
+//! Legacy adapters without an archive reader retain the original DM interface
+//! for test fixtures; production never falls back to one-message snippets.
 
 use std::sync::Arc;
 
@@ -36,11 +23,20 @@ pub struct LinkedInInbound<L: LinkedInApi> {
     /// The user's own member URN — used to drop self-sent messages, exactly
     /// like `LinkedInChannel::poll_once`.
     pub member_urn: String,
+    store: Option<Arc<augmentagent_store::Store>>,
 }
 
 impl<L: LinkedInApi> LinkedInInbound<L> {
     pub fn new(api: Arc<L>, member_urn: String) -> Self {
-        Self { api, member_urn }
+        Self {
+            api,
+            member_urn,
+            store: None,
+        }
+    }
+    pub fn with_store(mut self, store: Arc<augmentagent_store::Store>) -> Self {
+        self.store = Some(store);
+        self
     }
 }
 
@@ -61,6 +57,30 @@ pub fn dm_to_work_item(dm: Dm, my_urn: &str) -> WorkItem {
 #[async_trait]
 impl<L: LinkedInApi + 'static> InboundSource for LinkedInInbound<L> {
     async fn fetch_new(&self) -> anyhow::Result<Vec<WorkItem>> {
+        if let Some(store) = &self.store {
+            if let Some(reader) = self.api.archive_reader()? {
+                anyhow::ensure!(
+                    reader.mailbox() == self.member_urn,
+                    "LinkedIn reader account mismatch"
+                );
+                let emails = crate::archive_live::poll(
+                    &reader,
+                    store,
+                    100,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await?;
+                return Ok(emails
+                    .into_iter()
+                    .map(|email| WorkItem {
+                        platform: PLATFORM.into(),
+                        kind: "dm".into(),
+                        external_id: email.message_id.clone(),
+                        payload: serde_json::to_value(email).expect("Email serializes"),
+                    })
+                    .collect());
+            }
+        }
         let dms = match self.api.fetch_recent_dms().await {
             Ok(dms) => dms,
             Err(LinkedInError::AuthExpired) => {
@@ -135,11 +155,7 @@ mod tests {
         ) -> Result<String, LinkedInError> {
             Ok("urn:li:comment:fake".into())
         }
-        async fn react(
-            &self,
-            _post_urn: &str,
-            _reaction: &str,
-        ) -> Result<(), LinkedInError> {
+        async fn react(&self, _post_urn: &str, _reaction: &str) -> Result<(), LinkedInError> {
             Ok(())
         }
         async fn create_share(
@@ -175,7 +191,9 @@ mod tests {
         let items = inbound.fetch_new().await.unwrap();
         let ids: Vec<_> = items.iter().map(|w| w.external_id.clone()).collect();
         assert_eq!(ids, vec!["m1", "m2"]);
-        assert!(items.iter().all(|w| w.platform == "linkedin" && w.kind == "dm"));
+        assert!(items
+            .iter()
+            .all(|w| w.platform == "linkedin" && w.kind == "dm"));
         // Payload round-trips into a typed Email with the linkedin prefix.
         let email: augmentagent_store::Email =
             serde_json::from_value(items[0].payload.clone()).unwrap();

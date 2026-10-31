@@ -80,6 +80,11 @@ impl Auth {
         default_store().get(platform, account)
     }
 
+    /// Read without migration or permission repair (for dry-run workflows).
+    pub fn get_read_only(platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+        default_store().get_read_only(platform, account)
+    }
+
     /// Delete an entry. Idempotent — a missing entry is treated as success.
     pub fn delete(platform: &str, account: &str) -> Result<(), AuthError> {
         default_store().delete(platform, account)
@@ -157,6 +162,10 @@ pub trait CredentialStore: Send + Sync {
     fn backend(&self) -> &'static str;
     fn put(&self, platform: &str, account: &str, payload: &[u8]) -> Result<(), AuthError>;
     fn get(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError>;
+    /// Backends whose reads migrate or repair persistent state must override.
+    fn get_read_only(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+        self.get(platform, account)
+    }
     /// Idempotent: a missing entry is success.
     fn delete(&self, platform: &str, account: &str) -> Result<(), AuthError>;
     /// True only when the entry is known to exist. May read the item.
@@ -787,6 +796,15 @@ impl PrivateFileCredentialStore {
 
     /// Read and validate one slot. `Ok(None)` when it does not exist.
     fn read_slot(&self, platform: &str, account: &str) -> Result<Option<Vec<u8>>, AuthError> {
+        self.read_slot_with_repair(platform, account, true)
+    }
+
+    fn read_slot_with_repair(
+        &self,
+        platform: &str,
+        account: &str,
+        repair: bool,
+    ) -> Result<Option<Vec<u8>>, AuthError> {
         let path = self.path_for(platform, account)?;
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
@@ -800,6 +818,12 @@ impl PrivateFileCredentialStore {
         {
             use std::os::unix::fs::PermissionsExt;
             if meta.permissions().mode() & 0o077 != 0 {
+                if !repair {
+                    return Err(io_err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "credential permissions require repair; set the credential file mode to 0600 (chmod 600), or run a normal credential-loading command before retrying read-only mode",
+                    )));
+                }
                 tracing::warn!(
                     platform,
                     account,
@@ -883,6 +907,11 @@ fn corrupt(platform: &str, account: &str, why: &str) -> AuthError {
 }
 
 impl CredentialStore for PrivateFileCredentialStore {
+    fn get_read_only(&self, platform: &str, account: &str) -> Result<Vec<u8>, AuthError> {
+        self.read_slot_with_repair(platform, account, false)?
+            .ok_or_else(|| not_found(platform, account))
+    }
+
     fn backend(&self) -> &'static str {
         PRIVATE_FILE_BACKEND
     }
@@ -1142,5 +1171,47 @@ mod tests {
             Auth::get(&platform, account),
             Err(AuthError::NotFound { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    #[test]
+    fn dry_read_does_not_migrate_legacy_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = Arc::new(MemoryCredentialStore::default());
+        legacy.put("linkedin", "default", b"synthetic").unwrap();
+        let store = PrivateFileCredentialStore::new(dir.path()).with_legacy(legacy);
+        assert!(matches!(
+            store.get_read_only("linkedin", "default"),
+            Err(AuthError::NotFound { .. })
+        ));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        store.put("linkedin", "default", b"local").unwrap();
+        assert_eq!(
+            store.get_read_only("linkedin", "default").unwrap(),
+            b"local"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_read_rejects_weak_permissions_without_changing_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = PrivateFileCredentialStore::new(dir.path());
+        store.put("linkedin", "default", b"synthetic").unwrap();
+        let path = store.path_for("linkedin", "default").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = store.get_read_only("linkedin", "default").unwrap_err().to_string();
+        assert!(error.contains("0600"));
+        assert!(error.contains("chmod 600"));
+        assert!(!error.contains("corrupt"));
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 }

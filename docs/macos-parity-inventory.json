@@ -808,22 +808,15 @@
     "id": "cli:imessage",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent imessage; record its command-specific effects and authorization.",
-    "macos_target": "Mac exposes augmentagent imessage (sync, poll-once, outbox, allowlists, approve/skip) with the same results, side effects and guards.",
+    "macos_target": "Mac exposes augmentagent imessage (sync, poll-once, compose, outbox, allowlists, approve/skip) with the same results, side effects and guards. Compose is preview-only without --post and never sends before approval.",
     "prerequisites": [
       "Rust CLI",
       "selected feature credentials or synthetic fixtures"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1309",
-    "test_plan": "cargo test -p augmentagent-cli --test imessage_outbox_cli; real-host send acceptance with the agent on macOS (D1) and on Linux over SSH (D2) in #1309.",
-    "status": "verified",
-    "evidence": {
-      "commit": "57b1a8414545476db61b54f1c51dc776a70c5035",
-      "macos_version": "macOS 26.4 (25E246)",
-      "architecture": "arm64",
-      "test_command": "cargo test -p augmentagent-cli --test imessage_outbox_cli (13 passed); D1 acceptance AC-1..AC-6 via augmentagent imessage approve/outbox and scripts/imessage/send.py",
-      "result": "pass",
-      "artifact": "https://github.com/nolanmak/Jarvis/issues/1309"
-    }
+    "test_plan": "Managed CLI compose/outbox and imessage unit suites on both hosts; historical reply evidence remains in #1309. Expanded compose/contact-defaults host acceptance is pending #1642.",
+    "status": "unverified",
+    "evidence": null
   },
   {
     "id": "cli:install",
@@ -1286,6 +1279,20 @@
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1247",
     "test_plan": "Run augmentagent status --help on both hosts, then add a synthetic behavior/guard test for this command. `interactive.slack` live listener health (#1287): cargo test -p augmentagent-cli --test slack_serve_cli --test status_schema and --bin augmentagent -- status:: doctor:: on both hosts. #1299 fields (interactive.slack app_installed/owner_bound/credentials/reconnects, credentials, daemon_report, config_issues): cargo test -p augmentagent-cli --test slack_ops_cli on both hosts.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
+    "id": "cli:team",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "team list displays the explicit owner-team roster and invalid-entry warnings before database bootstrap. Classification uses exact handles or configured domains; owner identities take precedence.",
+    "macos_target": "The same roster parsing, classification, read-only CLI output, and warning behavior on macOS.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic AUGMENTAGENT_OWNER_TEAM configuration"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1698",
+    "test_plan": "Run scripts/cargo-managed.sh test -p augmentagent-messages --lib team and scripts/cargo-managed.sh test -p augmentagent-cli --test team_cli on both hosts. Native verification remains unrecorded.",
     "status": "unverified",
     "evidence": null
   },
@@ -3763,6 +3770,20 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1599",
     "test_plan": "Run worker lifecycle, updater, installer and storage concurrency regressions on Linux. Implement and verify launchd handoff before claiming macOS parity.",
     "status": "gap",
+    "evidence": null
+  },
+  {
+    "id": "cli:team-coverage",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Report teammate coverage decisions, record owner reviews, and evaluate the shadow rollout gate.",
+    "macos_target": "The same report, review persistence, and rollout gate behavior on macOS.",
+    "prerequisites": [
+      "Rust CLI",
+      "Synthetic SQLite coverage decisions"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1702",
+    "test_plan": "Run scripts/cargo-managed.sh test -p augmentagent-cli --test team_coverage_cli and scripts/cargo-managed.sh test -p augmentagent-store --test team_coverage_store on both hosts. Native verification remains unrecorded.",
+    "status": "unverified",
     "evidence": null
   }
 ]

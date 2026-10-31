@@ -262,8 +262,8 @@ should_write_stamp() {
 #
 # run_once holds an exclusive flock on the self-improve lock for the whole run
 # (#816), which makes "a run is in flight" observable from outside the
-# process. Defer the restart while it is held — bounded, because a stale
-# binary is worse than one lost build.
+# process. Defer while that owner holds the lock. Elapsed time alone cannot
+# authorize interrupting a live run; resume deployment when ownership ends.
 
 # #1048: the daemon's state dir, by the rule in the Rust
 # augmentagent_channel_core::state_dir::resolve: $XDG_STATE_HOME/augmentagent
@@ -280,7 +280,6 @@ AUGMENTAGENT_STATE_DIR="$(augmentagent_state_dir)"
 
 SELF_IMPROVE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$AUGMENTAGENT_STATE_DIR/self-improve.lock}"
 RESTART_DEFER_STAMP="${AUGMENTAGENT_RESTART_DEFER_STAMP:-${LOG_DIR:-$AUGMENTAGENT_STATE_DIR}/restart-deferred-since}"
-RESTART_DEFER_MAX_SECS="${AUGMENTAGENT_RESTART_DEFER_MAX_SECS:-2400}"
 
 # Is `$1` flock(2)-held by another process? 0 = held. Uses flock(1) where it
 # exists (Linux); macOS ships no flock(1), so fall back to python3's
@@ -319,8 +318,8 @@ external_autopr_isolated() {
     --lock "$SELF_IMPROVE_LOCK" --lock "${SELF_IMPROVE_LOCK%.lock}-resume.lock" 2>/dev/null
 }
 
-# Should this restart be deferred? 0 = defer (a run is in flight and the
-# deferral budget is not exhausted); 1 = proceed. Clears its own state on
+# Should this restart be deferred? 0 = defer (a run owns the lock);
+# 1 = proceed. Clears its own state on
 # every proceed so one long-past deferral cannot poison a later deploy.
 maybe_defer_restart() {
   if ! self_improve_run_in_flight; then
@@ -342,13 +341,8 @@ maybe_defer_restart() {
       return 0
       ;;
   esac
-  if [ $((now - since)) -lt "$RESTART_DEFER_MAX_SECS" ]; then
-    _sr_log "self-improve run still in flight ($((now - since))s); deferring restart"
-    return 0
-  fi
-  _sr_log "self-improve run in flight for $((now - since))s (> ${RESTART_DEFER_MAX_SECS}s); restarting anyway — a stale binary is worse than one lost build"
-  rm -f "$RESTART_DEFER_STAMP"
-  return 1
+  _sr_log "self-improve run still in flight ($((now - since))s); deferring restart until owner releases lock"
+  return 0
 }
 
 # --- #903: restart hygiene — host memory pressure + restart-rate budget ------

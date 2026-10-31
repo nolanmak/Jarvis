@@ -90,7 +90,10 @@ def supervise(receipt, argv):
         # supervisor and QEMU. A killed broker must not release build storage
         # before this subtree has actually exited.
         storage_fd = os.environ.get('JARVIS_STORAGE_LEASE_FD')
-        storage_fds = () if storage_fd is None else (int(storage_fd),)
+        listed = os.environ.get('JARVIS_STORAGE_LEASE_FDS')
+        storage_fds = tuple(int(value) for value in listed.split(',')) if listed else (() if storage_fd is None else (int(storage_fd),))
+        if len(storage_fds) > 64 or (listed and (not storage_fds or str(storage_fds[0]) != storage_fd)) or any(fd < 3 for fd in storage_fds):
+            raise RuntimeError('invalid inherited storage descriptor set')
         for descriptor in storage_fds:
             os.fstat(descriptor)  # fail before launch on a missing inherited FD
         child = subprocess.Popen(argv, start_new_session=True,

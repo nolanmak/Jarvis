@@ -305,3 +305,27 @@ fn failures_are_reported_for_notice_exactly_once() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn owner_contact_defaults_cover_future_handles_and_persist_explicit_exclusions() {
+    let (store, dir) = fresh();
+    assert!(!store.is_imessage_outbound_allowed(HANDLE).unwrap());
+    store.set_imessage_contact_defaults(true, true).unwrap();
+    assert!(store.is_imessage_outbound_allowed(HANDLE).unwrap());
+    assert!(store.is_imessage_inbound_allowed("future@example.com").unwrap());
+    assert!(!store.is_imessage_outbound_allowed("chat123456").unwrap());
+    assert!(!store.is_imessage_outbound_allowed("iMessage;+;chat123456").unwrap());
+    store.deny_imessage_outbound(HANDLE).unwrap();
+    assert!(!store.is_imessage_outbound_allowed(HANDLE).unwrap());
+    assert!(store.is_imessage_inbound_allowed(HANDLE).unwrap());
+    drop(store);
+    let store = Store::open(dir.path().join("data.db")).unwrap();
+    assert!(!store.is_imessage_outbound_allowed(HANDLE).unwrap());
+    assert!(store.is_imessage_outbound_allowed("future@example.com").unwrap());
+    store.allow_imessage_outbound(HANDLE).unwrap();
+    assert!(store.is_imessage_outbound_allowed(HANDLE).unwrap());
+    store.set_imessage_contact_defaults(false, false).unwrap();
+    assert!(!store.is_imessage_outbound_allowed("future@example.com").unwrap());
+    assert!(store.is_imessage_outbound_allowed(HANDLE).unwrap());
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+}

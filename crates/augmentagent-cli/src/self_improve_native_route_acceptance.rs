@@ -325,3 +325,161 @@ fn routed_transport_needs_actual_matching_completed_exchange() {
     broken["diagnostic_only"] = true.into();
     assert!(validate_completion(&broken, "expected").is_err());
 }
+
+fn file_edit_opts(root: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
+    let mut opts = fix_opts(root);
+    opts.allowed_tools = ["Read", "Grep", "Glob", "Write", "Edit"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    opts.system_prompt = "Use only the supplied guarded file tools to perform the requested edit. No shell, build, installation, or external action is available. Report honestly whether the edit succeeded.".into();
+    opts
+}
+
+#[test]
+fn file_edit_diagnostic_cannot_reach_a_build_backend() {
+    let opts = file_edit_opts(PathBuf::from("/tmp/synthetic-file-only"));
+    assert_eq!(
+        opts.allowed_tools,
+        vec!["Read", "Grep", "Glob", "Write", "Edit"]
+    );
+    assert!(!opts.allowed_tools.iter().any(|tool| tool.contains("Bash")));
+}
+
+#[tokio::test]
+#[ignore = "paid guarded native file edit only; no full issue or shipping authority"]
+async fn live_native_guarded_file_edit() -> Result<()> {
+    let state =
+        PathBuf::from(std::env::var_os("XDG_STATE_HOME").context("isolated state required")?)
+            .canonicalize()?;
+    anyhow::ensure!(
+        state.starts_with("/tmp") && workflow::path().starts_with(&state),
+        "isolated probe state required"
+    );
+    let fixture = tempfile::Builder::new()
+        .prefix("native-file-edit-")
+        .tempdir_in(state.parent().context("evidence parent missing")?)?
+        .keep();
+    initialize_fixture(&fixture).await?;
+    let target = fixture.join("arithmetic.py");
+    std::fs::write(&target, "def add(a, b):\n    return a + b - 1\n")?;
+    let before = crate::autoship_review::digest(&std::fs::read(&target)?);
+    let repository = format!("autoship-canary/file-edit-{}", uuid::Uuid::new_v4());
+    let guard = workflow::WorkflowGuard::acquire(fixture_start(&fixture, &repository))
+        .await?
+        .context("workflow lease unavailable")?;
+    guard.check_resource_policy()?;
+    augmentagent_channel_core::autoship_write_scope::register(
+        &fixture,
+        "file-edit-diagnostic-v1",
+        vec![
+            augmentagent_channel_core::autoship_write_scope::DeclaredPath {
+                path: "arithmetic.py".into(),
+                directory: false,
+            },
+        ],
+        vec![],
+    )?;
+    let reasoner = augmentagent_channel_core::build_workflow_pinned(Codex)
+        .context("production native constructor unavailable")?;
+    guard.bind_reasoner(reasoner.as_ref())?;
+    let mut opts = file_edit_opts(fixture.clone());
+    opts.audit_logger = Some(guard.audit_logger());
+    let sessions = FreshBuilderSessions::new();
+    let answer = sessions.scope(reasoner.call(&opts,
+        "Read arithmetic.py with the guarded tools, then replace its contents with the following two lines, including the final newline:\n```python\ndef add(a, b):\n    return a + b\n```\nUse Write or Edit, not shell. Return a concise honest summary.")).await?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(fixture.join("private-builder-response.txt"))?;
+        file.write_all(answer.as_bytes())?;
+    }
+    guard.audit_health().await?;
+    anyhow::ensure!(
+        std::fs::read(&target)? == b"def add(a, b):\n    return a + b\n",
+        "native file edit did not produce requested bytes"
+    );
+    let observed = sessions.observed();
+    anyhow::ensure!(
+        observed.len() == 1 && observed[0].provider == Codex && !observed[0].uncertain,
+        "actual native session missing"
+    );
+    let policy = private_json(&PathBuf::from(
+        std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").context("native VM policy required")?,
+    ))?;
+    let provider =
+        PathBuf::from(policy["state_root"].as_str().context("VM state missing")?).join("codex");
+    let alias = private_json(
+        &provider
+            .join("aliases")
+            .join(crate::autoship_review::digest(observed[0].id.as_bytes())),
+    )?;
+    let alias = alias.as_str().context("session alias missing")?;
+    anyhow::ensure!(
+        alias.starts_with("session-") && Path::new(alias).components().count() == 1,
+        "invalid native session alias"
+    );
+    let runtime = provider.join(alias);
+    let owner = private_json(&runtime.join("owned.json"))?;
+    anyhow::ensure!(
+        owner["owner"]
+            == serde_json::to_value(
+                guard
+                    .audit_logger()
+                    .native_runtime_owner()?
+                    .context("runtime owner missing")?
+            )?
+            && owner["audit_path"] == guard.audit_logger().path().to_string_lossy().as_ref(),
+        "native owner mismatch"
+    );
+    let completion = private_json(&runtime.join("complete.json"))?;
+    anyhow::ensure!(
+        completion["exit_code"] == 0
+            && completion["diagnostic_only"] != true
+            && completion["worker_quiescence"]["remaining_workers"] == 0
+            && completion["worker_quiescence"]["quiet_scans"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 2,
+        "native completion incomplete"
+    );
+    let mut edits = 0;
+    for line in std::fs::read_to_string(guard.audit_logger().path())?.lines() {
+        let row: Value = serde_json::from_str(line)?;
+        if let Some(tool) = row["tool"].as_str() {
+            anyhow::ensure!(
+                ["Read", "Grep", "Glob", "Write", "Edit"].contains(&tool),
+                "file-only probe observed undeclared tool"
+            );
+            if ["Write", "Edit"].contains(&tool) && row["stderr_truncated"].is_null() {
+                let path = row["args"]["file_path"]
+                    .as_str()
+                    .or_else(|| row["args"]["path"].as_str())
+                    .context("edit receipt lacks target path")?;
+                anyhow::ensure!(
+                    Path::new(path) == target || path == "arithmetic.py",
+                    "edit receipt targets another file"
+                );
+                edits += 1;
+            }
+        }
+    }
+    anyhow::ensure!(edits > 0, "changed source lacks guarded edit audit receipt");
+    let calls = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+        .snapshot(guard.id())?
+        .context("workflow missing")?
+        .model_calls;
+    anyhow::ensure!(
+        calls == 1,
+        "file edit must charge exactly one native dispatch"
+    );
+    guard.audit_logger().record_controller(serde_json::json!({"kind":"native_file_edit_diagnostic","native_session":observed[0].id,
+        "before_sha256":before,"after_sha256":crate::autoship_review::digest(&std::fs::read(&target)?),"guarded_edit_receipts":edits,
+        "host_completion":completion,"model_calls":calls,"shipping_authority":false,"full_issue_pass":false,"reachable_build_memory_mb":0}))?;
+    guard.finish()?;
+    Ok(())
+}

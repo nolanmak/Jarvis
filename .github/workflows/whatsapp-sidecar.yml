@@ -10,8 +10,17 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/whatsapp-sidecar.yml'
 
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
+
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 
 jobs:
   wire-contract:
@@ -40,17 +49,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Go tests, race checks and vet
         working-directory: sidecars/wa-sidecar
-        run: |
-          go mod verify
-          go test -mod=readonly ./...
-          go test -mod=readonly -race ./...
-          go vet -mod=readonly ./...
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-sidecar/wire-contract/4"
       - name: Build exact sidecar used by Rust contract tests
         working-directory: sidecars/wa-sidecar
-        run: |
-          go build -mod=readonly -trimpath -o "$RUNNER_TEMP/wa-sidecar" .
-          echo "AUGMENTAGENT_WA_SIDECAR_TEST_BIN=$RUNNER_TEMP/wa-sidecar" >> "$GITHUB_ENV"
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-sidecar/wire-contract/5"
       - name: Rust channel and real Go-process contract tests
-        run: cargo test -p augmentagent-channel-whatsapp
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-sidecar/wire-contract/6"
+
       - name: Rust channel lint
-        run: cargo clippy --no-deps -p augmentagent-channel-whatsapp --all-targets -- -D warnings
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-sidecar/wire-contract/7"

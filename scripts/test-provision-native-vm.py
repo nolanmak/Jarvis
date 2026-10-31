@@ -2,6 +2,9 @@
 """Private fixture-only profile union tests; no runtime, network or model calls."""
 import importlib.util
 import json
+import hashlib
+import os
+import subprocess
 from pathlib import Path
 import tempfile
 import types
@@ -30,6 +33,62 @@ def fake_stage(destination, native, bases=()):
 
 
 class ProvisionTests(unittest.TestCase):
+    def test_codex_companion_is_manifest_bound_and_launchable_without_host_fallback(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            installed = root / 'installed'; installed.mkdir()
+            native = installed / 'codex'
+            native.write_text('#!/bin/sh\nexec "$(dirname "$0")/codex-code-mode-host"\n')
+            native.chmod(0o755)
+            companion = installed / 'codex-code-mode-host'
+            companion.write_text('#!/bin/sh\nprintf "companion-started\\n"\n')
+            companion.chmod(0o755)
+            self.assertEqual(p.native_companions(native), [companion])
+            runtime = root / 'runtime'; runtime.mkdir(mode=0o700)
+            digest = hashlib.sha256(native.read_bytes()).hexdigest()
+            relative = 'libexec/codex/' + digest + '/codex-code-mode-host'
+            records = {}; p.copy_runtime_file(runtime, relative, companion, records)
+            manifest = {'version':1,'files':[{'path':relative,'sha256':records[relative][0]}],
+                'native_companions':{digest:[{'name':'codex-code-mode-host','path':relative,'sha256':records[relative][0]}]}}
+            (runtime/'manifest.json').write_text(json.dumps(manifest))
+            vm = p.helper('native-provider-vm.py'); vm.validate_runtime(runtime)
+            destination = root/'native'; destination.mkdir()
+            cli = destination/'cli'; cli.write_bytes(native.read_bytes()); cli.chmod(0o555)
+            vm.stage_native_companions(native, runtime, destination)
+            self.assertEqual(subprocess.check_output([str(cli)], env={'PATH':'/usr/bin:/bin'}), b'companion-started\n')
+            (destination/'codex-code-mode-host').unlink()
+            cli.chmod(0o755); cli.write_text('#!/bin/sh\nexit 0\n')
+            with self.assertRaisesRegex(ValueError,'digest'):
+                vm.stage_native_companions(native, runtime, destination)
+            cli.write_bytes(native.read_bytes())
+            (runtime/relative).chmod(0o600)
+            (runtime/relative).write_text('changed')
+            with self.assertRaisesRegex(ValueError,'digest'):
+                vm.stage_native_companions(native, runtime, destination)
+            companion.unlink(); companion.symlink_to(native)
+            with self.assertRaisesRegex(ValueError,'trusted'):
+                p.native_companions(native)
+
+    def test_runtime_only_refresh_preserves_grants_state_and_prior_generation(self):
+        with tempfile.TemporaryDirectory() as name, patch.object(p, 'stage_runtime', fake_stage):
+            root = Path(name)
+            args = self.args(root, 'codex')
+            policy = p.provision(args)
+            before = json.loads(policy.read_text())
+            old = Path(before['guest_runtime'])
+            p.refresh_runtime_policy(policy, Path('/synthetic/companion-update'))
+            after = json.loads(policy.read_text())
+            self.assertNotEqual(before['guest_runtime'],after['guest_runtime'])
+            self.assertTrue(old.exists())
+            self.assertEqual({k:v for k,v in before.items() if k!='guest_runtime'}, {k:v for k,v in after.items() if k!='guest_runtime'})
+            stable = policy.read_bytes()
+            def race(destination,native,bases=()):
+                fake_stage(destination,native,bases)
+                policy.write_bytes(stable+b' ')
+            with patch.object(p,'stage_runtime',race), self.assertRaisesRegex(ValueError,'changed during'):
+                p.refresh_runtime_policy(policy,Path('/synthetic/next'))
+            self.assertEqual(policy.read_bytes(),stable+b' ')
+
     def args(self, root, provider, extend=None):
         gateway = root / (provider + '-gateway.json')
         gateway.write_text(json.dumps({'version': 1, 'authorities': [{'authority': provider + '.example.com:443',

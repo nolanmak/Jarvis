@@ -313,12 +313,22 @@ fn clear_provider_environment(opts: &ReasonerOpts, scoped: bool) -> bool {
     opts.restrict_env || scoped
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    // Fault-injection deadlines must never change unrelated concurrent tests.
+    static TEST_REASONER_TIMEOUT: std::time::Duration;
+}
+
 /// Watchdog timeout for one spawned reasoner CLI call (#656). Env-tunable
 /// without a rebuild; the default is deliberately generous because agentic
 /// presets (wiki-ask, auto-PR build) legitimately run many minutes. The
 /// point is not tight latency — it's that "hung forever" becomes a typed,
 /// failover-eligible error instead of a silently stuck pipeline.
 pub fn reasoner_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(timeout) = TEST_REASONER_TIMEOUT.try_with(|timeout| *timeout) {
+        return timeout;
+    }
     let secs = std::env::var("AUGMENTAGENT_REASONER_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -1991,7 +2001,8 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 ///   including `send` and `send-now`; `finance` status/transactions/summary;
 ///   `calendar` list-events/create-event/rsvp; `loop`; `loops`; `meetup events`;
 ///   `socialapi`/`linkedin` dm and comment; `linkedin recent-dms`;
-///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`) and
+///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`, `imessage compose`,
+///   and read-only `imessage allowlist`) and
 ///   `aa-gh issue` create/list/view/comment.
 ///
 /// Several of those act outside the wiki: they can send email, post GitHub
@@ -2098,6 +2109,19 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // session's `/tmp/aa-imsg/<session>/` (allowlist + 25 MB cap in the CLI). Only this verb: `sync --apply` writes.
     let bash_imessage_fetch_abs = format!("Bash({} imessage fetch-attachment *)", bin.display());
     let bash_imessage_fetch_bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
+    // #1635 — `imessage compose --to … --body … --post` starts a text to a
+    // person as an approval card. Same safety argument as `socialapi dm` and
+    // `gmail compose --post`: the verb never touches Messages; its only
+    // externally visible effect is one card in the approval channel, and it
+    // refuses before storing anything unless the conversation is on
+    // `allow-outbound` and the kill-switch is set. Deliberately NOT
+    // `imessage *`: that would also hand the agent `approve`, `allow-outbound`,
+    // `alerts` and `outbox complete`. `imessage allowlist` is read-only and
+    // lets the agent explain a refusal instead of guessing.
+    let bash_imessage_compose_abs = format!("Bash({} imessage compose *)", bin.display());
+    let bash_imessage_compose_bare = "Bash(augmentagent imessage compose *)".to_string();
+    let bash_imessage_allowlist_abs = format!("Bash({} imessage allowlist)", bin.display());
+    let bash_imessage_allowlist_bare = "Bash(augmentagent imessage allowlist)".to_string();
     // #1061 — the same for the Apple Notes bundle, into the same session dir.
     let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
     let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
@@ -2225,6 +2249,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             env.push(("DISCORD_CHANNEL_ID".into(), cid));
         }
     }
+    // The compose subprocess must use the daemon's existing bundle and gate.
+    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() { env.push((key.into(), value)); }
+        }
+    }
     // #888/#1061 — `imessage fetch-attachment` and `apple-notes fetch-attachment` read their
     // `AUGMENTAGENT_*_S3_*` config and sign via the default AWS credential chain, which any
     // `AWS_*` var may steer: forward all three prefixes whole, only with a bucket configured
@@ -2339,12 +2369,22 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_recent_bare,
             bash_linkedin_recent_abs_noargs,
             bash_linkedin_recent_bare_noargs,
+            format!("Bash({} linkedin thread *)", bin.display()),
+            "Bash(augmentagent linkedin thread *)".into(),
+            format!("Bash({} linkedin archive-status)", bin.display()),
+            "Bash(augmentagent linkedin archive-status)".into(),
+            format!("Bash({} linkedin archive-status *)", bin.display()),
+            "Bash(augmentagent linkedin archive-status *)".into(),
             bash_linkedin_dm_abs,
             bash_linkedin_dm_bare,
             bash_linkedin_comment_abs,
             bash_linkedin_comment_bare,
             bash_imessage_fetch_abs,
             bash_imessage_fetch_bare,
+            bash_imessage_compose_abs,
+            bash_imessage_compose_bare,
+            bash_imessage_allowlist_abs,
+            bash_imessage_allowlist_bare,
             bash_notes_fetch_abs,
             bash_notes_fetch_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
@@ -3066,6 +3106,25 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "SCOPED_ENV_OK");
     }
 
+    #[tokio::test]
+    async fn injected_watchdog_is_local_to_its_future_and_never_changes_siblings() {
+        let ambient = reasoner_timeout();
+        let injected = TEST_REASONER_TIMEOUT.scope(std::time::Duration::from_secs(17), async {
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
+            // A separately spawned provider call must retain normal configuration.
+            assert_eq!(tokio::spawn(async { reasoner_timeout() }).await.unwrap(), ambient);
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
+        });
+        let sibling = async {
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), ambient);
+        };
+        tokio::join!(injected, sibling);
+        assert_eq!(reasoner_timeout(), ambient);
+    }
+
     fn dummy_opts() -> ReasonerOpts {
         ReasonerOpts {
             system_prompt: "stub".into(),
@@ -3709,6 +3768,20 @@ mod tests {
         assert!(opts
             .system_prompt
             .contains("ATTACH: deliverables/packet.pdf"));
+    }
+
+    #[test]
+    fn ask_opts_forwards_imessage_compose_environment_without_send_tools() {
+        let wiki=tempfile::tempdir().unwrap();let repo=tempfile::tempdir().unwrap();
+        let _guard=EnvGuard::set("AUGMENTAGENT_IMESSAGE_REPO_DIR", "/synthetic/imessage-bundle");
+        let prior=std::env::var_os("AUGMENTAGENT_IMESSAGE_SEND_ENABLED");
+        std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED","1");
+        let opts=ask_opts(wiki.path().into(),repo.path().into());
+        match prior { Some(v)=>std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED",v),None=>std::env::remove_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED") }
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),"/synthetic/imessage-bundle".into())));
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_SEND_ENABLED".into(),"1".into())));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage compose *)".into()));
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage approve") || t.contains("imessage *")));
     }
 
     /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees
@@ -4718,6 +4791,8 @@ mod ask_mode_social_card_allowlist_tests {
             // that was never ingested — the dead end that made the agent fall
             // back to "paste it yourself".
             "linkedin recent-dms",
+            "linkedin thread *",
+            "linkedin archive-status",
         ] {
             assert!(
                 tools.iter().any(|t| t.contains(needle)),
@@ -4781,9 +4856,6 @@ mod ask_mode_social_card_allowlist_tests {
 #[cfg(test)]
 mod failover_error_tests {
     use super::*;
-
-    /// Since #954 the reasoner timeout also bounds gate waits.
-    static TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn dummy_opts() -> ReasonerOpts {
         ReasonerOpts {
@@ -5040,7 +5112,6 @@ sleep 0.15
 "
             ),
         );
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
         let gate = Arc::new(CliGate::new(3));
         let reasoner = Arc::new(ClaudeCliReasoner {
             bin,
@@ -5317,17 +5388,14 @@ sleep 5
         // A day's budget, so only the caller's own 1 s watchdog bounds the wait.
         let day = std::time::Duration::from_secs(86_400);
         let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
-        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin: "never-spawned".into(),
             gate: Arc::clone(&gate),
         };
-        let err = reasoner
-            .call(&dummy_opts(), "hi")
+        let err = TEST_REASONER_TIMEOUT
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("the permit is held");
-        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         let typed = ReasonerError::find_in(&err).unwrap_or_else(|| panic!("untyped: {err:?}"));
         let ReasonerError::GateTimeout { provider, .. } = typed else {
             panic!("{typed:?}")
@@ -5459,18 +5527,15 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         // Keep the watchdog fixture to one process; orphaned shell children can
         // legitimately produce CleanupUnverified on busy CI hosts.
         let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nexec sleep 600\n");
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
-        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin,
             gate: CliGate::global(),
         };
         let started = std::time::Instant::now();
-        let err = reasoner
-            .call(&dummy_opts(), "hi")
+        let err = TEST_REASONER_TIMEOUT
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("must time out");
-        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
             "watchdog must fire promptly, took {:?}",

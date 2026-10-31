@@ -16,7 +16,7 @@ mod amendment;
 #[path = "self_improve_scope.rs"]
 mod scope_authority;
 #[path = "self_improve_verifier_checkout.rs"]
-mod verifier_checkout;
+pub(super) mod verifier_checkout;
 pub(super) use scope_authority::run as scope_original;
 #[path = "self_improve_readiness.rs"]
 pub(super) mod readiness;

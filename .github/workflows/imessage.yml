@@ -4,8 +4,17 @@ on:
     paths:
       - 'scripts/imessage/**'
       - '.github/workflows/imessage.yml'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
 jobs:
   exporter:
     # Python 3.9 compatibility coverage requires an available runner build.
@@ -15,4 +24,4 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.9'
-      - run: python3 -m unittest discover -s scripts/imessage/tests -v
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id imessage/exporter/2"

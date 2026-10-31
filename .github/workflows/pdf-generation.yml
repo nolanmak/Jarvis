@@ -16,11 +16,24 @@ on:
       - 'scripts/check-for-updates.sh'
       - 'scripts/tests/*pdf*'
       - 'scripts/tests/updater*.sh'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
   push:
     branches: [main]
     paths: *pdf_paths
 permissions:
   contents: read
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
 jobs:
   pdf:
     runs-on: ubuntu-24.04
@@ -38,21 +51,31 @@ jobs:
         with:
           toolchain: 1.94.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils
-      - run: python3 scripts/pdf-runtime.py
-      - run: python3 scripts/pdf-runtime.py --check
-      - run: python3 -m unittest discover -s scripts/tests -p pdf_runtime_test.py -v
-      - run: bash scripts/tests/updater-stamp.test.sh
-      - run: bash scripts/tests/updater-rebuild-trigger.test.sh
-      - run: ~/.local/share/augmentagent/pdf-runtime/bin/python3 -m unittest discover -s crates/augmentagent-docs/python -v
-      - run: cargo test --locked -p augmentagent-docs
-      - run: cargo test --locked -p augmentagent-cli --bin augmentagent document_signing::tests
-      - run: cargo test --locked -p augmentagent-approval-discord --lib signing_receipt
-      - run: cargo test --locked -p augmentagent-cli --test pdf_generation
-      - run: cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib
-      - run: "cargo test --locked -p augmentagent-approval-discord attachments:: --lib"
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/5"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/6"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/7"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/8"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/9"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/10"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/11"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/12"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/13"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/14"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/15"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/16"
+
       - name: Read-only repository documents and delivery CLI
-        run: |
-          cargo test --locked -p augmentagent-cli --bin augmentagent repo_docs::tests
-          cargo test --locked -p augmentagent-cli --test repo_docs_cli
-          cargo test --locked -p augmentagent-channel-core --lib query_document_commands
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id pdf-generation/pdf/17"

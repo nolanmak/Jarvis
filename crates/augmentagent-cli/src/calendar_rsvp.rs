@@ -97,7 +97,7 @@ pub(crate) fn run_status(store: Arc<Store>, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({"accounts": v}))?);
         return Ok(());
     }
-    println!("calendar auto-accept (account setting > global > ${AUTO_ACCEPT_ENV} > off):");
+    println!("calendar auto-accept (account setting > global > ${AUTO_ACCEPT_ENV} > on):");
     for (email, on, source) in rows {
         let email = if email.is_empty() { "(no address)".to_string() } else { email };
         println!("  {email}: {} ({source})", if on { "on" } else { "off" });
@@ -651,6 +651,15 @@ mod tests {
         assert_eq!(auto_accept_for(&store, "owner@example.test"), (true, "global"));
         store.set_config(&auto_accept_account_key("Owner@Example.test"), "off").unwrap();
         assert_eq!(auto_accept_for(&store, "owner@example.test"), (false, "account"));
+    }
+
+    #[test]
+    fn auto_accept_is_on_when_nothing_is_set() {
+        let (store, _d) = store();
+        if std::env::var(AUTO_ACCEPT_ENV).is_ok() {
+            return;
+        }
+        assert_eq!(auto_accept_for(&store, "owner@example.test"), (true, "default"));
     }
 
     /// Decline on a notice writes `declined` to the provider once; a second

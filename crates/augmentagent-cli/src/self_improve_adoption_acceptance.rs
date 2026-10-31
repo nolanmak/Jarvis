@@ -165,6 +165,7 @@ async fn run_pipeline() -> Result<()> {
         repo.join("arithmetic.py"),
         "def add(a, b):\n    return a + b - 2\n",
     )?;
+    shared_ci::fixture::install(&repo)?;
     fixture_git(&repo, &["add", "."]).await?;
     fixture_git(
         &repo,
@@ -205,7 +206,9 @@ async fn run_pipeline() -> Result<()> {
     );
     let builder =
         augmentagent_channel_core::build_pinned(Codex).context("native Codex unavailable")?;
-    let report = adopted_execution::resume(&repo, &builder, selected, false).await?;
+    let report = shared_ci::fixture::scope(
+        &repo, adopted_execution::resume(&repo, &builder, selected, false),
+    ).await??;
     println!("Initial adopted execution: {}", report.message);
     let store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
     let snapshot = store.snapshot(&id)?.context("adopted workflow missing")?;
@@ -289,6 +292,7 @@ async fn run_pipeline() -> Result<()> {
     std::fs::write(
         root.join("result.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
+        "ci_authority":"compiled disposable arithmetic fixture; not full Jarvis CI","full_jarvis_ci_pass":false,
         "native_models":true,"git":"real local bare origin","github":"simulated; not hosted-GitHub proof",
         "workflow":id,"source":"pull_request:841","imported_head":imported,"approved_head":after.checkpoint.binding.head,
         "model_calls_before_ci":calls,"model_calls_after_ci":after.model_calls,"merge_mutations":1,"passed":true}))?,

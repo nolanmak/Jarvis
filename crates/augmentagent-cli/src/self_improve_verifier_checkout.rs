@@ -1,17 +1,17 @@
 //! Verifiers consume committed Git blobs, never the worker's ignored files,
 //! staged substitutions, symlinks, bytecode or dependency search directories.
 use super::*;
-pub(super) const EXPORTER: &str = include_str!("../../../scripts/autoship-verifier-checkout.py");
+pub(in crate::self_improve) const EXPORTER: &str = include_str!("../../../scripts/autoship-verifier-checkout.py");
 /// Stable source pathname preserves Cargo dependency fingerprints. Contents are
 /// nevertheless reconstructed on every run; nothing is trusted as a source cache.
-pub(super) struct OwnedCheckout {
+pub(in crate::self_improve) struct OwnedCheckout {
     path: PathBuf,
     owner: PathBuf,
     identity: Vec<u8>,
     _lock: std::fs::File,
 }
 impl OwnedCheckout {
-    pub(super) fn path(&self) -> &Path {
+    pub(in crate::self_improve) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -24,7 +24,7 @@ impl Drop for OwnedCheckout {
         }
     }
 }
-fn allocate(parent: &Path, head: &str, contract: &str) -> Result<OwnedCheckout> {
+pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &str) -> Result<OwnedCheckout> {
     use std::io::Write;
     use std::os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},

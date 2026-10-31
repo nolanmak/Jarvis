@@ -27,6 +27,7 @@ TESTS = {
     "adoption": "self_improve::adoption_acceptance::live_native_source_less_adoption_repairs_reviews_and_merges",
     "adjudicator": "self_improve::native_acceptance::live_native_final_adjudicator_resolves_synthetic_contradiction",
     "writer": "self_improve::native_acceptance::live_native_writer_inventory_replay_1538",
+    "file_edit": "self_improve::native_route_acceptance::live_native_guarded_file_edit",
     "routed_transport": "self_improve::native_route_acceptance::live_native_operator_routed_transport",
 }
 
@@ -37,10 +38,10 @@ def reachable_build_memory(probe, declared_build_mb):
     # fixture observation runs in the controller's bounded command scope.
     # Routed transport uses the production configured constructor with no Bash.
     # Issue/adoption exercise builder and repair paths with guarded VM builds.
-    roles={'issue':'builder','adoption':'builder','writer':'reviewer','adjudicator':'reviewer','routed_transport':'reviewer'}
+    roles={'issue':'builder','adoption':'builder','writer':'reviewer','adjudicator':'reviewer','routed_transport':'reviewer','file_edit':'file_only'}
     if set(roles)!=set(TESTS) or probe not in roles:
         raise ValueError('probe capabilities must be explicitly classified')
-    if roles[probe]=='reviewer':
+    if roles[probe] in ('reviewer','file_only'):
         return 0
     if type(declared_build_mb) is not int or not 512<=declared_build_mb<=4096:
         raise ValueError('invalid declared build guest memory')

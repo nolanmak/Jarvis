@@ -162,11 +162,15 @@ impl NudgeScheduler {
         };
 
         let header = format_header(x, y, &card.action.action.created_at);
-        let body = format!("{header}\n\n{draft}");
+        // Reminder metadata is not part of the proposal. Including it in the
+        // draft makes the card's revision differ from the stored draft and
+        // causes every approval from a reminder to fail the stale-card check.
+        let mut email = card.action.email.clone();
+        email.body = format!("{header}\n\n{}", email.body);
 
         match self
             .approvals
-            .post_approval(&action_id, &card.action.email, &body)
+            .post_approval(&action_id, &email, &draft)
             .await
         {
             Ok(()) => {
@@ -222,6 +226,7 @@ mod tests {
     #[derive(Default)]
     struct CountingBroker {
         posts: StdMutex<Vec<(String, String)>>,
+        emails: StdMutex<Vec<Email>>,
     }
 
     #[async_trait]
@@ -229,9 +234,10 @@ mod tests {
         async fn post_approval(
             &self,
             action_id: &str,
-            _email: &Email,
+            email: &Email,
             draft: &str,
         ) -> Result<(), ApprovalError> {
+            self.emails.lock().unwrap().push(email.clone());
             self.posts
                 .lock()
                 .unwrap()
@@ -318,7 +324,11 @@ mod tests {
         let posts = broker.posts.lock().unwrap();
         assert_eq!(posts.len(), 2, "expected a promotion and a re-nudge post");
         for (_, body) in posts.iter() {
-            assert!(body.starts_with("🔔 reminder"), "header must lead: {body}");
+            assert_eq!(
+                crate::interaction::draft_revision(body),
+                crate::interaction::draft_revision("Hi Tess, does Tuesday work?"),
+                "reminder must preserve the stored proposal revision"
+            );
             assert!(
                 body.contains("Hi Tess, does Tuesday work?"),
                 "draft lost: {body}"
@@ -331,6 +341,9 @@ mod tests {
                 body.contains("[cc: cc@example.invalid]"),
                 "cc missing from nudged card: {body}"
             );
+        }
+        for email in broker.emails.lock().unwrap().iter() {
+            assert!(email.body.starts_with("🔔 reminder"));
         }
     }
 }

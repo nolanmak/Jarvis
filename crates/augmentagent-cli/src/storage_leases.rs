@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -15,10 +16,16 @@ struct Held {
     key: String,
     identity: Option<Identity>,
     file: File,
+    exported: AtomicBool,
 }
 impl Drop for Held {
     fn drop(&mut self) {
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        // A concurrent fork temporarily inherits even CLOEXEC descriptors until
+        // exec. Such unrelated children must not delay ordinary retention locks.
+        // Explicitly exported build leases, however, belong to descendants too.
+        if !self.exported.load(Ordering::Acquire) {
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN); }
+        }
     }
 }
 
@@ -51,6 +58,14 @@ pub(crate) fn lock_directory() -> Result<PathBuf> {
 }
 
 impl TargetLeases {
+    pub fn inherited_files(&self) -> Result<Vec<File>> {
+        self.0.iter().map(|held| {
+            let file = held.file.try_clone()?;
+            held.exported.store(true, Ordering::Release);
+            Ok(file)
+        }).collect()
+    }
+
     pub fn directory_fd(&self, root: &Path) -> Result<i32> {
         let metadata = std::fs::metadata(root)?;
         self.0
@@ -97,6 +112,12 @@ impl TargetLeases {
 
     pub fn try_release_root(root: &Path) -> Result<Option<Self>> {
         Self::try_paths(vec![(root.to_path_buf(), true), (root.join("release"), false)], None)
+    }
+
+    /// Pressure cleanup holds only the selected physical profile plus its
+    /// root, so an unrelated linked debug volume need not block release cleanup.
+    pub fn try_profile(root: &Path, profile: &Path, held: Option<&Self>) -> Result<Option<Self>> {
+        Self::try_paths(vec![(root.to_path_buf(), true), (profile.to_path_buf(), true)], held)
     }
 
     fn try_paths(paths: Vec<(PathBuf, bool)>, held: Option<&Self>) -> Result<Option<Self>> {
@@ -182,6 +203,7 @@ impl TargetLeases {
                 key,
                 identity,
                 file,
+                exported: AtomicBool::new(false),
             });
         }
         Ok(Some(leases))
@@ -191,6 +213,31 @@ impl TargetLeases {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incidental_fork_descriptor_does_not_extend_a_private_retention_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let lease = TargetLeases::try_directory(root.path()).unwrap().unwrap();
+        // dup shares the same open-file description as the descriptor inherited
+        // by an unrelated child between fork and exec, without a timing race.
+        let incidental: Vec<_> = lease.0.iter()
+            .map(|held| held.file.try_clone().unwrap()).collect();
+        assert!(TargetLeases::try_directory(root.path()).unwrap().is_none());
+        drop(lease);
+        assert!(TargetLeases::try_directory(root.path()).unwrap().is_some());
+        drop(incidental);
+    }
+
+    #[test]
+    fn explicitly_exported_descriptors_keep_all_target_locks_until_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let lease = TargetLeases::try_directory(root.path()).unwrap().unwrap();
+        let exported = lease.inherited_files().unwrap();
+        drop(lease);
+        assert!(TargetLeases::try_directory(root.path()).unwrap().is_none());
+        drop(exported);
+        assert!(TargetLeases::try_directory(root.path()).unwrap().is_some());
+    }
 
     #[test]
     fn physical_aliases_and_relocated_profiles_share_the_same_lease() {
