@@ -48,15 +48,23 @@ jobs:
         with:
           shared-key: ci
           env-vars: ImageOS
-      # A workspace crate that fails to compile here is a PR-gate problem, not
-      # a cache problem; keep going so every dependency still gets cached.
+      # Both steps run even if the first fails, so one log shows every error.
       # build/check rather than test --no-run/clippy: same dependency
       # artifacts, and only these accept --keep-going.
       - name: Build test targets
+        id: build
         if: steps.cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: cargo build --workspace --all-targets --locked --keep-going
       - name: Check metadata for clippy
+        id: check
         if: steps.cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: cargo check --workspace --all-targets --locked --keep-going
+      # rust-cache only saves when the job succeeds. Fail here so a partial
+      # build is never saved under a key later runs treat as a full hit.
+      - name: Refuse to save a partial cache
+        if: steps.build.outcome == 'failure' || steps.check.outcome == 'failure'
+        run: |
+          echo "::error::Dependency warm-up failed (build: ${{ steps.build.outcome }}, check: ${{ steps.check.outcome }}); not saving the cache."
+          exit 1
