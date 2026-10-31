@@ -185,6 +185,9 @@ fn validate_external_merge(conn: &Connection, op: &Operation, receipt: &serde_js
         ensure!(!raw.contains(&expected),"journal contains this private dispatch proof");
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
             let remote = &value["data"]["mergePullRequest"]["pullRequest"];
+            ensure!(value["data"]["mergePullRequest"]["clientMutationId"].as_str() != Some(op.id.as_str())
+                || remote["state"] != "MERGED",
+                "journal acknowledges this controller's merge; external attribution is unsafe");
             ensure!(remote["mergeCommit"]["message"].as_str().is_none_or(|message|!message.contains(&expected)),
                 "decoded journal contains private dispatch proof");
             if remote["state"] == "MERGED" {

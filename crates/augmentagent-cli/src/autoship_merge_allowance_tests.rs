@@ -795,7 +795,7 @@ fn allowance_confirmation_audit_rejects_substituted_operation_identity() {
 
 #[test]
 fn same_head_external_merge_requires_private_protocol_and_no_contradictory_proof() {
-    for case in ["valid", "legacy", "own_marker", "embedded_marker", "wrong_head", "wrong_commit", "journal_marker", "journal_commit", "already_merged_response", "partial_response", "new_binding", "new_pr", "retired"] {
+    for case in ["valid", "legacy", "own_marker", "embedded_marker", "wrong_head", "wrong_commit", "journal_marker", "journal_commit", "journal_accepted", "journal_other_echo", "already_merged_response", "partial_response", "new_binding", "new_pr", "retired"] {
         let dir = tempfile::tempdir().unwrap();
         let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
         let now = 100 * DAY;
@@ -815,14 +815,15 @@ fn same_head_external_merge_requires_private_protocol_and_no_contradictory_proof
             "wrong_commit" => proof["merge_commit"] = "invalid".into(),
             _ => (),
         }
-        if matches!(case,"journal_marker"|"journal_commit"|"already_merged_response"|"partial_response") {
-            let journal = if case == "partial_response" { serde_json::json!({"data":null,"errors":[{"message":"timeout"}]}) }
+        if matches!(case,"journal_marker"|"journal_commit"|"journal_accepted"|"journal_other_echo"|"already_merged_response"|"partial_response") {
+            let mut journal = if case == "partial_response" { serde_json::json!({"data":null,"errors":[{"message":"timeout"}]}) }
                 else { serde_json::json!({"data":{"mergePullRequest":{"pullRequest":{"state":"MERGED",
                     "mergeCommit":{"oid":if case=="journal_commit" {"d".repeat(40)} else {proof["merge_commit"].as_str().unwrap().to_owned()},
                     "message":if case=="journal_marker" {marker.clone()} else {"Manual merge".into()}}}}}}) };
+            if matches!(case,"journal_accepted"|"journal_other_echo") {journal["data"]["mergePullRequest"]["clientMutationId"]=if case=="journal_accepted" {op.id.clone()} else {"another-operation".into()}.into();}
             store.conn.execute("INSERT INTO merge_transport_response(operation,response,observed_at_ms) VALUES(?1,?2,?3)",params![op.id,journal.to_string(),now]).unwrap();
         }
-        let valid = matches!(case,"valid"|"already_merged_response"|"partial_response"|"new_binding"|"new_pr"|"retired");
+        let valid = matches!(case,"valid"|"journal_other_echo"|"already_merged_response"|"partial_response"|"new_binding"|"new_pr"|"retired");
         assert_eq!(store.validate_external_merge(&op,&proof).is_ok(),valid,"{case}");
         let release = MergeReleaseProof::ExternalMarkedMerge {receipt:proof};
         assert!(store.resolve_merge_without_debit(&op,"manual","autoship",&release,now).is_err(),"active worker must remain fenced");

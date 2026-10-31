@@ -895,7 +895,7 @@ mod tests {
                 assert_eq!(again, receipt);
                 assert_eq!(github.calls.len(),2);
                 assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,1);
-            } else if scenario.starts_with("manual") {
+            } else if scenario.starts_with("manual") && scenario != "manual-journal" {
                 assert!(result.unwrap().is_none(), "external merge does not mint autonomous receipt");
                 assert_eq!(store.merge_allowance(now,5).unwrap().pending,0);
                 assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,0);
