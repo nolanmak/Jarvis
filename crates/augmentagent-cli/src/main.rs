@@ -405,8 +405,7 @@ enum Cmd {
         #[command(subcommand)]
         op: TeamOp,
     },
-    /// Teammate-coverage shadow report, owner review and rollout gate
-    /// (#1702). The gate must PASS before `AUGMENTAGENT_TEAM_COVERAGE=on`.
+    /// Teammate-coverage decision report and owner review (#1702).
     TeamCoverage {
         #[command(subcommand)]
         op: TeamCoverageOp,
@@ -8874,7 +8873,7 @@ async fn run_stale_approval_reconcile(
 
 #[derive(Subcommand, Debug)]
 enum TeamCoverageOp {
-    /// Every coverage decision in the window, with the summary and gate.
+    /// Every coverage decision in the window, with a summary line.
     Report {
         /// Only decisions from the last N days.
         #[arg(long, default_value_t = 30)]
@@ -8884,18 +8883,15 @@ enum TeamCoverageOp {
     },
     /// Mark a decision `correct` or `wrong` (re-reviewing replaces it).
     Review { action_id: String, verdict: String },
-    /// Evaluate the rollout gate over all decisions; exit 1 unless it passes.
-    Gate,
 }
 
 fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
-    use team_coverage::{gate, summarize, summary_line};
+    use team_coverage::{summarize, summary_line};
     let now = chrono::Utc::now().timestamp_millis();
     match op {
         TeamCoverageOp::Report { days, json } => {
             let rows = store.team_coverage_report(now - i64::from(days) * 86_400_000)?;
             let s = summarize(&rows);
-            let g = gate(&s, now);
             if json {
                 let v = serde_json::json!({
                     "rows": rows.iter().map(|r| serde_json::json!({
@@ -8917,7 +8913,6 @@ fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
                         "replied_anyway": s.replied_anyway,
                         "first_decided_ms": s.first_decided_ms,
                     },
-                    "gate": { "pass": g.pass, "reasons": g.reasons },
                 });
                 println!("{v}");
             } else {
@@ -8937,7 +8932,7 @@ fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
                         r.review.as_deref().unwrap_or("-"),
                     );
                 }
-                println!("{}", summary_line(&s, &g, now));
+                println!("{}", summary_line(&s));
             }
         }
         TeamCoverageOp::Review { action_id, verdict } => {
@@ -8945,17 +8940,6 @@ fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
                 anyhow::bail!("no team-coverage decision for action {action_id}");
             }
             println!("reviewed {action_id}: {verdict}");
-        }
-        TeamCoverageOp::Gate => {
-            let s = summarize(&store.team_coverage_report(0)?);
-            let g = gate(&s, now);
-            println!("{}", summary_line(&s, &g, now));
-            for r in &g.reasons {
-                println!("  - {r}");
-            }
-            if !g.pass {
-                std::process::exit(1);
-            }
         }
     }
     Ok(())
@@ -24079,3 +24063,4 @@ async fn dispatch_linkedin_read(op: &LinkedinOp, reader: &augmentagent_channel_l
 
 #[cfg(test)]
 mod linkedin_read_dispatch_tests;
+

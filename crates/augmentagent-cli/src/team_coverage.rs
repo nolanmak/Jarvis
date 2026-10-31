@@ -7,16 +7,18 @@
 //! 3. M arrived strictly after t0;
 //! 4. S is in M's To ∪ Cc — the teammate answered the asker, not just the
 //!    owner internally;
-//! 5. M's new text (quoted history stripped) names no owner alias — a
-//!    teammate handing the request back ("<owner>, can you take this?") must
-//!    not retire the owner's card;
+//! 5. M does not hand the request back to the owner. The triage agent's
+//!    verdict on M decides: `reply` (the owner must act) never covers;
+//!    `flag`/`skip` (no reply needed from the owner) pass even when M names
+//!    the owner. Only an untriaged M falls back to the alias rule: its new
+//!    text (quoted history stripped) must name no owner alias;
 //! 6. M's recipients are known (#1699). Unknown never covers.
 //!
 //! Inert unless the roster AND the owner aliases are configured: without
-//! aliases condition 5 cannot be checked, so the rule refuses to run rather
-//! than retire hand-backs. `AUGMENTAGENT_TEAM_COVERAGE` selects
-//! `off | shadow | on` (default `shadow`: decisions are recorded and logged,
-//! nothing is retired).
+//! aliases the untriaged fallback cannot be checked, so the rule refuses to
+//! run rather than retire hand-backs. `AUGMENTAGENT_TEAM_COVERAGE` selects
+//! `off | shadow | on`, default `on` (cards retire on the next sweep, with
+//! Recompose to undo); `shadow` records decisions without retiring.
 
 use augmentagent_messages::team::{OwnerIdentities, TeamRoster};
 use augmentagent_store::{PendingActionRow, Store};
@@ -32,12 +34,13 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Unset or unrecognised → `Shadow`: a typo must never switch it on.
+    /// Unset or unrecognised → `On` (the owner's default). `shadow` records
+    /// decisions without retiring; `off` disables the rule.
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
-            Some("on") => Mode::On,
+            Some("shadow") => Mode::Shadow,
             Some("off") => Mode::Off,
-            _ => Mode::Shadow,
+            _ => Mode::On,
         }
     }
 
@@ -253,8 +256,15 @@ pub fn find_coverage(
                 }
             }
         }
-        if mentions_alias(&new_text(&m.body), &cfg.aliases) {
-            continue;
+        // Hand-back check. The triage agent already read M with the
+        // conversation in view: `reply` means the owner still has to act,
+        // `flag`/`skip` mean no reply is needed from them. Its verdict
+        // decides; the alias rule only stands in for untriaged messages.
+        match m.triage.as_deref() {
+            Some("reply") => continue,
+            Some("flag" | "skip") => {}
+            _ if mentions_alias(&new_text(&m.body), &cfg.aliases) => continue,
+            _ => {}
         }
         // Earliest covering message: the moment the asker was answered.
         if best.as_ref().is_none_or(|b| at < b.covered_at_ms) {
@@ -264,9 +274,9 @@ pub fn find_coverage(
     Ok(best)
 }
 
-// ---- #1702: shadow report, review and the objective rollout gate ----
+// ---- #1702: decision report and owner review ----
 
-/// Totals behind the rollout gate.
+/// Report totals.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Summary {
     pub decisions: usize,
@@ -287,56 +297,11 @@ pub fn summarize(rows: &[augmentagent_store::team_coverage::TeamCoverageReportRo
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gate {
-    pub pass: bool,
-    /// Every failed criterion, in a fixed order; empty when `pass`.
-    pub reasons: Vec<String>,
-}
-
-pub const GATE_MIN_DAYS: i64 = 7;
-pub const GATE_MIN_DECISIONS: usize = 10;
-pub const GATE_SPARSE_MIN_DAYS: i64 = 14;
-
-/// The #1702 gate for switching the default from `shadow` to `on`.
-pub fn gate(s: &Summary, now_ms: i64) -> Gate {
-    let Some(first) = s.first_decided_ms else {
-        return Gate { pass: false, reasons: vec!["no shadow decisions yet".into()] };
-    };
-    let days = (now_ms - first).max(0) / 86_400_000;
-    let mut reasons = Vec::new();
-    if days < GATE_MIN_DAYS {
-        reasons.push(format!("shadow for {days} day(s); need {GATE_MIN_DAYS}"));
-    }
-    if s.decisions < GATE_MIN_DECISIONS && days < GATE_SPARSE_MIN_DAYS {
-        reasons.push(format!(
-            "only {} decision(s); need {GATE_MIN_DECISIONS}, or {GATE_SPARSE_MIN_DAYS} days of shadow",
-            s.decisions
-        ));
-    }
-    if s.reviewed < s.decisions {
-        reasons.push(format!("{}/{} decision(s) reviewed; need all", s.reviewed, s.decisions));
-    }
-    if s.wrong > 0 {
-        reasons.push(format!("{} decision(s) marked wrong", s.wrong));
-    }
-    if s.replied_anyway > 0 {
-        reasons.push(format!("owner replied anyway on {} decision(s)", s.replied_anyway));
-    }
-    Gate { pass: reasons.is_empty(), reasons }
-}
-
 /// One-line health summary (autopr-health style).
-pub fn summary_line(s: &Summary, g: &Gate, now_ms: i64) -> String {
-    let days = s.first_decided_ms.map_or(0, |f| (now_ms - f).max(0) / 86_400_000);
+pub fn summary_line(s: &Summary) -> String {
     format!(
-        "team-coverage: {} decision(s), {} reviewed, {} wrong, {} replied-anyway, shadow {} day(s) — gate {}",
-        s.decisions,
-        s.reviewed,
-        s.wrong,
-        s.replied_anyway,
-        days,
-        if g.pass { "PASS" } else { "FAIL" }
+        "team-coverage: {} decision(s), {} reviewed, {} wrong, {} replied-anyway",
+        s.decisions, s.reviewed, s.wrong, s.replied_anyway
     )
 }
 
@@ -539,11 +504,45 @@ mod tests {
     }
 
     #[test]
-    fn mode_parse_defaults_to_shadow() {
-        assert_eq!(Mode::parse(None), Mode::Shadow);
-        assert_eq!(Mode::parse(Some(" ON ")), Mode::On);
+    fn mode_parse_defaults_to_on() {
+        assert_eq!(Mode::parse(None), Mode::On);
+        assert_eq!(Mode::parse(Some(" SHADOW ")), Mode::Shadow);
         assert_eq!(Mode::parse(Some("off")), Mode::Off);
-        assert_eq!(Mode::parse(Some("bogus")), Mode::Shadow);
+        assert_eq!(Mode::parse(Some("bogus")), Mode::On);
+    }
+
+    fn triage(store: &Store, id: &str, t: augmentagent_store::TriageResult) {
+        store.mark_email_processed(id, t).unwrap();
+    }
+
+    #[test]
+    fn agent_judged_no_reply_needed_covers_even_when_owner_is_named() {
+        let (_d, store) = temp_store();
+        let card = seed_card(&store, "m-in", T0);
+        teammate_reply(&store, "dana@labs.example.com, owner@example.com", AFTER, "Looping Sam in; Dana, attached."); // pii-ok
+        triage(&store, "m-team", augmentagent_store::TriageResult::Flag);
+        assert_eq!(tick(&store, &cfg(Mode::On)), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
+    }
+
+    #[test]
+    fn agent_judged_owner_must_reply_blocks_coverage() {
+        let (_d, store) = temp_store();
+        let card = seed_card(&store, "m-in", T0);
+        teammate_reply(&store, "dana@labs.example.com, owner@example.com", AFTER, "Over to you for pricing."); // pii-ok
+        triage(&store, "m-team", augmentagent_store::TriageResult::Reply);
+        assert_eq!(tick(&store, &cfg(Mode::On)), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
+    #[test]
+    fn agent_skip_verdict_also_covers() {
+        let (_d, store) = temp_store();
+        let card = seed_card(&store, "m-in", T0);
+        teammate_reply(&store, "dana@labs.example.com", AFTER, "Sam is cc'd, all handled."); // pii-ok
+        triage(&store, "m-team", augmentagent_store::TriageResult::Skip);
+        assert_eq!(tick(&store, &cfg(Mode::On)), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
     }
 
     #[test]
@@ -564,43 +563,6 @@ mod tests {
     // ---- #1702 ----
 
     const DAY: i64 = 86_400_000;
-
-    fn summary(decisions: usize, reviewed: usize, wrong: usize, anyway: usize, age_days: i64) -> (Summary, i64) {
-        let now = 100 * DAY;
-        (
-            Summary { decisions, reviewed, wrong, replied_anyway: anyway, first_decided_ms: Some(now - age_days * DAY) },
-            now,
-        )
-    }
-
-    #[test]
-    fn gate_check_passes_when_all_criteria_met() {
-        let (s, now) = summary(10, 10, 0, 0, 7);
-        assert_eq!(gate(&s, now), Gate { pass: true, reasons: vec![] });
-        // Fewer than 10 decisions is fine once 14 days have passed.
-        let (s, now) = summary(3, 3, 0, 0, 14);
-        assert!(gate(&s, now).pass);
-    }
-
-    #[test]
-    fn gate_check_fails_on_any_wrong_or_replied_anyway() {
-        let (s, now) = summary(12, 12, 1, 0, 9);
-        assert_eq!(gate(&s, now).reasons, vec!["1 decision(s) marked wrong".to_string()]);
-        let (s, now) = summary(12, 12, 0, 2, 9);
-        assert_eq!(gate(&s, now).reasons, vec!["owner replied anyway on 2 decision(s)".to_string()]);
-    }
-
-    #[test]
-    fn gate_check_fails_on_time_volume_and_review_coverage() {
-        let (s, now) = summary(10, 10, 0, 0, 6);
-        assert_eq!(gate(&s, now).reasons, vec!["shadow for 6 day(s); need 7".to_string()]);
-        let (s, now) = summary(4, 4, 0, 0, 9);
-        assert_eq!(gate(&s, now).reasons, vec!["only 4 decision(s); need 10, or 14 days of shadow".to_string()]);
-        let (s, now) = summary(10, 9, 0, 0, 8);
-        assert_eq!(gate(&s, now).reasons, vec!["9/10 decision(s) reviewed; need all".to_string()]);
-        let none = Summary::default();
-        assert_eq!(gate(&none, 100 * DAY).reasons, vec!["no shadow decisions yet".to_string()]);
-    }
 
     #[test]
     fn report_rows_summarize_and_render_a_summary_line() {
@@ -625,10 +587,9 @@ mod tests {
             s,
             Summary { decisions: 3, reviewed: 2, wrong: 1, replied_anyway: 1, first_decided_ms: Some(3 * DAY) }
         );
-        let g = gate(&s, 20 * DAY);
         assert_eq!(
-            summary_line(&s, &g, 20 * DAY),
-            "team-coverage: 3 decision(s), 2 reviewed, 1 wrong, 1 replied-anyway, shadow 17 day(s) — gate FAIL"
+            summary_line(&s),
+            "team-coverage: 3 decision(s), 2 reviewed, 1 wrong, 1 replied-anyway"
         );
     }
 
