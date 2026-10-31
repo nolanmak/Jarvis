@@ -87,6 +87,7 @@ fn process_birth(stat: &Path) -> Result<String> {
 }
 
 pub async fn run(repo: PathBuf, dry_run: bool) -> Result<()> {
+    crate::autoship_deployment::record("worker", dry_run, true).await?;
     let Some(worker) = crate::self_improve::AutoPrLoop::from_env(repo, dry_run) else {
         tracing::info!("auto-ship worker disabled: AUGMENTAGENT_AUTOPR is not enabled");
         return Ok(());

@@ -103,6 +103,7 @@ mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
 mod autoship_commands;
+mod autoship_deployment;
 mod autoship_contract;
 mod autoship_episode;
 mod autoship_metrics;
@@ -3512,6 +3513,9 @@ async fn main() -> Result<()> {
             no_email,
         } => {
             let external_autopr = autoship_worker::external_enabled();
+            if let Err(error) = autoship_deployment::record("daemon", dry_run, external_autopr).await {
+                warn!(%error, "could not publish effective autoship configuration; deployment remains unverified");
+            }
             if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
                 warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
             }

@@ -165,11 +165,15 @@ pub async fn run_readiness(json_output:bool) -> i32 {
     let claude=augmentagent_channel_core::native_vm::readiness::credentials("claude");
     let codex=augmentagent_channel_core::native_vm::readiness::credentials("codex");
     let runtime=augmentagent_channel_core::native_vm::readiness::runtime::inspect();
+    let deployment=crate::autoship_deployment::inspect(&std::env::current_dir().unwrap_or_default()).await;
+    let mut unverified=vec!["live-guarded-probe"];
+    if !deployment.matches { unverified.push("deployed-policy-equality"); }
     let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified","runtime":runtime,
         "credentials":{"claude":claude,"codex":codex},
         "roles":crate::self_improve::provider_readiness::inspect(),
         "resources":augmentagent_channel_core::run_resources::readiness().await,
-        "unverified":["live-guarded-probe","deployed-policy-equality"]});
+        "deployment":deployment,
+        "unverified":unverified});
     if json_output {println!("{body}");} else {
         println!("Autoship readiness is unverified.");
         for provider in ["claude","codex"] {
@@ -180,7 +184,8 @@ pub async fn run_readiness(json_output:bool) -> i32 {
             println!("{role}: {}",body["roles"][role]["status"]);
         }
         println!("Resources: {}",body["resources"]["status"]);
-        println!("Deployment and live-probe evidence remain unverified.");
+        println!("Deployment: {}",body["deployment"]["status"]);
+        println!("Live-probe evidence remains unverified.");
     }
     3
 }

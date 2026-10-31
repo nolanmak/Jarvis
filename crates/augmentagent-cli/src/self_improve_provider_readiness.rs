@@ -82,7 +82,9 @@ mod tests {
         const CHILD:&str="AUTOSHIP_ROLE_GATE_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
             use sha2::{Digest,Sha256};
-            for kind in ["roles","resources"] {
+            let mut cases = vec!["roles", "resources"];
+            if std::env::var_os("AUTOSHIP_DEPLOYMENT_GATE_LIVE").is_some() { cases.push("deployment"); }
+            for kind in cases {
                 let root=tempfile::tempdir().unwrap();
                 let fixture=root.path().join("fixture");std::fs::create_dir(&fixture).unwrap();
                 std::fs::set_permissions(&fixture,std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -93,7 +95,7 @@ mod tests {
                 std::fs::write(&runtime,serde_json::json!({"qemu":artifact,"kernel":artifact,"busybox":artifact,"firmware":artifact,
                     "data_dir":fixture,"library_dir":fixture,"module_dir":fixture,"modules":[artifact],"memory_mb":1024}).to_string()).unwrap();
                 std::fs::set_permissions(&runtime,std::fs::Permissions::from_mode(0o600)).unwrap();
-                let providers=if kind=="resources" {
+                let providers=if kind!="roles" {
                     let claude=root.path().join("claude.json");let codex=root.path().join("codex.json");
                     std::fs::write(&claude,r#"{"claudeAiOauth":{"accessToken":"fixture","refreshToken":"fixture","expiresAt":9999999999999}}"#).unwrap();
                     std::fs::write(&codex,r#"{"OPENAI_API_KEY":"fixture"}"#).unwrap();
@@ -106,9 +108,12 @@ mod tests {
                     "state_root":root.path().join("state"),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":providers}).to_string()).unwrap();
                 std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
                 let workspace=root.path().join("workspace");std::fs::create_dir(&workspace).unwrap();
-                let status=std::process::Command::new(std::env::current_exe().unwrap())
+                let mut command=std::process::Command::new(std::env::current_exe().unwrap());
+                command.env_clear();
+                if kind=="deployment" { command.env("AUGMENTAGENT_RUN_RESOURCES", "1"); }
+                let status=command
                     .args(["--exact","self_improve::provider_readiness::tests::unavailable_roles_or_resources_stop_before_git_selection_or_state_creation","--nocapture"])
-                    .env_clear().env("PATH","/usr/bin:/bin").env("HOME",&workspace)
+                    .env("PATH","/usr/bin:/bin").env("HOME",&workspace)
                     .env("XDG_STATE_HOME",workspace.join("state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",policy)
                     .env("AUGMENTAGENT_REASONER_CHAIN","claude").env("CLAUDE_CLI","/usr/bin/true").env("CODEX_CLI","/usr/bin/true")
                     .env("AUTOSHIP_ADMISSION_CASE",kind).env(CHILD,&workspace).current_dir(&workspace).status().unwrap();
@@ -118,7 +123,11 @@ mod tests {
         }
         let root=PathBuf::from(std::env::var_os(CHILD).unwrap());
         let error=super::super::run_once(&root,false).await.err().expect("missing admission must stop selection");
-        let expected=if std::env::var("AUTOSHIP_ADMISSION_CASE").unwrap()=="resources" {"workflow-resource:declaration-missing"} else {"workflow-role:builder:no-eligible-provider"};
+        let expected=match std::env::var("AUTOSHIP_ADMISSION_CASE").unwrap().as_str() {
+            "deployment" => "workflow-deployment:selection-missing",
+            "resources" => "workflow-resource:declaration-missing",
+            _ => "workflow-role:builder:no-eligible-provider",
+        };
         assert!(format!("{error:#}").contains(expected),"{error:#}");
         assert_eq!(std::fs::read_dir(root).unwrap().count(),0,"no git, lock, workflow, model or build state before admission");
     }

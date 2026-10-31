@@ -7518,6 +7518,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             .await.context("native runtime preflight task failed")??;
         provider_readiness::inspect().preflight()?;
         augmentagent_channel_core::run_resources::readiness().await.preflight()?;
+        crate::autoship_deployment::inspect(repo_root).await.preflight()?;
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
@@ -15304,6 +15305,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "crates/augmentagent-cli/src/self_improve_lifecycle_tests.rs",
                 "crates/augmentagent-cli/src/self_improve_progress_tests.rs",
                 "docs/CODEX-FALLBACK.md",
+                // Captures the configured path in a private receipt; never opens the map.
+                "scripts/autoship-deployment-readiness.py",
                 // Removes inherited overrides; never reads or writes the map.
                 "scripts/autoship-native-acceptance-probe.py",
             ],

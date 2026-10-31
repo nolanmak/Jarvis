@@ -323,3 +323,36 @@ fn readiness_separates_resource_selector_and_composed_vm_envelope() {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),2);
     }
 }
+
+#[test]
+fn readiness_never_treats_the_callers_profile_as_deployed_service_configuration() {
+    let root=tempfile::tempdir().unwrap();
+    let output=Command::new(env!("CARGO_BIN_EXE_augmentagent")).env_clear()
+        .env("PATH","/usr/bin:/bin").env("HOME",root.path()).env("XDG_STATE_HOME",root.path().join("state"))
+        .current_dir(root.path()).args(["autopr","readiness","--json"]).output().unwrap();
+    assert_eq!(output.status.code(),Some(3));
+    let report:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["deployment"]["matches"],false);
+    assert_eq!(report["deployment"]["status"],if cfg!(target_os="linux") {"selection-missing"} else {"platform-unverified"});
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),0);
+}
+
+#[cfg(target_os="linux")]
+#[test]
+fn deployment_startup_worker_records_effective_dotenv_without_credentials() {
+    let root=tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".env"),"AUGMENTAGENT_AUTOPR=0\nAUGMENTAGENT_REASONER_CHAIN=codex\nCODEX_API_KEY=private-startup-fixture\n").unwrap();
+    let child=Command::new(env!("CARGO_BIN_EXE_augmentagent")).env_clear().env("PATH","/usr/bin:/bin")
+        .env("HOME",root.path()).env("XDG_STATE_HOME",root.path().join("state")).current_dir(root.path())
+        .args(["auto-pr-worker","--dry-run","true"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let pid=child.id();let output=child.wait_with_output().unwrap();
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let path=root.path().join("state/augmentagent/autoship-effective-config/worker.json");
+    let bytes=std::fs::read(&path).expect("actual worker entry point must record loaded configuration");
+    let value:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["pid"],pid);assert_eq!(value["config"]["AUGMENTAGENT_REASONER_CHAIN"],"codex");
+    assert_eq!(value["dry_run"],true);
+    assert!(!String::from_utf8_lossy(&bytes).contains("private-startup-fixture"));
+    assert_eq!(path.metadata().unwrap().permissions().mode()&0o777,0o600);
+    assert!(!root.path().join("data.db").exists());
+}

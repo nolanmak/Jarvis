@@ -974,6 +974,9 @@ pub async fn run(repo_root: &Path, notify: bool, json: bool) -> anyhow::Result<i
     }
     let inputs = collect(repo_root);
     let mut findings = analyze(&inputs, &thresholds);
+    if let Some(finding) = deployment_finding(&crate::autoship_deployment::inspect(repo_root).await) {
+        findings.push(finding);
+    }
     for finding in findings.iter_mut().filter(|f| f.code == "disk-low") {
         if !cleanup_detail.is_empty() {
             finding.fix.push_str(&format!(" Cleanup result: {}", cleanup_detail.chars().take(800).collect::<String>()));
@@ -1757,5 +1760,37 @@ mod tests {
 
         // Missing file ⇒ None.
         assert!(read_baseline_red(&dir.path().join("nope")).is_none());
+    }
+}
+
+fn deployment_finding(report: &crate::autoship_deployment::Report) -> Option<Finding> {
+    if !report.expected_active || (report.matches && report.status == "configuration-matched") {
+        return None;
+    }
+    let services = ["daemon", "worker"].into_iter().filter_map(|role| {
+        report.services[role]["status"].as_str().map(|status| format!("{role}: {status}"))
+    }).collect::<Vec<_>>().join("; ");
+    Some(Finding {
+        severity: Severity::Alert,
+        code: "autoship-deployment-unverified",
+        detail: format!("Autoship deployment configuration is unverified: {}; {}", report.status, services),
+        fix: "Use the supported installer to select the shared native policy and the normal updater to deploy both services; verify autoship readiness afterward.".into(),
+    })
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    #[test]
+    fn deployment_mismatch_reports_worker_reason_and_ignores_disabled_autoship() {
+        let mut report:crate::autoship_deployment::Report=serde_json::from_value(serde_json::json!({
+            "status":"service-configuration-unverified","matches":false,"live_verified":false,
+            "worker_running":false,"expected_active":true,
+            "services":{"worker":{"status":"policy-not-selected"}}})).unwrap();
+        let finding=super::deployment_finding(&report).expect("configured daemon must expose missing worker policy");
+        assert_eq!(finding.code,"autoship-deployment-unverified");
+        assert!(finding.detail.contains("worker: policy-not-selected"));
+        report.expected_active=false;assert!(super::deployment_finding(&report).is_none());
+        report.expected_active=true;report.matches=true;report.status="configuration-matched".into();
+        assert!(super::deployment_finding(&report).is_none());
     }
 }
