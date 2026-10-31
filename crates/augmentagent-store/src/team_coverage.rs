@@ -2,7 +2,7 @@
 //! thread (with recipients, #1699) and a durable log of every coverage
 //! decision, shadow or live, that the #1702 report reads.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::recipients::Recipients;
 use crate::{Store, StoreResult};
@@ -203,5 +203,25 @@ impl Store {
             params![action_id, verdict, chrono::Utc::now().timestamp_millis()],
         )?;
         Ok(n > 0)
+    }
+}
+
+impl Store {
+    /// #1701 — where a stored Slack message sits: its thread root (`thread_ts`,
+    /// or its own `ts` when top-level) and whether it is a reply inside a
+    /// thread. `None` for anything not in the Slack ingest ledger.
+    pub fn slack_thread_position(&self, message_id: &str) -> StoreResult<Option<(String, bool)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<(String, Option<String>)> = guard
+            .query_row(
+                "SELECT ts, thread_ts FROM slack_ingest_ledger WHERE message_id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(ts, thread_ts)| match thread_ts {
+            Some(t) if t != ts => (t, true),
+            _ => (ts, false),
+        }))
     }
 }

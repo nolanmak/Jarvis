@@ -213,6 +213,14 @@ mod tests {
     }
 
     #[test]
+    fn telegram_handles_are_rosterable() {
+        let r = TeamRoster::parse("Ana=telegram:4242");
+        assert!(r.invalid_entries().is_empty());
+        assert_eq!(r.classify("Ana <telegram:4242>", &owner()), teammate("Ana"));
+        assert_eq!(r.classify("Bo <telegram:7>", &owner()), TeamClass::Other);
+    }
+
+    #[test]
     fn invalid_entry_warns_and_is_ignored() {
         let r = TeamRoster::parse("Ana,@nodot,ana@example.net,,=");
         assert_eq!(r.invalid_entries(), ["Ana", "@nodot", "="]);

@@ -132,41 +132,126 @@ pub fn mentions_alias(text: &str, aliases: &[String]) -> bool {
     })
 }
 
-/// Conditions 1–6 for one card. `after_ms` is the card's inbound bound
+/// Platforms the rule supports. Email, plus the chat adapters that can raise
+/// a card for a group conversation AND store every group member's messages
+/// with sender, time and the card's thread id (#1701 inventory). WhatsApp,
+/// iMessage and LinkedIn drop groups before drafting; SocialAPI, Twitter and
+/// Instagram cannot attribute group senders — all inert here.
+pub const CHAT_PLATFORMS: [&str; 3] = ["slack", "discord", "telegram"];
+
+pub fn supported(platform: &str) -> bool {
+    platform == augmentagent_channel_email::inbound::PLATFORM || CHAT_PLATFORMS.contains(&platform)
+}
+
+/// A stored message time in ms: RFC 2822 / RFC 3339 / epoch (s or ms), or a
+/// Slack `ts` (`"1700000000.000100"`). `0` when unparseable.
+pub fn message_time_ms(raw: &str) -> i64 {
+    let ms = augmentagent_channel_email::outbound::parse_rfc2822_or_ms(raw);
+    if ms != 0 {
+        return ms;
+    }
+    augmentagent_store::slack_ingest::ts_order(raw.trim())
+        .and_then(|(secs, micros)| i64::try_from(secs * 1000 + micros / 1000).ok())
+        .unwrap_or(0)
+}
+
+/// A conversation id that is 1:1 by construction: Slack `D…` channels and
+/// positive Telegram chat ids. The rule never runs on these.
+fn one_to_one_by_id(platform: &str, thread: &str) -> bool {
+    match platform {
+        "slack" => thread.starts_with('D'),
+        "telegram" => thread.parse::<i64>().is_ok_and(|id| id > 0),
+        _ => false,
+    }
+}
+
+/// Structured `<@ID>` / `<@!ID>` / `<@ID|name>` mentions as canonical handles.
+fn structured_mentions(platform: &str, body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("<@") {
+        rest = &rest[i + 2..];
+        let Some(end) = rest.find('>') else { break };
+        let id = rest[..end].trim_start_matches(['!', '&']).split('|').next().unwrap_or("");
+        if !id.is_empty() {
+            out.push(augmentagent_messages::handles::canonical(&format!("{platform}:{id}")));
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Whether one card is covered. `after_ms` is the card's inbound bound
 /// (receivedAt, else createdAt — the same bound Rule 1 uses).
+///
+/// Email: conditions 1–6 in the module docs. Group chat (#1701): 1–3 and 5
+/// apply; 4 holds by construction (every member sees a group message) except
+/// that a Slack thread reply must be in the asker's thread; 6 has no chat
+/// analogue. On top of that a chat message never covers when it is from the
+/// asker themself or structurally mentions anyone but the asker or a
+/// teammate (the owner included), and 1:1 conversations are exempt.
 pub fn find_coverage(
     store: &Store,
     row: &PendingActionRow,
     after_ms: i64,
     cfg: &Config,
 ) -> anyhow::Result<Option<Coverage>> {
-    use augmentagent_channel_email::outbound::parse_rfc2822_or_ms;
-    use augmentagent_messages::team::TeamClass;
+    use augmentagent_messages::{handles, team::TeamClass};
 
     let (Some(thread), Some(account)) = (row.thread_id.as_deref(), row.account_entity_id.as_deref())
     else {
         return Ok(None);
     };
-    let Some(asker) = augmentagent_store::recipients::parse_addresses(&row.from_email)
-        .into_iter()
-        .next()
-    else {
+    let email = row.platform == augmentagent_channel_email::inbound::PLATFORM;
+    if !supported(&row.platform) || one_to_one_by_id(&row.platform, thread) {
         return Ok(None);
+    }
+    let asker_addr = augmentagent_store::recipients::parse_addresses(&row.from_email).into_iter().next();
+    if email && asker_addr.is_none() {
+        return Ok(None);
+    }
+    let asker_handle = handles::canonical(&row.from_email);
+    let card_thread = if row.platform == "slack" {
+        store.slack_thread_position(&row.message_id)?.map(|(root, _)| root)
+    } else {
+        None
     };
+
     let mut best: Option<Coverage> = None;
     for m in store.thread_messages_in_mailbox(thread, account)? {
         let TeamClass::Teammate { label } = cfg.roster.classify(&m.from, &cfg.owner) else {
             continue;
         };
-        let at = parse_rfc2822_or_ms(&m.received_at);
+        let at = message_time_ms(&m.received_at);
         if at <= 0 || at <= after_ms {
             continue;
         }
-        let Some(r) = &m.recipients else {
-            continue;
-        };
-        if !r.to.iter().chain(&r.cc).any(|a| *a == asker) {
-            continue;
+        if email {
+            let Some(r) = &m.recipients else {
+                continue;
+            };
+            let asker = asker_addr.as_deref().unwrap_or_default();
+            if !r.to.iter().chain(&r.cc).any(|a| a == asker) {
+                continue;
+            }
+        } else {
+            if handles::canonical(&m.from) == asker_handle {
+                continue;
+            }
+            let foreign_mention = structured_mentions(&row.platform, &m.body).iter().any(|h| {
+                *h != asker_handle
+                    && !matches!(cfg.roster.classify(h, &cfg.owner), TeamClass::Teammate { .. })
+            });
+            if foreign_mention {
+                continue;
+            }
+            if row.platform == "slack" {
+                if let Some((root, true)) = store.slack_thread_position(&m.message_id)? {
+                    if card_thread.as_deref() != Some(root.as_str()) {
+                        continue;
+                    }
+                }
+            }
         }
         if mentions_alias(&new_text(&m.body), &cfg.aliases) {
             continue;
@@ -545,6 +630,159 @@ mod tests {
             summary_line(&s, &g, 20 * DAY),
             "team-coverage: 3 decision(s), 2 reviewed, 1 wrong, 1 replied-anyway, shadow 17 day(s) — gate FAIL"
         );
+    }
+
+    // ---- #1701: group chats ----
+
+    use augmentagent_store::slack_ingest::{SlackIngestSource, SlackMessageKey};
+
+    // 2026-01-01T00:00:00Z / 2026-01-02 in Slack ts form.
+    const TS0: &str = "1767225600.000100";
+    const TS1: &str = "1767312000.000200";
+    const TS2: &str = "1767398400.000300";
+
+    fn chat_cfg() -> Config {
+        Config {
+            mode: Mode::On,
+            roster: TeamRoster::parse("Ana=slack:UANA,Ana=discord:111,Ana=telegram:111"),
+            owner: OwnerIdentities::new(["owner@example.com"]),
+            aliases: vec!["Sam".into()],
+        }
+    }
+
+    fn chat_email(platform: &str, thread: &str, id: &str, from: &str, date: &str, body: &str) -> Email {
+        Email {
+            message_id: id.into(),
+            thread_id: Some(thread.into()),
+            from: from.into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: Vec::new(),
+            subject: String::new(),
+            body: body.into(),
+            date: date.into(),
+            account_entity_id: Some(format!("{platform}:acct")),
+            platform: platform.into(),
+            kind: "dm".into(),
+        }
+    }
+
+    /// Store a Slack message (with its thread) the way the Slack channel does.
+    fn slack(store: &Store, channel: &str, ts: &str, thread_ts: Option<&str>, from: &str, body: &str) -> String {
+        let key = SlackMessageKey::new("T1", channel, ts).unwrap();
+        let email = chat_email("slack", channel, &key.message_id(), from, ts, body);
+        store.record_slack_message(&key, thread_ts, &email, SlackIngestSource::Live, 0).unwrap();
+        key.message_id()
+    }
+
+    fn card_for(store: &Store, message_id: &str, thread: &str, from: &str) -> String {
+        store
+            .log_action(message_id, Some(thread), from, "", Some("question"), Some("a draft"), ActionStatus::Pending)
+            .unwrap()
+    }
+
+    const DANA_SLACK: &str = "Dana <slack:UDANA>";
+    const ANA_SLACK: &str = "Ana <slack:UANA>";
+
+    #[test]
+    fn slack_group_teammate_reply_retires() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, ANA_SLACK, "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 1);
+        assert_eq!(status(&store, &card), ("superseded".into(), Some("superseded: covered by teammate Ana".into())));
+    }
+
+    #[test]
+    fn discord_and_telegram_group_teammate_replies_retire() {
+        let (_d, store) = temp_store();
+        store.upsert_email(&chat_email("discord", "G1", "d-in", "Dana <discord:222>", "2026-01-01T00:00:00Z", "deck?")).unwrap();
+        let discord = card_for(&store, "d-in", "G1", "Dana <discord:222>");
+        store.upsert_email(&chat_email("discord", "G1", "d-ana", "Ana <discord:111>", "2026-01-02T00:00:00Z", "sent")).unwrap();
+        // Telegram groups have negative chat ids; dates are Unix seconds.
+        store.upsert_email(&chat_email("telegram", "-1001", "t-in", "Dana <telegram:222>", "1767225600", "deck?")).unwrap();
+        let telegram = card_for(&store, "t-in", "-1001", "Dana <telegram:222>");
+        store.upsert_email(&chat_email("telegram", "-1001", "t-ana", "Ana <telegram:111>", "1767312000", "sent")).unwrap();
+        assert_eq!(tick(&store, &chat_cfg()), 2);
+        assert_eq!(status(&store, &discord).0, "superseded");
+        assert_eq!(status(&store, &telegram).0, "superseded");
+    }
+
+    #[test]
+    fn group_non_team_member_reply_does_not_retire() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, "Eli <slack:UELI>", "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
+    #[test]
+    fn teammate_mentions_owner_does_not_retire() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, ANA_SLACK, "<@UOWNER> can you grab this?");
+        slack(&store, "C1", TS2, None, ANA_SLACK, "sam, thoughts?");
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
+    #[test]
+    fn teammate_mentioning_the_asker_still_retires() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, ANA_SLACK, "<@UDANA|dana> here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
+    }
+
+    #[test]
+    fn slack_reply_in_different_thread_does_not_retire() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS1, Some(TS0), DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        // Ana answers in some other thread.
+        slack(&store, "C1", TS2, Some("1767225000.000000"), ANA_SLACK, "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+        // In Dana's thread it covers.
+        slack(&store, "C1", "1767398500.000000", Some(TS0), ANA_SLACK, "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
+    }
+
+    #[test]
+    fn one_to_one_dm_never_retired_by_team_rule() {
+        let (_d, store) = temp_store();
+        // A teammate's own DM: their follow-up never covers their own card.
+        let m = slack(&store, "C9", TS0, None, ANA_SLACK, "quick q");
+        let own = card_for(&store, &m, "C9", ANA_SLACK);
+        slack(&store, "C9", TS1, None, ANA_SLACK, "nvm, also this");
+        // Slack D… channels and positive Telegram chat ids are 1:1 by id.
+        let m = slack(&store, "D1", TS0, None, DANA_SLACK, "deck?");
+        let slack_dm = card_for(&store, &m, "D1", DANA_SLACK);
+        slack(&store, "D1", TS1, None, ANA_SLACK, "sent");
+        store.upsert_email(&chat_email("telegram", "555", "t-in", "Dana <telegram:222>", "1767225600", "deck?")).unwrap();
+        let tg_dm = card_for(&store, "t-in", "555", "Dana <telegram:222>");
+        store.upsert_email(&chat_email("telegram", "555", "t-ana", "Ana <telegram:111>", "1767312000", "sent")).unwrap();
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        for id in [own, slack_dm, tg_dm] {
+            assert_eq!(status(&store, &id).0, "pending");
+        }
+    }
+
+    #[test]
+    fn unsupported_platforms_are_inert() {
+        let (_d, store) = temp_store();
+        store.upsert_email(&chat_email("socialapi", "conv", "s-in", "Dana <socialapi:instagram:222>", "2026-01-01T00:00:00Z", "hi")).unwrap();
+        let card = card_for(&store, "s-in", "conv", "Dana <socialapi:instagram:222>");
+        store.upsert_email(&chat_email("socialapi", "conv", "s-ana", "Ana <slack:UANA>", "2026-01-02T00:00:00Z", "sent")).unwrap();
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
     }
 
 }

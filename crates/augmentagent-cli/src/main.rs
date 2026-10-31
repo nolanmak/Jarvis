@@ -64,7 +64,7 @@ use augmentagent_channel_email::sigextract::{
     SignatureExtractor,
 };
 use augmentagent_channel_email::{
-    parse_rfc2822_or_ms, GmailChannel, GmailChannelConfig, OutboundObserver,
+    GmailChannel, GmailChannelConfig, OutboundObserver,
 };
 use augmentagent_channel_linkedin::{
     build_normshares_body, default_auth_path, is_linkedin_email, ConnectionRequestEngagement,
@@ -9089,7 +9089,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
-        let after_ms = match row.received_at.as_deref().map(parse_rfc2822_or_ms) {
+        let after_ms = match row.received_at.as_deref().map(team_coverage::message_time_ms) {
             Some(ms) if ms > 0 => ms,
             _ => row.created_at_ms,
         };
@@ -9106,7 +9106,7 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
             // Rule 4 (#1700) — a rostered teammate already answered the
             // asker on the owner's behalf. Email cards only; group chats are
             // #1701. Shadow mode records the decision and retires nothing.
-            Ok(false) if team_active && email_platform => {
+            Ok(false) if team_active && team_coverage::supported(&row.platform) => {
                 match team_coverage::find_coverage(store, row, after_ms, team) {
                     Ok(Some(c)) => covered.push((row.id.clone(), tid.to_string(), c)),
                     Ok(None) => {}
@@ -24055,4 +24055,5 @@ pub(crate) mod test_support {
         }
     }
 }
+
 
