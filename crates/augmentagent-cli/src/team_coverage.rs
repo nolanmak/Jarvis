@@ -547,4 +547,157 @@ mod tests {
         );
     }
 
+    // ---- #1701: group chats ----
+
+    use augmentagent_store::slack_ingest::{SlackIngestSource, SlackMessageKey};
+
+    // 2026-01-01T00:00:00Z / 2026-01-02 in Slack ts form.
+    const TS0: &str = "1767225600.000100";
+    const TS1: &str = "1767312000.000200";
+    const TS2: &str = "1767398400.000300";
+
+    fn chat_cfg() -> Config {
+        Config {
+            mode: Mode::On,
+            roster: TeamRoster::parse("Ana=slack:UANA,Ana=discord:111,Ana=telegram:111"),
+            owner: OwnerIdentities::new(["owner@example.com"]),
+            aliases: vec!["Sam".into()],
+        }
+    }
+
+    fn chat_email(platform: &str, thread: &str, id: &str, from: &str, date: &str, body: &str) -> Email {
+        Email {
+            message_id: id.into(),
+            thread_id: Some(thread.into()),
+            from: from.into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: Vec::new(),
+            subject: String::new(),
+            body: body.into(),
+            date: date.into(),
+            account_entity_id: Some(format!("{platform}:acct")),
+            platform: platform.into(),
+            kind: "dm".into(),
+        }
+    }
+
+    /// Store a Slack message (with its thread) the way the Slack channel does.
+    fn slack(store: &Store, channel: &str, ts: &str, thread_ts: Option<&str>, from: &str, body: &str) -> String {
+        let key = SlackMessageKey::new("T1", channel, ts).unwrap();
+        let email = chat_email("slack", channel, &key.message_id(), from, ts, body);
+        store.record_slack_message(&key, thread_ts, &email, SlackIngestSource::Live, 0).unwrap();
+        key.message_id()
+    }
+
+    fn card_for(store: &Store, message_id: &str, thread: &str, from: &str) -> String {
+        store
+            .log_action(message_id, Some(thread), from, "", Some("question"), Some("a draft"), ActionStatus::Pending)
+            .unwrap()
+    }
+
+    const DANA_SLACK: &str = "Dana <slack:UDANA>";
+    const ANA_SLACK: &str = "Ana <slack:UANA>";
+
+    #[test]
+    fn slack_group_teammate_reply_retires() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, ANA_SLACK, "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 1);
+        assert_eq!(status(&store, &card), ("superseded".into(), Some("superseded: covered by teammate Ana".into())));
+    }
+
+    #[test]
+    fn discord_and_telegram_group_teammate_replies_retire() {
+        let (_d, store) = temp_store();
+        store.upsert_email(&chat_email("discord", "G1", "d-in", "Dana <discord:222>", "2026-01-01T00:00:00Z", "deck?")).unwrap();
+        let discord = card_for(&store, "d-in", "G1", "Dana <discord:222>");
+        store.upsert_email(&chat_email("discord", "G1", "d-ana", "Ana <discord:111>", "2026-01-02T00:00:00Z", "sent")).unwrap();
+        // Telegram groups have negative chat ids; dates are Unix seconds.
+        store.upsert_email(&chat_email("telegram", "-1001", "t-in", "Dana <telegram:222>", "1767225600", "deck?")).unwrap();
+        let telegram = card_for(&store, "t-in", "-1001", "Dana <telegram:222>");
+        store.upsert_email(&chat_email("telegram", "-1001", "t-ana", "Ana <telegram:111>", "1767312000", "sent")).unwrap();
+        assert_eq!(tick(&store, &chat_cfg()), 2);
+        assert_eq!(status(&store, &discord).0, "superseded");
+        assert_eq!(status(&store, &telegram).0, "superseded");
+    }
+
+    #[test]
+    fn group_non_team_member_reply_does_not_retire() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, "Eli <slack:UELI>", "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
+    #[test]
+    fn teammate_mentions_owner_does_not_retire() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, ANA_SLACK, "<@UOWNER> can you grab this?");
+        slack(&store, "C1", TS2, None, ANA_SLACK, "sam, thoughts?");
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
+    #[test]
+    fn teammate_mentioning_the_asker_still_retires() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS0, None, DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        slack(&store, "C1", TS1, None, ANA_SLACK, "<@UDANA|dana> here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
+    }
+
+    #[test]
+    fn slack_reply_in_different_thread_does_not_retire() {
+        let (_d, store) = temp_store();
+        let m = slack(&store, "C1", TS1, Some(TS0), DANA_SLACK, "where is the deck?");
+        let card = card_for(&store, &m, "C1", DANA_SLACK);
+        // Ana answers in some other thread.
+        slack(&store, "C1", TS2, Some("1767225000.000000"), ANA_SLACK, "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+        // In Dana's thread it covers.
+        slack(&store, "C1", "1767398500.000000", Some(TS0), ANA_SLACK, "here you go");
+        assert_eq!(tick(&store, &chat_cfg()), 1);
+        assert_eq!(status(&store, &card).0, "superseded");
+    }
+
+    #[test]
+    fn one_to_one_dm_never_retired_by_team_rule() {
+        let (_d, store) = temp_store();
+        // A teammate's own DM: their follow-up never covers their own card.
+        let m = slack(&store, "C9", TS0, None, ANA_SLACK, "quick q");
+        let own = card_for(&store, &m, "C9", ANA_SLACK);
+        slack(&store, "C9", TS1, None, ANA_SLACK, "nvm, also this");
+        // Slack D… channels and positive Telegram chat ids are 1:1 by id.
+        let m = slack(&store, "D1", TS0, None, DANA_SLACK, "deck?");
+        let slack_dm = card_for(&store, &m, "D1", DANA_SLACK);
+        slack(&store, "D1", TS1, None, ANA_SLACK, "sent");
+        store.upsert_email(&chat_email("telegram", "555", "t-in", "Dana <telegram:222>", "1767225600", "deck?")).unwrap();
+        let tg_dm = card_for(&store, "t-in", "555", "Dana <telegram:222>");
+        store.upsert_email(&chat_email("telegram", "555", "t-ana", "Ana <telegram:111>", "1767312000", "sent")).unwrap();
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        for id in [own, slack_dm, tg_dm] {
+            assert_eq!(status(&store, &id).0, "pending");
+        }
+    }
+
+    #[test]
+    fn unsupported_platforms_are_inert() {
+        let (_d, store) = temp_store();
+        store.upsert_email(&chat_email("socialapi", "conv", "s-in", "Dana <socialapi:instagram:222>", "2026-01-01T00:00:00Z", "hi")).unwrap();
+        let card = card_for(&store, "s-in", "conv", "Dana <socialapi:instagram:222>");
+        store.upsert_email(&chat_email("socialapi", "conv", "s-ana", "Ana <slack:UANA>", "2026-01-02T00:00:00Z", "sent")).unwrap();
+        assert_eq!(tick(&store, &chat_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
 }
