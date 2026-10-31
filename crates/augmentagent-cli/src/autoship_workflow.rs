@@ -19,6 +19,8 @@ pub(crate) mod discord_ingress;
 mod review_epoch;
 #[path = "autoship_conversations.rs"]
 mod conversations;
+#[path = "autoship_owner_revision.rs"]
+mod owner_revision;
 #[path = "autoship_owner_turn.rs"]
 pub(crate) mod owner_turn;
 #[path = "autoship_owner_inbox.rs"]
@@ -329,6 +331,10 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_review_floor (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), after_seq INTEGER NOT NULL,
                 request_id TEXT NOT NULL REFERENCES discord_control_request(request_id));
+            CREATE TABLE IF NOT EXISTS workflow_owner_revision (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_turn(request_id), previous_contract TEXT NOT NULL,
+                next_contract TEXT NOT NULL, binding TEXT NOT NULL, owner_message_sha256 TEXT NOT NULL,
+                registration TEXT NOT NULL, activated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_owner_turn (
                 workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
                 owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,

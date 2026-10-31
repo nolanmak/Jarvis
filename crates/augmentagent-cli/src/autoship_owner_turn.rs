@@ -38,19 +38,30 @@ impl WorkflowStore {
         tx.commit()?;
         Ok(Some(OwnerTurn {lease:Lease {workflow:workflow.into(),owner:owner.into(),generation},request_id,body,pause_revision:control.revision,binding:checkpoint.binding}))
     }
+    pub fn owner_turn_for_lease(&mut self,lease:&Lease,now:i64)->Result<OwnerTurn> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_lease(&tx,lease,now)?;
+        let (request_id,body,pause_revision,binding):(String,String,i64,String)=tx.query_row("SELECT t.request_id,m.body,t.pause_revision,t.binding FROM workflow_owner_turn t JOIN workflow_owner_message m ON m.request_id=t.request_id WHERE t.workflow=?1 AND t.owner=?2 AND t.lease_generation=?3 AND t.state='claimed'",params![lease.workflow,lease.owner,lease.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let turn=OwnerTurn {lease:lease.clone(),request_id,body,pause_revision,binding:serde_json::from_str(&binding)?};
+        validate_turn(&tx,&turn,now)?;tx.commit()?;Ok(turn)
+    }
     /// This validates turn ownership only; native readiness, dispatch admission,
     /// workspace provenance and scope authorization remain separate requirements.
     pub fn validate_owner_turn(&mut self,turn:&OwnerTurn,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_binding(&tx,&turn.lease,&turn.binding,now)?;
+        validate_turn(&tx,turn,now)?;
+        tx.commit()?;Ok(())
+    }
+}
+pub(super) fn validate_turn(tx:&Transaction<'_>,turn:&OwnerTurn,now:i64)->Result<()> {
+        require_binding(tx,&turn.lease,&turn.binding,now)?;
         let matches:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workflow_owner_turn WHERE workflow=?1 AND request_id=?2 AND owner=?3 AND lease_generation=?4 AND pause_revision=?5 AND binding=?6 AND state='claimed' AND EXISTS(SELECT 1 FROM workflow_owner_message m WHERE m.request_id=?2 AND m.workflow=?1 AND m.body=?7 AND m.state='pending'))",params![turn.lease.workflow,turn.request_id,turn.lease.owner,turn.lease.generation,turn.pause_revision,serde_json::to_string(&turn.binding)?,turn.body],|r|r.get(0))?;
         ensure!(matches,"owner turn identity changed");
-        let control=super::owner_control::read(&tx,&turn.lease.workflow)?.context("owner control missing")?;
+        let control=super::owner_control::read(tx,&turn.lease.workflow)?.context("owner control missing")?;
         ensure!(control.paused && control.revision==turn.pause_revision,"owner intent changed during turn");
         let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&turn.lease.workflow],|r|r.get(0))?;
         ensure!(!matches!(serde_json::from_str::<Checkpoint>(&raw)?.stage,Stage::Merged|Stage::Retired|Stage::Held),"owner turn checkpoint blocked");
-        tx.commit()?;Ok(())
-    }
+    Ok(())
 }
 // Only model/verifier admission uses this exception. Publication and merge
 // retain the ordinary owner-pause checks even for an active owner turn.
