@@ -1,0 +1,62 @@
+name: Rust dependency cache
+
+# PR validation jobs restore one shared dependency cache per runner image
+# instead of each saving its own. Per-workflow caches overflowed the 10 GB
+# repo limit and evicted each other within minutes, so nearly every job built
+# cold. This is the only writer: it builds every workspace dependency for the
+# test and clippy profiles on main, and the cache key only changes when
+# Cargo.lock, manifests, the toolchain, the runner image or Cargo env change.
+#
+# Keep `env`, the toolchain and the rust-cache inputs in step with the
+# restore-only steps in the validation workflows, or keys stop matching.
+
+on:
+  push:
+    branches: [main, ci/shared-rust-cache]  # TEMP: validate keys before merge
+  schedule:
+    # Absorb runner image updates that land between main pushes.
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-cache-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    name: warm (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04 is separate: some jobs pin it for Python 3.9.
+        os: [ubuntu-latest, ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.94.1
+      - id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+      # A workspace crate that fails to compile here is a PR-gate problem, not
+      # a cache problem; keep going so every dependency still gets cached.
+      # build/check rather than test --no-run/clippy: same dependency
+      # artifacts, and only these accept --keep-going.
+      - name: Build test targets
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: cargo build --workspace --all-targets --locked --keep-going
+      - name: Check metadata for clippy
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: cargo check --workspace --all-targets --locked --keep-going

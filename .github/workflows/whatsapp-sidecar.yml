@@ -32,6 +32,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     timeout-minutes: 45
     env:
+      CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
@@ -46,7 +47,15 @@ jobs:
         with:
           toolchain: 1.94.1
           components: clippy
+      # Restore-only: rust-cache.yml writes this cache from main. Build
+      # parallelism doesn't change artifacts, so it stays out of the cache key.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+          save-if: false
+        env:
+          CARGO_BUILD_JOBS: ''
       - name: Go tests, race checks and vet
         working-directory: sidecars/wa-sidecar
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id whatsapp-sidecar/wire-contract/4"

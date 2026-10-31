@@ -35,7 +35,15 @@ jobs:
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
+      # Restore-only: rust-cache.yml writes this cache from main. Build
+      # parallelism doesn't change artifacts, so it stays out of the cache key.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+          save-if: false
+        env:
+          CARGO_BUILD_JOBS: ''
       - name: Format finance crate
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id finance/finance/3"
 

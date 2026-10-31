@@ -740,7 +740,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "apple-notes/notes/4"
@@ -756,7 +764,7 @@
         }
       },
       "role": "validation",
-      "sha256": "61d9922f2ba16e3788e64baa0b935a448c6cd45b55f3432d069f2696a3ec39db"
+      "sha256": "4e7439687e316ffe96fe9d377c4543ae6884cfba329ece692fe43ea5cdd3a80f"
     },
     ".github/workflows/approval-history.yml": {
       "defaults": {},
@@ -771,16 +779,31 @@
       },
       "jobs": {
         "decisions-and-context": {
+          "env": {
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
           "runs-on": "ubuntu-latest",
           "steps": [
             {
               "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
             },
             {
-              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec"
+              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+              "with": {
+                "toolchain": "1.94.1"
+              }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "approval-history/decisions-and-context/3"
@@ -798,12 +821,12 @@
         }
       },
       "role": "validation",
-      "sha256": "aa8d847c8b5a43726a910347843160f4c87b903d9d2864aeae2b0fadf2b91aec"
+      "sha256": "fd9d536577126a45a7d546e00a4533bf07d2b464aabf622e219095474f455965"
     },
     ".github/workflows/autonomous-code-scanner.yml": {
       "reason": "scheduled autonomous scanner and issue reporting",
       "role": "excluded",
-      "sha256": "6dcdfe4911693b2435b602fa27e6c989f3d4057a710711b38e4a165ba42664ad"
+      "sha256": "350b8a4deee9e416c7e655a047f5996a7674a4ec7d244c19d200d7947e32fde0"
     },
     ".github/workflows/bridge-suites.yml": {
       "defaults": {},
@@ -976,7 +999,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "uses": "denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed",
@@ -1005,7 +1036,7 @@
         }
       },
       "role": "validation",
-      "sha256": "2783d975ee525a0020b057c53c8f25eee1b995a78d56f492b0f1ce4c7733a11b"
+      "sha256": "124fd5fba66d5ac02076321345e11d7f73f83e2ff4f4609fe9c46efb497e3eb0"
     },
     ".github/workflows/computer-use.yml": {
       "defaults": {},
@@ -1191,6 +1222,10 @@
       },
       "jobs": {
         "rust": {
+          "env": {
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
           "runs-on": "ubuntu-latest",
           "steps": [
             {
@@ -1203,9 +1238,14 @@
               }
             },
             {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
               "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
               "with": {
-                "key": "discord-voice"
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
               }
             },
             {
@@ -1265,7 +1305,7 @@
         }
       },
       "role": "validation",
-      "sha256": "4a00c19c14475e6622d42ff66a20ba625dc553447205e37784aadb60dbba5375"
+      "sha256": "587a7fb2621cb6f5172bb0cc7c980ccb2544e159c33eba7b9dcb762197463582"
     },
     ".github/workflows/finance.yml": {
       "defaults": {},
@@ -1308,7 +1348,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "finance/finance/3",
@@ -1335,7 +1383,7 @@
         }
       },
       "role": "validation",
-      "sha256": "873114b2e7463369b11c2e4d831adb2be9a77274d0d572423fe0e9dd3fd83851"
+      "sha256": "9f3cbfffdc7a730d47702a3b61866b2631189089dc66d7ce7f791b3ae33cc779"
     },
     ".github/workflows/heartbeat.yml": {
       "defaults": {},
@@ -1379,7 +1427,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "heartbeat/heartbeat/3",
@@ -1406,7 +1462,7 @@
         }
       },
       "role": "validation",
-      "sha256": "17e01812b4077e547cf7782f895f75fa52420bacd9c2e98e787e6c3952ae55d1"
+      "sha256": "4698b08ab5c90792c8d3e22705e63bef500218e207be07e17f8a585b5be6f3ac"
     },
     ".github/workflows/imessage.yml": {
       "defaults": {},
@@ -1482,9 +1538,14 @@
               }
             },
             {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
               "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
               "with": {
-                "key": "linkedin"
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
               }
             },
             {
@@ -1506,7 +1567,7 @@
         }
       },
       "role": "validation",
-      "sha256": "a1329ccbc925a04b523a9f21c6a5870dc247996411415667c592e1e4edd0e57f"
+      "sha256": "f090f470a2c3c1c8c190def5bc421d57c2a60d801e17345485797f24094e0247"
     },
     ".github/workflows/model-router.yml": {
       "defaults": {},
@@ -1589,6 +1650,10 @@
           "timeout-minutes": 10
         },
         "adapters": {
+          "env": {
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
           "runs-on": "ubuntu-latest",
           "steps": [
             {
@@ -1601,7 +1666,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "model-router/adapters/3"
@@ -1748,7 +1821,7 @@
         }
       },
       "role": "validation",
-      "sha256": "cf43f77b7a15feba10388e98ec4c8c87b75806b8ebb9429e25f5370213dee45d"
+      "sha256": "4ff990251a435fdc004d2d32f20f7099b68aad570aee84b1771ea10ba558c312"
     },
     ".github/workflows/no-gmail-authors.yml": {
       "defaults": {},
@@ -1861,7 +1934,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "pdf-generation/pdf/4"
@@ -1911,7 +1992,7 @@
         }
       },
       "role": "validation",
-      "sha256": "848744b4cfaf1375dc825588521157a5f8fa622ba65ff3265f3cab22770e4908"
+      "sha256": "84772249e4e61e21e89b50a30d82ab2017a4db58b28a1b6ad2d3863b29801f5f"
     },
     ".github/workflows/phone.yml": {
       "defaults": {},
@@ -1961,7 +2042,9 @@
         "offline": {
           "env": {
             "AUGMENTAGENT_GH_DISABLE": "1",
-            "AUGMENTAGENT_PHONE_ENABLED": "0"
+            "AUGMENTAGENT_PHONE_ENABLED": "0",
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
           },
           "runs-on": "${{ matrix.os }}",
           "steps": [
@@ -1982,9 +2065,14 @@
               }
             },
             {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
               "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
               "with": {
-                "key": "phone-offline"
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
               }
             },
             {
@@ -2055,7 +2143,7 @@
         }
       },
       "role": "validation",
-      "sha256": "5a36ca22d6a2a95c674bd360b739da04782e1fa0be137629a1ba623871993497"
+      "sha256": "a3bdfd3a5fa1878a2420f55bf05bdd256f6930b064af537a10b4126c20b172b2"
     },
     ".github/workflows/platform.yml": {
       "defaults": {},
@@ -2070,6 +2158,10 @@
       },
       "jobs": {
         "platform": {
+          "env": {
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
           "name": "platform (${{ matrix.os }})",
           "runs-on": "${{ matrix.os }}",
           "steps": [
@@ -2083,9 +2175,14 @@
               }
             },
             {
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
               "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
               "with": {
-                "key": "platform"
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
               }
             },
             {
@@ -2250,7 +2347,7 @@
         }
       },
       "role": "validation",
-      "sha256": "e1ab4ad1ef740ab8f8b99c5b0ca4d5113a85dac3bdfbfc28db1e09e5a403a99b"
+      "sha256": "8a1fa57f48ddf757be343f63481ac7000625095277c122dfe0bc4a42bb97bdcc"
     },
     ".github/workflows/privacy.yml": {
       "defaults": {},
@@ -2321,6 +2418,11 @@
       "role": "validation",
       "sha256": "d74e245ac95731bbea4c018a4130a839605102c175c3ac7e4163e21807d60b04"
     },
+    ".github/workflows/rust-cache.yml": {
+      "reason": "main-branch Rust dependency cache warming, not PR validation",
+      "role": "excluded",
+      "sha256": "43d182508d451d31d0c0593c1b180a0fd1e5473c60d0a05cf6ca145aa3e8b0ef"
+    },
     ".github/workflows/whatsapp-history.yml": {
       "defaults": {},
       "env": {},
@@ -2367,7 +2469,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "whatsapp-history/history/4"
@@ -2386,7 +2496,7 @@
         }
       },
       "role": "validation",
-      "sha256": "8cba5248c9d40902d8e31110f5a8ccaa5dc1a2fcc3719c3e0fa2a9447dd169e6"
+      "sha256": "9d876c13a4ce45d8b4400f9441b940d9c82c490493bdc7623d5e706e2514eccc"
     },
     ".github/workflows/whatsapp-sidecar.yml": {
       "defaults": {},
@@ -2412,6 +2522,7 @@
           "env": {
             "CARGO_BUILD_JOBS": 2,
             "CARGO_INCREMENTAL": 0,
+            "CARGO_PROFILE_DEV_DEBUG": 0,
             "CARGO_PROFILE_TEST_DEBUG": 0,
             "GOMAXPROCS": 2
           },
@@ -2436,7 +2547,15 @@
               }
             },
             {
-              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+              "env": {
+                "CARGO_BUILD_JOBS": ""
+              },
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "env-vars": "ImageOS",
+                "save-if": false,
+                "shared-key": "ci"
+              }
             },
             {
               "command_id": "whatsapp-sidecar/wire-contract/4",
@@ -2470,7 +2589,7 @@
         }
       },
       "role": "validation",
-      "sha256": "41937e7d386a902fb32ff5bd3e29cbff09e2a1bd7b14056882cbb2dd310d5159"
+      "sha256": "e9164c618bfd381983d6be38f60e289fc065812a40a2ea1b8a93e2df418fd5f3"
     }
   }
 }
