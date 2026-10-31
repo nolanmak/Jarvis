@@ -1377,6 +1377,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sealed_generation_refuses_writer_registration_without_leaving_a_ticket() {
+        let (_dir,logger,_,_)=protected_fixture();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
+        logger.anchored.as_ref().unwrap().seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();
+        assert!(logger.begin_write().is_err(),"sealed audit accepted a new writer ticket");
+        assert_eq!(logger.pending_writers.load(std::sync::atomic::Ordering::Acquire),0);
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
     async fn protected_drain_waits_for_registered_writer() {
         let (_dir, logger, _, _) = protected_fixture();
         let ticket = logger.begin_write().unwrap();
