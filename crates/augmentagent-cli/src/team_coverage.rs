@@ -32,9 +32,13 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// Unset or unrecognised → `Shadow`: a typo must never switch it on.
     pub fn parse(raw: Option<&str>) -> Self {
-        let _ = raw;
-        todo!()
+        match raw.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
+            Some("on") => Mode::On,
+            Some("off") => Mode::Off,
+            _ => Mode::Shadow,
+        }
     }
 
     pub fn as_str(self) -> &'static str {
@@ -56,13 +60,35 @@ pub struct Config {
 impl Config {
     /// From the environment plus the owner's connected mailboxes.
     pub fn from_env(store: &Store) -> Self {
-        let _ = store;
-        todo!()
+        let mut owner_ids: Vec<String> = Vec::new();
+        match store.get_active_gmail_accounts() {
+            Ok(accounts) => {
+                for a in accounts {
+                    owner_ids.push(a.entity_id);
+                    if !a.email.is_empty() {
+                        owner_ids.push(a.email);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("team coverage: loading owner accounts failed: {e:#}"),
+        }
+        Config {
+            mode: Mode::parse(std::env::var(MODE_ENV).ok().as_deref()),
+            roster: TeamRoster::from_env(),
+            owner: OwnerIdentities::new(owner_ids),
+            aliases: std::env::var(ALIASES_ENV)
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(String::from)
+                .collect(),
+        }
     }
 
     /// Whether the rule may run at all.
     pub fn active(&self) -> bool {
-        todo!()
+        self.mode != Mode::Off && !self.roster.is_empty() && !self.aliases.is_empty()
     }
 }
 
@@ -77,14 +103,33 @@ pub struct Coverage {
 /// Body with quoted reply history removed (Gmail `On … wrote:`, `>` lines,
 /// Outlook `-----Original Message-----` / `From:`+`Sent:` headers).
 pub fn new_text(body: &str) -> String {
-    let _ = body;
-    todo!()
+    let text = augmentagent_channel_email::sigextract::strip_quoted_reply(body);
+    let lines: Vec<&str> = text.lines().collect();
+    let cut = lines.iter().enumerate().position(|(i, l)| {
+        let l = l.trim();
+        l.starts_with("-----Original Message-----")
+            || l.starts_with("________________________________")
+            || (l.starts_with("From:")
+                && lines.get(i + 1).is_some_and(|n| n.trim_start().starts_with("Sent:")))
+    });
+    lines[..cut.unwrap_or(lines.len())].join("\n").trim().to_string()
 }
 
 /// Whole-word, case-insensitive alias match (multi-word aliases allowed).
 pub fn mentions_alias(text: &str, aliases: &[String]) -> bool {
-    let _ = (text, aliases);
-    todo!()
+    let words = |s: &str| -> String {
+        let normalized: String = s
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect();
+        format!(" {} ", normalized.split_whitespace().collect::<Vec<_>>().join(" "))
+    };
+    let haystack = words(text);
+    aliases.iter().any(|a| {
+        let needle = words(a);
+        needle.trim() != "" && haystack.contains(&needle)
+    })
 }
 
 /// Conditions 1–6 for one card. `after_ms` is the card's inbound bound
@@ -95,8 +140,43 @@ pub fn find_coverage(
     after_ms: i64,
     cfg: &Config,
 ) -> anyhow::Result<Option<Coverage>> {
-    let _ = (store, row, after_ms, cfg);
-    todo!()
+    use augmentagent_channel_email::outbound::parse_rfc2822_or_ms;
+    use augmentagent_messages::team::TeamClass;
+
+    let (Some(thread), Some(account)) = (row.thread_id.as_deref(), row.account_entity_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(asker) = augmentagent_store::recipients::parse_addresses(&row.from_email)
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let mut best: Option<Coverage> = None;
+    for m in store.thread_messages_in_mailbox(thread, account)? {
+        let TeamClass::Teammate { label } = cfg.roster.classify(&m.from, &cfg.owner) else {
+            continue;
+        };
+        let at = parse_rfc2822_or_ms(&m.received_at);
+        if at <= 0 || at <= after_ms {
+            continue;
+        }
+        let Some(r) = &m.recipients else {
+            continue;
+        };
+        if !r.to.iter().chain(&r.cc).any(|a| *a == asker) {
+            continue;
+        }
+        if mentions_alias(&new_text(&m.body), &cfg.aliases) {
+            continue;
+        }
+        // Earliest covering message: the moment the asker was answered.
+        if best.as_ref().is_none_or(|b| at < b.covered_at_ms) {
+            best = Some(Coverage { teammate: label, covering_message_id: m.message_id, covered_at_ms: at });
+        }
+    }
+    Ok(best)
 }
 
 #[cfg(test)]

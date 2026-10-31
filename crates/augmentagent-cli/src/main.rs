@@ -8835,6 +8835,17 @@ async fn run_stale_approval_reconcile(
     for bad in roster.invalid_entries() {
         warn!(entry = %bad, "ignored invalid AUGMENTAGENT_OWNER_TEAM entry");
     }
+    // #1700 — without aliases the hand-back check can't run, so the rule
+    // stays off rather than retire "<owner>, can you take this?".
+    let team = team_coverage::Config::from_env(&store);
+    if !team.roster.is_empty() && team.aliases.is_empty() && team.mode != team_coverage::Mode::Off {
+        warn!(
+            "team coverage inactive: {} is set but {} is empty",
+            augmentagent_messages::team::TeamRoster::ENV,
+            team_coverage::ALIASES_ENV
+        );
+    }
+    info!(mode = team.mode.as_str(), active = team.active(), "team coverage configured");
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -8901,7 +8912,8 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
 /// [`reconcile_stale_approvals_tick`] with an explicit teammate-coverage
 /// config (#1700), so tests don't depend on the process environment.
 fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Config) -> Result<usize> {
-    let _ = team;
+    let team_active = team.active();
+    let mut covered: Vec<(String, String, team_coverage::Coverage)> = Vec::new();
     let pending = store.pending_actions_for_reconcile()?;
     let scheduled = store.scheduled_actions_for_reconcile()?;
     if pending.is_empty() && scheduled.is_empty() {
@@ -8995,6 +9007,20 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
                 );
                 answered_ids.push(row.id.clone());
             }
+            // Rule 4 (#1700) — a rostered teammate already answered the
+            // asker on the owner's behalf. Email cards only; group chats are
+            // #1701. Shadow mode records the decision and retires nothing.
+            Ok(false) if team_active && email_platform => {
+                match team_coverage::find_coverage(store, row, after_ms, team) {
+                    Ok(Some(c)) => covered.push((row.id.clone(), tid.to_string(), c)),
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        action_id = %row.id,
+                        thread = %tid,
+                        "team coverage: find_coverage failed: {e:#}"
+                    ),
+                }
+            }
             Ok(false) => {}
             Err(e) => warn!(
                 action_id = %row.id,
@@ -9074,6 +9100,35 @@ fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Conf
         &answered_ids,
         "superseded: you already replied on this thread",
     )?;
+    let now = chrono::Utc::now().timestamp_millis();
+    for (action_id, thread_id, c) in covered {
+        let decision = augmentagent_store::team_coverage::TeamCoverageDecision {
+            action_id: action_id.clone(),
+            mode: team.mode.as_str().to_string(),
+            teammate: c.teammate.clone(),
+            covering_message_id: c.covering_message_id.clone(),
+            thread_id: thread_id.clone(),
+            covered_at_ms: c.covered_at_ms,
+            decided_at_ms: now,
+        };
+        if store.record_team_coverage_decision(&decision)? {
+            info!(
+                action_id = %action_id,
+                thread = %thread_id,
+                teammate = %c.teammate,
+                covering_message = %c.covering_message_id,
+                mode = team.mode.as_str(),
+                "team coverage: {}",
+                if team.mode == team_coverage::Mode::On { "retiring card" } else { "would retire" }
+            );
+        }
+        if team.mode == team_coverage::Mode::On {
+            retired += store.mark_pending_heuristic_superseded_by_ids(
+                &[action_id],
+                &format!("superseded: covered by teammate {}", c.teammate),
+            )?;
+        }
+    }
     Ok(retired)
 }
 
@@ -23904,3 +23959,4 @@ pub(crate) mod test_support {
         }
     }
 }
+

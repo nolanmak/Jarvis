@@ -67,3 +67,36 @@ fn coverage_decisions_record_once_and_list_since() {
     assert_eq!(store.team_coverage_decisions(0).unwrap(), vec![d.clone()]);
     assert!(store.team_coverage_decisions(5_001).unwrap().is_empty());
 }
+
+/// One mailbox can carry several entity ids — a legacy connector id and the
+/// direct-Google id that replaced it. Messages stored under either id are the
+/// same mailbox, so a card raised under the old id still sees teammate
+/// replies stored under the new one.
+#[test]
+fn mailbox_spans_every_entity_id_of_the_same_address() {
+    let (_d, store) = temp_store();
+    store
+        .with_conn(|c| {
+            c.execute_batch(
+                "INSERT INTO gmail_accounts (id, connectionId, email, entityId, active, createdAt) \
+                 VALUES ('old', 'conn-old', 'owner@example.com', 'legacy-1', 0, 0);",
+            )
+        })
+        .unwrap();
+    store.upsert_google_gmail_account("owner@example.com").unwrap();
+    store.upsert_email(&email("m-old", "T1", "legacy-1", "asker@example.org", "owner@example.com")).unwrap();
+    store
+        .upsert_email(&email("m-new", "T1", "google:owner@example.com", "ana@example.net", "asker@example.org"))
+        .unwrap();
+    // A different mailbox with a colliding thread id stays out.
+    store.upsert_email(&email("m-x", "T1", "google:other@example.com", "ana@example.net", "asker@example.org")).unwrap();
+
+    let mut ids: Vec<String> = store
+        .thread_messages_in_mailbox("T1", "legacy-1")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.message_id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["m-new", "m-old"]);
+}
