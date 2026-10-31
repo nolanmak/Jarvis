@@ -29,13 +29,14 @@ impl Report {
     }
 }
 
-pub(crate) fn inspect() -> Report {
-    let chain=build_reasoner();
+pub(crate) fn inspect() -> Report { inspect_builder(build_reasoner().as_ref()) }
+
+pub(crate) fn inspect_builder(chain: &FallbackReasoner) -> Report {
     let providers=chain.lane_provider_availability(CapabilityClass::FullAgentic);
     let available:Vec<_>=providers.iter().filter(|(_,until)|until.is_none()).map(|(kind,_)|*kind).collect();
     let mut builder_reasons=Vec::new();
     if providers.is_empty() {
-        match augmentagent_channel_core::model_selection::current() {
+        match augmentagent_channel_core::model_selection::current().map(|selected|chain.builder_provider_pin().or(selected)) {
             Err(_)=>builder_reasons.push("model-selection-invalid".into()),
             Ok(selected)=>{
                 if augmentagent_channel_core::model_router::current().is_err() {

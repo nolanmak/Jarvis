@@ -75,6 +75,8 @@ mod workflow;
 mod recovery;
 #[path = "self_improve_workspace.rs"]
 mod workspace;
+#[path = "self_improve_targeted.rs"]
+pub(crate) mod targeted;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
 #[path = "self_improve_alignment.rs"]
@@ -7380,6 +7382,7 @@ enum Lane {
 /// `AUGMENTAGENT_AUTOPR_LANE` = `resume` | `build`; anything else (and the
 /// daemon default) is [`Lane::Combined`].
 fn lane_from_env() -> Lane {
+    if let Ok(lane)=targeted::COMMAND_LANE.try_with(|lane|*lane) { return lane; }
     match std::env::var("AUGMENTAGENT_AUTOPR_LANE")
         .ok()
         .as_deref()
@@ -7521,15 +7524,27 @@ async fn workflow_builder(repo: &Path, target: crate::autoship_workflow::submiss
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
+    run_selected(repo_root,dry_run,None,targeted::ExecutionMode::Background).await
+}
+
+async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted::Resolved>, mode: targeted::ExecutionMode) -> Result<RunReport> {
+    anyhow::ensure!(mode != targeted::ExecutionMode::Local || selected.is_some(), "local execution requires an authorized target");
     if !dry_run {
         // Read-only, before lock/state creation, issue selection or model spend.
         // Hashing runs off the async executor; launches still revalidate their
         // own declarations and retain existing runtime generations.
         tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
             .await.context("native runtime preflight task failed")??;
-        provider_readiness::inspect().preflight()?;
+        if let Some(selected)=&selected {
+            let target=match selected { targeted::Resolved::Issue(issue)=>crate::autoship_workflow::submission::Target::Issue(issue.number),
+                targeted::Resolved::Pr(pr)=>crate::autoship_workflow::submission::Target::Pr(pr.pr) };
+            let builder=workflow_builder(repo_root,target).await?;
+            provider_readiness::inspect_builder(builder.as_ref()).preflight()?;
+        } else { provider_readiness::inspect().preflight()?; }
         augmentagent_channel_core::run_resources::readiness().await.preflight()?;
-        crate::autoship_deployment::inspect(repo_root).await.preflight()?;
+        if mode == targeted::ExecutionMode::Background {
+            crate::autoship_deployment::inspect(repo_root).await.preflight()?;
+        }
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
@@ -7552,12 +7567,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     };
     let repo_root = controller.as_ref().map_or(repo_root, |controller| controller.root.as_path());
 
+    let selected_issue=match selected {
+        Some(targeted::Resolved::Pr(pr))=>return targeted::execute_pr(repo_root,pr,dry_run).await,
+        Some(targeted::Resolved::Issue(issue))=>Some(issue),
+        None=>None,
+    };
+
     // #931/#932 — a red `main` fails every gate identically, so it is the
     // loop's first issue: file it (once per SHA), run the ordinary pipeline
     // on it, or resume its fix PR — and when none of that is possible, end
     // the tick unbilled rather than buy a doomed build.
     let lane = lane_from_env();
-    let red_main_issue: Option<Issue> = match main_is_red(repo_root).await {
+    let red_main_issue: Option<Issue> = if let Some(issue)=selected_issue {Some(issue)} else { match main_is_red(repo_root).await {
         None => None,
         Some(red) => {
             let short = red.sha.get(..7).unwrap_or(&red.sha).to_string();
@@ -7607,7 +7628,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 }
             }
         }
-    };
+    }};
 
     // #866 — sitting draft PRs outrank new work: they are mostly-finished
     // diffs that only lack an approving review, and until now the dedup guard
@@ -13934,7 +13955,7 @@ CODEX-REVIEW: lgtm").0);
     #[test]
     fn the_reserved_build_slot_yields_to_a_waiting_draft_before_idling() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
         let resume_first = body
@@ -14610,7 +14631,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn preexisting_only_gate_failure_is_unbilled_and_unrecorded() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
         // The repair loop (#873, fresh path) checks the baseline BEFORE
@@ -14725,7 +14746,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn red_main_check_precedes_resume_and_pick() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..];
         let red = body.find("main_is_red(").expect("main_is_red in run_once");
         let resume = body.find("find_resumable_draft(").expect("resume");
@@ -14863,7 +14884,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn both_merge_paths_consult_the_same_policy() {
         let src = include_str!("self_improve.rs");
-        let fresh_start = src.find("pub async fn run_once(").expect("run_once");
+        let fresh_start = src.find("async fn run_selected(").expect("run_once");
         let fresh = &src[fresh_start..fresh_start + src[fresh_start..].find("\n}\n").expect("end")];
         assert!(
             fresh.contains("may_automerge("),
@@ -15063,7 +15084,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             "the writer must use the shared marker"
         );
         // And it must RECORD the PR it opens, or the binding never exists.
-        let run_start = src.find("pub async fn run_once(").expect("run_once");
+        let run_start = src.find("async fn run_selected(").expect("run_once");
         let run_body = &src[run_start..run_start + src[run_start..].find("\n}\n").expect("end")];
         assert!(
             run_body.contains("opened_prs::record("),
@@ -15540,7 +15561,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let r = src.find("fn recorded_verdict(&self)").expect("the recorder");
         let recorder = &src[r..r + src[r..].find("\n    }\n").expect("end")];
         assert!(recorder.contains("self.provider?"), "{recorder}");
-        let run = src.find("pub async fn run_once(").expect("run_once");
+        let run = src.find("async fn run_selected(").expect("run_once");
         let run_body = &src[run..run + src[run..].find("\n}\n").expect("end")];
         assert!(run_body.contains("independent.recorded_verdict()"), "the fresh lane records its verdict");
     }
@@ -15914,7 +15935,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn an_unservable_lane_is_a_fault_while_a_latched_one_is_a_pause() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
 
         let none = body
@@ -15944,7 +15965,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn availability_is_checked_before_the_scoping_call_is_spent() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
         let check = body
             .find("lane_availability(")
@@ -16406,7 +16427,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn red_main_issue_bypasses_the_fixability_verdict() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..];
         let at = body.find("if !s.fixable").expect("fixability branch");
         let line = &body[at..at + 80];
@@ -16421,7 +16442,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     // context instead of dropping it.
     #[test]
     fn not_fixable_specification_cannot_override_grounded_readiness() {
-        let source=include_str!("self_improve.rs");let start=source.find("pub async fn run_once(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();let body=&source[start..end];let at=body.find("if !s.fixable").unwrap();let end=at+body[at..].find("// #843").unwrap();
+        let source=include_str!("self_improve.rs");let start=source.find("async fn run_selected(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();let body=&source[start..end];let at=body.find("if !s.fixable").unwrap();let end=at+body[at..].find("// #843").unwrap();
         assert!(body[at..end].contains("overruled_scope_note"));
         assert!(!body[at..end].contains("label_gave_up"));
     }
@@ -16449,7 +16470,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn red_main_issue_gate_failure_is_a_real_attempt() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
         let at = body.find("if verdict.introduced.is_empty()").expect("not-charged branch");
@@ -16752,7 +16773,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn run_once_gave_up_does_not_close_anything() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         let body = &src[start..end];
         assert!(!body.contains("close_gave_up_pr("));
@@ -16929,7 +16950,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // the head lookup failed, the GitHub call failed, or the PR number
         // could not be parsed at all.
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
         // The no-number path cannot READ CodeRabbit (the endpoint needs a
         // number) but must still RECORD that, via the branch selector `gh`
@@ -17250,7 +17271,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn run_once_holds_overtaken_issues_before_scoping_and_slices_only_unguarded_parents() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         let overtaken = body.find("s.relevance == Relevance::Overtaken").expect("overtaken hold");
@@ -17620,7 +17641,7 @@ else:
     #[test]
     fn historical_not_fixable_markers_remain_readable_without_authorizing_new_labels() {
         assert_eq!(GIVE_UP_SCOPER_NOT_FIXABLE,"scoper:not-fixable");
-        let source=include_str!("self_improve.rs");let start=source.find("pub async fn run_once(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();
+        let source=include_str!("self_improve.rs");let start=source.find("async fn run_selected(").unwrap();let end=start+source[start..].find("\n}\n").unwrap();
         assert!(!source[start..end].contains("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}"));
     }
 
@@ -18044,7 +18065,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
     #[test]
     fn run_once_failure_sites_carry_typed_records() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         for kind in [
@@ -18175,7 +18196,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
         let gh_view = body.find(r#""view","#).expect("gh issue view");
         assert!(check < gh_view, "a gh outage must not turn a harness record into attempt 1");
         // run_once: the gate and publish failure arms return billed reports.
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         let gate = body.find("if let Err(gate_err) = verification_gate(&worktree, &workflow_guard.audit_logger()).await {").expect("gate arm");
@@ -18203,7 +18224,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
     #[test]
     fn revision_failures_record_the_revised_diff() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         let revise = body.find("revision hit the blast-radius guard").expect("revision loop");
@@ -18341,7 +18362,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
     #[test]
     fn commit_refusal_gets_one_personal_data_repair_round() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         let first = body.find("run(\"git\", &commit_args, &worktree)").expect("first commit");
@@ -18937,7 +18958,7 @@ with (pathlib.Path(os.environ['AUTOSHIP_COMPLETE_INVENTORY_CHILD'])/'calls').ope
     #[test]
     fn a_published_attempt_supersedes_the_branch_review_history() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
         let force = body.find("workflow_guard.push(&branch)").expect("guarded compare-and-swap push");
         let failed = body.find("\"git push failed\"").expect("the push-failure exit");
@@ -19314,7 +19335,7 @@ mod iterate_not_delete_tests {
 
     fn run_once_src() -> &'static str {
         let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
+        let start = src.find("async fn run_selected(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end of run_once");
         &src[start..end]
     }

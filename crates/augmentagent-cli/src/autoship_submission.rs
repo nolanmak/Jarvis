@@ -43,7 +43,7 @@ pub struct Admission {
 }
 
 impl Request {
-    fn normalized(&self) -> Result<Self> {
+    pub(crate) fn normalized(&self) -> Result<Self> {
         ensure!(
             self.repository.len() <= 256,
             "repository identity exceeds bound"
@@ -97,6 +97,41 @@ fn policy(conn: &Connection, workflow: &str) -> Result<Option<(Milestone, Option
 }
 
 impl WorkflowStore {
+    pub fn command_request(&self, workflow: &str) -> Result<Option<Request>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_job')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let raw: Option<(String,String,String,String)> = self.conn.query_row(
+            "SELECT repository,target,until_milestone,provider FROM command_job WHERE workflow=?1", [workflow],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
+        let Some((repository, target, until, provider)) = raw else {
+            return Ok(None);
+        };
+        let request = Request {
+            repository,
+            target: serde_json::from_str(&target)?,
+            until: serde_json::from_str(&until)?,
+            provider: serde_json::from_str(&provider)?,
+        }
+        .normalized()?;
+        let identity = request.identity()?;
+        let bound = if let Target::Pr(n) = request.target {
+            self.resolve_pr(&request.repository, n)?.unwrap_or(identity)
+        } else {
+            identity
+        };
+        ensure!(
+            bound == workflow,
+            "queued target identity differs from workflow"
+        );
+        Ok(Some(request))
+    }
+
     /// Read-only and compatible with stores created before command admission.
     pub fn command_builder(&self, workflow: &str) -> Result<Option<Provider>> {
         let exists: bool = self.conn.query_row(
@@ -646,5 +681,26 @@ mod tests {
         assert_eq!(store.command_builder("owner/repo#1").unwrap(), None);
         store.require_command_builder("owner/repo#1", None).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    #[test]
+    fn queued_target_lookup_rejects_rebound_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("state.db")).unwrap();
+        let requested = request(Milestone::Pr);
+        let admitted = store
+            .submit_authorized("target", "owner", &requested, 1)
+            .unwrap();
+        assert_eq!(
+            store.command_request(&admitted.workflow).unwrap(),
+            Some(requested.normalized().unwrap())
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE command_job SET target=?1",
+                [serde_json::to_string(&Target::Pr(43)).unwrap()],
+            )
+            .unwrap();
+        assert!(store.command_request(&admitted.workflow).is_err());
     }
 }
