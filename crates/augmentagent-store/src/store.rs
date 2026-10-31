@@ -4515,6 +4515,41 @@ impl Store {
         Ok(ids)
     }
 
+    /// Atomically replace pending composes and persist their recipient/body.
+    /// Reserve initial card posting for one minute so the daemon cannot race
+    /// the one-shot CLI. A failed post releases it; a crash expires the lease.
+    pub fn create_imessage_compose(&self, email: &Email, body: &str) -> StoreResult<(String, Vec<String>)> {
+        if email.platform != "imessage" || email.kind != "compose" || body.trim().is_empty() {
+            return Err(StoreError::InvalidInput("invalid iMessage compose".into()));
+        }
+        let thread = email.thread_id.as_deref().filter(|s| s.starts_with("imessage:"))
+            .ok_or_else(|| StoreError::InvalidInput("invalid iMessage compose thread".into()))?;
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let context = serde_json::to_string(&(email.to.clone(),email.cc.clone(),email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let superseded = {
+            let mut q = tx.prepare("SELECT a.id FROM actions a JOIN emails e ON e.messageId=a.messageId
+                WHERE a.threadId=?1 AND e.platform='imessage' AND e.kind='compose'
+                AND a.status='pending' AND a.scheduledAtMs IS NULL ORDER BY a.createdAt,a.id")?;
+            let rows = q.query_map([thread], |r| r.get::<_,String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,accountEntityId,firstSeenAt,platform,kind,retryGuardContext)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'imessage','compose',?9)",
+            params![email.message_id,thread,email.from,email.subject,redact::mask(&email.body).as_ref(),email.date,email.account_entity_id,now,context])?;
+        for old in &superseded {
+            tx.execute("UPDATE actions SET status='superseded',errorMessage='superseded by follow-up compose',updatedAt=?2 WHERE id=?1 AND status='pending'",params![old,now])?;
+        }
+        tx.execute("INSERT INTO actions(id,messageId,threadId,fromEmail,subject,originalBody,draftBody,status,createdAt,updatedAt,nudgeCount,nextNudgeAtMs)
+            VALUES(?1,?2,?3,?4,?5,NULL,?6,'pending',?7,?7,1,?7+60000)",
+            params![id,email.message_id,thread,email.from,email.subject,redact::mask(body).as_ref(),now])?;
+        tx.commit()?;
+        Ok((id,superseded))
+    }
+
     /// #1635 — ids of pending compose cards on `thread_id`: rows whose
     /// `emails.kind` is `kind`, still `pending` and not carrying a send-at
     /// proposal. A follow-up compose to the same person replaces these.
@@ -4670,6 +4705,7 @@ impl Store {
               WHERE a.status = 'pending' \
                 AND a.scheduledAtMs IS NULL \
                 AND COALESCE(e.kind, '') NOT IN ('identity_merge', 'sign_pdf') \
+                AND NOT (COALESCE(e.platform,'')='imessage' AND COALESCE(e.kind,'')='compose') \
               ORDER BY a.createdAt ASC",
         )?;
         let rows = stmt.query_map([], |r| {

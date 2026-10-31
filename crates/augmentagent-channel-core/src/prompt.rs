@@ -704,7 +704,7 @@ pub fn code_mode_repair_user_message(
 /// slack, telegram, …) share this prompt and have no subject at all, so they
 /// keep the pre-#652 bytes.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
-    if email.kind == "compose" {
+    if email.kind == "compose" && matches!(email.platform.as_str(), "imessage" | "slack") {
         return redraft_composed_message(email, previous_draft, feedback);
     }
     let subject_clause = if email.platform == "gmail" {
@@ -1068,6 +1068,9 @@ mod tests {
             got.contains("`Subject: <new subject>`"),
             "gmail redraft lost the subject channel:\n{got}"
         );
+        let mut composed_email = email();
+        composed_email.kind = "compose".into();
+        assert!(redraft_message(&composed_email, "draft", "change subject").contains("Subject: <new subject>"));
         let mut chat = email();
         chat.platform = "slack".into();
         let got = redraft_message(&chat, "the previous draft", "call it Invoice for July");

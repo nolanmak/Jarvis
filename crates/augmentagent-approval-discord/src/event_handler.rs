@@ -2252,6 +2252,21 @@ fn classify_custom_id(raw: &str) -> Option<(String, SweptKind)> {
 /// card was found and edited, `Ok(false)` when none matched (already resolved,
 /// scrolled past the last 100, or never posted). Best-effort by convention at
 /// the call site: the draft is repointed server-side regardless of the redraw.
+/// Attach the manual-text warning to the existing compose card, without
+/// changing its draft, controls, or approval state. The reply survives edits.
+pub async fn note_compose_card(http: &Http, channel: ChannelId, action_id: &str) -> anyhow::Result<bool> {
+    for msg in channel.messages(http, GetMessages::new().limit(100)).await? {
+        if action_id_from_message(&msg).is_some_and(|(id, kind)| id == action_id && kind == SweptKind::Card) {
+            channel.send_message(http, serenity::all::CreateMessage::new()
+                .content("You texted this person since composing; Approve still sends the composed text.")
+                .reference_message((channel, msg.id))
+                .allowed_mentions(serenity::all::CreateAllowedMentions::new().all_users(false).all_roles(false).everyone(false).replied_user(false))).await?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub async fn edit_card_for_action(
     http: &Http,
     channel_id: ChannelId,

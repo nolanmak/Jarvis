@@ -2001,7 +2001,8 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 ///   including `send` and `send-now`; `finance` status/transactions/summary;
 ///   `calendar` list-events/create-event/rsvp; `loop`; `loops`; `meetup events`;
 ///   `socialapi`/`linkedin` dm and comment; `linkedin recent-dms`;
-///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`) and
+///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`, `imessage compose`,
+///   and read-only `imessage allowlist`) and
 ///   `aa-gh issue` create/list/view/comment.
 ///
 /// Several of those act outside the wiki: they can send email, post GitHub
@@ -2246,6 +2247,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     if let Ok(cid) = std::env::var("DISCORD_CHANNEL_ID") {
         if !cid.is_empty() {
             env.push(("DISCORD_CHANNEL_ID".into(), cid));
+        }
+    }
+    // The compose subprocess must use the daemon's existing bundle and gate.
+    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() { env.push((key.into(), value)); }
         }
     }
     // #888/#1061 — `imessage fetch-attachment` and `apple-notes fetch-attachment` read their
@@ -3755,6 +3762,20 @@ mod tests {
         assert!(opts
             .system_prompt
             .contains("ATTACH: deliverables/packet.pdf"));
+    }
+
+    #[test]
+    fn ask_opts_forwards_imessage_compose_environment_without_send_tools() {
+        let wiki=tempfile::tempdir().unwrap();let repo=tempfile::tempdir().unwrap();
+        let _guard=EnvGuard::set("AUGMENTAGENT_IMESSAGE_REPO_DIR", "/synthetic/imessage-bundle");
+        let prior=std::env::var_os("AUGMENTAGENT_IMESSAGE_SEND_ENABLED");
+        std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED","1");
+        let opts=ask_opts(wiki.path().into(),repo.path().into());
+        match prior { Some(v)=>std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED",v),None=>std::env::remove_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED") }
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),"/synthetic/imessage-bundle".into())));
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_SEND_ENABLED".into(),"1".into())));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage compose *)".into()));
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage approve") || t.contains("imessage *")));
     }
 
     /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees

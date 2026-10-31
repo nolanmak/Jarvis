@@ -372,14 +372,14 @@ fn approval_embed_and_rows(
     // the owner started) has no inbound. Its address field is the recipient,
     // so label it To, and show the draft alone instead of an empty quoted
     // message above the separator.
-    let composed = email.kind == "compose";
-    let description = if composed && email.body.trim().is_empty() {
+    let composed = email.kind == "compose" && matches!(email.platform.as_str(), "imessage" | "slack");
+    let description = if composed {
         truncate_within(&human_draft, MAX_EMBED_DESCRIPTION)
     } else {
         format_body(&email.body, &human_draft)
     };
     let mut embed = CreateEmbed::new()
-        .title(truncate(&email.subject, 256))
+        .title(if composed && email.platform == "imessage" { "New message · iMessage".to_string() } else { truncate(&email.subject, 256) })
         .description(description)
         .field(if composed { "To" } else { "From" }, truncate(&email.from, 256), true)
         .field("MessageId", truncate(&email.message_id, 256), true);
@@ -1797,11 +1797,12 @@ mod tests {
         e.platform = "imessage".into();
         e.from = "Jane Doe <+15555550100>".into(); // pii-ok synthetic
         e.subject = "New iMessage to Jane Doe".into();
-        e.body = String::new();
+        e.body = "owner original instruction".into();
         let v: serde_json::Value =
             serde_json::from_str(&json(&approval_message("act-c1", &e, "running late, 10 min", 0)))
                 .unwrap();
         let embed = &v["embeds"][0];
+        assert_eq!(embed["title"], "New message · iMessage");
         let names: Vec<&str> = embed["fields"]
             .as_array()
             .unwrap()

@@ -233,6 +233,10 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_channel_sink", "crates/augmentagent-cli/src/notify.rs", "send_message(&", 1, TRANSPORT, "Discord leg: bot channel / request channel"),
     p("discord_channel_sink", "crates/augmentagent-cli/src/notify.rs", "CreateMessage::new(", 1, TRANSPORT, "Discord leg: bot channel / request channel"),
     p("discord_webhook_sink", "crates/augmentagent-cli/src/notify.rs", "DISCORD_WEBHOOK_URL", 3, TRANSPORT, "Discord leg: webhook"),
+    act(p("imessage_compose", "crates/augmentagent-cli/src/imessage_compose.rs", "send_message(&", 1, BROKER, "owner-started iMessage approval card")),
+    p("imessage_compose_activity", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 1, BROKER, "manual-text warning attached to a compose card"),
+    p("imessage_compose_activity_fallback", "crates/augmentagent-approval-discord/src/broker.rs", ".post_flag_notice(", 1, BROKER, "manual-text warning when the card is outside recent history"),
+    p("imessage_compose_activity_default", "crates/augmentagent-approval-discord/src/lib.rs", ".post_flag_notice(", 1, BROKER, "manual-text warning on configured approval surfaces"),
     act(p("calendar_rsvp", "crates/augmentagent-cli/src/calendar_rsvp.rs", "send_message(&", 1, BROKER, "calendar RSVP approval card")),
     p("calendar_rsvp_layout", "crates/augmentagent-cli/src/calendar_rsvp.rs", "CreateMessage::new(", 1, TRANSPORT, "calendar RSVP receipt fallback"),
     // -- Approval surfaces (#1289) -------------------------------------------

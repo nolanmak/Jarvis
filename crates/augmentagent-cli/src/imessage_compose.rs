@@ -20,7 +20,7 @@
 //! * `--to` is a phone number or Apple-ID email → that handle, verbatim.
 //! * Otherwise a person from the wiki's people pages (full name, first or last
 //!   name, page slug); two or more matches ask, nobody matches refuses. The
-//!   person's `imessage:` / `phone:` / `email:` identities are the candidate
+//!   person's explicit `imessage:` identities are the candidate
 //!   handles; the ones that have a 1:1 iMessage conversation in the bundle
 //!   are usable, and if several are, the owner is asked which.
 //! * The handle must have a 1:1 `iMessage` conversation in the bundle (SMS,
@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use augmentagent_channel_imessage::{resolve_target, Bundle, Conversation, ImessageTarget};
 use augmentagent_messages::{handles, people};
-use augmentagent_store::{ActionStatus, Email, Store};
+use augmentagent_store::{Email, Store};
 
 /// `email.kind` of a composed message (shared wording with Slack, #1290).
 pub(crate) const COMPOSE_KIND: &str = "compose";
@@ -87,9 +87,15 @@ impl Recipient {
 pub(crate) enum Resolution {
     One(Recipient),
     /// More than one match: ask, never pick.
-    Ambiguous { query: String, candidates: Vec<String> },
+    Ambiguous {
+        query: String,
+        candidates: Vec<String>,
+    },
     /// Nothing usable: fail closed.
-    Unknown { query: String, reason: String },
+    Unknown {
+        query: String,
+        reason: String,
+    },
 }
 
 fn unknown(query: &str, reason: impl Into<String>) -> Resolution {
@@ -99,14 +105,29 @@ fn unknown(query: &str, reason: impl Into<String>) -> Resolution {
     }
 }
 
-/// `+1 (555) 555-0100`, `jane@icloud.example.com` → the handle; a name → None.
+/// `+15555550100`, `jane@icloud.example.com` → the handle; a name → None.
 fn direct_handle(q: &str) -> Option<String> {
-    let q = q.trim().trim_start_matches("imessage:");
-    match handles::canonical(q) {
-        h if h.starts_with("phone:") => Some(h["phone:".len()..].to_string()),
-        h if h.starts_with("email:") => Some(h["email:".len()..].to_string()),
-        _ => None,
+    let q = q.trim().strip_prefix("imessage:").unwrap_or(q.trim());
+    if let Some(digits) = q.strip_prefix('+') {
+        if (8..=15).contains(&digits.len())
+            && !digits.starts_with('0')
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Some(q.to_string());
+        }
     }
+    let parts: Vec<_> = q.split('@').collect();
+    if parts.len() == 2
+        && !parts[0].is_empty()
+        && parts[1].contains('.')
+        && !parts[1].starts_with('.')
+        && !parts[1].ends_with('.')
+        && q.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@._+-".contains(&b))
+    {
+        return Some(q.to_ascii_lowercase());
+    }
+    None
 }
 
 /// The 1:1 conversation whose identifier is `handle`, if any. Apple-ID
@@ -140,6 +161,15 @@ pub(crate) fn resolve_recipient(
     let q = query.trim();
     if q.is_empty() {
         return unknown(q, "no recipient given");
+    }
+    if conversations
+        .iter()
+        .any(|c| c.identifier == q && c.is_group())
+    {
+        return unknown(
+            q,
+            "group compose is not supported; choose an existing 1:1 iMessage conversation",
+        );
     }
     if let Some(handle) = direct_handle(q) {
         // The bundle's spelling wins (case of an Apple-ID email), and the
@@ -180,7 +210,7 @@ pub(crate) fn resolve_recipient(
         .filter(|(slug, name)| *name == n || slug == q)
         .map(|(slug, _)| slug.clone())
         .collect();
-    let matches = if exact.is_empty() {
+    let matches = if exact.is_empty() || (!n.contains(' ') && !q.contains('-')) {
         let needle = format!(" {n} ");
         snap.names
             .iter()
@@ -190,18 +220,29 @@ pub(crate) fn resolve_recipient(
     } else {
         exact
     };
-    // Candidate handles per person: every phone/email identity (an
-    // `imessage:` identity canonicalises to one of those two).
+    // Sending requires an explicit iMessage identity, not a generic phone,
+    // email, search alias, or household link. Keep conflicting ownership closed.
+    let index =
+        match augmentagent_wiki::IdentityIndex::build(&augmentagent_wiki::WikiLayout::new(wiki)) {
+            Ok(index) => index,
+            Err(e) => return unknown(q, format!("could not read iMessage identities: {e}")),
+        };
     let handles_of = |slug: &str| -> Vec<String> {
-        snap.handles
+        let mut result: Vec<_> = index
+            .pages()
             .iter()
-            .filter(|(_, s)| s.as_str() == slug)
-            .filter_map(|(h, _)| {
-                h.strip_prefix("phone:")
-                    .or_else(|| h.strip_prefix("email:"))
-                    .map(str::to_string)
+            .filter(|p| p.slug == slug)
+            .flat_map(|p| &p.identities.imessage)
+            .filter_map(|h| direct_handle(h))
+            .filter(|h| {
+                snap.handles
+                    .get(&handles::canonical(h))
+                    .is_some_and(|owner| owner == slug)
             })
-            .collect()
+            .collect();
+        result.sort();
+        result.dedup();
+        result
     };
     match matches.len() {
         0 => unknown(q, format!("no one called “{q}” is in the wiki")),
@@ -213,15 +254,24 @@ pub(crate) fn resolve_recipient(
                 return unknown(
                     q,
                     format!(
-                        "{name} ({slug}) has no phone or iMessage identity in the wiki; add \
+                        "{name} ({slug}) has no iMessage identity in the wiki; add \
                          `imessage: <number or Apple ID>` under `identities:` on their page"
                     ),
                 );
             }
-            let usable: Vec<String> = all
+            let available: Vec<_> = all
                 .iter()
-                .filter_map(|h| one_to_one(conversations, h).map(|c| c.identifier.clone()))
+                .filter_map(|h| one_to_one(conversations, h))
                 .collect();
+            let mut usable: Vec<String> = available
+                .iter()
+                .filter(|c| c.service == "iMessage")
+                .map(|c| c.identifier.clone())
+                .collect();
+            // Preserve the exact service refusal when the only exported chat is SMS/RCS.
+            if usable.is_empty() && available.len() == 1 {
+                usable.push(available[0].identifier.clone());
+            }
             match usable.len() {
                 0 => unknown(
                     q,
@@ -275,8 +325,14 @@ pub(crate) enum ComposeOutcome {
         superseded: Vec<String>,
     },
     /// Dry run: what would be carded. Nothing stored, nothing sent.
-    Preview { recipient: Recipient, target: ImessageTarget },
-    Ambiguous { query: String, candidates: Vec<String> },
+    Preview {
+        recipient: Recipient,
+        target: ImessageTarget,
+    },
+    Ambiguous {
+        query: String,
+        candidates: Vec<String>,
+    },
     /// Refused before anything was stored.
     Unknown { query: String, reason: String },
 }
@@ -356,6 +412,11 @@ pub(crate) fn compose(
         Ok(t) => t,
         Err(e) => return refuse(format!("cannot send: {e}")),
     };
+    if target.kind != augmentagent_store::ImessageTargetKind::Handle {
+        return refuse(
+            "group compose is not supported; choose an existing 1:1 iMessage conversation".into(),
+        );
+    }
     match store.is_imessage_outbound_allowed(&target.conversation) {
         Ok(true) => {}
         Ok(false) => {
@@ -379,10 +440,16 @@ pub(crate) fn compose(
         to: recipient.handle.clone(),
         cc: String::new(),
         attachments: Vec::new(),
-        subject: format!("New iMessage to {label}"),
+        subject: body
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect(),
         // No inbound: the card shows the draft alone and Revise redrafts
         // against the owner's text.
-        body: String::new(),
+        body: body.to_string(),
         date: chrono::Utc::now().to_rfc3339(),
         account_entity_id: Some(crate::imessage_send::PLATFORM.into()),
         platform: crate::imessage_send::PLATFORM.into(),
@@ -390,35 +457,9 @@ pub(crate) fn compose(
     };
     // One live compose per person: a follow-up ("actually say …") replaces
     // the earlier card rather than leaving two Approve buttons.
-    let earlier = match store.pending_action_ids_for_thread_kind(&thread_id, COMPOSE_KIND) {
-        Ok(ids) => ids,
-        Err(e) => return refuse(format!("checking for an earlier compose: {e}")),
-    };
-    let stored = store.upsert_email(&email).and_then(|_| {
-        store.log_action(
-            &message_id,
-            email.thread_id.as_deref(),
-            &email.from,
-            &email.subject,
-            None,
-            Some(body),
-            ActionStatus::Pending,
-        )
-    });
-    let action_id = match stored {
-        Ok(id) => id,
+    let (action_id, superseded) = match store.create_imessage_compose(&email, body) {
+        Ok(result) => result,
         Err(e) => return refuse(format!("could not store the message: {e}")),
-    };
-    let superseded = if earlier.is_empty() {
-        Vec::new()
-    } else {
-        match store.mark_pending_superseded_by_ids(&earlier, "superseded by follow-up compose") {
-            Ok(_) => earlier,
-            Err(e) => {
-                tracing::warn!(action_id, "compose: superseding the earlier card failed: {e}");
-                Vec::new()
-            }
-        }
     };
     ComposeOutcome::Card {
         action_id,
@@ -472,6 +513,15 @@ pub(crate) async fn run(
             superseded,
         } => {
             let posted = post_card_now(store, &action_id, &email, &body).await;
+            if posted.is_err() {
+                // Release the initial posting reservation to the ordinary queue.
+                store.with_conn(|c| {
+                    c.execute(
+                        "UPDATE actions SET nudgeCount=0 WHERE id=?1 AND status='pending'",
+                        [&action_id],
+                    )
+                })?;
+            }
             if let Err(e) = &posted {
                 tracing::info!(action_id, "compose card left for the approval queue: {e}");
             }
@@ -496,13 +546,16 @@ pub(crate) async fn run(
                         recipient.label()
                     ),
                     Err(_) => println!(
-                        "pending approval: new iMessage to {} (ref {short}). The daemon posts \
-                         the card on its next tick; nothing is sent until you approve it.",
+                        "pending approval: new iMessage to {} (ref {short}). The card is queued \
+                         for approval; nothing is sent until you approve it.",
                         recipient.label()
                     ),
                 }
                 if !superseded.is_empty() {
-                    println!("replaced {} earlier pending compose(s) to the same person", superseded.len());
+                    println!(
+                        "replaced {} earlier pending compose(s) to the same person",
+                        superseded.len()
+                    );
                 }
             }
             Ok(())
@@ -539,11 +592,19 @@ async fn post_card_now(
         .context("DISCORD_CHANNEL_ID must be numeric")?;
     let http = serenity::http::Http::new(&token);
     let channel = serenity::all::ChannelId::new(cid);
-    let card = augmentagent_approval_discord::approval_message(action_id, email, draft, 0);
-    channel
-        .send_message(&http, card)
-        .await
-        .context("send approval card to Discord")?;
+    let card = augmentagent_approval_discord::approval_message(action_id, email, draft, 0)
+        .nonce(serenity::all::Nonce::String(format!(
+            "imsg-{}",
+            &action_id.replace('-', "")[..20]
+        )))
+        .enforce_nonce(true);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        channel.send_message(&http, card),
+    )
+    .await
+    .context("timed out posting approval card to Discord")?
+    .context("send approval card to Discord")?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Err(e) = store.record_nudge(action_id, now_ms + augmentagent_store::NUDGE_INTERVAL_MS) {
         tracing::warn!(action_id, "record_nudge after compose card failed: {e}");
@@ -614,9 +675,14 @@ mod tests {
             &wiki,
             "sam-lee",
             "Sam Lee",
-            &format!("identities:\n  phone: [\"{SMS_PHONE}\"]\n"),
+            &format!("identities:\n  imessage: [\"{SMS_PHONE}\"]\n"),
         );
-        write_person(&wiki, "no-phone", "No Phone", "identities:\n  email: [\"np@example.com\"]\n");
+        write_person(
+            &wiki,
+            "no-phone",
+            "No Phone",
+            "identities:\n  email: [\"np@example.com\"]\n",
+        );
         write_person(
             &wiki,
             "pat-new",
@@ -666,9 +732,13 @@ mod tests {
         assert_eq!(email.platform, "imessage");
         assert_eq!(email.kind, COMPOSE_KIND);
         assert!(email.message_id.starts_with(COMPOSE_MESSAGE_PREFIX));
-        assert_eq!(email.thread_id.as_deref(), Some(&*format!("imessage:{PHONE}")));
+        assert_eq!(
+            email.thread_id.as_deref(),
+            Some(&*format!("imessage:{PHONE}"))
+        );
         assert_eq!(email.from, format!("Jane Doe <{PHONE}>"));
-        assert!(email.body.is_empty());
+        assert_eq!(email.body, "on my way");
+        assert_eq!(email.subject, "on my way");
         let a = f.store.get_action_with_email(&action_id).unwrap().unwrap();
         assert_eq!(a.action.status, "pending");
         assert_eq!(a.action.draft_body.as_deref(), Some("on my way"));
@@ -751,10 +821,13 @@ mod tests {
         assert!(r.contains("no one called"), "{r}");
         // Person without a phone/iMessage identity.
         let r = reason(compose(&f.store, &f.config, "No Phone", "hi", false));
-        assert!(r.contains("no phone or iMessage identity"), "{r}");
+        assert!(r.contains("no iMessage identity"), "{r}");
         // Person whose number has no conversation yet.
         let r = reason(compose(&f.store, &f.config, "Pat New", "hi", false));
-        assert!(r.contains("no iMessage conversation with Pat New yet"), "{r}");
+        assert!(
+            r.contains("no iMessage conversation with Pat New yet"),
+            "{r}"
+        );
         // Handle not in the bundle.
         let r = reason(compose(&f.store, &f.config, "+15555550177", "hi", false));
         assert!(r.contains("not found in the iMessage bundle"), "{r}");
@@ -794,8 +867,9 @@ mod tests {
     fn a_follow_up_compose_replaces_the_earlier_pending_card() {
         let f = fixture();
         f.store.allow_imessage_outbound(PHONE).unwrap();
-        let ComposeOutcome::Card { action_id: first, .. } =
-            compose(&f.store, &f.config, "Jane", "first try", false)
+        let ComposeOutcome::Card {
+            action_id: first, ..
+        } = compose(&f.store, &f.config, "Jane", "first try", false)
         else {
             panic!()
         };
@@ -818,9 +892,13 @@ mod tests {
     async fn approve_on_a_compose_queues_the_outbox_row_and_denial_after_compose_refuses() {
         let f = fixture();
         f.store.allow_imessage_outbound(PHONE).unwrap();
-        let ComposeOutcome::Card { action_id, .. } =
-            compose(&f.store, &f.config, "Jane", "see you at 8 [assumes: dinner is on]", false)
-        else {
+        let ComposeOutcome::Card { action_id, .. } = compose(
+            &f.store,
+            &f.config,
+            "Jane",
+            "see you at 8\n\n<!--aa:assumes\ndinner is on\n-->",
+            false,
+        ) else {
             panic!()
         };
         let mut approver = crate::test_support::approver_with_store(Arc::clone(&f.store));
@@ -866,5 +944,108 @@ mod tests {
         assert!(matches!(out, ApprovalActionOutcome::Skipped), "{out:?}");
         let a = f.store.get_action_with_email(&action_id).unwrap().unwrap();
         assert_eq!(a.action.status, "rejected");
+    }
+    #[test]
+    fn imessage_compose_requires_an_explicit_imessage_identity_for_names() {
+        let f = fixture();
+        write_person(
+            f.config.wiki_root.as_ref().unwrap(),
+            "jane-doe",
+            "Jane Doe",
+            &format!("identities:\n  phone: [\"{PHONE}\"]\n"),
+        );
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let r = reason(compose(&f.store, &f.config, "Jane", "hi", false));
+        assert!(r.contains("no iMessage identity"), "{r}");
+        assert_eq!(pending_count(&f.store), 0);
+    }
+
+    #[test]
+    fn imessage_compose_bare_first_name_does_not_hide_other_matching_people() {
+        let f = fixture();
+        write_person(
+            f.config.wiki_root.as_ref().unwrap(),
+            "jane",
+            "Jane",
+            &format!("identities:\n  imessage: [\"{PHONE2}\"]\n"),
+        );
+        assert!(matches!(
+            compose(&f.store, &f.config, "Jane", "hi", false),
+            ComposeOutcome::Ambiguous { .. }
+        ));
+        assert_eq!(pending_count(&f.store), 0);
+    }
+
+    #[test]
+    fn imessage_compose_rejects_group_even_when_identifier_looks_like_a_handle() {
+        let f = fixture();
+        let path = f
+            .config
+            .bundle_dir
+            .as_ref()
+            .unwrap()
+            .join("conversations/index.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        index[PHONE]["participants"] = serde_json::json!([PHONE, PHONE2]);
+        index[PHONE]["chat_guid"] = serde_json::json!("any;+;synthetic-group");
+        std::fs::write(path, serde_json::to_vec(&index).unwrap()).unwrap();
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let r = reason(compose(&f.store, &f.config, PHONE, "hi", false));
+        assert!(r.contains("group"), "{r}");
+        assert_eq!(pending_count(&f.store), 0);
+    }
+
+    struct ReviseFixture;
+    #[async_trait::async_trait]
+    impl augmentagent_channel_core::Reasoner for ReviseFixture {
+        async fn call(
+            &self,
+            _: &augmentagent_channel_core::reasoner::ReasonerOpts,
+            prompt: &str,
+        ) -> anyhow::Result<String> {
+            assert!(prompt.contains("editing an iMessage text"));
+            assert!(prompt.contains("<previous_draft>\nhello world\n</previous_draft>"));
+            assert!(prompt.contains("make it warmer"));
+            assert!(!prompt.contains("<original_email>") && !prompt.contains("<inbound>"));
+            Ok("hello world!".into())
+        }
+    }
+    #[tokio::test]
+    async fn imessage_compose_revise_and_recompose_keep_owner_intent_without_an_inbound() {
+        use augmentagent_channel_core::{
+            cooldown::CooldownLatch, fallback::FallbackReasoner, providers::ProviderKind,
+        };
+        let f = fixture();
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let ComposeOutcome::Card { action_id, .. } =
+            compose(&f.store, &f.config, "Jane", "hello world", false)
+        else {
+            panic!()
+        };
+        let mut approver = crate::test_support::approver_with_store(Arc::clone(&f.store));
+        approver.reasoner = Arc::new(FallbackReasoner::for_tests(
+            vec![(ProviderKind::Claude, Arc::new(ReviseFixture))],
+            CooldownLatch::at(f._dir.path().join("cooldowns.json")),
+        ));
+        let out = approver.run_revise(&action_id, "make it warmer").await;
+        assert!(
+            matches!(out, ApprovalActionOutcome::Revised { .. }),
+            "{out:?}"
+        );
+        let row = f.store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(row.action.draft_body.as_deref(), Some("hello world!"));
+        assert_eq!(row.email.kind, "compose");
+        f.store
+            .mark_pending_superseded_by_ids(&[action_id.clone()], "synthetic replacement")
+            .unwrap();
+        assert!(matches!(
+            approver.run_recompose(&action_id).await,
+            ApprovalActionOutcome::Recomposed
+        ));
+        let row = f.store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(row.email.kind, "compose");
+        assert_eq!(row.action.status, "pending");
+        assert!(f.store.list_imessage_outbox(10).unwrap().is_empty());
     }
 }

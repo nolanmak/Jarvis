@@ -330,12 +330,12 @@ augmentagent imessage compose --to "Jane" --body "hi"            # preview only
 ```
 
 `--to` takes a person from the wiki (full or first name, or page slug, matched
-against the `imessage:` and `phone:` identities on `people/*.md`), an E.164
+against the explicit `imessage:` identities on `people/*.md`), an E.164
 phone number, or an Apple-ID email. Resolution fails closed, and every refusal
 names what to do:
 
 - a name matching several people lists them and stores nothing;
-- a person with no phone or iMessage identity in the wiki is refused;
+- a person with no explicit iMessage identity in the wiki is refused;
 - the handle must already have a 1:1 `iMessage` conversation in the bundle
   (SMS, RCS and group chats are refused; a person you have never texted from
   the Mac is refused until you have);
@@ -344,11 +344,11 @@ names what to do:
 
 Only after every check passes is one pending card stored. A second compose to
 the same person while the first is still pending replaces it. The card is
-labelled *New iMessage to …* with a **To** field; Revise redrafts against your
+labelled *New message · iMessage* with a **To** field; Revise redrafts against your
 text with no inbound to quote; Approve runs the same checks again and queues
 the outbox row; Skip discards it. A text you send by hand retires a pending
 *reply* card for that conversation but leaves a pending *compose*, since
-nothing has answered it. The sent text comes back through the exporter and is
+nothing has answered it, and adds a note that you texted since composing. The sent text comes back through the exporter and is
 recognised as the agent's own, so it never produces a reply card.
 
 With `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` in the environment (the
@@ -447,11 +447,11 @@ send as a recovery shortcut; reconcile against `chat.db` first.
 
 ```sh
 python3 -m unittest discover -s scripts/imessage/tests -v
-cargo test -p augmentagent-channel-imessage
-cargo test -p augmentagent-store --test imessage_outbox
-cargo test -p augmentagent-cli --test imessage_outbox_cli
-cargo test -p augmentagent-cli --bin augmentagent imessage_send
-cargo test -p augmentagent-cli --bin augmentagent imessage_compose
+./scripts/cargo-managed.sh test -p augmentagent-channel-imessage
+./scripts/cargo-managed.sh test -p augmentagent-store --test imessage_outbox
+./scripts/cargo-managed.sh test -p augmentagent-cli --test imessage_outbox_cli
+./scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent imessage_send
+./scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent imessage_compose
 ```
 
 Python tests use synthetic SQLite databases and require neither a Mac nor access

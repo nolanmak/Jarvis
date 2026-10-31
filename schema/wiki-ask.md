@@ -511,7 +511,7 @@ augmentagent imessage compose --to "<person, +E.164 number, or Apple-ID email>" 
 the Mac. Say "I've posted the text for your approval", never "I've sent it".
 
 - **`--to` is a wiki person or a handle.** A full or first name resolves
-  through the people pages' `imessage:` / `phone:` identities; a number or
+  through the people pages' explicit `imessage:` identities; a number or
   Apple-ID email is used as-is. The person must already have a 1:1 iMessage
   conversation with the user (SMS and group chats are refused).
 - **Ambiguous name → ask.** If the command says the name matches several

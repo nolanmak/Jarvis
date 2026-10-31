@@ -132,11 +132,17 @@ fn newest_is_echo_of_own_send(store: &Store, delta: &PollDelta) -> bool {
 /// Split the delta's `me` entries into (agent's own sends, manual replies).
 /// Each sent outbox row accounts for at most one entry.
 fn split_own_entries(store: &Store, delta: &PollDelta) -> (usize, usize) {
+    split_own_entries_since(store, delta, None)
+}
+
+fn split_own_entries_since(store: &Store, delta: &PollDelta, after: Option<i64>) -> (usize, usize) {
     let mine: Vec<&crate::bundle::MessageEntry> = delta
         .new_entries
         .iter()
         .map(|(_, e)| e)
         .filter(|e| e.sender == "me")
+        .filter(|e| after.is_none_or(|after| chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+            .is_ok_and(|ts| ts.timestamp_millis() > after)))
         .collect();
     if mine.is_empty() {
         return (0, 0);
@@ -181,6 +187,19 @@ impl ImessageReplier {
                 if manual > 0 {
                     // The operator answered by hand; the pending draft is stale.
                     let thread = format!("imessage:{}", delta.conversation.identifier);
+                    match self.store.pending_action_ids_for_thread_kind(&thread, COMPOSE_KIND) {
+                        Ok(ids) => for id in ids {
+                            if let Ok(Some(row)) = self.store.get_action_with_email(&id) {
+                                let Ok(created) = chrono::DateTime::parse_from_rfc3339(&row.action.created_at) else { continue; };
+                                if split_own_entries_since(&self.store, delta, Some(created.timestamp_millis())).1 == 0 { continue; }
+                                if let Err(error) = self.approvals.note_compose_activity(&id, &row.email).await {
+                                    warn!(action_id=%id, "compose manual-activity note failed: {error}");
+                                    stats.errors += 1;
+                                }
+                            }
+                        },
+                        Err(error) => warn!("compose manual-activity lookup failed: {error}"),
+                    }
                     // #1635 — a pending *compose* (a text the owner started)
                     // is not answered by the owner texting something else;
                     // only drafted replies go stale.
@@ -355,6 +374,7 @@ mod tests {
     struct Broker {
         cards: Mutex<Vec<(String, String)>>,
         flags: Mutex<usize>,
+        activity: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -362,6 +382,9 @@ mod tests {
         async fn post_approval(&self, id: &str, _e: &Email, d: &str) -> Result<(), ApprovalError> {
             self.cards.lock().unwrap().push((id.into(), d.into()));
             Ok(())
+        }
+        async fn note_compose_activity(&self, id: &str, _e: &Email) -> Result<(), ApprovalError> {
+            self.activity.lock().unwrap().push(id.into()); Ok(())
         }
         async fn post_flag_notice(&self, _e: &Email, _r: &str) -> Result<(), ApprovalError> {
             *self.flags.lock().unwrap() += 1;
@@ -801,7 +824,8 @@ mod tests {
         rep.handle_deltas(&[d1]).await;
         let reply_card = pending(&f.store).remove(0);
         let compose = pending_compose(&f.store, "here's the address");
-        let d2 = one_to_one(&[("me", "typed by hand")]);
+        let mut d2 = one_to_one(&[("me", "typed by hand")]);
+        d2.new_entries[0].1.timestamp = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
         let stats = rep.handle_deltas(&[d2]).await;
         assert_eq!(stats.manual_replies, 1);
         assert_eq!(stats.superseded, 1, "only the reply card");
@@ -809,6 +833,18 @@ mod tests {
         assert_eq!(r.action.status, "superseded");
         let c = f.store.get_action_with_email(&compose).unwrap().unwrap();
         assert_eq!(c.action.status, "pending");
+        assert_eq!(*f.broker.activity.lock().unwrap(), vec![compose]);
+    }
+
+    #[tokio::test]
+    async fn delayed_export_of_old_manual_text_does_not_warn_on_new_compose() {
+        let f = fx();
+        let compose = pending_compose(&f.store, "new owner text");
+        let delta = one_to_one(&[("me", "old manual text")]);
+        let rep = replier(&f, Scripted::new(&[]));
+        rep.handle_deltas(&[delta]).await;
+        assert!(f.broker.activity.lock().unwrap().is_empty());
+        assert_eq!(f.store.get_action_with_email(&compose).unwrap().unwrap().action.status, "pending");
     }
 
     #[tokio::test]
@@ -826,4 +862,16 @@ mod tests {
         assert_eq!(c.action.status, "pending");
         assert_eq!(pending(&f.store).len(), 2, "the compose and the new reply card");
     }
+    #[tokio::test]
+    async fn sent_compose_echo_is_an_own_send_and_never_a_manual_reply_or_new_card() {
+        let f=fx(); f.store.allow_imessage_inbound(PHONE).unwrap();
+        let id=pending_compose(&f.store, "agent composed this");
+        sent_row(&f.store, &id, "agent composed this", ts_ms(TS));
+        let d=one_to_one(&[("me", "agent composed this")]);
+        ingest(&f.store,&d);
+        let stats=replier(&f,Scripted::new(&[])).handle_deltas(&[d]).await;
+        assert_eq!((stats.own_sends,stats.manual_replies,stats.cards),(1,0,0));
+        assert!(f.broker.activity.lock().unwrap().is_empty());
+    }
+
 }

@@ -956,3 +956,25 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     assert!(!session.join("new.txt").exists());
     assert_eq!(std::fs::read_to_string(transcripts.join("meeting.md")).unwrap(), "SYNTHETIC_TRANSCRIPT\n");
 }
+
+#[test]
+fn imessage_compose_matches_social_card_scope_and_forbids_send_controls() {
+    use augmentagent_channel_core::reasoner::*;
+    let dir=tempfile::tempdir().unwrap();let wiki=dir.path().to_path_buf();
+    let presets=[ask_opts(wiki.clone(),wiki.clone()),triage_opts(Some(wiki.clone())),
+        draft_opts("Synthetic instructions".into(),Some(wiki.clone())),digest_opts(Some(wiki.clone())),
+        resume_opts(wiki.clone()),tone_summarize_opts(),loop_parse_opts()];
+    for opts in presets {
+        let has=|s:&str|opts.allowed_tools.iter().any(|t|t==s);
+        assert_eq!(has("Bash(augmentagent imessage compose *)"),has("Bash(augmentagent socialapi dm *)"));
+        assert_eq!(has("Bash(augmentagent imessage allowlist)"),has("Bash(augmentagent socialapi dm *)"));
+        for forbidden in ["imessage *","imessage approve *","imessage allow-outbound *","imessage alerts *","imessage outbox *"] {
+            assert!(!opts.allowed_tools.iter().any(|t|t.ends_with(&format!(" {forbidden})"))));
+        }
+    }
+    let opts=ask_opts(wiki.clone(),wiki);
+    assert!(opts.system_prompt.contains("imessage compose"));
+    assert!(opts.system_prompt.contains("--post"));
+    let manifest:serde_json::Value=serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
+    assert!(manifest.to_string().contains("imessage compose"));
+}
