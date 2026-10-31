@@ -37,6 +37,7 @@ pub fn reclaim(
     dry_run: bool,
     claims: &crate::storage_reservations::Claims,
     free_bytes: &dyn Fn(&Path) -> Option<u64>,
+    admission_paths: Option<&[std::path::PathBuf]>,
 ) -> Result<Vec<RootReport>> {
     let procs = crate::disk::build_procs();
     let mut refs = crate::snapshot_refs::collect_rebuildable();
@@ -71,20 +72,32 @@ pub fn reclaim(
             &std::env::var("AUGMENTAGENT_PRUNE_TARGET_DIRS").unwrap_or_default(),
         ),
     );
-    reports.extend(reclaim_roots(
+    let headroom = |path: &Path| {
+        Ok(free_bytes(path).context("cannot measure pressure filesystem")?
+            .saturating_sub(claims.reserved_on(path)?))
+    };
+    let reclaimed = if let Some(paths) = admission_paths {
+        reclaim_roots_for_paths(&roots, paths, required, held, dry_run,
+            procs.as_deref(), &refs, &headroom)?
+    } else {reclaim_roots(
         &roots,
         required,
         held,
         dry_run,
         procs.as_deref(),
         &refs,
-        &|path| {
-            Ok(free_bytes(path)
-                .context("cannot measure pressure filesystem")?
-                .saturating_sub(claims.reserved_on(path)?))
-        },
-    )?);
+        &headroom,
+    )?};
+    reports.extend(reclaimed);
     Ok(reports)
+}
+
+pub(crate) fn reclaim_roots_for_paths(
+    roots: &[Root], _paths: &[std::path::PathBuf], required: u64,
+    held: Option<&TargetLeases>, dry_run: bool, procs: Option<&[BuildProc]>,
+    refs: &References, headroom: &dyn Fn(&Path) -> Result<u64>,
+) -> Result<Vec<RootReport>> {
+    reclaim_roots(roots, required, held, dry_run, procs, refs, headroom)
 }
 
 pub(crate) fn reclaim_roots(
@@ -249,7 +262,9 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            Self::in_directory(tempfile::tempdir().unwrap())
+        }
+        fn in_directory(dir: tempfile::TempDir) -> Self {
             let target = dir.path().join("target");
             let deps = target.join("release/deps");
             std::fs::create_dir_all(&deps).unwrap();
@@ -292,6 +307,25 @@ mod tests {
                 &|_| Ok(if self.deps.exists() { 0 } else { 65536 }),
             )
             .unwrap()
+        }
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn admission_pressure_preserves_an_unrelated_filesystem_even_when_both_are_low() {
+        for dry_run in [true,false] {
+            let requested=Fixture::new();
+            let unrelated=Fixture::in_directory(tempfile::tempdir_in("/dev/shm").unwrap());
+            assert_ne!(std::fs::metadata(&requested.root.path).unwrap().dev(),
+                std::fs::metadata(&unrelated.root.path).unwrap().dev(),"fixture needs two real filesystems");
+            let reports=reclaim_roots_for_paths(&[unrelated.root.clone(),requested.root.clone()],
+                &[requested.root.path.join("future/output")],65536,None,dry_run,Some(&[]),&requested.refs,
+                &|path|Ok(if path.starts_with(&unrelated.root.path) && !unrelated.deps.exists() {65536} else {0})).unwrap();
+            assert!(unrelated.deps.exists(),"reclaimed warm cache on a filesystem unused by this admission");
+            assert!(!reports.iter().any(|r|r.path.starts_with(&unrelated.root.path.to_string_lossy().into_owned()) && r.removed>0),
+                "cleanup reported unrelated filesystem reclamation");
+            assert!(reports.iter().any(|r|r.path.starts_with(&requested.root.path.to_string_lossy().into_owned()) && r.removed>0));
+            assert_eq!(requested.deps.exists(),dry_run);
         }
     }
 

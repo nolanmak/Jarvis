@@ -1021,7 +1021,7 @@ fn reconcile_for(
     context: ReconcileContext<'_>, free_bytes: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<()> {
     let pressure = |required| crate::disk_pressure::reclaim(repo, required, context.held, false,
-        context.claims, free_bytes);
+        context.claims, free_bytes, Some(context.paths));
     reconcile_with_pressure(repo, target, state, floor_gb, cap_mb,
         ReconcileContext { ..context }, free_bytes, &pressure)
 }
