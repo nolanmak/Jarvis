@@ -1311,6 +1311,20 @@
     "evidence": null
   },
   {
+    "id": "cli:team",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "team list displays the explicit owner-team roster and invalid-entry warnings before database bootstrap. Classification uses exact handles or configured domains; owner identities take precedence.",
+    "macos_target": "The same roster parsing, classification, read-only CLI output, and warning behavior on macOS.",
+    "prerequisites": [
+      "Rust CLI",
+      "synthetic AUGMENTAGENT_OWNER_TEAM configuration"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1698",
+    "test_plan": "Run scripts/cargo-managed.sh test -p augmentagent-messages --lib team and scripts/cargo-managed.sh test -p augmentagent-cli --test team_cli on both hosts. Native verification remains unrecorded.",
+    "status": "unverified",
+    "evidence": null
+  },
+  {
     "id": "cli:telegram-bot",
     "source": "crates/augmentagent-cli/src/main.rs",
     "linux_baseline": "Linux exposes augmentagent telegram-bot; record its command-specific effects and authorization.",
@@ -3784,6 +3798,20 @@
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1599",
     "test_plan": "Run worker lifecycle, updater, installer and storage concurrency regressions on Linux. Implement and verify launchd handoff before claiming macOS parity.",
     "status": "gap",
+    "evidence": null
+  },
+  {
+    "id": "cli:team-coverage",
+    "source": "crates/augmentagent-cli/src/main.rs",
+    "linux_baseline": "Report teammate coverage decisions, record owner reviews, and evaluate the shadow rollout gate.",
+    "macos_target": "The same report, review persistence, and rollout gate behavior on macOS.",
+    "prerequisites": [
+      "Rust CLI",
+      "Synthetic SQLite coverage decisions"
+    ],
+    "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1702",
+    "test_plan": "Run scripts/cargo-managed.sh test -p augmentagent-cli --test team_coverage_cli and scripts/cargo-managed.sh test -p augmentagent-store --test team_coverage_store on both hosts. Native verification remains unrecorded.",
+    "status": "unverified",
     "evidence": null
   }
 ]

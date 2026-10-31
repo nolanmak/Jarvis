@@ -1,6 +1,7 @@
 //! `LinkedInChannel` — polls the voyager mailbox every 4h ± jitter, runs each
-//! new DM through the same triage → draft → ingest pipeline the Gmail channel
-//! uses, then hands the draft to the Discord approval broker.
+//! eligible live direct-message burst through triage → draft → ingest, then
+//! hands the draft to the Discord approval broker. Archive reconciliation keeps
+//! complete histories independently, including groups and owner messages.
 //!
 //! Sends happen from the approver (CLI crate) when the user clicks Approve on
 //! Discord — same as Gmail, except the wire call is `VoyagerClient::send_message`
@@ -147,6 +148,22 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
 
     pub async fn poll_once(&self) -> anyhow::Result<PollOutcome> {
         let mut outcome = PollOutcome::default();
+        if let Some(reader)=self.api.archive_reader()? {
+            anyhow::ensure!(reader.mailbox()==self.member_urn,"LinkedIn reader account mismatch");
+            let emails=crate::archive_live::poll(&reader,&self.store,100,&CancellationToken::new()).await?;
+            outcome.dms_checked=emails.len();
+            for email in emails {
+                match self.process_email(email).await {
+                    Ok(Some(DispatchOutcome::Skipped))=>outcome.skipped+=1,
+                    Ok(Some(DispatchOutcome::Flagged))=>outcome.flagged+=1,
+                    Ok(Some(DispatchOutcome::DryRun))=>outcome.replied_dry_run+=1,
+                    Ok(Some(DispatchOutcome::AwaitingApproval))=>outcome.awaiting_approval+=1,
+                    Ok(None)=>{},
+                    Err(e)=>{outcome.errors+=1;error!("LinkedIn live dispatch failed: {e:#}");}
+                }
+            }
+            return Ok(outcome);
+        }
         let dms = match self.api.fetch_recent_dms().await {
             Ok(dms) => dms,
             Err(LinkedInError::AuthExpired) => {
@@ -200,7 +217,20 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
         &self,
         email: augmentagent_store::Email,
     ) -> anyhow::Result<Option<DispatchOutcome>> {
-        self.store.upsert_email(&email)?;
+        let archived=self.store.with_conn(|c|c.query_row("SELECT EXISTS(SELECT 1 FROM linkedin_archive_messages WHERE stored_id=?1)",[&email.message_id],|r|r.get::<_,bool>(0)))?;
+        let reader=self.api.archive_reader()?;
+        let email=if archived {
+            let Some(stored)=crate::archive_live::pending(&self.store,&self.member_urn)?.into_iter().find(|candidate|candidate.message_id==email.message_id) else {return Ok(None);};
+            if let Some(reader)=&reader {
+                anyhow::ensure!(reader.mailbox()==self.member_urn,"LinkedIn reader account mismatch");
+                reader.require_direct(stored.thread_id.as_deref().unwrap_or("")).await?;
+            }
+            stored
+        } else {
+            anyhow::ensure!(reader.is_none(),"live LinkedIn message lacks durable archive admission");
+            self.store.upsert_email(&email)?;
+            email
+        };
         if self.store.is_email_complete(&email.message_id)? {
             return Ok(None);
         }
@@ -212,9 +242,15 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
             return Ok(None);
         }
 
+        let _live_claim=if archived {
+            let Some(claim)=crate::archive_live::claim(&self.store,&self.member_urn,&email.message_id)? else {return Ok(None);};
+            Some(claim)
+        } else {None};
+
         // --- TRIAGE (Opus with optional wiki read) ---
         let triage_opts = triage_opts(self.config.wiki_root.clone());
-        let triage_prompt = triage_user_message(&email, "", "");
+        let thread_context=crate::archive_live::context(&self.store,&email.message_id)?;
+        let triage_prompt = format!("{}\n\n{}",triage_user_message(&email, "", ""),thread_context);
         let raw = self.reasoner.call(&triage_opts, &triage_prompt).await?;
         let decision = match parse_decision(&raw) {
             Ok(d) => d,
@@ -315,7 +351,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                     self.config.wiki_root.as_deref(),
                 ).await?;
                 let user_msg =
-                    code_mode_user_message(&email, &wiki_hint, "", "", "", "");
+                    code_mode_user_message(&email, &wiki_hint, "", &thread_context, "", "");
                 let user_msg = format!("{user_msg}\n\n{}", shared_draft_context.prompt());
                 // Opts mirror the classic `draft_opts` shape: same permission
                 // mode, no allowed_tools / add_dirs — the Deno sandbox is
@@ -530,7 +566,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                     .unwrap_or_default();
                 let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+                let draft_prompt = draft_user_message(&email, "", "", &thread_context, "", "");
                 let draft_prompt = format!("{draft_prompt}\n\n{}", shared_draft_context.prompt());
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
@@ -711,7 +747,8 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> LinkedInChannel<L, R> {
     /// dispatching each `WorkItem` through [`LinkedInWorkHandler`] — which
     /// calls the same [`LinkedInChannel::process_email`] the old loop reached
     /// via `handle_dm`, so triage/draft/approve/ingest/dedup behavior is
-    /// unchanged.
+    /// preserved for eligible direct messages. The source first archives every
+    /// accessible conversation kind and uses durable live admission.
     ///
     /// Cadence parity: `ChannelRunner`'s post-tick jitter sleeps a uniform
     /// `[0, 2*jitter]` window, identical to the removed loop's
@@ -728,7 +765,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> LinkedInChannel<L, R> {
         let source = Arc::new(crate::inbound::LinkedInInbound::new(
             Arc::clone(&self.api),
             self.member_urn.clone(),
-        ));
+        ).with_store(Arc::clone(&self.store)));
         let trigger = Arc::new(InboundMessageTrigger::new(source));
         let handler = Arc::new(LinkedInWorkHandler {
             channel: Arc::clone(&self),

@@ -709,6 +709,8 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-channel-core",
+ "augmentagent-mcp-memory",
+ "augmentagent-messages",
  "augmentagent-store",
  "augmentagent-wiki",
  "reqwest",

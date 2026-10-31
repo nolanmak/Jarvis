@@ -2,6 +2,7 @@
 
 mod approval_context;
 mod team_coverage;
+mod linkedin_archive;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
 mod document_signing;
@@ -2632,11 +2633,45 @@ enum LinkedinOp {
     /// store to look up. Gmail has `gmail search` for exactly this; LinkedIn
     /// had nothing.
     RecentDms {
-        /// Cap the number of threads listed.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
+        #[arg(long, default_value = "INBOX")]
+        category: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        max_pages: usize,
+    },
+    /// Read paginated live history, including group and owner messages.
+    Thread {
+        conversation_urn: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        max_pages: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Archive-only, resumable import. No drafts, cards or sends.
+    Backfill {
+        /// Omit to enumerate every category reported by the mailbox API.
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        max_pages: usize,
+        /// Reconcile mailbox heads again without deleting stored history.
+        #[arg(long)]
+        refresh: bool,
+        /// Read into memory only; do not open the production database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Persisted coverage, not a credentials-present indicator.
+    ArchiveStatus {
+        #[arg(long, default_value = "INBOX")]
+        category: String,
     },
     /// Draft a DM reply into a Discord approval card (#572). Mirrors
     /// `gmail compose --post`: without `--post` it prints the draft, with it
@@ -3032,6 +3067,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Dry-run must precede Store::open and all persistent bootstrap hooks.
+    if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true } } = cli.cmd {
+        return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh).await;
+    }
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
@@ -4702,11 +4741,14 @@ async fn main() -> Result<()> {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
                 run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
             }
-            LinkedinOp::RecentDms { limit, json } => {
-                let repo_root =
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                run_linkedin_recent_dms(repo_root, *limit, *json).await
-            }
+            op @ (LinkedinOp::RecentDms { .. } | LinkedinOp::Thread { .. }) => {
+                let reader = linkedin_archive::reader()?;
+                print!("{}", dispatch_linkedin_read(op, &reader).await?);
+                Ok(())
+            },
+            LinkedinOp::Backfill { category, max_pages, refresh, .. } =>
+                linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh).await,
+            LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
             LinkedinOp::Dm {
                 conversation_urn,
                 with,
@@ -8097,6 +8139,12 @@ async fn run_linkedin_dm(
         }
         return Ok(());
     }
+    // A preview only echoes the supplied text. Validate authoritative direct
+    // membership before creating any persisted draft or approval card.
+    let auth = LinkedInAuth::load_with_migration(&std::env::current_dir()?)
+        .context("LinkedIn is not configured; run `linkedin login` before posting an approval card")?;
+    augmentagent_channel_linkedin::archive::ArchiveReader::new(auth)?
+        .require_direct(&conversation_urn).await?;
     let message_id = format!("compose:linkedin:dm:{conversation_urn}");
     let action_id = post_social_approval_card(
         &store,
@@ -8192,57 +8240,6 @@ async fn run_linkedin_comment(
     Ok(())
 }
 
-
-/// `linkedin recent-dms` — list recent DM threads and their conversation urns.
-///
-/// Read-only: one Voyager GET, no writes, nothing sent. Its whole purpose is
-/// to hand the agent the `--conversation-urn` that `linkedin dm` requires.
-async fn run_linkedin_recent_dms(
-    repo_root: PathBuf,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let auth = LinkedInAuth::load_with_migration(&repo_root)
-        .context("load linkedin auth (run `linkedin login`)")?;
-    let my_urn = auth.member_urn.clone();
-    let voyager = VoyagerClient::new(auth);
-    let dms = voyager
-        .fetch_recent_dms()
-        .await
-        .context("fetch recent linkedin dms")?;
-    // Drop our own outbound messages: you don't reply to yourself, and they
-    // would only pad the list the agent has to disambiguate.
-    let rows: Vec<_> = dms
-        .into_iter()
-        .filter(|d| !d.is_outbound(&my_urn))
-        .take(limit)
-        .collect();
-    if json {
-        let out: Vec<_> = rows
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "conversation_urn": d.conversation_urn,
-                    "message_urn": d.message_urn,
-                    "peer_name": d.peer_name,
-                    "text": d.text,
-                    "delivered_at_ms": d.delivered_at_ms,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-    if rows.is_empty() {
-        println!("(no recent inbound LinkedIn DMs)");
-        return Ok(());
-    }
-    for d in &rows {
-        let preview: String = d.text.chars().take(70).collect();
-        println!("{}\n  from: {}\n  {}\n", d.conversation_urn, d.peer_name, preview);
-    }
-    Ok(())
-}
 
 /// #1188 (review) — hard wall-clock bound on one card's best-effort redraw.
 /// serenity's `Http` (like `#500`'s ComposioClient) sets no request timeout,
@@ -13815,28 +13812,49 @@ impl ReplyApprover {
                     message: "no conversationUrn on email; cannot send".into(),
                 };
             };
-            match linkedin.send_message(conv_urn, body).await {
-                Ok(_) => {
-                    let _ = self.store.update_action_status(
-                        action_id,
-                        ActionStatus::Sent,
-                        Some(body),
-                        None,
+            match self.store.claim_action_for_send(action_id, ActionStatus::Pending, "linkedin-approval") {
+                Ok(true) => {}
+                Ok(false) => {
+                    return match self.handle_load(action_id) {
+                        Some(current) => ApprovalActionOutcome::AlreadyResolved {
+                            status: current.action.status, detail: current.action.error_message,
+                        },
+                        None => ApprovalActionOutcome::NotFound,
+                    };
+                }
+                Err(error) => return ApprovalActionOutcome::Failed {
+                    message: format!("could not claim LinkedIn approval: {error}"),
+                },
+            }
+            let send = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                linkedin.send_message(conv_urn, body),
+            ).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let msg = "LinkedIn send timed out after 30s; delivery is unknown. Check the conversation before resending.";
+                    let _ = self.store.finish_send_error(
+                        action_id, msg,
+                        Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
+                        "linkedin-approval",
                     );
-                    let _ = self
-                        .store
-                        .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                    return ApprovalActionOutcome::Failed { message: msg.into() };
+                }
+            };
+            match send {
+                Ok(_) => {
+                    if !matches!(self.store.finish_send_sent(action_id, "linkedin-approval"), Ok(true)) {
+                        return ApprovalActionOutcome::Failed {
+                            message: "LinkedIn accepted the reply, but its receipt could not be recorded; do not resend".into(),
+                        };
+                    }
+                    let _ = self.store.mark_email_processed(&action.email.message_id, TriageResult::Reply);
                     tracing::info!(action_id, "linkedin reply sent via approval handler");
                     ApprovalActionOutcome::Approved
                 }
                 Err(e) => {
                     let msg = format!("linkedin send_message: {e}");
-                    let _ = self.store.update_action_status(
-                        action_id,
-                        ActionStatus::Error,
-                        None,
-                        Some(&msg),
-                    );
+                    let _ = self.store.finish_send_error(action_id, &msg, None, "linkedin-approval");
                     ApprovalActionOutcome::Failed { message: msg }
                 }
             }
@@ -13863,13 +13881,13 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        let _ = self.store.reset_nudge_schedule(action_id);
+        match self.store.revise_pending_action(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(error) => return ApprovalActionOutcome::Failed {
+                message: format!("could not persist LinkedIn revision: {error}"),
+            },
+        }
         tracing::info!(action_id, "linkedin revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -13883,12 +13901,15 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         // Nothing to delete server-side — LinkedIn has no draft concept.
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Rejected,
-            None,
-            Some("skipped by approver"),
-        );
+        match self.store.try_resolve_action(
+            action_id, ActionStatus::Rejected, "linkedin-approval", Some("skipped by approver"),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(error) => return ApprovalActionOutcome::Failed {
+                message: format!("could not skip LinkedIn approval: {error}"),
+            },
+        }
         let _ = self
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -23312,18 +23333,18 @@ mod linkedin_composed_card_dispatch_tests {
                 other => panic!("{label}: schedule must be refused, got {other:?}"),
             }
 
-            // Skip's outcome is `Skipped` on both arms; the tell is that the
-            // platform arms resolve via `update_action_status` (no
-            // `status_source`) while the Gmail arm goes through
-            // `try_resolve_action`, which stamps the deciding surface.
+            // LinkedIn now uses a pending-only transition with its own
+            // source marker. Other platform arms retain their existing
+            // unstamped resolve path; neither may fall through to Gmail.
             assert!(matches!(
                 approver.run_skip(&id).await,
                 ApprovalActionOutcome::Skipped
             ));
             assert_eq!(
                 store.action_status_source(&id).unwrap(),
-                None,
-                "{label}: skip took the Gmail CAS path"
+                augmentagent_channel_linkedin::is_linkedin_email(&email)
+                    .then(|| "linkedin-approval".to_string()),
+                "{label}: skip took the wrong platform resolve path"
             );
         }
     }
@@ -24041,4 +24062,20 @@ pub(crate) mod test_support {
     }
 }
 
+#[cfg(test)]
+mod linkedin_approval_tests;
 
+/// Production read-command dispatch, with reader construction kept outside so
+/// command parsing and routing can be exercised against a local HTTP fixture.
+async fn dispatch_linkedin_read(op: &LinkedinOp, reader: &augmentagent_channel_linkedin::archive::ArchiveReader) -> Result<String> {
+    match op {
+        LinkedinOp::RecentDms { limit, json, category, cursor, max_pages } =>
+            linkedin_archive::recent_output(reader,*limit,*json,category,cursor.as_deref(),*max_pages).await,
+        LinkedinOp::Thread { conversation_urn, cursor, max_pages, json } =>
+            linkedin_archive::thread_output(reader,conversation_urn,cursor.as_deref(),*max_pages,*json).await,
+        _ => anyhow::bail!("not a LinkedIn live read command"),
+    }
+}
+
+#[cfg(test)]
+mod linkedin_read_dispatch_tests;
