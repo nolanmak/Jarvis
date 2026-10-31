@@ -1619,10 +1619,9 @@ pub(super) async fn prepare_resume_worktree(
     branch: &str,
 ) -> Result<PathBuf> {
     anyhow::ensure!(pr > 0, "PR identity required");
-    let path = repo_root
-        .join(".self-improve-worktrees")
-        .join(format!("resume-pr-{pr}"));
-    recovery::checkout_path(repo_root, &path)?;
+    let primary = workspace::primary_root(repo_root).await?;
+    let path = primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
+    recovery::checkout_path(&primary, &path)?;
     let exists = path.try_exists()?;
     if exists {
         recovery::existing_checkout(repo_root, &path).await?;

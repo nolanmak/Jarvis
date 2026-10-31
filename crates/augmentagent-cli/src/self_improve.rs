@@ -5,7 +5,7 @@
 //!
 //! - **Never touches `main`.** A fresh `git worktree` + branch is created per
 //!   attempt. The auto-updater pulls `origin/main`; an in-place edit there
-//!   would corrupt the deploy. We refuse to run if cwd isn't a clean repo.
+//!   would corrupt the deploy. Owned controller checkouts isolate owner edits.
 //! - **Verification gate.** Controller-pinned shared CI checks validate literal
 //!   source snapshots. Hosted-only checks remain explicit exact-head remote
 //!   requirements; missing local prerequisites never count as a passing check.
@@ -73,6 +73,8 @@ mod source_reconcile;
 mod workflow;
 #[path = "self_improve_recovery.rs"]
 mod recovery;
+#[path = "self_improve_workspace.rs"]
+mod workspace;
 #[path = "self_improve_contract.rs"]
 mod acceptance;
 #[path = "self_improve_alignment.rs"]
@@ -4833,11 +4835,10 @@ async fn baseline_failures(
     }
     gate_disk_guard()?;
     let lane = lane_from_env().worktree_name();
-    let worktree = repo_root
-        .join(".self-improve-worktrees")
+    let worktree = workspace::candidate_parent(repo_root).await?
         .join(format!("{lane}-baseline"));
     let branch = format!("agent-baseline/{lane}");
-    reclaim_worktree(repo_root, &worktree, &branch).await;
+    reclaim_worktree(repo_root, &worktree, &branch).await?;
     let (ok, _o, e) = run(
         "git",
         &[
@@ -4862,7 +4863,7 @@ async fn baseline_failures(
     let filters = tests.join(" ");
     info!(%pkg_args, %filters, "baseline check: cargo test on origin/main (sandboxed env)");
     let result = shared_ci::baseline(&worktree, pkgs, tests, audit).await;
-    reclaim_worktree(repo_root, &worktree, &branch).await;
+    reclaim_worktree(repo_root, &worktree, &branch).await?;
     let (_ok, out, err) = result?;
     let text = format!("{out}{err}");
     if text.contains("could not compile") || text.contains("error: package ID specification") {
@@ -4998,11 +4999,10 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
     // Outer `Err`: with no room to build, the gate was not run at all.
     gate_disk_guard()?;
     let lane = lane_from_env().worktree_name();
-    let worktree = repo_root
-        .join(".self-improve-worktrees")
+    let worktree = workspace::candidate_parent(repo_root).await?
         .join(format!("{lane}-baseline"));
     let branch = format!("agent-baseline/{lane}");
-    reclaim_worktree(repo_root, &worktree, &branch).await;
+    reclaim_worktree(repo_root, &worktree, &branch).await?;
     let (ok, _o, e) = run(
         "git",
         &[
@@ -5019,7 +5019,7 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
         bail!("baseline: worktree add from origin/main failed: {e}");
     }
     let verdict = verification_gate(&worktree, &standalone_resource_audit(&worktree)?).await;
-    reclaim_worktree(repo_root, &worktree, &branch).await;
+    reclaim_worktree(repo_root, &worktree, &branch).await?;
     Ok(verdict)
 }
 
@@ -7267,36 +7267,28 @@ async fn resume_draft_pr(
     outcome
 }
 
-/// Force the pipeline's fixed worktree path back to a usable state before a
-/// fresh `git worktree add`.
-///
-/// `git worktree remove` only acts on a *registered* worktree. A run killed
-/// mid-flight (daemon restart, OOM, `kill`) can leave the directory behind
-/// with a stale or absent `.git/worktrees` entry — `remove` then fails, and
-/// the `add` that follows refuses an existing path, so every later tick dies
-/// in the same place. Nothing here is recoverable state: the path is
-/// pipeline-owned and the branch is re-created from `origin/main`, so the
-/// unconditional `remove_dir_all` is safe and is what makes a crashed run
-/// self-healing instead of permanently wedging the loop.
-async fn reclaim_worktree(repo_root: &Path, worktree: &Path, branch: &str) {
-    let _ = run(
-        "git",
-        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
-        repo_root,
-    )
-    .await;
-    let _ = run("git", &["branch", "-D", branch], repo_root).await;
-    if worktree.exists() {
-        if let Err(e) = tokio::fs::remove_dir_all(worktree).await {
-            warn!(
-                path = %worktree.display(),
-                "could not reclaim stale self-improve worktree: {e}"
-            );
-        }
-    }
-    // Drop any registration left pointing at the path we just deleted;
-    // without this `worktree add` reports it as already checked out.
-    let _ = run("git", &["worktree", "prune"], repo_root).await;
+/// Reclaim only clean, registered, detached baseline worktrees.
+async fn reclaim_worktree(repo_root: &Path, worktree: &Path, branch: &str) -> Result<()> {
+    let primary = workspace::primary_root(repo_root).await?;
+    recovery::checkout_path(&primary, worktree)?;
+    if !worktree.try_exists()? { return Ok(()); }
+    // Only disposable baseline checkouts are reclaimed here. Candidates use
+    // durable recovery; unknown paths and dirty/unmerged work are never erased.
+    anyhow::ensure!(matches!(branch, "agent-baseline/current" | "agent-baseline/resume"),
+        "not a disposable baseline checkout; preserved");
+    anyhow::ensure!(worktree == workspace::candidate_parent(repo_root).await?
+        .join(format!("{}-baseline", branch.trim_start_matches("agent-baseline/"))),
+        "unexpected baseline path; preserved");
+    recovery::existing_checkout(repo_root, worktree).await?;
+    let (attached, _, _) = run("git", &["symbolic-ref", "--quiet", "HEAD"], worktree).await?;
+    anyhow::ensure!(!attached, "baseline is attached to a branch; preserved");
+    let (ok, status, _) = run("git", &["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"], worktree).await?;
+    anyhow::ensure!(ok && status.trim().is_empty(), "baseline contains unfinished work; preserved");
+    let (merged, _, _) = run("git", &["merge-base", "--is-ancestor", "HEAD", "origin/main"], worktree).await?;
+    anyhow::ensure!(merged, "baseline has unmerged commits; preserved");
+    let (ok, _, error) = run("git", &["worktree", "remove", &worktree.to_string_lossy()], repo_root).await?;
+    anyhow::ensure!(ok, "baseline cleanup refused: {}", truncate(&error, 400));
+    Ok(())
 }
 
 /// #816 — process-wide single-flight guard for the pipeline.
@@ -7531,18 +7523,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     };
     note_current_issue(0); // This run has not committed to an issue yet (#954).
 
-    // Refuse to run from a dirty tree / detached state — protects the deploy.
-    let (ok, status_out, _) = run("git", &["status", "--porcelain"], repo_root).await?;
-    if !ok {
-        bail!("not a git repo at {}", repo_root.display());
-    }
-    let dirty_status = unmanaged_dirty_status(&status_out);
-    if !dirty_status.is_empty() {
-        bail!(
-            "refusing to self-improve from a dirty working tree \
-             (commit/stash first):\n{dirty_status}"
-        );
-    }
+    // Deployment evidence above deliberately uses the real deploy root. All
+    // subsequent execution uses a clean controller pinned to fetched main;
+    // the controller lock lives until this whole attempt returns. Candidate
+    // locations remain stable through the shared Git repository.
+    let controller = if dry_run { None } else {
+        let lane = if lane_from_env() == Lane::Resume { "resume" } else { "build" };
+        Some(workspace::prepare(repo_root, lane).await?)
+    };
+    let repo_root = controller.as_ref().map_or(repo_root, |controller| controller.root.as_path());
 
     // #931/#932 — a red `main` fails every gate identically, so it is the
     // loop's first issue: file it (once per SHA), run the ordinary pipeline
@@ -7730,8 +7719,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     reasoner.track_review_history(repo_root, &branch, false)?;
     // Keep each issue's checkout stable across interruption. Other issues can
     // advance without deleting this candidate or its compiler fixture paths.
-    let worktree = repo_root
-        .join(".self-improve-worktrees")
+    let worktree = workspace::candidate_parent(repo_root).await?
         .join(format!("{}-issue-{}", lane_from_env().worktree_name(), issue.number));
     recovery::prepare(repo_root, &worktree, &branch).await?;
     let repository = workflow::canonical_repository(repo_root).await?;
@@ -9318,6 +9306,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 /// The pipeline owns this untracked worktree. It must not make the deploy
 /// appear dirty after a failed or interrupted attempt; every other porcelain
 /// entry remains a hard safety stop.
+#[cfg(test)]
 fn unmanaged_dirty_status(status: &str) -> String {
     status
         .lines()
@@ -11680,8 +11669,21 @@ impl AutoPrLoop {
         }, move || {
             let root = sweep_root.clone();
             async move {
-                let merged=merge_sweep(&root,dry_run).await;
-                if let Err(error)=legacy_readmission::sweep(&root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
+                // Unknown remote mutations must reconcile even when controller
+                // preparation is temporarily unavailable. This path reads Git
+                // identity and remote evidence without editing the owner tree.
+                if let Err(error) = publication::reconcile_merge_dispatches(&root, dry_run).await {
+                    warn!("merge dispatch reconciliation unavailable: {error:#}");
+                }
+                let controller = if dry_run { None } else {
+                    match workspace::prepare(&root, "sweep").await {
+                        Ok(controller) => Some(controller),
+                        Err(error) => { warn!("sweep controller unavailable: {error:#}"); return 0; }
+                    }
+                };
+                let root = controller.as_ref().map_or(root.as_path(), |controller| controller.root.as_path());
+                let merged=merge_sweep(root,dry_run).await;
+                if let Err(error)=legacy_readmission::sweep(root,None,dry_run).await {warn!("legacy hold readmission deferred: {error:#}");}
                 merged
             }
         });
@@ -11824,8 +11826,7 @@ impl AutoPrLoop {
                             break;
                         }
                     }
-                    // Transient refusals (dirty deploy tree while a sibling
-                    // session works, gh/network hiccup) — try next tick.
+                    // Transient controller or network failures retry next tick.
                     Err(e) => {
                         warn!("auto-PR tick failed: {e:#}");
                         break;
@@ -14383,7 +14384,7 @@ CODEX-REVIEW: lgtm").0);
     // ---- #812: a crashed run must not wedge the loop forever ----
 
     #[tokio::test]
-    async fn reclaim_clears_an_unregistered_leftover_worktree_dir() {
+    async fn reclaim_preserves_an_unregistered_leftover_worktree_dir() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let git = |args: &[&str]| {
@@ -14418,16 +14419,9 @@ CODEX-REVIEW: lgtm").0);
             "precondition: worktree add refuses the existing path"
         );
 
-        reclaim_worktree(repo, &worktree, "agent-fix/issue-1").await;
-
-        assert!(!worktree.exists(), "the leftover directory must be gone");
-        assert!(
-            add(&["worktree", "add", "-b", "agent-fix/issue-1",
-                  &worktree.to_string_lossy(), "main"])
-                .status
-                .success(),
-            "after reclaim the pipeline must be able to create its worktree again"
-        );
+        assert!(reclaim_worktree(repo, &worktree, "agent-fix/issue-1").await.is_err());
+        assert!(worktree.exists(), "unregistered data must be preserved");
+        assert_eq!(std::fs::read_to_string(worktree.join("half-written.rs")).unwrap(), "fn main() {}\n");
     }
 
     #[test]

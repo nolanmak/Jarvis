@@ -45,7 +45,7 @@ pub(super) fn checkout_path(root: &Path, worktree: &Path) -> Result<()> {
 /// Git searches parent directories by default. Require an exact registered
 /// linked worktree, not merely a directory that resolves to the same Git repo.
 pub(super) async fn existing_checkout(root: &Path, worktree: &Path) -> Result<()> {
-    checkout_path(root, worktree)?;
+    checkout_path(&workspace::primary_root(root).await?, worktree)?;
     let (ok, top, _) = run("git", &["rev-parse", "--show-toplevel"], worktree).await?;
     anyhow::ensure!(
         ok && Path::new(top.trim()).canonicalize()? == worktree.canonicalize()?,
@@ -82,7 +82,7 @@ pub(super) async fn existing_checkout(root: &Path, worktree: &Path) -> Result<()
 }
 
 pub(super) async fn prepare(root: &Path, worktree: &Path, branch: &str) -> Result<()> {
-    checkout_path(root, worktree)?;
+    checkout_path(&workspace::primary_root(root).await?, worktree)?;
     let (valid, _, error) = run("git", &["check-ref-format", "--branch", branch], root).await?;
     anyhow::ensure!(valid, "invalid recovery branch: {error}");
     if worktree.symlink_metadata().is_ok() {
