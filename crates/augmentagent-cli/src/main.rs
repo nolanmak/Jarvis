@@ -8910,17 +8910,24 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
         // old reply supersede every future draft the daemon makes for newer
         // inbounds on that thread, silently, before the owner can act — exactly
         // the false "Already resolved (superseded)." the user reported. This
-        // mirrors the inbound triage gate (#218): parse `receivedAt`, and fall
-        // back to `i64::MAX` (retire on nothing) when the arrival is unknown or
-        // unparseable, so a bad date never over-retires.
+        // mirrors the inbound triage gate (#218): parse `receivedAt`. When the
+        // arrival is unknown or unparseable, fall back to the card's own
+        // `createdAt` — a card is always raised after its inbound arrived, so a
+        // reply after it is after the inbound too and can't over-retire.
+        //
+        // "Replied" includes a card the owner approved and the daemon sent on
+        // the same thread: approving the newest draft answers the older
+        // inbounds too, and the OutboundObserver deliberately never logs our
+        // own sends as manual replies, so without this every older sibling
+        // card stayed in the queue after the owner had answered.
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
         let after_ms = match row.received_at.as_deref().map(parse_rfc2822_or_ms) {
             Some(ms) if ms > 0 => ms,
-            _ => i64::MAX,
+            _ => row.created_at_ms,
         };
-        match store.thread_has_user_reply_after(tid, after_ms) {
+        match store.thread_has_owner_send_after(tid, after_ms) {
             Ok(true) => {
                 info!(
                     action_id = %row.id,
@@ -8934,7 +8941,7 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             Err(e) => warn!(
                 action_id = %row.id,
                 thread = %tid,
-                "stale approval: thread_has_user_reply_after failed: {e:#}"
+                "stale approval: thread_has_owner_send_after failed: {e:#}"
             ),
         }
     }
@@ -22287,6 +22294,69 @@ mod stale_reconcile_tests {
             "pending",
             "the card for the inbound that arrived AFTER the reply must survive"
         );
+    }
+
+    /// The owner answers a thread by approving the NEWEST card; the daemon
+    /// sends it and records it in `self_sent_messages` (never in
+    /// `outbound_thread_log`). The older card on that thread, drafted for an
+    /// inbound the send has now answered, must retire — it used to sit in the
+    /// queue forever. A card for an inbound arriving after the send survives.
+    #[test]
+    fn reconcile_retires_older_cards_once_a_sibling_card_was_sent() {
+        let (store, _t) = fresh_store();
+        let older = seed_pending_dated(
+            &store,
+            "m-old",
+            Some("T-sent"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "2026-01-01T00:00:00Z",
+        );
+        // Sent "now" (2026+ wallclock) — after `older`'s inbound.
+        store
+            .record_self_sent_message("sent-1", Some("T-sent"), Some("acc"), Some("approved-card"))
+            .unwrap();
+        let later = seed_pending_dated(
+            &store,
+            "m-later",
+            Some("T-sent"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "2099-01-01T00:00:00Z",
+        );
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(status_of(&store, &older), "superseded");
+        assert_eq!(
+            status_of(&store, &later),
+            "pending",
+            "a card for mail that arrived after the send is still unanswered"
+        );
+    }
+
+    /// A card whose inbound has no usable `receivedAt` is bounded by its own
+    /// `createdAt` instead of never retiring: a reply before the card was
+    /// raised leaves it alone, a reply after it retires it.
+    #[test]
+    fn reconcile_rule1_falls_back_to_card_creation_when_inbound_date_is_unknown() {
+        let (store, _t) = fresh_store();
+        let card = seed_pending_dated(
+            &store,
+            "m-undated",
+            Some("T-undated"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "",
+        );
+        store
+            .record_outbound_thread_event("acc", "before-card", Some("T-undated"), 9_000_000)
+            .unwrap();
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(status_of(&store, &card), "pending");
+
+        store
+            .record_outbound_thread_event("acc", "after-card", Some("T-undated"), 4_000_000_000_000)
+            .unwrap();
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
+        assert_eq!(status_of(&store, &card), "superseded");
     }
 
     // ---- #1203: recompose durability + per-row scoping ----
