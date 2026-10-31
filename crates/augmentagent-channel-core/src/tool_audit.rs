@@ -371,9 +371,45 @@ impl std::fmt::Debug for AuditLogger {
 impl AuditLogger {
     /// Healthy runtime ownership handoff, distinct from interrupted recovery.
     pub fn handoff_evidence(&self,request_sha256:&str,destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
-        let _=request_sha256;
-        self.recovery_evidence(destination.lease_generation)
+        anyhow::ensure!(request_sha256.len()==64 && request_sha256.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid handoff request digest");
+        let source=self.native_runtime_owner()?.ok_or_else(||anyhow::anyhow!("handoff source authority missing"))?;
+        anyhow::ensure!(source.workflow_id==destination.workflow_id && destination.lease_generation>source.lease_generation,"handoff requires a newer owner of the same workflow");
+        let sink=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("handoff requires protected audit"))?;
+        let context=serde_json::json!({"version":1,"request_sha256":request_sha256,
+            "source":source,"destination":destination,"source_audit_path":self.path});
+        sink.seal_for_handoff(&context,|rows| {
+            self.protected_writer_health()?;
+            let generation=rows.iter().filter(|r|r["actor"]=="controller")
+                .filter_map(|r|r["generation"].as_i64()).max()
+                .ok_or_else(||anyhow::anyhow!("previous workflow lease evidence missing"))?;
+            anyhow::ensure!(generation==source.lease_generation,"handoff source generation differs from audit");
+            anyhow::ensure!(rows.iter().all(|r|r.get("workflow").is_none() || r["workflow"]==source.workflow_id),"foreign workflow in handoff audit");
+            let required=rows.iter().position(|r|r["actor"]=="controller" && r["kind"]=="run_resources_required")
+                .ok_or_else(||anyhow::anyhow!("durable required resource policy missing"))?;
+            let mut resources=std::collections::BTreeMap::new();
+            for (index,row) in rows.iter().enumerate() {
+                if row["kind"]=="run_resource_admitted" {
+                    anyhow::ensure!(row["actor"]=="controller" && index>required,"unprotected resource admission");
+                    let identity=&row["observation"]["identity"];
+                    anyhow::ensure!(identity.is_object(),"resource identity missing");
+                    let provider=row["provider"].as_str().ok_or_else(||anyhow::anyhow!("resource provider missing"))?;
+                    let key=crate::native_vm::ownership::canonical_bytes(identity)?;
+                    anyhow::ensure!(resources.insert(key,(identity.clone(),provider.to_string(),false)).is_none(),"duplicate resource admission");
+                }
+                if row["kind"]=="model_call_admitted" {
+                    anyhow::ensure!(row["actor"]=="controller" && index>required && row["admission_schema_version"]==2,"unbound legacy model admission");
+                    let key=crate::native_vm::ownership::canonical_bytes(&row["resource_identity"])?;
+                    let (_,provider,used)=resources.get_mut(&key).ok_or_else(||anyhow::anyhow!("model admission has no preceding resource identity"))?;
+                    anyhow::ensure!(!*used && row["actual_provider"]==*provider,"model/resource admission mismatch");
+                    *used=true;
+                }
+            }
+            let proofs=resources.values().map(|(identity,_,_)|crate::run_resources::verify_quiescent(identity)).collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(serde_json::json!({"previous_lease_generation":generation,"quiescent_resources":proofs}))
+        })
     }
+
+    pub(crate) fn protected_anchor_path(&self)->Option<&Path> {self.anchored.as_ref().map(|sink|sink.anchor_path())}
     /// Seal a failed generation only after a new fenced workflow lease and
     /// independent kernel proof that no admitted worker remains alive.
     pub fn recovery_evidence(&self, new_lease_generation: i64) -> anyhow::Result<serde_json::Value> {
@@ -693,6 +729,15 @@ impl AuditLogger {
     }
 
     pub fn protected_health(&self) -> anyhow::Result<()> {
+        self.protected_writer_health()?;
+        let result = self.anchored.as_ref().unwrap().append(serde_json::json!({
+            "actor": "controller", "kind": "audit_integrity_check"
+        }));
+        if result.is_err() {self.mark_failed();}
+        result
+    }
+
+    fn protected_writer_health(&self)->anyhow::Result<()> {
         anyhow::ensure!(self.anchored.is_some(), "protected audit required");
         anyhow::ensure!(
             !self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
@@ -711,13 +756,7 @@ impl AuditLogger {
                 "workflow audit has interrupted writer receipts"
             );
         }
-        let result = self.anchored.as_ref().unwrap().append(serde_json::json!({
-            "actor": "controller", "kind": "audit_integrity_check"
-        }));
-        if result.is_err() {
-            self.mark_failed();
-        }
-        result
+        Ok(())
     }
 
     /// The process-wide logger every preset shares (#1004). One instance so
@@ -1403,14 +1442,72 @@ mod tests {
         let proof=logger.handoff_evidence(&request,&destination).expect("healthy runtime has no handoff seal path");
         assert_eq!(proof["validation"]["handoff_context"]["request_sha256"],request);
         assert!(logger.record_controller(serde_json::json!({"actor":"controller","kind":"late"})).is_err());
+        assert!(logger.protected_health().is_err()); // A late health append is also closed.
+        assert!(logger.failure_path.as_ref().unwrap().exists());
         let sealed_bytes=std::fs::read(&anchor).unwrap();
         let reopened=AuditLogger::protected(log.clone(),anchor.clone(),&[]).unwrap();
         reopened.set_native_runtime_owner(source).unwrap();
         assert_eq!(reopened.handoff_evidence(&request,&destination).unwrap(),proof);
         assert_eq!(std::fs::read(&anchor).unwrap(),sealed_bytes,"replay rewrote the sealed anchor");
         assert!(reopened.handoff_evidence(&"b".repeat(64),&destination).is_err());
+        assert!(reopened.handoff_evidence(&request,&crate::native_vm::RuntimeOwner {lease_generation:3,..destination.clone()}).is_err());
         std::fs::write(log,b"changed committed audit").unwrap();
         assert!(reopened.handoff_evidence(&request,&destination).is_err(),"replay accepted modified committed bytes");
+    }
+
+    fn handoff_fixture()->(tempfile::TempDir,AuditLogger,crate::native_vm::RuntimeOwner,PathBuf) {
+        let (dir,logger,_,anchor)=protected_fixture();
+        let source=crate::native_vm::RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1};
+        logger.set_native_runtime_owner(source.clone()).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":"workflow","generation":1})).unwrap();
+        logger.require_run_resources().unwrap();
+        (dir,logger,crate::native_vm::RuntimeOwner {lease_generation:2,..source},anchor)
+    }
+
+    fn completed_resource_identity()->serde_json::Value {
+        use sha2::{Digest,Sha256};
+        serde_json::json!({"host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
+            "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+            "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1,"limits":{}})
+    }
+
+    #[test]
+    fn healthy_handoff_verifies_correlated_kernel_resource_evidence() {
+        let (_dir,logger,destination,_)=handoff_fixture();
+        let identity=completed_resource_identity();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
+        logger.model_call_admitted_in_scope("codex",&identity).unwrap();
+        let proof=logger.handoff_evidence(&"a".repeat(64),&destination).unwrap();
+        let observations=proof["validation"]["observation"]["quiescent_resources"].as_array().unwrap();
+        assert_eq!(observations.len(),1);
+        assert_eq!(observations[0]["identity"],identity);
+        assert_eq!(observations[0]["verified_state"],"removed_empty_subtree");
+    }
+
+    #[test]
+    fn healthy_handoff_never_seals_ambiguous_or_unsettled_evidence() {
+        for case in ["pending","interrupted","legacy","orphan","provider","duplicate","forged-host","foreign-workflow"] {
+            let (_dir,logger,destination,anchor)=handoff_fixture();
+            let mut identity=completed_resource_identity();
+            if case=="forged-host" {identity["host_sha256"]="0".repeat(64).into();}
+            let ticket=if case=="pending" {Some(logger.begin_write().unwrap())} else {None};
+            if case=="interrupted" {drop(logger.begin_write().unwrap());}
+            if ["legacy","provider","duplicate","forged-host"].contains(&case) {
+                logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
+            }
+            match case {
+                "legacy"=>logger.model_call_admitted("codex").unwrap(),
+                "provider"=>logger.model_call_admitted_in_scope("claude",&identity).unwrap(),
+                "orphan"|"forged-host"=>logger.model_call_admitted_in_scope("codex",&identity).unwrap(),
+                "duplicate"=>{logger.model_call_admitted_in_scope("codex",&identity).unwrap();logger.model_call_admitted_in_scope("codex",&identity).unwrap();},
+                "foreign-workflow"=>logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture","workflow":"foreign"})).unwrap(),
+                _=>{},
+            }
+            assert!(logger.handoff_evidence(&"a".repeat(64),&destination).is_err(),"accepted {case}");
+            let persisted:serde_json::Value=serde_json::from_slice(&std::fs::read(anchor).unwrap()).unwrap();
+            assert!(persisted["sealed"].is_null(),"invalid evidence sealed the source: {case}");
+            drop(ticket);
+        }
     }
 
     #[tokio::test]

@@ -136,13 +136,46 @@ impl AnchoredAudit {
     /// same lock as writers. A retry returns the identical immutable proof.
     pub fn seal_for_recovery<F>(&self, validate: F) -> Result<serde_json::Value>
     where F: FnOnce(&[serde_json::Value]) -> Result<serde_json::Value> {
+        let (_lock,mut anchor,rows,_)=self.locked_snapshot()?;
+        let validation = validate(&rows)?;
+        if let Some(proof) = anchor.sealed { return Ok(proof); }
+        let proof = serde_json::json!({"version":1,"committed_sha256":anchor.hash,
+            "committed_bytes":anchor.bytes,"sequence":anchor.sequence,
+            "interrupted_append":anchor.pending,"validation":validation});
+        anchor.sealed = Some(proof.clone());
+        self.save(&anchor)?;
+        Ok(proof)
+    }
+
+    /// Healthy handoff replay reads the immutable seal before inspecting any
+    /// later rejected writers. It cannot seal a pending or damaged append.
+    pub(crate) fn seal_for_handoff<F>(&self,context:&serde_json::Value,validate:F)->Result<serde_json::Value>
+    where F:FnOnce(&[serde_json::Value])->Result<serde_json::Value> {
+        let (_lock,mut anchor,rows,clean)=self.locked_snapshot()?;
+        ensure!(clean,"healthy handoff requires a fully committed audit");
+        if let Some(proof)=&anchor.sealed {
+            ensure!(proof["version"]==1 && proof["validation"]["handoff_context"]==*context
+                && proof["committed_sha256"]==anchor.hash && proof["committed_bytes"]==anchor.bytes
+                && proof["sequence"]==anchor.sequence,"audit seal belongs to another handoff");
+            return Ok(proof.clone());
+        }
+        let observation=validate(&rows)?;
+        let proof=serde_json::json!({"version":1,"committed_sha256":anchor.hash,
+            "committed_bytes":anchor.bytes,"sequence":anchor.sequence,
+            "validation":{"handoff_context":context,"observation":observation}});
+        anchor.sealed=Some(proof.clone());self.save(&anchor)?;Ok(proof)
+    }
+
+    pub(crate) fn anchor_path(&self)->&Path {&self.anchor}
+
+    fn locked_snapshot(&self)->Result<(File,Anchor,Vec<serde_json::Value>,bool)> {
         let lock = private_open(&self.anchor.with_extension("lock"), false)?;
         #[cfg(unix)]
         ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "audit lock failed");
         ensure!(self.anchor.exists() && self.log.exists(), "recovery requires existing audit evidence");
         let file = private_open(&self.anchor, false)?;
         ensure!(file.metadata()?.len() <= LIMIT, "anchor exceeds budget");
-        let mut anchor: Anchor = serde_json::from_reader(file)?;
+        let anchor: Anchor = serde_json::from_reader(file)?;
         ensure!(anchor.version == 1, "unsupported anchor");
         let mut file = private_open(&self.log, false)?;
         ensure!(file.metadata()?.len() <= LIMIT, "audit exceeds budget");
@@ -156,14 +189,8 @@ impl AnchoredAudit {
         ensure!(match &anchor.pending { Some(p) => p.as_bytes().starts_with(tail), None => tail.is_empty() }, "unrecognized audit tail");
         let rows = committed.split(|b| *b == b'\n').filter(|r| !r.is_empty())
             .map(serde_json::from_slice).collect::<std::result::Result<Vec<serde_json::Value>, _>>()?;
-        let validation = validate(&rows)?;
-        if let Some(proof) = anchor.sealed { return Ok(proof); }
-        let proof = serde_json::json!({"version":1,"committed_sha256":anchor.hash,
-            "committed_bytes":anchor.bytes,"sequence":anchor.sequence,
-            "interrupted_append":anchor.pending,"validation":validation});
-        anchor.sealed = Some(proof.clone());
-        self.save(&anchor)?;
-        Ok(proof)
+        let clean=anchor.pending.is_none() && tail.is_empty();
+        Ok((lock,anchor,rows,clean))
     }
     fn append_locked(&self, mut record: serde_json::Value) -> Result<()> {
         let mut anchor = if self.anchor.exists() {
