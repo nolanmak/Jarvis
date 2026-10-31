@@ -387,7 +387,8 @@ impl OwnerSurface {
                                 | crate::custom_id::Verb::Recompose
                                 | crate::custom_id::Verb::CalendarDecline
                         ) {
-                            return self.post_state_card(&custom.action_id);
+                            self.post_state_card(&custom.action_id)?;
+                            return self.mirror_card_files(message, binding.revision);
                         }
 
                         if matches!(
@@ -402,11 +403,12 @@ impl OwnerSurface {
                                 .map_err(|e| ApprovalError::Discord(e.to_string()))?
                             {
                                 if action.action.status == "pending" {
-                                    return self.post_card(
+                                    self.post_card(
                                         &custom.action_id,
                                         &action.email,
                                         action.action.draft_body.as_deref().unwrap_or(""),
-                                    );
+                                    )?;
+                                    return self.mirror_card_files(message, binding.revision);
                                 }
                             }
                         }
@@ -478,6 +480,35 @@ impl OwnerSurface {
                 message.id
             ),
             &text,
+        )
+    }
+    /// The canonical text card and the original Discord files have separate
+    /// transport origins. File links carry no action association or authority.
+    fn mirror_card_files(
+        &self,
+        message: &serenity::all::Message,
+        revision: i64,
+    ) -> Result<(), ApprovalError> {
+        if message.attachments.is_empty() {
+            return Ok(());
+        }
+        let mut body = format!(
+            "Files on the original Discord approval card: {}\n",
+            message.link()
+        );
+        for file in &message.attachments {
+            body.push_str(&format!("{}: {}\n", file.filename, file.url));
+        }
+        body.push_str("Review the files in Discord. Approve only the draft card or its Ref; this file-link message is not an approval card.");
+        self.output(
+            revision,
+            &format!(
+                "discord-files:{}:{}:{}",
+                message.channel_id,
+                message.id,
+                crate::interaction::draft_revision(&body)
+            ),
+            &body,
         )
     }
     pub fn new(store: Arc<Store>) -> Self {

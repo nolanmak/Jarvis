@@ -472,3 +472,45 @@ async fn native_send_completion_is_reconciled_without_a_discord_event() {
         "a resolution notice is not an approvable card"
     );
 }
+
+#[tokio::test]
+async fn approval_files_keep_their_original_links_without_becoming_approval_targets() {
+    use serenity::all::{ChannelId, GuildId, Message, MessageId, UserId};
+    let (s, surface, runtime, a, email) = fixture();
+    let b = s.imessage_owner_binding().unwrap().unwrap();
+    let mut message = Message::default();
+    message.id = MessageId::new(((b.activated_at_ms as u64 + 1000 - 1_420_070_400_000) << 22) + 1);
+    message.channel_id = ChannelId::new(11);
+    message.guild_id = Some(GuildId::new(20));
+    message.author.id = UserId::new(99);
+    message.author.bot = true;
+    let card = serde_json::to_value(augmentagent_approval_discord::approval_message(
+        &a, &email, "hello", 0,
+    ))
+    .unwrap();
+    message.components = serde_json::from_value(card["components"].clone()).unwrap();
+    message.attachments=serde_json::from_value(serde_json::json!([{"id":"123","filename":"review.pdf","size":10,
+        "url":"https://cdn.example.invalid/review.pdf","proxy_url":"https://cdn.example.invalid/review.pdf"}])).unwrap();
+    surface.mirror_discord(&message, None, None).unwrap();
+    surface.mirror_discord(&message, None, None).unwrap();
+    assert_eq!(s.list_imessage_outbox(100).unwrap().len(), 2);
+    let file_notice = deliver(&s);
+    let row = s
+        .list_imessage_outbox(100)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.message_guid.as_deref() == Some(&file_notice))
+        .unwrap();
+    assert!(row.body.contains("https://cdn.example.invalid/review.pdf"));
+    assert!(row.body.contains(&message.link()));
+    input(&s, 1, "like_add", "", Some(file_notice));
+    surface
+        .dispatch_one(&runtime, &runtime, AuditCtx::empty())
+        .await
+        .unwrap();
+    assert_eq!(runtime.effects.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        s.get_action_with_email(&a).unwrap().unwrap().action.status,
+        "pending"
+    );
+}

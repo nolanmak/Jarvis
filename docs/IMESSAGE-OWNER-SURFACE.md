@@ -235,7 +235,10 @@ publish them in gateway history. Reconnect catch-up follows durable per-channel
 cursors, discovers active/public archived/joined-private threads, and rereads a
 recent edit window, plus a rotating check of older known messages. Original messages before enrollment do not replay; a later
 edit can produce an update. Attachment URLs retain Discord's access/expiry rules;
-native iMessage media transfer is not included.
+native iMessage media transfer is not included. Approval-card attachments are
+forwarded as a separately keyed original-card/file link notice rather than a
+raw duplicate card. Link notices carry no action association and cannot authorize
+an approval; native replies/reactions must target the actual draft presentation.
 
 A disabled mirror is excluded from fan-out success accounting. Action completion is also reconciled from stored state every fifteen seconds,
 including Mac sender and dashboard transitions that do not create a Discord
