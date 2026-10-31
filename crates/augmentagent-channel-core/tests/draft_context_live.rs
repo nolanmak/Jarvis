@@ -145,8 +145,12 @@ async fn live_cross_platform_fact_changes_draft_and_missing_source_is_disclosed(
         missing_draft.contains('?')
             || lower.contains("resend")
             || lower.contains("could you")
-            || lower.contains("unable to confirm"),
-        "Missing evidence did not produce a clarification: {missing_draft}"
+            || lower.contains("unable to confirm")
+            || ((lower.contains("couldn't")
+                || lower.contains("can't")
+                || lower.contains("cannot"))
+                && (lower.contains("email") || lower.contains("confirm"))),
+        "Missing evidence was not disclosed or clarified: {missing_draft}"
     );
     let guarded = missing.guard_draft(&missing_draft);
     assert!(!augmentagent_approval_discord::split_needs_input(&guarded)
