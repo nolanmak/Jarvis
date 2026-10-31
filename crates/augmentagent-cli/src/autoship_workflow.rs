@@ -15,6 +15,8 @@ pub(crate) mod progress;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_conversations.rs"]
+mod conversations;
 #[path = "autoship_owner_turn.rs"]
 pub(crate) mod owner_turn;
 #[path = "autoship_owner_inbox.rs"]
@@ -315,6 +317,13 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_session_owner (
+                provider TEXT NOT NULL, native_session TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES workflow(id),
+                PRIMARY KEY(provider,native_session));
+            CREATE TABLE IF NOT EXISTS workflow_builder_conversation (
+                workflow TEXT NOT NULL REFERENCES workflow(id), provider TEXT NOT NULL, native_session TEXT NOT NULL,
+                uncertain INTEGER NOT NULL, binding TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(workflow,provider), UNIQUE(provider,native_session));
             CREATE TABLE IF NOT EXISTS workflow_owner_turn (
                 workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
                 owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,

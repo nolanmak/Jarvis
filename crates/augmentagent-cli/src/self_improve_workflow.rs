@@ -881,11 +881,14 @@ impl WorkflowGuard {
         sessions: &augmentagent_channel_core::native_session::FreshBuilderSessions,
     ) -> Result<()> {
         self.validate_before_side_effect()?;
-        let observations: Vec<_> = sessions.observed().into_iter().map(|s|serde_json::json!({"provider":s.provider.name(),"native_session":s.id,"uncertain":s.uncertain})).collect();
+        let observed=sessions.observed();
+        let observations: Vec<_> = observed.iter().map(|s|serde_json::json!({"provider":s.provider.name(),"native_session":s.id,"uncertain":s.uncertain})).collect();
         self.audit_event(
             "episode_native_conversations",
             serde_json::json!({"observed":observations}),
-        )
+        )?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store poisoned"))?
+            .record_builder_conversations(&self.lease,&self.binding,&observed,millis())
     }
 
     pub(super) fn episode_review_at_head(
