@@ -1656,7 +1656,7 @@ enum ImessageOp {
     AllowInbound { identifier: String },
     /// Stop drafting reply cards for a conversation.
     DenyInbound { identifier: String },
-    /// Owner policy for existing and future one-to-one iMessage contacts.
+    /// Owner policy for existing and future iMessage conversations, groups included.
     /// Every outgoing message still requires approval; explicit denials win.
     ContactDefaults {
         #[arg(long, required = true, action = clap::ArgAction::Set)]
