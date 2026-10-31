@@ -170,6 +170,9 @@ fn observation_capacity(conn: &Connection, now_ms: i64, required: u64, cap: u64,
     Ok((!shipping || allow_shipping) && required > 0 && used.checked_add(reserved).and_then(|n|n.checked_add(required)).is_some_and(|total| total <= cap))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimPurpose { General, Productive, MergeReconciliation }
+
 pub struct WorkflowStore {
     conn: Connection,
 }
@@ -557,13 +560,16 @@ impl WorkflowStore {
         Ok(inserted)
     }
 
-    /// Returns None for an occupied/not-yet-eligible/terminal workflow. Claims
-    /// increment a fencing generation even when the same owner resumes.
-    /// Productive workers cannot restart command-owned holds or spend models on
-    /// work awaiting free reconciliation. Recheck inside the claim transaction;
-    /// an earlier status projection is not authorization to resume.
+    /// Free merge reconciliation preserves command holds and merge ceilings.
+    /// Eligibility and ownership are checked atomically with the new lease.
+    pub fn claim_reconciliation(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::MergeReconciliation)
+    }
+
+    /// Productive workers cannot restart command holds or spend models on work
+    /// awaiting free reconciliation. A stale preview cannot authorize a claim.
     pub fn claim_productive(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, true)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::Productive)
     }
 
     pub fn claim(
@@ -573,10 +579,10 @@ impl WorkflowStore {
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<Option<Lease>> {
-        self.claim_inner(workflow, owner, now_ms, ttl_ms, false)
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::General)
     }
 
-    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, productive: bool) -> Result<Option<Lease>> {
+    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, purpose: ClaimPurpose) -> Result<Option<Lease>> {
         ensure!(
             !owner.is_empty() && ttl_ms > 0,
             "owner and positive lease ttl required"
@@ -596,12 +602,15 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
-        if productive {
-            let commanded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)", [workflow], |r| r.get(0))?;
-            if commanded {
+        if purpose != ClaimPurpose::General {
+            let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
+            if let Some(policy) = policy {
+                let until: submission::Milestone = serde_json::from_str(&policy)?;
                 let pending_merge: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operation o LEFT JOIN merge_allowance_dispatch d ON d.operation=o.id WHERE o.workflow=?1 AND o.kind=?2 AND (o.receipt IS NULL OR d.state='dispatched'))",
                     params![workflow, serde_json::to_string(&OperationKind::MergePr)?], |r| r.get(0))?;
-                if matches!(cp.stage, Stage::Held | Stage::AwaitChecks | Stage::Merge) || pending_merge {
+                if cp.stage == Stage::Held || pending_merge
+                    || (purpose == ClaimPurpose::Productive && matches!(cp.stage, Stage::AwaitChecks | Stage::Merge))
+                    || (purpose == ClaimPurpose::MergeReconciliation && until == submission::Milestone::Pr) {
                     return Ok(None);
                 }
             }
@@ -1770,6 +1779,23 @@ mod tests {
         assert!(store.merge_reconciliation_needed(&lease.workflow).unwrap());
         assert!(store.pending_operations(&lease.workflow).unwrap().is_empty());
         assert!(store.claim_productive(&lease.workflow,"command",30,1000).unwrap().is_none(),"completed operation hid uncertain merge dispatch");
+        assert!(store.claim_reconciliation(&lease.workflow,"sweep",30,1000).unwrap().is_none(),"free claim bypassed uncertain dispatch");
+    }
+
+    #[test]
+    fn reconciliation_claim_respects_command_ceiling_and_late_hold() {
+        use submission::{Request,Target,Milestone};
+        for (stage,until,allowed) in [(Stage::Held,Milestone::Merged,false),(Stage::AwaitChecks,Milestone::Pr,false),(Stage::AwaitChecks,Milestone::Merged,true)] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut controller=WorkflowStore::open(&path).unwrap();
+            controller.submit_authorized("command","owner",&Request {repository:"owner/repo".into(),target:Target::Issue(1),provider:None,until},1).unwrap();
+            controller.register("owner/repo#1","feature/fix",binding(),10).unwrap();
+            let lease=controller.claim("owner/repo#1","controller",20,1000).unwrap().unwrap();
+            let mut reconciler=WorkflowStore::open(&path).unwrap();
+            let mut checkpoint=reconciler.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage=stage;controller.checkpoint(&lease,&checkpoint,30).unwrap();controller.release(&lease,31).unwrap();
+            assert_eq!(reconciler.claim_reconciliation(&lease.workflow,"sweep",40,1000).unwrap().is_some(),allowed,"{stage:?} {until:?}");
+        }
     }
 
     #[test]

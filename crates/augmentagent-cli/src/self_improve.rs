@@ -1572,6 +1572,11 @@ async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
 /// justification is that it finishes work already approved, and acting on a
 /// guess would make it something else.
 async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
+    merge_sweep_selected(repo_root, dry_run, None).await
+}
+
+async fn merge_sweep_selected(repo_root: &Path, dry_run: bool, selected: Option<&adoption::AdoptedPr>) -> usize {
+    if selected.is_none() {
     if let Err(error)=publication::reconcile_merge_dispatches(repo_root,dry_run).await {
         warn!("merge dispatch reconciliation unavailable: {error:#}");
     }
@@ -1583,14 +1588,27 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
     if let Err(error)=publication::reconcile_pending(repo_root,dry_run).await {
         warn!("pending publication reconciliation unavailable: {error:#}");
     }
+    }
     let gh = gh_bin();
     // Repository connection pagination includes ready and draft PRs. Sort
     // locally only after the complete pool is known, then apply fair windows.
-    let out = match complete_repository_inventory(repo_root, "pr", None,
+    let out = if let Some(target) = selected {
+        let read = run(&gh, &["pr","view",&target.pr.to_string(),"--repo",&target.repository,"--json",
+            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body"],repo_root).await;
+        let row = match read {
+            Ok((true,raw,_)) => serde_json::from_str::<serde_json::Value>(&raw).ok(),
+            _ => None,
+        };
+        let Some(row) = row.filter(|row| row["number"].as_u64()==Some(target.pr)
+            && row["headRefOid"].as_str()==Some(target.head.as_str())) else {
+            warn!(pr=target.pr,"selected merge candidate changed or is unavailable");return 0;
+        };
+        serde_json::json!([row]).to_string()
+    } else { match complete_repository_inventory(repo_root, "pr", None,
         "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body").await {
         Ok(out) => out,
         Err(error) => { warn!("merge sweep inventory unavailable: {error:#}"); return 0; }
-    };
+    }};
     let prs: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
     let Some(rows) = prs.as_array() else {
         return 0;
@@ -1601,7 +1619,10 @@ async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
     };
     let owner = repository.split('/').next().map(str::to_string);
     let policy_owner = merge_policy_owner(repo_root).await;
-    let mut merged = adopted_execution::sweep(repo_root, dry_run).await.unwrap_or_else(|error| { warn!("adopted merge reconciliation failed: {error:#}"); 0 });
+    let adopted = if let Some(target)=selected {
+        adopted_execution::sweep_candidates(repo_root,dry_run,vec![target.clone()]).await
+    } else { adopted_execution::sweep(repo_root,dry_run).await };
+    let mut merged = adopted.unwrap_or_else(|error| { warn!("adopted merge reconciliation failed: {error:#}"); 0 });
 
     let mut examined = 0usize;
     // Start where the last tick left off, so a wall of ineligible drafts at
@@ -7127,7 +7148,7 @@ async fn resume_draft_pr(
                 )));
             }
             if checks_green(repo_root, pr).await != Some(true) {
-                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+                workflow.transition(Stage::AwaitChecks, "ci_pending", "reconcile_checks", chrono::Utc::now().timestamp_millis()).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; awaiting CI, merge sweep will retry"
                 )));
@@ -7138,7 +7159,7 @@ async fn resume_draft_pr(
                 _ => None,
             };
             let Some(readied) = ready_for_merge(repo_root, pr, draft).await else {
-                workflow.transition(Stage::Held, "resume_deferred", "resume_preserved_work", 0).await?;
+                workflow.transition(Stage::AwaitChecks, "ready_state_unavailable", "reconcile_checks", chrono::Utc::now().timestamp_millis()+60_000).await?;
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: LGTM recorded; ready state unavailable, merge sweep will retry"
                 )));
@@ -14896,7 +14917,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
         // The sweep reaches the policy through `sweep_verdict`, which is the
         // thing that adds the sweep-only conditions on top of it.
-        let sweep_start = src.find("async fn merge_sweep(").expect("the sweep");
+        let sweep_start = src.find("async fn merge_sweep_selected(").expect("the sweep");
         let sweep = &src[sweep_start..sweep_start + src[sweep_start..].find("\n}\n").expect("end")];
         assert!(
             sweep.contains("sweep_verdict("),
@@ -14906,7 +14927,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // before the remote, and a sweep that only read the remote would
         // refuse PRs the fresh path merges whenever an override is set.
         for path in [fresh, {
-            let i = src.find("async fn merge_sweep(").expect("the sweep");
+            let i = src.find("async fn merge_sweep_selected(").expect("the sweep");
             &src[i..i + src[i..].find("\n}\n").expect("end")]
         }] {
             assert!(
@@ -15557,7 +15578,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(!approval_of(Some(&verdict("gemini", true))).codex);
 
         let src = include_str!("self_improve.rs");
-        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let start = src.find("async fn merge_sweep_selected(").expect("the sweep");
         let sweep = code_only(&src[start..start + src[start..].find("\n}\n").expect("end")]);
         assert!(!sweep.contains("CODEX-REVIEW"), "the sweep must not count approval lines in the PR body");
         assert!(sweep.contains("recorded_approval("), "it asks the loop's own record");
@@ -15633,7 +15654,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn the_sweep_supplies_real_values_for_every_policy_gate() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let start = src.find("async fn merge_sweep_selected(").expect("the sweep");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
 
         for (field, assumed) in [
@@ -15710,7 +15731,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn the_sweep_reads_its_inputs_rather_than_assuming_them() {
         let src = include_str!("self_improve.rs");
-        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let start = src.find("async fn merge_sweep_selected(").expect("the sweep");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
 
         assert!(
@@ -15747,7 +15768,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         }).await.unwrap();
         assert_eq!(swept.load(Ordering::SeqCst), 3);
         let src = include_str!("self_improve.rs");
-        let fn_start = src.find("async fn merge_sweep(").expect("the sweep");
+        let fn_start = src.find("async fn merge_sweep_selected(").expect("the sweep");
         let fn_body = &src[fn_start..fn_start + src[fn_start..].find("\n}\n").expect("end")];
         // C5 — no reasoner, at all.
         for forbidden in ["reasoner", "build_reasoner", ".call("] {

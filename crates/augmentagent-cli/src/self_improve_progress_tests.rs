@@ -246,10 +246,11 @@ s=json.loads((root/'scenario').read_text())
 if a[:2]==['pr','list']:
     assert 'is:draft' not in a
     print(json.dumps([dict(number=20,headRefName='agent-fix/issue-10',headRefOid=s['head'],isDraft=s['draft'],isCrossRepository=False,mergeable='MERGEABLE',body='Automated self-improvement for #10.\n- complexity (scoping pass): medium')]))
-elif a[:2]==['repo','view']: print('fixture-owner/project')
+elif a[:2]==['repo','view']: print('WRITE' if 'viewerPermission' in a else 'fixture-owner/project')
+elif a[:2]==['api','user']: print('fixture-owner')
 elif a[:2]==['pr','view']:
     if '--jq' in a or '-q' in a: print(s['head'])
-    else: print(json.dumps(dict(id='PR_fixture20',number=20,baseRefName='main',state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
+    else: print(json.dumps(dict(id='PR_fixture20',number=20,url='https://github.com/fixture-owner/project/pull/20',baseRefName='main',headRefName='agent-fix/issue-10',isCrossRepository=False,headRepositoryOwner=dict(login='fixture-owner'),author=dict(login='fixture-owner'),title='Fix synthetic addition',body='Automated self-improvement for #10.\n- complexity (scoping pass): medium',closingIssuesReferences=[],mergeable='MERGEABLE',isDraft=s['draft'],state='MERGED' if (root/'merged').exists() else 'OPEN',headRefOid=s['head'])))
 elif a[:2]==['issue','view']: print(json.dumps(dict(body='Fix synthetic addition',author=dict(login='fixture-owner'))))
 elif a[:2]==['pr','diff']: print('src/synthetic.rs')
 elif a[:2]==['pr','checks']:
@@ -263,7 +264,7 @@ elif a[:2]==['api','graphql']:
     assert fields['head']==s['head']
     if s['fail_merge']: sys.exit(1)
     (root/'merged').write_text(s['head'])
-    print(json.dumps(dict(data=dict(mergePullRequest=dict(clientMutationId=fields['request'],pullRequest=dict(id='PR_fixture20',number=20,state='MERGED',headRefOid=s['head'],mergedAt=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),mergeCommit=dict(oid='e'*40),mergedBy=dict(login='fixture-owner')))))))
+    print(json.dumps(dict(data=dict(mergePullRequest=dict(clientMutationId=fields['request'],pullRequest=dict(id='PR_fixture20',number=20,state='MERGED',headRefOid=s['head'],mergedAt=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),mergeCommit=dict(oid='e'*40,message=fields['body']),mergedBy=dict(login='fixture-owner')))))))
 elif a[0]=='api' and '/rules/branches/main' in a[1]: print(json.dumps([dict(type='required_status_checks',ruleset_id=1,parameters=dict(strict_required_status_checks_policy=True,required_status_checks=[dict(context='rust')]))]))
 elif a[0]=='api' and '/rulesets/1' in a[1]: print(json.dumps(dict(enforcement='active',bypass_actors=[])))
 elif a[0]=='api' and '/git/ref/heads/main' in a[1]: print(s['base'])
@@ -371,6 +372,48 @@ else: raise Exception('unexpected call '+repr(a))
     workflow.finish().unwrap();
     // A newly verified LGTM survives delayed checks and subsequent merge failure.
     record_opened_pr(&opened_prs_path(), 10, 20, &head, verdict(&prepared));
+    if std::env::var_os("AUTOSHIP_TARGETED_SWEEP").is_some() {
+        use crate::autoship_workflow::{WorkflowStore, Stage, submission::{Request, Target, Milestone}};
+        let mut store=WorkflowStore::open(&workflow::path()).unwrap();
+        let workflow_id=store.resolve_pr("fixture-owner/project",20).unwrap().unwrap();
+        let id=workflow_id.as_str();
+        store.submit_authorized("targeted","github:fixture-owner",&Request {repository:"fixture-owner/project".into(),target:Target::Pr(20),provider:None,until:Milestone::Merged},chrono::Utc::now().timestamp_millis()).unwrap();
+        let now=chrono::Utc::now().timestamp_millis();
+        let lease=store.claim(id,"fixture",now,60000).unwrap().unwrap();
+        let mut checkpoint=store.snapshot(id).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::AwaitChecks;checkpoint.next.eligible_at_ms=0;
+        store.checkpoint(&lease,&checkpoint,now).unwrap();store.release(&lease,now).unwrap();
+        let before_calls=store.snapshot(id).unwrap().unwrap().model_calls;
+        drop(store);
+        assert!(std::process::Command::new("git").args(["--git-dir",remote.to_str().unwrap(),"update-ref","refs/heads/main",&base]).status().unwrap().success());
+        std::fs::write(root.join("owner-note.txt"),"owner unsaved fixture").unwrap();
+        let owner_index=std::fs::read(root.join(".git/index")).unwrap();
+        let owner_head=run("git", &["rev-parse","HEAD"],&root).await.unwrap().1;
+        std::fs::write(fixture_root.join("calls"),"").unwrap();
+        scenario("PENDING",false,false,&head);
+        assert!(targeted::work_once(&root,id).await.unwrap().is_idle());
+        assert!(!fixture_root.join("merged").exists());
+        scenario("SUCCESS",false,false,&head);
+        let report=targeted::work_once(&root,id).await.unwrap();
+        assert!(!report.is_idle(),"approved command did not reconcile: {}",report.message);
+        let store=WorkflowStore::open_read_only(&workflow::path()).unwrap().unwrap();
+        let state=store.snapshot(id).unwrap().unwrap();
+        assert_eq!(state.checkpoint.stage,Stage::Merged);
+        assert_eq!(state.model_calls,before_calls);
+        assert_eq!(store.merge_allowance(chrono::Utc::now().timestamp_millis(),5).unwrap().confirmed,1);
+        drop(store);
+        targeted::work_once(&root,id).await.unwrap();
+        let calls=std::fs::read_to_string(fixture_root.join("calls")).unwrap();
+        let calls:Vec<Vec<String>>=calls.lines().map(|s|serde_json::from_str(s).unwrap()).collect();
+        assert!(!calls.iter().any(|a|a.starts_with(&["pr".into(),"list".into()])),"targeted execution swept repository inventory");
+        assert_eq!(calls.iter().filter(|a|a.iter().any(|s|s.starts_with("query=mutation "))).count(),1);
+        assert_eq!(std::fs::read_to_string(root.join("owner-note.txt")).unwrap(),"owner unsaved fixture");
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(),owner_index);
+        assert_eq!(run("git", &["rev-parse","HEAD"],&root).await.unwrap().1,owner_head);
+        std::fs::write(fixture_root.join("reconciliation-verified"),b"selected approved PR merged once without models").unwrap();
+        return;
+    }
+
     scenario("PENDING", false, false, &head);
     assert_eq!(merge_sweep(&root, false).await, 0);
     scenario("SUCCESS", false, true, &head);
@@ -432,4 +475,12 @@ fn coderabbit_never_controls_ci_or_internal_review_approval() {
     for removed in ["wait_for_rabbit(", "rabbit_blocks", "@coderabbitai review", "AUTOPR_REQUIRE_CODERABBIT"] {
         assert!(!production.contains(removed), "retired dependency: {removed}");
     }
+}
+
+#[test]
+fn targeted_approved_pr_finishes_without_rebuilding_or_repository_sweep() {
+    let output=std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact","self_improve::progress_tests::approved_ready_pr_preserves_review_but_never_replays_uncertain_merge","--nocapture"])
+        .env("AUTOSHIP_TARGETED_SWEEP","1").output().unwrap();
+    assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
 }

@@ -366,7 +366,7 @@ impl SweepGuard {
                 evidence_hash: format!("{:x}", Sha256::digest(recorded.as_bytes())),
             });
         store.register(&id, branch, binding.clone(), now)?;
-        let Some(lease) = store.claim(
+        let Some(lease) = store.claim_reconciliation(
             &id,
             &format!("sweep:{}", uuid::Uuid::new_v4()),
             now,

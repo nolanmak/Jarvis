@@ -461,9 +461,9 @@ async fn execute(
             if !allowed || checks_green(repo, pr.pr).await != Some(true) {
                 guard
                     .transition(
-                        Stage::Held,
-                        "adopted_approved_pending_policy_or_ci",
-                        "reconcile_approved_pr",
+                        if allowed { Stage::AwaitChecks } else { Stage::Held },
+                        if allowed { "adopted_ci_pending" } else { "adopted_merge_policy_blocked" },
+                        if allowed { "reconcile_approved_pr" } else { "await_merge_authorization" },
                         chrono::Utc::now().timestamp_millis() + 300_000,
                     )
                     .await?;
@@ -615,6 +615,10 @@ async fn execute(
 /// Free reconciliation remains available while a different PR's builder runs.
 pub(super) async fn sweep(repo: &Path, dry_run: bool) -> Result<usize> {
     let candidates = discover(repo, dry_run).await?;
+    sweep_candidates(repo, dry_run, candidates).await
+}
+
+pub(super) async fn sweep_candidates(repo: &Path, dry_run: bool, candidates: Vec<adoption::AdoptedPr>) -> Result<usize> {
     let store = WorkflowStore::open(&workflow::path())?;
     let mut merged = 0;
     for pr in candidates

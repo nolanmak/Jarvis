@@ -172,6 +172,7 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
         .command_request(id)?
         .context("no queued command for workflow")?;
     authorize_command(repo, &request).await.context(CommandFailure {code:2, reason:"target-authorization-failed"})?;
+    let mut waiting_for_checks = false;
     if let Some(snapshot) = store.snapshot(id)? {
         use crate::autoship_workflow::Stage;
         if snapshot.lease_until_ms > chrono::Utc::now().timestamp_millis() {
@@ -192,11 +193,17 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
         if snapshot.checkpoint.stage == Stage::Merged {
             return Ok(RunReport::triage("Workflow is already merged".into()));
         }
-        if matches!(snapshot.checkpoint.stage, Stage::Held | Stage::Retired | Stage::AwaitChecks | Stage::Merge) {
+        if matches!(snapshot.checkpoint.stage, Stage::Held | Stage::Retired | Stage::Merge) {
             return Ok(RunReport::held(format!("Preserved {:?}: {}", snapshot.checkpoint.stage, snapshot.checkpoint.next.reason)));
         }
         if snapshot.checkpoint.next.eligible_at_ms > chrono::Utc::now().timestamp_millis() {
             return Ok(RunReport::held("Workflow retry is not eligible yet".into()));
+        }
+        if snapshot.checkpoint.stage == Stage::AwaitChecks {
+            if snapshot.pr.is_none() || request.until == crate::autoship_workflow::submission::Milestone::Pr {
+                return Ok(RunReport::held("Awaiting a bound PR and merge authorization".into()));
+            }
+            waiting_for_checks = true;
         }
     }
     let source_issue = if let Target::Issue(n) = request.target {
@@ -226,6 +233,20 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
         }
     }
     drop(store);
+    if waiting_for_checks {
+        let Resolved::Pr(pr) = selected else { anyhow::bail!("waiting workflow has no bound PR"); };
+        if !pr.ready_for_review() {
+            return Ok(RunReport::held("PR still has an unresolved base dependency".into()));
+        }
+        let controller = workspace::prepare(repo, "sweep").await
+            .context(CommandFailure {code:3, reason:"reconciliation-workspace-unavailable"})?;
+        let merged = merge_sweep_selected(&controller.root, false, Some(&pr)).await;
+        return Ok(if merged > 0 {
+            RunReport::triage("Selected PR reconciled using recorded approval".into())
+        } else {
+            RunReport::held("Selected PR awaits current CI, review or merge admission".into())
+        });
+    }
     COMMAND_LANE
         .scope(
             Lane::Combined,
