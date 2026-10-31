@@ -168,9 +168,12 @@ struct ClaimDuringRedraft {
 impl augmentagent_channel_core::Reasoner for ClaimDuringRedraft {
     async fn call(
         &self,
-        _: &augmentagent_channel_core::ReasonerOpts,
+        opts: &augmentagent_channel_core::ReasonerOpts,
         _: &str,
     ) -> anyhow::Result<String> {
+        if opts.system_prompt.contains("You select evidence") {
+            return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+        }
         if self.claim {
             assert!(self.store.claim_action_for_send(
                 &self.id,
