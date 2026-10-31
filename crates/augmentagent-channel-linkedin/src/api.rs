@@ -142,6 +142,7 @@ pub struct VoyagerClient {
     pub(crate) auth: LinkedInAuth,
     conversations_query_id: String,
     feed_query_id: String,
+    test_send_base: Option<String>,
 }
 
 impl VoyagerClient {
@@ -159,7 +160,19 @@ impl VoyagerClient {
             auth,
             conversations_query_id: query_id,
             feed_query_id,
+            test_send_base: None,
         }
+    }
+
+    /// Local HTTP fixture endpoint for exercising the real send and membership
+    /// checks. No runtime configuration can redirect production credentials.
+    #[doc(hidden)]
+    pub fn for_test(auth: LinkedInAuth, base: String) -> Result<Self, LinkedInError> {
+        crate::archive::ArchiveReader::for_test(auth.clone(), base.clone())
+            .map_err(|e| LinkedInError::Config(e.to_string()))?;
+        let mut client = Self::new(auth);
+        client.test_send_base = Some(base);
+        Ok(client)
     }
 
     pub(crate) fn base_headers(&self) -> Result<reqwest::header::HeaderMap, LinkedInError> {
@@ -195,8 +208,11 @@ impl VoyagerClient {
 #[async_trait]
 impl LinkedInApi for VoyagerClient {
     fn archive_reader(&self) -> Result<Option<crate::archive::ArchiveReader>, LinkedInError> {
-        crate::archive::ArchiveReader::new(self.auth.clone()).map(Some)
-            .map_err(|e|LinkedInError::Config(e.to_string()))
+        let reader = match &self.test_send_base {
+            Some(base) => crate::archive::ArchiveReader::for_test(self.auth.clone(), base.clone()),
+            None => crate::archive::ArchiveReader::new(self.auth.clone()),
+        };
+        reader.map(Some).map_err(|e| LinkedInError::Config(e.to_string()))
     }
 
     async fn fetch_recent_dms(&self) -> Result<Vec<Dm>, LinkedInError> {
@@ -250,12 +266,12 @@ impl LinkedInApi for VoyagerClient {
         conversation_urn: &str,
         text: &str,
     ) -> Result<String, LinkedInError> {
-        crate::archive::ArchiveReader::new(self.auth.clone())
-            .map_err(|e| LinkedInError::Config(e.to_string()))?
+        self.archive_reader()?
+            .ok_or_else(|| LinkedInError::Config("archive reader unavailable".into()))?
             .require_direct(conversation_urn).await
             .map_err(|e| LinkedInError::Config(e.to_string()))?;
-        let url = "https://www.linkedin.com/voyager/api/voyagerMessagingDashMessengerMessages\
-                   ?action=createMessage";
+        let url = format!("{}/voyagerMessagingDashMessengerMessages?action=createMessage",
+            self.test_send_base.as_deref().unwrap_or("https://www.linkedin.com/voyager/api"));
 
         // LinkedIn wants trackingId as raw 16 UUID bytes (Latin-1) and
         // originToken as the hyphenated form of the same UUID. Diverging

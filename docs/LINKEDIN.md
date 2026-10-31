@@ -270,7 +270,11 @@ triage. Direct eligibility requires two known participants, including the owner
 and the actual sender. Reclassification retires undispatched candidates.
 Authoritative conversation metadata is checked before archived candidates enter
 triage, and the send API checks direct membership again before an approved reply
-is posted. The read and backfill commands never grant group-send permission.
+is posted. Approval atomically claims the pending action before attempting a
+send, so simultaneous clicks or a replay after restart cannot send that action
+twice. A stale direct-message card is refused if current membership identifies
+a group or is unknown. The read and backfill commands never grant group-send
+permission.
 
 ### Search coverage and account identity
 

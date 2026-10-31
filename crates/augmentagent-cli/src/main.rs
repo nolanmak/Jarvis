@@ -13808,28 +13808,34 @@ impl ReplyApprover {
                     message: "no conversationUrn on email; cannot send".into(),
                 };
             };
+            match self.store.claim_action_for_send(action_id, ActionStatus::Pending, "linkedin-approval") {
+                Ok(true) => {}
+                Ok(false) => {
+                    return match self.handle_load(action_id) {
+                        Some(current) => ApprovalActionOutcome::AlreadyResolved {
+                            status: current.action.status, detail: current.action.error_message,
+                        },
+                        None => ApprovalActionOutcome::NotFound,
+                    };
+                }
+                Err(error) => return ApprovalActionOutcome::Failed {
+                    message: format!("could not claim LinkedIn approval: {error}"),
+                },
+            }
             match linkedin.send_message(conv_urn, body).await {
                 Ok(_) => {
-                    let _ = self.store.update_action_status(
-                        action_id,
-                        ActionStatus::Sent,
-                        Some(body),
-                        None,
-                    );
-                    let _ = self
-                        .store
-                        .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                    if !matches!(self.store.finish_send_sent(action_id, "linkedin-approval"), Ok(true)) {
+                        return ApprovalActionOutcome::Failed {
+                            message: "LinkedIn accepted the reply, but its receipt could not be recorded; do not resend".into(),
+                        };
+                    }
+                    let _ = self.store.mark_email_processed(&action.email.message_id, TriageResult::Reply);
                     tracing::info!(action_id, "linkedin reply sent via approval handler");
                     ApprovalActionOutcome::Approved
                 }
                 Err(e) => {
                     let msg = format!("linkedin send_message: {e}");
-                    let _ = self.store.update_action_status(
-                        action_id,
-                        ActionStatus::Error,
-                        None,
-                        Some(&msg),
-                    );
+                    let _ = self.store.finish_send_error(action_id, &msg, None, "linkedin-approval");
                     ApprovalActionOutcome::Failed { message: msg }
                 }
             }
@@ -24049,4 +24055,5 @@ pub(crate) mod test_support {
     }
 }
 
-
+#[cfg(test)]
+mod linkedin_approval_tests;
