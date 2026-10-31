@@ -4,10 +4,6 @@ on:
   pull_request:
     paths:
       - 'sidecars/discord-voice/**'
-      - 'crates/augmentagent-approval-discord/**'
-      - 'crates/augmentagent-channel-core/**'
-      - 'crates/augmentagent-cli/**'
-      - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
       - '.github/workflows/discord-voice.yml'
@@ -19,10 +15,6 @@ on:
     branches: [main]
     paths:
       - 'sidecars/discord-voice/**'
-      - 'crates/augmentagent-approval-discord/**'
-      - 'crates/augmentagent-channel-core/**'
-      - 'crates/augmentagent-cli/**'
-      - 'crates/augmentagent-store/**'
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
       - '.github/workflows/discord-voice.yml'
@@ -63,42 +55,3 @@ jobs:
 
       # Live calls require a disposable guild and provider credentials. They
       # remain explicit opt-in verification, never synthetic CI success.
-
-  rust:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: 1.94.1
-      # Restore-only: rust-cache.yml writes this cache from main. Build
-      # parallelism doesn't change artifacts, so it stays out of the cache key.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: ci
-          env-vars: ImageOS
-          save-if: false
-        env:
-          CARGO_BUILD_JOBS: ''
-      # augmentagent-channel-core's code_mode_compute tests spawn Deno to run a
-      # real program; without it they fail with DenoNotFound. code-mode.yml
-      # already installs it for the same crate — this job tests the whole crate
-      # and needs it too. Pinned to the same version so both agree.
-      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
-        with:
-          deno-version: 2.7.14
-      # augmentagent-cli's document_signing tests render a real PDF, which needs
-      # the pinned runtime and its fonts. pdf-generation.yml provisions both for
-      # the same code; this job runs those tests too and failed with
-      # "run python3 scripts/pdf-runtime.py to provision the pinned runtime".
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/4"
-
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/5"
-
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/6"
-
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/7"

@@ -1,0 +1,341 @@
+name: Rust suites
+
+# One workflow for the Rust feature suites that used to run as separate
+# workflows (approval history, finance, heartbeat, LinkedIn, phone, WhatsApp
+# sidecar, Discord voice, Code Mode, model router adapters, Apple Notes,
+# WhatsApp history, PDF generation). Each of those compiled the same
+# workspace crates (augmentagent-cli above all) on its own runner, and
+# together they queued ~16 Rust jobs per push against the hosted
+# concurrency limit (5 on macOS). Grouping them by runner image builds the
+# shared crates once per job. Platform keeps its own workflow.
+#
+# Steps run in order and stop at the first failure. Tool setup sits right
+# before the first step that needs it: the local CI controller gives each
+# step the prerequisites of every step before it in the job.
+
+on:
+  pull_request:
+  push:
+    branches: [main, ci/shared-rust-cache]  # TEMP: measure with warm cache before merge
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
+jobs:
+  channels:
+    name: channels (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      # Restore-only: rust-cache.yml writes this cache from main. Build
+      # parallelism doesn't change artifacts, so it stays out of the cache key.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+          save-if: false
+        env:
+          CARGO_BUILD_JOBS: ''
+
+      # Approval decisions and context (Linux).
+      - name: Approval history store
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/3"
+      - name: Approval history Discord cards
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/4"
+      - name: Approval context
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/5"
+      - name: Calendar approvals
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/6"
+
+      # Finance (Linux).
+      - name: Format finance crate
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/7"
+      - name: Finance lint
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/8"
+      - name: Finance and wiki behavior
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/9"
+      - name: Finance store and agent integration
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/10"
+      - name: Finance CLI unit and process tests
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/11"
+
+      # Heartbeat (Linux).
+      - name: Format heartbeat crate
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/12"
+      - name: Heartbeat lint
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/13"
+      - name: Heartbeat behavior
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/14"
+      - name: Heartbeat store schema and capability manifest
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/15"
+      - name: Heartbeat CLI unit and process tests
+        if: runner.os == 'Linux'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/16"
+
+      # LinkedIn archive/read/approval suite plus the directly affected
+      # store/auth contracts. No live credentials.
+      - name: LinkedIn archive, recall, and approval contracts
+        shell: bash
+        env:
+          AUGMENTAGENT_GH_DISABLE: '1'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/17"
+
+      # Phone offline acceptance.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Check that the runner rejects missing or skipped coverage
+        env: &phone_env
+          AUGMENTAGENT_GH_DISABLE: '1'
+          AUGMENTAGENT_PHONE_ENABLED: '0'
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/19"
+      - name: Live receipt validator (synthetic fixtures only)
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/20"
+      - name: Portable bridge search and parent lifetime
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/21"
+      - name: Journal write guard including portable path resolution
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/22"
+      - name: Compile opt-in native phone probes (no model calls)
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/23"
+      - name: Required offline phone suites
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/24"
+      - name: Service installation preserves private phone configuration
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/25"
+      - name: Pre-phone database upgrade and rollback compatibility
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/26"
+      - name: ConversationRelay rollback preserves GPT-Live tasks and receipts
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/27"
+      - name: CLI integration compiles
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/28"
+      - name: Phone lint
+        env: *phone_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/29"
+      - name: Upload offline phone evidence (not live qualification)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phone-offline-${{ matrix.os }}
+          path: |
+            target/phone-offline/
+            target/phone-upgrade/
+            target/phone-live-upgrade/
+          if-no-files-found: error
+
+      # WhatsApp sidecar wire contract: Go sidecar plus the Rust channel
+      # against the real Go process.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: sidecars/wa-sidecar/go.sum
+      - name: WhatsApp sidecar Go tests, race checks and vet
+        working-directory: sidecars/wa-sidecar
+        env:
+          GOMAXPROCS: 2
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/32"
+      - name: Build exact sidecar used by Rust contract tests
+        working-directory: sidecars/wa-sidecar
+        env:
+          GOMAXPROCS: 2
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/33"
+      - name: WhatsApp Rust channel and real Go-process contract tests
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/34"
+      - name: WhatsApp Rust channel lint
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/channels/35"
+
+  agents:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.94.1
+      # Restore-only: rust-cache.yml writes this cache from main. Build
+      # parallelism doesn't change artifacts, so it stays out of the cache key.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+          save-if: false
+        env:
+          CARGO_BUILD_JOBS: ''
+
+      # Model router adapters.
+      - name: Model router channel-core adapters
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/3"
+      - name: Model router Discord adapters
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/4"
+      - name: Model router CLI compiles
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/5"
+      - name: Pin each Discord model and exercise the audited tool probe
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/6"
+      - name: Switch one Discord channel through Qwen, GLM, and Codex
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/7"
+
+      # augmentagent-channel-core's code_mode_compute tests spawn Deno to run
+      # a real program; Discord voice and Code Mode both need it.
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
+        with:
+          deno-version: 2.7.14
+
+      # Discord voice. augmentagent-cli's document_signing tests render a real
+      # PDF, which needs the pinned runtime and its fonts.
+      - name: Install PDF fonts and poppler
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/9"
+      - name: Provision the pinned PDF runtime
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/10"
+      - name: Discord voice crates
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/11"
+      - name: CLI binary tests
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/12"
+
+      # Code Mode. Required real-VM acceptance runs separately on the
+      # provisioned host.
+      - name: Install trusted host parser
+        env: &code_mode_env
+          JARVIS_TEST_VM_CONFIG: ""
+          JARVIS_TEST_COMPUTE_PIP: ""
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/13"
+      - name: Validate CI refusal behavior
+        env: *code_mode_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/14"
+      - name: Rust, CLI and Deno contracts
+        env: *code_mode_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/15"
+      - name: Embedded helper update triggers
+        env: *code_mode_env
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/agents/16"
+
+  legacy-python:
+    # Python 3.9 compatibility coverage requires an available runner build.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.9'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.94.1
+      # Restore-only: rust-cache.yml writes this cache from main. Build
+      # parallelism doesn't change artifacts, so it stays out of the cache key.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+          save-if: false
+        env:
+          CARGO_BUILD_JOBS: ''
+      - name: Apple Notes channel
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/legacy-python/4"
+      - name: Apple Notes CLI
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/legacy-python/5"
+      - name: Apple Notes lint
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/legacy-python/6"
+      - name: WhatsApp exporter
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/legacy-python/7"
+      - name: WhatsApp history, iMessage and memory crates
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/legacy-python/8"
+      - name: WhatsApp history CLI
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/legacy-python/9"
+      - name: Memory MCP recall tools
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/legacy-python/10"
+
+  pdf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.94.1
+      # Restore-only: rust-cache.yml writes this cache from main. Build
+      # parallelism doesn't change artifacts, so it stays out of the cache key.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci
+          env-vars: ImageOS
+          save-if: false
+        env:
+          CARGO_BUILD_JOBS: ''
+      - name: Install PDF fonts and poppler
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/4"
+      - name: Provision the pinned PDF runtime
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/5"
+      - name: Check the PDF runtime
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/6"
+      - name: PDF runtime tests
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/7"
+      - name: Updater stamp
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/8"
+      - name: Updater rebuild trigger
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/9"
+      - name: Docs Python converters
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/10"
+      - name: Docs crate
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/11"
+      - name: Document signing
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/12"
+      - name: Signing receipts
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/13"
+      - name: PDF generation CLI
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/14"
+      - name: PDF generation prompt options
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/15"
+      - name: Discord attachments
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/16"
+      - name: Read-only repository documents and delivery CLI
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id rust/pdf/17"

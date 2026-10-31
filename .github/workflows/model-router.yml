@@ -111,37 +111,6 @@ jobs:
 
       - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/dashboard/6"
 
-  adapters:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: 1.94.1
-      # Restore-only: rust-cache.yml writes this cache from main. Build
-      # parallelism doesn't change artifacts, so it stays out of the cache key.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: ci
-          env-vars: ImageOS
-          save-if: false
-        env:
-          CARGO_BUILD_JOBS: ''
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/adapters/3"
-
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/adapters/4"
-
-      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/adapters/5"
-
-      - name: Pin each Discord model and exercise the audited tool probe
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/adapters/6"
-
-      - name: Switch one Discord channel through Qwen, GLM, and Codex
-        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id model-router/adapters/7"
 
   pinned-gateway:
     runs-on: ubuntu-latest
