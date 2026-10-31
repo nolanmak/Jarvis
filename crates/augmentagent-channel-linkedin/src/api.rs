@@ -55,6 +55,10 @@ pub enum LinkedInError {
 
 #[async_trait]
 pub trait LinkedInApi: Send + Sync {
+    /// Complete archive reader for production ingestion. Legacy test adapters
+    /// may omit it; a production reader failure never falls back to snippets.
+    fn archive_reader(&self) -> Result<Option<crate::archive::ArchiveReader>, LinkedInError> { Ok(None) }
+
     /// List the most recent 1-on-1 DM threads with the last message of each.
     /// Group chats are filtered out (v1 doesn't draft for group).
     async fn fetch_recent_dms(&self) -> Result<Vec<Dm>, LinkedInError>;
@@ -190,6 +194,11 @@ impl VoyagerClient {
 
 #[async_trait]
 impl LinkedInApi for VoyagerClient {
+    fn archive_reader(&self) -> Result<Option<crate::archive::ArchiveReader>, LinkedInError> {
+        crate::archive::ArchiveReader::new(self.auth.clone()).map(Some)
+            .map_err(|e|LinkedInError::Config(e.to_string()))
+    }
+
     async fn fetch_recent_dms(&self) -> Result<Vec<Dm>, LinkedInError> {
         let mailbox_urn = &self.auth.member_urn;
         let encoded_mailbox = urlencode_restli(mailbox_urn);

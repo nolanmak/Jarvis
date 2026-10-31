@@ -221,3 +221,26 @@ ambiguity. Continue stored thread reads using `next_offset`, `next_body_offset`,
 `account_id`, and `snapshot_max_rowid` to reconstruct full Unicode text. Inspect
 the returned coverage state and observation time before describing a thread as
 complete or an introduction as unanswered.
+
+### Live ingestion and approval
+
+Production polling uses the same paginated archive reader as backfill. Each
+poll has a 100-request budget, including category discovery, and resumes
+unfinished histories before admitting their messages for triage. Completed
+mailbox scopes are reconciled again on later polls to find changed threads.
+
+The first live poll persists an activation timestamp. Historical messages stay
+archive-only, including after restart; newly received messages are eligible
+based on their source timestamps. A separate seen-ID ledger handles equal-time
+arrivals. Completed direct threads queue one candidate per burst and pass their
+stored, source-ordered history to triage and drafting. Pending candidates survive
+restart, and a durable claim prevents concurrent workers from triaging the same
+candidate. Claims renew while a worker runs, release on normal exit, and expire
+after an hour without renewal following a crash.
+
+Group messages and owner-latest threads are stored and indexed without entering
+triage. Direct eligibility requires two known participants, including the owner
+and the actual sender. Reclassification retires undispatched candidates.
+Authoritative conversation metadata is checked before archived candidates enter
+triage, and the send API checks direct membership again before an approved reply
+is posted. The read and backfill commands never grant group-send permission.

@@ -38,3 +38,21 @@ CREATE TABLE IF NOT EXISTS linkedin_archive_cursors (
  account TEXT NOT NULL, scope TEXT NOT NULL, cursor TEXT NOT NULL,
  PRIMARY KEY(account,scope,cursor)
 );
+-- Live triage starts at an explicit persisted boundary, independent of history.
+CREATE TABLE IF NOT EXISTS linkedin_archive_live_state (
+ account TEXT PRIMARY KEY, started_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS linkedin_archive_live_heads (
+ account TEXT NOT NULL, conversation TEXT NOT NULL,
+ source_ms INTEGER NOT NULL, urn TEXT NOT NULL,
+ PRIMARY KEY(account,conversation)
+);
+CREATE TABLE IF NOT EXISTS linkedin_archive_live_queue (
+ account TEXT NOT NULL, conversation TEXT NOT NULL, stored_id TEXT NOT NULL UNIQUE,
+ claim_token TEXT, claimed_at_ms INTEGER,
+ PRIMARY KEY(account,conversation)
+);
+CREATE TABLE IF NOT EXISTS linkedin_archive_live_seen (
+ account TEXT NOT NULL, urn TEXT NOT NULL,
+ PRIMARY KEY(account,urn)
+);

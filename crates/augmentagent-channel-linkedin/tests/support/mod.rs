@@ -43,6 +43,11 @@ pub fn respond(request: &Request) -> ResponseTemplate {
         "archive must never issue writes"
     );
     let q = request.url.query_pairs().collect::<BTreeMap<_, _>>();
+    if q.get("queryId")
+        .is_some_and(|id| id.starts_with("messengerMailboxCounts"))
+    {
+        return ResponseTemplate::new(200).set_body_json(json!({"data":{"messengerMailboxCountsByMailbox":{"elements":[{"category":"PRIMARY_INBOX"}]}}}));
+    }
     if request.url.path().ends_with("graphql") {
         let variables = &q["variables"];
         let start = if variables.contains("nextCursor:mailbox%3A20")
