@@ -7,54 +7,58 @@ use augmentagent_store::Store;
 use std::{collections::BTreeSet, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
-fn reader() -> Result<ArchiveReader> {
+pub(crate) fn reader() -> Result<ArchiveReader> {
     let auth = LinkedInAuth::load_with_migration(&std::env::current_dir()?)?;
     Ok(ArchiveReader::new(auth)?)
 }
-pub async fn recent(
+pub async fn recent_output(
+    api: &ArchiveReader,
     limit: usize,
     json: bool,
     category: &str,
     cursor: Option<&str>,
     max_pages: usize,
-) -> Result<()> {
-    let api = reader()?;
+) -> Result<String> {
     let result = augmentagent_channel_linkedin::archive_listing::recent(
-        &api, limit, category, cursor, max_pages,
+        api, limit, category, cursor, max_pages,
     )
     .await?;
-    let complete = result.complete;
     if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        for c in &result.conversations {
-            println!(
-                "{}\n  {} [{}]\n  participants: {}\n",
-                c.urn,
-                c.title,
-                if c.group { "group" } else { "direct" },
-                c.participants
-                    .iter()
-                    .map(|p| p.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        println!(
-            "{} conversations; complete={}; category={}",
-            result.conversations.len(),
-            complete,
-            category
-        );
-        if let Some(cursor) = result.next_cursor {
-            println!("next_cursor: {cursor}");
-        }
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&result)?));
     }
-    Ok(())
+    let mut output = String::new();
+    for c in &result.conversations {
+        output.push_str(&format!(
+            "{}\n  {} [{}]\n  participants: {}\n\n",
+            c.urn,
+            c.title,
+            if c.group { "group" } else { "direct" },
+            c.participants
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    output.push_str(&format!(
+        "{} conversations; complete={}; category={}\n",
+        result.conversations.len(),
+        result.complete,
+        category
+    ));
+    if let Some(cursor) = result.next_cursor {
+        output.push_str(&format!("next_cursor: {cursor}\n"));
+    }
+    Ok(output)
 }
 
-pub async fn thread(urn: &str, cursor: Option<&str>, max_pages: usize, json: bool) -> Result<()> {
-    let api = reader()?;
+pub async fn thread_output(
+    api: &ArchiveReader,
+    urn: &str,
+    cursor: Option<&str>,
+    max_pages: usize,
+    json: bool,
+) -> Result<String> {
     let conversation = api.conversation(urn).await?;
     anyhow::ensure!(
         conversation
@@ -86,28 +90,28 @@ pub async fn thread(urn: &str, cursor: Option<&str>, max_pages: usize, json: boo
     }
     messages.sort_by(|a, b| (a.delivered_at_ms, &a.urn).cmp(&(b.delivered_at_ms, &b.urn)));
     if json {
-        println!(
-            "{}",
+        return Ok(format!(
+            "{}\n",
             serde_json::to_string_pretty(
                 &serde_json::json!({"schema_version":1,"account_id":format!("linkedin:{}",api.mailbox()),"conversation":conversation,"messages":messages,"next_cursor":next,"complete":complete,"pages":pages})
             )?
-        );
-    } else {
-        for m in &messages {
-            println!(
-                "{} {} {}\n{}\n",
-                m.delivered_at_ms,
-                if m.from_me { "owner" } else { "inbound" },
-                m.sender,
-                m.body
-            );
-        }
-        println!(
-            "complete={complete}; next_cursor={}",
-            next.as_deref().unwrap_or("")
-        );
+        ));
     }
-    Ok(())
+    let mut output = String::new();
+    for m in &messages {
+        output.push_str(&format!(
+            "{} {} {}\n{}\n\n",
+            m.delivered_at_ms,
+            if m.from_me { "owner" } else { "inbound" },
+            m.sender,
+            m.body
+        ));
+    }
+    output.push_str(&format!(
+        "complete={complete}; next_cursor={}\n",
+        next.as_deref().unwrap_or("")
+    ));
+    Ok(output)
 }
 
 pub async fn backfill(

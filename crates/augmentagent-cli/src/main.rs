@@ -4741,10 +4741,11 @@ async fn main() -> Result<()> {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
                 run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
             }
-            LinkedinOp::RecentDms { limit, json, category, cursor, max_pages } =>
-                linkedin_archive::recent(*limit,*json,category,cursor.as_deref(),*max_pages).await,
-            LinkedinOp::Thread { conversation_urn, cursor, max_pages, json } =>
-                linkedin_archive::thread(conversation_urn,cursor.as_deref(),*max_pages,*json).await,
+            op @ (LinkedinOp::RecentDms { .. } | LinkedinOp::Thread { .. }) => {
+                let reader = linkedin_archive::reader()?;
+                print!("{}", dispatch_linkedin_read(op, &reader).await?);
+                Ok(())
+            },
             LinkedinOp::Backfill { category, max_pages, refresh, .. } =>
                 linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh).await,
             LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
@@ -24057,3 +24058,18 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod linkedin_approval_tests;
+
+/// Production read-command dispatch, with reader construction kept outside so
+/// command parsing and routing can be exercised against a local HTTP fixture.
+async fn dispatch_linkedin_read(op: &LinkedinOp, reader: &augmentagent_channel_linkedin::archive::ArchiveReader) -> Result<String> {
+    match op {
+        LinkedinOp::RecentDms { limit, json, category, cursor, max_pages } =>
+            linkedin_archive::recent_output(reader,*limit,*json,category,cursor.as_deref(),*max_pages).await,
+        LinkedinOp::Thread { conversation_urn, cursor, max_pages, json } =>
+            linkedin_archive::thread_output(reader,conversation_urn,cursor.as_deref(),*max_pages,*json).await,
+        _ => anyhow::bail!("not a LinkedIn live read command"),
+    }
+}
+
+#[cfg(test)]
+mod linkedin_read_dispatch_tests;

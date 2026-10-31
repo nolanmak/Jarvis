@@ -188,6 +188,14 @@ async fn registered_search_discovers_silent_introductions_and_reads_every_body()
         json!({"query":"with:linkedin:introducer-1 in:linkedin","limit":50}),
     );
     assert_eq!(search["total_estimate"], 27);
+    // All fixture events are old even though they were imported just now.
+    // A three-week query must not mistake import time for source chronology.
+    let recent = call(
+        &memory,
+        "search_messages",
+        json!({"query":"with:linkedin:introducer-1 in:linkedin after:21d","limit":50}),
+    );
+    assert!(recent["hits"].as_array().unwrap().is_empty());
     assert_eq!(search["linkedin_coverage"]["scopes"][0]["complete"], true);
     let threads: BTreeMap<String, String> = search["hits"]
         .as_array()
