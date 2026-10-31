@@ -397,6 +397,12 @@ enum Cmd {
         #[command(subcommand)]
         op: embeddings_cmd::Op,
     },
+    /// The owner's team roster (#1698): who may answer on the owner's behalf.
+    /// Read from `AUGMENTAGENT_OWNER_TEAM` in `.env`; never opens the store.
+    Team {
+        #[command(subcommand)]
+        op: TeamOp,
+    },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
         #[command(subcommand)]
@@ -3037,6 +3043,9 @@ async fn main() -> Result<()> {
     if let Cmd::RepoDocs { ref op } = cli.cmd {
         return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
     }
+    if let Cmd::Team { op: TeamOp::List { json } } = cli.cmd {
+        return team_list(json);
+    }
     if let Cmd::Newsletter { ref op } = cli.cmd {
         return newsletter::run(op).await;
     }
@@ -4524,6 +4533,7 @@ async fn main() -> Result<()> {
             max_issues,
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
+        Cmd::Team { .. } => unreachable!("handled before database initialization"),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
@@ -8819,6 +8829,11 @@ async fn run_stale_approval_reconcile(
         interval_secs = STALE_RECONCILE_INTERVAL_SECS,
         "stale approval reconciliation started"
     );
+    // #1698 — a typo in the roster must be visible, not silently narrow it.
+    let roster = augmentagent_messages::team::TeamRoster::from_env();
+    for bad in roster.invalid_entries() {
+        warn!(entry = %bad, "ignored invalid AUGMENTAGENT_OWNER_TEAM entry");
+    }
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -8839,6 +8854,41 @@ async fn run_stale_approval_reconcile(
             }
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum TeamOp {
+    /// Print the parsed roster and any ignored entries.
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+fn team_list(json: bool) -> Result<()> {
+    use augmentagent_messages::team::TeamRoster;
+    let roster = TeamRoster::from_env();
+    for bad in roster.invalid_entries() {
+        eprintln!("warning: ignored invalid {} entry: {bad}", TeamRoster::ENV);
+    }
+    let entries = roster.entries();
+    if json {
+        let v = serde_json::json!({
+            "entries": entries
+                .iter()
+                .map(|(e, l)| serde_json::json!({"entry": e, "label": l}))
+                .collect::<Vec<_>>(),
+            "invalid": roster.invalid_entries(),
+        });
+        println!("{v}");
+    } else if entries.is_empty() {
+        println!("no team roster configured ({} unset or empty)", TeamRoster::ENV);
+    } else {
+        for (entry, label) in entries {
+            println!("{entry}\t{label}");
+        }
+    }
+    Ok(())
 }
 
 /// One reconciliation pass. Returns how many cards were retired. Split out from
