@@ -599,7 +599,7 @@ impl WorkflowStore {
         if productive {
             let commanded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)", [workflow], |r| r.get(0))?;
             if commanded {
-                let pending_merge: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE workflow=?1 AND kind=?2 AND receipt IS NULL)",
+                let pending_merge: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operation o LEFT JOIN merge_allowance_dispatch d ON d.operation=o.id WHERE o.workflow=?1 AND o.kind=?2 AND (o.receipt IS NULL OR d.state='dispatched'))",
                     params![workflow, serde_json::to_string(&OperationKind::MergePr)?], |r| r.get(0))?;
                 if matches!(cp.stage, Stage::Held | Stage::AwaitChecks | Stage::Merge) || pending_merge {
                     return Ok(None);
@@ -1751,6 +1751,25 @@ mod tests {
             let after=command.snapshot(&lease.workflow).unwrap().unwrap();
             assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.generation,before.generation);
         }
+    }
+
+    #[test]
+    fn productive_claim_cannot_ignore_completed_operation_with_uncertain_dispatch() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        store.submit_authorized("command","owner",&submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged},21).unwrap();
+        store.attach_pr(&lease,1,22).unwrap();
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Build;
+        store.checkpoint(&lease,&checkpoint,23).unwrap();
+        let op=store.begin_operation(&lease,OperationKind::MergePr,&binding(),24).unwrap();
+        store.reserve_merge(&lease,&op,"owner/repo",1,"PR_1",25,5).unwrap();
+        store.dispatch_marked_merge(&lease,&op,26,5).unwrap();
+        store.complete_operation(&lease,&op.id,"observed-merge",27).unwrap();
+        store.release(&lease,28).unwrap();
+        assert!(store.merge_reconciliation_needed(&lease.workflow).unwrap());
+        assert!(store.pending_operations(&lease.workflow).unwrap().is_empty());
+        assert!(store.claim_productive(&lease.workflow,"command",30,1000).unwrap().is_none(),"completed operation hid uncertain merge dispatch");
     }
 
     #[test]

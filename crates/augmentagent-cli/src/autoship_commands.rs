@@ -76,11 +76,16 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
         let allowance = store.merge_allowance(now, cap)?;
         let mut pending = Vec::new();
         let mut pending_evidence = Vec::new();
-        for op in store
-            .pending_operations(workflow)?
-            .into_iter()
-            .filter(|op| op.kind == OperationKind::MergePr)
-        {
+        let recovery_needed = store.merge_reconciliation_needed(workflow)?;
+        let mut operations: Vec<_> = store.pending_operations(workflow)?.into_iter()
+            .filter(|op| op.kind == OperationKind::MergePr).collect();
+        for record in store.pending_merge_dispatches(&repository)?.into_iter()
+            .filter(|record| record.operation.workflow == workflow) {
+            if !operations.iter().any(|op| op.id == record.operation.id) {
+                operations.push(record.operation);
+            }
+        }
+        for op in operations {
             if let Some(record) = store.merge_dispatch(&op.id)? {
                 let digest = store
                     .merge_response(&op, &record.repository, record.pr)?
@@ -92,12 +97,12 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             }
             pending.push(op.id);
         }
-        let code = if matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks) {
+        let code = if recovery_needed || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks) {
             3
         } else {
             0
         };
-        let complete = snapshot.checkpoint.stage == Stage::Merged;
+        let complete = snapshot.checkpoint.stage == Stage::Merged && !recovery_needed;
         let pr_url = snapshot
             .pr
             .map(|pr| format!("https://github.com/{repository}/pull/{pr}"));
@@ -108,7 +113,7 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             "stage":snapshot.checkpoint.stage,"reason":snapshot.checkpoint.next.reason,
             "next_action":snapshot.checkpoint.next.action,"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
             "provider":command.as_ref().and_then(|c| c.provider),"workflow_until":command.as_ref().map(|c| c.until),"pr_url":pr_url,
-            "merge":{"state":if complete {"observed-merged"} else if !pending.is_empty() {"pending"} else {"not-confirmed"}},
+            "merge":{"state":if complete {"observed-merged"} else if recovery_needed || !pending.is_empty() {"pending"} else {"not-confirmed"}},
             "deployment":{"state":"unknown"},"allowance":allowance,"pending_merge_operations":pending,"pending_merge_evidence":pending_evidence,
             "resources":{"attempts":snapshot.attempts,"model_calls":snapshot.model_calls,"tokens":snapshot.tokens,"wall_ms":snapshot.wall_ms},
             "lease":{"active":snapshot.lease_until_ms > now,"generation":snapshot.generation},

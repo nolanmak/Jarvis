@@ -13,13 +13,18 @@ fn fixture() -> tempfile::TempDir {
         .success());
     let gh = root.path().join("gh");
     std::fs::write(&gh, r#"#!/usr/bin/env python3
-import json,os,pathlib,sys
+import json,os,pathlib,sys,datetime
 r=pathlib.Path(os.environ['FIXTURE']);a=sys.argv[1:]
 s=json.loads((r/'scenario.json').read_text())
+with (r/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
 if a[:2]==['repo','view']: print(s.get('permission','WRITE') if 'viewerPermission' in a else 'owner/repo')
 elif a[:2]==['api','user']: print(s.get('actor','owner'))
 elif a[:2]==['api','repos/owner/repo/issues/7']:
  print(json.dumps({'number':7,'state':s.get('state','open'),'html_url':'https://github.com/owner/repo/issues/7','title':'Fix arithmetic','body':'Fix addition','user':{'login':'owner'},'author_association':'OWNER'}))
+elif a[:2]==['api','repos/owner/repo/pulls/42']:
+ print(json.dumps({'number':42,'node_id':'PR_42','merged':s.get('merged',True),'head':{'sha':'a'*40},'base':{'repo':{'full_name':'owner/repo'}},'merge_commit_sha':'c'*40,'merged_by':{'login':'owner'},'merged_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+elif a[:2]==['api','repos/owner/repo/git/commits/'+'c'*40]:
+ print(json.dumps({'sha':'c'*40,'message':'Autoship-Receipt: v1:op-42:'+'f'*64}))
 elif a[:2]==['pr','list']: print(json.dumps([{'number':42,'isCrossRepository':False,'headRepositoryOwner':{'login':'owner'}}] if s.get('open_pr') else []))
 elif a[:3]==['pr','view','42']:
  print(json.dumps({'number':42,'state':s.get('pr_state','OPEN'),'url':'https://github.com/owner/repo/pull/42','headRefName':'feature/fix','headRefOid':'a'*40,'baseRefName':'main','isCrossRepository':s.get('fork',False),'author':{'login':'owner'},'title':'Fix arithmetic','body':'Fix addition','closingIssuesReferences':[]}))
@@ -301,4 +306,143 @@ fn work_once_rechecks_repository_authority_before_execution() {
     assert_eq!(result["accepted"], false);
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert!(!root.path().join(".self-improve-worktrees").exists());
+}
+
+fn seed_pending_merges(root: &Path) {
+    let conn = rusqlite::Connection::open(root.join("state/workflow.db")).unwrap();
+    for (issue, pr) in [(7, 42), (8, 43)] {
+        let id = format!("owner/repo#{issue}");
+        let op = format!("op-{pr}");
+        let binding = serde_json::json!({"head":"a".repeat(40),"contract":"contract","evidence_hash":"proof"});
+        let checkpoint = serde_json::json!({"stage":"held","binding":binding,"evidence":[],"next":{"reason":"merge-reconciliation-required","action":"reconcile_merge","eligible_at_ms":0}});
+        conn.execute("INSERT INTO workflow(id,branch,pr,checkpoint,heartbeat_at,progress_at,generation) VALUES(?1,'feature/fix',?2,?3,10,10,1)",rusqlite::params![id,pr,checkpoint.to_string()]).unwrap();
+        conn.execute(
+            "INSERT INTO pr_alias VALUES(?1,?2)",
+            rusqlite::params![format!("owner/repo/pr/{pr}"), id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO operation VALUES(?1,?2,'\"merge_pr\"',?3,NULL,10)",
+            rusqlite::params![op, id, binding.to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO merge_allowance_dispatch(operation,repository,pr,pr_node_id,head,generation,reserved_at_ms,dispatched_at_ms,state) VALUES(?1,'owner/repo',?2,?3,?4,1,10,11,'dispatched')",rusqlite::params![op,pr,format!("PR_{pr}"),"a".repeat(40)]).unwrap();
+        conn.execute(
+            "INSERT INTO merge_private_marker VALUES(?1,1,?2)",
+            rusqlite::params![
+                op,
+                if pr == 42 {
+                    "f".repeat(64)
+                } else {
+                    "e".repeat(64)
+                }
+            ],
+        )
+        .unwrap();
+    }
+}
+#[test]
+fn work_once_recovers_only_its_pending_merge_without_runtime_or_mutation_replay() {
+    for completed_operation in [false, true] {
+        let root = fixture();
+        body(run(root.path(), &["--request-id", "recover"]), 0);
+        seed_pending_merges(root.path());
+        if completed_operation {
+            let conn = rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+            conn.execute(
+                "UPDATE operation SET receipt=?1 WHERE id='op-42'",
+                [format!("github:pr:42:merged:{}", "a".repeat(40))],
+            )
+            .unwrap();
+        }
+        let result = body(work(root.path(), "owner/repo#7"), 0);
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["stage"], "merged");
+        assert_eq!(result["allowance"]["confirmed"], 1);
+        assert_eq!(result["allowance"]["pending"], 1);
+        let again = body(work(root.path(), "owner/repo#7"), 0);
+        assert_eq!(again["allowance"]["confirmed"], 1);
+        let conn = rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM merge_allowance_dispatch WHERE operation='op-43'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "dispatched"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT json_extract(checkpoint,'$.stage') FROM workflow WHERE id='owner/repo#8'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "held"
+        );
+        let calls = std::fs::read_to_string(root.path().join("calls")).unwrap();
+        assert!(!calls.contains("pulls/43"));
+        assert!(!calls.contains("mutation"));
+        assert!(!root.path().join(".self-improve-worktrees").exists());
+    }
+}
+
+#[test]
+fn work_once_keeps_unknown_merges_pending_and_respects_live_ownership() {
+    for (active, completed) in [(false, false), (true, false), (false, true)] {
+        let root = fixture();
+        body(run(root.path(), &["--request-id", "uncertain"]), 0);
+        seed_pending_merges(root.path());
+        std::fs::write(root.path().join("scenario.json"), r#"{"merged":false}"#).unwrap();
+        let conn = rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+        if active {
+            conn.execute(
+                "UPDATE workflow SET lease_until=?1 WHERE id='owner/repo#7'",
+                [i64::MAX],
+            )
+            .unwrap();
+        }
+        if completed {
+            conn.execute(
+                "UPDATE operation SET receipt=?1 WHERE id='op-42'",
+                [format!("github:pr:42:merged:{}", "a".repeat(40))],
+            )
+            .unwrap();
+            conn.execute("UPDATE workflow SET checkpoint=json_set(checkpoint,'$.stage','merged') WHERE id='owner/repo#7'",[]).unwrap();
+        }
+        let before: String = conn
+            .query_row(
+                "SELECT checkpoint FROM workflow WHERE id='owner/repo#7'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let result = body(work(root.path(), "owner/repo#7"), 3);
+        assert_eq!(result["complete"], false);
+        assert_eq!(result["allowance"]["confirmed"], 0);
+        assert_eq!(result["allowance"]["pending"], 2);
+        assert_eq!(result["merge"]["state"], "pending");
+        assert_eq!(
+            result["pending_merge_operations"],
+            serde_json::json!(["op-42"])
+        );
+        assert_eq!(result["pending_merge_evidence"][0]["operation"], "op-42");
+        let conn = rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT checkpoint FROM workflow WHERE id='owner/repo#7'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            before
+        );
+        let calls = std::fs::read_to_string(root.path().join("calls")).unwrap();
+        assert!(!calls.contains("pulls/43"));
+        assert!(!calls.contains("mutation"));
+        assert_eq!(calls.contains("pulls/42"), !active);
+        assert!(!root.path().join(".self-improve-worktrees").exists());
+    }
 }

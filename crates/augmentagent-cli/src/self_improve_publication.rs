@@ -522,11 +522,15 @@ async fn recover_dispatched_merge(
 }
 
 async fn reconcile_merge_records(github: &mut impl Github, store: &mut crate::autoship_workflow::WorkflowStore, repository: &str) -> Result<usize> {
+    reconcile_merge_records_selected(github, store, repository, None).await
+}
+
+async fn reconcile_merge_records_selected(github: &mut impl Github, store: &mut crate::autoship_workflow::WorkflowStore, repository: &str, selected: Option<&str>) -> Result<usize> {
     use sha2::{Digest, Sha256};
     let mut confirmed = 0;
     // The ledger, not the open-PR inventory, owns uncertain dispatch recovery.
     // Dispatch capacity bounds this set; accounting recovery spends no model calls.
-    for record in store.pending_merge_dispatches(repository)? {
+    for record in store.pending_merge_dispatches(repository)?.into_iter().filter(|record| selected.is_none_or(|id| record.operation.workflow == id)) {
         let reconcile = async {
             if let Some((raw,_)) = store.merge_response(&record.operation,&record.repository,record.pr)? {
                 if crate::autoship_workflow::merge_request_not_executed(&raw) {
@@ -546,7 +550,7 @@ async fn reconcile_merge_records(github: &mut impl Github, store: &mut crate::au
             Err(_) => warn!(operation=%record.operation.id, "merge dispatch reconciliation timed out; capacity retained"),
         }
     }
-    store.reconcile_confirmed_workflows(repository, chrono::Utc::now().timestamp_millis())?;
+    store.reconcile_confirmed_workflows_for(repository, selected, chrono::Utc::now().timestamp_millis())?;
     Ok(confirmed)
 }
 
@@ -555,6 +559,15 @@ pub(super) async fn reconcile_merge_dispatches(root: &Path, dry_run: bool) -> Re
     let repository = workflow::canonical_repository(root).await?;
     let mut store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
     reconcile_merge_records(&mut MergeTransport(root), &mut store, &repository).await
+}
+
+/// Recover only this command's durable dispatches. No mutation or open-PR
+/// inventory is needed, and unrelated workflows retain their prior state.
+pub(super) async fn reconcile_command_merge(root: &Path, repository: &str, id: &str) -> Result<usize> {
+    // The command already authenticated and checked this canonical repository.
+    // Each proof read below remains bounded by the shared recovery deadline.
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+    reconcile_merge_records_selected(&mut MergeTransport(root), &mut store, repository, Some(id)).await
 }
 
 async fn merge_mutation(

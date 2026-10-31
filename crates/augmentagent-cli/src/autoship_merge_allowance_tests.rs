@@ -828,3 +828,24 @@ fn same_head_external_merge_requires_private_protocol_and_no_contradictory_proof
         }
     }
 }
+
+#[test]
+fn targeted_terminal_reconciliation_preserves_other_confirmed_workflows() {
+    let dir=tempfile::tempdir().unwrap();
+    let mut store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now=100*DAY;
+    for pr in 1..=2 {
+        let (lease,op)=fixture(&mut store,pr,now);
+        reserve(&mut store,&lease,&op,pr,now).unwrap();
+        store.dispatch_merge(&lease,&op,now,5).unwrap();
+        store.confirm_merge_dispatch(&op,&receipt(&op,pr,now),now).unwrap();
+        store.release(&lease,now).unwrap();
+    }
+    let other=store.snapshot("owner/repo#2").unwrap().unwrap();
+    assert_eq!(store.reconcile_confirmed_workflows_for("owner/repo",Some("owner/repo#1"),now+1).unwrap(),1);
+    assert_eq!(store.snapshot("owner/repo#1").unwrap().unwrap().checkpoint.stage,Stage::Merged);
+    let after=store.snapshot("owner/repo#2").unwrap().unwrap();
+    assert_eq!(after.checkpoint,other.checkpoint);assert_eq!(after.generation,other.generation);
+    assert_eq!(store.reconcile_confirmed_workflows_for("owner/repo",Some("owner/repo#1"),now+2).unwrap(),0);
+    assert_eq!(store.reconcile_confirmed_workflows("owner/repo",now+3).unwrap(),1);
+}

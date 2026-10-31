@@ -174,20 +174,29 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
     authorize_command(repo, &request).await.context(CommandFailure {code:2, reason:"target-authorization-failed"})?;
     if let Some(snapshot) = store.snapshot(id)? {
         use crate::autoship_workflow::Stage;
-        if snapshot.checkpoint.stage == Stage::Merged {
-            return Ok(RunReport::triage("Workflow is already merged".into()));
-        }
         if snapshot.lease_until_ms > chrono::Utc::now().timestamp_millis() {
             return Ok(RunReport::held("Workflow has an active owner lease".into()));
+        }
+        if store.merge_reconciliation_needed(id)? || store.pending_operations(id)?.iter().any(|op| op.kind == crate::autoship_workflow::OperationKind::MergePr) {
+            drop(store);
+            publication::reconcile_command_merge(repo, &request.repository, id).await?;
+            let observed = crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
+                .context("workflow state disappeared during reconciliation")?;
+            if observed.snapshot(id)?.is_some_and(|s| s.checkpoint.stage == Stage::Merged)
+                && !observed.merge_reconciliation_needed(id)?
+                && !observed.pending_operations(id)?.iter().any(|op| op.kind == crate::autoship_workflow::OperationKind::MergePr) {
+                return Ok(RunReport::triage("Confirmed merge reconciled without another mutation".into()));
+            }
+            return Ok(RunReport::held("Merge reconciliation remains pending; no mutation replayed".into()));
+        }
+        if snapshot.checkpoint.stage == Stage::Merged {
+            return Ok(RunReport::triage("Workflow is already merged".into()));
         }
         if matches!(snapshot.checkpoint.stage, Stage::Held | Stage::Retired | Stage::AwaitChecks | Stage::Merge) {
             return Ok(RunReport::held(format!("Preserved {:?}: {}", snapshot.checkpoint.stage, snapshot.checkpoint.next.reason)));
         }
         if snapshot.checkpoint.next.eligible_at_ms > chrono::Utc::now().timestamp_millis() {
             return Ok(RunReport::held("Workflow retry is not eligible yet".into()));
-        }
-        if store.pending_operations(id)?.iter().any(|op| op.kind == crate::autoship_workflow::OperationKind::MergePr) {
-            return Ok(RunReport::held("Pending merge requires reconciliation before execution".into()));
         }
     }
     let source_issue = if let Target::Issue(n) = request.target {

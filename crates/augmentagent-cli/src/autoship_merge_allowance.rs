@@ -281,11 +281,16 @@ impl WorkflowStore {
     }
 
     pub fn reconcile_confirmed_workflows(&mut self, repository: &str, now: i64) -> Result<usize> {
+        self.reconcile_confirmed_workflows_for(repository, None, now)
+    }
+
+    pub fn reconcile_confirmed_workflows_for(&mut self, repository: &str, workflow: Option<&str>, now: i64) -> Result<usize> {
         let ids = self.conn.prepare("SELECT d.operation FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation JOIN workflow w ON w.id=o.workflow
             WHERE d.repository=?1 AND d.state='confirmed' AND w.lease_until<=?2
+            AND (?3 IS NULL OR o.workflow=?3)
             AND json_extract(w.checkpoint,'$.stage')<>'retired'
             AND (json_extract(w.checkpoint,'$.stage')<>'merged' OR o.receipt IS NULL) ORDER BY d.operation")?
-            .query_map(params![repository.to_ascii_lowercase(),now],|r|r.get::<_,String>(0))?
+            .query_map(params![repository.to_ascii_lowercase(),now,workflow],|r|r.get::<_,String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut completed = 0;
         for operation in ids {
@@ -296,6 +301,20 @@ impl WorkflowStore {
         }
         Ok(completed)
     }
+    /// Operation completion alone does not settle autonomous attribution. A
+    /// lost response can leave a completed operation with an uncertain ledger.
+    pub fn merge_reconciliation_needed(&self, workflow: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_allowance_dispatch d
+            JOIN operation o ON o.id=d.operation JOIN workflow w ON w.id=o.workflow
+            WHERE o.workflow=?1 AND (d.state='dispatched' OR
+                (d.state='confirmed' AND w.pr=d.pr
+                 AND json_extract(w.checkpoint,'$.binding.head')=json_extract(o.binding,'$.head')
+                 AND json_extract(w.checkpoint,'$.binding.contract')=json_extract(o.binding,'$.contract')
+                 AND json_extract(w.checkpoint,'$.binding.evidence_hash')=json_extract(o.binding,'$.evidence_hash')
+                 AND (o.receipt IS NULL OR json_extract(w.checkpoint,'$.stage') NOT IN ('merged','retired')))))",
+            [workflow], |row| row.get(0))?)
+    }
+
     pub fn pending_merge_dispatches(&self, repository: &str) -> Result<Vec<MergeDispatchRecord>> {
         let ids = self.conn.prepare("SELECT operation FROM merge_allowance_dispatch WHERE repository=?1 AND state='dispatched' ORDER BY dispatched_at_ms,operation")?
             .query_map([repository], |row| row.get::<_,String>(0))?
