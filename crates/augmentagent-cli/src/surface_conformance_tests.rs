@@ -74,6 +74,7 @@ fn querier(root: &Path, provider: &Arc<RecordingNativeProvider>) -> WikiQuerier 
         conversation_scheduler: Arc::new(ConversationScheduler::new()),
         voice_enabled: true,
         phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     }
 }

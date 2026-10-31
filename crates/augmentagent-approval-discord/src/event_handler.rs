@@ -324,6 +324,9 @@ pub fn interrupted_turn_target(
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("discord broker ready as {}", ready.user.name);
+        if let Some(store)=self.state.store.as_ref() {
+            ctx.data.write().await.insert::<OwnerMirrorKey>(Arc::new(crate::imessage_owner::OwnerSurface::new(store.clone())));
+        }
         // Stash the bot's own user id so `message()` can tell the bot's prior
         // replies apart from the user's questions when building conversation
         // context for follow-ups.
@@ -423,8 +426,40 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn message_update(&self,ctx:Context,_old:Option<Message>,new:Option<Message>,event:serenity::all::MessageUpdateEvent) {
+        let Some(store)=self.state.store.as_ref() else {return};
+        let surface=crate::imessage_owner::OwnerSurface::new(store.clone());
+        if !surface.active() {return}
+        let message=match new {
+            Some(message)=>message,
+            None=>match event.channel_id.message(&ctx.http,event.id).await {Ok(m)=>m,Err(_)=>return},
+        };
+        if self.state.bot_user_id.get()!=Some(&message.author.id) {return}
+        let (parent,peer)=match message.channel_id.to_channel(&ctx.http).await {
+            Ok(Channel::Guild(c))=>(c.parent_id.map(|p|p.get()),None),
+            Ok(Channel::Private(c))=>(None,Some(c.recipient.id.get())),
+            _=>(None,None),
+        };
+        if let Err(error)=surface.mirror_discord(&message,parent,peer) {warn!("owner mirror update failed: {error}");}
+    }
+
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot {
+            if self.state.bot_user_id.get()==Some(&msg.author.id) {
+                if let Some(store)=self.state.store.as_ref() {
+                    let surface=crate::imessage_owner::OwnerSurface::new(store.clone());
+                    if surface.active() {
+                        let (parent,peer)=match msg.channel_id.to_channel(&ctx.http).await {
+                            Ok(Channel::Guild(c))=>(c.parent_id.map(|p|p.get()),None),
+                            Ok(Channel::Private(c))=>(None,Some(c.recipient.id.get())),
+                            _=>(None,None),
+                        };
+                        if let Err(error)=surface.mirror_discord(&msg,parent,peer) {
+                            warn!("owner iMessage mirror failed: {error}");
+                        }
+                    }
+                }
+            }
             return;
         }
         let Some(handler) = &self.state.query_handler else {
@@ -790,9 +825,9 @@ impl EventHandler for Handler {
                     return;
                 }
                 let reply = self.voice_command_reply(&ctx, &command).await;
-                if let Err(error) = command.edit_response(&ctx.http,
-                    EditInteractionResponse::new().content(reply)).await {
-                    warn!("could not post Discord voice command result: {error}");
+                match command.edit_response(&ctx.http,EditInteractionResponse::new().content(reply)).await {
+                    Ok(posted)=>mirror_interaction_output(&ctx,posted,command.user.id,command.guild_id).await,
+                    Err(error)=>warn!("could not post Discord voice command result: {error}"),
                 }
             }
             Interaction::Component(comp) => {
@@ -819,7 +854,7 @@ impl EventHandler for Handler {
                                     let update = crate::owner_alerts::status_update(&alert, chrono::Utc::now().timestamp_millis(), &comp.message.embeds);
                                     if let Err(error) = comp.channel_id.edit_message(&ctx.http, comp.message.id, update).await {
                                         warn!(alert_id=%id, "owner alert card refresh failed: {error}");
-                                        let _ = comp.create_followup(&ctx.http, CreateInteractionResponseFollowup::new()
+                                        let _ = owner_component_followup(&ctx, &comp, CreateInteractionResponseFollowup::new()
                                             .ephemeral(true)
                                             .content("The alert card could not be refreshed. The control outcome above still applies; the card may show an older status.")).await;
                                     }
@@ -869,13 +904,9 @@ impl EventHandler for Handler {
                         let comp_clone = comp.clone();
                         tokio::spawn(async move {
                             let outcome = dispatch_component_approval(&comp_clone, allowed, handler).await;
-                            if let Err(e) = deliver_approval_outcome(
-                                &ctx_clone.http,
-                                &comp_clone,
-                                &outcome,
-                                &action_id,
-                            ).await {
-                                warn!(%action_id, "failed to deliver approval outcome: {e}");
+                            match deliver_approval_outcome(&ctx_clone.http,&comp_clone,&outcome,&action_id).await {
+                                Ok(posted)=>mirror_interaction_output(&ctx_clone,posted,comp_clone.user.id,comp_clone.guild_id).await,
+                                Err(e)=>warn!(%action_id,"failed to deliver approval outcome: {e}"),
                             }
                         });
                     }
@@ -915,8 +946,7 @@ impl EventHandler for Handler {
                     Verb::Revise => {
                         // Opening a modal IS the response — fast enough.
                         let modal = revise_modal(&cid.action_id, None);
-                        if let Err(e) = comp
-                            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                        if let Err(e) = owner_component_response(&ctx, &comp, CreateInteractionResponse::Modal(modal))
                             .await
                         {
                             warn!("failed to open revise modal: {e}");
@@ -947,8 +977,7 @@ impl EventHandler for Handler {
                             return;
                         }
                         let modal = fill_ask_modal(&cid.action_id, &needs);
-                        if let Err(e) = comp
-                            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                        if let Err(e) = owner_component_response(&ctx, &comp, CreateInteractionResponse::Modal(modal))
                             .await
                         {
                             warn!("failed to open fill-ask modal: {e}");
@@ -1158,9 +1187,7 @@ impl EventHandler for Handler {
                             // the select displaying "Custom…"; re-picking
                             // still works.
                             let modal = schedule_modal(&cid.action_id);
-                            if let Err(e) = comp
-                                .create_response(
-                                    &ctx.http,
+                            if let Err(e) = owner_component_response(&ctx, &comp,
                                     CreateInteractionResponse::Modal(modal),
                                 )
                                 .await
@@ -1417,9 +1444,7 @@ impl EventHandler for Handler {
                     return;
                 }
                 if !is_authorized(self.state.allowed_user_id, modal.user.id) {
-                    let _ = modal
-                        .create_response(
-                            &ctx.http,
+                    let _ = owner_modal_response(&ctx, &modal,
                             CreateInteractionResponse::Message(
                                 CreateInteractionResponseMessage::new()
                                     .content("Not authorized.")
@@ -1432,9 +1457,7 @@ impl EventHandler for Handler {
                 // Defer the modal submission immediately — the revise work
                 // (reasoner call, create_draft, delete_draft) takes well over
                 // 3s, which is Discord's interaction ack deadline.
-                if let Err(e) = modal
-                    .create_response(
-                        &ctx.http,
+                if let Err(e) = owner_modal_response(&ctx, &modal,
                         CreateInteractionResponse::Defer(
                             CreateInteractionResponseMessage::new().ephemeral(true),
                         ),
@@ -1520,9 +1543,7 @@ impl EventHandler for Handler {
                         let filled =
                             extract_fill_values(&modal.data.components, &needs);
                         if filled.is_empty() {
-                            let _ = modal
-                                .create_followup(
-                                    &ctx.http,
+                            let _ = owner_modal_followup(&ctx, &modal,
                                     CreateInteractionResponseFollowup::new()
                                         .content(
                                             "No values supplied — draft unchanged.",
@@ -1601,9 +1622,7 @@ impl EventHandler for Handler {
 
                     // Follow up on the deferred modal interaction.
                     let message = describe(&outcome);
-                    if let Err(e) = modal_clone
-                        .create_followup(
-                            &ctx_clone.http,
+                    if let Err(e) = owner_modal_followup(&ctx_clone, &modal_clone,
                             CreateInteractionResponseFollowup::new()
                                 .content(message)
                                 .ephemeral(true),
@@ -1739,14 +1758,55 @@ where
 
 const TYPING_REFRESH_SECS: u64 = 9;
 
+// Private interaction replies are absent from gateway messages and REST history.
+struct OwnerMirrorKey;
+impl serenity::prelude::TypeMapKey for OwnerMirrorKey {
+    type Value=Arc<crate::imessage_owner::OwnerSurface>;
+}
+async fn mirror_interaction_output(ctx:&Context,mut message:Message,actor:UserId,guild:Option<serenity::all::GuildId>) {
+    let Some(surface)=ctx.data.read().await.get::<OwnerMirrorKey>().cloned() else {return};
+    let Ok(Some(origin))=surface.store.imessage_owner_context() else {return};
+    if actor.get()!=origin.owner_id {return;}
+    message.guild_id=guild;
+    let parent=match message.channel_id.to_channel(&ctx.http).await {
+        Ok(serenity::all::Channel::Guild(c))=>c.parent_id.map(|p|p.get()),
+        Ok(serenity::all::Channel::Private(c)) if c.recipient.id==actor=>None,
+        _=>return,
+    };
+    if let Err(error)=surface.mirror_discord(&message,parent,guild.is_none().then_some(actor.get())) {
+        warn!("owner iMessage private reply mirror failed: {error}");
+    }
+}
+async fn owner_component_response(ctx:&Context,comp:&serenity::all::ComponentInteraction,response:CreateInteractionResponse)->Result<(),serenity::Error> {
+    let visible=matches!(&response,CreateInteractionResponse::Message(_));
+    comp.create_response(&ctx.http,response).await?;
+    if visible {if let Ok(message)=comp.get_response(&ctx.http).await {mirror_interaction_output(ctx,message,comp.user.id,comp.guild_id).await;}}
+    Ok(())
+}
+async fn owner_modal_response(ctx:&Context,modal:&serenity::all::ModalInteraction,response:CreateInteractionResponse)->Result<(),serenity::Error> {
+    let visible=matches!(&response,CreateInteractionResponse::Message(_));
+    modal.create_response(&ctx.http,response).await?;
+    if visible {if let Ok(message)=modal.get_response(&ctx.http).await {mirror_interaction_output(ctx,message,modal.user.id,modal.guild_id).await;}}
+    Ok(())
+}
+async fn owner_component_followup(ctx:&Context,comp:&serenity::all::ComponentInteraction,builder:CreateInteractionResponseFollowup)->Result<Message,serenity::Error> {
+    let message=comp.create_followup(&ctx.http,builder).await?;
+    mirror_interaction_output(ctx,message.clone(),comp.user.id,comp.guild_id).await;
+    Ok(message)
+}
+async fn owner_modal_followup(ctx:&Context,modal:&serenity::all::ModalInteraction,builder:CreateInteractionResponseFollowup)->Result<Message,serenity::Error> {
+    let message=modal.create_followup(&ctx.http,builder).await?;
+    mirror_interaction_output(ctx,message.clone(),modal.user.id,modal.guild_id).await;
+    Ok(message)
+}
+
 /// Immediate, within-budget ack for a component interaction (Approve / Skip)
 /// before we start slow work. Follow up with `followup` once the work is done.
 async fn defer_ephemeral(
     ctx: &Context,
     comp: &serenity::all::ComponentInteraction,
 ) -> Result<(), serenity::Error> {
-    comp.create_response(
-        &ctx.http,
+    owner_component_response(&ctx, &comp,
         CreateInteractionResponse::Defer(
             CreateInteractionResponseMessage::new().ephemeral(true),
         ),
@@ -1760,9 +1820,7 @@ async fn followup(
     comp: &serenity::all::ComponentInteraction,
     message: &str,
 ) {
-    if let Err(e) = comp
-        .create_followup(
-            &ctx.http,
+    if let Err(e) = owner_component_followup(&ctx, &comp,
             CreateInteractionResponseFollowup::new()
                 .content(message)
                 .ephemeral(true),
@@ -1787,8 +1845,7 @@ async fn followup_with_recovery(
     action_id: &str,
 ) {
     log_resolved(comp, outcome, action_id);
-    if let Err(e) = comp
-        .create_followup(&ctx.http, approval_followup(outcome, action_id))
+    if let Err(e) = owner_component_followup(&ctx, &comp, approval_followup(outcome, action_id))
         .await
     {
         warn!("failed to send followup: {e}");
@@ -1841,7 +1898,7 @@ async fn deliver_approval_outcome(
     comp: &serenity::all::ComponentInteraction,
     outcome: &ApprovalActionOutcome,
     action_id: &str,
-) -> Result<(), serenity::Error> {
+) -> Result<Message, serenity::Error> {
     log_resolved(comp, outcome, action_id);
     let mut followup = approval_followup(outcome, action_id);
     // #1507 — name the card the click acted on, so a reply can't be mistaken
@@ -1863,11 +1920,11 @@ async fn deliver_approval_outcome(
             .to_string();
         followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, name));
     }
-    comp.create_followup(http, followup).await?;
+    let posted=comp.create_followup(http, followup).await?;
     if should_delete_source(outcome) {
         comp.channel_id.delete_message(http, comp.message.id).await?;
     }
-    Ok(())
+    Ok(posted)
 }
 
 /// The card's embed title (its subject line), if it has one.
@@ -1911,9 +1968,7 @@ async fn ack_ephemeral(
     comp: &serenity::all::ComponentInteraction,
     message: &str,
 ) {
-    if let Err(e) = comp
-        .create_response(
-            &ctx.http,
+    if let Err(e) = owner_component_response(&ctx, &comp,
             CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content(message)
@@ -1952,9 +2007,7 @@ async fn modal_followup(
     message: &str,
     action_id: &str,
 ) {
-    if let Err(e) = modal
-        .create_followup(
-            &ctx.http,
+    if let Err(e) = owner_modal_followup(&ctx, &modal,
             CreateInteractionResponseFollowup::new()
                 .content(message)
                 .ephemeral(true),

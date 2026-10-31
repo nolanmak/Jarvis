@@ -460,11 +460,10 @@ pub(crate) async fn run_cli_resolve(
         broker: std::sync::OnceLock::new(),
         imessage: ImessageSendConfig::from_env(),
     };
-    let outcome = if approve {
-        approver.run_approve(action_id).await
-    } else {
-        approver.run_skip(action_id).await
-    };
+    let outcome = augmentagent_approval_discord::deciding("cli",async {
+        use augmentagent_approval_discord::ApprovalActionHandler;
+        if approve {approver.approve(action_id).await} else {approver.skip(action_id).await}
+    }).await;
     match outcome {
         ApprovalActionOutcome::Approved => {
             println!("approved: queued for the Mac sender");
