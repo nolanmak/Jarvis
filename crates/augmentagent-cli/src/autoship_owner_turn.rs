@@ -33,6 +33,7 @@ impl WorkflowStore {
         // An owner clarification can change acceptance even before the head
         // changes. Preserve history, invalidate only the current approval index.
         tx.execute("DELETE FROM review WHERE workflow=?1",[workflow])?;
+        tx.execute("DELETE FROM review_fragment WHERE workflow=?1",[workflow])?;
         event(&tx,workflow,generation,"owner_turn_claimed",&serde_json::json!({"request_id":request_id,"pause_revision":control.revision,"binding":checkpoint.binding}).to_string(),now)?;
         tx.commit()?;
         Ok(Some(OwnerTurn {lease:Lease {workflow:workflow.into(),owner:owner.into(),generation},request_id,body,pause_revision:control.revision,binding:checkpoint.binding}))

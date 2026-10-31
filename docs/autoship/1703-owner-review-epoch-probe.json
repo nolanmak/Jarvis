@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1713,
+    1709,
+    1712
+  ],
+  "status": "owner-input-review-epoch-and-milestone-invalidation-verified-not-deployed",
+  "parent_commit": "cfa295cf0d039d76f0f73141c4d3f3b845d68be6",
+  "tests": {
+    "owner_input_red": {
+      "log": "/tmp/autoship-1703-red-owner-review-boundary.log",
+      "cargo_exit": 101,
+      "failed": 2,
+      "assertions": [
+        "Old PR-ready receipt completes work after owner requirements changed.",
+        "Historical adopted publication review survives owner input on an unchanged head."
+      ],
+      "command": "CARGO_TARGET_DIR=/mnt/build/augmentagent-session-targets/jarvis-autoship-1598-09482344886d3206 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_input_invalidates"
+    },
+    "audit_epoch_red": {
+      "log": "/tmp/autoship-1703-red-ready-epoch.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Old readiness lacks a current-epoch approval after recovery.",
+      "command": "CARGO_TARGET_DIR=/mnt/build/augmentagent-session-targets/jarvis-autoship-1598-09482344886d3206 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent audit_recovery_cannot_revive_pr_ready"
+    },
+    "final_unit_suite_green": {
+      "log": "/tmp/autoship-1703-green-review-epoch-final.log",
+      "suite_result": "ok",
+      "passed": 1491,
+      "failed": 0,
+      "ignored": 25,
+      "overall_command_exit": 101,
+      "note": "Unit suite passed; the later compiled submit suite had five fixture failures because it seeded ready receipts without any review. Runtime code was unchanged after this unit pass.",
+      "command": "CARGO_TARGET_DIR=/mnt/build/augmentagent-session-targets/jarvis-autoship-1598-09482344886d3206 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent --test autoship_commands_cli --test autoship_submit_cli --test autoship_resolution_cli"
+    },
+    "compiled_cli_fixture_red": {
+      "log": "/tmp/autoship-1703-green-review-epoch-final.log",
+      "failed": 5,
+      "reason": "Observer fixture manufactured a ready receipt without the matching current review. Fixture now seeds synthetic review/index/event evidence; the production approval gate was preserved."
+    },
+    "final_compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-review-epoch-cli-final.log",
+      "exit": 0,
+      "passed": 43,
+      "failed": 0,
+      "command": "CARGO_TARGET_DIR=/mnt/build/augmentagent-session-targets/jarvis-autoship-1598-09482344886d3206 scripts/cargo-managed.sh test -p augmentagent-cli --test autoship_commands_cli --test autoship_submit_cli --test autoship_resolution_cli"
+    }
+  },
+  "verified": [
+    "Accepted owner input atomically invalidates current review/index fragments and PR-ready receipts together with inbox, pause and acknowledgement. Injected failure at readiness deletion rolls the entire transaction back.",
+    "A durable per-workflow review floor binds the accepted request to the previous event sequence; it does not delete historical review events.",
+    "Sweep, adopted publication, episode review and PR-ready readers share exact-current-binding and review-epoch filtering. Audit recovery and owner-turn claim bound historical reads as well.",
+    "Pending input hides current reviews/fragments and blocks new PR-ready receipt creation, including a late review recorded by the previously active worker.",
+    "After the old worker releases and an owner turn claims the candidate, a test-only simulated pending-state clear cannot restore old or late review authority after restart. This simulation is not native owner-turn completion evidence.",
+    "PR readiness now requires a current approved review; missing current-epoch approval cannot be replaced by an older receipt on the same restored binding."
+  ],
+  "limits": [
+    "Review epoch invalidation is not executable acceptance-contract revision. No new owner contract was compiled or activated in this change.",
+    "Native owner consumer, actual guarded edit/test, protected contract amendment, full dependent cache revision and independent re-review remain unfinished.",
+    "No public consumer completion API, production rollout, live Discord/native acceptance, hosted CI acceptance or required soaks completed. No child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_milestone.rs",
+      "sha256": "73c92792def1820be750866ba3e4999643d0df9ee43986bf721a91bdd96abe72"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+      "sha256": "1043faf17f3b779c1c7e7388dcb5f926c5cffac89714dfc34d6a4016de42fbfa"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "d8ce573a0eaffea804caa26025ae88e1a078849d9b5f2069b145724c736f3870"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "8c0b187879c53547945a0e132b2805d456775606e6fc763fc70496d637a29793"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_adopted.rs",
+      "sha256": "c4ff1d99001fc01a3652470e5c94ef32a6027b9533ab029153c032dd95b5d67c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "02173d07de716690dc299b92e326529f6b7a47e4609e4321a60442b85e3c1e4a"
+    },
+    {
+      "path": "crates/augmentagent-cli/tests/autoship_submit_cli.rs",
+      "sha256": "fde84357781954b80b29867eca2372788ac320e43597f7e7e97ad5965b2a8678"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_review_epoch.rs",
+      "sha256": "7bed5aefa782f1e2294221521fb38e833411f12e133ef3a69b24fc3e8cdf7c0e"
+    }
+  ]
+}

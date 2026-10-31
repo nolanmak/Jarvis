@@ -508,7 +508,17 @@ fn seed_pr_milestone(root:&Path,id:&str,receipt:bool) {
     let binding=serde_json::json!({"head":"a".repeat(40),"contract":"contract","evidence_hash":"evidence"});
     let cp=serde_json::json!({"stage":"await_checks","binding":binding,"evidence":[],"next":{"reason":"pr_milestone_reached","action":"await_merge_authorization","eligible_at_ms":0}});
     conn.execute("INSERT INTO workflow(id,branch,pr,checkpoint,heartbeat_at,progress_at) VALUES(?1,'branch',42,?2,10,10) ON CONFLICT(id) DO UPDATE SET checkpoint=excluded.checkpoint",rusqlite::params![id,cp.to_string()]).unwrap();
-    if receipt {conn.execute("INSERT INTO pr_ready_receipt VALUES(?1,?2,42,'protected-review-digest',10)",rusqlite::params![id,format!(r#"{{"head":"{}","contract":"contract","evidence_hash":"evidence"}}"#,"a".repeat(40))]).unwrap();}
+    if receipt {
+        // These compiled observer tests seed synthetic durable evidence rather
+        // than running a provider. A ready receipt needs its matching review.
+        use sha2::Digest;
+        let evidence="synthetic independent review";
+        let review=serde_json::json!({"reviewer":"fixture-independent","binding":binding,"approved":true,"evidence":evidence});
+        let encoded=format!(r#"{{"head":"{}","contract":"contract","evidence_hash":"evidence"}}"#,"a".repeat(40));
+        conn.execute("INSERT INTO review VALUES(?1,'fixture-independent',?2,1,?3)",rusqlite::params![id,encoded,evidence]).unwrap();
+        conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,0,'review_recorded',?2,10)",rusqlite::params![id,review.to_string()]).unwrap();
+        conn.execute("INSERT INTO pr_ready_receipt VALUES(?1,?2,42,?3,10)",rusqlite::params![id,encoded,format!("{:x}",sha2::Sha256::digest(evidence.as_bytes()))]).unwrap();
+    }
 }
 #[test]
 fn pr_only_completion_requires_published_validation_receipt_for_current_binding() {

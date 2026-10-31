@@ -15,6 +15,8 @@ pub(crate) mod progress;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_review_epoch.rs"]
+mod review_epoch;
 #[path = "autoship_conversations.rs"]
 mod conversations;
 #[path = "autoship_owner_turn.rs"]
@@ -324,6 +326,9 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id), provider TEXT NOT NULL, native_session TEXT NOT NULL,
                 uncertain INTEGER NOT NULL, binding TEXT NOT NULL, updated_at INTEGER NOT NULL,
                 PRIMARY KEY(workflow,provider), UNIQUE(provider,native_session));
+            CREATE TABLE IF NOT EXISTS workflow_review_floor (
+                workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), after_seq INTEGER NOT NULL,
+                request_id TEXT NOT NULL REFERENCES discord_control_request(request_id));
             CREATE TABLE IF NOT EXISTS workflow_owner_turn (
                 workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
                 owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,
@@ -1070,6 +1075,7 @@ impl WorkflowStore {
     pub fn review_fragment(&mut self, lease: &Lease, binding: &Binding, key: &str, now: i64) -> Result<Option<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
+        if owner_inbox::pending(&tx,&lease.workflow)?>0 {return Ok(None);}
         let generation:i64=tx.query_row("SELECT generation FROM workflow_audit_generation WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).optional()?.unwrap_or(0);
         let value=tx.query_row("SELECT payload FROM review_fragment WHERE workflow=?1 AND audit_generation=?2 AND key=?3",
             params![lease.workflow,generation,key],|r|r.get(0)).optional()?;
@@ -1129,6 +1135,7 @@ impl WorkflowStore {
     /// Returns only records for the current binding; this is evidence, not a
     /// merge verdict. The caller must apply independence and adjudication rules.
     pub fn current_reviews(&self, workflow: &str) -> Result<Vec<Review>> {
+        if self.pending_owner_messages(workflow)?>0 {return Ok(Vec::new());}
         let snapshot = self.snapshot(workflow)?.context("unknown workflow")?;
         let binding = snapshot.checkpoint.binding;
         let mut statement = self.conn.prepare("SELECT reviewer,approved,evidence FROM review WHERE workflow=?1 AND binding=?2 ORDER BY reviewer")?;

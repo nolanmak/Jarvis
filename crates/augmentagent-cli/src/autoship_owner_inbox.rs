@@ -31,6 +31,7 @@ impl WorkflowStore {
             let revision=super::owner_control::read(&tx,workflow)?.map_or(0,|c|c.revision);
             super::owner_control::apply_in_transaction(&tx,workflow,&origin.principal(),revision,true,now)?;
             tx.execute("INSERT INTO workflow_owner_message VALUES(?1,?2,?3,'pending',?4)",params![request_id,workflow,body,now])?;
+            super::review_epoch::invalidate(&tx,workflow,&request_id)?;
         }
         tx.commit()?;Ok(reply)
     }

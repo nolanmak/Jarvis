@@ -40,15 +40,7 @@ fn publication_review(
     let Some(snapshot) = store.snapshot(&id)? else {
         return Ok(None);
     };
-    let review = store
-        .events(&id)?
-        .into_iter()
-        .rev()
-        .take_while(|(_, kind, _, _)| kind != "audit_generation_recovered")
-        .filter(|(_, kind, _, _)| kind == "review_recorded")
-        .filter_map(|(_, _, raw, _)| {
-            serde_json::from_str::<crate::autoship_workflow::Review>(&raw).ok()
-        })
+    let review=store.current_review_history(&id)?.into_iter()
         .find(|r| {
             r.binding == snapshot.checkpoint.binding
                 && r.binding.head == candidate.head
@@ -945,6 +937,18 @@ mod fairness_tests {
             body: "Preserve existing behavior".into(),
             dependency: adoption::Dependency::Main,
         }
+    }
+    #[test]
+    fn owner_input_invalidates_adopted_publication_on_unchanged_head() {
+        use crate::autoship_workflow::{Binding,Review,discord_ingress::DiscordOrigin,submission::{Request,Target,Milestone}};
+        let dir=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();let candidate=candidate(42);
+        let origin=DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        let id=store.submit_discord_authorized(&origin,&Request {repository:candidate.repository.clone(),target:Target::Pr(42),provider:None,until:Milestone::Merged},&"a".repeat(64),1).unwrap().admission.workflow;
+        let binding=Binding {head:candidate.head.clone(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        store.register(&id,&candidate.branch,binding.clone(),2).unwrap();let lease=store.claim(&id,"worker",3,100).unwrap().unwrap();store.attach_pr_in_repo(&lease,&candidate.repository,42,4).unwrap();
+        store.record_review(&lease,&Review {reviewer:"adopted-publication-old".into(),binding,approved:true,evidence:"old structured receipt".into()},5).unwrap();assert!(publication_review(&store,&candidate).unwrap().is_some());
+        store.enqueue_owner_message(&DiscordOrigin {message:45,..origin},&id,"Change the behavior",None,6).unwrap();
+        assert!(publication_review(&store,&candidate).unwrap().is_none(),"historical review survived owner input despite unchanged head");
     }
     #[test]
     fn recovered_audit_cannot_revive_adopted_publication_approval() {

@@ -379,15 +379,7 @@ impl SweepGuard {
         };
         // Bind merge metadata to the protected review that granted authority,
         // not a different cached OpenedPr supplied by a reconciliation caller.
-        let reviews: Vec<Review> = store
-            .events(&id)?
-            .into_iter()
-            .rev()
-            .take_while(|(_, kind, _, _)| kind != "audit_generation_recovered")
-            .filter(|(_, kind, _, _)| kind == "review_recorded")
-            .filter_map(|(_, _, body, _)| serde_json::from_str::<Review>(&body).ok())
-            .filter(|review| review.binding == binding)
-            .collect();
+        let reviews=store.current_review_history(&id)?;
         let structured = reviews.iter().find_map(|review| {
             structured_review_base(&review.evidence, head).map(|base| (review.approved, base))
         });
@@ -907,14 +899,9 @@ impl WorkflowGuard {
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?;
-        for (_, kind, body, _) in store.events(self.id())?.into_iter().rev() {
-            if kind != "review_recorded" {
-                continue;
-            }
-            if let Ok(review) = serde_json::from_str::<Review>(&body) {
-                if review.binding.head == head && review.reviewer.starts_with("episode-evidence-") {
-                    return Ok(Some(serde_json::from_str(&review.evidence)?));
-                }
+        for review in store.current_review_history(self.id())? {
+            if review.binding.head==head && review.reviewer.starts_with("episode-evidence-") {
+                return Ok(Some(serde_json::from_str(&review.evidence)?));
             }
         }
         Ok(None)
