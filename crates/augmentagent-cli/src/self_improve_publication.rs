@@ -431,6 +431,33 @@ pub(super) fn accepted_merge_receipt(raw: &str, node: &str, pr: u64, head: &str,
     })
 }
 
+pub(super) fn marker_merge_receipt(
+    record: &crate::autoship_workflow::MergeDispatchRecord,
+    remote: &serde_json::Value,
+    commit: &serde_json::Value,
+) -> Result<MergeMutationReceipt> {
+    let head = record.operation.binding.head.as_str();
+    anyhow::ensure!(remote["merged"] == true && remote["number"].as_u64() == Some(record.pr)
+        && remote["node_id"].as_str() == Some(record.node.as_str())
+        && remote["head"]["sha"].as_str() == Some(head)
+        && remote["base"]["repo"]["full_name"].as_str().is_some_and(|name| name.eq_ignore_ascii_case(&record.repository)),
+        "remote PR does not prove the dispatched identity");
+    let sha = remote["merge_commit_sha"].as_str().context("remote merge commit missing")?;
+    anyhow::ensure!(matches!(sha.len(),40|64) && sha.bytes().all(|c|c.is_ascii_hexdigit())
+        && commit["sha"].as_str() == Some(sha),"immutable commit identity differs");
+    let merged_at = remote["merged_at"].as_str().context("remote merge time missing")?;
+    anyhow::ensure!(chrono::DateTime::parse_from_rfc3339(merged_at)?.timestamp_millis() >= 0,"invalid remote merge time");
+    let receipt = MergeMutationReceipt {
+        expected_head:head.into(),pr_number:record.pr,pr_node_id:record.node.clone(),merge_commit:sha.into(),
+        merged_by:remote["merged_by"]["login"].as_str().filter(|s|!s.trim().is_empty()).context("remote merge actor missing")?.into(),
+        merged_at:merged_at.into(),
+        merge_message:Some(commit["message"].as_str().context("immutable commit message missing")?.into()),
+        client_mutation_id:String::new(),commit_marker_operation:Some(record.operation.id.clone()),
+    };
+    anyhow::ensure!(serde_json::to_vec(&receipt)?.len() <= 16 * 1024,"immutable merge proof exceeds bound");
+    Ok(receipt)
+}
+
 async fn recover_dispatched_merge(
     github: &mut impl Github,
     record: &crate::autoship_workflow::MergeDispatchRecord,
@@ -463,15 +490,7 @@ async fn recover_dispatched_merge(
     anyhow::ensure!(matches!(sha.len(),40|64) && sha.bytes().all(|c|c.is_ascii_hexdigit()), "invalid remote merge commit");
     let raw = github.call(&["api", &format!("repos/{repository}/git/commits/{sha}")]).await?;
     let commit: serde_json::Value = serde_json::from_str(&raw)?;
-    anyhow::ensure!(commit["sha"].as_str() == Some(sha), "immutable commit identity differs");
-    let receipt = MergeMutationReceipt {
-        expected_head: head.into(), pr_number: pr, pr_node_id: record.node.clone(),
-        merge_commit: sha.into(),
-        merged_by: remote["merged_by"]["login"].as_str().context("remote merge actor missing")?.into(),
-        merged_at: remote["merged_at"].as_str().context("remote merge time missing")?.into(),
-        merge_message: Some(commit["message"].as_str().context("immutable commit message missing")?.into()),
-        client_mutation_id: String::new(), commit_marker_operation: Some(operation_id.into()),
-    };
+    let receipt = marker_merge_receipt(record,&remote,&commit)?;
     store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
     Ok(receipt)
 }

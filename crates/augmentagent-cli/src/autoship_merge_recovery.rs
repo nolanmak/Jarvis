@@ -189,10 +189,37 @@ pub async fn resolve(
         Ok(value) => value,
         Err(error) => return failure(operation, 4, "workflow-state-unavailable", error),
     };
+    let immutable_proof = if classification == "autonomous" && journal.is_none() {
+        let checked = (async {
+            ensure!(matches!(record.state.as_str(),"dispatched"|"confirmed")
+                && manifest.response_sha256.is_none() && remote["merged"] == true,
+                "immutable recovery requires a dispatched intent and no invented response digest");
+            let sha = remote["merge_commit_sha"].as_str().context("remote merge commit missing")?;
+            ensure!(matches!(sha.len(),40|64) && sha.bytes().all(|c|c.is_ascii_hexdigit()),"invalid merge commit identity");
+            ensure!(manifest.merge_commit.as_deref() == Some(sha)
+                && manifest.remote_head.as_deref() == remote["head"]["sha"].as_str()
+                && manifest.remote_head.as_deref() == Some(record.operation.binding.head.as_str())
+                && manifest.merged_at.as_deref() == remote["merged_at"].as_str(),
+                "manifest differs from immutable merge observation");
+            let commit = github(&format!("repos/{}/git/commits/{sha}",record.repository)).await?;
+            let receipt = crate::self_improve::immutable_merge_proof(&record,&remote,&commit)?;
+            store.validate_merge_receipt_marker(operation,&receipt)?;
+            if record.state == "confirmed" {
+                let existing = store.confirmed_merge_receipt(operation)?.context("confirmed merge proof missing")?;
+                ensure!(existing == receipt,"immutable confirmation proof differs");
+            }
+            Ok::<_,anyhow::Error>(receipt)
+        }).await;
+        match checked {
+            Ok(receipt) => Some(receipt),
+            Err(error) => return failure(operation,3,"merge-reconciliation-required",error),
+        }
+    } else { None };
     // Validate all proof against read-only state and current GitHub evidence
     // before opening a writer, even when the operator is authorized.
     let validated = (|| -> Result<(Option<Value>, Option<MergeReleaseProof>)> {
         if classification == "autonomous" {
+            if let Some(receipt) = &immutable_proof { return Ok((Some(receipt.clone()),None)); }
             let (raw, node) = journal
                 .as_ref()
                 .context("no controller-recorded response; mergedBy alone is not attribution")?;
@@ -352,15 +379,14 @@ pub async fn resolve(
         let now = chrono::Utc::now().timestamp_millis();
         if let Some(receipt) = receipt {
             store.confirm_merge_dispatch(&record.operation, &receipt, now)?;
-            store.record_confirmed_merge_resolution(
-                &record.operation,
-                &actor,
-                manifest
-                    .response_sha256
-                    .as_deref()
-                    .context("response digest missing")?,
-                now,
-            )?;
+            if immutable_proof.is_some() {
+                store.record_confirmed_marker_resolution(&record.operation,&actor,&receipt,now)?;
+            } else {
+                store.record_confirmed_merge_resolution(
+                    &record.operation, &actor,
+                    manifest.response_sha256.as_deref().context("response digest missing")?, now,
+                )?;
+            }
             store.reconcile_confirmed_workflow(&record.operation.id, now)?;
         } else {
             store.resolve_merge_without_debit(

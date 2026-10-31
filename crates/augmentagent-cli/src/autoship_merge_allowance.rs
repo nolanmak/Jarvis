@@ -794,6 +794,31 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub fn record_confirmed_marker_resolution(&mut self, op:&Operation, actor:&str, receipt:&serde_json::Value, now:i64) -> Result<()> {
+        ensure!(!actor.trim().is_empty() && actor.len() <= 256,"invalid resolution actor");
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (workflow,kind,binding,raw,prior,generation):(String,String,String,String,Option<String>,i64) = tx.query_row(
+            "SELECT o.workflow,o.kind,o.binding,m.receipt,d.resolution,d.generation FROM merge_allowance_dispatch d
+             JOIN operation o ON o.id=d.operation JOIN merge_mutation_receipt m ON m.operation=o.id
+             WHERE d.operation=?1 AND d.state='confirmed'",[&op.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        ensure!(workflow == op.workflow && op.kind == OperationKind::MergePr
+            && serde_json::from_str::<OperationKind>(&kind)? == op.kind
+            && serde_json::from_str::<Binding>(&binding)? == op.binding
+            && raw == serde_json::to_string(receipt)?
+            && receipt["commit_marker_operation"].as_str() == Some(op.id.as_str()),
+            "confirmation audit lacks matching immutable commit proof");
+        validate_merge_receipt_identity(&tx,&op.id,receipt)?;
+        let decision = serde_json::json!({"classification":"autonomous","actor":actor,
+            "proof_kind":"immutable_commit_marker","receipt_sha256":format!("{:x}",Sha256::digest(raw.as_bytes()))}).to_string();
+        if let Some(prior) = prior { ensure!(prior == decision,"immutable merge resolution conflict"); }
+        else {
+            tx.execute("UPDATE merge_allowance_dispatch SET resolution=?2 WHERE operation=?1",params![op.id,decision])?;
+            event(&tx,&workflow,generation,"merge_resolution_confirmed",&serde_json::json!({"operation":op.id,"decision":serde_json::from_str::<serde_json::Value>(&decision)?}).to_string(),now)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Recovery never fabricates a successful response from `state=MERGED`.
     pub fn confirmed_merge_receipt(&self, operation: &str) -> Result<Option<serde_json::Value>> {
         let raw: Option<String> = self.conn.query_row(

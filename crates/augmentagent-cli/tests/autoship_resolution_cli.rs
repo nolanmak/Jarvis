@@ -65,6 +65,7 @@ with (root/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
 if a==['api','user']: print(json.dumps({'login':'owner'}))
 elif a==['api','repos/owner/repo']: print(json.dumps({'full_name':'owner/repo','permissions':{'admin':not (root/'deny').exists()}}))
 elif a==['api','repos/owner/repo/pulls/34']: print((root/'remote.json').read_text())
+elif a==['api','repos/owner/repo/git/commits/'+'c'*40]: print((root/'commit.json').read_text())
 else: raise Exception('unexpected/mutating GitHub call '+repr(a))
 "#).unwrap();
     std::fs::set_permissions(root.join("gh"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -105,6 +106,53 @@ fn request_error() -> Value {
 }
 fn accepted() -> Value {
     json!({"data":{"mergePullRequest":{"clientMutationId":"op-pending","pullRequest":{"id":"PR_34","number":34,"state":"MERGED","headRefOid":"a".repeat(40),"mergedAt":"2026-10-31T00:00:00Z","mergeCommit":{"oid":"c".repeat(40)},"mergedBy":{"login":"owner"}}}}})
+}
+
+#[test]
+fn cli_recovers_lost_response_from_immutable_commit_without_inventing_echo() {
+    for scenario in ["valid","wrong-marker","wrong-commit","legacy","oversized","invalid-time"] {
+        let dir = fixture(None,true,&"a".repeat(40));
+        let root = dir.path();
+        let marker = format!("Autoship-Receipt: v1:op-pending:{}","f".repeat(64));
+        if scenario != "legacy" {
+            let conn = rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+            conn.execute_batch("CREATE TABLE merge_private_marker(operation TEXT PRIMARY KEY,protocol INTEGER,nonce TEXT);").unwrap();
+            conn.execute("INSERT INTO merge_private_marker VALUES('op-pending',1,?1)",["f".repeat(64)]).unwrap();
+        }
+        std::fs::write(root.join("commit.json"),json!({
+            "sha":if scenario=="wrong-commit" {"d".repeat(40)} else {"c".repeat(40)},
+            "message":if scenario=="wrong-marker" {"manual merge".into()}
+                else if scenario=="oversized" { format!("{}\n{marker}","x".repeat(20_000)) } else {marker}
+        }).to_string()).unwrap();
+        if scenario == "invalid-time" {
+            for file in ["remote.json","evidence.json"] {
+                let path = root.join(file);
+                let mut value:Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                value["merged_at"] = "invalid-time".into();
+                std::fs::write(path,value.to_string()).unwrap();
+            }
+        }
+        let before = Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap());
+        if scenario != "valid" {
+            assert_code(&invoke(root,"autonomous"),3);
+            assert_eq!(Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap()),before,"{scenario}");
+            continue;
+        }
+        for _ in 0..2 { assert_code(&invoke(root,"autonomous"),0); }
+        let conn = rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+        let raw:String = conn.query_row("SELECT receipt FROM merge_mutation_receipt",[],|r|r.get(0)).unwrap();
+        let proof:Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(proof["commit_marker_operation"],"op-pending");
+        assert!(proof.get("client_mutation_id").is_none());
+        let decision:String = conn.query_row("SELECT resolution FROM merge_allowance_dispatch",[],|r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&decision).unwrap()["proof_kind"],"immutable_commit_marker");
+        let checkpoint:String = conn.query_row("SELECT checkpoint FROM workflow",[],|r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&checkpoint).unwrap()["stage"],"merged");
+        let n:u32 = conn.query_row("SELECT count(*) FROM workflow_event WHERE kind='autonomous_merge_confirmed'",[],|r|r.get(0)).unwrap();
+        assert_eq!(n,1);
+        let journals:u32 = conn.query_row("SELECT count(*) FROM merge_transport_response",[],|r|r.get(0)).unwrap();
+        assert_eq!(journals,0,"recovery must never fabricate an original response");
+    }
 }
 
 #[test]

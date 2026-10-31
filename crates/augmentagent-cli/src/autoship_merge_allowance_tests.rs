@@ -3,6 +3,41 @@ use super::*;
 const DAY: i64 = 86_400_000;
 
 #[test]
+fn marker_resolution_audit_requires_exact_confirmed_binding_and_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    let (lease,op) = fixture(&mut store,1,now);
+    let (_,other) = fixture(&mut store,2,now);
+    reserve(&mut store,&lease,&op,1,now).unwrap();
+    let marker = store.dispatch_marked_merge(&lease,&op,now,5).unwrap();
+    let mut proof = receipt(&op,1,now);
+    proof.as_object_mut().unwrap().remove("client_mutation_id");
+    proof["commit_marker_operation"] = op.id.clone().into();
+    proof["merge_message"] = marker.into();
+    assert!(store.record_confirmed_marker_resolution(&op,"owner",&proof,now).is_err());
+    store.confirm_merge_dispatch(&op,&proof,now).unwrap();
+    for field in ["workflow","kind","head","contract","evidence","receipt"] {
+        let mut wrong = op.clone();
+        let mut changed = proof.clone();
+        match field {
+            "workflow" => wrong.workflow = other.workflow.clone(),
+            "kind" => wrong.kind = OperationKind::Push,
+            "head" => wrong.binding.head = "c".repeat(40),
+            "contract" => wrong.binding.contract = "changed".into(),
+            "evidence" => wrong.binding.evidence_hash = "changed".into(),
+            "receipt" => changed["merge_commit"] = "c".repeat(40).into(),
+            _ => unreachable!(),
+        }
+        assert!(store.record_confirmed_marker_resolution(&wrong,"owner",&changed,now).is_err(),"{field}");
+        assert!(store.merge_dispatch(&op.id).unwrap().unwrap().resolution.is_none());
+    }
+    store.record_confirmed_marker_resolution(&op,"owner",&proof,now).unwrap();
+    store.record_confirmed_marker_resolution(&op,"owner",&proof,now).unwrap();
+    assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,1);
+}
+
+#[test]
 fn corrupt_terminal_proof_cannot_starve_other_confirmed_workflows() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
