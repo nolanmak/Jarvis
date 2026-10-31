@@ -91,6 +91,29 @@
   },
   "marker_fixture_followup": {
     "root": "/tmp/autoship-native-acceptance-l18ykhkg",
-    "status": "running-not-accepted"
+    "status": "failed-obsolete-event-assertion",
+    "exit_code": 101,
+    "model_calls": 11,
+    "elapsed_seconds": 616.51,
+    "verified_progress": "Merged workflow with one confirmed dispatch and durable mutation receipt. Original harness expected legacy merge_mutation_accepted event; current authoritative event is autonomous_merge_confirmed."
+  },
+  "retained_terminal_verification": {
+    "status": "passed",
+    "artifact": "/tmp/autoship-source-less-acceptance-50PYFm/completion-verification.json",
+    "artifact_sha256": "85e182b78a7ba1fceb311743b6ffacb38f47478584c967a146596810b1cea345",
+    "result": {
+      "confirmed_merges": 1,
+      "head": "91f001d40751e345afd1bd326e9697ebf26b041b",
+      "model_calls": 11,
+      "passed": true,
+      "pending_merges": 0,
+      "remaining": 4,
+      "replay_mutations": 0,
+      "scope": "terminal assertions on retained real-native/local-Git/scripted-GitHub run; not production or fresh full rerun",
+      "workflow": "autoship-canary/adopted-8c0d74e5-56dd-408c-97f8-1471e9da702c/pr/841"
+    },
+    "test_binary_sha256": "6db08b059bebf6d8a119408a64e70793e10bb629c039e1db1fe7b0b690d26b3c",
+    "log": "/tmp/autoship-1703-green-retained-adoption-completion.log",
+    "limitation": "Separate terminal assertions on the retained native run; original test exit remains failure. Not a fresh full rerun, hosted GitHub acceptance, deployed CLI/Discord proof, or soak."
   }
 }

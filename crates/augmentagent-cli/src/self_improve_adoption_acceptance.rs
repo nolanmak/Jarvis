@@ -273,13 +273,7 @@ async fn run_pipeline() -> Result<()> {
         after.model_calls == calls,
         "CI-only reconciliation rebilled native work"
     );
-    let events = store.events(&id)?;
-    anyhow::ensure!(
-        events
-            .iter()
-            .any(|(_, kind, _, _)| kind == "merge_mutation_accepted"),
-        "merge lacks accepted own mutation attribution"
-    );
+    verify_merge_attribution(&store, &id)?;
     anyhow::ensure!(
         std::fs::read_to_string(root.join("merge-mutations.jsonl"))?
             .lines()
@@ -349,5 +343,58 @@ async fn adoption_boundary_preserves_policy_and_immutable_merge_marker() -> Resu
     anyhow::ensure!(fixture_git(&repo,&["show","-s","--format=%B",oid]).await?==body,"response marker must exist in real Git commit");
     anyhow::ensure!(fixture_git(&repo,&["rev-parse","main"]).await?==oid,"main must point at the fixture squash commit");
     anyhow::ensure!(fixture_git(&repo,&["rev-parse",&format!("{oid}^{{tree}}")]).await?==fixture_git(&repo,&["rev-parse",&format!("{head}^{{tree}}")]).await?,"squash must preserve approved candidate tree");
+    Ok(())
+}
+
+
+fn verify_merge_attribution(store:&crate::autoship_workflow::WorkflowStore,id:&str)->Result<()> {
+    let events=store.events(id)?;
+    let confirmations:Vec<_>=events.iter().filter(|(_,kind,_,_)|kind=="autonomous_merge_confirmed").collect();
+    anyhow::ensure!(confirmations.len()==1,"expected exactly one autonomous confirmation");
+    let payload:serde_json::Value=serde_json::from_str(&confirmations[0].2)?;
+    let operation=payload["operation"].as_str().context("confirmed operation missing")?;
+    let receipt=store.confirmed_merge_receipt(operation)?.context("confirmed durable receipt missing")?;
+    store.validate_confirmed_merge_proof(operation,&receipt)?;
+    let at=chrono::DateTime::parse_from_rfc3339(receipt["merged_at"].as_str().context("merge time missing")?)?.timestamp_millis();
+    let allowance=store.merge_allowance(at,5)?;
+    anyhow::ensure!(allowance.confirmed==1 && allowance.pending==0 && allowance.remaining==4 && allowance.available==4,"wrong confirmed allowance or unresolved hold");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "verify final assertions against an explicit retained disposable native adoption run; no model calls"]
+async fn verify_retained_adoption_completion() -> Result<()> {
+    let root=PathBuf::from(std::env::var_os("AUTOSHIP_ADOPTION_COMPLETION_ROOT").context("retained fixture root required")?).canonicalize()?;
+    anyhow::ensure!(root.starts_with("/tmp") && root.file_name().unwrap().to_string_lossy().starts_with("autoship-source-less-acceptance-"),"not a retained adoption fixture");
+    let script=root.join("github-fixture.py");
+    anyhow::ensure!(std::fs::read_to_string(&script)?==GH_FIXTURE,"retained GitHub boundary differs from current fixture");
+    let config:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("fixture.json"))?)?;
+    let repository=config["repository"].as_str().context("repository missing")?;
+    let origin=PathBuf::from(config["origin"].as_str().context("origin missing")?).canonicalize()?;
+    anyhow::ensure!(origin.starts_with(&root),"fixture origin escaped retained root");
+    let path=root.join("state/augmentagent/workflow.db");
+    anyhow::ensure!(workflow::path()==path,"completion replay must use retained workflow state");
+    anyhow::ensure!(PathBuf::from(std::env::var_os("GH_BIN").context("fixture GitHub boundary required")?).canonicalize()?==script.canonicalize()?,"completion replay must use retained GitHub fixture");
+    anyhow::ensure!(PathBuf::from(std::env::var_os("AUTOSHIP_ADOPTION_ACCEPTANCE_CHILD").context("fixture environment required")?).canonicalize()?==root,"completion fixture environment differs");
+    let id=crate::autoship_workflow::pr_workflow_id(repository,841)?;
+    let store=crate::autoship_workflow::WorkflowStore::open_read_only(&path)?.context("retained workflow missing")?;
+    let before=store.snapshot(&id)?.context("retained snapshot missing")?;
+    anyhow::ensure!(before.checkpoint.stage==crate::autoship_workflow::Stage::Merged,"workflow not merged");
+    verify_merge_attribution(&store,&id)?;
+    let mutations=std::fs::read(root.join("merge-mutations.jsonl"))?;
+    anyhow::ensure!(mutations.split(|b|*b==b'\n').filter(|line|!line.is_empty()).count()==1,"mutation repeated");
+    anyhow::ensure!(std::fs::read_to_string(root.join("merged"))?==before.checkpoint.binding.head,"merged candidate differs");
+    let repo=root.join("repository");
+    anyhow::ensure!(repo.canonicalize()?.starts_with(&root),"fixture repository escaped root");
+    anyhow::ensure!(adopted_execution::sweep(&repo,false).await?==0,"completed merge replayed");
+    anyhow::ensure!(std::fs::read(root.join("merge-mutations.jsonl"))?==mutations,"replay changed mutation history");
+    let after=store.snapshot(&id)?.context("workflow disappeared")?;
+    anyhow::ensure!(after.model_calls==before.model_calls,"reconciliation spent model calls");
+    verify_merge_attribution(&store,&id)?;
+    std::fs::write(root.join("completion-verification.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "passed":true,"workflow":id,"head":after.checkpoint.binding.head,"model_calls":after.model_calls,
+        "confirmed_merges":1,"pending_merges":0,"remaining":4,"replay_mutations":0,
+        "scope":"terminal assertions on retained real-native/local-Git/scripted-GitHub run; not production or fresh full rerun"
+    }))?)?;
     Ok(())
 }
