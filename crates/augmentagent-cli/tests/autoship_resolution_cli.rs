@@ -188,8 +188,48 @@ fn cli_releases_only_proven_unexecuted_or_external_merges() {
             )
             .unwrap();
         assert_eq!(events, 1);
+        if classification == "manual" {
+            drop(conn);
+            let before = Sha256::digest(std::fs::read(dir.path().join("workflow.db")).unwrap());
+            for (file,key) in [("evidence.json","merge_commit"),("remote.json","merge_commit_sha")] {
+                let path = dir.path().join(file);
+                let mut value:Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                value[key] = "d".repeat(40).into();
+                std::fs::write(path,value.to_string()).unwrap();
+            }
+            assert_code(&invoke(dir.path(),"manual"),3);
+            assert_eq!(Sha256::digest(std::fs::read(dir.path().join("workflow.db")).unwrap()),before);
+        }
     }
 }
+#[test]
+fn cli_repeats_controller_resolution_without_rewriting_audit_or_live_work() {
+    let dir = fixture(Some(request_error()), false, &"a".repeat(40));
+    assert_code(&invoke(dir.path(),"not-merged"),0);
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("workflow.db")).unwrap();
+        let raw:String = conn.query_row("SELECT resolution FROM merge_allowance_dispatch",[],|r|r.get(0)).unwrap();
+        let mut decision:Value = serde_json::from_str(&raw).unwrap();
+        decision["actor"] = "autoship".into();
+        conn.execute("UPDATE merge_allowance_dispatch SET resolution=?1",[decision.to_string()]).unwrap();
+        conn.execute("UPDATE operation SET receipt=?1",[decision.to_string()]).unwrap();
+        conn.execute("UPDATE workflow SET owner='new-worker',lease_until=?1,generation=generation+1",
+            [chrono::Utc::now().timestamp_millis()+60_000]).unwrap();
+    }
+    let before = Sha256::digest(std::fs::read(dir.path().join("workflow.db")).unwrap());
+    let body = assert_code(&invoke(dir.path(),"not-merged"),0);
+    assert_eq!(body["reason"],"merge-resolution-already-recorded");
+    assert_eq!(body["actor"],"owner");
+    assert_eq!(body["resolution_actor"],"autoship");
+    assert_eq!(Sha256::digest(std::fs::read(dir.path().join("workflow.db")).unwrap()),before);
+    let path = dir.path().join("evidence.json");
+    let mut manifest:Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["response_sha256"] = "0".repeat(64).into();
+    std::fs::write(path,manifest.to_string()).unwrap();
+    assert_code(&invoke(dir.path(),"not-merged"),3);
+    assert_eq!(Sha256::digest(std::fs::read(dir.path().join("workflow.db")).unwrap()),before);
+}
+
 #[test]
 fn cli_cannot_resolve_ambiguity_from_open_state_or_same_account_alone() {
     for (merged, classification) in [

@@ -219,10 +219,6 @@ pub async fn resolve(
             );
             return Ok((Some(receipt), None));
         }
-        ensure!(
-            remote["merged"].as_bool() == Some(classification == "manual"),
-            "classification differs from remote merged state"
-        );
         if record.state == "released" {
             let decision: Value = serde_json::from_str(
                 record
@@ -231,7 +227,8 @@ pub async fn resolve(
                     .context("released reservation lacks resolution")?,
             )?;
             ensure!(
-                decision["classification"] == classification && decision["actor"] == actor,
+                decision["classification"] == classification
+                    && decision["actor"].as_str().is_some_and(|actor| !actor.trim().is_empty()),
                 "immutable prior resolution differs"
             );
             let proof: MergeReleaseProof = serde_json::from_value(decision["proof"].clone())?;
@@ -244,11 +241,18 @@ pub async fn resolve(
                         manifest.response_sha256.as_deref() == Some(response_sha256.as_str()),
                         "resolution evidence changed"
                     );
+                    let (raw,_) = journal.as_ref().context("recorded rejection journal missing")?;
+                    ensure!(*response_sha256 == format!("{:x}",Sha256::digest(raw.as_bytes()))
+                        && merge_request_not_executed(raw), "recorded rejection journal differs");
                     return Ok((None, Some(proof)));
                 }
                 _ => (),
             }
         }
+        ensure!(
+            remote["merged"].as_bool() == Some(classification == "manual"),
+            "classification differs from remote merged state"
+        );
         if record.state == "reserved" {
             return Ok((None, Some(MergeReleaseProof::NeverDispatched)));
         }
@@ -309,6 +313,21 @@ pub async fn resolve(
         Ok(value) => value,
         Err(error) => return failure(operation, 3, "merge-reconciliation-required", error),
     };
+    if record.state == "released" && proof.is_some()
+        && record.operation.receipt.is_some() && record.operation.receipt == record.resolution {
+        // The authorized operator is reading an immutable prior decision, not
+        // making a new one. Do not open a writer or touch a newer live lease.
+        let decision:Value = match serde_json::from_str(record.resolution.as_deref().unwrap()) {
+            Ok(value) => value,
+            Err(error) => return failure(operation,4,"workflow-state-unavailable",error),
+        };
+        if serde_json::to_value(proof.as_ref().unwrap()).ok().as_ref() != Some(&decision["proof"]) {
+            return failure(operation,3,"merge-reconciliation-required","immutable resolution evidence changed");
+        }
+        return (0,json!({"schema_version":1,"operation":operation,"workflow":record.operation.workflow,
+            "resolved":true,"classification":classification,"actor":actor,"resolution_actor":decision["actor"],
+            "reason":"merge-resolution-already-recorded"}));
+    }
     // Non-confirming resolutions must not compete with a live workflow. Check
     // before writer initialization; the store repeats this under its write lock.
     if proof.is_some() {
