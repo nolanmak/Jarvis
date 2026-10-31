@@ -22,6 +22,11 @@ impl Drop for OwnedCheckout {
                 let _ = std::fs::remove_file(&self.owner);
             }
         }
+        // Closing only this descriptor leaves flock held by an unrelated
+        // fork until exec closes its inherited copy. Cleanup has completed,
+        // so explicitly release the shared open-file-description lock now.
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN); }
     }
 }
 pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &str) -> Result<OwnedCheckout> {
@@ -195,6 +200,20 @@ pub(super) async fn materialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn released_checkout_unlocks_even_when_a_fork_inherits_its_descriptor() {
+        let parent = tempfile::tempdir().unwrap();
+        let checkout = allocate(parent.path(), "head", "contract").unwrap();
+        // A duplicate references the same open file description, as an
+        // unrelated child temporarily does between fork and exec.
+        let inherited = checkout._lock.try_clone().unwrap();
+        drop(checkout);
+        let replacement = allocate(parent.path(), "head", "contract")
+            .expect("completed checkout must release admission before every inherited descriptor closes");
+        drop(replacement);
+        drop(inherited);
+    }
+
     #[test]
     fn stable_owned_path_is_recreated_and_foreign_paths_are_not_deleted() {
         use std::os::unix::fs::PermissionsExt;
