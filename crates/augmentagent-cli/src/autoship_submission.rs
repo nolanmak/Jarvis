@@ -97,6 +97,52 @@ fn policy(conn: &Connection, workflow: &str) -> Result<Option<(Milestone, Option
 }
 
 impl WorkflowStore {
+    pub fn has_command_jobs(&self) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_job')",
+            [], |row| row.get(0))?;
+        if !exists { return Ok(false); }
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM command_job)", [], |row| row.get(0))?)
+    }
+
+    /// Reserve a scheduling turn, not a workflow lease or permission to spend.
+    /// Failures and process death both retain the five-minute retry delay.
+    /// Alternating with the automatic lane prevents command traffic starvation.
+    pub fn next_command_job(&mut self, repository: &str, now: i64) -> Result<Option<String>> {
+        let repository = repository.to_ascii_lowercase();
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let yield_normal: bool = tx.query_row(
+            "SELECT yield_normal FROM command_lane_turn WHERE repository=?1", [&repository],
+            |row| row.get(0)).optional()?.unwrap_or(false);
+        if yield_normal {
+            tx.execute("UPDATE command_lane_turn SET yield_normal=0 WHERE repository=?1", [&repository])?;
+            tx.commit()?;
+            return Ok(None);
+        }
+        let id: Option<String> = tx.query_row(
+            "SELECT j.workflow FROM command_job j
+             LEFT JOIN command_schedule s ON s.workflow=j.workflow
+             LEFT JOIN workflow w ON w.id=j.workflow
+             WHERE j.repository=?1 AND COALESCE(s.eligible_at,0)<=?2
+             AND (w.id IS NULL OR (
+                w.lease_until<=?2
+                AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
+                AND json_extract(w.checkpoint,'$.stage') NOT IN ('held','retired','merged','merge')
+                AND NOT (j.until_milestone='\"pr\"' AND json_extract(w.checkpoint,'$.stage')='await_checks')
+             ))
+             ORDER BY COALESCE(s.attempted_at,0),j.created_at,j.workflow LIMIT 1",
+            params![repository,now], |row| row.get(0)).optional()?;
+        if let Some(id) = &id {
+            tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3)
+                ON CONFLICT(workflow) DO UPDATE SET attempted_at=excluded.attempted_at,eligible_at=excluded.eligible_at",
+                params![id,now,now.saturating_add(300_000)])?;
+            tx.execute("INSERT INTO command_lane_turn(repository,yield_normal) VALUES(?1,1)
+                ON CONFLICT(repository) DO UPDATE SET yield_normal=1", [&repository])?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Read the original admission before revalidating a possibly closed target.
     /// The channel must first authenticate and recheck repository authority.
     pub fn replay_authorized(&self, request_id: &str, principal: &str, request: &Request) -> Result<Option<Admission>> {
@@ -313,6 +359,74 @@ mod tests {
             until,
         }
     }
+    #[test]
+    fn command_queue_rotates_durably_and_preserves_normal_lane_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.db");
+        let mut store = WorkflowStore::open(&path).unwrap();
+        for number in [42, 43] {
+            let mut req = request(Milestone::Merged);
+            req.target = Target::Pr(number);
+            store.submit_authorized(&format!("request-{number}"), "owner", &req, number as i64).unwrap();
+        }
+        assert_eq!(store.next_command_job("other/repo", 100).unwrap(), None);
+        assert_eq!(store.next_command_job("owner/repo", 100).unwrap().as_deref(), Some("owner/repo/pr/42"));
+        drop(store);
+        let mut store = WorkflowStore::open(&path).unwrap();
+        // A second worker/restart cannot immediately repeat the first job;
+        // the automatic issue lane gets a turn between command jobs.
+        assert_eq!(store.next_command_job("owner/repo", 101).unwrap(), None);
+        assert_eq!(store.next_command_job("owner/repo", 102).unwrap().as_deref(), Some("owner/repo/pr/43"));
+        assert_eq!(store.next_command_job("owner/repo", 103).unwrap(), None);
+        assert_eq!(store.next_command_job("owner/repo", 104).unwrap(), None);
+        assert_eq!(store.next_command_job("owner/repo", 300_100).unwrap().as_deref(), Some("owner/repo/pr/42"));
+        assert!(store.snapshot("owner/repo/pr/42").unwrap().is_none());
+        assert_eq!(store.merge_allowance(300_100, 5).unwrap().available, 5);
+    }
+
+    #[test]
+    fn command_queue_two_connections_cannot_select_same_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.db");
+        WorkflowStore::open(&path).unwrap().submit_authorized("job", "owner", &request(Milestone::Merged), 1).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2).map(|_| {
+            let path = path.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut store = WorkflowStore::open(&path).unwrap();
+                barrier.wait();
+                store.next_command_job("owner/repo", 100).unwrap()
+            })
+        }).collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
+        assert_eq!(WorkflowStore::open(&path).unwrap().next_command_job("owner/repo",101).unwrap(), None);
+    }
+
+    #[test]
+    fn command_queue_skips_holds_future_retries_active_leases_and_completed_pr_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("queue.db")).unwrap();
+        for (number, stage, eligible, lease_until, until) in [
+            (42, Stage::Held, 0, 0, Milestone::Merged),
+            (43, Stage::Retired, 0, 0, Milestone::Merged),
+            (44, Stage::Merged, 0, 0, Milestone::Merged),
+            (45, Stage::Build, 10_000, 0, Milestone::Merged),
+            (46, Stage::Build, 0, 10_000, Milestone::Merged),
+            (47, Stage::AwaitChecks, 0, 0, Milestone::Pr),
+            (48, Stage::AwaitChecks, 0, 0, Milestone::Merged),
+        ] {
+            let mut req = request(until); req.target = Target::Pr(number);
+            let id = store.submit_authorized(&format!("request-{number}"), "owner", &req, number as i64).unwrap().workflow;
+            store.register(&id, "branch", Binding { head:"head".into(), contract:"contract".into(), evidence_hash:"evidence".into() }, 1).unwrap();
+            let mut cp = store.snapshot(&id).unwrap().unwrap().checkpoint;
+            cp.stage = stage; cp.next.eligible_at_ms = eligible;
+            store.conn.execute("UPDATE workflow SET checkpoint=?2,lease_until=?3,pr=?4 WHERE id=?1", params![id,serde_json::to_string(&cp).unwrap(),lease_until,number]).unwrap();
+        }
+        assert_eq!(store.next_command_job("owner/repo", 100).unwrap().as_deref(), Some("owner/repo/pr/48"));
+        assert_eq!(store.snapshot("owner/repo/pr/42").unwrap().unwrap().checkpoint.stage, Stage::Held);
+    }
+
     #[test]
     fn enqueue_survives_restart_and_retry_replays_original_result() {
         let dir = tempfile::tempdir().unwrap();

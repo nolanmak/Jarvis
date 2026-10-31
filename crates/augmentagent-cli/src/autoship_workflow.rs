@@ -278,6 +278,11 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_job (
                 workflow TEXT PRIMARY KEY, repository TEXT NOT NULL, target TEXT NOT NULL,
                 until_milestone TEXT NOT NULL, provider TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_schedule (
+                workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
+                attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_lane_turn (
+                repository TEXT PRIMARY KEY, yield_normal INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS command_client_intent (
                 request_id TEXT PRIMARY KEY, principal TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS command_request (

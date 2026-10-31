@@ -394,7 +394,9 @@ else: raise Exception('unexpected call '+repr(a))
         assert!(targeted::work_once(&root,id).await.unwrap().is_idle());
         assert!(!fixture_root.join("merged").exists());
         scenario("SUCCESS",false,false,&head);
-        let report=targeted::work_once(&root,id).await.unwrap();
+        let report=if std::env::var("AUTOSHIP_TARGETED_SWEEP").as_deref() == Ok("background") {
+            run_once(&root,false).await.unwrap()
+        } else { targeted::work_once(&root,id).await.unwrap() };
         assert!(!report.is_idle(),"approved command did not reconcile: {}",report.message);
         let store=WorkflowStore::open_read_only(&workflow::path()).unwrap().unwrap();
         let state=store.snapshot(id).unwrap().unwrap();
@@ -482,5 +484,13 @@ fn targeted_approved_pr_finishes_without_rebuilding_or_repository_sweep() {
     let output=std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact","self_improve::progress_tests::approved_ready_pr_preserves_review_but_never_replays_uncertain_merge","--nocapture"])
         .env("AUTOSHIP_TARGETED_SWEEP","1").output().unwrap();
+    assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn background_queue_consumes_approved_command_without_rebuilding() {
+    let output=std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact","self_improve::progress_tests::approved_ready_pr_preserves_review_but_never_replays_uncertain_merge","--nocapture"])
+        .env("AUTOSHIP_TARGETED_SWEEP","background").output().unwrap();
     assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
 }

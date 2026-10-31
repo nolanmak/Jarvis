@@ -166,6 +166,10 @@ impl std::error::Error for CommandFailure {}
 /// A local operator executes the same durable job without depending on a
 /// daemon/worker process pair. It still passes every runtime and workflow gate.
 pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
+    work_once_mode(repo, id, ExecutionMode::Local).await
+}
+
+pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -> Result<RunReport> {
     let store = crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
         .context("no durable autoship state")?;
     let mut request = store
@@ -250,7 +254,7 @@ pub(crate) async fn work_once(repo: &Path, id: &str) -> Result<RunReport> {
     COMMAND_LANE
         .scope(
             Lane::Combined,
-            run_selected(repo, false, Some(selected), ExecutionMode::Local),
+            run_selected(repo, false, Some(selected), mode),
         )
         .await
 }

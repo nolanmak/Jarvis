@@ -7545,6 +7545,21 @@ async fn workflow_builder(repo: &Path, target: crate::autoship_workflow::submiss
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
+    if !dry_run {
+        // An empty/legacy store preserves the existing read-only readiness path.
+        let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&workflow::path())?
+            .map(|store| store.has_command_jobs()).transpose()?.unwrap_or(false);
+        if queued {
+            let repository = tokio::time::timeout(std::time::Duration::from_secs(30),
+                workflow::canonical_repository(repo_root)).await.context("queue repository lookup timed out")??;
+            let next = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+                .next_command_job(&repository, chrono::Utc::now().timestamp_millis())?;
+            if let Some(id) = next {
+                return targeted::work_once_mode(repo_root, &id, targeted::ExecutionMode::Background).await;
+            }
+        }
+    }
+
     run_selected(repo_root,dry_run,None,targeted::ExecutionMode::Background).await
 }
 
