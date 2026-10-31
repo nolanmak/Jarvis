@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     path::Path,
@@ -41,7 +42,8 @@ fn status_reports_real_checkpoint_and_pending_capacity_without_writes() {
         wall_ms INTEGER,model_calls INTEGER,tokens INTEGER);
         CREATE TABLE operation(id TEXT PRIMARY KEY,workflow TEXT,kind TEXT,binding TEXT,receipt TEXT,created_at INTEGER);
         CREATE TABLE merge_allowance_dispatch(operation TEXT PRIMARY KEY,repository TEXT,pr INTEGER,pr_node_id TEXT,
-        head TEXT,generation INTEGER,reserved_at_ms INTEGER,dispatched_at_ms INTEGER,merged_at_ms INTEGER,resolution TEXT,state TEXT);").unwrap();
+        head TEXT,generation INTEGER,reserved_at_ms INTEGER,dispatched_at_ms INTEGER,merged_at_ms INTEGER,resolution TEXT,state TEXT);
+        CREATE TABLE merge_transport_response(operation TEXT PRIMARY KEY,response TEXT,observed_at_ms INTEGER);").unwrap();
     let binding =
         serde_json::json!({"head":"a".repeat(40),"contract":"contract","evidence_hash":"evidence"});
     let checkpoint = serde_json::json!({"stage":"held","binding":binding,"evidence":[],
@@ -57,6 +59,11 @@ fn status_reports_real_checkpoint_and_pending_capacity_without_writes() {
     )
     .unwrap();
     conn.execute("INSERT INTO merge_allowance_dispatch VALUES('op-pending','owner/repo',34,'PR_34',?1,2,10,11,NULL,NULL,'dispatched')", ["a".repeat(40)]).unwrap();
+    conn.execute(
+        "INSERT INTO merge_transport_response VALUES('op-pending',?1,12)",
+        [r#"{"data":null}"#],
+    )
+    .unwrap();
     drop(conn);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let before = std::fs::read(&path).unwrap();
@@ -80,6 +87,16 @@ fn status_reports_real_checkpoint_and_pending_capacity_without_writes() {
     assert_eq!(body["allowance"]["available"], 4);
     assert_eq!(body["pending_merge_operations"][0], "op-pending");
     assert_eq!(body["deployment"]["state"], "unknown");
+    let manifest = &body["pending_merge_evidence"][0];
+    assert_eq!(manifest["operation"], "op-pending");
+    assert_eq!(
+        manifest["response_sha256"],
+        format!("{:x}", Sha256::digest(br#"{"data":null}"#))
+    );
+    assert!(
+        manifest.get("response").is_none(),
+        "status exposes digest, never raw response"
+    );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }

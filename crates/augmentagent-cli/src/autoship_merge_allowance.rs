@@ -13,6 +13,58 @@ pub struct MergeAllowance {
     pub last_merged_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeDispatchRecord {
+    pub operation: Operation,
+    pub repository: String,
+    pub pr: u64,
+    pub node: String,
+    pub state: String,
+    pub resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MergeReleaseProof {
+    NeverDispatched,
+    RequestNotExecuted {
+        response_sha256: String,
+    },
+    DifferentMergedHead {
+        node: String,
+        pr: u64,
+        head: String,
+        merge_commit: String,
+        merged_at: String,
+    },
+}
+
+/// GraphQL request errors precede execution. Execution errors instead include
+/// a `data` entry (possibly null) and must never release uncertain capacity.
+/// https://spec.graphql.org/September2025/#sec-Errors
+pub fn merge_request_not_executed(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    value.is_object()
+        && value.get("data").is_none()
+        && value["errors"].as_array().is_some_and(|errors| {
+            !errors.is_empty()
+                && errors.iter().all(|error| {
+                    error["message"]
+                        .as_str()
+                        .is_some_and(|message| !message.is_empty())
+                        && error["locations"].as_array().is_some_and(|locations| {
+                            !locations.is_empty()
+                                && locations.iter().all(|location| {
+                                    location["line"].as_u64().is_some_and(|n| n > 0)
+                                        && location["column"].as_u64().is_some_and(|n| n > 0)
+                                })
+                        })
+                })
+        })
+}
+
 fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
     ensure!(now >= 0 && cap > 0, "invalid merge allowance day or cap");
     let start = now.div_euclid(86_400_000) * 86_400_000;
@@ -44,6 +96,218 @@ fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
 }
 
 impl WorkflowStore {
+    pub fn merge_dispatch(&self, id: &str) -> Result<Option<MergeDispatchRecord>> {
+        let row: Option<(String,String,String,Option<String>,String,u64,String,String,Option<String>)> = self.conn.query_row(
+            "SELECT o.workflow,o.kind,o.binding,o.receipt,d.repository,d.pr,d.pr_node_id,d.state,d.resolution FROM operation o
+             JOIN merge_allowance_dispatch d ON d.operation=o.id WHERE o.id=?1", [id],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
+        row.map(
+            |(workflow, kind, binding, receipt, repository, pr, node, state, resolution)| {
+                Ok(MergeDispatchRecord {
+                    operation: Operation {
+                        id: id.into(),
+                        workflow,
+                        kind: serde_json::from_str(&kind)?,
+                        binding: serde_json::from_str(&binding)?,
+                        receipt,
+                    },
+                    repository,
+                    pr,
+                    node,
+                    state,
+                    resolution,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn resolve_merge_without_debit(
+        &mut self,
+        op: &Operation,
+        classification: &str,
+        actor: &str,
+        proof: &MergeReleaseProof,
+        now: i64,
+    ) -> Result<()> {
+        self.resolve_merge_without_debit_inner(op, classification, actor, proof, now, None)
+    }
+
+    /// The owning worker may release proven pre-execution rejection without
+    /// revoking its own lease. Unknown/partial execution is never eligible.
+    pub fn release_rejected_merge(
+        &mut self,
+        lease: &Lease,
+        op: &Operation,
+        now: i64,
+    ) -> Result<()> {
+        let raw: String = self.conn.query_row(
+            "SELECT response FROM merge_transport_response WHERE operation=?1",
+            [&op.id],
+            |r| r.get(0),
+        )?;
+        let proof = MergeReleaseProof::RequestNotExecuted {
+            response_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
+        };
+        self.resolve_merge_without_debit_inner(
+            op,
+            "not-merged",
+            "autoship",
+            &proof,
+            now,
+            Some(lease),
+        )
+    }
+
+    fn resolve_merge_without_debit_inner(
+        &mut self,
+        op: &Operation,
+        classification: &str,
+        actor: &str,
+        proof: &MergeReleaseProof,
+        now: i64,
+        active_lease: Option<&Lease>,
+    ) -> Result<()> {
+        ensure!(
+            matches!(classification, "manual" | "not-merged")
+                && !actor.trim().is_empty()
+                && actor.len() <= 256,
+            "invalid merge resolution classification or actor"
+        );
+        let decision = serde_json::to_string(
+            &serde_json::json!({"classification":classification,"actor":actor,"proof":proof}),
+        )?;
+        ensure!(
+            decision.len() <= 16 * 1024,
+            "resolution evidence exceeds bound"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (workflow,binding,state,node,pr,prior):(String,String,String,String,u64,Option<String>)=tx.query_row(
+            "SELECT o.workflow,o.binding,d.state,d.pr_node_id,d.pr,d.resolution FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE o.id=?1",
+            [&op.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        ensure!(
+            op.kind == OperationKind::MergePr
+                && workflow == op.workflow
+                && serde_json::from_str::<Binding>(&binding)? == op.binding,
+            "resolution intent differs"
+        );
+        if state == "released" {
+            ensure!(
+                prior.as_deref() == Some(decision.as_str()),
+                "immutable merge resolution conflict"
+            );
+            tx.commit()?;
+            return Ok(());
+        }
+        ensure!(
+            matches!(state.as_str(), "reserved" | "dispatched"),
+            "confirmed merge cannot be released"
+        );
+        let (owner, until, generation): (Option<String>, i64, i64) = tx.query_row(
+            "SELECT owner,lease_until,generation FROM workflow WHERE id=?1",
+            [&workflow],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if let Some(lease) = active_lease {
+            ensure!(
+                lease.workflow == op.workflow
+                    && matches!(proof, MergeReleaseProof::RequestNotExecuted { .. }),
+                "active resolution requires this lease's non-execution proof"
+            );
+            require_binding(&tx, lease, &op.binding, now)?;
+        } else {
+            ensure!(
+                owner.is_none() || until <= now,
+                "workflow-active: stop or await the worker before resolving its merge"
+            );
+        }
+        match proof {
+            MergeReleaseProof::NeverDispatched => ensure!(
+                state == "reserved",
+                "dispatched mutation requires remote evidence"
+            ),
+            MergeReleaseProof::RequestNotExecuted { response_sha256 } => {
+                let raw: String = tx.query_row(
+                    "SELECT response FROM merge_transport_response WHERE operation=?1",
+                    [&op.id],
+                    |r| r.get(0),
+                )?;
+                ensure!(
+                    *response_sha256 == format!("{:x}", Sha256::digest(raw.as_bytes()))
+                        && merge_request_not_executed(&raw),
+                    "journal does not prove a pre-execution request rejection"
+                );
+            }
+            MergeReleaseProof::DifferentMergedHead {
+                node: remote_node,
+                pr: remote_pr,
+                head,
+                merge_commit,
+                merged_at,
+            } => {
+                ensure!(
+                    classification == "manual"
+                        && remote_node == &node
+                        && *remote_pr == pr
+                        && head != &op.binding.head,
+                    "same-head merge observation cannot distinguish manual from autonomous"
+                );
+                for sha in [head, merge_commit] {
+                    ensure!(
+                        matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "invalid remote merge identity"
+                    );
+                }
+                ensure!(
+                    chrono::DateTime::parse_from_rfc3339(merged_at)?.timestamp_millis() >= 0,
+                    "invalid merge timestamp"
+                );
+                let raw: Option<String> = tx
+                    .query_row(
+                        "SELECT response FROM merge_transport_response WHERE operation=?1",
+                        [&op.id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(raw) = raw {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        ensure!(
+                            value
+                                .pointer("/data/mergePullRequest/pullRequest/state")
+                                .and_then(|v| v.as_str())
+                                != Some("MERGED"),
+                            "remote observation contradicts original accepted response"
+                        );
+                    }
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE merge_allowance_dispatch SET state='released',resolution=?2 WHERE operation=?1",
+            params![op.id, decision],
+        )?;
+        tx.execute(
+            "UPDATE operation SET receipt=?2 WHERE id=?1",
+            params![op.id, decision],
+        )?;
+        // Operator recovery fences expired workers. Proven rejection handled
+        // by the current owner preserves its lease and checkpoint.
+        let event_generation = if active_lease.is_none() {
+            tx.execute(
+                "UPDATE workflow SET owner=NULL,lease_until=0,generation=generation+1 WHERE id=?1",
+                [&workflow],
+            )?;
+            generation + 1
+        } else {
+            generation
+        };
+        event(&tx,&workflow,event_generation,"merge_capacity_resolved",&serde_json::json!({"operation":op.id,"decision":serde_json::from_str::<serde_json::Value>(&decision)?}).to_string(),now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn merge_allowance(&self, now: i64, cap: u32) -> Result<MergeAllowance> {
         let tx = self.conn.unchecked_transaction()?;
         let status = allowance(&tx, now, cap)?;
@@ -90,6 +354,14 @@ impl WorkflowStore {
                 && serde_json::from_str::<OperationKind>(&kind)? == OperationKind::MergePr
                 && serde_json::from_str::<Binding>(&binding)? == op.binding,
             "stored merge intent differs"
+        );
+        let settled: Option<String> =
+            tx.query_row("SELECT receipt FROM operation WHERE id=?1", [&op.id], |r| {
+                r.get(0)
+            })?;
+        ensure!(
+            settled.is_none(),
+            "settled merge intent must not be re-dispatched"
         );
         let attached: Option<u64> =
             tx.query_row("SELECT pr FROM workflow WHERE id=?1", [&op.workflow], |r| {
@@ -338,6 +610,43 @@ impl WorkflowStore {
             Ok((raw, node))
         })
         .transpose()
+    }
+
+    /// If a process exits after confirmation but before this audit record, a
+    /// repeated operator command completes the audit without another debit.
+    pub fn record_confirmed_merge_resolution(
+        &mut self,
+        op: &Operation,
+        actor: &str,
+        response_sha256: &str,
+        now: i64,
+    ) -> Result<()> {
+        ensure!(
+            !actor.trim().is_empty() && actor.len() <= 256,
+            "invalid resolution actor"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state,raw,prior,generation):(String,String,Option<String>,i64)=tx.query_row(
+            "SELECT d.state,r.response,d.resolution,d.generation FROM merge_allowance_dispatch d JOIN merge_transport_response r ON r.operation=d.operation WHERE d.operation=?1",[&op.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        ensure!(
+            state == "confirmed"
+                && response_sha256 == format!("{:x}", Sha256::digest(raw.as_bytes())),
+            "confirmation lacks matching journal evidence"
+        );
+        let decision=serde_json::json!({"classification":"autonomous","actor":actor,"response_sha256":response_sha256}).to_string();
+        if let Some(prior) = prior {
+            ensure!(prior == decision, "immutable merge resolution conflict");
+        } else {
+            tx.execute(
+                "UPDATE merge_allowance_dispatch SET resolution=?2 WHERE operation=?1",
+                params![op.id, decision],
+            )?;
+            event(&tx,&op.workflow,generation,"merge_resolution_confirmed",&serde_json::json!({"operation":op.id,"decision":serde_json::from_str::<serde_json::Value>(&decision)?}).to_string(),now)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Recovery never fabricates a successful response from `state=MERGED`.

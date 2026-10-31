@@ -1091,6 +1091,13 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Resolve a pending merge using bound controller and GitHub evidence.
+    ResolveMerge {
+        #[arg(long)] operation: String,
+        #[arg(long, value_parser = ["autonomous", "manual", "not-merged"])] classification: String,
+        #[arg(long)] evidence: PathBuf,
+        #[arg(long)] json: bool,
+    },
     /// Inspect a durable workflow without starting work or changing state.
     Status {
         #[arg(long)]
@@ -3035,6 +3042,9 @@ async fn main() -> Result<()> {
 
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::Autopr { op: AutoprOp::ResolveMerge { ref operation, ref classification, ref evidence, json } } = cli.cmd {
+        std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Status { ref workflow, json } } = cli.cmd {
         std::process::exit(autoship_commands::run_status(workflow, json));
@@ -5597,6 +5607,7 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
+        Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

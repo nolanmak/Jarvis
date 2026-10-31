@@ -376,3 +376,134 @@ fn allowance_response_journal_is_bound_and_immutable() {
     );
     assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 0);
 }
+
+#[test]
+fn allowance_operator_resolution_requires_proof_and_quiescence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    let (lease, op) = fixture(&mut store, 1, now);
+    reserve(&mut store, &lease, &op, 1, now).unwrap();
+    assert!(store
+        .resolve_merge_without_debit(
+            &op,
+            "not-merged",
+            "owner",
+            &MergeReleaseProof::NeverDispatched,
+            now
+        )
+        .is_err());
+    store.release(&lease, now).unwrap();
+    store
+        .resolve_merge_without_debit(
+            &op,
+            "not-merged",
+            "owner",
+            &MergeReleaseProof::NeverDispatched,
+            now,
+        )
+        .unwrap();
+    store
+        .resolve_merge_without_debit(
+            &op,
+            "not-merged",
+            "owner",
+            &MergeReleaseProof::NeverDispatched,
+            now + 1,
+        )
+        .unwrap();
+    assert_eq!(store.merge_allowance(now, 5).unwrap().available, 5);
+    assert_eq!(
+        store.merge_dispatch(&op.id).unwrap().unwrap().state,
+        "released"
+    );
+    let next = store
+        .claim(&lease.workflow, "next", now + 2, DAY)
+        .unwrap()
+        .unwrap();
+    assert!(
+        reserve(&mut store, &next, &op, 1, now + 2).is_err(),
+        "resolved intent must never be re-dispatched"
+    );
+}
+
+#[test]
+fn allowance_remote_request_error_releases_but_execution_error_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    for pr in 1..=2 {
+        let (lease, op) = fixture(&mut store, pr, now);
+        reserve(&mut store, &lease, &op, pr, now).unwrap();
+        store.dispatch_merge(&lease, &op, now, 5).unwrap();
+        let mut response = serde_json::json!({"errors":[{"message":"Unknown field","locations":[{"line":1,"column":1}]}]});
+        if pr == 2 {
+            response["data"] = serde_json::Value::Null;
+        }
+        let raw = response.to_string();
+        store.record_merge_response(&op, &raw, now).unwrap();
+        store.release(&lease, now).unwrap();
+        let proof = MergeReleaseProof::RequestNotExecuted {
+            response_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
+        };
+        let result = store.resolve_merge_without_debit(&op, "not-merged", "owner", &proof, now);
+        assert_eq!(
+            result.is_ok(),
+            pr == 1,
+            "execution errors retain unknown capacity: {result:?}"
+        );
+    }
+    assert_eq!(store.merge_allowance(now, 5).unwrap().pending, 1);
+    assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 0);
+}
+
+#[test]
+fn allowance_manual_resolution_requires_a_different_merged_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    let (lease, op) = fixture(&mut store, 1, now);
+    reserve(&mut store, &lease, &op, 1, now).unwrap();
+    store.dispatch_merge(&lease, &op, now, 5).unwrap();
+    store.release(&lease, now).unwrap();
+    let proof = |head: String| MergeReleaseProof::DifferentMergedHead {
+        node: "PR_1".into(),
+        pr: 1,
+        head,
+        merge_commit: "c".repeat(40),
+        merged_at: chrono::DateTime::from_timestamp_millis(now)
+            .unwrap()
+            .to_rfc3339(),
+    };
+    assert!(store
+        .resolve_merge_without_debit(&op, "manual", "owner", &proof(op.binding.head.clone()), now)
+        .is_err());
+    assert_eq!(store.merge_allowance(now, 5).unwrap().pending, 1);
+    store
+        .resolve_merge_without_debit(&op, "manual", "owner", &proof("b".repeat(40)), now)
+        .unwrap();
+    assert_eq!(store.merge_allowance(now, 5).unwrap().remaining, 5);
+    assert_eq!(store.merge_allowance(now, 5).unwrap().pending, 0);
+    assert!(
+        store
+            .confirm_merge_dispatch(&op, &receipt(&op, 1, now), now)
+            .is_err(),
+        "conflicting late receipt is not silently accepted"
+    );
+}
+
+#[test]
+fn allowance_accepts_real_github_request_error_shape_with_diagnostic_path() {
+    let mut response = serde_json::json!({"errors":[{"path":["query AutoshipReadOnlyValidationProbe","definitelyMissingAutoshipProbeField"],
+        "extensions":{"code":"undefinedField","typeName":"Query","fieldName":"definitelyMissingAutoshipProbeField"},
+        "locations":[{"line":1,"column":41}],"message":"Field does not exist on Query"}]});
+    assert!(
+        merge_request_not_executed(&response.to_string()),
+        "GitHub includes a diagnostic path on pre-execution validation errors"
+    );
+    response["data"] = serde_json::Value::Null;
+    assert!(
+        !merge_request_not_executed(&response.to_string()),
+        "data null is still an execution response"
+    );
+}

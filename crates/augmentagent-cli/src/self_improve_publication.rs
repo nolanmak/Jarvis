@@ -287,9 +287,17 @@ struct MergeTransport<'a>(&'a Path);
 impl Github for MergeTransport<'_> {
     async fn call(&mut self, args: &[&str]) -> Result<String> {
         let (ok, out, error) = run(&gh_bin(), args, self.0).await?;
-        anyhow::ensure!(ok, "GitHub merge transport: {error}");
-        Ok(out)
+        merge_transport_output(ok, out, &error, args.starts_with(&["api", "graphql"]))
     }
+}
+fn merge_transport_output(ok: bool, out: String, error: &str, graphql: bool) -> Result<String> {
+    // gh exits nonzero for GraphQL errors while still returning the original
+    // JSON response. Preserve that evidence; exit status alone is not proof
+    // that a mutation failed before execution.
+    let response = graphql && serde_json::from_str::<serde_json::Value>(&out).ok()
+        .is_some_and(|value| value.is_object() && (value.get("data").is_some() || value.get("errors").is_some()));
+    anyhow::ensure!(ok || response, "GitHub merge transport: {error}");
+    Ok(out)
 }
 
 /// A head-only CAS cannot bind main. Require GitHub to atomically reject
@@ -372,7 +380,7 @@ async fn require_strict_integration(github: &mut impl Github, repository: &str) 
     anyhow::bail!("merge-dependency:strict-integration-protection: main requires strict up-to-date required checks without actor bypass")
 }
 
-fn accepted_merge_receipt(raw: &str, node: &str, pr: u64, head: &str, operation_id: &str) -> Result<MergeMutationReceipt> {
+pub(super) fn accepted_merge_receipt(raw: &str, node: &str, pr: u64, head: &str, operation_id: &str) -> Result<MergeMutationReceipt> {
     let response: serde_json::Value = serde_json::from_str(raw)?;
     anyhow::ensure!(
         response.get("errors").is_none_or(
@@ -429,6 +437,10 @@ async fn merge_mutation(
         return Ok(Some(serde_json::from_value(receipt)?));
     }
     if let Some((raw, node)) = store.merge_response(operation, repository, pr)? {
+        if crate::autoship_workflow::merge_request_not_executed(&raw) {
+            store.release_rejected_merge(lease,operation,chrono::Utc::now().timestamp_millis())?;
+            anyhow::bail!("merge-request-rejected-before-execution: capacity released; original response retained");
+        }
         let receipt = accepted_merge_receipt(&raw, &node, pr, head, operation_id)?;
         store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
         return Ok(Some(receipt));
@@ -477,6 +489,10 @@ async fn merge_mutation(
         ])
         .await?;
     store.record_merge_response(operation, &raw, chrono::Utc::now().timestamp_millis())?;
+    if crate::autoship_workflow::merge_request_not_executed(&raw) {
+        store.release_rejected_merge(lease,operation,chrono::Utc::now().timestamp_millis())?;
+        anyhow::bail!("merge-request-rejected-before-execution: capacity released; original response retained");
+    }
     let receipt = accepted_merge_receipt(&raw, node, pr, head, operation_id)?;
     store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
     Ok(Some(receipt))
@@ -586,10 +602,19 @@ mod tests {
             calls: vec![],
         }
     }
+    #[test]
+    fn failed_graphql_cli_preserves_original_response_for_reconciliation() {
+        let raw=r#"{"errors":[{"message":"Unknown field","locations":[{"line":1,"column":1}]}]}"#;
+        assert_eq!(merge_transport_output(false,raw.into(),"GraphQL error",true).unwrap(),raw);
+        assert!(merge_transport_output(false,"".into(),"timeout",true).is_err());
+        assert!(merge_transport_output(false,"bad JSON".into(),"failure",true).is_err());
+        assert!(merge_transport_output(false,raw.into(),"non-GraphQL failure",false).is_err());
+    }
+
     #[tokio::test]
     async fn journaled_merge_response_recovers_without_network_replay() {
         use crate::autoship_workflow::{WorkflowStore, Binding};
-        for valid in [true, false] {
+        for outcome in ["accepted", "incomplete", "request_error"] {
             let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("workflow.db");
             let now = chrono::Utc::now().timestamp_millis();
             let mut store = WorkflowStore::open(&path).unwrap();
@@ -602,17 +627,19 @@ mod tests {
             store.dispatch_merge(&lease, &op, now, 5).unwrap();
             let mut response = mutation_response();
             response["data"]["mergePullRequest"]["clientMutationId"] = op.id.clone().into();
-            if !valid { response["data"]["mergePullRequest"]["pullRequest"]["mergedAt"] = serde_json::Value::Null; }
+            if outcome == "incomplete" { response["data"]["mergePullRequest"]["pullRequest"]["mergedAt"] = serde_json::Value::Null; }
+            if outcome == "request_error" { response = serde_json::json!({"errors":[{"message":"Unknown field","locations":[{"line":1,"column":1}]}]}); }
             let raw = response.to_string();
             store.record_merge_response(&op, &raw, now).unwrap();
             drop(store);
             let mut store = WorkflowStore::open(&path).unwrap();
             let mut github = MergeFake { replies:VecDeque::from([Ok(merge_before("MERGED"))]), calls:vec![] };
             let recovered = merge_mutation(&mut github, "owner/repo", 12, "head", &op, &lease, &mut store, 5).await;
-            if valid { assert!(recovered.unwrap().is_some(), "accepted journal response must recover attribution"); }
+            if outcome == "accepted" { assert!(recovered.unwrap().is_some(), "accepted journal response must recover attribution"); }
             else { assert!(recovered.is_err(), "incomplete journal response remains unresolved"); }
             assert!(github.calls.is_empty(), "recovery consumes original response, never a second remote request");
-            assert_eq!(store.merge_allowance(now, 5).unwrap().pending, u32::from(!valid));
+            assert_eq!(store.merge_allowance(now, 5).unwrap().pending, u32::from(outcome == "incomplete"));
+            if outcome == "request_error" { store.attach_pr(&lease,12,now).unwrap(); }
         }
     }
 

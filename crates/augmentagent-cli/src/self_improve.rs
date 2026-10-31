@@ -11530,6 +11530,10 @@ fn utc_day_of(now: chrono::DateTime<chrono::Utc>) -> u64 {
 }
 
 /// Shipping allowance is read from durable accepted merge receipts, never attempts.
+pub(crate) fn accepted_merge_response(raw: &str, node: &str, pr: u64, head: &str, operation: &str) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(publication::accepted_merge_receipt(raw, node, pr, head, operation)?)?)
+}
+
 pub(crate) fn merge_allowance_status() -> Result<crate::autoship_workflow::MergeAllowance> {
     let cap = AutoPrLoop::cap_from(std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref());
     crate::autoship_workflow::WorkflowStore::open(&workflow::path())?

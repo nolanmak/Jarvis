@@ -9,7 +9,7 @@ use std::{path::Path, time::Duration};
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
-pub use merge_allowance::MergeAllowance;
+pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

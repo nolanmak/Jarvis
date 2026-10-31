@@ -1,7 +1,10 @@
-//! Shared command projections. Read paths never create state or launch work.
+#[path = "autoship_merge_recovery.rs"]
+pub(crate) mod merge_recovery;
+// Shared command projections. Read paths never create state or launch work.
 use crate::autoship_workflow::{OperationKind, Stage, WorkflowStore};
 use anyhow::{ensure, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 fn target(workflow: &str) -> Result<(String, Value)> {
@@ -48,12 +51,24 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             return Ok(None);
         };
         let allowance = store.merge_allowance(now, cap)?;
-        let pending: Vec<_> = store
+        let mut pending = Vec::new();
+        let mut pending_evidence = Vec::new();
+        for op in store
             .pending_operations(workflow)?
             .into_iter()
             .filter(|op| op.kind == OperationKind::MergePr)
-            .map(|op| op.id)
-            .collect();
+        {
+            if let Some(record) = store.merge_dispatch(&op.id)? {
+                let digest = store
+                    .merge_response(&op, &record.repository, record.pr)?
+                    .map(|(raw, _)| format!("{:x}", Sha256::digest(raw.as_bytes())));
+                pending_evidence.push(
+                    json!({"schema_version":1,"operation":op.id,"repository":record.repository,
+                    "pr":record.pr,"head":op.binding.head,"response_sha256":digest}),
+                );
+            }
+            pending.push(op.id);
+        }
         let code = if matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks) {
             3
         } else {
@@ -71,7 +86,7 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             "next_action":snapshot.checkpoint.next.action,"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
             "provider":null,"pr_url":pr_url,
             "merge":{"state":if complete {"observed-merged"} else if !pending.is_empty() {"pending"} else {"not-confirmed"}},
-            "deployment":{"state":"unknown"},"allowance":allowance,"pending_merge_operations":pending,
+            "deployment":{"state":"unknown"},"allowance":allowance,"pending_merge_operations":pending,"pending_merge_evidence":pending_evidence,
             "resources":{"attempts":snapshot.attempts,"model_calls":snapshot.model_calls,"tokens":snapshot.tokens,"wall_ms":snapshot.wall_ms},
             "lease":{"active":snapshot.lease_until_ms > now,"generation":snapshot.generation},
             "progress_at_ms":snapshot.progress_at_ms}),
