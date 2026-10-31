@@ -98,6 +98,39 @@ pub(crate) fn validate_merge_receipt_identity(conn: &Connection, operation: &str
     Ok(())
 }
 
+pub(super) fn validate_merge_receipt_equivalence(conn:&Connection, operation:&str, first:&serde_json::Value, later:&serde_json::Value) -> Result<()> {
+    validate_merge_receipt_identity(conn,operation,first)?;
+    validate_merge_receipt_identity(conn,operation,later)?;
+    let normalized = |proof:&serde_json::Value| -> Result<serde_json::Value> {
+        let mut proof = proof.clone();
+        let fields = proof.as_object_mut().context("merge proof is not an object")?;
+        fields.remove("client_mutation_id");
+        fields.remove("commit_marker_operation");
+        if let Some(at) = fields.get("merged_at").and_then(|v|v.as_str()) {
+            let at = chrono::DateTime::parse_from_rfc3339(at)?.timestamp_millis();
+            fields.insert("merged_at".into(),at.into());
+        }
+        Ok(proof)
+    };
+    ensure!(normalized(first)? == normalized(later)?,"immutable merge receipt conflict");
+    Ok(())
+}
+
+fn validate_existing_autonomous_resolution(conn:&Connection, operation:&str, raw:&str) -> Result<()> {
+    let decision:serde_json::Value = serde_json::from_str(raw)?;
+    ensure!(decision["classification"] == "autonomous"
+        && decision["actor"].as_str().is_some_and(|actor|!actor.trim().is_empty()),"immutable merge resolution conflict");
+    let (source,digest) = if let Some(digest) = decision["response_sha256"].as_str() {
+        (conn.query_row("SELECT response FROM merge_transport_response WHERE operation=?1",[operation],|r|r.get::<_,String>(0))?,digest)
+    } else {
+        ensure!(decision["proof_kind"] == "immutable_commit_marker","unknown confirmation audit proof");
+        (conn.query_row("SELECT receipt FROM merge_mutation_receipt WHERE operation=?1",[operation],|r|r.get::<_,String>(0))?,
+            decision["receipt_sha256"].as_str().context("confirmation audit digest missing")?)
+    };
+    ensure!(digest == format!("{:x}",Sha256::digest(source.as_bytes())),"confirmation audit evidence changed");
+    Ok(())
+}
+
 fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
     ensure!(now >= 0 && cap > 0, "invalid merge allowance day or cap");
     let start = now.div_euclid(86_400_000) * 86_400_000;
@@ -129,6 +162,10 @@ fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
 }
 
 impl WorkflowStore {
+    pub fn validate_confirmed_merge_proof(&self, operation:&str, receipt:&serde_json::Value) -> Result<()> {
+        let first = self.confirmed_merge_receipt(operation)?.context("confirmed merge proof missing")?;
+        validate_merge_receipt_equivalence(&self.conn,operation,&first,receipt)
+    }
     pub fn reconcile_confirmed_workflow(&mut self, operation: &str, now: i64) -> Result<bool> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<(String,String,String,Option<String>,u64,String,i64,String,String,Option<u64>,i64,i64)> = tx.query_row(
@@ -660,7 +697,7 @@ impl WorkflowStore {
             )
             .optional()?;
         if let Some(prior) = prior {
-            ensure!(prior == raw, "immutable merge receipt conflict");
+            validate_merge_receipt_equivalence(&tx,&op.id,&serde_json::from_str(&prior)?,receipt)?;
         } else {
             ensure!(
                 state == "dispatched",
@@ -782,7 +819,7 @@ impl WorkflowStore {
         );
         let decision=serde_json::json!({"classification":"autonomous","actor":actor,"response_sha256":response_sha256}).to_string();
         if let Some(prior) = prior {
-            ensure!(prior == decision, "immutable merge resolution conflict");
+            validate_existing_autonomous_resolution(&tx,&op.id,&prior)?;
         } else {
             tx.execute(
                 "UPDATE merge_allowance_dispatch SET resolution=?2 WHERE operation=?1",
@@ -804,13 +841,12 @@ impl WorkflowStore {
         ensure!(workflow == op.workflow && op.kind == OperationKind::MergePr
             && serde_json::from_str::<OperationKind>(&kind)? == op.kind
             && serde_json::from_str::<Binding>(&binding)? == op.binding
-            && raw == serde_json::to_string(receipt)?
             && receipt["commit_marker_operation"].as_str() == Some(op.id.as_str()),
             "confirmation audit lacks matching immutable commit proof");
-        validate_merge_receipt_identity(&tx,&op.id,receipt)?;
+        validate_merge_receipt_equivalence(&tx,&op.id,&serde_json::from_str(&raw)?,receipt)?;
         let decision = serde_json::json!({"classification":"autonomous","actor":actor,
             "proof_kind":"immutable_commit_marker","receipt_sha256":format!("{:x}",Sha256::digest(raw.as_bytes()))}).to_string();
-        if let Some(prior) = prior { ensure!(prior == decision,"immutable merge resolution conflict"); }
+        if let Some(prior) = prior { validate_existing_autonomous_resolution(&tx,&op.id,&prior)?; }
         else {
             tx.execute("UPDATE merge_allowance_dispatch SET resolution=?2 WHERE operation=?1",params![op.id,decision])?;
             event(&tx,&workflow,generation,"merge_resolution_confirmed",&serde_json::json!({"operation":op.id,"decision":serde_json::from_str::<serde_json::Value>(&decision)?}).to_string(),now)?;

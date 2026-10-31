@@ -785,7 +785,7 @@ impl WorkflowStore {
             )
             .optional()?;
         if let Some(prior) = prior {
-            ensure!(prior == raw, "immutable mutation receipt conflict");
+            merge_allowance::validate_merge_receipt_equivalence(&tx,operation,&serde_json::from_str(&prior)?,receipt)?;
         } else {
             ensure!(
                 completed.is_none(),

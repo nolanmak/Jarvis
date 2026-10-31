@@ -189,11 +189,20 @@ pub async fn resolve(
         Ok(value) => value,
         Err(error) => return failure(operation, 4, "workflow-state-unavailable", error),
     };
-    let immutable_proof = if classification == "autonomous" && journal.is_none() {
+    let needs_immutable_proof = classification == "autonomous" && journal.as_ref().is_none_or(|(raw,node)| {
+        !merge_request_not_executed(raw) && crate::self_improve::accepted_merge_response(
+            raw,node,record.pr,&record.operation.binding.head,operation).is_err()
+    });
+    let immutable_proof = if needs_immutable_proof {
         let checked = (async {
             ensure!(matches!(record.state.as_str(),"dispatched"|"confirmed")
-                && manifest.response_sha256.is_none() && remote["merged"] == true,
-                "immutable recovery requires a dispatched intent and no invented response digest");
+                && remote["merged"] == true,
+                "immutable recovery requires a dispatched intent and merged PR");
+            match &journal {
+                Some((raw,_)) => ensure!(manifest.response_sha256.as_deref() == Some(format!("{:x}",Sha256::digest(raw.as_bytes())).as_str())
+                    && !merge_request_not_executed(raw),"partial response digest differs or proves non-execution"),
+                None => ensure!(manifest.response_sha256.is_none(),"no journal exists for the supplied response digest"),
+            }
             let sha = remote["merge_commit_sha"].as_str().context("remote merge commit missing")?;
             ensure!(matches!(sha.len(),40|64) && sha.bytes().all(|c|c.is_ascii_hexdigit()),"invalid merge commit identity");
             ensure!(manifest.merge_commit.as_deref() == Some(sha)
@@ -205,8 +214,7 @@ pub async fn resolve(
             let receipt = crate::self_improve::immutable_merge_proof(&record,&remote,&commit)?;
             store.validate_merge_receipt_marker(operation,&receipt)?;
             if record.state == "confirmed" {
-                let existing = store.confirmed_merge_receipt(operation)?.context("confirmed merge proof missing")?;
-                ensure!(existing == receipt,"immutable confirmation proof differs");
+                store.validate_confirmed_merge_proof(operation,&receipt)?;
             }
             Ok::<_,anyhow::Error>(receipt)
         }).await;
@@ -236,6 +244,7 @@ pub async fn resolve(
                 operation,
             )?;
             store.validate_merge_receipt_marker(operation, &receipt)?;
+            if record.state == "confirmed" { store.validate_confirmed_merge_proof(operation,&receipt)?; }
             ensure!(
                 remote["merged"] == true
                     && remote["head"]["sha"] == receipt["expected_head"]

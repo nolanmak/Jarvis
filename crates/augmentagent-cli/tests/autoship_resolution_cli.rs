@@ -110,8 +110,14 @@ fn accepted() -> Value {
 
 #[test]
 fn cli_recovers_lost_response_from_immutable_commit_without_inventing_echo() {
-    for scenario in ["valid","wrong-marker","wrong-commit","legacy","oversized","invalid-time"] {
-        let dir = fixture(None,true,&"a".repeat(40));
+    for scenario in ["valid","partial","execution-error","pre-execution-error","wrong-digest","wrong-marker","wrong-commit","legacy","oversized","invalid-time"] {
+        let response = match scenario {
+            "partial" | "wrong-digest" => Some(json!({"data":{"mergePullRequest":null}})),
+            "execution-error" => Some(json!({"data":null,"errors":[{"message":"execution interrupted"}]})),
+            "pre-execution-error" => Some(request_error()),
+            _ => None,
+        };
+        let dir = fixture(response.clone(),true,&"a".repeat(40));
         let root = dir.path();
         let marker = format!("Autoship-Receipt: v1:op-pending:{}","f".repeat(64));
         if scenario != "legacy" {
@@ -132,8 +138,14 @@ fn cli_recovers_lost_response_from_immutable_commit_without_inventing_echo() {
                 std::fs::write(path,value.to_string()).unwrap();
             }
         }
+        if scenario == "wrong-digest" {
+            let path = root.join("evidence.json");
+            let mut value:Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            value["response_sha256"] = "0".repeat(64).into();
+            std::fs::write(path,value.to_string()).unwrap();
+        }
         let before = Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap());
-        if scenario != "valid" {
+        if !matches!(scenario,"valid"|"partial"|"execution-error") {
             assert_code(&invoke(root,"autonomous"),3);
             assert_eq!(Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap()),before,"{scenario}");
             continue;
@@ -151,7 +163,28 @@ fn cli_recovers_lost_response_from_immutable_commit_without_inventing_echo() {
         let n:u32 = conn.query_row("SELECT count(*) FROM workflow_event WHERE kind='autonomous_merge_confirmed'",[],|r|r.get(0)).unwrap();
         assert_eq!(n,1);
         let journals:u32 = conn.query_row("SELECT count(*) FROM merge_transport_response",[],|r|r.get(0)).unwrap();
-        assert_eq!(journals,0,"recovery must never fabricate an original response");
+        assert_eq!(journals,u32::from(response.is_some()),"recovery must never fabricate an original response");
+        if let Some(response) = response {
+            let journal:String = conn.query_row("SELECT response FROM merge_transport_response",[],|r|r.get(0)).unwrap();
+            assert_eq!(journal,response.to_string(),"original response must remain immutable");
+        }
+        if scenario == "valid" {
+            let mut late = accepted();
+            late["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"]["message"] = proof["merge_message"].clone();
+            let late = late.to_string();
+            conn.execute("INSERT INTO merge_transport_response VALUES('op-pending',?1,99)",[&late]).unwrap();
+            let path = root.join("evidence.json");
+            let mut manifest:Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest["response_sha256"] = format!("{:x}",Sha256::digest(late.as_bytes())).into();
+            std::fs::write(path,manifest.to_string()).unwrap();
+            drop(conn);
+            assert_code(&invoke(root,"autonomous"),0);
+            let conn = rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+            let canonical:String = conn.query_row("SELECT receipt FROM merge_mutation_receipt",[],|r|r.get(0)).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&canonical).unwrap(),proof);
+            let original_audit:String = conn.query_row("SELECT resolution FROM merge_allowance_dispatch",[],|r|r.get(0)).unwrap();
+            assert_eq!(original_audit,decision,"late evidence must not rewrite the first audit");
+        }
     }
 }
 

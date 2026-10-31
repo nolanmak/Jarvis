@@ -3,6 +3,36 @@ use super::*;
 const DAY: i64 = 86_400_000;
 
 #[test]
+fn late_equivalent_merge_proof_preserves_first_receipt_and_debits_once() {
+    for marker_first in [true,false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+        let now = 100 * DAY;
+        let (lease,op) = fixture(&mut store,1,now);
+        reserve(&mut store,&lease,&op,1,now).unwrap();
+        let marker = store.dispatch_marked_merge(&lease,&op,now,5).unwrap();
+        let mut response = receipt(&op,1,now);
+        response["merge_message"] = marker.into();
+        let mut recovered = response.clone();
+        recovered.as_object_mut().unwrap().remove("client_mutation_id");
+        recovered["commit_marker_operation"] = op.id.clone().into();
+        let (first,late) = if marker_first {(&recovered,&response)} else {(&response,&recovered)};
+        store.confirm_merge_dispatch(&op,first,now).unwrap();
+        store.record_merge_mutation(&lease,&op.id,first,now).unwrap();
+        store.confirm_merge_dispatch(&op,late,now+1).unwrap();
+        store.record_merge_mutation(&lease,&op.id,late,now+1).unwrap();
+        assert_eq!(store.confirmed_merge_receipt(&op.id).unwrap().as_ref(),Some(first));
+        assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,1);
+        for field in ["merge_commit","merged_by","merged_at","merge_message"] {
+            let mut wrong = late.clone();
+            wrong[field] = if field=="merge_commit" {"d".repeat(40)} else {"different".into()}.into();
+            assert!(store.confirm_merge_dispatch(&op,&wrong,now+2).is_err(),"{field}");
+        }
+        assert_eq!(store.confirmed_merge_receipt(&op.id).unwrap().as_ref(),Some(first));
+    }
+}
+
+#[test]
 fn marker_resolution_audit_requires_exact_confirmed_binding_and_proof() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
