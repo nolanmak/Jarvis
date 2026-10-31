@@ -28,7 +28,7 @@ jobs:
       # instead of skipping them (local runs still skip).
       REQUIRE_ENFORCEABLE_SANDBOX: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install renderer, syscall-filter library and ripgrep
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/1"
       - name: Report sandbox capabilities
