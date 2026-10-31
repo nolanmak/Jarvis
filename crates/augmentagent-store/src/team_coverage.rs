@@ -136,3 +136,35 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
+
+/// #1702 — one row of the shadow report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamCoverageReportRow {
+    pub decision: TeamCoverageDecision,
+    /// The card's platform (`emails.platform`; empty if the inbound is gone).
+    pub platform: String,
+    /// The owner sent on the thread after the teammate's covering message —
+    /// the objective "the owner still needed to answer" false-positive signal.
+    pub owner_replied_anyway: bool,
+    /// `correct` / `wrong`, or `None` until the owner reviews it.
+    pub review: Option<String>,
+}
+
+pub const REVIEW_VERDICTS: [&str; 2] = ["correct", "wrong"];
+
+impl Store {
+    /// Decisions made at or after `since_ms`, with platform, the
+    /// replied-anyway signal and the owner's review.
+    pub fn team_coverage_report(&self, since_ms: i64) -> StoreResult<Vec<TeamCoverageReportRow>> {
+        let _ = since_ms;
+        Ok(Vec::new())
+    }
+
+    /// Record the owner's verdict on a decision. `Ok(false)` when there is no
+    /// such decision; an unknown verdict is an error. Re-reviewing replaces
+    /// the earlier verdict.
+    pub fn review_team_coverage(&self, action_id: &str, verdict: &str) -> StoreResult<bool> {
+        let _ = (action_id, verdict);
+        Ok(false)
+    }
+}

@@ -179,6 +179,47 @@ pub fn find_coverage(
     Ok(best)
 }
 
+// ---- #1702: shadow report, review and the objective rollout gate ----
+
+/// Totals behind the rollout gate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Summary {
+    pub decisions: usize,
+    pub reviewed: usize,
+    pub wrong: usize,
+    pub replied_anyway: usize,
+    /// Earliest decision in the window; shadow mode started no later.
+    pub first_decided_ms: Option<i64>,
+}
+
+pub fn summarize(rows: &[augmentagent_store::team_coverage::TeamCoverageReportRow]) -> Summary {
+    let _ = rows;
+    Summary::default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gate {
+    pub pass: bool,
+    /// Every failed criterion, in a fixed order; empty when `pass`.
+    pub reasons: Vec<String>,
+}
+
+pub const GATE_MIN_DAYS: i64 = 7;
+pub const GATE_MIN_DECISIONS: usize = 10;
+pub const GATE_SPARSE_MIN_DAYS: i64 = 14;
+
+/// The #1702 gate for switching the default from `shadow` to `on`.
+pub fn gate(s: &Summary, now_ms: i64) -> Gate {
+    let _ = (s, now_ms);
+    Gate { pass: false, reasons: vec![] }
+}
+
+/// One-line health summary (autopr-health style).
+pub fn summary_line(s: &Summary, g: &Gate) -> String {
+    let _ = (s, g);
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,4 +441,75 @@ mod tests {
         assert!(mentions_alias("cc sam owner.", &a));
         assert!(!mentions_alias("same here, samples attached", &a));
     }
+    // ---- #1702 ----
+
+    const DAY: i64 = 86_400_000;
+
+    fn summary(decisions: usize, reviewed: usize, wrong: usize, anyway: usize, age_days: i64) -> (Summary, i64) {
+        let now = 100 * DAY;
+        (
+            Summary { decisions, reviewed, wrong, replied_anyway: anyway, first_decided_ms: Some(now - age_days * DAY) },
+            now,
+        )
+    }
+
+    #[test]
+    fn gate_check_passes_when_all_criteria_met() {
+        let (s, now) = summary(10, 10, 0, 0, 7);
+        assert_eq!(gate(&s, now), Gate { pass: true, reasons: vec![] });
+        // Fewer than 10 decisions is fine once 14 days have passed.
+        let (s, now) = summary(3, 3, 0, 0, 14);
+        assert!(gate(&s, now).pass);
+    }
+
+    #[test]
+    fn gate_check_fails_on_any_wrong_or_replied_anyway() {
+        let (s, now) = summary(12, 12, 1, 0, 9);
+        assert_eq!(gate(&s, now).reasons, vec!["1 decision(s) marked wrong".to_string()]);
+        let (s, now) = summary(12, 12, 0, 2, 9);
+        assert_eq!(gate(&s, now).reasons, vec!["owner replied anyway on 2 decision(s)".to_string()]);
+    }
+
+    #[test]
+    fn gate_check_fails_on_time_volume_and_review_coverage() {
+        let (s, now) = summary(10, 10, 0, 0, 6);
+        assert_eq!(gate(&s, now).reasons, vec!["shadow for 6 day(s); need 7".to_string()]);
+        let (s, now) = summary(4, 4, 0, 0, 9);
+        assert_eq!(gate(&s, now).reasons, vec!["only 4 decision(s); need 10, or 14 days of shadow".to_string()]);
+        let (s, now) = summary(10, 9, 0, 0, 8);
+        assert_eq!(gate(&s, now).reasons, vec!["9/10 decision(s) reviewed; need all".to_string()]);
+        let none = Summary::default();
+        assert_eq!(gate(&none, 100 * DAY).reasons, vec!["no shadow decisions yet".to_string()]);
+    }
+
+    #[test]
+    fn report_rows_summarize_and_render_a_summary_line() {
+        use augmentagent_store::team_coverage::{TeamCoverageDecision, TeamCoverageReportRow};
+        let row = |id: &str, decided: i64, review: Option<&str>, anyway: bool| TeamCoverageReportRow {
+            decision: TeamCoverageDecision {
+                action_id: id.into(),
+                mode: "shadow".into(),
+                teammate: "Ana".into(),
+                covering_message_id: "m".into(),
+                thread_id: "T".into(),
+                covered_at_ms: decided - 1,
+                decided_at_ms: decided,
+            },
+            platform: "gmail".into(),
+            owner_replied_anyway: anyway,
+            review: review.map(String::from),
+        };
+        let rows = vec![row("a", 5 * DAY, Some("correct"), false), row("b", 3 * DAY, Some("wrong"), true), row("c", 4 * DAY, None, false)];
+        let s = summarize(&rows);
+        assert_eq!(
+            s,
+            Summary { decisions: 3, reviewed: 2, wrong: 1, replied_anyway: 1, first_decided_ms: Some(3 * DAY) }
+        );
+        let g = gate(&s, 20 * DAY);
+        assert_eq!(
+            summary_line(&s, &g),
+            "team-coverage: 3 decision(s), 2 reviewed, 1 wrong, 1 replied-anyway, shadow 17 day(s) — gate FAIL"
+        );
+    }
+
 }
