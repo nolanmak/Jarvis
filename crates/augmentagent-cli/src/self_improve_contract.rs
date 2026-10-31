@@ -652,6 +652,47 @@ async fn isolated_observation(
 mod tests {
     use super::*;
     use anyhow::ensure;
+    fn fence_proposal(script:&str)->serde_json::Value {
+        serde_json::json!({
+            "contract":{"schema_version":1,"revision":1,"pull_request":841,
+                "criteria":[{"id":"sum","requirement":"Return the arithmetic sum","verifier_ids":["observe"]}],
+                "allowed_paths":[{"kind":"file","path":"arithmetic.py"}],
+                "verifiers":[{"id":"observe","command":{"kind":"black_box","invocation":{"kind":"python_script","file":"autoship_verifiers/observe.py","args":[]},
+                    "oracle":{"kind":"json","value":[5,3,0]}},"pinned_files":["autoship_verifiers/observe.py"],"failure_witness":"observed arithmetic differs"}]},
+            "files":{"autoship_verifiers/observe.py":script}
+        })
+    }
+    #[test]
+    fn contract_fence_accepts_escaped_whitespace_only_outside_json_values() {
+        let script="import json\nprint(json.dumps({'literal':r'\\n'}))\n";
+        let value=fence_proposal(script);
+        let raw=serde_json::to_string(&value).unwrap();
+        let expected=parse_proposal_for(&format!("```autoship-contract\n{raw}\n```"),AcceptanceSource::PullRequest(841)).unwrap();
+        for padding in ["\n","\\n","\\n\\r\\t","\r\n\\n  "] {
+            let parsed=parse_proposal_for(&format!("```autoship-contract\n{raw}{padding}```"),AcceptanceSource::PullRequest(841)).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(),serde_json::to_value(&expected).unwrap());
+            assert_eq!(expected.files["autoship_verifiers/observe.py"],script,"literal escapes in pinned source must stay intact");
+        }
+    }
+    #[test]
+    fn contract_fence_preserves_backticks_inside_pinned_file_strings() {
+        let script="print('```')\n";let raw=serde_json::to_string(&fence_proposal(script)).unwrap();
+        let parsed=parse_proposal_for(&format!("```autoship-contract\n{raw}\n```"),AcceptanceSource::PullRequest(841)).unwrap();
+        assert_eq!(parsed.files["autoship_verifiers/observe.py"],script);
+    }
+    #[test]
+    fn contract_fence_rejects_ambiguous_or_unterminated_data_and_wrong_authority() {
+        let raw=serde_json::to_string(&fence_proposal("print(5)\n")).unwrap();
+        for trailing in ["{}"," trailing prose","\\n{}","\\nDO_THIS","\\u000a"] {
+            assert!(parse_proposal_for(&format!("```autoship-contract\n{raw}{trailing}```"),AcceptanceSource::PullRequest(841)).is_err(),"{trailing}");
+        }
+        assert!(parse_proposal_for(&format!("```autoship-contract\n{raw}"),AcceptanceSource::PullRequest(841)).is_err());
+        let valid=format!("```autoship-contract\n{raw}\n```");
+        assert!(parse_proposal_for(&format!("{valid}\n{valid}"),AcceptanceSource::PullRequest(841)).is_err());
+        assert!(parse_proposal_for(&valid,AcceptanceSource::Issue(841)).is_err());
+        let mut extra=fence_proposal("print(5)\n");extra["untrusted_authority"]=true.into();
+        assert!(parse_proposal_for(&format!("```autoship-contract\n{}\n```",extra),AcceptanceSource::PullRequest(841)).is_err());
+    }
     #[test]
     fn verifier_harness_cannot_replace_source_or_escape() {
         for path in [
