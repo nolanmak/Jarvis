@@ -454,6 +454,16 @@ impl AuditLogger {
     }
 
     pub fn model_call_admitted(&self, provider: &str) -> anyhow::Result<()> {
+        self.record_model_admission(provider,None)
+    }
+
+    /// Bind a protected model turn to the exact controller resource receipt.
+    /// Ordering alone cannot associate it with a later quiescence proof.
+    pub(crate) fn model_call_admitted_in_scope(&self,provider:&str,identity:&serde_json::Value)->anyhow::Result<()> {
+        self.record_model_admission(provider,Some(identity))
+    }
+
+    fn record_model_admission(&self,provider:&str,identity:Option<&serde_json::Value>)->anyhow::Result<()> {
         let observer = self
             .model_call_observer
             .lock()
@@ -463,7 +473,12 @@ impl AuditLogger {
             observer(provider)?;
         }
         if self.anchored.is_some() {
-            self.record_controller(serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider}))?;
+            let mut record=serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider});
+            if let Some(identity)=identity {
+                record["admission_schema_version"]=2.into();
+                record["resource_identity"]=identity.clone();
+            }
+            self.record_controller(record)?;
         }
         Ok(())
     }

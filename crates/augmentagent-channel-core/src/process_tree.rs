@@ -59,6 +59,7 @@ impl ProcessGroup {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        let mut resource_identity=None;
         if self.resource_required {
             let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
                 .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -71,9 +72,15 @@ impl ProcessGroup {
             if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
             }
+            resource_identity=Some(observation["identity"].clone());
         }
         if let Some(logger)=logger {logger.dispatch_allowed()?;}
-        if model { if let Some(logger)=logger { logger.model_call_admitted(provider)?; } }
+        if model { if let Some(logger)=logger {
+            match &resource_identity {
+                Some(identity)=>logger.model_call_admitted_in_scope(provider,identity)?,
+                None=>logger.model_call_admitted(provider)?,
+            }
+        } }
         let mut proceed=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.receipt.with_file_name("launch-continue"))?;
         proceed.write_all(b"admitted\n")?;
         proceed.sync_all()?;
