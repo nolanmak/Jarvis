@@ -4,7 +4,6 @@ use augmentagent_store::{
     rusqlite::{params, OptionalExtension},
     Store,
 };
-use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
@@ -13,24 +12,7 @@ pub struct Checkpoint {
     pub revision: i64,
     pub retry_at_ms: i64,
 }
-#[derive(Debug, Serialize)]
-pub struct Coverage {
-    pub account: String,
-    pub category: String,
-    pub mailbox_complete: bool,
-    pub conversations: i64,
-    pub complete_threads: i64,
-    pub messages: i64,
-    pub owner_messages: i64,
-    pub group_conversations: i64,
-    pub oldest_source_ms: Option<i64>,
-    pub newest_source_ms: Option<i64>,
-    pub queued_index: i64,
-    pub missing_index: i64,
-    pub stale_index: i64,
-    pub missing_fts: i64,
-    pub complete: bool,
-}
+pub use augmentagent_store::linkedin_archive::Coverage;
 
 pub fn checkpoint(store: &Store, account: &str, category: &str) -> anyhow::Result<Checkpoint> {
     Ok(store.with_conn(|c| {
@@ -129,20 +111,13 @@ pub fn commit_messages(
 }
 
 pub fn coverage(store: &Store, account: &str, category: &str) -> anyhow::Result<Coverage> {
-    Ok(store.with_conn(|c|{
-        let mailbox_complete=c.query_row("SELECT complete FROM linkedin_archive_mailboxes WHERE account=?1 AND category=?2",params![account,category],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(false);
-        let (conversations,complete_threads,group_conversations)=c.query_row("SELECT COUNT(*),COALESCE(SUM(c.complete),0),COALESCE(SUM(c.group_chat),0) FROM linkedin_archive_conversations c JOIN linkedin_archive_categories k ON k.account=c.account AND k.conversation=c.urn WHERE k.account=?1 AND k.category=?2",params![account,category],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        let (messages,owner_messages,oldest_source_ms,newest_source_ms,queued_index)=c.query_row("SELECT COUNT(*),COALESCE(SUM(m.from_me),0),MIN(m.source_ms),MAX(m.source_ms),COUNT(q.message_id) FROM linkedin_archive_messages m JOIN linkedin_archive_categories k ON k.account=m.account AND k.conversation=m.conversation LEFT JOIN message_index_queue q ON q.message_id=m.stored_id WHERE k.account=?1 AND k.category=?2",params![account,category],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let (missing_index,stale_index,missing_fts):(i64,i64,i64)=c.query_row(
-            "SELECT COALESCE(SUM(mi.message_id IS NULL),0),
-                COALESCE(SUM(mi.message_id IS NOT NULL AND (mi.extractor_version<?3 OR mi.from_me<>m.from_me OR mi.ts_ms<>m.source_ms)),0),
-                COALESCE(SUM(mi.message_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM message_fts f WHERE f.rowid=mi.rowid)),0)
-             FROM linkedin_archive_messages m
-             JOIN linkedin_archive_categories k ON k.account=m.account AND k.conversation=m.conversation
-             LEFT JOIN message_index mi ON mi.message_id=m.stored_id
-             WHERE k.account=?1 AND k.category=?2",
-            params![account,category,augmentagent_messages::EXTRACTOR_VERSION],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        Ok(Coverage{account:account.into(),category:category.into(),mailbox_complete,conversations,complete_threads,messages,owner_messages,group_conversations,oldest_source_ms,newest_source_ms,queued_index,missing_index,stale_index,missing_fts,complete:mailbox_complete&&conversations==complete_threads&&queued_index==0&&missing_index==0&&stale_index==0&&missing_fts==0})
+    Ok(store.with_conn(|c| {
+        augmentagent_store::linkedin_archive::coverage(
+            c,
+            account,
+            category,
+            augmentagent_messages::EXTRACTOR_VERSION,
+        )
     })?)
 }
 

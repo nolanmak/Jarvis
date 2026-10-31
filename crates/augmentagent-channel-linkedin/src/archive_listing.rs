@@ -15,6 +15,7 @@ struct Cursor {
 }
 #[derive(Serialize)]
 pub struct ConversationResults {
+    pub account_id: String,
     pub schema_version: u32,
     pub conversations: Vec<Conversation>,
     pub next_cursor: Option<String>,
@@ -100,6 +101,7 @@ pub async fn recent(
         Some(serde_json::to_string(&position)?)
     };
     let result = ConversationResults {
+        account_id: format!("linkedin:{}", api.mailbox()),
         schema_version: 2,
         conversations: rows,
         next_cursor,

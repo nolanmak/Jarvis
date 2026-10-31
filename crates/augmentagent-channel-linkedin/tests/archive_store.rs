@@ -717,3 +717,100 @@ fn equal_participant_names_are_ambiguous_but_stable_identity_is_exact() {
         "membership must not imply authorship"
     );
 }
+
+#[test]
+fn search_results_expose_account_and_partial_archive_coverage() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    let empty = s
+        .with_conn(|c| {
+            Ok(augmentagent_messages::query::search(c, "in:linkedin", Some(50), 0).unwrap())
+        })
+        .unwrap();
+    let empty = serde_json::to_value(empty).unwrap();
+    assert_eq!(empty["linkedin_coverage"]["scope"], "known_categories_only");
+    assert_eq!(empty["linkedin_coverage"]["state"], "not_synced");
+    let cp = checkpoint(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    commit_conversations(
+        &s,
+        OWNER,
+        "PRIMARY_INBOX",
+        &cp,
+        &Page {
+            items: vec![conversation(0)],
+            next: Some("more".into()),
+        },
+        10000,
+    )
+    .unwrap();
+    let cp = pending_threads(&s, OWNER, "PRIMARY_INBOX")
+        .unwrap()
+        .remove(0)
+        .1;
+    commit_messages(
+        &s,
+        OWNER,
+        "thread:0",
+        &cp,
+        &Page {
+            items: vec![message(0, 1)],
+            next: None,
+        },
+        10001,
+    )
+    .unwrap();
+    augmentagent_messages::index::drain(&s, 100, std::time::Duration::ZERO).unwrap();
+    let result = s
+        .with_conn(|c| {
+            Ok(augmentagent_messages::query::search(c, "in:linkedin", Some(50), 0).unwrap())
+        })
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["hits"][0]["account_id"], format!("linkedin:{OWNER}"));
+    assert_eq!(result["linkedin_coverage"]["scopes"][0]["complete"], false);
+    assert_eq!(
+        result["linkedin_coverage"]["scopes"][0]["last_success_ms"],
+        10000
+    );
+    let server = augmentagent_mcp_memory::Server::open(f.path()).unwrap();
+    let result = server
+        .search_conversation_history(Some("Message"), None, None, Some("linkedin"), Some(10))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap()[0]["account_id"],
+        format!("linkedin:{OWNER}")
+    );
+    let request=serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_conversation_history","arguments":{"keyword":"Message","channel":"linkedin"}}})).unwrap();
+    let response = server.dispatch(&request);
+    let page: serde_json::Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(page["linkedin_coverage"]["scopes"][0]["complete"], false);
+}
+
+#[test]
+fn legacy_linkedin_read_and_date_filter_use_received_time_when_available() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    s.with_conn(|c|{c.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,accountEntityId,firstSeenAt,platform,kind) VALUES('legacy','legacy-thread','Peer','','legacySource','2020-01-02T03:04:05.123Z','linkedin:legacy-owner',1900000000000,'linkedin','dm')",[])?;Ok(())}).unwrap();
+    let server = augmentagent_mcp_memory::Server::open(f.path()).unwrap();
+    let hits = server
+        .search_conversation_history(
+            None,
+            Some(1577934245123),
+            Some(1577934245124),
+            Some("linkedin"),
+            Some(10),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "legacy receipt time must not move old messages into the import window"
+    );
+    let page = server
+        .read_conversation_thread("legacy-thread", 0, 0, 20)
+        .unwrap();
+    assert_eq!(page["messages"][0]["timestamp_ms"], 1577934245123i64);
+    assert_eq!(page["messages"][0]["imported_at_ms"], 1900000000000i64);
+    assert_eq!(page["coverage"]["state"], "unverified");
+}

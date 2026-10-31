@@ -89,7 +89,7 @@ pub async fn thread(urn: &str, cursor: Option<&str>, max_pages: usize, json: boo
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({"schema_version":1,"conversation":conversation,"messages":messages,"next_cursor":next,"complete":complete,"pages":pages})
+                &serde_json::json!({"schema_version":1,"account_id":format!("linkedin:{}",api.mailbox()),"conversation":conversation,"messages":messages,"next_cursor":next,"complete":complete,"pages":pages})
             )?
         );
     } else {
@@ -146,10 +146,21 @@ pub async fn backfill(
 }
 
 pub fn status(store: &Store, category: &str) -> Result<()> {
-    let api = reader()?;
+    let mut coverage = store.with_conn(|c| {
+        augmentagent_store::linkedin_archive::search_coverage(
+            c,
+            augmentagent_messages::EXTRACTOR_VERSION,
+        )
+    })?;
+    coverage.scopes.retain(|scope| scope.category == category);
+    if coverage.scopes.is_empty() {
+        coverage.state = "not_synced";
+    }
     println!(
         "{}",
-        serde_json::to_string_pretty(&db::coverage(store, api.mailbox(), category)?)?
+        serde_json::to_string_pretty(
+            &serde_json::json!({"schema_version":1,"category":category,"coverage":coverage})
+        )?
     );
     Ok(())
 }

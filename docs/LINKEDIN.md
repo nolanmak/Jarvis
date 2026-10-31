@@ -186,7 +186,7 @@ selects the mailbox category (default `INBOX`); `--max-pages` bounds requests.
 A limit of zero performs no requests. A page budget of zero returns a resumable
 partial result. Limits above the mailbox size stop at server exhaustion.
 
-The JSON contract is version 2: an object with `schema_version`, `conversations`,
+The JSON contract is version 2: an object with `schema_version`, `account_id`, `conversations`,
 `category`, `pages`, `complete`, and `next_cursor`, replacing the old flat DM
 array. Each conversation contains its stable `urn`, `title`, `group` flag,
 `participants`, and source `last_activity_ms`. These are conversation records,
@@ -244,3 +244,20 @@ and the actual sender. Reclassification retires undispatched candidates.
 Authoritative conversation metadata is checked before archived candidates enter
 triage, and the send API checks direct membership again before an approved reply
 is posted. The read and backfill commands never grant group-send permission.
+
+### Search coverage and account identity
+
+Both `search_messages` and the memory tool's `search_conversation_history`
+return `account_id` with hits. Pass that identity with `thread_id` when reading
+stored threads. Search responses include `linkedin_coverage` whenever LinkedIn
+is in scope, including zero-hit results. Its scope is explicitly
+`known_categories_only`; recorded categories do not prove that every current
+mailbox category has been discovered. Per-category results expose last success,
+last error, retry time, failed thread count, and search-index health.
+
+`archive-status` reads persisted state without requiring working cookies. Its
+version-1 response contains `category` and `coverage`, covering recorded accounts
+in the requested category. A missing progress record is `not_synced`, not proof
+that the database contains no older message rows. Legacy LinkedIn rows use their
+stored `receivedAt` source timestamp when parseable, while import time remains
+separately labeled. Their history coverage stays unverified until reconciled.
