@@ -68,6 +68,14 @@ pub const LIVE_VOICE_BLOCKER: &str = "Live voice needs the app to join a huddle 
 
 pub static OWNER_COMMANDS: &[OwnerCommand] = &[
     OwnerCommand {
+        name: "autoship", aliases: &[],
+        usage: "autoship <GitHub PR URL> [--provider codex|claude] | status|pause|resume [--workflow ID] | use ID",
+        description: "Queue or join an Autoship workflow from the owner's private Discord DM. Inspect status, request pause/resume, or select a bound workflow. Acceptance does not confirm completion or teardown; PR coding follow-ups are not connected yet.",
+        discord: &["!autoship"],
+        slack: SlackMapping::Blocked { issue: 1713, reason: "Autoship admission currently requires the verified owner Discord DM; Slack workflow routing is not connected." },
+        plain: PlainText::Sigil,
+    },
+    OwnerCommand {
         name: "help",
         aliases: &["commands"],
         usage: "help [command]",
@@ -216,7 +224,8 @@ pub fn find(word: &str) -> Option<&'static OwnerCommand> {
 /// Recognizer functions the Discord dispatcher calls, and the trigger each
 /// stands for. A new recognizer must be added here (see the pinned
 /// limitation test).
-const DISCORD_RECOGNIZERS: [(&str, &str); 6] = [
+const DISCORD_RECOGNIZERS: [(&str, &str); 7] = [
+    ("autoship::dispatch(", "!autoship"),
     ("model_command_in_guild(", "model"),
     ("match_loop_prefix(", "loop"),
     ("parse_journal_command(", "!journal"),

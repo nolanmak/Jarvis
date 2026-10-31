@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1714,
+    1713
+  ],
+  "status": "bound-owner-dm-progress-delivery-connected-not-deployed",
+  "parent_commit": "c97251f7d04e2dee153464caffc3693748d04d80",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-progress-delivery.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Bound progress never reaches delivery claim."
+    },
+    "initial_compile_failure": {
+      "log": "/tmp/autoship-1703-green-progress-delivery.log",
+      "cargo_exit": 101,
+      "reason": "Test-only macro needed an anyhow namespace; corrected."
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-progress-delivery-final.log",
+      "exit": 0,
+      "passed": 1476,
+      "failed": 0,
+      "ignored": 25
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-progress-delivery-cli.log",
+      "exit": 0,
+      "passed": 43,
+      "failed": 0
+    },
+    "discord_gateway_green": {
+      "log": "/tmp/autoship-1703-green-progress-delivery-gateway.log",
+      "exit": 0,
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "verified": [
+    "Production QueryHandler and reconnect worker drain current progress to workflows bound to the configured owner DM. Positive private-recipient metadata is checked before claim and again before send.",
+    "Durable per-workflow/destination/sequence claim pins the content, nonce and uncertainty before transport dispatch. Duplicate polls and reopened stores cannot claim an already attempted update.",
+    "Older unsent history is summarized by the current progress state. A stale pending-list sequence cannot dispatch after progress has advanced; durable historical events remain retained.",
+    "Successful transport message IDs confirm only the exact workflow, sequence and bound destination. Repeated identical receipts are idempotent and conflicting receipts reject.",
+    "An uncertain update blocks later sends at that workflow destination. Production-adapter regression sends one confirmed update, then injects a lost response and verifies repeated drains do not resend it.",
+    "Status counts unconfirmed progress across bound destinations and reports delivery-confirmed or delivery-uncertain without claiming workflow or deployment success."
+  ],
+  "limits": [
+    "No live Discord acceptance, deployment, hosted CI acceptance or soak completed. No child issue closed.",
+    "This change sends append-only current updates in already-bound owner DMs. Operational destination routing, PR threads, one editable status message, routine-edit throttling and preserving a separate latest unresolved blocker summary remain open.",
+    "All transport failures remain conservatively uncertain. Typed 429/backoff handling, degraded/dead-letter states, bounded history reconciliation and explicit owner resolution/duplicate-authorized retry remain open.",
+    "Destination generation/rebind, legacy notification deduplication, actual provider receipt projection and verified updater deployment outcomes remain open."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-approval-discord/src/autoship.rs",
+      "sha256": "8f1548c12cbd38ffb6e1a295013dad1afd4997490897362e3db6e67e22166942"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/lib.rs",
+      "sha256": "2cea425efb4dd5c5868197840d090e7ad4c0c66d483108207110f229f2d5b1bb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "286558316376fc1fc5b8a21e73bfa8fd3a140dba2224ccfbcbdaf637f91e80fb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_progress.rs",
+      "sha256": "a48b29a350a9b650e15ecb18c92a7a2d0e387ae79b80b8868ba4fa52bdae2e0c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "f78ff9c850d9e4109fc326bdceedd5e782ed29e4cfe002235ea4c843bf4a175b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "94d42557d327ae52c16674cfca8bdc73867b83d369789a18bf4a40dcb880dd76"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "9345b4f4736acaa6ebd493dc3c82cc5fbf6b0ea8a1380207892f7802084448f7"
+    }
+  ]
+}

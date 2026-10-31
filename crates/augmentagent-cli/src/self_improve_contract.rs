@@ -30,7 +30,13 @@ const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 pub(super) const CONTRACT_PROMPT: &str = r#"
 Emit exactly one ```autoship-contract fenced JSON object with fields `contract`
 and `files`. contract schema_version=1, revision=1, exactly one real source:
-issue=<number> or pull_request=<number>. criteria are {id,requirement,verifier_ids};
+issue=<number> or pull_request=<number>, as a direct field of contract. There is
+NO `source` JSON field and no nested {kind,number} source object in this schema.
+For PR #841 the identity fields are exactly {"schema_version":1,"revision":1,"pull_request":841};
+for issue #840 they are exactly {"schema_version":1,"revision":1,"issue":840}.
+Use the actual requested number, not these example numbers. Omit the other source
+field entirely. Do not add metadata fields: unknown contract fields are rejected.
+criteria are {id,requirement,verifier_ids};
 allowed_paths are {kind:"file"|"directory",path}; verifiers are
 {id,command,pinned_files,failure_witness}. EVERY command must be:
 {kind:"black_box",invocation:{kind:"python_script",file:"autoship_verifiers/observe.py",args:[]},oracle:{kind:"json",value:[5,3,0]}}
@@ -1768,6 +1774,10 @@ pub(super) async fn verify_with_repair_for(
                     &prompt,
                 )
                 .await?;
+                // The model leaves edits in the worktree. Checkpoint them before
+                // shared CI binds its exact source tree; the next acceptance
+                // iteration still rechecks scope and the independent oracle.
+                recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
                 verification_gate(worktree, &workflow.audit_logger()).await?;

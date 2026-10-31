@@ -109,12 +109,14 @@ pub(super) struct CapacityAccounting {
 }
 impl CapacityAccounting {
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
-        if !self.audit.resource_capacity_seen() { return Ok(None); }
-        let calls_after = self.store.lock().map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
-            .snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
+        let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let paused=store.owner_control(&self.workflow)?.is_some_and(|c|c.paused);
+        if !paused && !self.audit.resource_capacity_seen() { return Ok(None); }
+        let calls_after = store.snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
         let paid = calls_after.checked_sub(self.calls_before).context("durable model admissions decreased")?;
         Ok(Some(RunReport {
-            message: format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)"),
+            message: if paused {format!("Autoship owner pause requested; candidate and evidence preserved ({paid} model admissions this run)")}
+                else {format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)")},
             billed: paid > 0,
             held: paid == 0,
             resumed: self.resumed,
@@ -366,7 +368,7 @@ impl SweepGuard {
                 evidence_hash: format!("{:x}", Sha256::digest(recorded.as_bytes())),
             });
         store.register(&id, branch, binding.clone(), now)?;
-        let Some(lease) = store.claim(
+        let Some(lease) = store.claim_reconciliation(
             &id,
             &format!("sweep:{}", uuid::Uuid::new_v4()),
             now,
@@ -377,15 +379,7 @@ impl SweepGuard {
         };
         // Bind merge metadata to the protected review that granted authority,
         // not a different cached OpenedPr supplied by a reconciliation caller.
-        let reviews: Vec<Review> = store
-            .events(&id)?
-            .into_iter()
-            .rev()
-            .take_while(|(_, kind, _, _)| kind != "audit_generation_recovered")
-            .filter(|(_, kind, _, _)| kind == "review_recorded")
-            .filter_map(|(_, _, body, _)| serde_json::from_str::<Review>(&body).ok())
-            .filter(|review| review.binding == binding)
-            .collect();
+        let reviews=store.current_review_history(&id)?;
         let structured = reviews.iter().find_map(|review| {
             structured_review_base(&review.evidence, head).map(|base| (review.approved, base))
         });
@@ -495,7 +489,7 @@ impl SweepGuard {
                 );
             }
         }
-        let worktree = prepare_resume_worktree(repo, pr, &self.branch).await?;
+        let worktree = prepare_resume_worktree_at_head(repo, pr, &self.branch,Some(&expected)).await?;
         let reference = {
             let store = inner
                 .store
@@ -550,6 +544,10 @@ impl SweepGuard {
         }
         // Network and artifact reads can span lease expiry; fence immediately before mutation.
         inner.validate_before_side_effect()
+    }
+
+    pub(super) fn merge_lease(&self) -> Result<Lease> {
+        self.inner.as_ref().context("released sweep lease")?.merge_lease()
     }
 
     pub(super) fn record_merge_mutation(
@@ -616,7 +614,13 @@ impl WorkflowGuard {
         Self::acquire_at(state, start, millis()).await
     }
 
+    pub(super) async fn acquire_owner_turn(start:Start<'_>)->Result<Option<Self>> {
+        Self::acquire_mode_at(&path(),start,millis(),true).await
+    }
     async fn acquire_at(state: &Path, start: Start<'_>, now: i64) -> Result<Option<Self>> {
+        Self::acquire_mode_at(state,start,now,false).await
+    }
+    async fn acquire_mode_at(state:&Path,start:Start<'_>,now:i64,owner_turn:bool)->Result<Option<Self>> {
         anyhow::ensure!(
             !start.repository.trim().is_empty(),
             "canonical repository required"
@@ -651,11 +655,13 @@ impl WorkflowGuard {
         {
             binding = git_binding(start.worktree, start.contract, start.environment, &[]).await?;
         }
-        store.register(&id, start.branch, binding.clone(), now)?;
-        let owner = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
-        let Some(lease) = store.claim(&id, &owner, now, LEASE_MS)? else {
-            return Ok(None);
-        };
+        if owner_turn {
+            anyhow::ensure!(existing.as_ref().is_some_and(|s|s.checkpoint.binding==binding),"owner turn requires the current owned candidate binding");
+        } else {store.register(&id,start.branch,binding.clone(),now)?;}
+        let owner=format!("{}:{}",std::process::id(),uuid::Uuid::new_v4());
+        let lease=if owner_turn {store.claim_owner_turn(&id,&owner,now,LEASE_MS)?.map(|turn|turn.lease)}
+            else {store.claim_productive(&id,&owner,now,LEASE_MS)?};
+        let Some(lease)=lease else {return Ok(None);};
         if let Some(pr) = start.pr {
             store.attach_pr_in_repo(&lease, start.repository, pr, now)?;
         }
@@ -763,6 +769,12 @@ impl WorkflowGuard {
     }
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
+        let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
+        self.audit.set_dispatch_observer(Arc::new(move || {
+            let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
+            let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
+            store.validate_dispatch(&dispatch_lease,&binding,millis())
+        }))?;
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
         let capacity_flag = self.capacity_exhausted.clone();
@@ -806,6 +818,20 @@ impl WorkflowGuard {
             }
         }))
     }
+    /// Builder identity is checked independently of audit binding so reviewer
+    /// and diagnostic reasoners are never forced onto the builder's provider.
+    pub(super) fn bind_builder(&self, reasoner: &FallbackReasoner) -> Result<()> {
+        use crate::autoship_workflow::submission::Provider;
+        let actual = match reasoner.builder_provider_pin() {
+            Some(augmentagent_channel_core::providers::ProviderKind::Claude) => Some(Provider::Claude),
+            Some(augmentagent_channel_core::providers::ProviderKind::Codex) => Some(Provider::Codex),
+            _ => None,
+        };
+        self.store.lock().map_err(|_| anyhow::anyhow!("workflow store poisoned"))?
+            .require_command_builder(self.id(), actual)?;
+        self.bind_reasoner(reasoner)
+    }
+
     pub(super) fn bind_reasoner(&self, reasoner: &FallbackReasoner) -> Result<()> {
         // The guard installs exactly one observer at acquisition. Rebinding a
         // builder or attaching a separately constructed reviewer cannot double charge.
@@ -855,11 +881,14 @@ impl WorkflowGuard {
         sessions: &augmentagent_channel_core::native_session::FreshBuilderSessions,
     ) -> Result<()> {
         self.validate_before_side_effect()?;
-        let observations: Vec<_> = sessions.observed().into_iter().map(|s|serde_json::json!({"provider":s.provider.name(),"native_session":s.id,"uncertain":s.uncertain})).collect();
+        let observed=sessions.observed();
+        let observations: Vec<_> = observed.iter().map(|s|serde_json::json!({"provider":s.provider.name(),"native_session":s.id,"uncertain":s.uncertain})).collect();
         self.audit_event(
             "episode_native_conversations",
             serde_json::json!({"observed":observations}),
-        )
+        )?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store poisoned"))?
+            .record_builder_conversations(&self.lease,&self.binding,&observed,millis())
     }
 
     pub(super) fn episode_review_at_head(
@@ -870,14 +899,9 @@ impl WorkflowGuard {
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("workflow lock poisoned"))?;
-        for (_, kind, body, _) in store.events(self.id())?.into_iter().rev() {
-            if kind != "review_recorded" {
-                continue;
-            }
-            if let Ok(review) = serde_json::from_str::<Review>(&body) {
-                if review.binding.head == head && review.reviewer.starts_with("episode-evidence-") {
-                    return Ok(Some(serde_json::from_str(&review.evidence)?));
-                }
+        for review in store.current_review_history(self.id())? {
+            if review.binding.head==head && review.reviewer.starts_with("episode-evidence-") {
+                return Ok(Some(serde_json::from_str(&review.evidence)?));
             }
         }
         Ok(None)
@@ -1105,6 +1129,11 @@ impl WorkflowGuard {
             .pending_operations(&self.lease.workflow)
     }
 
+    pub(super) fn merge_lease(&self) -> Result<Lease> {
+        self.validate_before_side_effect()?;
+        Ok(self.lease.clone())
+    }
+
     pub(super) fn record_merge_mutation(
         &self,
         operation: &Operation,
@@ -1181,6 +1210,27 @@ impl WorkflowGuard {
         self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?
             .record_review_fragment(&self.lease,&self.binding,key,payload,millis())?;
         self.audit_event("review_fragment_completed",serde_json::json!({"key":key,"payload_sha256":format!("{:x}",Sha256::digest(payload.as_bytes()))}))
+    }
+
+    /// Complete the caller's PR milestone only after the validated revision
+    /// and independent approval have both been published under this binding.
+    pub(super) async fn published_pr_ready(&mut self, pr: u64, review: &IndependentReview) -> Result<bool> {
+        anyhow::ensure!(review.approved(), "PR milestone requires independent approval");
+        let structured=review.structured.as_ref().context("PR milestone requires structured review evidence")?;
+        anyhow::ensure!(structured.binding.head==self.binding.head && structured.binding.contract_hash==self.binding.contract,
+            "PR milestone review differs from current candidate or contract");
+        let verdict=review.recorded_verdict().context("PR milestone review evidence missing")?;
+        let encoded=serde_json::to_string(&verdict)?;
+        self.record_review(&format!("pr-ready-{}",uuid::Uuid::new_v4()),true,&encoded)?;
+        let pr_only={
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?;
+            store.record_pr_ready(&self.lease,&self.binding,pr,&encoded,millis())?;
+            store.command_request(&self.lease.workflow)?.is_some_and(|r|r.until==durable::submission::Milestone::Pr)
+        };
+        if pr_only {
+            self.transition(Stage::AwaitChecks,"pr_milestone_reached","await_merge_authorization",0).await?;
+        }
+        Ok(pr_only)
     }
 
     pub(super) fn record_review(
@@ -1285,6 +1335,8 @@ impl WorkflowGuard {
             &actual == expected,
             "workflow evidence changed; fresh verification and review required"
         );
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .validate_dispatch(&self.lease,expected,millis())?;
         Ok(())
     }
 
@@ -1320,6 +1372,12 @@ impl WorkflowGuard {
         action: &str,
         eligible_at_ms: i64,
     ) -> Result<()> {
+        // Completion and waiting receipts remain recordable after a pause;
+        // entering another productive stage does not.
+        if !matches!(stage,Stage::Merged|Stage::Retired|Stage::Held|Stage::AwaitChecks) {
+            self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+                .require_owner_dispatch(self.id())?;
+        }
         let evidence = self
             .store
             .lock()
@@ -1609,31 +1667,34 @@ pub(super) async fn prepare_resume_worktree(
     pr: u64,
     branch: &str,
 ) -> Result<PathBuf> {
+    prepare_resume_worktree_at_head(repo_root,pr,branch,None).await
+}
+
+pub(super) async fn prepare_resume_worktree_at_head(
+    repo_root:&Path, pr:u64, branch:&str, expected_head:Option<&str>,
+)->Result<PathBuf> {
     anyhow::ensure!(pr > 0, "PR identity required");
-    let path = repo_root
-        .join(".self-improve-worktrees")
-        .join(format!("resume-pr-{pr}"));
+    let primary = workspace::primary_root(repo_root).await?;
+    let path = primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
+    recovery::checkout_path(&primary, &path)?;
+    let exists = path.try_exists()?;
+    if exists {
+        recovery::existing_checkout(repo_root, &path).await?;
+    }
+    let (valid, _, _) = run("git", &["check-ref-format", "--branch", branch], repo_root).await?;
+    anyhow::ensure!(valid, "invalid resumed PR branch");
     let (ok, _, _) = run("git", &["fetch", "origin", branch], repo_root).await?;
     anyhow::ensure!(ok, "cannot refresh resumed PR branch");
-    if path.exists() {
-        anyhow::ensure!(
-            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
-            "resume worktree path is a symlink"
-        );
-        let expected = git_evidence(
-            repo_root,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .await?;
-        let actual = git_evidence(
-            &path,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .await?;
-        anyhow::ensure!(
-            Path::new(&expected).canonicalize()? == Path::new(&actual).canonicalize()?,
-            "preserved resume worktree belongs to another repository"
-        );
+    let fetched=git_evidence(repo_root,&["rev-parse","--verify",&format!("origin/{branch}^{{commit}}")]).await?;
+    if let Some(expected)=expected_head {
+        anyhow::ensure!(matches!(expected.len(),40|64) && expected.bytes().all(|b|b.is_ascii_hexdigit())
+            && fetched.eq_ignore_ascii_case(expected),"resolved PR head changed before execution; candidate preserved");
+        if exists {
+            anyhow::ensure!(git_evidence(&path,&["rev-parse","HEAD"]).await?.eq_ignore_ascii_case(expected),
+                "resumed candidate differs from authorized PR head; candidate preserved");
+        }
+    }
+    if exists {
         return Ok(path);
     }
     let (ok, _, error) = run(
@@ -1643,7 +1704,7 @@ pub(super) async fn prepare_resume_worktree(
             "add",
             "--detach",
             &path.to_string_lossy(),
-            &format!("origin/{branch}"),
+            &fetched,
         ],
         repo_root,
     )
@@ -1698,6 +1759,24 @@ mod tests {
         ]);
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         dir
+    }
+    #[tokio::test]
+    async fn claimed_owner_guard_admits_native_work_without_granting_shipping() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");let now=millis();
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let origin=durable::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+        let request=durable::submission::Request {repository:"owner/repo".into(),target:durable::submission::Target::Pr(42),provider:Some(durable::submission::Provider::Codex),until:durable::submission::Milestone::Merged};
+        let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),now).unwrap().admission.workflow;
+        let binding=git_binding(dir.path(),"C1","rust-a",&[]).await.unwrap();store.register(&id,"candidate",binding,now).unwrap();
+        store.enqueue_owner_message(&durable::discord_ingress::DiscordOrigin {message:45,..origin},&id,"Fix the test",None,now).unwrap();drop(store);
+        let guard=WorkflowGuard::acquire_mode_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:None,pr:Some(42),branch:"candidate",contract:"C1",environment:"rust-a"},millis(),true).await.unwrap().unwrap();
+        guard.audit_logger().dispatch_allowed().unwrap();guard.audit_logger().model_call_admitted("codex").unwrap();
+        assert!(guard.intent(OperationKind::Push).is_err());assert!(guard.intent(OperationKind::MergePr).is_err());
+        let mut store=WorkflowStore::open(&path).unwrap();let revision=store.owner_control(&id).unwrap().unwrap().revision;
+        store.set_owner_pause(&id,"owner",revision,true,millis()).unwrap();
+        assert!(guard.audit_logger().dispatch_allowed().is_err());assert!(guard.audit_logger().model_call_admitted("codex").is_err());
+        assert_eq!(store.snapshot(&id).unwrap().unwrap().model_calls,1);assert_eq!(store.pending_owner_messages(&id).unwrap(),1);
+        assert_eq!(std::fs::read_to_string(dir.path().join("code.txt")).unwrap(),"baseline\n");guard.finish().unwrap();
     }
     #[tokio::test]
     async fn real_git_binding_changes_with_dirty_code_environment_and_contract() {
@@ -1790,6 +1869,30 @@ mod tests {
             ),
             "transient transport failure must not grant another fresh builder reset"
         );
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_pause_fences_live_guard_dispatch_without_losing_completion_receipts() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {
+            repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(7),pr:Some(42),
+            branch:"fix/seven",contract:"C1",environment:"rust-a",
+        },millis()).await.unwrap().unwrap();
+        let operation=guard.intent(OperationKind::Push).unwrap();
+        let accounting=guard.capacity_accounting(false).unwrap();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        WorkflowStore::open(&path).unwrap().set_owner_pause(guard.id(),"github:owner",0,true,millis()).unwrap();
+        assert!(guard.transition(Stage::Review,"review","review",0).await.is_err());
+        assert!(guard.audit_logger().model_call_admitted("claude").is_err());
+        assert!(augmentagent_channel_core::run_resources::check_requirement("verification",Some(&guard.audit_logger())).unwrap_err().to_string().contains("owner-paused"));
+        assert!(!guard.audit_logger().resource_capacity_seen(),"owner pause is not resource exhaustion");
+        assert!(accounting.report().unwrap().unwrap().message.contains("owner pause"));
+        assert!(guard.validate_binding(guard.binding()).await.is_err());
+        guard.observe_remote(&operation,"published-head",None).unwrap();
+        let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.model_calls,before.model_calls);
+        assert!(WorkflowStore::open(&path).unwrap().pending_operations(guard.id()).unwrap().is_empty());
         guard.finish().unwrap();
     }
 
@@ -2276,6 +2379,38 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn published_pr_milestone_stops_pr_only_work_after_real_push_and_bound_review() {
+        let dir=repo();let remote=tempfile::tempdir().unwrap();
+        assert!(run("git",&["init","--bare","-q"],remote.path()).await.unwrap().0);
+        assert!(run("git",&["remote","add","origin",remote.path().to_str().unwrap()],dir.path()).await.unwrap().0);
+        let state=control_dir();let path=state.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id=store.submit_authorized("pr-only","owner",&durable::submission::Request {
+            repository:"owner/repo".into(),target:durable::submission::Target::Pr(42),provider:None,until:durable::submission::Milestone::Pr
+        },millis()).unwrap().workflow;drop(store);
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
+            source_issue:None,pr:Some(42),branch:"fix/pr",contract:"contract",environment:"rust"},millis()).await.unwrap().unwrap();
+        let mut review=super::super::progress_tests::synthetic_aligned_review(&guard.binding.head,true);
+        let evidence=review.structured.as_mut().unwrap();evidence.binding.contract_hash=guard.binding.contract.clone();
+        for pass in &mut evidence.passes {pass.binding=evidence.binding.clone();pass.coverage.binding=evidence.binding.clone();}
+        evidence.adjudication.as_mut().unwrap().binding=evidence.binding.clone();
+        assert!(guard.published_pr_ready(42,&review).await.is_err(),"approval without publication cannot finish");
+        guard.push("fix/pr").await.unwrap();
+        let mut wrong=super::super::progress_tests::synthetic_aligned_review("other-head",true);
+        assert!(guard.published_pr_ready(42,&wrong).await.is_err());
+        wrong.structured=None;
+        assert!(guard.published_pr_ready(42,&wrong).await.is_err(),"legacy booleans are not a fresh receipt");
+        assert!(guard.published_pr_ready(42,&review).await.unwrap());
+        guard.finish().unwrap();
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        let snapshot=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(snapshot.checkpoint.stage,Stage::AwaitChecks);
+        assert_eq!(snapshot.checkpoint.next.reason,"pr_milestone_reached");
+        assert!(store.pr_ready(&id).unwrap().is_some());
+        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
     }
 
     #[tokio::test]

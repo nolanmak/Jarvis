@@ -5,6 +5,31 @@ Codex-backed Qwen/GLM adapters. Missing policy, missing provider profile or an
 incomplete saved native runtime fails before native dispatch. Interactive calls
 without the required-workflow marker retain their existing transport.
 
+Select an existing private profile for both Linux services through the managed
+installer (run from the deployed checkout during normal rollout):
+
+```sh
+AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/controller/policy.json \
+  bash scripts/ensure-autopr-worker.sh
+```
+
+The installer persists only the selected path in
+`$XDG_CONFIG_HOME/augmentagent/autoship-native.env` (default
+`~/.config/augmentagent/autoship-native.env`), mode 0600. Both the daemon drop-in
+and independent worker load this shared environment file. Later installer runs
+without a selection preserve it. Staging a policy alone does not select it.
+The installer neither edits the profile/credentials nor changes refresh grants,
+and does not restart services. The normal updater owns activation. Removing the
+selection file deselects this shared override on the next normal rollout;
+separately configured environment values still apply.
+
+Successful installation proves configuration persistence, not provider readiness.
+Before accepting rollout, verify both running processes' selected policy hashes,
+packaged executable hashes, runtime integrity, role capabilities, usable auth,
+and a current guarded edit plus independent review. Never dump credential values
+or complete process environments for that check. Existing runtime generations
+remain available while their leases drain.
+
 The daemon reads `AUGMENTAGENT_NATIVE_VM_POLICY` itself, never from model options.
 The file must be owner-private, regular and single-link. Its version 1 shape is:
 
@@ -159,13 +184,25 @@ continue to resolve. Runtime upgrades require a newly staged manifest and an
 atomic policy update pointing to it; retain the prior runtime until old native
 runs have drained. Do not copy a host home directory into a runtime image.
 
-Select the native profile with an environment-only drop-in on the existing
-daemon unit, preserving its `ExecStart` and existing drop-ins:
+Select the reviewed native profile through the managed installer from the deployed
+checkout. It writes the shared final environment file for both services and
+preserves their launch commands:
 
-```ini
-[Service]
-Environment=AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/private/policy.json
+```sh
+AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/private/policy.json \
+  bash scripts/ensure-autopr-worker.sh
 ```
+
+The installer validates all settings before replacing managed files and rolls
+back the prior selection and units if installation or manager reload fails.
+An `Environment=` drop-in cannot override this shared `EnvironmentFile=`.
+The normal updater detects a changed selection or policy digest even when Git
+and the build stamp are current. It activates the daemon through its usual
+in-flight-work, memory, restart-budget and executable checks. The independent
+worker notices selection and policy changes and reloads after its current
+builder tick and reconciliation sweep finish. Activation remains pending when
+a guard refuses; a later updater tick retries. Confirm both process-bound
+policy digests with `autopr readiness --json` after they have drained.
 
 This selects a profile only; it does **not** enroll run resources. A service
 with `Delegate=no` or no `DelegateSubgroup=daemon` cannot admit required
@@ -187,8 +224,8 @@ provisioning helper itself is read directly from the updated checkout. A missing
 profile keeps required Autoship native calls closed while unrelated interactive
 calls and ordinary updater operation retain their existing behavior.
 
-No installer in this patch writes that drop-in, expands gateway grants or
-refreshes the original authentication file automatically. All profile paths are
+The managed selection does not expand gateway grants or refresh the original
+authentication file automatically. All profile paths are
 controller inputs. This document describes the reviewed rollout artifact, not
 an assertion that production has been configured or authenticated acceptance
 has passed.
@@ -272,7 +309,13 @@ start its controller at 6.5 GiB available memory while retaining the 8 GiB unit
 ceiling. The allowance is an estimate, not a guaranteed controller memory bound.
 Every real dispatch still passes RunScope's sibling, ancestor and host checks;
 controller growth or other workloads may cause a subsequent capacity refusal.
-The wrapper records these preliminary budgets with its result.
+The wrapper records these preliminary budgets with its result. A zero systemd exit
+status alone is not a passing probe: stopping a service can return zero before
+the test completes. The wrapper requires a fresh, private completion receipt
+from the process supervising the exact test, plus its one-test passing summary.
+An interrupted run without that receipt is failed/incomplete, even if systemd
+reports success. Retain the transcript, result, and completion receipt together.
+
 
 Probe budgets follow reachable capabilities: `issue` and `adoption` include the
 configured build guest because they exercise builders/repairs. `writer` and
@@ -345,3 +388,120 @@ non-network tests cover rotation followed by SIGKILL and fresh-session seeding,
 received-response recovery, original expiry, concurrent/stale requests, scope
 refusal, and persistence-before-delivery. Natural provider refresh and fresh-session
 authentication remain distinct rollout checks; these tests use no actual credentials.
+
+## Read-only credential diagnostics
+
+`augmentagent autopr readiness --json` reports native credential declarations for
+Claude and Codex without invoking a provider or refreshing credentials. It reads
+the selected private policy each time, includes its SHA-256, and reports missing
+policy, invalid policy, undeclared route, missing/invalid credential, known
+expiry, unknown expiry, explicitly authorized refresh, or an unexpired/static
+credential declaration. It never prints credential values.
+
+Claude subscription expiry uses the credential's `expiresAt` milliseconds;
+Codex subscription expiry reads the access token's JWT `exp` seconds. Reading
+that field does not verify the token's signature, revocation status, quota, or
+provider reachability. Opaque tokens retain an explicit unknown-expiry status.
+A known expired token is ineligible for protected native dispatch unless the
+existing profile authorizes refresh of its imported controller credential.
+This does not enable refresh or modify a credential grant.
+
+Credential declarations alone cannot establish workflow readiness. The command
+keeps `ready: false` and names the role, resource, deployment and live-probe evidence
+that remains unverified; exit 3 means readiness has not been established.
+
+
+The readiness report also verifies the selected native guest's complete manifest
+and reports its digest, file count and byte count. It rejects missing or changed
+artifacts, path traversal, duplicate entries, symlinks, extra files and an unsafe
+guest root. Hashing streams bounded reads; inspection never repairs files or
+retires runtime generations. Every invocation rechecks the inventory.
+
+Build-runtime inspection validates the private configuration, required fields,
+memory range, module declarations and trusted artifact/directory permissions.
+It reports the configuration digest and individual hashes for QEMU, kernel,
+BusyBox, firmware and modules. Dependency directory contents are not certified
+by these hashes; the guest launch and acceptance probes retain their checks.
+`build-declaration-verified` is a declaration check, not evidence that a VM booted.
+
+Non-dry-run `run_once` calls this read-only preflight before acquiring a run lock,
+creating workflow state, inspecting Git or selecting issues. Missing/invalid
+declarations return a `native-runtime:` blocker. Hashing runs off the async
+executor, and the actual launch independently revalidates its declaration.
+
+Provider compatibility is checked separately from the guest inventory. The
+readiness report hashes the currently resolved provider executable. For a Codex
+executable, the runtime must declare its matching `codex-code-mode-host`, and
+that companion must appear in the file manifest with matching bytes. A Codex
+upgrade can invalidate this mapping even when every old guest artifact still
+matches its manifest. Protected provider admission rechecks this compatibility,
+including calls through an already-constructed chain.
+
+Use the existing runtime-only provisioning operation to prepare a new generation:
+
+```sh
+python3 scripts/provision-native-vm-probe.py \
+  --refresh-runtime-policy /absolute/controller/policy.json \
+  --native-executable /absolute/path/to/codex
+```
+
+This preserves credentials, grants, resources and state paths and retains the
+old generation. It changes only the guest-runtime pointer after syncing the new
+artifacts. Do not delete old generations while leases may still use them. Validate
+the refreshed generation with the current packaged guarded-edit/review probes;
+a compatibility hash alone does not prove provider execution.
+
+The normal updater runs `scripts/ensure-native-runtime.py` before its unchanged-Git
+exit and again after applying an update. It acts only on the explicit private
+`autoship-native.env` selection described above. It resolves Codex using the
+running auto-PR worker's `CODEX_CLI` and `PATH`, falling back to the daemon and then
+the updater environment if neither service is running. It never imports credentials
+or activates a profile. Current generations are validated and left untouched;
+stale companion mappings cause a runtime-only refresh under the provisioning lock.
+Corrupt inventories fail with `native-runtime-reconciliation-failed` instead of
+being silently replaced. Failures are logged and retried on the next updater tick
+without blocking software updates needed to repair them. A successful binary
+build stamp does not assert native provider readiness.
+
+Refresh retains previous generations. If publication is attempted but reports an
+error, it also retains the new generation: a workflow could already have observed
+that pointer, even if another actor subsequently changes it. Reclamation must
+respect runtime ownership and leases; pointer absence alone is insufficient.
+
+Read-only `autopr readiness --json` also reports `roles.builder`,
+`roles.independent_reviewer` and `roles.adjudicator`. Builder admission uses the
+same effective model selection, routing, capability, credential and cooldown
+filters as the workflow chain. Review admission considers all currently available
+builders and the configured native reviewer pool; native Codex can supply the
+existing protected fresh-session review path. Actual review still requires durable
+authorship and its controller-owned conversation receipt. Final adjudication
+requires native Codex separately, even when another provider can build or review.
+Missing capacity and cooldowns stay distinct from declaration availability.
+
+A non-dry-run worker checks these roles after runtime inspection and before
+creating a run lock, inspecting Git or selecting an issue. This catches a usable
+builder with no review/adjudication path before scoping spends model calls. Reads
+of model selection observe an atomic published snapshot without creating selection
+locks or directories. Providers and credentials are rechecked on later admission;
+`declared-available` never asserts a successful live call, sufficient resources,
+matching deployed configuration, or permission to merge.
+
+Resource readiness is reported separately under `resources`. It composes the
+native guest, build guest and declared host overhead with the same memory rule
+used at launch, then checks the calling process's delegated service and aggregate
+ceilings through the packaged resource supervisor. A shared nonblocking admission
+lock protects the memory-capacity snapshot. Existing idle `run-*` reservations
+remain charged at their full ceilings. Invalid declarations, an undersized service,
+missing delegation, exhausted memory headroom and a busy inspector have distinct
+statuses. Inspection has a five-second subprocess deadline and creates no helper
+file, cgroup, workflow state or reservation; it never reclaims cache.
+
+An unused delegated service can report `capacity-unverified` with
+`controller-initialization-required`. That permits the existing locked admission
+step to initialize accounting and attempt reservation; it does not authorize model
+execution or claim readiness. Other resource blockers stop the non-dry-run worker
+before Git access or issue selection. Every actual launch still reserves capacity
+and verifies limits before provider admission. The snapshot is not a reservation,
+and CPU/PID ceilings are declarations, not a promise of future throughput.
+A CLI run outside a delegated service reports its own missing delegation; it does
+not infer the serving worker's effective configuration or capacity.

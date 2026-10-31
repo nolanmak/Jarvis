@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1712,
+    1715
+  ],
+  "status": "publication-milestone-and-wait-verified-not-deployed",
+  "parent_commit": "452bde454a4ecab4caf682e26243b9bb26730d87",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_commands.rs": "00cbbaa99084f560958d583c1e3057a3f8b547874213e7be5cbe137302ffe9b8",
+    "crates/augmentagent-cli/src/autoship_run_command.rs": "23ee443c65bfd52479fc3acce4dc9bbcc6c2c9063f50fcb3ba01cd3ba675abb9",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "548aca004ac02faf66ea1a1a406ccce894d08acef1f2a4bf587402073a625c21",
+    "crates/augmentagent-cli/src/self_improve.rs": "9a7e148a4717cf0d61c0271f3fb547bb90fecfed440b113a0efc29b7552c7d8a",
+    "crates/augmentagent-cli/src/self_improve_adopted.rs": "ca2434d5861c2f55e59d3c693f9776145a9cc5c6bcb9cf652b88bb39489909e5",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "c50020214b0bcd11a5fc9a133a5daa68792e6d5c5a50278e4b35628e557c79a0",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "44dacbaaa5c07bc26194f860161c0a8dc83581f571960e843e21ee465f8c4c6b",
+    "crates/augmentagent-cli/tests/autoship_submit_cli.rs": "afd36c65552538872632eca6a8669ae73490ca7d626047c98a2949c11f9a1826",
+    "crates/augmentagent-cli/src/autoship_milestone.rs": "c7495387740d2022f97b3355519cee23136e3efa9bf72fa4b829d0a49f214377",
+    "crates/augmentagent-cli/src/autoship_wait.rs": "7b175df968cc905bedf82d632a815f52f91d9c54417fc38eaa950481af167b5c"
+  },
+  "tests": {
+    "milestone_red": {
+      "log": "/tmp/autoship-1703-red-pr-milestone.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Bound approval and confirmed publication could not produce a durable PR completion receipt."
+    },
+    "cli_red": {
+      "log": "/tmp/autoship-1703-red-milestone-wait-cli.log",
+      "cargo_exit": 101,
+      "failed": 2,
+      "assertions": [
+        "PR-only status stayed incomplete despite its publication receipt.",
+        "Compiled CLI did not accept --wait or --timeout-secs."
+      ]
+    },
+    "head_freshness_red": {
+      "log": "/tmp/autoship-1703-red-pr-head-freshness.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Wait returned PR success from an old receipt after the remote PR head changed."
+    },
+    "head_timeout_red": {
+      "log": "/tmp/autoship-1703-red-wait-head-timeout.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Final remote observation returned success after a 5-second scripted delay despite a 1-second wait timeout."
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-milestone-wait-deadline.log",
+      "exit": 0,
+      "passed": 1449,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 143.76
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-milestone-wait-deadline.log",
+      "exit": 0,
+      "status_readiness_passed": 14,
+      "submission_work_wait_passed": 17,
+      "resolution_passed": 10,
+      "failed": 0
+    }
+  },
+  "verified": [
+    "A lease-fenced PR milestone requires current-binding approved review evidence, a bound PR and a confirmed Push/CreatePr operation. A receipt survives restart; changed bindings and later same-binding dissent invalidate readiness.",
+    "The production bridge requires structured independent approval for the exact head and contract. Fresh, resumed and source-less publication paths record the milestone; PR-only jobs stop in AwaitChecks before merge dispatch.",
+    "A real-Git bridge test pushes to a temporary bare remote, rejects unpublished/old-head/legacy-boolean evidence, records PR readiness, and leaves confirmed merge count zero.",
+    "Status separates requested PR completion from observed merge completion. A PR observer joining merge-enabled work does not downgrade merge authority or rewrite cached admission.",
+    "Wait observes durable state without running or claiming work. Timeout and client death preserve the submitted job; final PR completion rechecks authorized remote identity/head under the same observation deadline."
+  ],
+  "limits": [
+    "Durable status reports the last observed workflow binding. It does not fetch live GitHub state; --wait performs the final current-head check for PR completion.",
+    "Automatic re-verification after a changed remote head remains open; wait reports a deferred changed/unverified head instead of success.",
+    "The shared bridge uses synthetic structured review evidence in its real-Git test. CLI tests use scripted GitHub and seeded worker checkpoints; this is not a full native-model/live-GitHub completion run.",
+    "Pause/resume/cancel/model and adoption controls, complete worker health, Discord initiation/sessions/updates, native CLI acceptance, normal updater rollout and required soaks remain open."
+  ]
+}

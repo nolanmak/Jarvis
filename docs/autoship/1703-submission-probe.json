@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1712,
+  "status": "shared-admission-core-not-exposed-by-cli-or-discord",
+  "parent_commit": "7e8d2e6fd4cda4839a69e91e2da99e47ae67df4f",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_submission.rs": "9cd7495a9fa518b841b752b09b633277b31c4b753619753e5ca41a7cf1e1d3e7",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "e55190fe7a747f999486c92000de8d96a2221b6f8704aa63be584a6f17829be6",
+    "crates/augmentagent-cli/src/autoship_merge_allowance.rs": "c73210d786e6245d5acb3f21f5c1769a49dfa9a02154a0b4a295638253a8fd5f"
+  },
+  "verified_behavior": [
+    "Authorized admission uses one immediate SQLite transaction; accepted requests create one durable job without fabricating an executing workflow.",
+    "Request ID retries replay the original admission; payload/principal conflicts reject. Rejected joins retain their original result after policy changes.",
+    "Joining preserves provider and merge ceiling. A PR observer cannot downgrade merge-enabled work; a merged observer cannot upgrade PR-only work.",
+    "Existing PR aliases join their original workflow. Late conflicting aliases hold rather than bypass the submitted policy.",
+    "PR-only policy is checked inside both merge reservation and dispatch transactions; all other merge guards remain required."
+  ],
+  "tests": {
+    "admission_red": {
+      "log": "/tmp/autoship-1703-red-submission.log",
+      "failed": 4,
+      "cargo_exit": 101
+    },
+    "merge_boundary_red": {
+      "log": "/tmp/autoship-1703-red-submission-merge.log",
+      "passed": 6,
+      "failed": 2,
+      "cargo_exit": 101
+    },
+    "ledger_green": {
+      "log": "/tmp/autoship-1703-green-submission-ledger.log",
+      "passed": 69,
+      "failed": 0,
+      "exit": 0
+    },
+    "final_cli_suite": {
+      "log": "/tmp/autoship-1703-green-submission-cli.log",
+      "passed": 1428,
+      "failed": 0,
+      "ignored": 25,
+      "exit": 0,
+      "seconds": 129.37,
+      "includes": "Subprocess exits after durable enqueue before returning a result; retry replays the original admission with one job and one request record."
+    }
+  },
+  "limits": [
+    "Caller and remote-target authorization remain obligations of the not-yet-connected CLI/Discord adapters.",
+    "The durable queue is not yet consumed by targeted execution; no new run command is exposed by this change.",
+    "Work-once, wait, pause, cancel, resume, model changes and delivery controls remain to be connected. See the builder-pin follow-up for execution enforcement.",
+    "Late alias conflicts preserve state and require explicit resolution; automatic handoff is not implemented here.",
+    "No production rollout, real GitHub mutation, native model call or Discord delivery occurred in these tests."
+  ],
+  "followup": {
+    "builder_pin": "docs/autoship/1703-builder-pin-probe.json",
+    "status": "Stored pins are now enforced by existing fresh/resumed/adopted execution; targeted CLI/Discord dispatch remains unconnected."
+  }
+}

@@ -72,6 +72,7 @@ impl ProcessGroup {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
             }
         }
+        if let Some(logger)=logger {logger.dispatch_allowed()?;}
         if model { if let Some(logger)=logger { logger.model_call_admitted(provider)?; } }
         let mut proceed=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.receipt.with_file_name("launch-continue"))?;
         proceed.write_all(b"admitted\n")?;
@@ -864,6 +865,24 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst),0);
         assert_eq!(blocked.load(Ordering::SeqCst),1);
         assert!(!effect.exists());
+    }
+
+    #[tokio::test]
+    async fn late_owner_pause_blocks_model_and_verifier_supervisor_release() {
+        for model in [false,true] {
+            let directory=tempfile::tempdir().unwrap();let effect=directory.path().join("effect");
+            let mut command=Command::new("/usr/bin/python3");
+            command.args(["-I","-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()"]).arg(&effect);
+            let paused=Arc::new(AtomicBool::new(false));let check=paused.clone();
+            let logger=Arc::new(crate::tool_audit::AuditLogger::new(directory.path().join("audit")));
+            logger.set_dispatch_observer(Arc::new(move || {anyhow::ensure!(!check.load(Ordering::SeqCst),"owner-paused");Ok(())})).unwrap();
+            logger.dispatch_allowed().unwrap();
+            let (mut child,group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+            paused.store(true,Ordering::SeqCst);
+            let result=if model {group.admit_model("codex",Some(&logger)).await} else {group.admit_command("verification",Some(&logger)).await};
+            assert_eq!(result.unwrap_err().to_string(),"owner-paused");
+            drop(group);child.wait().await.unwrap();assert!(!effect.exists());
+        }
     }
 
     #[tokio::test]

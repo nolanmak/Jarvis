@@ -1055,9 +1055,20 @@ for line in sys.stdin:
         if let Some(path) = path_env { shell.env("PATH", path); }
         let started = std::time::Instant::now();
         let mut child = shell.spawn().unwrap();
-        child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+        let input_error=child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).err();
         let output = child.wait_with_output().unwrap();
+        if let Some(error)=input_error {
+            assert!(error.kind()==std::io::ErrorKind::BrokenPipe && output.status.code()==Some(2),
+                "hook input failed: {error}; exit={:?}; stderr={}",output.status.code(),String::from_utf8_lossy(&output.stderr));
+        }
         (output.status.code(), started.elapsed(), String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    #[test]
+    fn hook_runner_collects_early_refusal_after_stdin_closes() {
+        let event=json!({"synthetic":"x".repeat(1024*1024)});
+        let (code,_,stderr)=run_hook("exec 0<&-; printf 'synthetic refusal' >&2; exit 2",&event,None);
+        assert_eq!(code,Some(2));assert_eq!(stderr,"synthetic refusal");
     }
 
     fn primary_event(phase: &str, id: &str) -> Value {

@@ -286,6 +286,8 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 8, REPLY, "query answers, command replies, interrupted-turn notices"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "send_message(&", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "CreateMessage::new(", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
+    p("autoship_replies", "crates/augmentagent-approval-discord/src/autoship.rs", "send_message(&", 1, REPLY, "autoship acknowledgements restricted to the verified originating owner DM"),
+    p("autoship_replies", "crates/augmentagent-approval-discord/src/autoship.rs", "CreateMessage::new(", 1, REPLY, "autoship acknowledgements restricted to the verified originating owner DM"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "send_message(&", 6, REPLY, "Discord voice transcripts in the voice channel"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "CreateMessage::new(", 7, REPLY, "Discord voice transcripts in the voice channel"),
     p("cli_discord_posts", CLI, "send_message(&", 7, Route::DiscordOnly("explicit `--post` Discord commands (compose/propose cards, wiki ask --post) and Discord loop output"), "one-shot Discord posts"),

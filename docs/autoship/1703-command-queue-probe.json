@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1706,
+    1712
+  ],
+  "status": "background-command-queue-verified-not-deployed",
+  "parent_commit": "e1f27d3796111e94b442cc602ee761d5a2283d02",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_submission.rs": "cac703f6b09ada88157fcd028702bdf5d66d31ca00368ff54337c77c960240b7",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "0545f02847d82e9cae55af2eced51b701c0726d8728e9a1552b9a8567f3a6200",
+    "crates/augmentagent-cli/src/self_improve.rs": "7a37cd95a568d9159cbcdf83546c61ce2a9f20a7ab8d8cdc9a9a92a2930b4d7d",
+    "crates/augmentagent-cli/src/self_improve_progress_tests.rs": "dc1b4afe6881dc28ea5a71b3c32411caead66597306cb637ec5df65f5e8349d9",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "76dfd4672a2e9bae3495279eaa82383252de5846417a8f92684e6c5123dc3f2c"
+  },
+  "tests": {
+    "scheduler_red": {
+      "log": "/tmp/autoship-1703-red-command-queue.log",
+      "cargo_exit": 101,
+      "failed": 2
+    },
+    "background_red": {
+      "log": "/tmp/autoship-1703-red-background-queue.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Without queue dispatch, background run_once ignored the approved command and entered builder runtime readiness."
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-command-queue-unit.log",
+      "exit": 0,
+      "passed": 1444,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 135.88
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-command-queue-cli.log",
+      "exit": 0,
+      "status_readiness_passed": 13,
+      "submission_work_passed": 11,
+      "resolution_passed": 10,
+      "failed": 0
+    }
+  },
+  "verified": [
+    "The background run_once entry point consumes admitted command jobs through the shared targeted service. Productive work explicitly retains Background execution mode.",
+    "Persistent scheduling rotates oldest attempts, preserves a five-minute retry floor across restart, and yields a normal automatic-lane turn between command jobs.",
+    "Two concurrent SQLite connections cannot reserve the same scheduling turn. Selection creates no workflow checkpoint and consumes no merge allowance.",
+    "Held, retired, merged, merge-stage, future-eligible, actively leased and PR-only AwaitChecks jobs are excluded from productive queue selection.",
+    "Real-Git regression verifies a queued approved PR reaches exactly one merge through background run_once, without another model call, repository-wide discovery or changes to owner files/index/HEAD."
+  ],
+  "limits": [
+    "Runs through the existing worker build-loop cadence and merge-capacity admission; the five-minute retry floor is not a five-minute pickup SLA.",
+    "The background approved-PR regression uses real Git with scripted GitHub/review boundaries, not live GitHub or native-model acceptance.",
+    "Scheduler selection grants neither a workflow lease nor merge authority. Productive execution uses Background deployment readiness; approved reconciliation retains existing free sweep gates.",
+    "Wait/control commands, queue wake-up latency, stale-input re-verification, legacy-hold recovery, Discord sessions/updates, native CLI acceptance, production rollout and required soaks remain open."
+  ]
+}

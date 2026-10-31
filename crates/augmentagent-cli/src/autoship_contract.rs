@@ -579,12 +579,14 @@ impl RegisteredContract {
     }
     /// Verify before AND after running the child. The orchestrator additionally
     /// must deny builder writes while verification executes (lease/sandbox).
-    pub fn verify_integrity(&self, root: &Path) -> Result<()> {
+    pub fn verify_metadata(&self)->Result<()> {
         self.contract.validate()?;
-        ensure!(
-            self.computed_hash()? == self.contract_hash,
-            "contract registration was modified"
-        );
+        ensure!(self.computed_hash()?==self.contract_hash,"contract registration was modified");
+        ensure!(valid_commit(&self.baseline_head) && !self.environment_id.is_empty(),"invalid registered baseline identity");
+        Ok(())
+    }
+    pub fn verify_integrity(&self, root: &Path) -> Result<()> {
+        self.verify_metadata()?;
         for (file, expected) in &self.file_hashes {
             ensure!(
                 &hash_file(root, file)? == expected,

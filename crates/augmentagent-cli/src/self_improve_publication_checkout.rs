@@ -121,7 +121,7 @@ async fn restore(
             remote.split_whitespace().next() == Some(request.head.as_str()),
             "publication remote branch no longer matches protected head"
         );
-        store.validate_lease(lease, &binding, now())?;
+        store.validate_dispatch(lease, &binding, now())?;
         git(repo, &["fetch", "--no-tags", "origin", &reference]).await?;
         anyhow::ensure!(
             git(repo, &["rev-parse", "FETCH_HEAD"]).await? == request.head,
@@ -134,12 +134,12 @@ async fn restore(
             "publication branch advanced; preserving it for verification"
         ),
         Err(_) => {
-            store.validate_lease(lease, &binding, now())?;
+            store.validate_dispatch(lease, &binding, now())?;
             git(repo, &["update-ref", &reference, &request.head, ""]).await?;
         }
     }
     absent_path(&request.worktree)?;
-    store.validate_lease(lease, &binding, now())?;
+    store.validate_dispatch(lease, &binding, now())?;
     git(
         repo,
         &[
@@ -164,7 +164,7 @@ async fn restore(
             .is_empty(),
         "restored publication checkout is not clean"
     );
-    store.validate_lease(lease, &binding, now())?;
+    store.validate_dispatch(lease, &binding, now())?;
     Ok(())
 }
 

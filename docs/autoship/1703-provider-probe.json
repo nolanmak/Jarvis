@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1704,
+  "checkout_revision_at_launch": "b16cf888f9439c512f98542877744b41130f3284",
+  "binary_sha256": "fb76e1a230c9c7ad566ba5d7b3b84e8cf2678a55548743de0eee59ad41c4a21a",
+  "source_policy_sha256": "e2142f9fa26f2ae98b1ae7d36c566cf77dd18b9d01d50c8c8c222a9b11242f9b",
+  "refreshed_isolated_policy_sha256": "19ebd1eb544eaa6c6a3edd687302435c28f1d64722b08c737d987f7cdead5c51",
+  "isolated_policy_changes": [
+    "state_root",
+    "guest_runtime"
+  ],
+  "credential_grants_changed": false,
+  "old_runtime_preserved": true,
+  "initial_file_edit": {
+    "exit_code": 101,
+    "reason": "installed Codex executable digest has no manifested companion",
+    "model_admission": false
+  },
+  "refreshed_file_edit": {
+    "exit_code": 0,
+    "exact_model_calls_asserted": 1,
+    "guarded_edit_asserted": true
+  },
+  "full_issue_fixture": {
+    "exit_code": 0,
+    "clean_review_pass_events": 1,
+    "acceptance_pass_events": 1,
+    "model_call_admitted_events": 12,
+    "seeded_regression_detected": true,
+    "corrupted_and_stale_head_evidence_rejected": true
+  },
+  "production_deployed": false,
+  "no_remote_publication": true,
+  "full_jarvis_ci_pass": false,
+  "scope": "Live provider/pipeline fixture before the new compatibility preflight guard; the guard has separate unit and CLI regression evidence. This is not production shipping acceptance.",
+  "evidence_paths": {
+    "initial": "/tmp/autoship-native-acceptance-x3ep_2_o",
+    "file_edit": "/tmp/autoship-native-acceptance-_vo2bi6i",
+    "full_issue": "/tmp/autoship-native-acceptance-7sd570tj"
+  },
+  "role_admission_diagnostic": {
+    "exit": 3,
+    "elapsed_seconds": 93.66,
+    "binary_sha256": "5408b525cc9c1a3ea826868aafa8db3d8d6359cf35a9f19a3029433b48a08234",
+    "ready": false,
+    "roles": {
+      "adjudicator": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "builder": {
+        "providers": [
+          "claude"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "independent_reviewer": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "live_verified": false
+    },
+    "runtime_status": "native-guest-verified",
+    "build_status": "build-declaration-verified",
+    "production_policy_unchanged": true,
+    "created_state": false,
+    "limitation": "debug build; earlier diagnostic timeout at 60 seconds; no production performance or live-provider acceptance claim",
+    "evidence_root": "/tmp/autoship-1703-auto-runtime-g2qovoh1",
+    "implementation": "role admission change following 5fca60f3",
+    "acceptance_scope": "Read-only isolated profile diagnostic, not a live provider call or deployed acceptance. Release-build latency remains to be measured."
+  }
+}

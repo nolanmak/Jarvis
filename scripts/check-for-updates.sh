@@ -52,6 +52,15 @@ DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
 
+reconcile_native_runtime() {
+  if [ "$(uname -s)" = Linux ] && [ -f "$REPO_ROOT/scripts/ensure-native-runtime.py" ]; then
+    if ! /usr/bin/python3 "$REPO_ROOT/scripts/ensure-native-runtime.py" >> "$LOG" 2>&1; then
+      log "NATIVE RUNTIME RECONCILIATION FAILED — provider admission remains blocked; retrying next tick"
+      return 1
+    fi
+  fi
+}
+
 # Tell the owner on Discord. Best effort and never fatal: a webhook that is
 # unset or down must not stop a deploy. Anything this function reports is a
 # state a human has to know about, not routine progress.
@@ -111,6 +120,33 @@ not restarting"
   return 1
 }
 
+# Policy selection can change without a Git or executable update. Use the
+# ordinary daemon restart guards; the independent worker drains and reloads
+# itself at its next completed tick/sweep boundary.
+reconcile_native_selection() {
+  [ "$(uname -s)" = Linux ] || return 0
+  local helper="$REPO_ROOT/scripts/autoship-deployment-readiness.py" status=0
+  [ -f "$helper" ] || return 0
+  /usr/bin/python3 "$helper" --activation-needed \
+    --selection "${XDG_CONFIG_HOME:-$HOME/.config}/augmentagent/autoship-native.env" \
+    --receipts "$LOG_DIR/autoship-effective-config" || status=$?
+  case "$status" in
+    0) return 0 ;;
+    10) ;;
+    *) log "native policy activation evidence unavailable; keeping services and retrying next tick"; return 0 ;;
+  esac
+  if deploy_pinned_elsewhere || maybe_defer_restart || ! memory_pressure_ok || ! restart_budget_ok; then
+    log "native policy activation deferred by deployment guards; retrying next tick"
+    return 0
+  fi
+  if systemctl --user daemon-reload >> "$LOG" 2>&1 && restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+    record_restart
+    log "native policy activated for daemon; worker reloads after its active work drains; verify autoship readiness"
+  else
+    log "native policy activation failed; receipt remains pending for next tick"
+  fi
+}
+
 # Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
 # restart the corresponding services. On Rust build failure we exit non-zero
 # WITHOUT restarting and WITHOUT advancing the stamp, so the daemon keeps
@@ -168,6 +204,11 @@ apply_update() {
   else
     log "no rust code changed; skipping rust rebuild"
   fi
+
+  # The pulled helper or selected profile may be new, and a provider binary
+  # may have changed during compilation. Preserve the binary deployment's
+  # independent status: failed runtime repair must not freeze code updates.
+  reconcile_native_runtime || true
 
   if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
     log "rebuilding dashboard (changed files touched src/, views/, or package.json)"
@@ -365,6 +406,7 @@ will retry via the build-stamp mismatch path."
   fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
+  reconcile_native_selection
   # #1571 — a verified deploy on our own binary closes any pinned-deploy
   # alert; the next pin is a new incident and gets a new Discord message.
   rm -f "$PINNED_ALERT_STAMP"
@@ -377,6 +419,9 @@ will retry via the build-stamp mismatch path."
 }
 
 log "checking for updates"
+# Provider packages can move independently of Git, including when HEAD and
+# the build stamp are current. This also runs after a pull/build below.
+reconcile_native_runtime || true
 # #891 — housekeeping that must never run under a live build.
 trim_gate_cache_if_idle || true
 
@@ -397,6 +442,7 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   # (correctness over cost — this path only fires when something already went
   # wrong, not on the steady-state hot path).
   if [ "$BUILT" = "$LOCAL" ]; then
+    reconcile_native_selection
     log "up to date ($LOCAL)"
     exit 0
   fi
@@ -510,7 +556,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(ci-build-vm|native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/ci-contract\.(py|json)$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(ci-build-vm|native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-deployment-readiness|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/ci-contract\.(py|json)$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi
