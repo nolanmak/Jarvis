@@ -228,3 +228,7 @@ jobs:
       - name: Renderer synthetic media artifact
         working-directory: sidecars/renderer
         run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id platform/platform/36"
+
+      - name: LinkedIn archive, recall, and approval contracts
+        shell: bash
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id platform/platform/37"

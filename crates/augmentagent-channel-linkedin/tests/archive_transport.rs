@@ -212,7 +212,7 @@ async fn transport_failures_are_typed_bounded_and_do_not_echo_payloads() {
             "shape",
         ),
         (
-            ResponseTemplate::new(200).set_delay(Duration::from_secs(1)),
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
             "timeout",
         ),
     ] {
@@ -222,9 +222,12 @@ async fn transport_failures_are_typed_bounded_and_do_not_echo_payloads() {
             .expect(1)
             .mount(&server)
             .await;
-        let reader =
-            ArchiveReader::for_test_with_timeout(auth(), server.uri(), Duration::from_millis(50))
-                .unwrap();
+        let timeout = if expected == "timeout" {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(30)
+        };
+        let reader = ArchiveReader::for_test_with_timeout(auth(), server.uri(), timeout).unwrap();
         let error = reader
             .messages("SYNTHETIC_PRIVATE_CURSOR", None)
             .await

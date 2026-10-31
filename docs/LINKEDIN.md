@@ -279,7 +279,9 @@ is posted. Approval atomically claims the pending action before attempting a
 send, so simultaneous clicks or a replay after restart cannot send that action
 twice. A stale direct-message card is refused if current membership identifies
 a group or is unknown. The read and backfill commands never grant group-send
-permission.
+permission. A `linkedin dm` invocation without `--post` only prints the supplied
+text; it neither generates a draft nor needs credentials. Direct membership is
+validated before any approval card is persisted and again before sending.
 
 ### Search coverage and account identity
 

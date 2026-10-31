@@ -577,6 +577,10 @@
         "browser-binary-runtime"
       ]
     },
+    "platform/platform/37": {
+      "body": "cargo test -p augmentagent-channel-linkedin --lib --tests --locked\ncargo test -p augmentagent-messages -p augmentagent-mcp-memory --lib --locked\ncargo test -p augmentagent-cli --test linkedin_archive_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent linkedin --locked\ncargo test -p augmentagent-channel-core --lib ask_mode_social_card_allowlist_tests --locked\n",
+      "shell": "bash"
+    },
     "platform/platform/4": {
       "body": "cargo test -p augmentagent-cli --bin augmentagent -- disk:: disk_pressure:: autoship_worktree_cleanup:: build_storage:: deploy_snapshot:: snapshot_refs:: storage_leases:: storage_reservations:: autoship_worker:: worker_upgrade_waits_for_the_run storage_contention_is_infrastructure autopr_health::\npython3 scripts/tests/disk-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/update-storage-smoke.py target/debug/augmentagent\npython3 scripts/tests/auto_pr_worker_status_test.py\npython3 scripts/tests/autopr_worker_install_test.py\nbash scripts/tests/update-build.test.sh\nbash scripts/tests/service-restart.test.sh\n",
       "shell": "bash"
@@ -2173,6 +2177,11 @@
               "command_id": "platform/platform/36",
               "name": "Renderer synthetic media artifact",
               "working-directory": "sidecars/renderer"
+            },
+            {
+              "command_id": "platform/platform/37",
+              "name": "LinkedIn archive, recall, and approval contracts",
+              "shell": "bash"
             }
           ],
           "strategy": {
@@ -2188,7 +2197,7 @@
         }
       },
       "role": "validation",
-      "sha256": "e1ab4ad1ef740ab8f8b99c5b0ca4d5113a85dac3bdfbfc28db1e09e5a403a99b"
+      "sha256": "e36c9def4e6e1eb5e1d54487654270f33de94ae3ba2d3a934cc7e5bae5520d9f"
     },
     ".github/workflows/privacy.yml": {
       "defaults": {},

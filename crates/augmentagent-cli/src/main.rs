@@ -8119,9 +8119,6 @@ async fn run_linkedin_dm(
     post: bool,
     json: bool,
 ) -> Result<()> {
-    let auth = LinkedInAuth::load_with_migration(&std::env::current_dir()?)?;
-    augmentagent_channel_linkedin::archive::ArchiveReader::new(auth)?
-        .require_direct(&conversation_urn).await?;
     let draft = read_body(body, body_file)?;
     anyhow::ensure!(!draft.trim().is_empty(), "--body (or --body-file) is required");
     let counterparty = with.unwrap_or_else(|| "them".to_string());
@@ -8142,6 +8139,12 @@ async fn run_linkedin_dm(
         }
         return Ok(());
     }
+    // A preview only echoes the supplied text. Validate authoritative direct
+    // membership before creating any persisted draft or approval card.
+    let auth = LinkedInAuth::load_with_migration(&std::env::current_dir()?)
+        .context("LinkedIn is not configured; run `linkedin login` before posting an approval card")?;
+    augmentagent_channel_linkedin::archive::ArchiveReader::new(auth)?
+        .require_direct(&conversation_urn).await?;
     let message_id = format!("compose:linkedin:dm:{conversation_urn}");
     let action_id = post_social_approval_card(
         &store,
