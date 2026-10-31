@@ -26,6 +26,18 @@ pub struct DiscordAdmission {
     pub nonce:String,
 }
 impl WorkflowStore {
+    pub fn queued_discord_acks(&self,bot:u64,owner:u64)->Result<Vec<DiscordOrigin>> {
+        ensure!(bot>0 && owner>0,"Discord recovery identity missing");
+        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_command_ingress')",[],|r|r.get(0))?;
+        if !exists {return Ok(Vec::new());}
+        let mut statement=self.conn.prepare("SELECT i.origin FROM discord_command_ingress i JOIN command_request r ON r.request_id=i.request_id WHERE i.state='queued' AND r.principal=?1 ORDER BY i.created_at,i.request_id LIMIT 128")?;
+        let rows=statement.query_map([format!("discord:{bot}:{owner}")],|r|r.get::<_,String>(0))?;
+        rows.map(|row| {
+            let origin:DiscordOrigin=serde_json::from_str(&row?)?;
+            origin.validate()?;ensure!(origin.bot==bot && origin.owner==owner,"Discord recovery origin mismatch");
+            Ok(origin)
+        }).collect()
+    }
     /// The transport must authorize the owner/private destination and validate
     /// the GitHub target before entering this transaction. Text is never authority.
     pub fn submit_discord_authorized(&mut self,origin:&DiscordOrigin,request:&Request,message_hash:&str,now:i64)->Result<DiscordAdmission> {
@@ -62,6 +74,8 @@ impl WorkflowStore {
     /// silently changes which candidate an owner's follow-up would edit.
     pub fn discord_workflow(&self,origin:&DiscordOrigin,explicit:Option<&str>)->Result<Option<String>> {
         origin.validate()?;
+        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_workflow_binding')",[],|r|r.get(0))?;
+        if !exists {ensure!(explicit.is_none(),"workflow is not bound to this Discord conversation");return Ok(None);}
         let mut statement=self.conn.prepare("SELECT workflow FROM discord_workflow_binding WHERE bot=?1 AND owner=?2 AND channel=?3 ORDER BY workflow")?;
         let rows=statement.query_map(params![origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string()],|r|r.get::<_,String>(0))?;
         let workflows=rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -149,6 +163,7 @@ mod tests {
         assert_eq!(workers.into_iter().map(|w|w.join().unwrap()).filter(Option::is_some).count(),1);
         let mut store=WorkflowStore::open(&path).unwrap();
         assert!(store.claim_discord_ack(&origin(),4).unwrap().is_none(),"unknown sends cannot be replayed");
+        assert!(store.queued_discord_acks(11,22).unwrap().is_empty());
         let mut foreign=origin();foreign.channel=99;assert!(store.confirm_discord_ack(&foreign,55,5).is_err());
         store.confirm_discord_ack(&origin(),55,6).unwrap();store.confirm_discord_ack(&origin(),55,7).unwrap();
         assert!(store.confirm_discord_ack(&origin(),56,8).is_err());
@@ -169,6 +184,9 @@ mod tests {
             .env(ENV,&path).output().unwrap();assert_eq!(output.status.code(),Some(73));
         let mut store=WorkflowStore::open(&path).unwrap();
         let replay=store.submit_discord_authorized(&origin(),&request(),&"a".repeat(64),2).unwrap();
+        assert_eq!(store.queued_discord_acks(11,22).unwrap(),vec![origin()]);
+        assert!(store.queued_discord_acks(11,23).unwrap().is_empty());
+        assert!(store.queued_discord_acks(12,22).unwrap().is_empty());
         assert_eq!(store.claim_discord_ack(&origin(),3).unwrap(),Some(replay));
         assert!(store.claim_discord_ack(&origin(),4).unwrap().is_none());
     }

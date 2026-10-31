@@ -52,6 +52,64 @@ pub(crate) async fn admit(repo:&Path,path:&Path,policy:OwnerPolicy,context:&Cont
     WorkflowStore::open(path)?.submit_discord_authorized(&context.origin,&request,&digest,chrono::Utc::now().timestamp_millis())
 }
 
+type GatewayContext = augmentagent_approval_discord::autoship::Context;
+type GatewayReply = augmentagent_approval_discord::autoship::Reply;
+
+fn gateway_origin(context:&GatewayContext)->Result<DiscordOrigin> {
+    let origin=DiscordOrigin {bot:context.bot,owner:context.author,channel:context.channel,message:context.message};
+    authorize(OwnerPolicy {bot:context.bot,owner:context.owner.unwrap_or(0)},
+        &Context {origin:origin.clone(),guild:context.guild,owner_dm_verified:true})?;
+    Ok(origin)
+}
+
+pub(crate) fn gateway_bound(path:&Path,context:&GatewayContext)->Result<bool> {
+    let origin=gateway_origin(context)?;
+    let Some(store)=WorkflowStore::open_read_only(path)? else {return Ok(false);};
+    match store.discord_workflow(&origin,None) {
+        Ok(workflow)=>Ok(workflow.is_some()),
+        Err(error) if error.to_string()=="workflow-selection-required"=>Ok(true),
+        Err(error)=>Err(error),
+    }
+}
+
+/// Only the verified gateway boundary calls this adapter. It deliberately does
+/// not install an ordinary wiki conversation as a workflow coding session.
+pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContext,text:&str)->Result<Option<GatewayReply>> {
+    let origin=gateway_origin(context)?;
+    let plain=|content:&str|Some(GatewayReply {content:content.into(),nonce:None});
+    if !augmentagent_approval_discord::autoship::recognizes(text) {
+        ensure!(gateway_bound(path,context)?,"autoship conversation is not bound");
+        return Ok(plain("This conversation is bound to Autoship. PR coding follow-ups are not connected yet; this message has not edited the PR. Track the workflow with `autopr status --workflow ID`."));
+    }
+    if parse(text).is_err() {
+        return Ok(plain("Use `!autoship https://github.com/OWNER/REPO/pull/N [--provider codex|claude]` in your private DM. This queues or joins a workflow; it does not confirm a merge. Discord session controls and coding follow-ups are not connected yet."));
+    }
+    let policy=OwnerPolicy {bot:context.bot,owner:context.owner.unwrap_or(0)};
+    let verified=Context {origin:origin.clone(),guild:context.guild,owner_dm_verified:true};
+    if admit(repo,path,policy,&verified,text).await.is_err() {
+        return Ok(plain("Autoship could not admit this request. The target, current GitHub access, or durable request validation failed. No completion is confirmed; inspect the workflow from the CLI before retrying."));
+    }
+    gateway_claim_ack(path,context)
+}
+
+pub(crate) fn gateway_claim_ack(path:&Path,context:&GatewayContext)->Result<Option<GatewayReply>> {
+    let origin=gateway_origin(context)?;
+    Ok(WorkflowStore::open(path)?.claim_discord_ack(&origin,chrono::Utc::now().timestamp_millis())?
+        .map(|ack|GatewayReply {content:ack.reply,nonce:Some(ack.nonce)}))
+}
+
+pub(crate) fn gateway_pending(path:&Path,bot:u64,owner:u64)->Result<Vec<GatewayContext>> {
+    let Some(store)=WorkflowStore::open_read_only(path)? else {return Ok(Vec::new());};
+    Ok(store.queued_discord_acks(bot,owner)?.into_iter().map(|origin|GatewayContext {
+        bot:origin.bot,owner:Some(origin.owner),author:origin.owner,channel:origin.channel,message:origin.message,guild:None,
+    }).collect())
+}
+
+pub(crate) fn gateway_acknowledged(path:&Path,context:&GatewayContext,message:u64)->Result<()> {
+    let origin=gateway_origin(context)?;
+    WorkflowStore::open(path)?.confirm_discord_ack(&origin,message,chrono::Utc::now().timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

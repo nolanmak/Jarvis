@@ -378,13 +378,56 @@ mod tests {
             let policy=crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22};
             scenario(serde_json::json!({"permission":"WRITE","pr":pr}));
             let text="!autoship https://github.com/owner/repo/pull/42 --provider codex";
+            // Exercise the same dispatcher and CLI adapter used by WikiQuerier,
+            // with a scripted transport and real durable workflow storage.
+            use augmentagent_approval_discord::{autoship as gateway,QueryHandler};
+            struct Adapter {repo:PathBuf,path:PathBuf}
+            #[async_trait::async_trait]
+            impl QueryHandler for Adapter {
+                async fn answer(&self,_:&augmentagent_approval_discord::AuditCtx,_:&str)->Result<String> {panic!("autoship reached ordinary chat")}
+                fn autoship_bound(&self,c:&gateway::Context)->Result<bool> {crate::autoship_discord_command::gateway_bound(&self.path,c)}
+                async fn autoship_command(&self,c:&gateway::Context,t:&str)->Result<Option<gateway::Reply>> {
+                    crate::autoship_discord_command::gateway_command(&self.repo,&self.path,c,t).await
+                }
+                fn autoship_acknowledged(&self,c:&gateway::Context,m:u64)->Result<()> {crate::autoship_discord_command::gateway_acknowledged(&self.path,c,m)}
+                fn autoship_pending(&self,b:u64,o:u64)->Result<Vec<gateway::Context>> {crate::autoship_discord_command::gateway_pending(&self.path,b,o)}
+                fn autoship_claim_ack(&self,c:&gateway::Context)->Result<Option<gateway::Reply>> {crate::autoship_discord_command::gateway_claim_ack(&self.path,c)}
+            }
+            struct Wire(std::sync::atomic::AtomicUsize);
+            #[async_trait::async_trait]
+            impl gateway::Transport for Wire {
+                async fn verify_owner_dm(&self,_:&gateway::Context)->Result<bool> {Ok(true)}
+                async fn send(&self,_:&gateway::Context,r:&gateway::Reply)->Result<u64> {
+                    self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    assert!(r.content.contains("Completion has not been observed") || r.content.contains("has not edited the PR"));
+                    Ok(55)
+                }
+            }
+            let adapter=Adapter {repo:root.clone(),path:workflow::path()};
+            let wire=Wire(std::sync::atomic::AtomicUsize::new(0));
+            let gateway_context=gateway::Context {bot:11,owner:Some(22),author:22,channel:33,message:44,guild:None};
+            assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
+            assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),1);
             let discord=crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&context,text).await.unwrap();
             assert!(discord.admission.accepted);assert!(!discord.admission.complete);
             let mut closed=pr.clone();closed["state"]="CLOSED".into();
             scenario(serde_json::json!({"permission":"WRITE","pr":closed}));
             assert_eq!(crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&context,text).await.unwrap(),discord);
+            assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),1);
+            assert!(gateway::dispatch(&adapter,&wire,&gateway::Context {message:45,..gateway_context.clone()},"fix the test").await.unwrap());
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),2);
             scenario(serde_json::json!({"permission":"READ","pr":closed}));
             assert!(crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&context,text).await.is_err());
+            scenario(serde_json::json!({"permission":"WRITE","pr":pr}));
+            let restart_context=crate::autoship_discord_command::Context {origin:crate::autoship_workflow::discord_ingress::DiscordOrigin {message:46,..context.origin.clone()},guild:None,owner_dm_verified:true};
+            crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&restart_context,text).await.unwrap();
+            // No gateway event replay: the recovery adapter reopens persisted
+            // queued acknowledgements and uses the same atomic dispatch claim.
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),1);
+            assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),3);
             return;
         }
         let dir = tempfile::tempdir().unwrap();

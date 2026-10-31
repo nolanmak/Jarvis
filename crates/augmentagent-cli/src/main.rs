@@ -11540,6 +11540,22 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    fn autoship_bound(&self, context: &augmentagent_approval_discord::autoship::Context) -> anyhow::Result<bool> {
+        autoship_discord_command::gateway_bound(&autoship_workflow::default_path(), context)
+    }
+    async fn autoship_command(&self, context: &augmentagent_approval_discord::autoship::Context, text: &str)
+        -> anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {
+        autoship_discord_command::gateway_command(&self.repo_root, &autoship_workflow::default_path(), context, text).await
+    }
+    fn autoship_acknowledged(&self, context: &augmentagent_approval_discord::autoship::Context, message: u64) -> anyhow::Result<()> {
+        autoship_discord_command::gateway_acknowledged(&autoship_workflow::default_path(), context, message)
+    }
+    fn autoship_pending(&self, bot: u64, owner: u64) -> anyhow::Result<Vec<augmentagent_approval_discord::autoship::Context>> {
+        autoship_discord_command::gateway_pending(&autoship_workflow::default_path(), bot, owner)
+    }
+    fn autoship_claim_ack(&self, context: &augmentagent_approval_discord::autoship::Context) -> anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {
+        autoship_discord_command::gateway_claim_ack(&autoship_workflow::default_path(), context)
+    }
     fn attach_voice_tools(&self, service: Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>) {
         let _ = self.voice_tools.set(service);
     }
