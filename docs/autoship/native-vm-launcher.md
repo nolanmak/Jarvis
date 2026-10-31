@@ -432,3 +432,20 @@ old generation. It changes only the guest-runtime pointer after syncing the new
 artifacts. Do not delete old generations while leases may still use them. Validate
 the refreshed generation with the current packaged guarded-edit/review probes;
 a compatibility hash alone does not prove provider execution.
+
+The normal updater runs `scripts/ensure-native-runtime.py` before its unchanged-Git
+exit and again after applying an update. It acts only on the explicit private
+`autoship-native.env` selection described above. It resolves Codex using the
+running auto-PR worker's `CODEX_CLI` and `PATH`, falling back to the daemon and then
+the updater environment if neither service is running. It never imports credentials
+or activates a profile. Current generations are validated and left untouched;
+stale companion mappings cause a runtime-only refresh under the provisioning lock.
+Corrupt inventories fail with `native-runtime-reconciliation-failed` instead of
+being silently replaced. Failures are logged and retried on the next updater tick
+without blocking software updates needed to repair them. A successful binary
+build stamp does not assert native provider readiness.
+
+Refresh retains previous generations. If publication is attempted but reports an
+error, it also retains the new generation: a workflow could already have observed
+that pointer, even if another actor subsequently changes it. Reclamation must
+respect runtime ownership and leases; pointer absence alone is insufficient.

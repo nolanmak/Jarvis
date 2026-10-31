@@ -52,6 +52,15 @@ DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
 
+reconcile_native_runtime() {
+  if [ "$(uname -s)" = Linux ] && [ -f "$REPO_ROOT/scripts/ensure-native-runtime.py" ]; then
+    if ! /usr/bin/python3 "$REPO_ROOT/scripts/ensure-native-runtime.py" >> "$LOG" 2>&1; then
+      log "NATIVE RUNTIME RECONCILIATION FAILED — provider admission remains blocked; retrying next tick"
+      return 1
+    fi
+  fi
+}
+
 # Tell the owner on Discord. Best effort and never fatal: a webhook that is
 # unset or down must not stop a deploy. Anything this function reports is a
 # state a human has to know about, not routine progress.
@@ -168,6 +177,11 @@ apply_update() {
   else
     log "no rust code changed; skipping rust rebuild"
   fi
+
+  # The pulled helper or selected profile may be new, and a provider binary
+  # may have changed during compilation. Preserve the binary deployment's
+  # independent status: failed runtime repair must not freeze code updates.
+  reconcile_native_runtime || true
 
   if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
     log "rebuilding dashboard (changed files touched src/, views/, or package.json)"
@@ -377,6 +391,9 @@ will retry via the build-stamp mismatch path."
 }
 
 log "checking for updates"
+# Provider packages can move independently of Git, including when HEAD and
+# the build stamp are current. This also runs after a pull/build below.
+reconcile_native_runtime || true
 # #891 — housekeeping that must never run under a live build.
 trim_gate_cache_if_idle || true
 

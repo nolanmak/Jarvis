@@ -69,6 +69,26 @@ class ProvisionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'trusted'):
                 p.native_companions(native)
 
+    def test_refresh_retains_generation_when_publication_succeeds_then_reports_error(self):
+        for restored in (False,True):
+            with tempfile.TemporaryDirectory() as name, patch.object(p,'stage_runtime',fake_stage):
+                root=Path(name);policy=p.provision(self.args(root,'codex'))
+                before=json.loads(policy.read_text());helper=p.helper('native-provider-vm.py');atomic=helper.atomic
+                published=[]
+                def write_then_fail(path,contents):
+                    atomic(path,contents)
+                    published.append(json.loads(contents)['guest_runtime'])
+                    # Another actor can restore the pointer after a workflow
+                    # observed the new generation. Pointer absence isn't proof
+                    # that the generation was never published.
+                    if restored:atomic(path,json.dumps(before).encode())
+                    raise OSError('simulated post-publication durability failure')
+                with patch.object(helper,'atomic',write_then_fail), self.assertRaises(OSError):
+                    p.refresh_runtime_policy(policy,Path('/synthetic/new-runtime'))
+                self.assertNotEqual(before['guest_runtime'],published[0])
+                self.assertTrue(Path(published[0]).exists(),'possibly published runtime must survive uncertain completion')
+                self.assertTrue(Path(before['guest_runtime']).exists())
+
     def test_runtime_only_refresh_preserves_grants_state_and_prior_generation(self):
         with tempfile.TemporaryDirectory() as name, patch.object(p, 'stage_runtime', fake_stage):
             root = Path(name)
