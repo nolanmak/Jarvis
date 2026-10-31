@@ -17,11 +17,15 @@ def show(key):
 def escaped(value):
  if '\n' in value or '\r' in value: raise RuntimeError('newline in service configuration')
  return value.replace('\\','\\\\').replace('"','\\"').replace('%','%%')
-def environment_file(path,optional=False):
+def environment_file(path,optional=False,literal=False):
  # This directive consumes the whole path; embedded shell quotes become
  # literal filename characters. Only systemd specifiers need escaping.
  if not pathlib.Path(path).is_absolute() or any(c in path for c in '\n\r\0'):
   raise RuntimeError('environment file must be an absolute single-line path')
+ if literal:
+  # EnvironmentFile uses libc glob patterns. Inherited daemon directives keep
+  # their patterns; our shared selection names one exact file instead.
+  path=''.join('\\'+c if c in '\\*?[]' else c for c in path)
  return 'EnvironmentFile='+('-' if optional else '')+path.replace('%','%%')
 plan={}
 def write(path,text):
@@ -75,7 +79,7 @@ if selected:
  # EnvironmentFile does not expand systemd specifiers or shell variables.
  value=selected.replace('\\','\\\\').replace('"','\\"')
  selection_text='# Managed by ensure-autopr-worker.sh\nAUGMENTAGENT_NATIVE_VM_POLICY="'+value+'"\n'
-shared_environment=environment_file(str(selection),True)
+shared_environment=environment_file(str(selection),True,literal=True)
 extra.append(shared_environment)
 dry=os.environ.get('AUGMENTAGENT_AUTOSTART_DRY_RUN')
 if dry is None:
