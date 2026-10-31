@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1712,
+  "status": "queued-status-projection-verified-not-deployed",
+  "parent_commit": "565245021d6038540cbc54d204bf5963fef4c372",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_commands.rs": "6115cfc134d835e69ca8cc07d9c82427d341751076065b8913d4e689958827f2",
+    "crates/augmentagent-cli/tests/autoship_commands_cli.rs": "4ba2a9448858a245d4c3dc36fa55a3884917b6c3d53d486965a1cfea1d67bee8"
+  },
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-queued-status.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "durable queued submission incorrectly returned workflow-not-found/exit 2"
+    },
+    "green": {
+      "log": "/tmp/autoship-1703-green-queued-status.log",
+      "exit": 0,
+      "passed": 13,
+      "failed": 0,
+      "seconds": 12.54
+    }
+  },
+  "verified": [
+    "Compiled CLI reports accepted, incomplete queued jobs before the first worker checkpoint.",
+    "Provider and merge ceiling are read from the durable command policy.",
+    "PR aliases and repository casing resolve the original workflow and its pending merge hold.",
+    "Status preserves database bytes and creates no unrelated state.",
+    "Out-of-range target numbers reject before opening state."
+  ],
+  "limits": [
+    "Worker activity and deployment remain unknown until supported by observations.",
+    "Public run/work-once wiring, automatic queue consumption and targeted free reconciliation remain outstanding.",
+    "Discord sessions and delivery, production rollout, native CLI acceptance and required soaks remain open."
+  ]
+}

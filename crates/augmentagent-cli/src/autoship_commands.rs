@@ -27,8 +27,8 @@ fn target(workflow: &str) -> Result<(String, Value)> {
         "invalid repository identity"
     );
     let number: u64 = number.parse()?;
-    ensure!(number > 0, "target number must be positive");
-    Ok((repository.into(), json!({"kind":kind,"number":number})))
+    ensure!(number > 0 && number <= i64::MAX as u64, "target number out of range");
+    Ok((repository.to_ascii_lowercase(), json!({"kind":kind,"number":number})))
 }
 
 fn error(workflow: &str, reason: &str, detail: &str) -> Value {
@@ -47,8 +47,27 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
         let Some(store) = WorkflowStore::open_read_only(path)? else {
             return Ok(None);
         };
+        let canonical = if target["kind"] == "pr" {
+            store.resolve_pr(&repository, target["number"].as_u64().unwrap())?
+                .unwrap_or(crate::autoship_workflow::pr_workflow_id(&repository, target["number"].as_u64().unwrap())?)
+        } else {
+            crate::autoship_workflow::workflow_id(&repository, target["number"].as_u64().unwrap())?
+        };
+        let workflow = canonical.as_str();
+        let command = store.command_request(workflow)?;
         let Some(snapshot) = store.snapshot(workflow)? else {
-            return Ok(None);
+            let Some(command) = command else { return Ok(None); };
+            // Admission is durable before a worker claims the job. There is no
+            // execution/head/worker-liveness evidence at this point.
+            return Ok(Some((0, json!({"schema_version":1,"workflow":workflow,
+                "repository":command.repository,"target":command.target,
+                "accepted":true,"complete":false,"stage":"queued","reason":"awaiting-worker-claim",
+                "next_action":"claim_workflow","eligible_at_ms":null,"head":null,
+                "provider":command.provider,"workflow_until":command.until,"pr_url":null,
+                "worker":{"state":"unknown"},"merge":{"state":"not-confirmed"},
+                "deployment":{"state":"unknown"},"allowance":null,
+                "pending_merge_operations":[],"pending_merge_evidence":[],
+                "resources":null,"lease":{"active":false},"progress_at_ms":null}))));
         };
         let allowance = store.merge_allowance(now, cap)?;
         let mut pending = Vec::new();
@@ -84,7 +103,7 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             "accepted":true,"complete":complete,"head":snapshot.checkpoint.binding.head,
             "stage":snapshot.checkpoint.stage,"reason":snapshot.checkpoint.next.reason,
             "next_action":snapshot.checkpoint.next.action,"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
-            "provider":null,"pr_url":pr_url,
+            "provider":command.as_ref().and_then(|c| c.provider),"workflow_until":command.as_ref().map(|c| c.until),"pr_url":pr_url,
             "merge":{"state":if complete {"observed-merged"} else if !pending.is_empty() {"pending"} else {"not-confirmed"}},
             "deployment":{"state":"unknown"},"allowance":allowance,"pending_merge_operations":pending,"pending_merge_evidence":pending_evidence,
             "resources":{"attempts":snapshot.attempts,"model_calls":snapshot.model_calls,"tokens":snapshot.tokens,"wall_ms":snapshot.wall_ms},
@@ -139,8 +158,12 @@ pub fn run_status(workflow: &str, json_output: bool) -> i32 {
             body["next_action"].as_str().unwrap_or("unknown"),
             body["eligible_at_ms"]
         );
-        println!("Confirmed auto-merges today: {}; remaining: {}; pending capacity holds: {}; available: {}",
-            body["allowance"]["confirmed"],body["allowance"]["remaining"],body["allowance"]["pending"],body["allowance"]["available"]);
+        if body["allowance"].is_object() {
+            println!("Confirmed auto-merges today: {}; remaining: {}; pending capacity holds: {}; available: {}",
+                body["allowance"]["confirmed"],body["allowance"]["remaining"],body["allowance"]["pending"],body["allowance"]["available"]);
+        } else {
+            println!("Merge allowance: unobserved; worker status: unknown");
+        }
         if let Some(url) = body["pr_url"].as_str() {
             println!("PR: {url}");
         }

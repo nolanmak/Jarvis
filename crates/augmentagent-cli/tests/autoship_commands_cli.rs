@@ -99,6 +99,21 @@ fn status_reports_real_checkpoint_and_pending_capacity_without_writes() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+
+    // A PR observer must follow the existing issue workflow, including its hold.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE pr_alias(id TEXT PRIMARY KEY,workflow TEXT);
+        INSERT INTO pr_alias VALUES('owner/repo/pr/34','owner/repo#12');").unwrap();
+    drop(conn);
+    let before_alias = std::fs::read(&path).unwrap();
+    let output = status(root.path(), "Owner/Repo/pr/34");
+    assert_eq!(output.status.code(), Some(3));
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["workflow"], "owner/repo#12");
+    assert_eq!(body["reason"], "merge-reconciliation-required");
+    assert_eq!(body["pending_merge_operations"][0], "op-pending");
+    assert_eq!(std::fs::read(&path).unwrap(), before_alias);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -108,6 +123,7 @@ fn invalid_status_target_rejects_without_creating_state() {
         "../../other#1",
         "owner/repo#0",
         "owner/repo#bad",
+        "owner/repo#18446744073709551615",
         "owner/repo",
     ] {
         let output = status(root.path(), workflow);
@@ -355,4 +371,34 @@ fn deployment_startup_worker_records_effective_dotenv_without_credentials() {
     assert!(!String::from_utf8_lossy(&bytes).contains("private-startup-fixture"));
     assert_eq!(path.metadata().unwrap().permissions().mode()&0o777,0o600);
     assert!(!root.path().join("data.db").exists());
+}
+
+#[test]
+fn queued_submission_is_visible_before_worker_claim_without_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("workflow.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE workflow(id TEXT PRIMARY KEY,branch TEXT,pr INTEGER,checkpoint TEXT,owner TEXT,
+        generation INTEGER,lease_until INTEGER,heartbeat_at INTEGER,progress_at INTEGER,attempts INTEGER,
+        wall_ms INTEGER,model_calls INTEGER,tokens INTEGER);
+        CREATE TABLE command_job(workflow TEXT PRIMARY KEY,repository TEXT,target TEXT,until_milestone TEXT,provider TEXT,created_at INTEGER);
+        CREATE TABLE pr_alias(id TEXT PRIMARY KEY,workflow TEXT);").unwrap();
+    conn.execute("INSERT INTO command_job VALUES(?1,?2,?3,?4,?5,10)", rusqlite::params![
+        "owner/repo/pr/42", "owner/repo", r#"{"kind":"pr","number":42}"#, r#""pr""#, r#""codex""#]).unwrap();
+    drop(conn);
+    std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let output = status(root.path(), "owner/repo/pr/42");
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stdout));
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["accepted"], true);
+    assert_eq!(body["complete"], false);
+    assert_eq!(body["stage"], "queued");
+    assert_eq!(body["provider"], "codex");
+    assert_eq!(body["workflow_until"], "pr");
+    assert_eq!(body["worker"]["state"], "unknown");
+    assert!(body["head"].is_null());
+    assert_eq!(body["deployment"]["state"], "unknown");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
