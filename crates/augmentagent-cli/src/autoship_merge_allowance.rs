@@ -628,8 +628,15 @@ impl WorkflowStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state,raw,prior,generation):(String,String,Option<String>,i64)=tx.query_row(
-            "SELECT d.state,r.response,d.resolution,d.generation FROM merge_allowance_dispatch d JOIN merge_transport_response r ON r.operation=d.operation WHERE d.operation=?1",[&op.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let (state,raw,prior,generation,workflow,kind,binding):(String,String,Option<String>,i64,String,String,String)=tx.query_row(
+            "SELECT d.state,r.response,d.resolution,d.generation,o.workflow,o.kind,o.binding FROM merge_allowance_dispatch d JOIN merge_transport_response r ON r.operation=d.operation JOIN operation o ON o.id=d.operation WHERE d.operation=?1",[&op.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+        ensure!(
+            op.workflow == workflow
+                && op.kind == OperationKind::MergePr
+                && serde_json::from_str::<OperationKind>(&kind)? == OperationKind::MergePr
+                && serde_json::from_str::<Binding>(&binding)? == op.binding,
+            "confirmation audit intent differs from dispatched operation"
+        );
         ensure!(
             state == "confirmed"
                 && response_sha256 == format!("{:x}", Sha256::digest(raw.as_bytes())),
@@ -643,7 +650,7 @@ impl WorkflowStore {
                 "UPDATE merge_allowance_dispatch SET resolution=?2 WHERE operation=?1",
                 params![op.id, decision],
             )?;
-            event(&tx,&op.workflow,generation,"merge_resolution_confirmed",&serde_json::json!({"operation":op.id,"decision":serde_json::from_str::<serde_json::Value>(&decision)?}).to_string(),now)?;
+            event(&tx,&workflow,generation,"merge_resolution_confirmed",&serde_json::json!({"operation":op.id,"decision":serde_json::from_str::<serde_json::Value>(&decision)?}).to_string(),now)?;
         }
         tx.commit()?;
         Ok(())

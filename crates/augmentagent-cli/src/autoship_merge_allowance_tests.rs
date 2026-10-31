@@ -507,3 +507,35 @@ fn allowance_accepts_real_github_request_error_shape_with_diagnostic_path() {
         "data null is still an execution response"
     );
 }
+
+#[test]
+fn allowance_confirmation_audit_rejects_substituted_operation_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    let (lease, op) = fixture(&mut store, 1, now);
+    let (_, other) = fixture(&mut store, 2, now);
+    reserve(&mut store, &lease, &op, 1, now).unwrap();
+    store.dispatch_merge(&lease, &op, now, 5).unwrap();
+    let raw = r#"{"data":{"mergePullRequest":{}}}"#;
+    store.record_merge_response(&op, raw, now).unwrap();
+    store.confirm_merge_dispatch(&op, &receipt(&op, 1, now), now).unwrap();
+    let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+    for field in ["workflow", "kind", "head", "contract", "evidence"] {
+        let mut substituted = op.clone();
+        match field {
+            "workflow" => substituted.workflow = other.workflow.clone(),
+            "kind" => substituted.kind = OperationKind::Push,
+            "head" => substituted.binding.head = "c".repeat(40),
+            "contract" => substituted.binding.contract = "different".into(),
+            "evidence" => substituted.binding.evidence_hash = "different".into(),
+            _ => unreachable!(),
+        }
+        assert!(store.record_confirmed_merge_resolution(&substituted, "owner", &digest, now).is_err(),
+            "substituted {field} must not write an audit decision");
+        assert!(store.merge_dispatch(&op.id).unwrap().unwrap().resolution.is_none());
+    }
+    store.record_confirmed_merge_resolution(&op, "owner", &digest, now).unwrap();
+    store.record_confirmed_merge_resolution(&op, "owner", &digest, now).unwrap();
+    assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 1);
+}
