@@ -868,3 +868,21 @@ fn targeted_terminal_reconciliation_preserves_other_confirmed_workflows() {
     assert_eq!(store.reconcile_confirmed_workflows_for("owner/repo",Some("owner/repo#1"),now+2).unwrap(),0);
     assert_eq!(store.reconcile_confirmed_workflows("owner/repo",now+3).unwrap(),1);
 }
+
+#[test]
+fn progress_merge_requires_receipt_and_cannot_be_overwritten_by_late_stage() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+    let mut store=WorkflowStore::open(&path).unwrap();let now=100*DAY;
+    let (lease,op)=fixture(&mut store,1,now);
+    let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+    checkpoint.stage=Stage::Merged;store.checkpoint(&lease,&checkpoint,now).unwrap();
+    assert_ne!(store.progress_events(&lease.workflow).unwrap().last().unwrap().kind,"merged");
+    reserve(&mut store,&lease,&op,1,now).unwrap();store.dispatch_merge(&lease,&op,now,5).unwrap();
+    store.confirm_merge_dispatch(&op,&receipt(&op,1,now),now).unwrap();
+    let events=store.progress_events(&lease.workflow).unwrap();let merged=events.last().unwrap();
+    assert_eq!(merged.kind,"merged");assert_eq!(merged.deployment_state,"unknown");assert_eq!(merged.merge_state,"observed-autonomous-merge");
+    checkpoint.stage=Stage::Review;store.checkpoint(&lease,&checkpoint,now+1).unwrap();
+    assert_eq!(store.progress_events(&lease.workflow).unwrap(),events);
+    drop(store);let mut store=WorkflowStore::open(&path).unwrap();store.confirm_merge_dispatch(&op,&receipt(&op,1,now),now+2).unwrap();
+    assert_eq!(store.progress_events(&lease.workflow).unwrap(),events);
+}

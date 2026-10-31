@@ -394,6 +394,7 @@ fn queued_submission_is_visible_before_worker_claim_without_writes() {
     assert_eq!(body["accepted"], true);
     assert_eq!(body["complete"], false);
     assert_eq!(body["stage"], "queued");
+    assert_eq!(body["delivery"]["state"], "not-observed");
     assert_eq!(body["provider"], "codex");
     assert_eq!(body["workflow_until"], "pr");
     assert_eq!(body["worker"]["state"], "unknown");

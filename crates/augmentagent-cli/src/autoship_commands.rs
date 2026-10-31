@@ -70,6 +70,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
         let command = store.command_request(workflow)?;
         let attempt = store.command_attempt(workflow)?;
         let owner_control=store.owner_control(workflow)?;
+        let delivery=store.progress_delivery(workflow)?;
         let paused=owner_control.as_ref().is_some_and(|c|c.paused);
         let Some(snapshot) = store.snapshot(workflow)? else {
             let Some(command) = command else { return Ok(None); };
@@ -83,7 +84,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
                 "accepted":true,"complete":false,"stage":"queued",
                 "reason":if paused {"owner-pause-requested"} else {attempt.as_ref().map_or("awaiting-worker-claim",|a|a.reason.as_str())},
                 "next_action":if paused {"await_owner_resume"} else if attempt.is_some() {"retry_worker_attempt"} else {"claim_workflow"},
-                "owner_control":owner_control,
+                "owner_control":owner_control,"delivery":delivery,
                 "eligible_at_ms":attempt.as_ref().map(|a|a.eligible_at_ms),"head":null,"last_attempt":attempt,
                 "provider":command.provider,"workflow_until":command.until,"pr_url":null,
                 "worker":{"state":"unknown"},"merge":{"state":"not-confirmed"},
@@ -137,7 +138,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             "accepted":true,"complete":complete,"head":snapshot.checkpoint.binding.head,
             "stage":snapshot.checkpoint.stage,"reason":if paused && !complete && !recovery_needed {"owner-pause-requested"} else {&snapshot.checkpoint.next.reason},
             "next_action":if paused && !complete && !recovery_needed {"await_quiescence_or_owner_resume"} else {&snapshot.checkpoint.next.action},"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
-            "owner_control":owner_control,
+            "owner_control":owner_control,"delivery":delivery,
             "provider":command.as_ref().and_then(|c| c.provider),"workflow_until":command.as_ref().map(|c| c.until),"pr_url":pr_url,
             "requested_until":milestone,"milestones":{"pr":pr_ready,"merged":merged},
             "merge":{"state":if merged {"observed-merged"} else if recovery_needed || !pending.is_empty() {"pending"} else {"not-confirmed"}},

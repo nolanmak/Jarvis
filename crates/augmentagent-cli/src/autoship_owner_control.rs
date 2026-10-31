@@ -41,6 +41,7 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         tx.execute("INSERT INTO workflow_owner_control VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET revision=excluded.revision,paused=excluded.paused,principal=excluded.principal,updated_at=excluded.updated_at",
             params![workflow,revision,paused,principal,now])?;
         tx.execute("INSERT INTO workflow_owner_control_event VALUES(?1,?2,?3,?4,?5)",params![workflow,revision,paused,principal,now])?;
+        super::progress::project(tx,workflow,"owner_control_changed",now)?;
         Ok(control)
 }
 

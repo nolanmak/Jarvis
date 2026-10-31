@@ -9,6 +9,8 @@ use std::{path::Path, time::Duration};
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
+#[path = "autoship_progress.rs"]
+pub(crate) mod progress;
 #[path = "autoship_milestone.rs"]
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
@@ -409,6 +411,13 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_event (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL REFERENCES workflow(id),
                 generation INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_progress_state (
+                workflow TEXT PRIMARY KEY, sequence INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                terminal INTEGER NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_progress_event (
+                workflow TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL,
+                created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
+                PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
         Ok(Self { conn })
     }
@@ -1774,6 +1783,7 @@ fn event(
         "INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,?3,?4,?5)",
         params![workflow, generation, kind, payload, now_ms],
     )?;
+    progress::project(tx,workflow,kind,now_ms)?;
     Ok(())
 }
 

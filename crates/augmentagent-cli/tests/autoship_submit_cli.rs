@@ -534,6 +534,8 @@ fn waiting_timeout_detaches_without_starting_or_canceling_the_durable_job() {
     assert_eq!(result["observation"]["detached"],true);
     let queued=body(status(root.path(),"owner/repo#7"),0);
     assert_eq!(queued["stage"],"queued");
+    assert_eq!(queued["delivery"]["state"],"delivery-unconfigured");
+    assert_eq!(queued["delivery"]["pending_events"],1);
     assert!(!root.path().join(".self-improve-worktrees").exists());
     assert_eq!(body(run(root.path(),&["--request-id","waiting"]),0)["reason"],"queued");
 }

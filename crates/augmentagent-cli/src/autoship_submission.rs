@@ -151,9 +151,12 @@ impl WorkflowStore {
         ensure!(outcome != AttemptOutcome::Selected, "attempt outcome is not terminal");
         ensure!(!reason.is_empty() && reason.len()<=128 && reason.bytes().all(|b|b.is_ascii_lowercase() || b==b'-'), "invalid attempt reason");
         let outcome=serde_json::to_value(outcome)?;
-        Ok(self.conn.execute("UPDATE command_attempt SET finished_at=?3,outcome=?4,reason=?5
+        let tx=self.conn.unchecked_transaction()?;
+        let changed=tx.execute("UPDATE command_attempt SET finished_at=?3,outcome=?4,reason=?5
             WHERE workflow=?1 AND selected_at=?2 AND finished_at IS NULL",
-            params![workflow,selected_at,now,outcome.as_str().unwrap(),reason])? == 1)
+            params![workflow,selected_at,now,outcome.as_str().unwrap(),reason])? == 1;
+        if changed {super::progress::project(&tx,workflow,"command_attempt_finished",now)?;}
+        tx.commit()?;Ok(changed)
     }
 
     pub fn has_command_jobs(&self) -> Result<bool> {
@@ -392,9 +395,10 @@ pub(super) fn submit_in_transaction(tx:&Transaction<'_>,request_id:&str,principa
             provider,
         };
         if admission.accepted {
-            tx.execute("INSERT INTO command_job(workflow,repository,target,until_milestone,provider,created_at)
+            let inserted=tx.execute("INSERT INTO command_job(workflow,repository,target,until_milestone,provider,created_at)
                 VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(workflow) DO NOTHING",
                 params![workflow,request.repository,serde_json::to_string(&request.target)?,serde_json::to_string(&until)?,serde_json::to_string(&provider)?,now])?;
+            if inserted==1 {super::progress::project(tx,&workflow,"command_queued",now)?;}
         }
         tx.execute("INSERT INTO command_request(request_id,principal,payload,admission,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![request_id,principal,payload,serde_json::to_string(&admission)?,now])?;
