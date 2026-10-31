@@ -2001,7 +2001,8 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 ///   including `send` and `send-now`; `finance` status/transactions/summary;
 ///   `calendar` list-events/create-event/rsvp; `loop`; `loops`; `meetup events`;
 ///   `socialapi`/`linkedin` dm and comment; `linkedin recent-dms`;
-///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`) and
+///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`, `imessage compose`,
+///   and read-only `imessage allowlist`) and
 ///   `aa-gh issue` create/list/view/comment.
 ///
 /// Several of those act outside the wiki: they can send email, post GitHub
@@ -2108,6 +2109,19 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // session's `/tmp/aa-imsg/<session>/` (allowlist + 25 MB cap in the CLI). Only this verb: `sync --apply` writes.
     let bash_imessage_fetch_abs = format!("Bash({} imessage fetch-attachment *)", bin.display());
     let bash_imessage_fetch_bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
+    // #1635 — `imessage compose --to … --body … --post` starts a text to a
+    // person as an approval card. Same safety argument as `socialapi dm` and
+    // `gmail compose --post`: the verb never touches Messages; its only
+    // externally visible effect is one card in the approval channel, and it
+    // refuses before storing anything unless the conversation is on
+    // `allow-outbound` and the kill-switch is set. Deliberately NOT
+    // `imessage *`: that would also hand the agent `approve`, `allow-outbound`,
+    // `alerts` and `outbox complete`. `imessage allowlist` is read-only and
+    // lets the agent explain a refusal instead of guessing.
+    let bash_imessage_compose_abs = format!("Bash({} imessage compose *)", bin.display());
+    let bash_imessage_compose_bare = "Bash(augmentagent imessage compose *)".to_string();
+    let bash_imessage_allowlist_abs = format!("Bash({} imessage allowlist)", bin.display());
+    let bash_imessage_allowlist_bare = "Bash(augmentagent imessage allowlist)".to_string();
     // #1061 — the same for the Apple Notes bundle, into the same session dir.
     let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
     let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
@@ -2235,6 +2249,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             env.push(("DISCORD_CHANNEL_ID".into(), cid));
         }
     }
+    // The compose subprocess must use the daemon's existing bundle and gate.
+    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() { env.push((key.into(), value)); }
+        }
+    }
     // #888/#1061 — `imessage fetch-attachment` and `apple-notes fetch-attachment` read their
     // `AUGMENTAGENT_*_S3_*` config and sign via the default AWS credential chain, which any
     // `AWS_*` var may steer: forward all three prefixes whole, only with a bucket configured
@@ -2355,6 +2375,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_comment_bare,
             bash_imessage_fetch_abs,
             bash_imessage_fetch_bare,
+            bash_imessage_compose_abs,
+            bash_imessage_compose_bare,
+            bash_imessage_allowlist_abs,
+            bash_imessage_allowlist_bare,
             bash_notes_fetch_abs,
             bash_notes_fetch_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
@@ -3738,6 +3762,20 @@ mod tests {
         assert!(opts
             .system_prompt
             .contains("ATTACH: deliverables/packet.pdf"));
+    }
+
+    #[test]
+    fn ask_opts_forwards_imessage_compose_environment_without_send_tools() {
+        let wiki=tempfile::tempdir().unwrap();let repo=tempfile::tempdir().unwrap();
+        let _guard=EnvGuard::set("AUGMENTAGENT_IMESSAGE_REPO_DIR", "/synthetic/imessage-bundle");
+        let prior=std::env::var_os("AUGMENTAGENT_IMESSAGE_SEND_ENABLED");
+        std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED","1");
+        let opts=ask_opts(wiki.path().into(),repo.path().into());
+        match prior { Some(v)=>std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED",v),None=>std::env::remove_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED") }
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),"/synthetic/imessage-bundle".into())));
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_SEND_ENABLED".into(),"1".into())));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage compose *)".into()));
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage approve") || t.contains("imessage *")));
     }
 
     /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees

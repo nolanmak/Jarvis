@@ -45,7 +45,7 @@ pub mod timeparse;
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 // #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
 // repost so it renders the same To/cc/bcc decoration as the Revise repost.
-pub use event_handler::{append_envelope_markers, chunk_for_discord, edit_card_for_action};
+pub use event_handler::{append_envelope_markers, chunk_for_discord, edit_card_for_action, note_compose_card};
 pub use event_handler::{fetch_owner_history, interrupted_turn_target, INTERRUPTED_TURN_NOTICE};
 pub use journal_cmd::{parse_journal_command, JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
 // #35 Phase 5: the email channel appends the needs-input marker to the
@@ -179,6 +179,11 @@ pub trait ApprovalBroker: Send + Sync {
         email: &Email,
         draft: &str,
     ) -> Result<(), ApprovalError>;
+
+    /// Warn on a still-pending compose when the owner texts manually.
+    async fn note_compose_activity(&self, action_id: &str, email: &Email) -> Result<(), ApprovalError> {
+        self.post_flag_notice(email, &format!("You texted this person since composing. Approve still sends the composed text (ref {}).", &action_id[..8.min(action_id.len())])).await
+    }
 
     /// Post a simple "heads up" notice for a triage-flagged email. No buttons,
     /// no draft — the user is expected to open Gmail themselves if they want

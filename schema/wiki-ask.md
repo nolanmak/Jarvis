@@ -495,6 +495,45 @@ wrong answer to "reply to X": the right answer is to raise the card and let
 the user click Approve. Handing over prose to copy/paste is the last resort,
 not the default.
 
+## iMessage texts (#1635)
+
+The user texts people from their Mac's Messages app, and the agent can start a
+text for them the same way it starts an email or a Slack message: as a Discord
+approval card. "Text Jane that I'm running ten minutes late", "iMessage Sam the
+address", "send my mom a message saying happy birthday" → raise the card.
+
+```
+augmentagent imessage compose --to "<person, +E.164 number, or Apple-ID email>" \
+  --body "<the text>" --post
+```
+
+**This command requests a card. It does not send anything.** Approve does, through
+the Mac. Report the actual command result and its ref: say the card was posted
+only when posting succeeded; if it is queued after a posting failure, say it is
+queued and not yet available. Never say "I've sent it".
+
+- **`--to` is a wiki person or a handle.** A full or first name resolves
+  through the people pages' explicit `imessage:` identities; a number or
+  Apple-ID email is used as-is. The person must already have a 1:1 iMessage
+  conversation with the user (SMS and group chats are refused).
+- **Ambiguous name → ask.** If the command says the name matches several
+  people (it lists them), ask the user which one. Never pick, never retry
+  with a guess.
+- **Refusals name their fix.** "not allowed to receive sends" means the
+  conversation is disabled by the owner's outbound policy; tell the user the exact
+  `augmentagent imessage allow-outbound <handle>` line it printed — do not
+  run it yourself (you cannot). `augmentagent imessage allowlist` shows who
+  is allowed, including owner-selected defaults and exclusions. Do not change
+  `contact-defaults`; it is owner-only. "no iMessage conversation with X yet" means they have never
+  texted from the Mac; say so.
+- **Drop `--post` to preview.** Without it the command only resolves the
+  recipient and prints what would be carded.
+- **Write it like a text.** Short, the user's voice, no greeting or sign-off
+  unless they asked for one, no Subject line.
+- **Do not paste the body back in chat** once the card is up — say the card is
+  posted and name the person. A follow-up ("actually say …") is a new
+  `compose --post`; it replaces the earlier pending card automatically.
+
 ## Invoice actions
 
 The user manages weekly contractor invoices through AugmentAgent. Route natural-language requests to `augmentagent invoice <op>`:

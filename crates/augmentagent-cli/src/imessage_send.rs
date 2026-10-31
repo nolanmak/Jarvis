@@ -66,10 +66,13 @@ impl ReplyApprover {
             Ok(t) => t,
             Err(e) => return failed(format!("cannot send: {e}")),
         };
-        match self
-            .store
-            .is_imessage_outbound_allowed(&target.conversation)
-        {
+        let allowed = if target.kind == augmentagent_store::ImessageTargetKind::ChatGuid {
+            // Contact defaults never opt groups in.
+            self.store.list_imessage_allowlist(true).map(|ids| ids.contains(&target.conversation))
+        } else {
+            self.store.is_imessage_outbound_allowed(&target.conversation)
+        };
+        match allowed {
             Ok(true) => {}
             Ok(false) => {
                 return failed(format!(
@@ -399,7 +402,7 @@ pub(crate) fn set_allowlist(
         (false, false) => store.deny_imessage_inbound(identifier)?,
     };
     let list = if outbound { "outbound" } else { "inbound" };
-    let verb = if allow { "added to" } else { "removed from" };
+    let verb = if allow { "enabled on" } else { "explicitly disabled on" };
     if changed {
         println!("{verb} the {list} allowlist");
     } else {
@@ -413,6 +416,10 @@ pub(crate) fn set_allowlist(
 
 pub(crate) fn print_allowlists(store: &Store) -> anyhow::Result<()> {
     for (label, outbound) in [("outbound", true), ("inbound", false)] {
+        println!("{label} defaults\t{}", if store.imessage_contact_default(outbound)? { "all one-to-one iMessage contacts (approval required for sends)" } else { "explicit allowlist only" });
+        for id in store.list_imessage_denials(outbound)? {
+            println!("{label} denied\t{id}");
+        }
         for id in store.list_imessage_allowlist(outbound)? {
             println!("{label}\t{id}");
         }

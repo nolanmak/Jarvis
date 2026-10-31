@@ -96,6 +96,7 @@ mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
 mod imessage_send;
+mod imessage_compose;
 mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
@@ -1615,13 +1616,26 @@ enum ImessageOp {
     AllowInbound { identifier: String },
     /// Stop drafting reply cards for a conversation.
     DenyInbound { identifier: String },
-    /// Print both allowlists.
+    /// Owner policy for existing and future one-to-one iMessage contacts.
+    /// Every outgoing message still requires approval; explicit denials win.
+    ContactDefaults {
+        #[arg(long, required = true, action = clap::ArgAction::Set)]
+        inbound: bool,
+        #[arg(long, required = true, action = clap::ArgAction::Set)]
+        outbound: bool,
+    },
+    /// Print both allowlists, contact defaults, and explicit exclusions.
     Allowlist,
     /// Approve one pending iMessage card from the terminal: the same checks
     /// and outbox queueing as the card's Approve button.
     Approve { action_id: String },
     /// Skip one pending iMessage card from the terminal.
     Skip { action_id: String },
+    /// Start a new iMessage to a person as an approval card (#1635). Mirrors
+    /// `gmail compose --post`: without `--post` it resolves the recipient and
+    /// prints what would be carded; with it the card is raised and Approve
+    /// queues the text for the Mac sender. Never sends by itself.
+    Compose(imessage_compose::ComposeArgs),
 }
 
 #[derive(Subcommand)]
@@ -2847,9 +2861,9 @@ enum WikiOp {
     ///
     /// - Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
     ///
-    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
+    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, `imessage compose` (a text to a person, as an approval card) and `imessage allowlist`, and `aa-gh issue` create/list/view/comment.
     ///
-    /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
+    /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events, social DMs and comments, and iMessage texts are raised as Discord approval cards and happen only when approved.
     Ask {
         /// The question. Wrap in quotes if multi-word; use --stdin for private prompts.
         #[arg(required_unless_present = "stdin")]
@@ -5021,12 +5035,19 @@ async fn main() -> Result<()> {
             ImessageOp::DenyInbound { identifier } => {
                 imessage_send::set_allowlist(&store, false, false, identifier)
             }
+            ImessageOp::ContactDefaults { inbound, outbound } => {
+                store.set_imessage_contact_defaults(*inbound, *outbound)?;
+                imessage_send::print_allowlists(&store)
+            }
             ImessageOp::Allowlist => imessage_send::print_allowlists(&store),
             ImessageOp::Approve { action_id } => {
                 imessage_send::run_cli_resolve(Arc::clone(&store), action_id, true).await
             }
             ImessageOp::Skip { action_id } => {
                 imessage_send::run_cli_resolve(Arc::clone(&store), action_id, false).await
+            }
+            ImessageOp::Compose(args) => {
+                imessage_compose::run(&store, cli.wiki_dir.clone(), args).await
             }
         },
         Cmd::Calendar { op } => match op {

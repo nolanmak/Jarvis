@@ -4467,6 +4467,111 @@ impl Store {
         Ok(ids)
     }
 
+    /// #1635 — the thread-wide flip above, minus rows whose `emails.kind` is
+    /// `excluded_kind`. An iMessage conversation can hold two kinds of pending
+    /// card: a drafted *reply* to the other person's newest text, and a
+    /// *compose* the owner started themselves. A newer inbound or a manual
+    /// reply retires the first (the draft answers a message that is no longer
+    /// the newest) but not the second: the owner's composed text still says
+    /// what they meant to say, and nothing has answered it. Same status and
+    /// `scheduledAtMs` scope as [`Self::mark_pending_drafts_superseded_by_thread`].
+    pub fn mark_pending_drafts_superseded_by_thread_except_kind(
+        &self,
+        thread_id: &str,
+        reason: &str,
+        excluded_kind: &str,
+    ) -> StoreResult<Vec<String>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT a.id FROM actions a \
+             LEFT JOIN emails e ON e.messageId = a.messageId \
+             WHERE a.threadId = ?1 AND a.status IN ('pending', 'dry_run') \
+               AND a.scheduledAtMs IS NULL \
+               AND COALESCE(e.kind, '') != ?2",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![thread_id, excluded_kind], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE actions \
+             SET status = 'superseded', \
+                 errorMessage = COALESCE(NULLIF(?1, ''), 'superseded by manual reply'), \
+                 updatedAt = ?2 \
+             WHERE status IN ('pending', 'dry_run') AND id IN ({placeholders})"
+        );
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![reason.to_string().into(), now.into()];
+        values.extend(ids.iter().map(|id| rusqlite::types::Value::from(id.clone())));
+        guard.execute(&sql, rusqlite::params_from_iter(values))?;
+        Ok(ids)
+    }
+
+    /// Atomically replace pending composes and persist their recipient/body.
+    /// Reserve initial card posting for one minute so the daemon cannot race
+    /// the one-shot CLI. A failed post releases it; a crash expires the lease.
+    pub fn create_imessage_compose(&self, email: &Email, body: &str) -> StoreResult<(String, Vec<String>)> {
+        if email.platform != "imessage" || email.kind != "compose" || body.trim().is_empty() {
+            return Err(StoreError::InvalidInput("invalid iMessage compose".into()));
+        }
+        let thread = email.thread_id.as_deref().filter(|s| s.starts_with("imessage:"))
+            .ok_or_else(|| StoreError::InvalidInput("invalid iMessage compose thread".into()))?;
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let context = serde_json::to_string(&(email.to.clone(),email.cc.clone(),email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let superseded = {
+            let mut q = tx.prepare("SELECT a.id FROM actions a JOIN emails e ON e.messageId=a.messageId
+                WHERE a.threadId=?1 AND e.platform='imessage' AND e.kind='compose'
+                AND a.status='pending' AND a.scheduledAtMs IS NULL ORDER BY a.createdAt,a.id")?;
+            let rows = q.query_map([thread], |r| r.get::<_,String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,accountEntityId,firstSeenAt,platform,kind,retryGuardContext)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'imessage','compose',?9)",
+            params![email.message_id,thread,email.from,email.subject,redact::mask(&email.body).as_ref(),email.date,email.account_entity_id,now,context])?;
+        for old in &superseded {
+            tx.execute("UPDATE actions SET status='superseded',errorMessage='superseded by follow-up compose',updatedAt=?2 WHERE id=?1 AND status='pending'",params![old,now])?;
+        }
+        tx.execute("INSERT INTO actions(id,messageId,threadId,fromEmail,subject,originalBody,draftBody,status,createdAt,updatedAt,nudgeCount,nextNudgeAtMs)
+            VALUES(?1,?2,?3,?4,?5,NULL,?6,'pending',?7,?7,1,?7+60000)",
+            params![id,email.message_id,thread,email.from,email.subject,redact::mask(body).as_ref(),now])?;
+        tx.commit()?;
+        Ok((id,superseded))
+    }
+
+    /// #1635 — ids of pending compose cards on `thread_id`: rows whose
+    /// `emails.kind` is `kind`, still `pending` and not carrying a send-at
+    /// proposal. A follow-up compose to the same person replaces these.
+    pub fn pending_action_ids_for_thread_kind(
+        &self,
+        thread_id: &str,
+        kind: &str,
+    ) -> StoreResult<Vec<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT a.id FROM actions a \
+             JOIN emails e ON e.messageId = a.messageId \
+             WHERE a.threadId = ?1 AND e.kind = ?2 AND a.status = 'pending' \
+               AND a.scheduledAtMs IS NULL \
+             ORDER BY a.createdAt ASC",
+        )?;
+        let ids = stmt
+            .query_map(params![thread_id, kind], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
     /// #449 — record a message the daemon itself just sent, so the
     /// OutboundObserver can skip it when it scans the SENT folder instead of
     /// misreading it as a reply the user typed by hand.
@@ -4600,6 +4705,7 @@ impl Store {
               WHERE a.status = 'pending' \
                 AND a.scheduledAtMs IS NULL \
                 AND COALESCE(e.kind, '') NOT IN ('identity_merge', 'sign_pdf') \
+                AND NOT (COALESCE(e.platform,'')='imessage' AND COALESCE(e.kind,'')='compose') \
               ORDER BY a.createdAt ASC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -7003,8 +7109,22 @@ impl Store {
     /// post a second card in the window.
     pub fn recompose_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
         let now = now_millis();
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Restoring an older owner compose is a replacement too. Serialize
+        // against new composes so a conversation never gains two pending texts.
+        let compose_thread: Option<String> = tx.query_row(
+            "SELECT a.threadId FROM actions a JOIN emails e ON e.messageId=a.messageId
+             WHERE a.id=?1 AND a.status='superseded' AND e.platform='imessage' AND e.kind='compose'",
+            [action_id], |r| r.get(0),
+        ).optional()?;
+        if let Some(thread) = compose_thread {
+            tx.execute("UPDATE actions SET status='superseded',errorMessage='superseded by restored compose',updatedAt=?3
+                WHERE threadId=?1 AND id!=?2 AND status='pending' AND scheduledAtMs IS NULL
+                AND messageId IN (SELECT messageId FROM emails WHERE platform='imessage' AND kind='compose')",
+                params![thread,action_id,now])?;
+        }
+        let n = tx.execute(
             "UPDATE actions \
                 SET status = 'pending', recomposedAtMs = ?4, errorMessage = NULL, \
                     nudgeCount = 1, nextNudgeAtMs = ?2, \
@@ -7012,6 +7132,7 @@ impl Store {
               WHERE id = ?1 AND status = 'superseded'",
             params![action_id, now + NUDGE_INTERVAL_MS, source, now],
         )?;
+        tx.commit()?;
         Ok(n == 1)
     }
 
@@ -12215,6 +12336,57 @@ mod tests {
         assert_eq!(s2, "superseded");
         assert_eq!(s3, "pending", "T2 must be untouched");
         assert_eq!(e1.as_deref(), Some("superseded by manual reply"));
+    }
+
+    /// #1635 — the kind-aware variant leaves a pending compose alone and
+    /// the lookup finds exactly the pending composes on a thread.
+    // pii-ok — synthetic test fixture.
+    #[test]
+    fn supersede_except_kind_keeps_composes_and_lookup_finds_them() {
+        let (s, _f) = fresh_store();
+        let email = |id: &str, kind: &str| Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: id.into(),
+            thread_id: Some("imessage:+15555550100".into()), // pii-ok synthetic
+            from: "+15555550100".into(), // pii-ok synthetic
+            subject: "s".into(),
+            body: String::new(),
+            date: String::new(),
+            account_entity_id: Some("imessage".into()),
+            platform: "imessage".into(),
+            kind: kind.into(),
+        };
+        s.upsert_email(&email("r1", "dm")).unwrap();
+        s.upsert_email(&email("c1", "compose")).unwrap();
+        s.upsert_email(&email("c2", "compose")).unwrap();
+        let t = "imessage:+15555550100"; // pii-ok synthetic
+        let reply = s.log_action("r1", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+        let comp1 = s.log_action("c1", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+        let comp2 = s.log_action("c2", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+        // An action with no emails row at all counts as kind '' and is swept.
+        let orphan = s.log_action("o1", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+
+        let mut found = s.pending_action_ids_for_thread_kind(t, "compose").unwrap();
+        found.sort();
+        let mut want = vec![comp1.clone(), comp2.clone()];
+        want.sort();
+        assert_eq!(found, want);
+        assert!(s.pending_action_ids_for_thread_kind("imessage:+15555550199", "compose").unwrap().is_empty()); // pii-ok synthetic
+
+        let mut swept = s
+            .mark_pending_drafts_superseded_by_thread_except_kind(t, "superseded by manual reply", "compose")
+            .unwrap();
+        swept.sort();
+        let mut want = vec![reply.clone(), orphan.clone()];
+        want.sort();
+        assert_eq!(swept, want);
+        let status = |id: &str| s.get_action_with_email(id).unwrap().map(|a| a.action.status);
+        assert_eq!(status(&reply).as_deref(), Some("superseded"));
+        assert_eq!(status(&comp1).as_deref(), Some("pending"));
+        assert_eq!(status(&comp2).as_deref(), Some("pending"));
+        assert!(s.pending_action_ids_for_thread_kind(t, "dm").unwrap().is_empty());
     }
 
     /// `dry_run` rows on the same thread also get swept — they're equivalent
