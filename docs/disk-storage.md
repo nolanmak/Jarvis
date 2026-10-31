@@ -119,6 +119,16 @@ the disk, admission still refuses rather than lowering the reserve. Reclaimed
 dependencies can make the next build slower, but do not require relocating or
 replacing the deployed executable.
 
+For a specific build admission, pressure cleanup considers only filesystems
+containing that writer's monitored target, profile, and scratch paths. A release
+build blocked on the root filesystem does not pressure-delete warm Cargo caches
+on an unrelated build volume, even if that volume is also below the same
+threshold. Multiple monitored filesystems remain independently eligible, and
+unknown or empty filesystem scope refuses cleanup. Discovering `disk prune`
+continues proactive pressure cleanup across all owned build filesystems. A
+filesystem with no eligible cache still refuses admission; this does not change
+the free-space floor, growth reservation, ownership, or live-build exclusions.
+
 The same pass retires registered Autoship worktrees under
 `.self-improve-worktrees` after 24 hours without writes. It holds the fresh,
 resume, and per-PR run locks, requires HEAD to be reachable from `origin/main`,
