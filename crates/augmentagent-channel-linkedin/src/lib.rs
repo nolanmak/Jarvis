@@ -10,6 +10,9 @@
 //! store in `linkedin-auth.json` (vault if mounted, repo root otherwise).
 
 pub mod api;
+pub mod archive;
+pub mod archive_store;
+pub mod archive_sync;
 pub mod auth;
 pub mod channel;
 pub mod connections;

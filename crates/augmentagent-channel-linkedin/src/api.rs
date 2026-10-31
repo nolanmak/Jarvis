@@ -241,6 +241,10 @@ impl LinkedInApi for VoyagerClient {
         conversation_urn: &str,
         text: &str,
     ) -> Result<String, LinkedInError> {
+        crate::archive::ArchiveReader::new(self.auth.clone())
+            .map_err(|e| LinkedInError::Config(e.to_string()))?
+            .require_direct(conversation_urn).await
+            .map_err(|e| LinkedInError::Config(e.to_string()))?;
         let url = "https://www.linkedin.com/voyager/api/voyagerMessagingDashMessengerMessages\
                    ?action=createMessage";
 

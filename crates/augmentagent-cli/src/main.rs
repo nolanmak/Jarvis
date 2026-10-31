@@ -2,6 +2,7 @@
 
 mod approval_context;
 mod team_coverage;
+mod linkedin_archive;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
 mod document_signing;
@@ -2632,11 +2633,42 @@ enum LinkedinOp {
     /// store to look up. Gmail has `gmail search` for exactly this; LinkedIn
     /// had nothing.
     RecentDms {
-        /// Cap the number of threads listed.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
+        #[arg(long, default_value = "INBOX")]
+        category: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        max_pages: usize,
+    },
+    /// Read paginated live history, including group and owner messages.
+    Thread {
+        conversation_urn: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        max_pages: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Archive-only, resumable import. No drafts, cards or sends.
+    Backfill {
+        /// Omit to enumerate every category reported by the mailbox API.
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        max_pages: usize,
+        /// Reconcile mailbox heads again without deleting stored history.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Persisted coverage, not a credentials-present indicator.
+    ArchiveStatus {
+        #[arg(long, default_value = "INBOX")]
+        category: String,
     },
     /// Draft a DM reply into a Discord approval card (#572). Mirrors
     /// `gmail compose --post`: without `--post` it prints the draft, with it
@@ -4702,11 +4734,13 @@ async fn main() -> Result<()> {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
                 run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
             }
-            LinkedinOp::RecentDms { limit, json } => {
-                let repo_root =
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                run_linkedin_recent_dms(repo_root, *limit, *json).await
-            }
+            LinkedinOp::RecentDms { limit, json, category, cursor, max_pages } =>
+                linkedin_archive::recent(*limit,*json,category,cursor.as_deref(),*max_pages).await,
+            LinkedinOp::Thread { conversation_urn, cursor, max_pages, json } =>
+                linkedin_archive::thread(conversation_urn,cursor.as_deref(),*max_pages,*json).await,
+            LinkedinOp::Backfill { category, max_pages, refresh } =>
+                linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh).await,
+            LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
             LinkedinOp::Dm {
                 conversation_urn,
                 with,
@@ -8077,6 +8111,9 @@ async fn run_linkedin_dm(
     post: bool,
     json: bool,
 ) -> Result<()> {
+    let auth = LinkedInAuth::load_with_migration(&std::env::current_dir()?)?;
+    augmentagent_channel_linkedin::archive::ArchiveReader::new(auth)?
+        .require_direct(&conversation_urn).await?;
     let draft = read_body(body, body_file)?;
     anyhow::ensure!(!draft.trim().is_empty(), "--body (or --body-file) is required");
     let counterparty = with.unwrap_or_else(|| "them".to_string());
@@ -8192,57 +8229,6 @@ async fn run_linkedin_comment(
     Ok(())
 }
 
-
-/// `linkedin recent-dms` — list recent DM threads and their conversation urns.
-///
-/// Read-only: one Voyager GET, no writes, nothing sent. Its whole purpose is
-/// to hand the agent the `--conversation-urn` that `linkedin dm` requires.
-async fn run_linkedin_recent_dms(
-    repo_root: PathBuf,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let auth = LinkedInAuth::load_with_migration(&repo_root)
-        .context("load linkedin auth (run `linkedin login`)")?;
-    let my_urn = auth.member_urn.clone();
-    let voyager = VoyagerClient::new(auth);
-    let dms = voyager
-        .fetch_recent_dms()
-        .await
-        .context("fetch recent linkedin dms")?;
-    // Drop our own outbound messages: you don't reply to yourself, and they
-    // would only pad the list the agent has to disambiguate.
-    let rows: Vec<_> = dms
-        .into_iter()
-        .filter(|d| !d.is_outbound(&my_urn))
-        .take(limit)
-        .collect();
-    if json {
-        let out: Vec<_> = rows
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "conversation_urn": d.conversation_urn,
-                    "message_urn": d.message_urn,
-                    "peer_name": d.peer_name,
-                    "text": d.text,
-                    "delivered_at_ms": d.delivered_at_ms,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-    if rows.is_empty() {
-        println!("(no recent inbound LinkedIn DMs)");
-        return Ok(());
-    }
-    for d in &rows {
-        let preview: String = d.text.chars().take(70).collect();
-        println!("{}\n  from: {}\n  {}\n", d.conversation_urn, d.peer_name, preview);
-    }
-    Ok(())
-}
 
 /// #1188 (review) — hard wall-clock bound on one card's best-effort redraw.
 /// serenity's `Http` (like `#500`'s ComposioClient) sets no request timeout,

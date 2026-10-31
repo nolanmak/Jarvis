@@ -439,6 +439,25 @@ fn narrow_to_households(
     Ok(())
 }
 
+// Membership names complement wiki identities, including silent participants.
+fn resolve_people_and_members(c: &Connection, reference: &str) -> augmentagent_store::rusqlite::Result<Vec<PersonMatch>> {
+    let mut found = people::resolve_person(c, reference)?;
+    let needle = reference.trim().to_lowercase();
+    if needle.is_empty() || reference.contains(':') { return Ok(found); }
+    let mut q = c.prepare("SELECT DISTINCT urn,name FROM linkedin_archive_participants")?;
+    let rows = q.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
+    for row in rows {
+        let (urn,name) = row?;
+        let normalized = name.to_lowercase();
+        if normalized != needle && !normalized.split_whitespace().any(|word| word == needle) { continue; }
+        for mut candidate in people::resolve_person(c, &format!("linkedin:{urn}"))? {
+            if candidate.name.is_none() { candidate.name = Some(name.clone()); }
+            if !found.iter().any(|f|f.key == candidate.key) { found.push(candidate); }
+        }
+    }
+    Ok(found)
+}
+
 /// Resolve every person reference in the query, then narrow by household.
 fn person_refs(c: &Connection, q: &Query) -> augmentagent_store::rusqlite::Result<Vec<PersonRef>> {
     let mut refs = Vec::new();
@@ -456,7 +475,7 @@ fn person_refs(c: &Connection, q: &Query) -> augmentagent_store::rusqlite::Resul
         );
     for (reference, slot) in listed {
         refs.push(PersonRef {
-            matches: people::resolve_person(c, reference)?,
+            matches: resolve_people_and_members(c, reference)?,
             reference: reference.clone(),
             slot,
         });
@@ -489,8 +508,16 @@ pub fn plan(
     let conversation_clause = |sql: &mut Sql, handles: &[String]| {
         let list = sql.in_list(handles);
         sql.filters.push(format!(
-            "mi.conversation_id IN (SELECT conversation_id FROM message_index \
-             WHERE sender_handle IN ({list}) OR counterpart_handle IN ({list}))"
+            "((NOT EXISTS(SELECT 1 FROM linkedin_archive_messages known WHERE known.stored_id=mi.message_id) \
+              AND EXISTS(SELECT 1 FROM message_index peer \
+                JOIN emails pe ON pe.messageId=peer.message_id \
+                JOIN emails own ON own.messageId=mi.message_id \
+                WHERE peer.platform=mi.platform AND peer.conversation_id=mi.conversation_id \
+                AND pe.accountEntityId IS own.accountEntityId \
+                AND (peer.sender_handle IN ({list}) OR peer.counterpart_handle IN ({list})))) OR \
+             (mi.platform='linkedin' AND EXISTS(SELECT 1 FROM linkedin_archive_messages am \
+              JOIN linkedin_archive_participants ap ON ap.account=am.account AND ap.conversation=am.conversation \
+              WHERE am.stored_id=mi.message_id AND ('linkedin:' || ap.urn) IN ({list}))))"
         ));
     };
 
