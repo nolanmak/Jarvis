@@ -2664,6 +2664,9 @@ enum LinkedinOp {
         /// Reconcile mailbox heads again without deleting stored history.
         #[arg(long)]
         refresh: bool,
+        /// Read into memory only; do not open the production database.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Persisted coverage, not a credentials-present indicator.
     ArchiveStatus {
@@ -3064,6 +3067,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Dry-run must precede Store::open and all persistent bootstrap hooks.
+    if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true } } = cli.cmd {
+        return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh).await;
+    }
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
@@ -4738,7 +4745,7 @@ async fn main() -> Result<()> {
                 linkedin_archive::recent(*limit,*json,category,cursor.as_deref(),*max_pages).await,
             LinkedinOp::Thread { conversation_urn, cursor, max_pages, json } =>
                 linkedin_archive::thread(conversation_urn,cursor.as_deref(),*max_pages,*json).await,
-            LinkedinOp::Backfill { category, max_pages, refresh } =>
+            LinkedinOp::Backfill { category, max_pages, refresh, .. } =>
                 linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh).await,
             LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
             LinkedinOp::Dm {

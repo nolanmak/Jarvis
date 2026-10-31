@@ -204,6 +204,7 @@ augmentagent linkedin recent-dms --limit 40 --category PRIMARY_INBOX --json
 augmentagent linkedin recent-dms --limit 40 --category PRIMARY_INBOX --cursor '<returned-cursor>' --json
 augmentagent linkedin thread '<conversation-urn>' --max-pages 10 --json
 augmentagent linkedin backfill --max-pages 100
+augmentagent linkedin backfill --dry-run --max-pages 100
 augmentagent linkedin archive-status --category PRIMARY_INBOX
 ```
 
@@ -226,6 +227,15 @@ a newer pause.
 
 Backfill defaults to all categories exposed by the account's mailbox inventory.
 It stores group and owner messages without drafting, raising cards or sending.
+`--dry-run` performs the same bounded live reads and indexing in a fresh in-memory
+database. It does not open or migrate the configured database, advance durable
+checkpoints, migrate credentials, or repair credential-file permissions. Its
+counts describe a fresh traversal, not the number of new rows relative to an
+existing archive. JSON identifies `dry_run`, `persistent_writes`, the
+`all_accessible_history` scope, request `pages`, and completion. Category discovery
+consumes one request from `--max-pages`; a zero budget performs no requests or
+credential reads and reports incomplete coverage. Missing credentials fail
+without creating database or credential files.
 Repeat bounded invocations to resume durable progress; `--refresh` reconciles
 mailbox heads while preserving imported history. Completion requires mailbox
 and thread exhaustion and a healthy search index. A successful request alone

@@ -116,16 +116,39 @@ pub async fn backfill(
     max_pages: usize,
     refresh: bool,
 ) -> Result<()> {
-    let api = reader()?;
-    let categories = match category {
-        Some(c) => vec![c.to_string()],
-        None => archive_sync::categories(&api, &store, &CancellationToken::new())
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "LinkedIn account reads deferred; inspect archive-status before retrying"
-                )
-            })?,
+    run_backfill(store, category, max_pages, refresh, false).await
+}
+
+pub async fn dry_run(category: Option<&str>, max_pages: usize, refresh: bool) -> Result<()> {
+    // This entry point runs before normal CLI bootstrap opens the disk store.
+    run_backfill(
+        Arc::new(Store::open(":memory:")?),
+        category,
+        max_pages,
+        refresh,
+        true,
+    )
+    .await
+}
+
+async fn run_backfill(
+    store: Arc<Store>,
+    category: Option<&str>,
+    max_pages: usize,
+    refresh: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if max_pages == 0 {
+        println!(
+            "{}",
+            serde_json::json!({"schema_version":1,"dry_run":dry_run,"persistent_writes":!dry_run,"archive_only":true,"scope":"all_accessible_history","categories":category.into_iter().collect::<Vec<_>>(),"complete":false,"pages":0,"stopped":"page_budget","reports":[]})
+        );
+        return Ok(());
+    }
+    let api = if dry_run {
+        ArchiveReader::new(LinkedInAuth::load_read_only(&std::env::current_dir()?)?)?
+    } else {
+        reader()?
     };
     let cancel = CancellationToken::new();
     let signal = cancel.clone();
@@ -134,21 +157,54 @@ pub async fn backfill(
             signal.cancel();
         }
     });
-    let mut reports = Vec::new();
-    let mut remaining = max_pages;
-    let result:Result<()>=async{
-        for category in &categories{
-            if refresh{db::refresh_mailbox(&store,api.mailbox(),category)?;}
-            let report=archive_sync::sync(&api,&store,category,remaining,&cancel).await?;
-            remaining=remaining.saturating_sub(report.pages);reports.push(report);
-        }
-        augmentagent_messages::index::drain(&store,100,std::time::Duration::from_millis(10))?;
-        for (report,category) in reports.iter_mut().zip(&categories){report.coverage=db::coverage(&store,api.mailbox(),category)?;}
-        println!("{}",serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"archive_only":true,"categories":categories,"complete":reports.iter().all(|r|r.coverage.complete),"reports":reports}))?);
-        Ok(())
-    }.await;
+    let result =
+        backfill_with_reader(&api, &store, category, max_pages, refresh, dry_run, &cancel).await;
     task.abort();
-    result
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
+}
+
+/// Shared command implementation; callers choose durable or in-memory storage.
+pub async fn backfill_with_reader(
+    api: &ArchiveReader,
+    store: &Store,
+    category: Option<&str>,
+    max_pages: usize,
+    refresh: bool,
+    dry_run: bool,
+    cancel: &CancellationToken,
+) -> Result<serde_json::Value> {
+    let mut remaining = max_pages;
+    let categories = match category {
+        Some(c) => vec![c.to_string()],
+        None if remaining == 0 => Vec::new(),
+        None => {
+            let categories = archive_sync::categories(api, store, cancel).await?
+                .ok_or_else(|| anyhow::anyhow!("LinkedIn account reads deferred or cancelled; inspect archive-status before retrying"))?;
+            remaining -= 1;
+            categories
+        }
+    };
+    let mut reports = Vec::new();
+    for category in &categories {
+        if refresh && remaining > 0 && !cancel.is_cancelled() {
+            db::refresh_mailbox(store, api.mailbox(), category)?;
+        }
+        let report = archive_sync::sync(api, store, category, remaining, cancel).await?;
+        remaining = remaining.saturating_sub(report.pages);
+        let deferred = report.account_deferred;
+        reports.push(report);
+        if deferred || cancel.is_cancelled() {
+            break;
+        }
+    }
+    augmentagent_messages::index::drain(store, 100, std::time::Duration::from_millis(10))?;
+    for (report, category) in reports.iter_mut().zip(&categories) {
+        report.coverage = db::coverage(store, api.mailbox(), category)?;
+    }
+    Ok(
+        serde_json::json!({"schema_version":1,"dry_run":dry_run,"persistent_writes":!dry_run,"archive_only":true,"scope":"all_accessible_history","categories":categories,"complete":!categories.is_empty() && reports.len()==categories.len() && reports.iter().all(|r|r.coverage.complete),"pages":max_pages-remaining,"reports":reports}),
+    )
 }
 
 pub fn status(store: &Store, category: &str) -> Result<()> {
