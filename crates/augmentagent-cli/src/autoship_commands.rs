@@ -59,14 +59,20 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
         };
         let workflow = canonical.as_str();
         let command = store.command_request(workflow)?;
+        let attempt = store.command_attempt(workflow)?;
         let Some(snapshot) = store.snapshot(workflow)? else {
             let Some(command) = command else { return Ok(None); };
             // Admission is durable before a worker claims the job. There is no
             // execution/head/worker-liveness evidence at this point.
-            return Ok(Some((0, json!({"schema_version":1,"workflow":workflow,
+            // A failed attempt is still retryable. Only authoritative workflow
+            // state may turn it into a terminal workflow failure.
+            let code=if attempt.is_some() {3} else {0};
+            return Ok(Some((code, json!({"schema_version":1,"workflow":workflow,
                 "repository":command.repository,"target":command.target,
-                "accepted":true,"complete":false,"stage":"queued","reason":"awaiting-worker-claim",
-                "next_action":"claim_workflow","eligible_at_ms":null,"head":null,
+                "accepted":true,"complete":false,"stage":"queued",
+                "reason":attempt.as_ref().map_or("awaiting-worker-claim",|a|a.reason.as_str()),
+                "next_action":if attempt.is_some() {"retry_worker_attempt"} else {"claim_workflow"},
+                "eligible_at_ms":attempt.as_ref().map(|a|a.eligible_at_ms),"head":null,"last_attempt":attempt,
                 "provider":command.provider,"workflow_until":command.until,"pr_url":null,
                 "worker":{"state":"unknown"},"merge":{"state":"not-confirmed"},
                 "deployment":{"state":"unknown"},"allowance":null,
@@ -117,7 +123,7 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             "deployment":{"state":"unknown"},"allowance":allowance,"pending_merge_operations":pending,"pending_merge_evidence":pending_evidence,
             "resources":{"attempts":snapshot.attempts,"model_calls":snapshot.model_calls,"tokens":snapshot.tokens,"wall_ms":snapshot.wall_ms},
             "lease":{"active":snapshot.lease_until_ms > now,"generation":snapshot.generation},
-            "progress_at_ms":snapshot.progress_at_ms}),
+            "progress_at_ms":snapshot.progress_at_ms,"last_attempt":attempt}),
         )))
     })();
     match observed {

@@ -345,6 +345,19 @@ mod tests {
                 !root.join(".self-improve-worktrees").exists(),
                 "resolution prepared a checkout"
             );
+            // The worker persists a readiness deferral even when no executing
+            // workflow was created; a fresh status reader must explain it.
+            scenario(serde_json::json!({"permission":"WRITE","issue":issue}));
+            let id=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap()
+                .submit_authorized("worker-readiness","github:owner",&request,1).unwrap().workflow;
+            let error=run_once(&root,false).await.err().expect("missing runtime should defer");
+            assert_eq!(error.downcast_ref::<CommandFailure>().unwrap().reason,"execution-readiness-blocked");
+            let (code,status)=crate::autoship_commands::status(&workflow::path(),&id,chrono::Utc::now().timestamp_millis(),5);
+            assert_eq!(code,3);assert_eq!(status["reason"],"execution-readiness-blocked");
+            assert_eq!(status["last_attempt"]["outcome"],"deferred");
+            assert_eq!(status["worker"]["state"],"unknown");
+            assert!(status["head"].is_null());
+            assert!(!root.join(".self-improve-worktrees").exists());
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -374,6 +387,8 @@ root=pathlib.Path(os.environ['AUTOSHIP_TARGET_RESOLUTION_FIXTURE'])
 a=sys.argv[1:];s=json.loads((root/'scenario.json').read_text())
 if a[:2]==['repo','view']:
  print(s['permission'] if 'viewerPermission' in a else 'owner/repo')
+elif a[:2]==['api','user']: print('owner')
+elif a[:2]==['pr','list']: print('[]')
 elif a[:1]==['api'] and a[1]=='repos/owner/repo/issues/7':print(json.dumps(s['issue']))
 elif a[:2]==['pr','view'] and a[2]=='42':print(json.dumps(s['pr']))
 else:raise Exception('unexpected request '+repr(a))
@@ -383,6 +398,7 @@ else:raise Exception('unexpected request '+repr(a))
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
         let output=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","self_improve::targeted::tests::explicit_targets_are_authorized_and_bound_before_execution","--nocapture"])
+            .env_remove("AUGMENTAGENT_NATIVE_VM_POLICY")
             .env(CHILD,root).env("GH_BIN",gh).env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","owner")
             .env("XDG_STATE_HOME",root.join("state")).env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.join("state/workflow.db"))
             .output().unwrap();

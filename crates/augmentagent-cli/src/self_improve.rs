@@ -7552,10 +7552,24 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         if queued {
             let repository = tokio::time::timeout(std::time::Duration::from_secs(30),
                 workflow::canonical_repository(repo_root)).await.context("queue repository lookup timed out")??;
+            let selected_at = chrono::Utc::now().timestamp_millis();
             let next = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
-                .next_command_job(&repository, chrono::Utc::now().timestamp_millis())?;
+                .next_command_job(&repository, selected_at)?;
             if let Some(id) = next {
-                return targeted::work_once_mode(repo_root, &id, targeted::ExecutionMode::Background).await;
+                use crate::autoship_workflow::submission::AttemptOutcome;
+                let result = targeted::work_once_mode(repo_root, &id, targeted::ExecutionMode::Background).await;
+                let (outcome,reason) = match &result {
+                    Ok(report) if report.is_idle() => (AttemptOutcome::Deferred,"workflow-deferred"),
+                    Ok(_) => (AttemptOutcome::Progress,"workflow-progressed"),
+                    Err(error) => match error.downcast_ref::<targeted::CommandFailure>() {
+                        Some(failure) if failure.code==2 => (AttemptOutcome::Rejected,failure.reason),
+                        Some(failure) if failure.code==3 => (AttemptOutcome::Deferred,failure.reason),
+                        _ => (AttemptOutcome::Failed,"execution-failed"),
+                    },
+                };
+                crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+                    .finish_command_attempt(&id,selected_at,outcome,reason,chrono::Utc::now().timestamp_millis())?;
+                return result;
             }
         }
     }
@@ -10734,6 +10748,7 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 /// must approve before any PR opens. Not-fixable verdicts stop after one
 /// call. Budget the daily cap accordingly.
 pub struct AutoPrLoop {
+    command_repository: Option<String>,
     upgrade: Option<crate::autoship_worker::UpgradeWatch>,
     repo_root: PathBuf,
     dry_run: bool,
@@ -11677,6 +11692,7 @@ impl AutoPrLoop {
             .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
             .max(300);
         Some(Self {
+            command_repository: None,
             upgrade: None,
             repo_root,
             dry_run,
@@ -11702,6 +11718,7 @@ impl AutoPrLoop {
     #[cfg(test)]
     fn for_tests(repo_root: PathBuf, daily_cap: u32, state: &Path) -> Self {
         Self {
+            command_repository: None,
             upgrade: None,
             repo_root,
             dry_run: true,
@@ -11826,7 +11843,7 @@ impl AutoPrLoop {
         }
     }
 
-    async fn run_builds<F, T>(self, shutdown: tokio_util::sync::CancellationToken, tick: F) -> Result<()>
+    async fn run_builds<F, T>(mut self, shutdown: tokio_util::sync::CancellationToken, tick: F) -> Result<()>
     where F: Fn() -> T, T: std::future::Future<Output = Result<RunReport>>,
     {
         info!(
@@ -11836,6 +11853,8 @@ impl AutoPrLoop {
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
         let counter_path = self.counter_path.clone();
+        let mut queue_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+        queue_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let next_tick = tokio::time::Instant::now() + self.interval;
             loop {
@@ -11846,6 +11865,34 @@ impl AutoPrLoop {
                         return Ok(());
                     }
                     _ = tokio::time::sleep_until(next_tick) => break,
+                    _ = queue_timer.tick(), if !self.dry_run => {
+                        // Retry unavailable identity on subsequent polls. No network
+                        // lookup is needed while the durable command queue is empty.
+                        if self.command_repository.is_none() {
+                            let queued = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
+                                .and_then(|store| store.map(|s| s.has_command_jobs()).transpose());
+                            match queued {
+                                Ok(Some(true)) => {},
+                                Ok(_) => continue,
+                                Err(error) => { warn!("command queue wake-up unavailable: {error:#}"); continue; }
+                            }
+                            self.command_repository = tokio::time::timeout(std::time::Duration::from_secs(30),
+                                workflow::canonical_repository(&self.repo_root)).await.ok().and_then(Result::ok);
+                            if self.command_repository.is_none() {
+                                warn!("command queue identity unavailable; normal polling remains active");
+                                continue;
+                            }
+                        }
+                        let due = crate::autoship_workflow::WorkflowStore::open_read_only(&self.workflow_path)
+                            .and_then(|store| store.map(|store| store.command_queue_due(
+                                self.command_repository.as_deref().unwrap(), (self.clock)().timestamp_millis()))
+                                .transpose().map(|due| due.unwrap_or(false)));
+                        match due {
+                            Ok(true) => break,
+                            Ok(false) => {},
+                            Err(error) => warn!("command queue wake-up unavailable: {error:#}"),
+                        }
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if self.upgrade.is_some() => {}
                 }
             }
@@ -11927,6 +11974,58 @@ mod progress_tests;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn queued_command_wakes_sleeping_worker_without_waiting_for_normal_tick() {
+        use super::*;
+        use crate::autoship_workflow::{WorkflowStore, submission::{Request,Target,Milestone}};
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let state=tempfile::tempdir().unwrap();
+        let mut worker=AutoPrLoop::for_tests("/nonexistent".into(),5,state.path());
+        worker.dry_run=false;
+        worker.command_repository=Some("owner/repo".into());
+        let path=worker.workflow_path.clone();
+        let stop=tokio_util::sync::CancellationToken::new();
+        let timer_stop=stop.clone();
+        let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+        let submitted=async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            WorkflowStore::open(&path).unwrap().submit_authorized("wake","owner",&Request {
+                repository:"owner/repo".into(),target:Target::Issue(7),provider:None,until:Milestone::Merged
+            },chrono::Utc::now().timestamp_millis()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(26)).await;
+            timer_stop.cancel();
+        };
+        let run=worker.run_with(stop,move || {
+            observed.fetch_add(1,Ordering::SeqCst);
+            async { Ok(RunReport::idle()) }
+        },|| async {0});
+        let (result,())=tokio::join!(run,submitted);result.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst),1,"eligible command waited for the 30-minute tick");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_wakeup_does_not_accelerate_unrelated_or_delayed_jobs() {
+        use super::*;
+        use crate::autoship_workflow::{WorkflowStore,submission::{Request,Target,Milestone}};
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        for repository in ["other/repo","owner/repo"] {
+            let state=tempfile::tempdir().unwrap();
+            let mut worker=AutoPrLoop::for_tests("/nonexistent".into(),5,state.path());
+            worker.dry_run=false;worker.command_repository=Some("owner/repo".into());
+            let now=chrono::Utc::now().timestamp_millis();
+            let mut store=WorkflowStore::open(&worker.workflow_path).unwrap();
+            store.submit_authorized("job","owner",&Request {repository:repository.into(),target:Target::Issue(7),provider:None,until:Milestone::Merged},now).unwrap();
+            if repository=="owner/repo" { store.next_command_job(repository,now).unwrap(); }
+            drop(store);
+            let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+            let stop=tokio_util::sync::CancellationToken::new();let timer_stop=stop.clone();
+            let run=worker.run_with(stop,move || {observed.fetch_add(1,Ordering::SeqCst);async {Ok(RunReport::idle())}},|| async {0});
+            let timer=async move {tokio::time::sleep(std::time::Duration::from_secs(61)).await;timer_stop.cancel();};
+            let (result,())=tokio::join!(run,timer);result.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst),0);
+        }
+    }
+
     // #1705: an infrastructure fault must never exhaust the shipping allowance.
     #[tokio::test(start_paused = true)]
     async fn failed_attempts_do_not_exhaust_shipping_allowance() {

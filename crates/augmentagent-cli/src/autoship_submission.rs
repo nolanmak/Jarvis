@@ -96,13 +96,80 @@ fn policy(conn: &Connection, workflow: &str) -> Result<Option<(Milestone, Option
     .transpose()
 }
 
+const DUE_COMMAND_SQL: &str = "SELECT j.workflow FROM command_job j
+             LEFT JOIN command_schedule s ON s.workflow=j.workflow
+             LEFT JOIN workflow w ON w.id=j.workflow
+             WHERE j.repository=?1 AND COALESCE(s.eligible_at,0)<=?2
+             AND (w.id IS NULL OR (
+                w.lease_until<=?2
+                AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
+                AND json_extract(w.checkpoint,'$.stage') NOT IN ('held','retired','merged','merge')
+                AND NOT (j.until_milestone='\"pr\"' AND json_extract(w.checkpoint,'$.stage')='await_checks')
+             ))
+             ORDER BY COALESCE(s.attempted_at,0),j.created_at,j.workflow LIMIT 1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome { Selected, Deferred, Rejected, Failed, Progress }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandAttempt {
+    pub selected_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub outcome: AttemptOutcome,
+    pub reason: String,
+    pub eligible_at_ms: i64,
+}
+
 impl WorkflowStore {
+    /// Read-only and compatible with pre-attempt stores. A selection receipt
+    /// is historical evidence, never proof of a currently live worker.
+    pub fn command_attempt(&self, workflow: &str) -> Result<Option<CommandAttempt>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_attempt')",
+            [], |row| row.get(0))?;
+        if !exists { return Ok(None); }
+        let raw: Option<(i64,Option<i64>,String,String,i64)> = self.conn.query_row(
+            "SELECT selected_at,finished_at,outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1",
+            [workflow], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
+        raw.map(|(selected_at_ms,finished_at_ms,outcome,reason,eligible_at_ms)| Ok(CommandAttempt {
+            selected_at_ms,finished_at_ms,outcome:serde_json::from_value(serde_json::Value::String(outcome))?,reason,eligible_at_ms
+        })).transpose()
+    }
+
+    /// A late result cannot overwrite a newer selected attempt. Keep bounded
+    /// machine reasons only; provider output and credentials never belong here.
+    pub fn finish_command_attempt(&self, workflow: &str, selected_at: i64, outcome: AttemptOutcome,
+        reason: &str, now: i64) -> Result<bool> {
+        ensure!(outcome != AttemptOutcome::Selected, "attempt outcome is not terminal");
+        ensure!(!reason.is_empty() && reason.len()<=128 && reason.bytes().all(|b|b.is_ascii_lowercase() || b==b'-'), "invalid attempt reason");
+        let outcome=serde_json::to_value(outcome)?;
+        Ok(self.conn.execute("UPDATE command_attempt SET finished_at=?3,outcome=?4,reason=?5
+            WHERE workflow=?1 AND selected_at=?2 AND finished_at IS NULL",
+            params![workflow,selected_at,now,outcome.as_str().unwrap(),reason])? == 1)
+    }
+
     pub fn has_command_jobs(&self) -> Result<bool> {
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_job')",
             [], |row| row.get(0))?;
         if !exists { return Ok(false); }
         Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM command_job)", [], |row| row.get(0))?)
+    }
+
+    /// Read-only wake-up hint. The selecting transaction and execution leases
+    /// must still recheck eligibility; this cannot authorize or reserve work.
+    pub fn command_queue_due(&self, repository: &str, now: i64) -> Result<bool> {
+        if !self.has_command_jobs()? { return Ok(false); }
+        let scheduled: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_schedule')",
+            [], |row| row.get(0))?;
+        if !scheduled {
+            return Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE repository=?1)",
+                [repository.to_ascii_lowercase()], |row| row.get(0))?);
+        }
+        Ok(self.conn.query_row(DUE_COMMAND_SQL, params![repository.to_ascii_lowercase(),now],
+            |row| row.get::<_,String>(0)).optional()?.is_some())
     }
 
     /// Reserve a scheduling turn, not a workflow lease or permission to spend.
@@ -120,21 +187,16 @@ impl WorkflowStore {
             return Ok(None);
         }
         let id: Option<String> = tx.query_row(
-            "SELECT j.workflow FROM command_job j
-             LEFT JOIN command_schedule s ON s.workflow=j.workflow
-             LEFT JOIN workflow w ON w.id=j.workflow
-             WHERE j.repository=?1 AND COALESCE(s.eligible_at,0)<=?2
-             AND (w.id IS NULL OR (
-                w.lease_until<=?2
-                AND json_extract(w.checkpoint,'$.next.eligible_at_ms')<=?2
-                AND json_extract(w.checkpoint,'$.stage') NOT IN ('held','retired','merged','merge')
-                AND NOT (j.until_milestone='\"pr\"' AND json_extract(w.checkpoint,'$.stage')='await_checks')
-             ))
-             ORDER BY COALESCE(s.attempted_at,0),j.created_at,j.workflow LIMIT 1",
+            DUE_COMMAND_SQL,
             params![repository,now], |row| row.get(0)).optional()?;
         if let Some(id) = &id {
             tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3)
                 ON CONFLICT(workflow) DO UPDATE SET attempted_at=excluded.attempted_at,eligible_at=excluded.eligible_at",
+                params![id,now,now.saturating_add(300_000)])?;
+            tx.execute("INSERT INTO command_attempt(workflow,selected_at,finished_at,outcome,reason,eligible_at)
+                VALUES(?1,?2,NULL,'selected','worker-attempt-unconfirmed',?3)
+                ON CONFLICT(workflow) DO UPDATE SET selected_at=excluded.selected_at,finished_at=NULL,
+                outcome=excluded.outcome,reason=excluded.reason,eligible_at=excluded.eligible_at",
                 params![id,now,now.saturating_add(300_000)])?;
             tx.execute("INSERT INTO command_lane_turn(repository,yield_normal) VALUES(?1,1)
                 ON CONFLICT(repository) DO UPDATE SET yield_normal=1", [&repository])?;
@@ -359,6 +421,31 @@ mod tests {
             until,
         }
     }
+    #[test]
+    fn command_attempt_result_is_durable_and_fenced_against_a_new_selection() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("queue.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id=store.submit_authorized("job","owner",&request(Milestone::Merged),1).unwrap().workflow;
+        assert!(store.command_queue_due("owner/repo",100).unwrap());
+        assert!(!store.command_queue_due("different/repo",100).unwrap());
+        store.next_command_job("owner/repo",100).unwrap().unwrap();
+        assert!(!store.command_queue_due("owner/repo",101).unwrap());
+        assert_eq!(store.command_attempt(&id).unwrap().unwrap().outcome,AttemptOutcome::Selected);
+        drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        assert!(store.finish_command_attempt(&id,100,AttemptOutcome::Deferred,"execution-readiness-blocked",110).unwrap());
+        assert!(!store.finish_command_attempt(&id,100,AttemptOutcome::Failed,"execution-failed",111).unwrap());
+        assert_eq!(store.command_attempt(&id).unwrap().unwrap().reason,"execution-readiness-blocked");
+        assert!(store.next_command_job("owner/repo",300100).unwrap().is_none());
+        assert!(store.next_command_job("owner/repo",300100).unwrap().is_some());
+        assert!(!store.finish_command_attempt(&id,100,AttemptOutcome::Progress,"workflow-progressed",300101).unwrap());
+        let current=store.command_attempt(&id).unwrap().unwrap();
+        assert_eq!(current.selected_at_ms,300100);assert!(current.finished_at_ms.is_none());
+        assert_eq!(current.outcome,AttemptOutcome::Selected);
+        assert!(store.snapshot(&id).unwrap().is_none());
+        assert_eq!(store.merge_allowance(300101,5).unwrap().available,5);
+    }
+
     #[test]
     fn command_queue_rotates_durably_and_preserves_normal_lane_turns() {
         let dir = tempfile::tempdir().unwrap();

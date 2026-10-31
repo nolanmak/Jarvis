@@ -402,3 +402,37 @@ fn queued_submission_is_visible_before_worker_claim_without_writes() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
+
+#[test]
+fn queued_worker_failure_survives_restart_and_status_never_claims_worker_liveness() {
+    let root=tempfile::tempdir().unwrap();let path=root.path().join("workflow.db");
+    let conn=rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE workflow(id TEXT PRIMARY KEY,branch TEXT,pr INTEGER,checkpoint TEXT,owner TEXT,
+        generation INTEGER,lease_until INTEGER,heartbeat_at INTEGER,progress_at INTEGER,attempts INTEGER,
+        wall_ms INTEGER,model_calls INTEGER,tokens INTEGER);
+        CREATE TABLE command_job(workflow TEXT PRIMARY KEY,repository TEXT,target TEXT,until_milestone TEXT,provider TEXT,created_at INTEGER);
+        CREATE TABLE pr_alias(id TEXT PRIMARY KEY,workflow TEXT);
+        CREATE TABLE command_attempt(workflow TEXT PRIMARY KEY,selected_at INTEGER,finished_at INTEGER,outcome TEXT,reason TEXT,eligible_at INTEGER);").unwrap();
+    conn.execute("INSERT INTO command_job VALUES(?1,?2,?3,?4,?5,10)",rusqlite::params![
+        "owner/repo/pr/42","owner/repo",r#"{"kind":"pr","number":42}"#,r#""merged""#,"null"]).unwrap();
+    conn.execute("INSERT INTO command_attempt VALUES(?1,100,NULL,'selected','worker-attempt-unconfirmed',300100)",["owner/repo/pr/42"]).unwrap();
+    drop(conn);
+    std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).unwrap();
+    for (outcome,reason) in [("selected","worker-attempt-unconfirmed"),("deferred","execution-readiness-blocked"),("failed","execution-failed")] {
+        if outcome!="selected" {
+            let conn=rusqlite::Connection::open(&path).unwrap();
+            conn.execute("UPDATE command_attempt SET finished_at=110,outcome=?1,reason=?2",rusqlite::params![outcome,reason]).unwrap();
+        }
+        let before=std::fs::read(&path).unwrap();
+        let output=status(root.path(),"owner/repo/pr/42");
+        assert_eq!(output.status.code(),Some(3),"{}",String::from_utf8_lossy(&output.stdout));
+        let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["reason"],reason);
+        assert_eq!(body["last_attempt"]["outcome"],outcome);
+        assert_eq!(body["eligible_at_ms"],300100);
+        assert_eq!(body["accepted"],true);assert_eq!(body["complete"],false);
+        assert_eq!(body["worker"]["state"],"unknown");
+        assert!(body["head"].is_null());
+        assert_eq!(std::fs::read(&path).unwrap(),before);
+    }
+}
