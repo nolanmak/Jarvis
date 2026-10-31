@@ -640,6 +640,7 @@ mod tests {
     #[test]
     fn immediate_card_uses_the_persisted_masked_draft_and_rejects_replaced_actions() {
         let f = fixture();
+        f.store.allow_imessage_outbound(PHONE).unwrap();
         let body = "Authorization: Bearer sk-fake-1234567890abcdef"; // pii-ok: synthetic redaction fixture
         let ComposeOutcome::Card { action_id, .. } =
             compose(&f.store, &f.config, PHONE, body, false)
