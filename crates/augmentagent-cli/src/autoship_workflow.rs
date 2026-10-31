@@ -323,6 +323,9 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS merge_transport_response (
                 operation TEXT PRIMARY KEY REFERENCES merge_allowance_dispatch(operation),
                 response TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS merge_private_marker (
+                operation TEXT PRIMARY KEY REFERENCES merge_allowance_dispatch(operation),
+                protocol INTEGER NOT NULL CHECK(protocol=1), nonce TEXT NOT NULL UNIQUE);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_pr
                 ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node

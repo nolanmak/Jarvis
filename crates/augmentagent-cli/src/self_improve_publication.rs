@@ -281,6 +281,8 @@ pub(super) struct MergeMutationReceipt {
     pub client_mutation_id: String,
     #[serde(default)]
     pub merged_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_message: Option<String>,
 }
 struct MergeTransport<'a>(&'a Path);
 #[async_trait::async_trait]
@@ -419,6 +421,7 @@ pub(super) fn accepted_merge_receipt(raw: &str, node: &str, pr: u64, head: &str,
         merged_by: actor.into(),
         client_mutation_id: operation_id.into(),
         merged_at: merged_at.into(),
+        merge_message: result["mergeCommit"]["message"].as_str().map(str::to_owned),
     })
 }
 
@@ -472,8 +475,8 @@ async fn merge_mutation(
         .context("missing PR node identity")?;
     require_strict_integration(github, repository).await?;
     store.reserve_merge(lease, operation, repository, pr, node, chrono::Utc::now().timestamp_millis(), cap)?;
-    store.dispatch_merge(lease, operation, chrono::Utc::now().timestamp_millis(), cap)?;
-    let query="mutation AutoshipMerge($id:ID!,$head:GitObjectID!,$request:String!){mergePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,mergeMethod:SQUASH,clientMutationId:$request}){clientMutationId pullRequest{id number state headRefOid mergedAt mergeCommit{oid} mergedBy{login}}}}";
+    let marker = store.dispatch_marked_merge(lease, operation, chrono::Utc::now().timestamp_millis(), cap)?;
+    let query="mutation AutoshipMerge($id:ID!,$head:GitObjectID!,$request:String!,$body:String!){mergePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,mergeMethod:SQUASH,clientMutationId:$request,commitBody:$body}){clientMutationId pullRequest{id number state headRefOid mergedAt mergeCommit{oid message} mergedBy{login}}}}";
     let raw = github
         .call(&[
             "api",
@@ -486,6 +489,8 @@ async fn merge_mutation(
             &format!("head={head}"),
             "-f",
             &format!("request={operation_id}"),
+            "-f",
+            &format!("body={marker}"),
         ])
         .await?;
     store.record_merge_response(operation, &raw, chrono::Utc::now().timestamp_millis())?;
@@ -579,7 +584,16 @@ mod tests {
         async fn call(&mut self, args: &[&str]) -> Result<String> {
             self.calls
                 .push(args.iter().map(|s| s.to_string()).collect());
-            self.replies.pop_front().expect("unexpected merge request")
+            let raw = self.replies.pop_front().expect("unexpected merge request")?;
+            if args.starts_with(&["api", "graphql"]) {
+                let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+                let message = &mut value["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"]["message"];
+                if message.as_str() == Some("@echo-request-body") {
+                    *message = args.iter().find_map(|arg| arg.strip_prefix("body=")).unwrap().into();
+                    return Ok(value.to_string());
+                }
+            }
+            Ok(raw)
         }
     }
     fn merge_before(state: &str) -> String {
@@ -589,7 +603,7 @@ mod tests {
         serde_json::json!([{"type":"required_status_checks","ruleset_id":1,"parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"tests"}]}}]).to_string()
     }
     fn mutation_response() -> serde_json::Value {
-        serde_json::json!({"data":{"mergePullRequest":{"clientMutationId":"op-1","pullRequest":{"id":"PR_fixture","number":12,"state":"MERGED","headRefOid":"head","mergedAt":"2026-10-31T00:00:00Z","mergeCommit":{"oid":"a".repeat(40)},"mergedBy":{"login":"controller"}}}}})
+        serde_json::json!({"data":{"mergePullRequest":{"clientMutationId":"op-1","pullRequest":{"id":"PR_fixture","number":12,"state":"MERGED","headRefOid":"head","mergedAt":"2026-10-31T00:00:00Z","mergeCommit":{"oid":"a".repeat(40),"message":"@echo-request-body"},"mergedBy":{"login":"controller"}}}}})
     }
     fn mutation_fake(response: Result<String>) -> MergeFake {
         MergeFake {
@@ -614,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn journaled_merge_response_recovers_without_network_replay() {
         use crate::autoship_workflow::{WorkflowStore, Binding};
-        for outcome in ["accepted", "incomplete", "request_error"] {
+        for outcome in ["accepted", "incomplete", "request_error", "wrong_marker"] {
             let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("workflow.db");
             let now = chrono::Utc::now().timestamp_millis();
             let mut store = WorkflowStore::open(&path).unwrap();
@@ -624,9 +638,11 @@ mod tests {
             store.attach_pr(&lease, 12, now).unwrap();
             let op = store.begin_operation(&lease, OperationKind::MergePr, &binding, now).unwrap();
             store.reserve_merge(&lease, &op, "owner/repo", 12, "PR_fixture", now, 5).unwrap();
-            store.dispatch_merge(&lease, &op, now, 5).unwrap();
+            let marker = store.dispatch_marked_merge(&lease, &op, now, 5).unwrap();
             let mut response = mutation_response();
             response["data"]["mergePullRequest"]["clientMutationId"] = op.id.clone().into();
+            response["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"]["message"] = marker.into();
+            if outcome == "wrong_marker" { response["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"]["message"] = "manual merge".into(); }
             if outcome == "incomplete" { response["data"]["mergePullRequest"]["pullRequest"]["mergedAt"] = serde_json::Value::Null; }
             if outcome == "request_error" { response = serde_json::json!({"errors":[{"message":"Unknown field","locations":[{"line":1,"column":1}]}]}); }
             let raw = response.to_string();
@@ -638,7 +654,7 @@ mod tests {
             if outcome == "accepted" { assert!(recovered.unwrap().is_some(), "accepted journal response must recover attribution"); }
             else { assert!(recovered.is_err(), "incomplete journal response remains unresolved"); }
             assert!(github.calls.is_empty(), "recovery consumes original response, never a second remote request");
-            assert_eq!(store.merge_allowance(now, 5).unwrap().pending, u32::from(outcome == "incomplete"));
+            assert_eq!(store.merge_allowance(now, 5).unwrap().pending, u32::from(matches!(outcome,"incomplete"|"wrong_marker")));
             if outcome == "request_error" { store.attach_pr(&lease,12,now).unwrap(); }
         }
     }
@@ -656,6 +672,16 @@ mod tests {
         assert!(mutation.iter().any(|s| s.contains("expectedHeadOid:$head")));
         assert!(mutation.iter().any(|s| s == "head=head"));
         assert!(mutation.iter().any(|s| s == "request=op-1"));
+        assert!(mutation.iter().any(|s| s.contains("commitBody:$body")));
+        let marker = mutation.iter().find_map(|s| s.strip_prefix("body=")).unwrap();
+        assert_eq!(receipt.merge_message.as_deref(), Some(marker));
+        assert!(marker.starts_with("Autoship-Receipt: v1:op-1:"));
+        assert_eq!(serde_json::from_value::<MergeMutationReceipt>(serde_json::to_value(&receipt).unwrap()).unwrap(), receipt);
+        for message in [serde_json::Value::Null, serde_json::json!("manual merge"), serde_json::json!("Autoship-Receipt: v1:op-1:public-operation-id-is-not-proof")] {
+            let mut wrong = mutation_response();
+            wrong["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"]["message"] = message;
+            assert!(merge_test(&mut mutation_fake(Ok(wrong.to_string())), "owner/repo", 12, "head", "op-1").await.is_err());
+        }
         for field in [
             "clientMutationId",
             "headRefOid",

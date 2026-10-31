@@ -208,6 +208,7 @@ pub async fn resolve(
                 &record.operation.binding.head,
                 operation,
             )?;
+            store.validate_merge_receipt_marker(operation, &receipt)?;
             ensure!(
                 remote["merged"] == true
                     && remote["head"]["sha"] == receipt["expected_head"]

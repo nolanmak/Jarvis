@@ -132,6 +132,25 @@ fn cli_resolves_original_accepted_response_once_without_mutation() {
         "no unrelated application initialization"
     );
 }
+
+#[test]
+fn cli_recovers_marked_journal_response_without_losing_proof() {
+    let marker = format!("Autoship-Receipt: v1:op-pending:{}", "f".repeat(64));
+    let mut response = accepted();
+    response["data"]["mergePullRequest"]["pullRequest"]["mergeCommit"]["message"] = marker.clone().into();
+    let dir = fixture(Some(response), true, &"a".repeat(40));
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("workflow.db")).unwrap();
+        conn.execute_batch("CREATE TABLE merge_private_marker(operation TEXT PRIMARY KEY,protocol INTEGER,nonce TEXT);").unwrap();
+        conn.execute("INSERT INTO merge_private_marker VALUES('op-pending',1,?1)", ["f".repeat(64)]).unwrap();
+    }
+    for _ in 0..2 { assert_code(&invoke(dir.path(), "autonomous"), 0); }
+    let conn = rusqlite::Connection::open(dir.path().join("workflow.db")).unwrap();
+    let raw: String = conn.query_row("SELECT receipt FROM merge_mutation_receipt", [], |r| r.get(0)).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["merge_message"], marker);
+    let confirmed: u32 = conn.query_row("SELECT count(*) FROM merge_allowance_dispatch WHERE state='confirmed'", [], |r| r.get(0)).unwrap();
+    assert_eq!(confirmed, 1);
+}
 #[test]
 fn cli_releases_only_proven_unexecuted_or_external_merges() {
     for (response, merged, head, classification) in [
@@ -208,6 +227,7 @@ fn cli_rejects_stale_or_contradictory_proof_without_writing_state() {
         "wrong-commit",
         "contradictory-head",
         "active-worker",
+        "missing-marker",
     ] {
         let raw = if scenario == "active-worker" {
             request_error()
@@ -221,6 +241,11 @@ fn cli_rejects_stale_or_contradictory_proof_without_writing_state() {
         };
         let dir = fixture(Some(raw), scenario != "active-worker", &head);
         let root = dir.path();
+        if scenario == "missing-marker" {
+            let conn = rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+            conn.execute_batch("CREATE TABLE merge_private_marker(operation TEXT PRIMARY KEY,protocol INTEGER,nonce TEXT);
+                INSERT INTO merge_private_marker VALUES('op-pending',1,'private-marker');").unwrap();
+        }
         if scenario == "wrong-digest" {
             let path = root.join("evidence.json");
             let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -253,8 +278,8 @@ fn cli_rejects_stale_or_contradictory_proof_without_writing_state() {
         };
         assert_code(&invoke(root, classification), 3);
         assert_eq!(
-            std::fs::read(root.join("workflow.db")).unwrap(),
-            before,
+            Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap()),
+            Sha256::digest(before),
             "{scenario}: invalid proof must not initialize a writer"
         );
     }

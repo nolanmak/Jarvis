@@ -1,6 +1,66 @@
 use super::*;
 
 const DAY: i64 = 86_400_000;
+
+#[test]
+fn marked_dispatch_fences_and_commits_proof_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    let (lease, op) = fixture(&mut store, 1, now);
+    reserve(&mut store, &lease, &op, 1, now).unwrap();
+    let mut wrong = op.clone();
+    wrong.binding.contract = "other".into();
+    assert!(store.dispatch_marked_merge(&lease, &wrong, now, 5).is_err());
+    assert_eq!(store.merge_dispatch(&op.id).unwrap().unwrap().state, "reserved");
+    assert_eq!(store.conn.query_row("SELECT count(*) FROM merge_private_marker", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    let first = store.dispatch_marked_merge(&lease, &op, now, 5).unwrap();
+    let (second_lease, second_op) = fixture(&mut store, 2, now);
+    reserve(&mut store, &second_lease, &second_op, 2, now).unwrap();
+    let second = store.dispatch_marked_merge(&second_lease, &second_op, now, 5).unwrap();
+    assert_ne!(first.rsplit(':').next(), second.rsplit(':').next());
+    let mut proof = receipt(&second_op, 2, now);
+    proof["merge_message"] = first.into();
+    assert!(store.confirm_merge_dispatch(&second_op, &proof, now).is_err());
+    assert_eq!(store.merge_allowance(now, 5).unwrap().pending, 2);
+    assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 0);
+}
+
+#[test]
+fn marked_dispatch_requires_private_proof_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workflow.db");
+    let mut store = WorkflowStore::open(&path).unwrap();
+    let now = 100 * DAY;
+    let (lease, op) = fixture(&mut store, 1, now);
+    reserve(&mut store, &lease, &op, 1, now).unwrap();
+    let marker = store.dispatch_marked_merge(&lease, &op, now, 5).unwrap();
+    assert!(marker.starts_with(&format!("Autoship-Receipt: v1:{}:", op.id)));
+    let nonce = marker.rsplit(':').next().unwrap();
+    assert_eq!(nonce.len(), 64);
+    assert!(nonce.bytes().all(|c| c.is_ascii_hexdigit()));
+    assert!(!serde_json::to_string(&store.merge_dispatch(&op.id).unwrap()).unwrap().contains(nonce),
+        "public dispatch projection must not leak the private pre-merge proof");
+    assert!(store.dispatch_marked_merge(&lease, &op, now, 5).is_err(), "never redispatch");
+    drop(store);
+    let mut store = WorkflowStore::open(&path).unwrap();
+    for message in [None, Some("manual merge".into()), Some(format!("Autoship-Receipt: v1:{}:{}", op.id, "0".repeat(64))),
+        Some(format!("{marker}\n{marker}")), Some(format!("{marker}\nAutoship-Receipt: v1:other:forged"))] {
+        let mut proof = receipt(&op, 1, now);
+        if let Some(message) = message { proof["merge_message"] = message.into(); }
+        assert!(store.confirm_merge_dispatch(&op, &proof, now + DAY).is_err(), "unproven marked merge must stay pending");
+        assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 0);
+        assert_eq!(store.merge_allowance(now + DAY, 5).unwrap().pending, 1);
+    }
+    let mut proof = receipt(&op, 1, now);
+    proof["merge_message"] = format!("Merge fixture\n\n{marker}").into();
+    store.confirm_merge_dispatch(&op, &proof, now + DAY).unwrap();
+    store.confirm_merge_dispatch(&op, &proof, now + DAY).unwrap();
+    assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 1);
+    assert_eq!(store.merge_allowance(now + DAY, 5).unwrap().confirmed, 0);
+    assert_eq!(store.merge_allowance(now + DAY, 5).unwrap().pending, 0);
+}
+
 fn fixture(store: &mut WorkflowStore, pr: u64, now: i64) -> (Lease, Operation) {
     let id = format!("owner/repo#{pr}");
     let binding = Binding {

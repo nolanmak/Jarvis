@@ -65,6 +65,25 @@ pub fn merge_request_not_executed(raw: &str) -> bool {
         })
 }
 
+/// Legacy stores have no marker table; a read-only preflight must not migrate
+/// them. Marked dispatches always require their exact, unique private proof.
+fn validate_merge_marker(conn: &Connection, operation: &str, receipt: &serde_json::Value) -> Result<()> {
+    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_private_marker')", [], |r| r.get(0))?;
+    if !exists { return Ok(()); }
+    let marker: Option<(i64, String)> = conn.query_row(
+        "SELECT protocol,nonce FROM merge_private_marker WHERE operation=?1", [operation],
+        |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    if let Some((protocol, nonce)) = marker {
+        ensure!(protocol == 1, "unsupported merge marker protocol");
+        let expected = format!("Autoship-Receipt: v1:{}:{nonce}", operation);
+        let message = receipt["merge_message"].as_str().context("marked merge lacks commit message proof")?;
+        let mut markers = message.lines().filter(|line| line.trim_start().starts_with("Autoship-Receipt:"));
+        ensure!(markers.next() == Some(expected.as_str()) && markers.next().is_none(),
+            "merge commit does not uniquely prove this private dispatch");
+    }
+    Ok(())
+}
+
 fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
     ensure!(now >= 0 && cap > 0, "invalid merge allowance day or cap");
     let start = now.div_euclid(86_400_000) * 86_400_000;
@@ -96,6 +115,10 @@ fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
 }
 
 impl WorkflowStore {
+    pub fn validate_merge_receipt_marker(&self, operation: &str, receipt: &serde_json::Value) -> Result<()> {
+        validate_merge_marker(&self.conn, operation, receipt)
+    }
+
     pub fn merge_dispatch(&self, id: &str) -> Result<Option<MergeDispatchRecord>> {
         let row: Option<(String,String,String,Option<String>,String,u64,String,String,Option<String>)> = self.conn.query_row(
             "SELECT o.workflow,o.kind,o.binding,o.receipt,d.repository,d.pr,d.pr_node_id,d.state,d.resolution FROM operation o
@@ -412,12 +435,37 @@ impl WorkflowStore {
 
     /// Commit immediately before invoking the remote mutation. Neither a crash
     /// nor a lost response can make this slot available for another mutation.
+    pub fn dispatch_marked_merge(
+        &mut self,
+        lease: &Lease,
+        op: &Operation,
+        now: i64,
+        cap: u32,
+    ) -> Result<String> {
+        // Separate from the public operation ID; never include this secret in
+        // pre-merge status, event payloads, or model context.
+        let nonce = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        self.dispatch_merge_inner(lease, op, now, cap, Some(&nonce))?;
+        Ok(format!("Autoship-Receipt: v1:{}:{nonce}", op.id))
+    }
+
     pub fn dispatch_merge(
         &mut self,
         lease: &Lease,
         op: &Operation,
         now: i64,
         cap: u32,
+    ) -> Result<()> {
+        self.dispatch_merge_inner(lease, op, now, cap, None)
+    }
+
+    fn dispatch_merge_inner(
+        &mut self,
+        lease: &Lease,
+        op: &Operation,
+        now: i64,
+        cap: u32,
+        nonce: Option<&str>,
     ) -> Result<()> {
         let tx = self
             .conn
@@ -427,6 +475,13 @@ impl WorkflowStore {
             op.workflow == lease.workflow,
             "merge dispatch workflow differs"
         );
+        let (workflow, kind, binding): (String, String, String) = tx.query_row(
+            "SELECT workflow,kind,binding FROM operation WHERE id=?1", [&op.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        ensure!(workflow == op.workflow && op.kind == OperationKind::MergePr
+            && serde_json::from_str::<OperationKind>(&kind)? == op.kind
+            && serde_json::from_str::<Binding>(&binding)? == op.binding,
+            "merge dispatch differs from stored intent");
         let status = allowance(&tx, now, cap)?;
         ensure!(
             status.confirmed.saturating_add(status.pending) <= cap,
@@ -441,6 +496,10 @@ impl WorkflowStore {
             updated == 1,
             "merge dispatch requires an undispatched reservation owned by this lease"
         );
+        if let Some(nonce) = nonce {
+            tx.execute("INSERT INTO merge_private_marker(operation,protocol,nonce) VALUES(?1,1,?2)",
+                params![op.id, nonce])?;
+        }
         event(
             &tx,
             &lease.workflow,
@@ -487,6 +546,7 @@ impl WorkflowStore {
             serde_json::from_str::<Binding>(&stored_binding)? == op.binding,
             "merge receipt contract or evidence differs from dispatched intent"
         );
+        validate_merge_marker(&tx, &op.id, receipt)?;
         ensure!(
             receipt["client_mutation_id"].as_str() == Some(op.id.as_str())
                 && receipt["expected_head"].as_str() == Some(head.as_str())
