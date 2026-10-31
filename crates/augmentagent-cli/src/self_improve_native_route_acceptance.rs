@@ -336,6 +336,29 @@ fn file_edit_opts(root: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     opts
 }
 
+fn file_edit_audit_tool(_provider: ProviderKind, tool: &str) -> Result<bool> {
+    anyhow::ensure!(
+        ["Read", "Grep", "Glob", "Write", "Edit"].contains(&tool),
+        "file-only probe observed undeclared tool"
+    );
+    Ok(["Write", "Edit"].contains(&tool))
+}
+
+#[test]
+fn file_edit_audit_checks_provider_namespace_and_keeps_shells_forbidden() {
+    for provider in [Claude, Codex] {
+        for name in ["Read", "Grep", "Glob", "Write", "Edit"] {
+            let tool=if provider==Claude {format!("mcp__jarvis__{name}")} else {name.into()};
+            assert_eq!(file_edit_audit_tool(provider,&tool).unwrap(),matches!(name,"Write"|"Edit"));
+        }
+        for name in ["Bash", "mcp__jarvis__Bash", "mcp__other__Write", "mcp__jarvis__WriteExtra", "mcp__jarvis__mcp__jarvis__Write"] {
+            assert!(file_edit_audit_tool(provider,name).is_err(),"{provider:?}: {name}");
+        }
+    }
+    assert!(file_edit_audit_tool(Claude,"Write").is_err());
+    assert!(file_edit_audit_tool(Codex,"mcp__jarvis__Write").is_err());
+}
+
 #[test]
 fn file_edit_diagnostic_cannot_reach_a_build_backend() {
     let opts = file_edit_opts(PathBuf::from("/tmp/synthetic-file-only"));
@@ -462,11 +485,7 @@ async fn guarded_file_edit(provider: ProviderKind) -> Result<()> {
     for line in std::fs::read_to_string(guard.audit_logger().path())?.lines() {
         let row: Value = serde_json::from_str(line)?;
         if let Some(tool) = row["tool"].as_str() {
-            anyhow::ensure!(
-                ["Read", "Grep", "Glob", "Write", "Edit"].contains(&tool),
-                "file-only probe observed undeclared tool"
-            );
-            if ["Write", "Edit"].contains(&tool) && row["stderr_truncated"].is_null() {
+            if file_edit_audit_tool(provider, tool)? && row["stderr_truncated"].is_null() {
                 let path = row["args"]["file_path"]
                     .as_str()
                     .or_else(|| row["args"]["path"].as_str())
