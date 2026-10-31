@@ -139,3 +139,104 @@ async fn reply_guard_requires_authoritative_direct_membership() {
             .all(|r| r.method.as_str() == "GET"));
     }
 }
+
+#[tokio::test]
+async fn conflicting_duplicate_message_ids_are_not_silently_imported() {
+    let server = MockServer::start().await;
+    let message = |id: &str, ts| json!({"backendUrn":id,"senderUrn":"urn:li:fsd_profile:ME","deliveredAt":ts,"body":{"text":"synthetic"}});
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        "elements":[message("id:a",1),message("id:b",2),message("id:a",3)], "metadata":{"nextCursor":null}
+    }))).mount(&server).await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    assert!(
+        matches!(
+            reader.messages("thread:1", None).await,
+            Err(ArchiveError::Shape(_))
+        ),
+        "conflicting copies of one identity require an explicit incomplete result"
+    );
+}
+
+#[tokio::test]
+async fn message_payload_cannot_claim_another_conversation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        "elements":[{"backendUrn":"id:a","conversationUrn":"thread:other","senderUrn":"urn:li:fsd_profile:ME","deliveredAt":1,"body":{"text":"synthetic"}}], "metadata":{"nextCursor":null}
+    }))).mount(&server).await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    assert!(matches!(
+        reader.messages("thread:1", None).await,
+        Err(ArchiveError::Shape(_))
+    ));
+}
+
+#[tokio::test]
+async fn identical_duplicate_messages_remain_one_canonical_record() {
+    let server = MockServer::start().await;
+    let message = json!({"backendUrn":"id:a","senderUrn":"urn:li:fsd_profile:ME","deliveredAt":1,"body":{"text":"synthetic"}});
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "elements":[message.clone(),message], "metadata":{"nextCursor":null}
+        })))
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    assert_eq!(
+        reader.messages("thread:1", None).await.unwrap().items.len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transport_failures_are_typed_bounded_and_do_not_echo_payloads() {
+    use std::time::Duration;
+    for (template, expected) in [
+        (ResponseTemplate::new(401), "auth"),
+        (ResponseTemplate::new(403), "auth"),
+        (
+            ResponseTemplate::new(429).insert_header("Retry-After", "120"),
+            "rate",
+        ),
+        (
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "Thu, 01 Jan 1970 00:02:00 GMT"),
+            "date",
+        ),
+        (
+            ResponseTemplate::new(200).set_body_string("SYNTHETIC_PRIVATE_BODY"),
+            "shape",
+        ),
+        (
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"errors":[{"message":"SYNTHETIC_PRIVATE_BODY"}]})),
+            "shape",
+        ),
+        (
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(1)),
+            "timeout",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(template)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reader =
+            ArchiveReader::for_test_with_timeout(auth(), server.uri(), Duration::from_millis(50))
+                .unwrap();
+        let error = reader
+            .messages("SYNTHETIC_PRIVATE_CURSOR", None)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("SYNTHETIC"));
+        assert!(match (expected, error) {
+            ("auth", ArchiveError::Auth)
+            | ("shape", ArchiveError::Shape(_))
+            | ("timeout", ArchiveError::Timeout)
+            | ("rate", ArchiveError::RateLimited(120))
+            | ("date", ArchiveError::RateLimited(0)) => true,
+            _ => false,
+        });
+    }
+}

@@ -44,7 +44,7 @@ pub struct Conversation {
     pub participants: Vec<Participant>,
     pub last_activity_ms: i64,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub urn: String,
     pub conversation: String,
@@ -73,27 +73,39 @@ pub struct ArchiveReader {
 }
 impl ArchiveReader {
     pub fn new(auth: LinkedInAuth) -> Result<Self, ArchiveError> {
-        Self::build(auth, "https://www.linkedin.com/voyager/api".into())
+        Self::build(
+            auth,
+            "https://www.linkedin.com/voyager/api".into(),
+            Duration::from_secs(30),
+        )
     }
     /// Local mock endpoint only. Production never accepts a URL from a cursor.
     #[doc(hidden)]
     pub fn for_test(auth: LinkedInAuth, base: String) -> Result<Self, ArchiveError> {
+        Self::for_test_with_timeout(auth, base, Duration::from_secs(30))
+    }
+    #[doc(hidden)]
+    pub fn for_test_with_timeout(
+        auth: LinkedInAuth,
+        base: String,
+        timeout: Duration,
+    ) -> Result<Self, ArchiveError> {
         let u = reqwest::Url::parse(&base).map_err(|_| ArchiveError::Config)?;
         if u.scheme() != "http"
             || !matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
         {
             return Err(ArchiveError::Config);
         }
-        Self::build(auth, base)
+        Self::build(auth, base, timeout)
     }
-    fn build(auth: LinkedInAuth, base: String) -> Result<Self, ArchiveError> {
+    fn build(auth: LinkedInAuth, base: String, timeout: Duration) -> Result<Self, ArchiveError> {
         auth.validate().map_err(|_| ArchiveError::Config)?;
         let mailbox = auth.member_urn.clone();
         let http = reqwest::Client::builder()
             .user_agent(auth.user_agent.clone())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(timeout)
             .build()
             .map_err(|_| ArchiveError::Config)?;
         let mut headers = VoyagerClient::new(auth)
@@ -257,12 +269,21 @@ impl ArchiveReader {
             url.query_pairs_mut().append_pair("nextCursor", cursor);
         }
         let value = self.get(url.into()).await?;
-        let mut items = elements(&value)?
-            .iter()
-            .map(|v| parse_message(v, conversation, &self.mailbox))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut unique = std::collections::BTreeMap::new();
+        for value in elements(&value)? {
+            let item = parse_message(value, conversation, &self.mailbox)?;
+            if let Some(previous) = unique.get(&item.urn) {
+                if previous != &item {
+                    return Err(ArchiveError::Shape(
+                        "conflicting copies of message identity",
+                    ));
+                }
+            } else {
+                unique.insert(item.urn.clone(), item);
+            }
+        }
+        let mut items: Vec<_> = unique.into_values().collect();
         items.sort_by(|a, b| (a.delivered_at_ms, &a.urn).cmp(&(b.delivered_at_ms, &b.urn)));
-        items.dedup_by(|a, b| a.urn == b.urn);
         Ok(Page {
             items,
             next: next_cursor(&value, cursor)?,
@@ -358,6 +379,13 @@ fn parse_conversation(v: &Value) -> Result<Conversation, ArchiveError> {
     })
 }
 fn parse_message(v: &Value, conversation: &str, owner: &str) -> Result<Message, ArchiveError> {
+    if let Some(scope) = v.get("conversationUrn") {
+        if scope.as_str() != Some(conversation) {
+            return Err(ArchiveError::Shape(
+                "message conversation identity mismatch",
+            ));
+        }
+    }
     let sender = v
         .get("senderUrn")
         .and_then(Value::as_str)

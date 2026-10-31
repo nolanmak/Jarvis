@@ -349,3 +349,173 @@ async fn inventory_throttle_is_durable_before_any_category_is_known() {
     assert_eq!(explicit.pages, 0);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn fake_clock_proves_retry_waits_until_the_exact_deadline_then_recovers() {
+    use std::sync::{
+        atomic::{AtomicI64, AtomicUsize, Ordering},
+        Arc,
+    };
+    let server = MockServer::start().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    Mock::given(method("GET"))
+        .respond_with(move |r: &wiremock::Request| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(429).insert_header("Retry-After", "600")
+            } else {
+                respond(r)
+            }
+        })
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let store = Store::open(":memory:").unwrap();
+    let clock = AtomicI64::new(1000);
+    let now = || clock.load(Ordering::SeqCst);
+    let cancel = CancellationToken::new();
+    archive_sync::sync_with_clock(&reader, &store, "PRIMARY_INBOX", 100, &cancel, &now)
+        .await
+        .unwrap();
+    assert_eq!(db::account_retry_at(&store, OWNER).unwrap(), 601000);
+    clock.store(600999, Ordering::SeqCst);
+    let before =
+        archive_sync::sync_with_clock(&reader, &store, "PRIMARY_INBOX", 100, &cancel, &now)
+            .await
+            .unwrap();
+    assert_eq!(before.pages, 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    clock.store(601000, Ordering::SeqCst);
+    let resumed =
+        archive_sync::sync_with_clock(&reader, &store, "PRIMARY_INBOX", 100, &cancel, &now)
+            .await
+            .unwrap();
+    assert_eq!(resumed.pages, 54);
+    assert_eq!(resumed.coverage.messages, 153);
+    assert_eq!(db::account_retry_at(&store, OWNER).unwrap(), 0);
+    augmentagent_messages::index::drain(&store, 100, std::time::Duration::ZERO).unwrap();
+    assert!(
+        db::coverage(&store, OWNER, "PRIMARY_INBOX")
+            .unwrap()
+            .complete
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 55);
+}
+
+#[tokio::test]
+async fn cancellation_during_request_preserves_checkpoint_and_counts_the_attempt() {
+    use std::{sync::Arc, time::Duration};
+    let server = MockServer::start().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let observed = started.clone();
+    Mock::given(method("GET"))
+        .respond_with(move |r: &wiremock::Request| {
+            let q = r.url.query_pairs().collect::<BTreeMap<_, _>>();
+            if q.get("variables")
+                .is_some_and(|v| v.contains("nextCursor:"))
+            {
+                observed.notify_one();
+                respond(r).set_delay(Duration::from_secs(10))
+            } else {
+                respond(r)
+            }
+        })
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(file.path()).unwrap();
+    archive_sync::sync(
+        &reader,
+        &store,
+        "PRIMARY_INBOX",
+        1,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let before = db::checkpoint(&store, OWNER, "PRIMARY_INBOX").unwrap();
+    let cancel = CancellationToken::new();
+    let (report, _) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            archive_sync::sync(&reader, &store, "PRIMARY_INBOX", 10, &cancel),
+            async {
+                started.notified().await;
+                cancel.cancel();
+            }
+        )
+    })
+    .await
+    .unwrap();
+    let report = report.unwrap();
+    assert_eq!(report.stopped, "cancelled");
+    assert_eq!(
+        report.pages, 1,
+        "a dispatched request still consumes budget when cancelled"
+    );
+    assert_eq!(report.coverage.conversations, 20);
+    assert!(!report.coverage.complete);
+    drop(store);
+    let reopened = Store::open(file.path()).unwrap();
+    let after = db::checkpoint(&reopened, OWNER, "PRIMARY_INBOX").unwrap();
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.cursor, before.cursor);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn one_failed_history_page_preserves_other_threads_and_resumes_after_restart() {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
+    };
+    let server = MockServer::start().await;
+    let failed = Arc::new(AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .respond_with(move |r: &wiremock::Request| {
+            let q = r.url.query_pairs().collect::<BTreeMap<_, _>>();
+            if q.get("conversationUrn").is_some_and(|v| v == "thread:2")
+                && q.contains_key("nextCursor")
+                && !failed.swap(true, Ordering::SeqCst)
+            {
+                ResponseTemplate::new(200).set_body_string("synthetic malformed body")
+            } else {
+                respond(r)
+            }
+        })
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(file.path()).unwrap();
+    let clock = AtomicI64::new(1000);
+    let now = || clock.load(Ordering::SeqCst);
+    let cancel = CancellationToken::new();
+    let first = archive_sync::sync_with_clock(&reader, &store, "PRIMARY_INBOX", 100, &cancel, &now)
+        .await
+        .unwrap();
+    assert_eq!(first.pages, 53);
+    assert_eq!(first.coverage.messages, 148);
+    assert_eq!(first.coverage.complete_threads, 44);
+    assert_eq!(first.coverage.failed_threads, 1);
+    assert!(!first.coverage.complete);
+    let pending = db::pending_threads(&store, OWNER, "PRIMARY_INBOX").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1.cursor.as_deref(), Some("history:4"));
+    drop(store);
+    let reopened = Store::open(file.path()).unwrap();
+    clock.store(61000, Ordering::SeqCst);
+    let resumed =
+        archive_sync::sync_with_clock(&reader, &reopened, "PRIMARY_INBOX", 100, &cancel, &now)
+            .await
+            .unwrap();
+    assert_eq!(resumed.pages, 2);
+    assert_eq!(resumed.coverage.messages, 153);
+    augmentagent_messages::index::drain(&reopened, 100, std::time::Duration::ZERO).unwrap();
+    assert!(
+        db::coverage(&reopened, OWNER, "PRIMARY_INBOX")
+            .unwrap()
+            .complete
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 55);
+}

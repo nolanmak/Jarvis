@@ -215,6 +215,11 @@ process restarts; a repeated rejection records an error and defers retries
 instead of restarting indefinitely. This is a conservative recovery policy,
 not a claim that every 400 response means an expired LinkedIn cursor. A first-page
 failure, authentication error, or throttle does not trigger this recovery.
+Conflicting copies of one message ID, or an explicit message conversation ID
+that disagrees with the requested thread, fail the page instead of choosing an
+arbitrary copy. Identical copies are deduplicated. Cancellation leaves committed
+checkpoints intact; a started read still consumes the invocation's request budget,
+while durable page counters advance only after a successful transaction.
 
 Authentication, redirect, and rate-limit failures pause archival reads for the
 whole account, including category discovery. The pause survives restarts and

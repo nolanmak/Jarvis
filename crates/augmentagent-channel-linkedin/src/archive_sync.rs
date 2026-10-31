@@ -32,6 +32,19 @@ pub async fn sync(
     max_pages: usize,
     cancel: &CancellationToken,
 ) -> anyhow::Result<SyncReport> {
+    sync_with_clock(reader, store, category, max_pages, cancel, &now_ms).await
+}
+
+/// Clock injection for deterministic retry/recovery tests; production uses UTC.
+#[doc(hidden)]
+pub async fn sync_with_clock(
+    reader: &ArchiveReader,
+    store: &Store,
+    category: &str,
+    max_pages: usize,
+    cancel: &CancellationToken,
+    now: &(dyn Fn() -> i64 + Sync),
+) -> anyhow::Result<SyncReport> {
     let account = reader.mailbox();
     let mut pages = 0;
     let mut account_deferred = false;
@@ -41,7 +54,7 @@ pub async fn sync(
             stopped = "cancelled".into();
             break;
         }
-        let request_started = now_ms();
+        let request_started = now();
         if db::account_retry_at(store, account)? > request_started {
             stopped = "retry_deferred".into();
             account_deferred = true;
@@ -49,27 +62,27 @@ pub async fn sync(
         }
         let cp = db::checkpoint(store, account, category)?;
         if !cp.complete {
-            if cp.retry_at_ms > now_ms() {
+            if cp.retry_at_ms > now() {
                 stopped = "retry_deferred".into();
                 break;
             }
+            pages += 1;
             let fetched = tokio::select! {
                 _=cancel.cancelled()=>{stopped="cancelled".into();break;},
                 p=reader.conversations(category,cp.cursor.as_deref())=>p,
             };
-            pages += 1;
             match fetched {
                 Ok(page) => {
                     db::clear_account_failure(store, account, request_started)?;
-                    db::commit_conversations(store, account, category, &cp, &page, now_ms())?;
+                    db::commit_conversations(store, account, category, &cp, &page, now())?;
                 }
                 Err(e) => {
-                    account_deferred = defer_account(store, account, &e, now_ms())?;
+                    account_deferred = defer_account(store, account, &e, now())?;
                     // A cursor-bearing request rejected as bad/gone gets one
                     // bounded reconciliation. This is deliberately not applied
                     // to auth, throttling, or malformed successful responses.
                     if matches!(e, ArchiveError::Status(400 | 410))
-                        && db::restart_cursor(store, account, category, false, &cp, now_ms())?
+                        && db::restart_cursor(store, account, category, false, &cp, now())?
                     {
                         continue;
                     }
@@ -79,7 +92,7 @@ pub async fn sync(
                         category,
                         false,
                         &e.to_string(),
-                        retry_at(&e, now_ms()),
+                        retry_at(&e, now()),
                     )?;
                     stopped = e.to_string();
                     break;
@@ -91,25 +104,25 @@ pub async fn sync(
                 stopped = "history_exhausted".into();
                 break;
             }
-            let Some((thread, cp)) = pending.into_iter().find(|(_, p)| p.retry_at_ms <= now_ms())
+            let Some((thread, cp)) = pending.into_iter().find(|(_, p)| p.retry_at_ms <= now())
             else {
                 stopped = "retry_deferred".into();
                 break;
             };
+            pages += 1;
             let fetched = tokio::select! {
                 _=cancel.cancelled()=>{stopped="cancelled".into();break;},
                 p=reader.messages(&thread,cp.cursor.as_deref())=>p,
             };
-            pages += 1;
             match fetched {
                 Ok(page) => {
                     db::clear_account_failure(store, account, request_started)?;
-                    db::commit_messages(store, account, &thread, &cp, &page, now_ms())?;
+                    db::commit_messages(store, account, &thread, &cp, &page, now())?;
                 }
                 Err(e) => {
-                    account_deferred = defer_account(store, account, &e, now_ms())?;
+                    account_deferred = defer_account(store, account, &e, now())?;
                     if matches!(e, ArchiveError::Status(400 | 410))
-                        && db::restart_cursor(store, account, &thread, true, &cp, now_ms())?
+                        && db::restart_cursor(store, account, &thread, true, &cp, now())?
                     {
                         continue;
                     }
@@ -119,7 +132,7 @@ pub async fn sync(
                         &thread,
                         true,
                         &e.to_string(),
-                        retry_at(&e, now_ms()),
+                        retry_at(&e, now()),
                     )?;
                     // Session/throttle failures are account-wide. Other failures
                     // leave this thread partial while allowing other threads.
