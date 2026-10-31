@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Own and reap one provider tree, including descendants that call setsid."""
 import ctypes
+import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
@@ -31,9 +33,93 @@ def supervise(receipt, argv):
         raise RuntimeError('provider supervision lost its parent')
     children_path = Path(f'/proc/self/task/{os.getpid()}/children')
     children_path.read_text()  # readiness before any provider can run
-    child = subprocess.Popen(argv, start_new_session=True)
+    resource_path = Path(receipt).with_name('resource-accounting.json')
+    scope = None
+    if 'JARVIS_RUN_RESOURCE_POLICY' in os.environ:
+        module = None
+        try:
+            spec = importlib.util.spec_from_file_location('run_resources', Path(__file__).with_name('run-resource-scope.py'))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            scope = module.declared_scope()
+            resource_path.write_text(json.dumps({'phase':'admitted', **scope.observation()}))
+            resource_path.chmod(0o600)
+        except BaseException as error:
+            category=type(error).__name__
+            if category not in {'RuntimeError','ValueError','TypeError','JSONDecodeError','OSError','FileNotFoundError','PermissionError','BlockingIOError','NotADirectoryError','TimeoutError'}:
+                category='BoundaryFailure'
+            refusal = {'phase':'admission_failed','exhausted':True,'refusal_code':'admission_setup_failed','failure_class':category}
+            if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4095:
+                refusal['errno']=error.errno
+            if module is not None and hasattr(module,'refusal_receipt'):
+                refusal = module.refusal_receipt(error)
+            resource_path.write_text(json.dumps(refusal))
+            resource_path.chmod(0o600)
+            Path(receipt).write_text('all-descendants-reaped\n')
+            Path(receipt).chmod(0o600)
+            raise
+    vm_preflight = os.environ.pop('JARVIS_SUPERVISOR_VM_PREFLIGHT', None) == '1'
+    admission = os.environ.pop('JARVIS_SUPERVISOR_ADMISSION', None) == '1'
+    if vm_preflight and not admission:
+        raise RuntimeError('VM preflight requires controller admission')
+    if admission and not vm_preflight:
+        ready = Path(receipt).with_name('launch-ready')
+        proceed = Path(receipt).with_name('launch-continue')
+        ready.write_text('ready\n')
+        ready.chmod(0o600)
+        deadline = time.monotonic() + 10
+        while not proceed.exists():
+            if stopping or time.monotonic() >= deadline:
+                if scope:
+                    resource_path.write_text(json.dumps({'phase':'cancelled_before_dispatch', **scope.observation()}))
+                    scope.close()
+                Path(receipt).write_text('all-descendants-reaped\n')
+                Path(receipt).chmod(0o600)
+                return 125
+            time.sleep(0.005)
+        if proceed.read_text() != 'admitted\n':
+            raise RuntimeError('invalid controller launch admission')
+    if vm_preflight:
+        os.environ['JARVIS_NATIVE_VM_READY'] = str(Path(receipt).with_name('vm-ready'))
+        os.environ['JARVIS_NATIVE_VM_CONTINUE'] = str(Path(receipt).with_name('launch-continue'))
+    else:
+        os.environ.pop('JARVIS_NATIVE_VM_READY', None)
+        os.environ.pop('JARVIS_NATIVE_VM_CONTINUE', None)
+    try:
+        # Trusted build broker carries the same flock open description through
+        # supervisor and QEMU. A killed broker must not release build storage
+        # before this subtree has actually exited.
+        storage_fd = os.environ.get('JARVIS_STORAGE_LEASE_FD')
+        listed = os.environ.get('JARVIS_STORAGE_LEASE_FDS')
+        storage_fds = tuple(int(value) for value in listed.split(',')) if listed else (() if storage_fd is None else (int(storage_fd),))
+        if len(storage_fds) > 64 or (listed and (not storage_fds or str(storage_fds[0]) != storage_fd)) or any(fd < 3 for fd in storage_fds):
+            raise RuntimeError('invalid inherited storage descriptor set')
+        for descriptor in storage_fds:
+            os.fstat(descriptor)  # fail before launch on a missing inherited FD
+        child = subprocess.Popen(argv, start_new_session=True,
+                                 pass_fds=storage_fds,
+                                 preexec_fn=scope.attach_child if scope else None)
+    except BaseException:
+        if scope:
+            resource_path.write_text(json.dumps({'phase':'launch_failed', **scope.observation()}))
+            scope.close()
+        Path(receipt).write_text('all-descendants-reaped\n')
+        Path(receipt).chmod(0o600)
+        raise
     status = None
     try:
+        if vm_preflight:
+            vm_ready = Path(receipt).with_name('vm-ready')
+            deadline = time.monotonic() + 60
+            while not vm_ready.exists():
+                if stopping or child.poll() is not None or time.monotonic() >= deadline:
+                    return 125
+                time.sleep(0.005)
+            if vm_ready.read_text() != 'ready\n':
+                raise RuntimeError('invalid VM readiness')
+            ready = Path(receipt).with_name('launch-ready')
+            ready.write_text('ready\n')
+            ready.chmod(0o600)
         while not stopping:
             try:
                 status = child.wait(timeout=0.05)
@@ -58,6 +144,10 @@ def supervise(receipt, argv):
                 try:
                     pid, _ = os.waitpid(-1, os.WNOHANG)
                 except ChildProcessError:
+                    if scope:
+                        observation = scope.observation()
+                        scope.close()
+                        resource_path.write_text(json.dumps({'phase':'completed', **observation}))
                     descriptor = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(descriptor, 'w') as stream:
                         stream.write('all-descendants-reaped\n')

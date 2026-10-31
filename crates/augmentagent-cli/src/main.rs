@@ -1,6 +1,10 @@
 //! `augmentagent` binary.
 
 mod approval_context;
+mod team_coverage;
+mod linkedin_archive;
+mod disk_pressure;
+mod autoship_worktree_cleanup;
 mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
@@ -61,7 +65,7 @@ use augmentagent_channel_email::sigextract::{
     SignatureExtractor,
 };
 use augmentagent_channel_email::{
-    parse_rfc2822_or_ms, GmailChannel, GmailChannelConfig, OutboundObserver,
+    GmailChannel, GmailChannelConfig, OutboundObserver,
 };
 use augmentagent_channel_linkedin::{
     build_normshares_body, default_auth_path, is_linkedin_email, ConnectionRequestEngagement,
@@ -94,9 +98,15 @@ mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
 mod imessage_send;
+mod imessage_compose;
 mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
+mod autoship_contract;
+mod autoship_episode;
+mod autoship_metrics;
+mod autoship_review;
+mod autoship_workflow;
 mod channel_router;
 mod code_mode;
 mod compute_cli;
@@ -108,6 +118,8 @@ mod snapshot_refs;
 mod disk;
 mod build_storage;
 mod storage_leases;
+mod storage_reservations;
+mod autoship_worker;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
@@ -211,6 +223,11 @@ enum Cmd {
     },
     /// List active gmail accounts from the shared db.
     AccountsList,
+    /// Run opted-in auto-ship independently of the serving daemon.
+    AutoPrWorker {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
     /// Resolve + persist each connected Gmail's real address via Composio
     /// `GMAIL_GET_PROFILE`, so the dashboard + invoice entity picker show
     /// who's who instead of opaque IDs. Safe to re-run.
@@ -370,6 +387,8 @@ enum Cmd {
         #[command(subcommand)]
         op: ImessageOp,
     },
+    /// Independently replay owner-outcome calibration before changing triage guidance.
+    TriageCalibration { #[command(subcommand)] op: self_improve::triage_calibration::Op },
     /// Similarity triage pre-filter (#1127): calibrate, stats, reset.
     TriagePrefilter {
         #[command(subcommand)]
@@ -379,6 +398,18 @@ enum Cmd {
     Embeddings {
         #[command(subcommand)]
         op: embeddings_cmd::Op,
+    },
+    /// The owner's team roster (#1698): who may answer on the owner's behalf.
+    /// Read from `AUGMENTAGENT_OWNER_TEAM` in `.env`; never opens the store.
+    Team {
+        #[command(subcommand)]
+        op: TeamOp,
+    },
+    /// Teammate-coverage shadow report, owner review and rollout gate
+    /// (#1702). The gate must PASS before `AUGMENTAGENT_TEAM_COVERAGE=on`.
+    TeamCoverage {
+        #[command(subcommand)]
+        op: TeamCoverageOp,
     },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
@@ -618,6 +649,9 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Join triage flag/pending decisions to recorded owner outcomes.
+        #[arg(long, default_value_t = false)]
+        outcomes: bool,
     },
     /// #1011 — grade the SCOPING pass against fixed, cached issues.
     ///
@@ -1014,6 +1048,9 @@ enum DiskOp {
     Build {
         #[arg(long)]
         target_dir: PathBuf,
+        /// Release-only deployment build; reserve space alongside auto-ship.
+        #[arg(long)]
+        update: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -1593,13 +1630,26 @@ enum ImessageOp {
     AllowInbound { identifier: String },
     /// Stop drafting reply cards for a conversation.
     DenyInbound { identifier: String },
-    /// Print both allowlists.
+    /// Owner policy for existing and future one-to-one iMessage contacts.
+    /// Every outgoing message still requires approval; explicit denials win.
+    ContactDefaults {
+        #[arg(long, required = true, action = clap::ArgAction::Set)]
+        inbound: bool,
+        #[arg(long, required = true, action = clap::ArgAction::Set)]
+        outbound: bool,
+    },
+    /// Print both allowlists, contact defaults, and explicit exclusions.
     Allowlist,
     /// Approve one pending iMessage card from the terminal: the same checks
     /// and outbox queueing as the card's Approve button.
     Approve { action_id: String },
     /// Skip one pending iMessage card from the terminal.
     Skip { action_id: String },
+    /// Start a new iMessage to a person as an approval card (#1635). Mirrors
+    /// `gmail compose --post`: without `--post` it resolves the recipient and
+    /// prints what would be carded; with it the card is raised and Approve
+    /// queues the text for the Mac sender. Never sends by itself.
+    Compose(imessage_compose::ComposeArgs),
 }
 
 #[derive(Subcommand)]
@@ -2392,10 +2442,11 @@ enum GmailOp {
         /// compose --post replaces the pending follow-up card (#596).
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         allow_duplicate: bool,
-        /// Attach a local file to the draft (#417). One file; uploaded via
-        /// Composio's attachment store before the draft is created.
+        /// Attach a local file to the draft (#417). Repeat for several
+        /// (`--attach a.pdf --attach b.pdf`); each is sent byte-for-byte, in
+        /// the order given.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// Gmail messageId of the inbound message we're replying to. Used as
         /// the action row's messageId so the Approve / Revise / Skip handlers
         /// resolve the same way they do for auto-triage replies. Pass it
@@ -2458,11 +2509,11 @@ enum GmailOp {
         /// detected and preserved automatically where possible.
         #[arg(long)]
         thread_id: Option<String>,
-        /// Attach a local file to the REPLACEMENT draft (#417). Note: the
-        /// replacement carries only what you pass here — an attachment on
-        /// the old draft is NOT carried over (Composio can't read it back).
+        /// Attach a local file to the REPLACEMENT draft (#417); repeatable.
+        /// Note: the replacement carries only what you pass here — an
+        /// attachment on the old draft is NOT carried over.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// #994 — the recipient's own message, so the register check can hold
         /// this body to THEIR casing rather than trusting the drafter's
         /// receipt. Same flags as `gmail compose`; omitting them leaves the
@@ -2508,9 +2559,9 @@ enum GmailOp {
         body_file: Option<String>,
         #[arg(long)]
         thread_id: Option<String>,
-        /// Attach a local file (#417).
+        /// Attach a local file (#417); repeatable.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// #994 — the recipient's own message, so the register check can hold
         /// this body to THEIR casing rather than trusting the drafter's
         /// receipt. Same flags as `gmail compose`; omitting them leaves the
@@ -2582,11 +2633,45 @@ enum LinkedinOp {
     /// store to look up. Gmail has `gmail search` for exactly this; LinkedIn
     /// had nothing.
     RecentDms {
-        /// Cap the number of threads listed.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
+        #[arg(long, default_value = "INBOX")]
+        category: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        max_pages: usize,
+    },
+    /// Read paginated live history, including group and owner messages.
+    Thread {
+        conversation_urn: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        max_pages: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Archive-only, resumable import. No drafts, cards or sends.
+    Backfill {
+        /// Omit to enumerate every category reported by the mailbox API.
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        max_pages: usize,
+        /// Reconcile mailbox heads again without deleting stored history.
+        #[arg(long)]
+        refresh: bool,
+        /// Read into memory only; do not open the production database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Persisted coverage, not a credentials-present indicator.
+    ArchiveStatus {
+        #[arg(long, default_value = "INBOX")]
+        category: String,
     },
     /// Draft a DM reply into a Discord approval card (#572). Mirrors
     /// `gmail compose --post`: without `--post` it prints the draft, with it
@@ -2824,9 +2909,9 @@ enum WikiOp {
     ///
     /// - Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
     ///
-    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
+    /// - Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf/sign/signatures`, `imessage fetch-attachment`, `imessage compose` (a text to a person, as an approval card) and `imessage allowlist`, and `aa-gh issue` create/list/view/comment.
     ///
-    /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
+    /// Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events, social DMs and comments, and iMessage texts are raised as Discord approval cards and happen only when approved.
     Ask {
         /// The question. Wrap in quotes if multi-word; use --stdin for private prompts.
         #[arg(required_unless_present = "stdin")]
@@ -2982,8 +3067,15 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Dry-run must precede Store::open and all persistent bootstrap hooks.
+    if let Cmd::Linkedin { op: LinkedinOp::Backfill { ref category, max_pages, refresh, dry_run: true } } = cli.cmd {
+        return linkedin_archive::dry_run(category.as_deref(), max_pages, refresh).await;
+    }
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::AutoPrWorker { dry_run } = cli.cmd {
+        return autoship_worker::run(std::env::current_dir()?, dry_run).await;
     }
     if let Cmd::ComposioAuthTool = cli.cmd {
         return composio_auth_tool::serve().await;
@@ -2996,6 +3088,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::RepoDocs { ref op } = cli.cmd {
         return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
+    }
+    if let Cmd::Team { op: TeamOp::List { json } } = cli.cmd {
+        return team_list(json);
     }
     if let Cmd::Newsletter { ref op } = cli.cmd {
         return newsletter::run(op).await;
@@ -3094,10 +3189,36 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&record)?);
                 Ok(())
             }
-            DiskOp::Build { target_dir, command } => {
-                let lease = if build_storage::inherited_lease(target_dir)? { None }
-                    else { Some(build_storage::admit_session(&repo_root, target_dir).await?) };
-                build_storage::run_command(target_dir, command, lease.as_ref()).await
+            DiskOp::Build { target_dir, command, update } => {
+                let result = async {
+                    let admitted: Result<Option<build_storage::Lease>> = async {
+                        if build_storage::inherited_mode(target_dir, *update)? { Ok(None) }
+                        else if *update { build_storage::admit_update(&repo_root, target_dir).await.map(Some) }
+                        else { build_storage::admit_session(&repo_root, target_dir).await.map(Some) }
+                    }.await;
+                    let lease = match admitted {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            let code = if error.downcast_ref::<storage_reservations::Busy>().is_some() { 75 }
+                                else if error.chain().any(|e| e.to_string().contains(disk::LOW_DISK_REFUSAL)) { 73 }
+                                else { 76 };
+                            eprintln!("build admission deferred: {error:#}");
+                            std::process::exit(code);
+                        }
+                    };
+                    build_storage::run_command(target_dir, command, lease.as_ref(), *update).await
+                }.await;
+                if let Err(ref error) = result {
+                    if error.downcast_ref::<storage_reservations::Busy>().is_some() {
+                        eprintln!("update/build deferred: {error:#}");
+                        std::process::exit(75);
+                    }
+                    if error.chain().any(|e| e.to_string().contains(disk::LOW_DISK_REFUSAL)) {
+                        eprintln!("{error:#}");
+                        std::process::exit(73);
+                    }
+                }
+                result
             }
             DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
                 &repo_root,
@@ -3365,6 +3486,10 @@ async fn main() -> Result<()> {
             dry_run,
             no_email,
         } => {
+            let external_autopr = autoship_worker::external_enabled();
+            if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+            }
             // #1287 — a Discord configuration error must not stop the
             // surfaces that are configured (Slack alone, for one): report it
             // and run without the Discord approval broker, as an unset
@@ -4068,7 +4193,9 @@ async fn main() -> Result<()> {
             // run spawns the claude CLI on the owner's subscription (#448),
             // so it must never start billing as a side effect of a deploy.
             // Serve's --dry-run flows through: the gate runs but no PR opens.
-            match self_improve::AutoPrLoop::from_env(
+            if external_autopr {
+                info!("auto-PR loop hosted by augmentagent-autopr.service");
+            } else { match self_improve::AutoPrLoop::from_env(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 dry_run,
             ) {
@@ -4077,7 +4204,7 @@ async fn main() -> Result<()> {
                     tasks.push(tokio::spawn(async move { ap.run(sd).await }));
                 }
                 None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
-            }
+            } }
             // #427 — ShadowNote journal → wiki ingest. Self-gates on the
             // SHADOWNOTE_* keyring/env config (plus AWS creds via the SDK
             // default chain); an unconfigured box logs and moves on, same
@@ -4202,6 +4329,13 @@ async fn main() -> Result<()> {
             // counters with no visible card is pointless.
             if !dry_run {
                 if !no_email {
+                    let calibration_store=Arc::clone(&store);
+                    let calibration_skill=cli.skill_dir.clone();
+                    let calibration_shutdown=shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        self_improve::triage_calibration::run_background(calibration_store,calibration_skill,calibration_shutdown).await;
+                        Ok(())
+                    }));
                     let assessment_store=Arc::clone(&store);
                     let assessment_reasoner=build_reasoner();
                     let assessment_wiki=cli.wiki_dir.clone();
@@ -4445,6 +4579,8 @@ async fn main() -> Result<()> {
             max_issues,
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
+        Cmd::Team { .. } => unreachable!("handled before database initialization"),
+        Cmd::TeamCoverage { op } => team_coverage_cmd(&store, op),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
@@ -4605,11 +4741,14 @@ async fn main() -> Result<()> {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
                 run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
             }
-            LinkedinOp::RecentDms { limit, json } => {
-                let repo_root =
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                run_linkedin_recent_dms(repo_root, *limit, *json).await
-            }
+            op @ (LinkedinOp::RecentDms { .. } | LinkedinOp::Thread { .. }) => {
+                let reader = linkedin_archive::reader()?;
+                print!("{}", dispatch_linkedin_read(op, &reader).await?);
+                Ok(())
+            },
+            LinkedinOp::Backfill { category, max_pages, refresh, .. } =>
+                linkedin_archive::backfill(store,category.as_deref(),*max_pages,*refresh).await,
+            LinkedinOp::ArchiveStatus { category } => linkedin_archive::status(&store,category),
             LinkedinOp::Dm {
                 conversation_urn,
                 with,
@@ -4924,6 +5063,7 @@ async fn main() -> Result<()> {
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
+        Cmd::TriageCalibration { op } => self_improve::triage_calibration::run(store, op).await,
         Cmd::TriagePrefilter { op } => triage_prefilter_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
@@ -4955,12 +5095,19 @@ async fn main() -> Result<()> {
             ImessageOp::DenyInbound { identifier } => {
                 imessage_send::set_allowlist(&store, false, false, identifier)
             }
+            ImessageOp::ContactDefaults { inbound, outbound } => {
+                store.set_imessage_contact_defaults(*inbound, *outbound)?;
+                imessage_send::print_allowlists(&store)
+            }
             ImessageOp::Allowlist => imessage_send::print_allowlists(&store),
             ImessageOp::Approve { action_id } => {
                 imessage_send::run_cli_resolve(Arc::clone(&store), action_id, true).await
             }
             ImessageOp::Skip { action_id } => {
                 imessage_send::run_cli_resolve(Arc::clone(&store), action_id, false).await
+            }
+            ImessageOp::Compose(args) => {
+                imessage_compose::run(&store, cli.wiki_dir.clone(), args).await
             }
         },
         Cmd::Calendar { op } => match op {
@@ -5434,7 +5581,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::TokenUsage { days, json } => {
+        Cmd::TokenUsage { days, json, outcomes } => {
             use augmentagent_channel_core::token_usage as tu;
             let path = tu::default_usage_log_path();
             // #1413 — a report window can straddle a rotation.
@@ -5443,10 +5590,21 @@ async fn main() -> Result<()> {
             if rolled.len() > days as usize {
                 rolled.drain(..rolled.len() - days as usize);
             }
-            if json {
+            let outcome_report = if outcomes || !json {
+                let since = chrono::Utc::now().timestamp_millis().saturating_sub(i64::from(days) * 86_400_000);
+                Some(store.triage_outcome_report(since, 20)?)
+            } else { None };
+            if json && outcomes {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"token_usage":rolled,"triage_outcomes":outcome_report}))?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&rolled)?);
             } else {
                 print!("{}", tu::format_report(&rolled));
+                if let Some(report) = outcome_report {
+                    println!("Triage outcomes: flag precision {} ({} observed owner resolutions); flagged then aged out {}; unresolved flags {}; unknown original cohort {}.",
+                        report.flag_precision.map(|v| format!("{:.1}%",v*100.0)).unwrap_or_else(|| "not observed".into()),
+                        report.observed_owner_resolutions, report.flagged_then_aged_out, report.flagged.unresolved, report.unknown_cohort.total());
+                }
                 if raw.is_empty() {
                     println!("  (log: {})", path.display());
                 }
@@ -5506,6 +5664,7 @@ async fn main() -> Result<()> {
         Cmd::Phone { op: PhoneOp::Metrics { last } } => phone_metrics::run(&store, last),
         Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
+        Cmd::AutoPrWorker { .. } => unreachable!("worker dispatch precedes database initialization"),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
@@ -6488,27 +6647,133 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// #417 — Upload `--attach` (when given) to Composio's attachment store,
-/// printing what was attached so the operator can SEE it happened. Fails
-/// loudly on a missing/unreadable file before any draft is created.
+/// #417 — Stage every `--attach` file, printing each so the operator can SEE
+/// what was attached. Fails loudly on a missing/unreadable file before any
+/// draft is created.
 async fn upload_attach_if_given(
     gmail: &ComposioClient,
-    attach: Option<PathBuf>,
-) -> Result<Option<Attachment>> {
-    let Some(path) = attach else { return Ok(None) };
-    let meta = std::fs::metadata(&path)
-        .with_context(|| format!("attachment not found: {}", path.display()))?;
-    let att = gmail
-        .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
-        .await
-        .context("attachment upload failed")?;
-    println!(
-        "attached: {} ({} KB, {})",
-        att.name,
-        meta.len().div_ceil(1024),
-        att.mimetype
-    );
-    Ok(Some(att))
+    attach: Vec<PathBuf>,
+) -> Result<(
+    Vec<Attachment>,
+    Option<String>,
+    Vec<tempfile::NamedTempFile>,
+)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let mut out = Vec::with_capacity(attach.len());
+    let mut reviews = Vec::with_capacity(attach.len());
+    let mut snapshots = Vec::with_capacity(attach.len());
+    for path in attach {
+        anyhow::ensure!(
+            std::fs::metadata(&path)?.is_file(),
+            "attachment is not a regular file: {}",
+            path.display()
+        );
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("attachment not found: {}", path.display()))?;
+        // Both direct Google and Composio read at draft time. Keep a private
+        // snapshot alive through draft creation so its review digest cannot drift.
+        let suffix = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_default();
+        let mut snapshot = tempfile::Builder::new().suffix(&suffix).tempfile()?;
+        snapshot.write_all(&bytes)?;
+        let mut att = gmail
+            .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", snapshot.path())
+            .await
+            .context("attachment upload failed")?;
+        att.name = augmentagent_docs::inbound::recorded_original_name(&path).unwrap_or_else(|| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let review = format!(
+            "{}; source path: {}; {} bytes; SHA-256: {:x}",
+            att.name,
+            path.display(),
+            bytes.len(),
+            Sha256::digest(&bytes)
+        );
+        println!("attached: {review}");
+        reviews.push(review);
+        out.push(att);
+        snapshots.push(snapshot);
+    }
+    let review = (!reviews.is_empty()).then(|| reviews.join(" | "));
+    Ok((out, review, snapshots))
+}
+
+#[cfg(test)]
+mod original_attachment_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn upload_preserves_binary_bytes_and_review_identifies_each_revision() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"%PDF-1.7\n\x00\xff original signed layout";
+        let client = ComposioClient::new("test".into());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aa-doc-1457-1.pdf");
+        let second = dir.path().join("second.pdf");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(&second, b"second document").unwrap();
+        augmentagent_docs::inbound::record_original_name(&path, "Signed agreement.pdf")
+            .await
+            .unwrap();
+        let (attached, review, snapshots) =
+            upload_attach_if_given(&client, vec![path.clone(), second])
+                .await
+                .unwrap();
+        let review = review.unwrap();
+        assert_eq!(attached.len(), 2);
+        assert_eq!(attached[0].name, "Signed agreement.pdf");
+        assert_eq!(attached[1].name, "second.pdf");
+        assert!(review.contains("aa-doc-1457-1.pdf"));
+        assert!(review.contains(&format!("SHA-256: {:x}", Sha256::digest(bytes))));
+        assert!(review.contains("second.pdf"));
+        let body = augmentagent_approval_discord::append_envelope_markers(
+            "email body".into(),
+            None,
+            "action",
+            "sender@example.com",
+            Some(&review),
+        );
+        assert!(body.contains(&review));
+        std::fs::write(&path, b"corrected revision").unwrap();
+        assert_eq!(
+            std::fs::read(attached[0].path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        let (_, revised_review, _new_snapshots) =
+            upload_attach_if_given(&client, vec![path.clone()])
+                .await
+                .unwrap();
+        assert_ne!(Some(review), revised_review);
+        let snapshot_path = attached[0].path.clone().unwrap();
+        drop(snapshots);
+        assert!(!snapshot_path.exists());
+        assert!(
+            upload_attach_if_given(&client, vec![dir.path().join("missing.pdf")])
+                .await
+                .is_err()
+        );
+        let (empty, review, guards) = upload_attach_if_given(&client, vec![]).await.unwrap();
+        assert!(empty.is_empty() && review.is_none() && guards.is_empty());
+    }
+}
+
+/// The card's single `[attachment: …]` marker value, or `None` without any.
+fn attachment_names(attachments: &[Attachment]) -> Option<String> {
+    (!attachments.is_empty()).then(|| {
+        attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 /// Canonicalize a user-supplied `--thread-id` before any draft is created
@@ -7002,7 +7267,7 @@ async fn run_gmail_compose(
     json: bool,
     post: bool,
     allow_duplicate: bool,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_message_id: Option<String>,
     reply_to_from: Option<String>,
     reply_to_subject: Option<String>,
@@ -7105,7 +7370,7 @@ async fn run_gmail_compose(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -7113,7 +7378,7 @@ async fn run_gmail_compose(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -7130,7 +7395,7 @@ async fn run_gmail_compose(
             &bcc,
             &subject,
             &body_str,
-            attachment.as_ref().map(|a| a.name.as_str()),
+            attachment_review.as_deref(),
             thread_id.as_deref(),
             reply_to_message_id.as_deref(),
             reply_to_from.as_deref(),
@@ -7181,7 +7446,8 @@ async fn run_gmail_compose(
                     "bcc": bcc,
                     "subject": subject,
                     "thread_id": thread_id,
-                    "attachment": attachment.as_ref().map(|a| a.name.clone()),
+                    "attachment": attachment_names(&attachments),
+                    "attachments": attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                     "approval_card_posted": true,
                 })
             );
@@ -7202,7 +7468,8 @@ async fn run_gmail_compose(
                 "bcc": bcc,
                 "subject": subject,
                 "thread_id": thread_id,
-                "attachment": attachment.as_ref().map(|a| a.name.clone()),
+                "attachment": attachment_names(&attachments),
+                    "attachments": attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                 "open_in_gmail": format!("https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"),
             })
         );
@@ -7217,7 +7484,7 @@ async fn run_gmail_compose(
             println!("bcc:     {}", bcc.join(", "));
         }
         println!("subject: {subject}");
-        if let Some(a) = &attachment {
+        for a in &attachments {
             println!("attachment: {} ({})", a.name, a.mimetype);
         }
         println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={draft_id}");
@@ -7872,6 +8139,12 @@ async fn run_linkedin_dm(
         }
         return Ok(());
     }
+    // A preview only echoes the supplied text. Validate authoritative direct
+    // membership before creating any persisted draft or approval card.
+    let auth = LinkedInAuth::load_with_migration(&std::env::current_dir()?)
+        .context("LinkedIn is not configured; run `linkedin login` before posting an approval card")?;
+    augmentagent_channel_linkedin::archive::ArchiveReader::new(auth)?
+        .require_direct(&conversation_urn).await?;
     let message_id = format!("compose:linkedin:dm:{conversation_urn}");
     let action_id = post_social_approval_card(
         &store,
@@ -7968,57 +8241,6 @@ async fn run_linkedin_comment(
 }
 
 
-/// `linkedin recent-dms` — list recent DM threads and their conversation urns.
-///
-/// Read-only: one Voyager GET, no writes, nothing sent. Its whole purpose is
-/// to hand the agent the `--conversation-urn` that `linkedin dm` requires.
-async fn run_linkedin_recent_dms(
-    repo_root: PathBuf,
-    limit: usize,
-    json: bool,
-) -> Result<()> {
-    let auth = LinkedInAuth::load_with_migration(&repo_root)
-        .context("load linkedin auth (run `linkedin login`)")?;
-    let my_urn = auth.member_urn.clone();
-    let voyager = VoyagerClient::new(auth);
-    let dms = voyager
-        .fetch_recent_dms()
-        .await
-        .context("fetch recent linkedin dms")?;
-    // Drop our own outbound messages: you don't reply to yourself, and they
-    // would only pad the list the agent has to disambiguate.
-    let rows: Vec<_> = dms
-        .into_iter()
-        .filter(|d| !d.is_outbound(&my_urn))
-        .take(limit)
-        .collect();
-    if json {
-        let out: Vec<_> = rows
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "conversation_urn": d.conversation_urn,
-                    "message_urn": d.message_urn,
-                    "peer_name": d.peer_name,
-                    "text": d.text,
-                    "delivered_at_ms": d.delivered_at_ms,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-    if rows.is_empty() {
-        println!("(no recent inbound LinkedIn DMs)");
-        return Ok(());
-    }
-    for d in &rows {
-        let preview: String = d.text.chars().take(70).collect();
-        println!("{}\n  from: {}\n  {}\n", d.conversation_urn, d.peer_name, preview);
-    }
-    Ok(())
-}
-
 /// #1188 (review) — hard wall-clock bound on one card's best-effort redraw.
 /// serenity's `Http` (like `#500`'s ComposioClient) sets no request timeout,
 /// so the history fetch + edit inside `edit_card_for_action` would otherwise
@@ -8073,7 +8295,7 @@ async fn run_gmail_update_draft(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
@@ -8121,7 +8343,7 @@ async fn run_gmail_update_draft(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let new_id = gmail
         .update_draft_with_attachment(
             &entity_id,
@@ -8130,7 +8352,7 @@ async fn run_gmail_update_draft(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -8200,7 +8422,7 @@ async fn run_gmail_update_draft(
                         Some(store.as_ref()),
                         action_id,
                         &row.email.from,
-                        attachment.as_ref().map(|a| a.name.as_str()),
+                        attachment_review.as_deref(),
                     );
                     let edit = augmentagent_approval_discord::approval_edit_message(
                         action_id,
@@ -8339,7 +8561,7 @@ async fn run_gmail_send_now(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
@@ -8361,7 +8583,7 @@ async fn run_gmail_send_now(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, _attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -8369,7 +8591,7 @@ async fn run_gmail_send_now(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -8612,6 +8834,22 @@ async fn run_stale_approval_reconcile(
         interval_secs = STALE_RECONCILE_INTERVAL_SECS,
         "stale approval reconciliation started"
     );
+    // #1698 — a typo in the roster must be visible, not silently narrow it.
+    let roster = augmentagent_messages::team::TeamRoster::from_env();
+    for bad in roster.invalid_entries() {
+        warn!(entry = %bad, "ignored invalid AUGMENTAGENT_OWNER_TEAM entry");
+    }
+    // #1700 — without aliases the hand-back check can't run, so the rule
+    // stays off rather than retire "<owner>, can you take this?".
+    let team = team_coverage::Config::from_env(&store);
+    if !team.roster.is_empty() && team.aliases.is_empty() && team.mode != team_coverage::Mode::Off {
+        warn!(
+            "team coverage inactive: {} is set but {} is empty",
+            augmentagent_messages::team::TeamRoster::ENV,
+            team_coverage::ALIASES_ENV
+        );
+    }
+    info!(mode = team.mode.as_str(), active = team.active(), "team coverage configured");
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -8634,9 +8872,141 @@ async fn run_stale_approval_reconcile(
     }
 }
 
+#[derive(Subcommand, Debug)]
+enum TeamCoverageOp {
+    /// Every coverage decision in the window, with the summary and gate.
+    Report {
+        /// Only decisions from the last N days.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Mark a decision `correct` or `wrong` (re-reviewing replaces it).
+    Review { action_id: String, verdict: String },
+    /// Evaluate the rollout gate over all decisions; exit 1 unless it passes.
+    Gate,
+}
+
+fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
+    use team_coverage::{gate, summarize, summary_line};
+    let now = chrono::Utc::now().timestamp_millis();
+    match op {
+        TeamCoverageOp::Report { days, json } => {
+            let rows = store.team_coverage_report(now - i64::from(days) * 86_400_000)?;
+            let s = summarize(&rows);
+            let g = gate(&s, now);
+            if json {
+                let v = serde_json::json!({
+                    "rows": rows.iter().map(|r| serde_json::json!({
+                        "action_id": r.decision.action_id,
+                        "mode": r.decision.mode,
+                        "platform": r.platform,
+                        "teammate": r.decision.teammate,
+                        "covering_message_id": r.decision.covering_message_id,
+                        "thread_id": r.decision.thread_id,
+                        "covered_at_ms": r.decision.covered_at_ms,
+                        "decided_at_ms": r.decision.decided_at_ms,
+                        "owner_replied_anyway": r.owner_replied_anyway,
+                        "review": r.review,
+                    })).collect::<Vec<_>>(),
+                    "summary": {
+                        "decisions": s.decisions,
+                        "reviewed": s.reviewed,
+                        "wrong": s.wrong,
+                        "replied_anyway": s.replied_anyway,
+                        "first_decided_ms": s.first_decided_ms,
+                    },
+                    "gate": { "pass": g.pass, "reasons": g.reasons },
+                });
+                println!("{v}");
+            } else {
+                for r in &rows {
+                    let at = chrono::DateTime::from_timestamp_millis(r.decision.covered_at_ms)
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    println!(
+                        "{}\t{}\t{}\tteammate={}\tcovered={}\tmsg={}\treplied-anyway={}\treview={}",
+                        r.decision.action_id,
+                        r.decision.mode,
+                        r.platform,
+                        r.decision.teammate,
+                        at,
+                        r.decision.covering_message_id,
+                        r.owner_replied_anyway,
+                        r.review.as_deref().unwrap_or("-"),
+                    );
+                }
+                println!("{}", summary_line(&s, &g, now));
+            }
+        }
+        TeamCoverageOp::Review { action_id, verdict } => {
+            if !store.review_team_coverage(&action_id, &verdict)? {
+                anyhow::bail!("no team-coverage decision for action {action_id}");
+            }
+            println!("reviewed {action_id}: {verdict}");
+        }
+        TeamCoverageOp::Gate => {
+            let s = summarize(&store.team_coverage_report(0)?);
+            let g = gate(&s, now);
+            println!("{}", summary_line(&s, &g, now));
+            for r in &g.reasons {
+                println!("  - {r}");
+            }
+            if !g.pass {
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+enum TeamOp {
+    /// Print the parsed roster and any ignored entries.
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+fn team_list(json: bool) -> Result<()> {
+    use augmentagent_messages::team::TeamRoster;
+    let roster = TeamRoster::from_env();
+    for bad in roster.invalid_entries() {
+        eprintln!("warning: ignored invalid {} entry: {bad}", TeamRoster::ENV);
+    }
+    let entries = roster.entries();
+    if json {
+        let v = serde_json::json!({
+            "entries": entries
+                .iter()
+                .map(|(e, l)| serde_json::json!({"entry": e, "label": l}))
+                .collect::<Vec<_>>(),
+            "invalid": roster.invalid_entries(),
+        });
+        println!("{v}");
+    } else if entries.is_empty() {
+        println!("no team roster configured ({} unset or empty)", TeamRoster::ENV);
+    } else {
+        for (entry, label) in entries {
+            println!("{entry}\t{label}");
+        }
+    }
+    Ok(())
+}
+
 /// One reconciliation pass. Returns how many cards were retired. Split out from
 /// the loop so it is directly unit-testable.
 fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
+    reconcile_stale_approvals_tick_with(store, &team_coverage::Config::from_env(store))
+}
+
+/// [`reconcile_stale_approvals_tick`] with an explicit teammate-coverage
+/// config (#1700), so tests don't depend on the process environment.
+fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Config) -> Result<usize> {
+    let team_active = team.active();
+    let mut covered: Vec<(String, String, team_coverage::Coverage)> = Vec::new();
     let pending = store.pending_actions_for_reconcile()?;
     let scheduled = store.scheduled_actions_for_reconcile()?;
     if pending.is_empty() && scheduled.is_empty() {
@@ -8703,17 +9073,24 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
         // old reply supersede every future draft the daemon makes for newer
         // inbounds on that thread, silently, before the owner can act — exactly
         // the false "Already resolved (superseded)." the user reported. This
-        // mirrors the inbound triage gate (#218): parse `receivedAt`, and fall
-        // back to `i64::MAX` (retire on nothing) when the arrival is unknown or
-        // unparseable, so a bad date never over-retires.
+        // mirrors the inbound triage gate (#218): parse `receivedAt`. When the
+        // arrival is unknown or unparseable, fall back to the card's own
+        // `createdAt` — a card is always raised after its inbound arrived, so a
+        // reply after it is after the inbound too and can't over-retire.
+        //
+        // "Replied" includes a card the owner approved and the daemon sent on
+        // the same thread: approving the newest draft answers the older
+        // inbounds too, and the OutboundObserver deliberately never logs our
+        // own sends as manual replies, so without this every older sibling
+        // card stayed in the queue after the owner had answered.
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
-        let after_ms = match row.received_at.as_deref().map(parse_rfc2822_or_ms) {
+        let after_ms = match row.received_at.as_deref().map(team_coverage::message_time_ms) {
             Some(ms) if ms > 0 => ms,
-            _ => i64::MAX,
+            _ => row.created_at_ms,
         };
-        match store.thread_has_user_reply_after(tid, after_ms) {
+        match store.thread_has_owner_send_after(tid, after_ms) {
             Ok(true) => {
                 info!(
                     action_id = %row.id,
@@ -8723,11 +9100,25 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
                 );
                 answered_ids.push(row.id.clone());
             }
+            // Rule 4 (#1700) — a rostered teammate already answered the
+            // asker on the owner's behalf. Email cards only; group chats are
+            // #1701. Shadow mode records the decision and retires nothing.
+            Ok(false) if team_active && team_coverage::supported(&row.platform) => {
+                match team_coverage::find_coverage(store, row, after_ms, team) {
+                    Ok(Some(c)) => covered.push((row.id.clone(), tid.to_string(), c)),
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        action_id = %row.id,
+                        thread = %tid,
+                        "team coverage: find_coverage failed: {e:#}"
+                    ),
+                }
+            }
             Ok(false) => {}
             Err(e) => warn!(
                 action_id = %row.id,
                 thread = %tid,
-                "stale approval: thread_has_user_reply_after failed: {e:#}"
+                "stale approval: thread_has_owner_send_after failed: {e:#}"
             ),
         }
     }
@@ -8802,6 +9193,35 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
         &answered_ids,
         "superseded: you already replied on this thread",
     )?;
+    let now = chrono::Utc::now().timestamp_millis();
+    for (action_id, thread_id, c) in covered {
+        let decision = augmentagent_store::team_coverage::TeamCoverageDecision {
+            action_id: action_id.clone(),
+            mode: team.mode.as_str().to_string(),
+            teammate: c.teammate.clone(),
+            covering_message_id: c.covering_message_id.clone(),
+            thread_id: thread_id.clone(),
+            covered_at_ms: c.covered_at_ms,
+            decided_at_ms: now,
+        };
+        if store.record_team_coverage_decision(&decision)? {
+            info!(
+                action_id = %action_id,
+                thread = %thread_id,
+                teammate = %c.teammate,
+                covering_message = %c.covering_message_id,
+                mode = team.mode.as_str(),
+                "team coverage: {}",
+                if team.mode == team_coverage::Mode::On { "retiring card" } else { "would retire" }
+            );
+        }
+        if team.mode == team_coverage::Mode::On {
+            retired += store.mark_pending_heuristic_superseded_by_ids(
+                &[action_id],
+                &format!("superseded: covered by teammate {}", c.teammate),
+            )?;
+        }
+    }
     Ok(retired)
 }
 
@@ -8857,6 +9277,20 @@ async fn run_stale_draft_sweep(
     }
 }
 
+fn optional_digest_rows<T,E:std::fmt::Display>(ctx:&mut String,section:&str,result:std::result::Result<Vec<T>,E>)->Vec<T> {
+    match result { Ok(rows)=>rows,Err(error)=>{ctx.push_str(&format!("{section} unavailable: {error}\n"));vec![]} }
+}
+
+#[test]
+fn optional_digest_query_failure_preserves_other_sections() {
+    let mut ctx=String::from("Inbox evidence\n");
+    let rows:Vec<String>=optional_digest_rows(&mut ctx,"Retry failure evidence",Err("malformed row"));
+    assert!(rows.is_empty());
+    let rows=optional_digest_rows(&mut ctx,"Loop evidence",Ok::<_,&str>(vec!["successful occurrence"]));
+    ctx.push_str(rows[0]);
+    assert!(ctx.contains("Inbox evidence") && ctx.contains("Retry failure evidence unavailable") && ctx.contains("successful occurrence"));
+}
+
 async fn run_digest(
     cli: &Cli,
     store: Arc<Store>,
@@ -8895,6 +9329,60 @@ async fn run_digest(
     } else {
         for (status, n) in &counts {
             ctx.push_str(&format!("- {status}: {n}\n"));
+        }
+    }
+
+    ctx.push_str("\n## Autoship native reviewer canary\n");
+    match self_improve::review_canary_summary() {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Canary evidence unavailable: {error:#}\n")),
+    }
+    ctx.push_str("\n## Autoship observed throughput and resources\n");
+    match autoship_metrics::summary(since_ms, chrono::Utc::now().timestamp_millis()) {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Workflow evidence unavailable: {error:#}\n")),
+    }
+    ctx.push_str("\n## Autoship readiness dependencies\n");
+    match self_improve::readiness_summary() { Ok(summary)=>ctx.push_str(&summary),Err(error)=>ctx.push_str(&format!("Readiness evidence unavailable: {error}\n")) }
+    ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
+    match store.triage_outcome_report(since_ms,25) {
+        Ok(triage_outcomes) => {
+    for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending), ("unknown original cohort", &triage_outcomes.unknown_cohort)] {
+        ctx.push_str(&format!("- {cohort}: approved {}, revised {}, skipped {}, aged out {}, unresolved {}\n",
+            counts.approved, counts.revised, counts.skipped, counts.aged_out, counts.unresolved));
+    }
+    match triage_outcomes.flag_precision {
+        Some(precision) => ctx.push_str(&format!("- Flag precision among {} observed owner resolutions: {:.1}% (aged-out and unresolved excluded)\n",
+            triage_outcomes.observed_owner_resolutions, precision * 100.0)),
+        None => ctx.push_str("- Flag precision unavailable: no observed owner resolutions.\n"),
+    }
+    ctx.push_str(&format!("- Flagged then aged out: {}.\n", triage_outcomes.flagged_then_aged_out));
+    for case in &triage_outcomes.disagreement_review_set {
+        ctx.push_str(&format!("- Disagreement review case {}: {:?}; {}. Review only; no automatic policy change.\n",
+            case.action_id, case.owner_outcome, case.evidence));
+    }
+        },
+        Err(error) => ctx.push_str(&format!("Triage outcome evidence unavailable: {error}\n")),
+    }
+    ctx.push_str("\n## Retry failure memory (latest 25; full history retained)\n");
+    for failure in optional_digest_rows(&mut ctx,"Retry failure evidence",store.email_retry_failures_since(since_ms, 25)) {
+        ctx.push_str(&format!("- action {} / message {}: attempt {}, guard {}, failure {}\n",
+            failure.action_id, failure.message_id, failure.attempt_n,
+            truncate(&failure.guard, 80), truncate(&failure.failure_class, 240)));
+    }
+    ctx.push_str("\n## Email guard observations (intentional dispositions, not retry failures)\n");
+    for guard in optional_digest_rows(&mut ctx,"Email guard evidence",store.email_guards_since(since_ms,25)) {
+        ctx.push_str(&format!("- attempt {}: guard {}; disposition {}\n",guard.attempt_n,guard.guard,guard.disposition));
+    }
+    ctx.push_str("\n## Scheduled loop progress (latest 25 occurrences; full evidence retained)\n");
+    for occurrence in optional_digest_rows(&mut ctx,"Scheduled loop evidence",store.loop_occurrences_since(since_ms, 25)) {
+        let coverage = optional_digest_rows(&mut ctx,&format!("Loop {} coverage",occurrence.loop_id),store.loop_coverage(&occurrence.loop_id, 5));
+        ctx.push_str(&format!("- loop {} / occurrence {}: {}; covered observations shown {}; outcome {}\n",
+            occurrence.loop_id, occurrence.request_id, occurrence.state, coverage.len(),
+            truncate(occurrence.error.as_deref().or(occurrence.answer.as_deref()).unwrap_or("pending"), 300)));
+        for finding in coverage {
+            ctx.push_str(&format!("  - {} [evidence: {}]\n", truncate(&finding.finding, 160),
+                truncate(&finding.evidence.join(", "), 200)));
         }
     }
     ctx.push_str(&format!("\n## Pending replies (awaiting approval)\n- {pending}\n"));
@@ -12034,6 +12522,21 @@ mod approval_body_tests {
         assert!(err.contains("records no decision"), "{err}");
     }
 
+    #[test]
+    fn issue_1678_gmail_accepts_standard_time_replies_and_explicit_owner_override() {
+        let draft = "Monday afternoon works for me. Please pick a time.\n";
+        for inbound in ["11am works for me", "noon PST is optimal.\n\nThank you,\n\nPat Lee"] {
+            let body = format!("register: standard\n{draft}");
+            assert_eq!(strip_register_receipt(&body, Some(inbound)).unwrap(), (draft.into(), true));
+        }
+        let lower = "that works for me. please send the invite";
+        assert!(strip_register_receipt(draft, Some(lower)).is_err());
+        let asked = format!("register: standard (you asked)\n{draft}");
+        assert_eq!(strip_register_receipt(&asked, Some(lower)).unwrap(), (draft.into(), true));
+        let undecided = format!("register: unknown (you asked)\n{draft}");
+        assert!(strip_register_receipt(&undecided, Some(lower)).is_err());
+    }
+
     // #962 — who the card's From line (and the actions/emails rows) name.
     #[test]
     fn reply_cards_keep_the_replied_to_sender_as_their_identity() {
@@ -13309,28 +13812,49 @@ impl ReplyApprover {
                     message: "no conversationUrn on email; cannot send".into(),
                 };
             };
-            match linkedin.send_message(conv_urn, body).await {
-                Ok(_) => {
-                    let _ = self.store.update_action_status(
-                        action_id,
-                        ActionStatus::Sent,
-                        Some(body),
-                        None,
+            match self.store.claim_action_for_send(action_id, ActionStatus::Pending, "linkedin-approval") {
+                Ok(true) => {}
+                Ok(false) => {
+                    return match self.handle_load(action_id) {
+                        Some(current) => ApprovalActionOutcome::AlreadyResolved {
+                            status: current.action.status, detail: current.action.error_message,
+                        },
+                        None => ApprovalActionOutcome::NotFound,
+                    };
+                }
+                Err(error) => return ApprovalActionOutcome::Failed {
+                    message: format!("could not claim LinkedIn approval: {error}"),
+                },
+            }
+            let send = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                linkedin.send_message(conv_urn, body),
+            ).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let msg = "LinkedIn send timed out after 30s; delivery is unknown. Check the conversation before resending.";
+                    let _ = self.store.finish_send_error(
+                        action_id, msg,
+                        Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
+                        "linkedin-approval",
                     );
-                    let _ = self
-                        .store
-                        .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                    return ApprovalActionOutcome::Failed { message: msg.into() };
+                }
+            };
+            match send {
+                Ok(_) => {
+                    if !matches!(self.store.finish_send_sent(action_id, "linkedin-approval"), Ok(true)) {
+                        return ApprovalActionOutcome::Failed {
+                            message: "LinkedIn accepted the reply, but its receipt could not be recorded; do not resend".into(),
+                        };
+                    }
+                    let _ = self.store.mark_email_processed(&action.email.message_id, TriageResult::Reply);
                     tracing::info!(action_id, "linkedin reply sent via approval handler");
                     ApprovalActionOutcome::Approved
                 }
                 Err(e) => {
                     let msg = format!("linkedin send_message: {e}");
-                    let _ = self.store.update_action_status(
-                        action_id,
-                        ActionStatus::Error,
-                        None,
-                        Some(&msg),
-                    );
+                    let _ = self.store.finish_send_error(action_id, &msg, None, "linkedin-approval");
                     ApprovalActionOutcome::Failed { message: msg }
                 }
             }
@@ -13360,13 +13884,13 @@ impl ReplyApprover {
                 };
             }
         };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        let _ = self.store.reset_nudge_schedule(action_id);
+        match self.store.revise_pending_action(action_id, &redraft) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(error) => return ApprovalActionOutcome::Failed {
+                message: format!("could not persist LinkedIn revision: {error}"),
+            },
+        }
         tracing::info!(action_id, "linkedin revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -13380,12 +13904,15 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         // Nothing to delete server-side — LinkedIn has no draft concept.
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Rejected,
-            None,
-            Some("skipped by approver"),
-        );
+        match self.store.try_resolve_action(
+            action_id, ActionStatus::Rejected, "linkedin-approval", Some("skipped by approver"),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Self::resolved_outcome(&self.store, action_id),
+            Err(error) => return ApprovalActionOutcome::Failed {
+                message: format!("could not skip LinkedIn approval: {error}"),
+            },
+        }
         let _ = self
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -14962,7 +15489,7 @@ impl ReplyApprover {
                 &subject,
                 &gmail_redraft,
                 draft_thread_id,
-                None,
+                &[],
                 &cc,
                 &bcc,
             )
@@ -22014,6 +22541,69 @@ mod stale_reconcile_tests {
         );
     }
 
+    /// The owner answers a thread by approving the NEWEST card; the daemon
+    /// sends it and records it in `self_sent_messages` (never in
+    /// `outbound_thread_log`). The older card on that thread, drafted for an
+    /// inbound the send has now answered, must retire — it used to sit in the
+    /// queue forever. A card for an inbound arriving after the send survives.
+    #[test]
+    fn reconcile_retires_older_cards_once_a_sibling_card_was_sent() {
+        let (store, _t) = fresh_store();
+        let older = seed_pending_dated(
+            &store,
+            "m-old",
+            Some("T-sent"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "2026-01-01T00:00:00Z",
+        );
+        // Sent "now" (2026+ wallclock) — after `older`'s inbound.
+        store
+            .record_self_sent_message("sent-1", Some("T-sent"), Some("acc"), Some("approved-card"))
+            .unwrap();
+        let later = seed_pending_dated(
+            &store,
+            "m-later",
+            Some("T-sent"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "2099-01-01T00:00:00Z",
+        );
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(status_of(&store, &older), "superseded");
+        assert_eq!(
+            status_of(&store, &later),
+            "pending",
+            "a card for mail that arrived after the send is still unanswered"
+        );
+    }
+
+    /// A card whose inbound has no usable `receivedAt` is bounded by its own
+    /// `createdAt` instead of never retiring: a reply before the card was
+    /// raised leaves it alone, a reply after it retires it.
+    #[test]
+    fn reconcile_rule1_falls_back_to_card_creation_when_inbound_date_is_unknown() {
+        let (store, _t) = fresh_store();
+        let card = seed_pending_dated(
+            &store,
+            "m-undated",
+            Some("T-undated"),
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
+            "",
+        );
+        store
+            .record_outbound_thread_event("acc", "before-card", Some("T-undated"), 9_000_000)
+            .unwrap();
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(status_of(&store, &card), "pending");
+
+        store
+            .record_outbound_thread_event("acc", "after-card", Some("T-undated"), 4_000_000_000_000)
+            .unwrap();
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
+        assert_eq!(status_of(&store, &card), "superseded");
+    }
+
     // ---- #1203: recompose durability + per-row scoping ----
 
     /// A superseded, then recomposed, row carries the persisted override.
@@ -22758,18 +23348,18 @@ mod linkedin_composed_card_dispatch_tests {
                 other => panic!("{label}: schedule must be refused, got {other:?}"),
             }
 
-            // Skip's outcome is `Skipped` on both arms; the tell is that the
-            // platform arms resolve via `update_action_status` (no
-            // `status_source`) while the Gmail arm goes through
-            // `try_resolve_action`, which stamps the deciding surface.
+            // LinkedIn now uses a pending-only transition with its own
+            // source marker. Other platform arms retain their existing
+            // unstamped resolve path; neither may fall through to Gmail.
             assert!(matches!(
                 approver.run_skip(&id).await,
                 ApprovalActionOutcome::Skipped
             ));
             assert_eq!(
                 store.action_status_source(&id).unwrap(),
-                None,
-                "{label}: skip took the Gmail CAS path"
+                augmentagent_channel_linkedin::is_linkedin_email(&email)
+                    .then(|| "linkedin-approval".to_string()),
+                "{label}: skip took the wrong platform resolve path"
             );
         }
     }
@@ -23486,3 +24076,21 @@ pub(crate) mod test_support {
         }
     }
 }
+
+#[cfg(test)]
+mod linkedin_approval_tests;
+
+/// Production read-command dispatch, with reader construction kept outside so
+/// command parsing and routing can be exercised against a local HTTP fixture.
+async fn dispatch_linkedin_read(op: &LinkedinOp, reader: &augmentagent_channel_linkedin::archive::ArchiveReader) -> Result<String> {
+    match op {
+        LinkedinOp::RecentDms { limit, json, category, cursor, max_pages } =>
+            linkedin_archive::recent_output(reader,*limit,*json,category,cursor.as_deref(),*max_pages).await,
+        LinkedinOp::Thread { conversation_urn, cursor, max_pages, json } =>
+            linkedin_archive::thread_output(reader,conversation_urn,cursor.as_deref(),*max_pages,*json).await,
+        _ => anyhow::bail!("not a LinkedIn live read command"),
+    }
+}
+
+#[cfg(test)]
+mod linkedin_read_dispatch_tests;

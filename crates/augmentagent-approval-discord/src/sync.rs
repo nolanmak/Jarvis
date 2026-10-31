@@ -248,6 +248,14 @@ impl ApprovalBroker for MultiSurfaceBroker {
         any_ok("card", results).map(|_| ())
     }
 
+    async fn note_compose_activity(&self, action_id: &str, email: &Email) -> Result<(), ApprovalError> {
+        let mut results = Vec::new();
+        for (name, broker) in &self.surfaces {
+            results.push((*name, broker.note_compose_activity(action_id, email).await));
+        }
+        any_ok("compose activity note", results).map(|_| ())
+    }
+
     async fn post_flag_notice(&self, email: &Email, reason: &str) -> Result<(), ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {

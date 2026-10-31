@@ -104,7 +104,9 @@ pub struct ImessageOutboxItem {
 /// What the sender observed in `chat.db`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImessageSendOutcome {
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+    },
     Sent {
         message_guid: Option<String>,
     },
@@ -146,6 +148,11 @@ pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
              enabled_at_ms INTEGER NOT NULL\
          );",
     )?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS imessage_contact_defaults (
+        outbound INTEGER PRIMARY KEY CHECK(outbound IN (0,1)), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)));
+        CREATE TABLE IF NOT EXISTS imessage_contact_denials (
+        outbound INTEGER NOT NULL CHECK(outbound IN (0,1)), identifier TEXT NOT NULL,
+        PRIMARY KEY(outbound,identifier));")?;
     Ok(())
 }
 
@@ -249,7 +256,8 @@ impl Store {
         let n = self.with_conn(|c| match outcome {
             ImessageSendOutcome::Unknown { reason } => c.execute(
                 "UPDATE imessage_outbox SET status='unknown',error_detail=?2,completed_at_ms=?3
-                 WHERE id=?1 AND status='claimed'", params![id,reason,now],
+                 WHERE id=?1 AND status='claimed'",
+                params![id, reason, now],
             ),
             ImessageSendOutcome::Sent { message_guid } => c.execute(
                 "UPDATE imessage_outbox \
@@ -379,31 +387,64 @@ impl Store {
         })
     }
 
+    /// Owner-selected defaults apply to existing and future direct handles.
+    /// Compose/approve still validate the bundle, service and global send switch.
+    pub fn set_imessage_contact_defaults(&self, inbound: bool, outbound: bool) -> StoreResult<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO imessage_contact_defaults(outbound,enabled) VALUES(0,?1),(1,?2)
+                ON CONFLICT(outbound) DO UPDATE SET enabled=excluded.enabled",
+                params![inbound, outbound],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn imessage_contact_default(&self, outbound: bool) -> StoreResult<bool> {
+        self.with_conn(|c| c.query_row("SELECT COALESCE((SELECT enabled FROM imessage_contact_defaults WHERE outbound=?1),0)", [outbound], |r|r.get(0)))
+    }
+
+    pub fn list_imessage_denials(&self, outbound: bool) -> StoreResult<Vec<String>> {
+        self.with_conn(|c| {
+            let mut q=c.prepare("SELECT identifier FROM imessage_contact_denials WHERE outbound=?1 ORDER BY identifier")?;
+            let rows=q.query_map([outbound], |r|r.get(0))?;
+            rows.collect()
+        })
+    }
+
     fn allow_imessage(&self, outbound: bool, identifier: &str) -> StoreResult<bool> {
         check_identifier(identifier, "conversation identifier")?;
-        let sql = format!(
-            "INSERT INTO {} (identifier, enabled_at_ms) VALUES (?1, ?2) \
-             ON CONFLICT(identifier) DO NOTHING",
-            allowlist_table(outbound)
-        );
-        Ok(self.with_conn(|c| c.execute(&sql, params![identifier, now_millis()]))? == 1)
+        self.with_conn(|c| {
+        let tx=rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+        let removed=tx.execute("DELETE FROM imessage_contact_denials WHERE outbound=?1 AND identifier=?2",params![outbound,identifier])?;
+        let added=tx.execute(&format!("INSERT INTO {}(identifier,enabled_at_ms) VALUES(?1,?2) ON CONFLICT(identifier) DO NOTHING",allowlist_table(outbound)),params![identifier,now_millis()])?;
+        tx.commit()?;
+        Ok(removed+added>0)
+        })
     }
 
     fn deny_imessage(&self, outbound: bool, identifier: &str) -> StoreResult<bool> {
-        let sql = format!(
-            "DELETE FROM {} WHERE identifier = ?1",
-            allowlist_table(outbound)
-        );
-        Ok(self.with_conn(|c| c.execute(&sql, params![identifier]))? == 1)
+        check_identifier(identifier, "conversation identifier")?;
+        self.with_conn(|c| {
+        let tx=rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+        let removed=tx.execute(&format!("DELETE FROM {} WHERE identifier=?1",allowlist_table(outbound)),[identifier])?;
+        let added=tx.execute("INSERT INTO imessage_contact_denials(outbound,identifier) VALUES(?1,?2) ON CONFLICT DO NOTHING",params![outbound,identifier])?;
+        tx.commit()?;
+        Ok(removed+added>0)
+        })
     }
 
     fn is_imessage_allowed(&self, outbound: bool, identifier: &str) -> StoreResult<bool> {
-        let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE identifier = ?1",
-            allowlist_table(outbound)
-        );
-        let n: i64 = self.with_conn(|c| c.query_row(&sql, params![identifier], |r| r.get(0)))?;
-        Ok(n > 0)
+        let direct = identifier.strip_prefix('+').is_some_and(|digits| {
+            (8..=15).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+        }) || (identifier.contains('@')
+            && !identifier.contains(';')
+            && !identifier.chars().any(char::is_whitespace));
+        self.with_conn(|c| c.query_row(&format!("SELECT
+            NOT EXISTS(SELECT 1 FROM imessage_contact_denials WHERE outbound=?1 AND identifier=?2)
+            AND (EXISTS(SELECT 1 FROM {} WHERE identifier=?2)
+            OR (?3 AND EXISTS(SELECT 1 FROM imessage_contact_defaults WHERE outbound=?1 AND enabled=1)))",allowlist_table(outbound)),
+            params![outbound,identifier,direct],|r|r.get(0)))
     }
 
     /// Opt a conversation into sends. Returns `false` if it already was.
@@ -411,7 +452,8 @@ impl Store {
         self.allow_imessage(true, identifier)
     }
 
-    /// Returns `false` if the conversation was not on the list.
+    /// Persist an exclusion, even when contact defaults are enabled.
+    /// Returns `false` if the conversation was already explicitly denied.
     pub fn deny_imessage_outbound(&self, identifier: &str) -> StoreResult<bool> {
         self.deny_imessage(true, identifier)
     }

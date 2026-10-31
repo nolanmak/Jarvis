@@ -272,6 +272,9 @@ pub enum ReasonerError {
     /// not the provider. Never latched; the chain may still try the next.
     #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
     GateTimeout { provider: String, waited_secs: u64 },
+    /// Host capacity is shared by providers; never fan out or blame the code.
+    #[error("{provider} resource capacity: {message}")]
+    ResourceCapacity { provider: String, message: String },
     /// A previous tool process may still be active. Retrying another provider
     /// could race that process, so this error must stop the fallback chain.
     #[error("{provider} process cleanup is unverified; recovery requires reconciliation")]
@@ -304,12 +307,28 @@ impl ReasonerError {
     }
 }
 
+// Command::get_envs does not expose env_clear. Use exactly the same policy
+// while constructing the CLI command and its process-tree supervisor.
+fn clear_provider_environment(opts: &ReasonerOpts, scoped: bool) -> bool {
+    opts.restrict_env || scoped
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    // Fault-injection deadlines must never change unrelated concurrent tests.
+    static TEST_REASONER_TIMEOUT: std::time::Duration;
+}
+
 /// Watchdog timeout for one spawned reasoner CLI call (#656). Env-tunable
 /// without a rebuild; the default is deliberately generous because agentic
 /// presets (wiki-ask, auto-PR build) legitimately run many minutes. The
 /// point is not tight latency — it's that "hung forever" becomes a typed,
 /// failover-eligible error instead of a silently stuck pipeline.
 pub fn reasoner_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(timeout) = TEST_REASONER_TIMEOUT.try_with(|timeout| *timeout) {
+        return timeout;
+    }
     let secs = std::env::var("AUGMENTAGENT_REASONER_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -677,7 +696,16 @@ impl ReasonerOpts {
 /// fenced-block extraction layer lives here, once.
 #[async_trait]
 pub trait Reasoner: Send + Sync {
+    /// Native adapters admit the model only after resource/launch readiness.
+    /// HTTP implementations and test doubles retain fallback-owned admission.
+    fn defers_model_admission(&self) -> bool { false }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
+    /// Optional calibrated guidance is admitted only by a transport that proves
+    /// the replayed native route. Unknown adapters keep the original prompt.
+    async fn call_calibrated(&self, opts:&ReasonerOpts, user_message:&str, _supplement:&str, _serving_model:&str)->anyhow::Result<String> {
+        self.call(opts,user_message).await
+    }
+
 
     /// Like [`call`](Reasoner::call), but returns **everything the model said**
     /// across the turn rather than just its final text block.
@@ -989,6 +1017,7 @@ fn rate_limited_error(provider: &str, message: String) -> anyhow::Error {
 
 #[async_trait]
 impl Reasoner for ClaudeCliReasoner {
+    fn defers_model_admission(&self) -> bool { true }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         self.call_with_capture(opts, user_message, TextCapture::LastBlock)
             .await
@@ -1114,9 +1143,12 @@ impl ClaudeCliReasoner {
         capture: TextCapture,
         clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
-        let mut native_lease = crate::native_session::CURRENT
-            .try_with(|session| Arc::clone(session))
-            .ok()
+        let fresh_review = crate::native_session::is_fresh_review();
+        if fresh_review && (!opts.allowed_tools.is_empty() || opts.settings_json.is_some() || opts.handoff_path.is_some()) {
+            return Err(CallError::Other(anyhow::anyhow!("fresh review must use supplied evidence without tools, settings or handoff history")));
+        }
+        let review_directory = if fresh_review { Some(tempfile::tempdir()?) } else { None };
+        let mut native_lease = crate::native_session::current_for(crate::providers::ProviderKind::Claude)?
             .map(|session| session.begin(crate::providers::ProviderKind::Claude))
             .transpose()?;
         let mut args: Vec<String> = vec![
@@ -1127,6 +1159,11 @@ impl ClaudeCliReasoner {
             "--permission-mode".into(),
             opts.permission_mode.clone(),
         ];
+        if fresh_review {
+            args.extend(["--safe-mode".into(), "--tools".into(), "".into(),
+                "--setting-sources".into(), "".into(), "--strict-mcp-config".into(),
+                "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()]);
+        }
         if let Some(lease) = &native_lease {
             match lease.launch() {
                 crate::native_session::Launch::Create { requested_id: Some(id) } => {
@@ -1141,9 +1178,18 @@ impl ClaudeCliReasoner {
             }
         }
 
-        // `--allowedTools`: empty list = no tools. Space-separated names per claude CLI docs.
-        args.push("--allowedTools".into());
-        args.push(opts.allowed_tools.join(" "));
+        let launch_audit=opts.audit_logger.clone().or_else(default_audit_logger);
+        let vm_required = crate::native_vm::required(launch_audit.as_ref());
+        let native_scope = crate::autoship_scope::NativeScope::from_opts(opts)?;
+        let claude_bridge = if native_scope.is_some() {
+            Some(crate::codex_tools::ClaudeBridgeLaunch::prepare(opts)?)
+        } else { None };
+        if let Some(bridge) = &claude_bridge {
+            args.extend(bridge.args());
+        } else {
+            args.push("--allowedTools".into());
+            args.push(opts.allowed_tools.join(" "));
+        }
 
         // `--system-prompt` REPLACES Claude Code's default system (tools list,
         // MCP metadata, agent catalog — ~25k tokens). Empty → minimal stub.
@@ -1153,7 +1199,10 @@ impl ClaudeCliReasoner {
             &opts.system_prompt
         };
         args.push("--system-prompt".into());
-        args.push(effective_system.to_string());
+        let effective_system = if claude_bridge.is_some() {
+            format!("{effective_system}\n\nAll file and command tools are guarded jarvis MCP tools. Relative paths resolve in {}. Use mcp__jarvis__Read/Write/Edit/Glob/Grep/Bash as available. Commands accept one executable and arguments; split compound shell operations. Build with cargo/npm through the bridge; it owns build isolation and storage. Native shell/file/web tools are disabled.", opts.cwd.as_ref().map(|p|p.display().to_string()).unwrap_or_default())
+        } else { effective_system.to_owned() };
+        args.push(effective_system);
 
         let router = crate::model_router::current()?.filter(|r| r.enabled());
         let routed_model = router.as_ref().and_then(|r| r.model(crate::providers::ProviderKind::Claude, crate::providers::tier_of(opts)));
@@ -1162,9 +1211,11 @@ impl ClaudeCliReasoner {
             args.push(m.clone());
         }
 
-        for dir in &opts.add_dirs {
-            args.push("--add-dir".into());
-            args.push(dir.to_string_lossy().into_owned());
+        if claude_bridge.is_none() && !fresh_review {
+            for dir in &opts.add_dirs {
+                args.push("--add-dir".into());
+                args.push(dir.to_string_lossy().into_owned());
+            }
         }
 
         // `--settings <json>` wires in per-call settings — notably the
@@ -1178,7 +1229,7 @@ impl ClaudeCliReasoner {
         // agent's tool surface stays exactly what we declare and never
         // picks up the host's global MCP config), and the remaining
         // settings (hooks, etc.) go to `--settings`.
-        let handoff_hooks = crate::handoff::ClaudeHooks::prepare(opts)?;
+        let handoff_hooks = if claude_bridge.is_none() { crate::handoff::ClaudeHooks::prepare(opts)? } else { None };
         let effective_settings = handoff_hooks
             .as_ref()
             .map(|launch| &launch.settings_json)
@@ -1187,7 +1238,7 @@ impl ClaudeCliReasoner {
         // private temp file rather than in Claude's process argv, which other
         // same-host processes can inspect via /proc.
         let mut _voice_mcp_file: Option<tempfile::NamedTempFile> = None;
-        if let Some(settings) = effective_settings {
+        if let Some(settings) = effective_settings.filter(|_| claude_bridge.is_none()) {
             let (settings_only, mcp_config) = split_mcp_from_settings(settings);
             if let Some(mcp_json) = mcp_config {
                 args.push("--mcp-config".into());
@@ -1210,13 +1261,21 @@ impl ClaudeCliReasoner {
             }
         }
 
-        let mut cmd = Command::new(&self.bin);
+
+        let mut cmd = match &native_scope {
+            Some(scope) if !vm_required => scope.command(&self.bin),
+            _ => Command::new(&self.bin),
+        };
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Scope Write/Edit by setting the spawned CLI's cwd when requested.
-        if let Some(cwd) = &opts.cwd {
+        if let Some(directory) = &review_directory {
+            cmd.current_dir(directory.path());
+        } else if let Some(bridge) = &claude_bridge {
+            cmd.current_dir(&bridge.bridge.native_cwd);
+        } else if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
         }
         // #128 — When `restrict_env` is set (wiki-query path), clear the
@@ -1225,7 +1284,8 @@ impl ClaudeCliReasoner {
         // scoped Bash allowlist) from seeing provider keys the daemon
         // loaded from `.env` at startup. `opts.env` is then layered on
         // top with explicit, just-in-time-loaded secrets.
-        if opts.restrict_env {
+        let clear_environment = clear_provider_environment(opts, native_scope.is_some());
+        if clear_environment {
             cmd.env_clear();
             for var in SAFELIST_ENV_VARS {
                 if let Ok(v) = std::env::var(var) {
@@ -1253,12 +1313,21 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        let (mut child, process_group) = crate::process_tree::spawn_supervised(
-            &cmd,
-            opts.restrict_env,
-            clean,
-            opts.handoff_path.as_deref(),
-        )
+        if !vm_required { if let Some(scope) = &native_scope { scope.configure(&mut cmd); } }
+        crate::run_resources::check_requirement("claude",launch_audit.as_ref())?;
+        let native_launch = native_lease.as_ref().map(|lease|lease.launch());
+        let native_vm = if vm_required {
+            Some(crate::native_vm::Launch::prepare("claude", opts, &cmd,
+                claude_bridge.as_ref().map(|bridge|&bridge.bridge), native_launch.as_ref())?)
+        } else { None };
+        if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
+        // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
+        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
+        let spawned = match &native_vm {
+            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref(), &vm.resource_policy),
+            None => crate::process_tree::spawn_admitted_with_policy(&cmd, clear_environment, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
+        };
+        let (mut child, process_group) = spawned
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 CallError::Other(
@@ -1272,7 +1341,11 @@ impl ClaudeCliReasoner {
             }
         })?;
 
+        process_group.admit_model("claude",launch_audit.as_ref()).await?;
+
         if let Some(mut stdin) = child.stdin.take() {
+            // #1626 — from the first byte on, the CLI may have the turn.
+            if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
             if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
@@ -1295,7 +1368,7 @@ impl ClaudeCliReasoner {
         let audit_logger = opts.audit_logger.clone().or_else(default_audit_logger);
         let audit_active = audit_logger.is_some() || opts.audit_notifier.is_some();
         let audit_session = opts.session_id.clone().unwrap_or_else(|| "-".to_string());
-        let mut pending_tool_uses: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut pending_tool_uses: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
 
         // Every non-empty text block the model emitted, in stream order, plus
         // the terminal `result` payload. Reducing these to one string is
@@ -1310,6 +1383,8 @@ impl ClaudeCliReasoner {
         // daemon actually spends, so capture it as the stream goes by.
         let call_started = std::time::Instant::now();
         let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
+        crate::triage_capture::start(&audit_session,routed_model.as_ref().or(opts.model.as_ref()).map(String::as_str).unwrap_or(""),router.is_none());
+
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -1320,11 +1395,13 @@ impl ClaudeCliReasoner {
                         || value["type"] == "result"
                     {
                         if let Some(id) = value["session_id"].as_str() {
+                            if let Some(vm) = &native_vm { vm.observe_session(id)?; }
                             lease.observe(id)?;
                         }
                     }
                 }
             }
+            crate::triage_capture::line(&audit_session,&line);
             if let Some(u) = crate::token_usage::parse_usage(&line) {
                 observed_usage = Some(u);
             }
@@ -1380,7 +1457,15 @@ impl ClaudeCliReasoner {
         }
 
         let status = child.wait().await?;
+        let resources = process_group.resource_outcome("claude", audit_logger.as_ref());
         drop(process_group);
+        resources?;
+        // Unmatched tool uses represent uncertain side effects. Dropping their
+        // protected intent tickets leaves durable orphan/failure evidence.
+        pending_tool_uses.clear();
+        if let Some(logger) = &audit_logger {
+            logger.drain_checked().await?;
+        }
         if !status.success() {
             let mut stderr_buf = String::new();
             if let Some(mut err) = child.stderr.take() {
@@ -1453,6 +1538,7 @@ impl ClaudeCliReasoner {
         if let Some(lease) = native_lease {
             lease.finish()?;
         }
+        crate::triage_capture::finish(&audit_session);
         Ok(final_text)
     }
 }
@@ -1469,7 +1555,7 @@ impl ClaudeCliReasoner {
 /// inline loop, including the high-risk gate around the notifier.
 pub(crate) fn audit_stream_line(
     line: &str,
-    pending: &mut HashMap<String, (String, serde_json::Value)>,
+    pending: &mut HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)>,
     session_id: &str,
     model: Option<&str>,
     logger: Option<&Arc<AuditLogger>>,
@@ -1478,14 +1564,19 @@ pub(crate) fn audit_stream_line(
     for ev in parse_stream_event(line) {
         match ev {
             ToolEvent::Use { id, name, input } => {
-                pending.insert(id, (name, input));
+                let intent = logger.filter(|logger| logger.is_protected()).and_then(|logger|
+                    match logger.begin_write() {
+                        Ok(ticket) => Some(ticket),
+                        Err(error) => { warn!("native tool intent audit failed: {error:#}"); None }
+                    });
+                pending.insert(id, (name, input, intent));
             }
             ToolEvent::Result {
                 id,
                 is_error,
                 content,
             } => {
-                let Some((name, input)) = pending.remove(&id) else {
+                let Some((name, input, intent)) = pending.remove(&id) else {
                     debug!("tool-audit: unmatched tool_result id={id}");
                     continue;
                 };
@@ -1502,10 +1593,17 @@ pub(crate) fn audit_stream_line(
                     record.set_model(model);
                 }
                 if let Some(logger) = logger.cloned() {
-                    let rec = record.clone();
-                    tokio::spawn(async move {
-                        logger.record(&rec).await;
-                    });
+                    match logger.begin_write() {
+                        Ok(ticket) => {
+                            let rec = record.clone();
+                            tokio::spawn(async move {
+                                logger.record(&rec).await;
+                                if let Some(intent) = intent { intent.complete(); }
+                                ticket.complete();
+                            });
+                        }
+                        Err(error) => warn!("tool audit registration failed: {error:#}"),
+                    }
                 }
                 if is_high_risk(&name) {
                     if let Some(notifier) = notifier.cloned() {
@@ -1903,7 +2001,8 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 ///   including `send` and `send-now`; `finance` status/transactions/summary;
 ///   `calendar` list-events/create-event/rsvp; `loop`; `loops`; `meetup events`;
 ///   `socialapi`/`linkedin` dm and comment; `linkedin recent-dms`;
-///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`) and
+///   `repo-docs`; `doc render-pdf`; `imessage fetch-attachment`, `imessage compose`,
+///   and read-only `imessage allowlist`) and
 ///   `aa-gh issue` create/list/view/comment.
 ///
 /// Several of those act outside the wiki: they can send email, post GitHub
@@ -2010,6 +2109,19 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // session's `/tmp/aa-imsg/<session>/` (allowlist + 25 MB cap in the CLI). Only this verb: `sync --apply` writes.
     let bash_imessage_fetch_abs = format!("Bash({} imessage fetch-attachment *)", bin.display());
     let bash_imessage_fetch_bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
+    // #1635 — `imessage compose --to … --body … --post` starts a text to a
+    // person as an approval card. Same safety argument as `socialapi dm` and
+    // `gmail compose --post`: the verb never touches Messages; its only
+    // externally visible effect is one card in the approval channel, and it
+    // refuses before storing anything unless the conversation is on
+    // `allow-outbound` and the kill-switch is set. Deliberately NOT
+    // `imessage *`: that would also hand the agent `approve`, `allow-outbound`,
+    // `alerts` and `outbox complete`. `imessage allowlist` is read-only and
+    // lets the agent explain a refusal instead of guessing.
+    let bash_imessage_compose_abs = format!("Bash({} imessage compose *)", bin.display());
+    let bash_imessage_compose_bare = "Bash(augmentagent imessage compose *)".to_string();
+    let bash_imessage_allowlist_abs = format!("Bash({} imessage allowlist)", bin.display());
+    let bash_imessage_allowlist_bare = "Bash(augmentagent imessage allowlist)".to_string();
     // #1061 — the same for the Apple Notes bundle, into the same session dir.
     let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
     let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
@@ -2137,6 +2249,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             env.push(("DISCORD_CHANNEL_ID".into(), cid));
         }
     }
+    // The compose subprocess must use the daemon's existing bundle and gate.
+    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() { env.push((key.into(), value)); }
+        }
+    }
     // #888/#1061 — `imessage fetch-attachment` and `apple-notes fetch-attachment` read their
     // `AUGMENTAGENT_*_S3_*` config and sign via the default AWS credential chain, which any
     // `AWS_*` var may steer: forward all three prefixes whole, only with a bucket configured
@@ -2251,12 +2369,22 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_recent_bare,
             bash_linkedin_recent_abs_noargs,
             bash_linkedin_recent_bare_noargs,
+            format!("Bash({} linkedin thread *)", bin.display()),
+            "Bash(augmentagent linkedin thread *)".into(),
+            format!("Bash({} linkedin archive-status)", bin.display()),
+            "Bash(augmentagent linkedin archive-status)".into(),
+            format!("Bash({} linkedin archive-status *)", bin.display()),
+            "Bash(augmentagent linkedin archive-status *)".into(),
             bash_linkedin_dm_abs,
             bash_linkedin_dm_bare,
             bash_linkedin_comment_abs,
             bash_linkedin_comment_bare,
             bash_imessage_fetch_abs,
             bash_imessage_fetch_bare,
+            bash_imessage_compose_abs,
+            bash_imessage_compose_bare,
+            bash_imessage_allowlist_abs,
+            bash_imessage_allowlist_bare,
             bash_notes_fetch_abs,
             bash_notes_fetch_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
@@ -2780,6 +2908,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_native_tool_intent_poisoning_is_durable_and_workflow_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::create_dir(dir.path().join("anchors")).unwrap();
+        let path = dir.path().join("logs/workflow.log");
+        let anchor = dir.path().join("anchors/anchor.json");
+        let logger = Arc::new(AuditLogger::protected(path.clone(), anchor.clone(), &[]).unwrap());
+        let use_event = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"pending-write","name":"mcp__jarvis__Write","input":{"file_path":"fixture.rs","content":"synthetic"}}]}}"#;
+        let mut pending = HashMap::new();
+        audit_stream_line(use_event, &mut pending, "session", Some("synthetic-model"), Some(&logger), None);
+        assert_eq!(pending.len(), 1);
+        drop(pending); // Process death before the matching result.
+        assert!(logger.drain_checked().await.is_err());
+        drop(logger);
+        let reopened = AuditLogger::protected(path, anchor, &[]).unwrap();
+        assert!(reopened.drain_checked().await.is_err(), "restart cannot erase uncertain side effects");
+        let interactive = Arc::new(AuditLogger::new(dir.path().join("interactive.log")));
+        let mut pending = HashMap::new();
+        audit_stream_line(use_event, &mut pending, "interactive", None, Some(&interactive), None);
+        drop(pending);
+        interactive.drain_checked().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn audit_stream_line_records_writes_and_pings_high_risk() {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("tool-audit.log");
@@ -2790,7 +2942,7 @@ mod tests {
         let typed: Arc<CountingNotifier> = Arc::new(CountingNotifier::default());
         let notifier: Arc<dyn AuditNotifier> = typed.clone();
 
-        let mut pending: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut pending: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
         let session = "ch:123";
         // 1) High-risk Write: tool_use then tool_result.
         let write_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_w","name":"Write","input":{"file_path":"/tmp/x.txt","content":"hi"}}]}}"#;
@@ -2876,7 +3028,7 @@ mod tests {
         // Empty pending + None logger/notifier — should be a no-op even on a
         // tool_use line. Guard against future refactors that accidentally
         // pay parse cost on the no-audit path.
-        let mut pending: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut pending: HashMap<String, (String, serde_json::Value, Option<crate::tool_audit::AuditWriteGuard>)> = HashMap::new();
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_x","name":"Write","input":{}}]}}"#;
         audit_stream_line(line, &mut pending, "s", None, None, None);
         // Pending gains one entry because the use was parsed; that's fine —
@@ -2926,6 +3078,51 @@ mod tests {
                 Ok(self.canned.clone())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_provider_supervisor_does_not_restore_ambient_credentials() {
+        const PROBE: &str = "AUTOSHIP_SYNTHETIC_AMBIENT_CREDENTIAL";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reasoner::tests::scoped_provider_supervisor_does_not_restore_ambient_credentials", "--nocapture"])
+                .env(PROBE, "synthetic-only").output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let mut opts = dummy_opts();
+        opts.restrict_env = false; // Actual autoship builder preset.
+        let clear = clear_provider_environment(&opts, true);
+        assert!(clear);
+        assert!(!clear_provider_environment(&opts, false));
+        let mut command = tokio::process::Command::new("/usr/bin/python3");
+        command.env_clear().env("DECLARED_PROVIDER_AUTH_PROBE", "synthetic-only")
+            .args(["-I", "-c", "import os; assert 'AUTOSHIP_SYNTHETIC_AMBIENT_CREDENTIAL' not in os.environ; assert os.environ['DECLARED_PROVIDER_AUTH_PROBE']=='synthetic-only'; print('SCOPED_ENV_OK')"]);
+        let clean = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (child, group) = crate::process_tree::spawn_supervised(&command, clear, clean, None).unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        drop(group);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "SCOPED_ENV_OK");
+    }
+
+    #[tokio::test]
+    async fn injected_watchdog_is_local_to_its_future_and_never_changes_siblings() {
+        let ambient = reasoner_timeout();
+        let injected = TEST_REASONER_TIMEOUT.scope(std::time::Duration::from_secs(17), async {
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
+            // A separately spawned provider call must retain normal configuration.
+            assert_eq!(tokio::spawn(async { reasoner_timeout() }).await.unwrap(), ambient);
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), std::time::Duration::from_secs(17));
+        });
+        let sibling = async {
+            tokio::task::yield_now().await;
+            assert_eq!(reasoner_timeout(), ambient);
+        };
+        tokio::join!(injected, sibling);
+        assert_eq!(reasoner_timeout(), ambient);
     }
 
     fn dummy_opts() -> ReasonerOpts {
@@ -3571,6 +3768,20 @@ mod tests {
         assert!(opts
             .system_prompt
             .contains("ATTACH: deliverables/packet.pdf"));
+    }
+
+    #[test]
+    fn ask_opts_forwards_imessage_compose_environment_without_send_tools() {
+        let wiki=tempfile::tempdir().unwrap();let repo=tempfile::tempdir().unwrap();
+        let _guard=EnvGuard::set("AUGMENTAGENT_IMESSAGE_REPO_DIR", "/synthetic/imessage-bundle");
+        let prior=std::env::var_os("AUGMENTAGENT_IMESSAGE_SEND_ENABLED");
+        std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED","1");
+        let opts=ask_opts(wiki.path().into(),repo.path().into());
+        match prior { Some(v)=>std::env::set_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED",v),None=>std::env::remove_var("AUGMENTAGENT_IMESSAGE_SEND_ENABLED") }
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_REPO_DIR".into(),"/synthetic/imessage-bundle".into())));
+        assert!(opts.env.contains(&("AUGMENTAGENT_IMESSAGE_SEND_ENABLED".into(),"1".into())));
+        assert!(opts.allowed_tools.contains(&"Bash(augmentagent imessage compose *)".into()));
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("imessage approve") || t.contains("imessage *")));
     }
 
     /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees
@@ -4580,6 +4791,8 @@ mod ask_mode_social_card_allowlist_tests {
             // that was never ingested — the dead end that made the agent fall
             // back to "paste it yourself".
             "linkedin recent-dms",
+            "linkedin thread *",
+            "linkedin archive-status",
         ] {
             assert!(
                 tools.iter().any(|t| t.contains(needle)),
@@ -4643,9 +4856,6 @@ mod ask_mode_social_card_allowlist_tests {
 #[cfg(test)]
 mod failover_error_tests {
     use super::*;
-
-    /// Since #954 the reasoner timeout also bounds gate waits.
-    static TIMEOUT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn dummy_opts() -> ReasonerOpts {
         ReasonerOpts {
@@ -4822,6 +5032,43 @@ mod failover_error_tests {
     }
 
     #[tokio::test]
+    async fn fresh_claude_review_disables_native_customizations_and_builder_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_path = dir.path().join("argv.txt");
+        let cwd_path = dir.path().join("cwd.txt");
+        let bin = stub_cli(&dir, "fake-fresh-claude", &format!(r#"
+printf '%s\n' "$@" > '{}'
+pwd > '{}'
+session=''
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--session-id' ]; then session="$argument"; fi
+  previous="$argument"
+done
+cat >/dev/null
+echo "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}}"
+echo "{{\"type\":\"result\",\"session_id\":\"$session\",\"result\":\"reviewed\"}}"
+"#, args_path.display(), cwd_path.display()));
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let provider = crate::providers::ProviderKind::Claude;
+        let builder = crate::native_session::NativeSession::from_id(provider, Some("builder-session".into())).unwrap();
+        let mut opts = dummy_opts();
+        opts.cwd = Some(dir.path().to_owned());
+        opts.add_dirs = vec![dir.path().to_owned()];
+        let (answer, native_id) = crate::native_session::CURRENT.scope(builder.clone(),
+            crate::native_session::fresh_review_scope(provider, reasoner.call(&opts, "review supplied evidence"))).await.unwrap();
+        assert_eq!(answer, "reviewed");
+        assert_ne!(native_id, "builder-session");
+        assert_eq!(builder.id().as_deref(), Some("builder-session"));
+        let argv = std::fs::read_to_string(args_path).unwrap();
+        for required in ["--safe-mode", "--tools\n\n", "--setting-sources\n\n", "--strict-mcp-config", "--disable-slash-commands"] {
+            assert!(argv.contains(required), "missing {required}: {argv}");
+        }
+        assert!(!argv.contains("--resume") && !argv.contains("builder-session") && !argv.contains("--add-dir"));
+        assert_ne!(std::fs::read_to_string(cwd_path).unwrap().trim(), dir.path().to_str().unwrap());
+    }
+
+    #[tokio::test]
     async fn native_claude_records_first_nonempty_assistant_text() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_cli(&dir, "fake-claude-first-text", r#"
@@ -4865,7 +5112,6 @@ sleep 0.15
 "
             ),
         );
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
         let gate = Arc::new(CliGate::new(3));
         let reasoner = Arc::new(ClaudeCliReasoner {
             bin,
@@ -5142,17 +5388,14 @@ sleep 5
         // A day's budget, so only the caller's own 1 s watchdog bounds the wait.
         let day = std::time::Duration::from_secs(86_400);
         let leaked = gate.acquire_timed("claude", "TextOnly", day).await.unwrap();
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
-        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin: "never-spawned".into(),
             gate: Arc::clone(&gate),
         };
-        let err = reasoner
-            .call(&dummy_opts(), "hi")
+        let err = TEST_REASONER_TIMEOUT
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("the permit is held");
-        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         let typed = ReasonerError::find_in(&err).unwrap_or_else(|| panic!("untyped: {err:?}"));
         let ReasonerError::GateTimeout { provider, .. } = typed else {
             panic!("{typed:?}")
@@ -5284,18 +5527,15 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         // Keep the watchdog fixture to one process; orphaned shell children can
         // legitimately produce CleanupUnverified on busy CI hosts.
         let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nexec sleep 600\n");
-        let _env = TIMEOUT_ENV_LOCK.lock().await;
-        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
         let reasoner = ClaudeCliReasoner {
             bin,
             gate: CliGate::global(),
         };
         let started = std::time::Instant::now();
-        let err = reasoner
-            .call(&dummy_opts(), "hi")
+        let err = TEST_REASONER_TIMEOUT
+            .scope(std::time::Duration::from_secs(1), reasoner.call(&dummy_opts(), "hi"))
             .await
             .expect_err("must time out");
-        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
             "watchdog must fire promptly, took {:?}",

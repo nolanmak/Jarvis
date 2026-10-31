@@ -11,6 +11,10 @@ on:
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
       - '.github/workflows/discord-voice.yml'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
   push:
     branches: [main]
     paths:
@@ -23,8 +27,17 @@ on:
       - 'systemd/augmentagent-discord-voice.service'
       - '.github/workflows/discord-voice.yml'
 
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
+
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 
 jobs:
   sidecar:
@@ -40,10 +53,14 @@ jobs:
           node-version: '24.17.0'
           cache: npm
           cache-dependency-path: sidecars/discord-voice/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm audit --omit=optional --audit-level=high
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/2"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/3"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/5"
+
       # Live calls require a disposable guild and provider credentials. They
       # remain explicit opt-in verification, never synthetic CI success.
 
@@ -69,7 +86,10 @@ jobs:
       # the pinned runtime and its fonts. pdf-generation.yml provisions both for
       # the same code; this job runs those tests too and failed with
       # "run python3 scripts/pdf-runtime.py to provision the pinned runtime".
-      - run: sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils
-      - run: python3 scripts/pdf-runtime.py
-      - run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked
-      - run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/5"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/6"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/7"

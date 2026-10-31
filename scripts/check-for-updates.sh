@@ -66,6 +66,7 @@ notify_owner() {
 # library's diagnostics land in update.log like everything else.
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
+. "$REPO_ROOT/scripts/lib/update-build.sh"
 
 # #1571 — the unit no longer runs what this script builds. A drop-in that
 # overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
@@ -142,19 +143,28 @@ apply_update() {
     #
     # If a new binary is ever referenced from production code, add it here.
     # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
-    # Once available, the deployed binary coordinates release builds with
-    # gates/pruning too. Bootstrap installs still build directly.
-    # Keep this array nonempty: macOS Bash 3.2 treats expansion of an empty
-    # array as an unbound variable under set -u.
-    local build_driver=(cargo)
-    if "$DAEMON_BINARY" disk build --help >/dev/null 2>&1; then
-      build_driver=("$DAEMON_BINARY" disk build --target-dir "$REPO_ROOT/target" -- cargo)
-    fi
-    if ! "${build_driver[@]}" build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
-      log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
-      exit 1
+    local build_status=0
+    if run_update_build "$DAEMON_BINARY" "$REPO_ROOT/target"; then
+      :
+    else
+      build_status=$?
+      case "$build_status" in
+        73|75|76) return 0 ;; # A clean deferral; never advance the stamp.
+        *) return 1 ;;
+      esac
     fi
     log "rust build ok (augmentagent + augmentagent-mcp-memory)"
+    # Install without starting a duplicate legacy loop. The worker starts
+    # after the daemon restart, and future daemon updates leave it running.
+    local worker_help=""
+    worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
+    case "$worker_help" in
+      *'Usage: augmentagent auto-pr-worker'*)
+        if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
+          log "AUTO-SHIP WORKER PROVISIONING FAILED — deployment stamp withheld"
+          return 1
+        fi ;;
+    esac
   else
     log "no rust code changed; skipping rust rebuild"
   fi
@@ -287,7 +297,18 @@ apply_update() {
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
           # #1571 — proof now includes "and it is running the binary we
           # built"; a bounce onto anything else is a pinned deploy.
-          if restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+          resource_status=0
+          if [ -x "$REPO_ROOT/scripts/configure-run-resources.sh" ]; then
+            AUGMENTAGENT_RESOURCE_UNIT="$SYSTEMD_UNIT" "$REPO_ROOT/scripts/configure-run-resources.sh" --install >> "$LOG" 2>&1 || resource_status=$?
+          fi
+          if [ "$resource_status" -eq 3 ]; then
+            log "run-resource delegation unsupported; required Autoship stays disabled while unrelated service updates continue"
+            notify_owner "Run-resource delegation unavailable for $SYSTEMD_UNIT; required Autoship remains disabled. Other daemon services continue updating."
+          fi
+          if [ "$resource_status" -ne 0 ] && [ "$resource_status" -ne 3 ]; then
+            log "resource delegation setup failed; keeping daemon and withholding build stamp"
+            RESTART_FAILURES=$((RESTART_FAILURES + 1))
+          elif restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
             record_restart
           else
             [ -n "$SR_LAST_EXE" ] && report_pinned_deploy "came back running \
@@ -489,7 +510,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(ci-build-vm|native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/ci-contract\.(py|json)$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi

@@ -16,6 +16,10 @@ struct State {
     id: Option<String>,
     active: bool,
     uncertain: bool,
+    /// #1626 — set by the active lease the moment it starts writing the
+    /// prompt to the native CLI. Before that point nothing has reached the
+    /// CLI, so a dropped lease has no native side effect to be uncertain of.
+    submission_started: bool,
     native_submitted_at_ms: Option<u64>,
     first_text_output_at_ms: Option<u64>,
 }
@@ -24,6 +28,7 @@ struct State {
 pub struct NativeSession {
     provider: ProviderKind,
     state: Mutex<State>,
+    retired_vm: Mutex<Vec<std::path::PathBuf>>,
 }
 
 pub struct Lease {
@@ -34,6 +39,73 @@ pub struct Lease {
 }
 
 tokio::task_local! { pub static CURRENT: Arc<NativeSession>; }
+tokio::task_local! { pub static FRESH_REVIEW: bool; }
+
+/// A controller-owned set of actual native conversations for one restarted
+/// builder episode. Audit UUIDs are deliberately not used as CLI identities.
+#[derive(Default)]
+pub struct FreshBuilderSessions {
+    sessions: Mutex<Vec<Arc<NativeSession>>>,
+}
+#[derive(Debug, Clone)]
+pub struct ObservedConversation {
+    pub provider: ProviderKind,
+    pub id: String,
+    pub uncertain: bool,
+}
+tokio::task_local! { static FRESH_BUILDERS: Arc<FreshBuilderSessions>; }
+impl FreshBuilderSessions {
+    pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
+    pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
+        FRESH_BUILDERS.scope(Arc::clone(self), call).await
+    }
+    pub fn observed(&self) -> Vec<ObservedConversation> {
+        self.sessions.lock().expect("builder sessions mutex poisoned").iter().filter_map(|session| {
+            session.id().map(|id| ObservedConversation { provider: session.provider(), id, uncertain: session.is_uncertain() })
+        }).collect()
+    }
+    fn session(&self, provider: ProviderKind) -> anyhow::Result<Option<Arc<NativeSession>>> {
+        if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) { return Ok(None); }
+        let mut sessions = self.sessions.lock().expect("builder sessions mutex poisoned");
+        if let Some(session) = sessions.iter().find(|session| session.provider() == provider) {
+            return Ok(Some(Arc::clone(session)));
+        }
+        let session = NativeSession::new(provider)?;
+        sessions.push(Arc::clone(&session));
+        Ok(Some(session))
+    }
+}
+
+/// Actual transport selection happens after fallback chooses a provider.
+/// A nested independent review must override even a fresh builder episode.
+/// Transport adapters use this protocol handle; observing an ID here alone is
+/// not evidence that a real provider CLI executed.
+pub fn current_for(provider: ProviderKind) -> anyhow::Result<Option<Arc<NativeSession>>> {
+    if !is_fresh_review() {
+        if let Ok(session) = FRESH_BUILDERS.try_with(|sessions| sessions.session(provider)) {
+            return session;
+        }
+    }
+    Ok(CURRENT.try_with(Arc::clone).ok())
+}
+
+/// Override any inherited builder conversation. Each invocation creates a new
+/// native conversation and returns the identifier actually observed from the CLI.
+pub async fn fresh_review_scope<T>(
+    provider: ProviderKind,
+    call: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<(T, String)> {
+    let session = NativeSession::new(provider)?;
+    let result = FRESH_REVIEW.scope(true, CURRENT.scope(session.clone(), call)).await?;
+    let id = session.id().ok_or_else(|| anyhow::anyhow!("fresh review did not observe a native conversation identifier"))?;
+    anyhow::ensure!(!session.is_uncertain(), "fresh reviewer conversation is uncertain");
+    Ok((result, id))
+}
+
+pub fn is_fresh_review() -> bool {
+    FRESH_REVIEW.try_with(|fresh| *fresh).unwrap_or(false)
+}
+
 
 impl NativeSession {
     pub fn new(provider: ProviderKind) -> anyhow::Result<Arc<Self>> {
@@ -47,7 +119,8 @@ impl NativeSession {
             "native session ID is empty");
         Ok(Arc::new(Self {
             provider,
-            state: Mutex::new(State { id, active: false, uncertain: false,
+            retired_vm: Mutex::new(Vec::new()),
+            state: Mutex::new(State { id, active: false, uncertain: false, submission_started: false,
                 native_submitted_at_ms: None, first_text_output_at_ms: None }),
         }))
     }
@@ -64,7 +137,10 @@ impl NativeSession {
             },
             None => Launch::Create { requested_id: None },
         };
+        anyhow::ensure!(!is_fresh_review() || matches!(launch, Launch::Create { .. }),
+            "fresh review cannot resume an existing native conversation");
         state.active = true;
+        state.submission_started = false;
         state.native_submitted_at_ms = None;
         state.first_text_output_at_ms = None;
         Ok(Lease { session: Arc::clone(self), launch, observed_id: None, finished: false })
@@ -91,9 +167,30 @@ impl NativeSession {
     }
 }
 
+impl Drop for NativeSession {
+    fn drop(&mut self) {
+        if let Ok(paths)=self.retired_vm.lock() { for path in paths.iter() { crate::native_vm::retire(path); } }
+    }
+}
 impl Lease {
+    pub(crate) fn register_vm_retirement(&self, path:std::path::PathBuf) {
+        if is_fresh_review() || FRESH_BUILDERS.try_with(|_|()).is_ok() {
+            let mut paths=self.session.retired_vm.lock().expect("native retirement mutex poisoned");
+            if !paths.contains(&path) { paths.push(path); }
+        }
+    }
     pub fn launch(&self) -> Launch {
         self.launch.clone()
+    }
+
+    /// #1626 — the prompt is about to be written to the native CLI. From
+    /// here on the CLI may have received (part of) the turn, so a dropped
+    /// lease leaves the session uncertain. Call before the first byte.
+    pub fn mark_submitting(&self) {
+        let mut state = self.session.state.lock().expect("native session mutex poisoned");
+        if state.active {
+            state.submission_started = true;
+        }
     }
 
     /// Record when the prompt was fully written to the native CLI.
@@ -159,7 +256,142 @@ impl Drop for Lease {
         if !self.finished {
             let mut state = self.session.state.lock().expect("native session mutex poisoned");
             state.active = false;
-            state.uncertain = true;
+            // #1626 — a refusal before the prompt reached the CLI (resource
+            // capacity, hook preparation, spawn failure) ran nothing on the
+            // native side; the session stays clean and the next turn resumes
+            // it. Once submission started, or the CLI reported a session, the
+            // turn may have run and replay is blocked until inspected.
+            if state.submission_started || self.observed_id.is_some() {
+                state.uncertain = true;
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod fresh_review_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_review_overrides_builder_and_cannot_resume_even_on_retry() {
+        let builder = NativeSession::from_id(ProviderKind::Codex, Some("actual-builder".into())).unwrap();
+        let (_, observed) = CURRENT.scope(builder.clone(), fresh_review_scope(ProviderKind::Codex, async {
+            let session = CURRENT.with(Arc::clone);
+            let mut lease = session.begin(ProviderKind::Codex)?;
+            assert!(matches!(lease.launch(), Launch::Create { .. }));
+            lease.observe("actual-review")?;
+            lease.finish()?;
+            assert!(session.begin(ProviderKind::Codex).is_err(), "retry must not resume reviewer history");
+            Ok(())
+        })).await.unwrap();
+        assert_eq!(observed, "actual-review");
+        assert_eq!(builder.id().as_deref(), Some("actual-builder"));
+        assert!(!builder.is_uncertain());
+    }
+
+    #[tokio::test]
+    async fn restarted_builder_is_provider_aware_reusable_and_does_not_leak_into_review() {
+        let inherited = NativeSession::from_id(ProviderKind::Claude, Some("old-builder".into())).unwrap();
+        let episode = FreshBuilderSessions::new();
+        CURRENT.scope(inherited.clone(), episode.scope(async {
+            for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+                let session = current_for(provider).unwrap().unwrap();
+                let mut lease = session.begin(provider).unwrap();
+                let id = match lease.launch() {
+                    Launch::Create { requested_id } => requested_id.unwrap_or("new-codex".into()),
+                    _ => panic!("restarted builder inherited history"),
+                };
+                lease.observe(&id).unwrap();
+                lease.finish().unwrap();
+            }
+            fresh_review_scope(ProviderKind::Codex, async {
+                let session = current_for(ProviderKind::Codex)?.unwrap();
+                let mut lease = session.begin(ProviderKind::Codex)?;
+                assert!(matches!(lease.launch(), Launch::Create { .. }));
+                lease.observe("independent-review")?;
+                lease.finish()?;
+                Ok(())
+            }).await.unwrap();
+        })).await;
+        episode.scope(async {
+            let session = current_for(ProviderKind::Codex).unwrap().unwrap();
+            let mut lease = session.begin(ProviderKind::Codex).unwrap();
+            assert_eq!(lease.launch(), Launch::Resume { id: "new-codex".into() });
+            lease.observe("new-codex").unwrap();
+            lease.finish().unwrap();
+        }).await;
+        assert_eq!(inherited.id().as_deref(), Some("old-builder"));
+        let observed = episode.observed();
+        assert_eq!(observed.len(), 2);
+        assert!(observed.iter().all(|s| !s.uncertain && s.id != "old-builder" && s.id != "independent-review"));
+    }
+
+    #[tokio::test]
+    async fn fresh_review_requires_cli_observed_identity() {
+        assert!(fresh_review_scope(ProviderKind::Codex, async { Ok("LGTM") }).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod lease_drop_tests {
+    //! #1626 — only a turn the native CLI may have received leaves the
+    //! session uncertain. A lease dropped by a pre-spawn refusal (resource
+    //! capacity, hook preparation, spawn failure) had no native side effect
+    //! and must not latch the conversation.
+    use super::*;
+
+    #[test]
+    fn a_lease_dropped_before_submission_leaves_the_session_clean_and_resumable() {
+        let session = NativeSession::from_id(ProviderKind::Claude, Some("bound".into())).unwrap();
+        {
+            let lease = session.begin(ProviderKind::Claude).unwrap();
+            assert_eq!(lease.launch(), Launch::Resume { id: "bound".into() });
+            // Refused before any byte reached the CLI: dropped unfinished.
+        }
+        assert!(!session.is_uncertain(), "no prompt was submitted, nothing is uncertain");
+        let mut again = session.begin(ProviderKind::Claude).expect("writer released");
+        assert_eq!(again.launch(), Launch::Resume { id: "bound".into() });
+        again.observe("bound").unwrap();
+        again.finish().unwrap();
+        assert!(!session.is_uncertain());
+    }
+
+    #[test]
+    fn a_lease_dropped_after_submission_started_marks_the_session_uncertain() {
+        let session = NativeSession::from_id(ProviderKind::Codex, Some("bound".into())).unwrap();
+        {
+            let lease = session.begin(ProviderKind::Codex).unwrap();
+            lease.mark_submitting();
+            // The process died with the prompt partly or fully written.
+        }
+        assert!(session.is_uncertain(), "the CLI may have run the turn");
+        let blocked = session.begin(ProviderKind::Codex).err().expect("replay must be blocked");
+        assert!(blocked.to_string().contains("uncertain"), "{blocked}");
+    }
+
+    #[test]
+    fn a_lease_dropped_after_the_cli_reported_a_session_is_uncertain_even_without_submission() {
+        let session = NativeSession::new(ProviderKind::Claude).unwrap();
+        {
+            let mut lease = session.begin(ProviderKind::Claude).unwrap();
+            let Launch::Create { requested_id: Some(id) } = lease.launch() else { panic!("claude creates with an id") };
+            lease.observe(&id).unwrap();
+        }
+        assert!(session.is_uncertain());
+    }
+
+    #[test]
+    fn a_new_lease_starts_without_a_stale_submission_mark() {
+        let session = NativeSession::from_id(ProviderKind::Claude, Some("bound".into())).unwrap();
+        {
+            let mut lease = session.begin(ProviderKind::Claude).unwrap();
+            lease.mark_submitting();
+            lease.observe("bound").unwrap();
+            lease.finish().unwrap();
+        }
+        {
+            let _lease = session.begin(ProviderKind::Claude).unwrap();
+        }
+        assert!(!session.is_uncertain(), "the mark belongs to the finished turn, not the next lease");
     }
 }

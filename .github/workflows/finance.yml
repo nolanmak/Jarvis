@@ -10,8 +10,17 @@ on:
       - 'scripts/systemd/augmentagent-finance-sync.*'
       - '.github/workflows/finance.yml'
       - 'Cargo.*'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
 jobs:
   finance:
     runs-on: ubuntu-latest
@@ -28,17 +37,15 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Format finance crate
-        run: cargo fmt -p augmentagent-finance -- --check
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id finance/finance/3"
+
       - name: Finance lint
-        run: cargo clippy -p augmentagent-finance --all-targets -- -D warnings
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id finance/finance/4"
+
       - name: Finance and wiki behavior
-        run: cargo test -p augmentagent-finance -p augmentagent-wiki
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id finance/finance/5"
+
       - name: Store and agent integration
-        run: |
-          cargo test -p augmentagent-store --lib finance_evidence
-          cargo test -p augmentagent-channel-core --lib finance_allowlist
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id finance/finance/6"
       - name: CLI unit and process tests
-        run: |
-          cargo test -p augmentagent-cli --bin augmentagent finance::tests
-          cargo test -p augmentagent-cli --test finance_cli
-          cargo test -p augmentagent-cli --test status_schema
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id finance/finance/7"

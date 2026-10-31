@@ -38,6 +38,11 @@ pub struct AgentError;
 /// durable delivery outbox. Never create a separate phone-only model history.
 #[async_trait]
 pub trait ConversationAgent: Send + Sync {
+    /// Summarize completed result data without tools, chat history, or a new
+    /// native task. The caller enforces a deadline and a 500-byte output cap.
+    async fn summarize_live_result(&self, _call: &PhoneCall, _result: &str) -> Result<String, AgentError> {
+        Err(AgentError)
+    }
     /// Resume a persisted task or retry its result delivery, without redialing.
     async fn resume_task(&self, _call: &PhoneCall, _task_id: &str) -> Result<(), AgentError> {
         Err(AgentError)
@@ -101,6 +106,11 @@ pub trait ConversationAgent: Send + Sync {
     /// an outbox leave the default, and the notice is never marked delivered.
     async fn call_ended(&self, _call: &PhoneCall, _key: &str, _text: &str) -> Result<(), AgentError> {
         Err(AgentError)
+    }
+    /// Accept a transcript batch into the same authenticated, idempotent chat
+    /// outbox as call notices. Generated text is not evidence of playback.
+    async fn mirror_transcript(&self, call: &PhoneCall, key: &str, text: &str) -> Result<(), AgentError> {
+        self.call_ended(call, key, text).await
     }
 }
 /// What a spoken system announcement says about a dispatched task (#1556):
@@ -558,6 +568,13 @@ async fn relay(
         let _ = state.service.store.phone_request_stop(&call.owner, &id);
         return StatusCode::CONFLICT.into_response();
     }
+    let live = match state.service.store.phone_voice_backend(&id) {
+        Ok(backend) => backend == "openai_live",
+        Err(error) => return failure(error.into()),
+    };
+    if live && state.service.config.live.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let Ok(permit) = state.sockets.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -566,7 +583,11 @@ async fn relay(
         .max_message_size(32_768)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            run_socket(state, call, socket).await;
+            if live {
+                crate::live_media::run(state.service, state.auth.account().to_owned(), call, socket).await;
+            } else {
+                run_socket(state, call, socket).await;
+            }
         })
 }
 #[derive(Debug)]

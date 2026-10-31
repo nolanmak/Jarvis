@@ -366,3 +366,72 @@ async fn runtime_resumes_durable_tasks_without_a_live_relay() {
     tokio::time::timeout(std::time::Duration::from_secs(2), agent.0.notified()).await.expect("startup recovery tick");
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_retries_dispatch_after_reconciliation_database_failure() {
+    struct RecoveryAgent(tokio::sync::Notify);
+    #[async_trait]
+    impl ConversationAgent for RecoveryAgent {
+        async fn answer(&self, _: &PhoneCall, _: &str, _: &str, _: SpeechSender, _: CancellationToken) -> Result<String, AgentError> {
+            panic!("recovery does not fabricate a voice turn")
+        }
+        async fn interrupted(&self, _: &PhoneCall, _: &str) -> Result<(), AgentError> { Ok(()) }
+        async fn resume_task(&self, _: &PhoneCall, task_id: &str) -> Result<(), AgentError> {
+            assert_eq!(task_id, "persisted-task");
+            self.0.notify_one();
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+    store.phone_import_destination("owner", "+12025550123", 0).unwrap();
+    let call = store.phone_reserve_call(augmentagent_store::phone::ReserveCall {
+        owner: "owner", request_id: "earlier-call", conversation: "chat", now_ms: 0,
+    }).unwrap().call;
+    // The call has ended; recovery must not need a live relay or a dial permit.
+    store.phone_bind_provider(&call.id, "CA-earlier").unwrap();
+    store.phone_provider_event(&call.id, "CA-earlier", CallState::Canceled, 100).unwrap();
+    store.phone_enqueue_dispatch(&call.id, "persisted-task", "Synthetic task").unwrap();
+    let service = Arc::new(PhoneService::new(store.clone(), Arc::new(Provider::default()), Arc::new(Time(AtomicI64::new(100))),
+        PhoneConfig::new(true, "https://phone.example.test", "runtime-test-verification-secret-32", vec![]).unwrap()));
+    let agent = Arc::new(RecoveryAgent(tokio::sync::Notify::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let runtime = PhoneRuntime::start(service, Arc::new(WebhookAuth::new("AC-test", "token")), agent.clone(), listener).await.unwrap();
+    // Fault only the reconciliation query after synchronous startup succeeds.
+    // This deterministic schema fault models a query failure without blocking
+    // the executor on SQLite's real-time busy timeout.
+    store.with_conn(|db| { db.execute_batch("ALTER TABLE phone_live_sessions RENAME TO temporarily_unavailable_sessions")?; Ok(()) }).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(runtime.is_running(), "a transient reconciliation error must not terminate dispatch");
+    store.with_conn(|db| { db.execute_batch("ALTER TABLE temporarily_unavailable_sessions RENAME TO phone_live_sessions")?; Ok(()) }).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), agent.0.notified()).await.expect("next tick resumes the durable task after recovery");
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_reports_actual_transport_without_claiming_provider_readiness_or_exposing_keys() {
+    for selection in [None, Some("gleam"), Some("willow"), Some("voice_private")] {
+        let live = selection.is_some();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
+        let provider = Arc::new(Provider::default());
+        let mut config = PhoneConfig::new(true, "https://phone.example.test", "private-verification-secret-32-bytes", vec![]).unwrap();
+        if let Some(name) = selection {
+            let description = (name == "voice_private").then_some("Private voice description");
+            let voice = augmentagent_phone::live_voice::LiveVoice::parse(name, description).unwrap();
+            config = config.with_live(Some(augmentagent_phone::live_config::LiveConfig::new("private-openai-key".into()).unwrap().with_voice(voice)));
+        }
+        let service = Arc::new(PhoneService::new(store, provider.clone(), Arc::new(Time(AtomicI64::new(100))), config));
+        let runtime = PhoneRuntime::start(service, Arc::new(WebhookAuth::new("AC-test", "private-twilio-token")), Arc::new(Agent), tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()).await.unwrap();
+        let health = runtime.health();
+        assert!(health.running);
+        assert_eq!(health.transport, if live { "openai_live" } else { "conversation_relay" });
+        assert_eq!(health.audio_model, live.then_some("gpt-live-1"));
+        assert_eq!(health.voice, match selection { Some("voice_private") => "custom", Some(name) => name, None => augmentagent_phone::voice::DEFAULT_ELEVENLABS_VOICE });
+        assert_eq!(health.provider_readiness, if live { "requires_per_call_preflight" } else { "not_probed" });
+        let report = format!("{health:?}");
+        for private in ["voice_private", "Private voice description", "private-openai-key", "private-twilio-token", "private-verification-secret", "phone.example.test"] { assert!(!report.contains(private)); }
+        assert_eq!(*provider.starts.lock().unwrap(), 0, "health must never dial or probe a provider");
+        runtime.shutdown().await.unwrap();
+    }
+}

@@ -3,10 +3,49 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 
+fn cfg_without_tests(meta: &syn::Meta) -> Option<bool> {
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::List(list) => {
+            let values = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .ok()?;
+            let values: Vec<_> = values.iter().map(cfg_without_tests).collect();
+            if list.path.is_ident("all") {
+                if values.contains(&Some(false)) {
+                    Some(false)
+                } else if values.iter().all(|v| *v == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                if values.contains(&Some(true)) {
+                    Some(true)
+                } else if values.iter().all(|v| *v == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("not") && values.len() == 1 {
+                values[0].map(|v| !v)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 fn test_only(attributes: &[syn::Attribute]) -> bool {
-    attributes.iter().any(|attribute| attribute.path().is_ident("test")
-        || (attribute.path().is_ident("cfg") && attribute.parse_args::<syn::Path>()
-            .is_ok_and(|path| path.is_ident("test"))))
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("test")
+            || (attribute.path().is_ident("cfg")
+                && attribute
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| cfg_without_tests(&meta) == Some(false)))
+    })
 }
 
 /// What the scanner learned about one production callsite.
@@ -146,31 +185,189 @@ impl<'ast> Visit<'ast> for Inventory {
     }
 }
 
-fn collect(directory: &Path, root: &Path, found: &mut BTreeMap<String, Site>) {
+fn rust_files(directory: &Path, files: &mut BTreeSet<PathBuf>) {
     for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
-        if path.is_dir() { collect(&path, root, found); }
-        else if path.extension().is_some_and(|extension| extension == "rs") {
-            let source = std::fs::read_to_string(&path).unwrap();
-            let mut inventory = Inventory::default();
-            inventory.visit_file(&syn::parse_file(&source).unwrap());
-            let relative = path.strip_prefix(root).unwrap().to_string_lossy();
-            for (name, site) in inventory.presets { found.insert(format!("{relative}::{name}"), site); }
+        if path.is_dir() {
+            rust_files(&path, files);
+        } else if path.extension().is_some_and(|v| v == "rs") {
+            files.insert(path.canonicalize().unwrap());
         }
     }
 }
 
+/// Follow module declarations rather than filename conventions. A test-only
+/// external module's helpers are excluded transitively, but a shared file with
+/// any production reference remains inventoried. Orphan source files stay in
+/// the inventory conservatively so this cannot conceal undeclared production.
+fn production_files(files: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    fn edges(
+        items: &[syn::Item],
+        attribute_dir: &Path,
+        module_dir: &Path,
+        in_test: bool,
+        out: &mut Vec<(PathBuf, bool)>,
+    ) {
+        for item in items {
+            let syn::Item::Mod(module) = item else {
+                continue;
+            };
+            let in_test = in_test || test_only(&module.attrs);
+            if let Some((_, items)) = &module.content {
+                let child = module_dir.join(module.ident.to_string());
+                edges(items, &child, &child, in_test, out);
+            } else {
+                let explicit = module.attrs.iter().find_map(|attribute| {
+                    if !attribute.path().is_ident("path") {
+                        return None;
+                    }
+                    match &attribute.meta {
+                        syn::Meta::NameValue(value) => match &value.value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(path),
+                                ..
+                            }) => Some(attribute_dir.join(path.value())),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                });
+                let path = explicit.unwrap_or_else(|| {
+                    let flat = module_dir.join(format!("{}.rs", module.ident));
+                    if flat.exists() {
+                        flat
+                    } else {
+                        module_dir.join(module.ident.to_string()).join("mod.rs")
+                    }
+                });
+                if let Ok(path) = path.canonicalize() {
+                    out.push((path, in_test));
+                }
+            }
+        }
+    }
+    let mut graph = BTreeMap::new();
+    let mut incoming = BTreeSet::new();
+    let mut file_test = BTreeSet::new();
+    for file in files {
+        let parsed = syn::parse_file(&std::fs::read_to_string(file).unwrap()).unwrap();
+        if test_only(&parsed.attrs) {
+            file_test.insert(file.clone());
+        }
+        let parent = file.parent().unwrap();
+        let stem = file.file_stem().unwrap().to_str().unwrap();
+        let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+            parent.to_path_buf()
+        } else {
+            parent.join(stem)
+        };
+        let mut found = vec![];
+        edges(&parsed.items, parent, &module_dir, false, &mut found);
+        for (target, _) in &found {
+            incoming.insert(target.clone());
+        }
+        graph.insert(file.clone(), found);
+    }
+    let mut production: BTreeSet<_> = files
+        .iter()
+        .filter(|file| (!incoming.contains(*file) || matches!(file.file_name().and_then(|n|n.to_str()),Some("lib.rs"|"main.rs"))) && !file_test.contains(*file))
+        .cloned()
+        .collect();
+    loop {
+        let before = production.len();
+        for file in production.clone() {
+            if let Some(edges) = graph.get(&file) {
+                for (target, test) in edges {
+                    if !test && files.contains(target) && !file_test.contains(target) {
+                        production.insert(target.clone());
+                    }
+                }
+            }
+        }
+        if production.len() == before {
+            break;
+        }
+    }
+    let mut test_reachable=file_test;
+    for edges in graph.values() {for (target,is_test) in edges {if *is_test {test_reachable.insert(target.clone());}}}
+    loop {
+        let before=test_reachable.len();
+        for file in test_reachable.clone() {
+            if let Some(edges)=graph.get(&file) {for (target,_) in edges {test_reachable.insert(target.clone());}}
+        }
+        if before==test_reachable.len(){break;}
+    }
+    // Cyclic/unreferenced source stays conservative unless test reachability is
+    // established and no production root can reach it.
+    files.iter().filter(|file|!test_reachable.contains(*file) || production.contains(*file)).cloned().collect()
+}
+fn collect_files(files: &BTreeSet<PathBuf>, root: &Path) -> BTreeMap<String, Site> {
+    let mut found = BTreeMap::new();
+    for path in production_files(files) {
+        let source = std::fs::read_to_string(&path).unwrap();
+        let mut inventory = Inventory::default();
+        inventory.visit_file(&syn::parse_file(&source).unwrap());
+        let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+        for (name, site) in inventory.presets {
+            found.insert(format!("{relative}::{name}"), site);
+        }
+    }
+    found
+}
+
+#[test]
+fn external_test_modules_are_excluded_without_hiding_shared_production() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let preset = "fn opts() -> ReasonerOpts { ReasonerOpts::pinned(ModelTier::Quality, \"fixture\") }";
+    std::fs::write(
+        root.join("lib.rs"),
+        r#"
+        #[cfg(all(test, feature="fixture"))] #[path="helper.rs"] mod fixture;
+        #[cfg(test)] #[path="shared.rs"] mod shared_test;
+        #[cfg(any(test, feature="production"))] #[path="shared.rs"] mod shared_production;
+        #[cfg(not(test))] mod live;
+    "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("helper.rs"),
+        format!("{preset}\n#[path=\"leaf.rs\"] mod child;"),
+    )
+    .unwrap();
+    for name in ["leaf.rs", "shared.rs", "live.rs", "orphan_tests.rs"] {
+        std::fs::write(root.join(name), &preset).unwrap();
+    }
+    let mut files = BTreeSet::new();
+    rust_files(&root, &mut files);
+    let found = collect_files(&files, &root);
+    assert_eq!(
+        found.into_keys().collect::<BTreeSet<_>>(),
+        ["shared.rs::opts", "live.rs::opts", "orphan_tests.rs::opts"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+}
+
 /// Every production callsite in the workspace, plus the checked-in manifest.
 fn scan_workspace() -> (BTreeMap<String, Site>, serde_json::Value) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let mut found = BTreeMap::new();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let mut files = BTreeSet::new();
     for entry in std::fs::read_dir(root.join("crates")).unwrap() {
         let src = entry.unwrap().path().join("src");
-        if src.is_dir() { collect(&src, &root, &mut found); }
+        if src.is_dir() {
+            rust_files(&src, &mut files);
+        }
     }
     let manifest = serde_json::from_slice(
-        &std::fs::read(root.join("docs/reasoner-capabilities.json")).unwrap()).unwrap();
-    (found, manifest)
+        &std::fs::read(root.join("docs/reasoner-capabilities.json")).unwrap(),
+    )
+    .unwrap();
+    (collect_files(&files, &root), manifest)
 }
 
 #[test]
@@ -758,4 +955,26 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     assert_eq!(std::fs::read_to_string(&discord_txt).unwrap(), "SYNTHETIC_DISCORD_TEXT\n");
     assert!(!session.join("new.txt").exists());
     assert_eq!(std::fs::read_to_string(transcripts.join("meeting.md")).unwrap(), "SYNTHETIC_TRANSCRIPT\n");
+}
+
+#[test]
+fn imessage_compose_matches_social_card_scope_and_forbids_send_controls() {
+    use augmentagent_channel_core::reasoner::*;
+    let dir=tempfile::tempdir().unwrap();let wiki=dir.path().to_path_buf();
+    let presets=[ask_opts(wiki.clone(),wiki.clone()),triage_opts(Some(wiki.clone())),
+        draft_opts("Synthetic instructions".into(),Some(wiki.clone())),digest_opts(Some(wiki.clone())),
+        resume_opts(wiki.clone()),tone_summarize_opts(),loop_parse_opts()];
+    for opts in presets {
+        let has=|s:&str|opts.allowed_tools.iter().any(|t|t==s);
+        assert_eq!(has("Bash(augmentagent imessage compose *)"),has("Bash(augmentagent socialapi dm *)"));
+        assert_eq!(has("Bash(augmentagent imessage allowlist)"),has("Bash(augmentagent socialapi dm *)"));
+        for forbidden in ["imessage *","imessage approve *","imessage allow-outbound *","imessage alerts *","imessage outbox *","imessage contact-defaults *"] {
+            assert!(!opts.allowed_tools.iter().any(|t|t.ends_with(&format!(" {forbidden})"))));
+        }
+    }
+    let opts=ask_opts(wiki.clone(),wiki);
+    assert!(opts.system_prompt.contains("imessage compose"));
+    assert!(opts.system_prompt.contains("--post"));
+    let manifest:serde_json::Value=serde_json::from_str(include_str!("../../../docs/reasoner-capabilities.json")).unwrap();
+    assert!(manifest.to_string().contains("imessage compose"));
 }

@@ -226,7 +226,7 @@ pub struct DraftSpec<'a> {
     pub subject: &'a str,
     pub body: &'a str,
     pub thread_id: Option<&'a str>,
-    pub attachment: Option<&'a LocalAttachment>,
+    pub attachments: &'a [LocalAttachment],
 }
 
 struct CachedToken {
@@ -1031,7 +1031,7 @@ struct Threading {
 
 /// An RFC 5322 message for `drafts.create`'s `raw`. Plain-text body, base64
 /// transfer encoding (safe for any line length or charset), multipart/mixed
-/// when an attachment rides along.
+/// with one part per attachment when any ride along.
 fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
     let mut out = String::new();
     push_address_header(&mut out, "To", spec.to);
@@ -1063,15 +1063,16 @@ fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
         out.push_str("\r\n");
     };
 
-    match spec.attachment {
-        None => text_part(&mut out),
-        Some(att) => {
-            let boundary = format!("=_augmentagent_{:x}", wallclock_ms());
-            out.push_str(&format!(
-                "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
-            ));
-            out.push_str(&format!("--{boundary}\r\n"));
-            text_part(&mut out);
+    if spec.attachments.is_empty() {
+        text_part(&mut out);
+    } else {
+        let boundary = format!("=_augmentagent_{:x}", wallclock_ms());
+        out.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
+        ));
+        out.push_str(&format!("--{boundary}\r\n"));
+        text_part(&mut out);
+        for att in spec.attachments {
             out.push_str(&format!("--{boundary}\r\n"));
             let name = att.name.replace('"', "");
             out.push_str(&format!(
@@ -1083,8 +1084,9 @@ fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
             ));
             out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
             out.push_str(&wrap_base64(&att.bytes));
-            out.push_str(&format!("\r\n--{boundary}--\r\n"));
+            out.push_str("\r\n");
         }
+        out.push_str(&format!("--{boundary}--\r\n"));
     }
     out
 }
@@ -1557,7 +1559,7 @@ mod tests {
             subject: "Re: Hello",
             body: "line one\r\nline two — with a dash",
             thread_id: Some("t1"),
-            attachment: None,
+            attachments: &[],
         };
         let threading = Threading {
             in_reply_to: "<abc@mail.example.com>".into(),
@@ -1589,7 +1591,7 @@ mod tests {
             to: "a@example.com",
             subject: "Invoice",
             body: "attached",
-            attachment: Some(&att),
+            attachments: std::slice::from_ref(&att),
             ..Default::default()
         };
         let mime = build_mime(&spec, &Threading::default());
@@ -1599,6 +1601,45 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 fake");
         assert!(mime.contains(&b64));
         assert!(mime.trim_end().ends_with("--"));
+    }
+
+    #[test]
+    fn mime_carries_every_attachment_byte_for_byte_in_order() {
+        let atts: Vec<LocalAttachment> = [
+            ("Proposal.pdf", &b"%PDF-1.7 proposal \x00\xff\r\n"[..]),
+            ("Audit.pdf", &b"%PDF-1.7 audit"[..]),
+            ("Summary (Plain).pdf", &[0u8, 1, 2, 254, 255][..]),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| LocalAttachment {
+            name: name.into(),
+            mimetype: "application/pdf".into(),
+            bytes: bytes.to_vec(),
+        })
+        .collect();
+        let spec = DraftSpec {
+            to: "a@example.com",
+            subject: "Docs",
+            body: "attached",
+            attachments: &atts,
+            ..Default::default()
+        };
+        let mime = build_mime(&spec, &Threading::default());
+        let boundary = mime
+            .split("boundary=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap();
+        let parts: Vec<&str> = mime.split(&format!("--{boundary}")).collect();
+        // preamble, text, three files, closing "--".
+        assert_eq!(parts.len(), 6, "{mime}");
+        assert!(parts[5].starts_with("--"));
+        for (part, att) in parts[2..5].iter().zip(&atts) {
+            assert!(part.contains(&format!("filename=\"{}\"", att.name)), "{part}");
+            let b64 = part.split("\r\n\r\n").nth(1).unwrap().replace("\r\n", "");
+            let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+            assert_eq!(decoded, att.bytes, "{}", att.name);
+        }
     }
 
     #[test]

@@ -84,8 +84,8 @@ pub struct AuditRecord {
     /// Tool name as emitted by the claude CLI (e.g. `Write`, `Edit`,
     /// `Bash`, `mcp__gh__issue_create`).
     pub tool: String,
-    /// Tool input arguments verbatim from the stream-json event. Kept as
-    /// a `serde_json::Value` to round-trip whatever shape the CLI used.
+    /// Tool input arguments, with private compose payloads omitted. Kept as
+    /// a `serde_json::Value` for the provider's remaining argument shape.
     pub args: serde_json::Value,
     /// Tool exit code (`Bash` only — `None` for everything else).
     pub exit_code: Option<i32>,
@@ -110,7 +110,9 @@ const CLAUDE_REFUSALS: &[&str] = &[
 
 fn is_claude_refusal(content: &str) -> bool {
     let content = content.trim_start();
-    CLAUDE_REFUSALS.iter().any(|prefix| content.starts_with(prefix))
+    CLAUDE_REFUSALS
+        .iter()
+        .any(|prefix| content.starts_with(prefix))
 }
 
 impl AuditRecord {
@@ -295,9 +297,21 @@ pub fn default_audit_log_path() -> PathBuf {
 
 /// Append-only NDJSON writer. Cheap to clone (`Arc<Mutex<…>>` inside) so
 /// the caller can hand it to spawned tasks.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuditLogger {
     path: PathBuf,
+    model_call_observer:
+        Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
+    run_resources_required: Arc<std::sync::atomic::AtomicBool>,
+    native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
+    resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
+    resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
+    anchored: Option<crate::audit_chain::AnchoredAudit>,
+    failure_path: Option<PathBuf>,
+    pending_dir: Option<PathBuf>,
+    pending_writers: Arc<std::sync::atomic::AtomicUsize>,
+    writers_changed: Arc<tokio::sync::Notify>,
+    audit_failed: Arc<std::sync::atomic::AtomicBool>,
     /// When this process last ran a retention pass (#1004). `None` in the
     /// field below means this logger never prunes at all.
     last_prune: Arc<Mutex<Option<std::time::Instant>>>,
@@ -313,16 +327,353 @@ pub struct AuditLogger {
     write_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Debug)]
+pub struct AuditWriteGuard {
+    logger: AuditLogger,
+    pending: Option<PathBuf>,
+    completed: bool,
+}
+impl AuditWriteGuard {
+    pub fn complete(mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for AuditWriteGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            if let Some(path) = &self.pending {
+                let result = std::fs::remove_file(path)
+                    .and_then(|_| std::fs::File::open(path.parent().unwrap())?.sync_all());
+                if result.is_err() {
+                    self.logger.mark_failed();
+                }
+            }
+        } else {
+            self.logger.mark_failed();
+        }
+        self.logger
+            .pending_writers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.logger.writers_changed.notify_waiters();
+    }
+}
+
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogger")
+            .field("path", &self.path)
+            .field("anchored", &self.anchored)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AuditLogger {
+    /// Seal a failed generation only after a new fenced workflow lease and
+    /// independent kernel proof that no admitted worker remains alive.
+    pub fn recovery_evidence(&self, new_lease_generation: i64) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(self.pending_writers.load(std::sync::atomic::Ordering::Acquire) == 0, "audit writers still active");
+        let sink = self.anchored.as_ref().ok_or_else(|| anyhow::anyhow!("recovery requires protected audit"))?;
+        let mut tickets = Vec::new();
+        if let Some(dir) = &self.pending_dir {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                anyhow::ensure!(entry.file_type()?.is_file(), "invalid interrupted audit ticket");
+                tickets.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        tickets.sort();
+        anyhow::ensure!(self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
+            || self.failure_path.as_ref().is_some_and(|path| path.exists())
+            || !tickets.is_empty(), "healthy audit generation cannot be replaced");
+        sink.seal_for_recovery(|rows| {
+            let generation = rows.iter().filter(|r| r["actor"] == "controller")
+                .filter_map(|r| r["generation"].as_i64()).max()
+                .ok_or_else(|| anyhow::anyhow!("previous workflow lease evidence missing"))?;
+            anyhow::ensure!(generation < new_lease_generation, "recovery requires a newer fenced lease");
+            let required = rows.iter().position(|r| r["actor"] == "controller" && r["kind"] == "run_resources_required")
+                .ok_or_else(|| anyhow::anyhow!("durable required resource policy missing"))?;
+            let mut proofs = Vec::new();
+            for (index, row) in rows.iter().enumerate() {
+                if row["kind"] == "run_resource_admitted" {
+                    anyhow::ensure!(index > required && row["actor"] == "controller", "unprotected resource admission");
+                    proofs.push(crate::run_resources::verify_quiescent(&row["observation"]["identity"])?);
+                }
+                if row["kind"] == "model_call_admitted" {
+                    anyhow::ensure!(index > required && !proofs.is_empty(), "model dispatch without protected resource admission");
+                }
+            }
+            Ok(serde_json::json!({"previous_lease_generation":generation,
+                "recovery_lease_generation":new_lease_generation,"interrupted_tickets":tickets,
+                "quiescent_resources":proofs}))
+        })
+    }
+
+    pub fn set_resource_capacity_observer(&self, observer: Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>) -> anyhow::Result<()> {
+        *self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?=Some(observer);
+        Ok(())
+    }
+    /// Controller-owned workflow requirement, independent of model/child env.
+    pub fn require_run_resources(&self) -> anyhow::Result<()> {
+        self.protected_health()?;
+        anyhow::ensure!(self.is_protected(),"workflow resources require protected audit");
+        self.record_controller(serde_json::json!({"actor":"controller","kind":"run_resources_required","version":1}))?;
+        self.run_resources_required.store(true,std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    pub fn run_resources_required(&self) -> bool { self.run_resources_required.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn resource_capacity_seen(&self) -> bool { self.resource_capacity_seen.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn resource_capacity_exhausted(&self, observation: &serde_json::Value) -> anyhow::Result<()> {
+        self.resource_capacity_seen.store(true,std::sync::atomic::Ordering::SeqCst);
+        let observer=self.resource_capacity_observer.lock().map_err(|_|anyhow::anyhow!("resource observer lock poisoned"))?.clone();
+        if let Some(observer)=observer {observer(observation)?;}
+        Ok(())
+    }
+
+    pub fn set_model_call_observer(
+        &self,
+        observer: Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
+    ) -> anyhow::Result<()> {
+        *self
+            .model_call_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))? = Some(observer);
+        Ok(())
+    }
+
+    pub fn model_call_admitted(&self, provider: &str) -> anyhow::Result<()> {
+        let observer = self
+            .model_call_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model accounting lock poisoned"))?
+            .clone();
+        if let Some(observer) = observer {
+            observer(provider)?;
+        }
+        if self.anchored.is_some() {
+            self.record_controller(serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider}))?;
+        }
+        Ok(())
+    }
+
     /// Build a logger writing to the given path. Use
     /// [`default_audit_log_path`] for the standard location.
+    /// Set once for this logger instance after the workflow's fenced claim.
+    pub fn set_native_runtime_owner(&self, owner:crate::native_vm::RuntimeOwner)->anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && owner.lease_generation>0 && !owner.workflow_id.is_empty(),"invalid native runtime owner");
+        let mut current=self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?;
+        anyhow::ensure!(current.as_ref().is_none_or(|existing|existing==&owner),"native runtime owner cannot change within a logger instance");
+        *current=Some(owner);
+        Ok(())
+    }
+    pub fn native_runtime_owner(&self)->anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
+        Ok(self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?.clone())
+    }
+
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            model_call_observer: Arc::new(std::sync::Mutex::new(None)),
+            resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
+            resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
+            anchored: None,
+            failure_path: None,
+            pending_dir: None,
+            pending_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            writers_changed: Arc::new(tokio::sync::Notify::new()),
+            audit_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_prune: Arc::new(Mutex::new(None)),
             manages_retention: false,
             write_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Dedicated workflow audit with its anchor outside every worker write root.
+    /// This log is retained as a complete workflow artifact and never pruned.
+    pub fn protected(
+        path: PathBuf,
+        anchor: PathBuf,
+        writable_roots: &[PathBuf],
+    ) -> anyhow::Result<Self> {
+        let failure_path = anchor.with_extension("failure");
+        let pending_dir = anchor.with_extension("pending");
+        std::fs::create_dir_all(&pending_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            anyhow::ensure!(
+                !std::fs::symlink_metadata(&pending_dir)?
+                    .file_type()
+                    .is_symlink(),
+                "audit pending directory is a symlink"
+            );
+            std::fs::set_permissions(&pending_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let anchored =
+            crate::audit_chain::AnchoredAudit::new(path.clone(), anchor, writable_roots)?;
+        Ok(Self {
+            anchored: Some(anchored),
+            failure_path: Some(failure_path),
+            pending_dir: Some(pending_dir),
+            ..Self::new(path)
+        })
+    }
+
+    /// Autoship must propagate this failure into workflow evidence rather than
+    /// issuing LGTM when its audit cannot be persisted or verified.
+    pub async fn record_checked(&self, record: &AuditRecord) -> anyhow::Result<()> {
+        self.record_value_checked(serde_json::to_value(record)?)
+            .await
+    }
+
+    /// Controller receipts have their own actor kind, never a fictional model.
+    pub fn record_controller(&self, value: serde_json::Value) -> anyhow::Result<()> {
+        let sink = self
+            .anchored
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("protected audit required"))?;
+        let ticket = self.begin_write()?;
+        let result = sink.append(value);
+        if result.is_err() {
+            self.mark_failed();
+        }
+        ticket.complete();
+        result
+    }
+
+    async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
+        let sink = self
+            .anchored
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("protected audit required"))?;
+        let ticket = self.begin_write()?;
+        let logger = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let result = sink.append(value);
+            if result.is_err() {
+                logger.mark_failed();
+            }
+            ticket.complete();
+            result
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.mark_failed();
+                Err(error.into())
+            }
+        }
+    }
+
+    fn mark_failed(&self) {
+        self.audit_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(path) = &self.failure_path {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            if let Ok(mut file) = options.open(path) {
+                let _ = file
+                    .write_all(b"workflow audit continuity failed; reconcile before approval\n");
+                let _ = file.sync_all();
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+                }
+            }
+        }
+    }
+
+    pub fn is_protected(&self) -> bool {
+        self.anchored.is_some()
+    }
+
+    /// Register BEFORE spawning a writer. Durable tickets survive cancellation
+    /// and process death; a restarted logger cannot silently forget lost rows.
+    pub fn begin_write(&self) -> anyhow::Result<AuditWriteGuard> {
+        let pending = if let Some(dir) = &self.pending_dir {
+            let path = dir.join(uuid::Uuid::new_v4().to_string());
+            let result = (|| -> anyhow::Result<()> {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                }
+                options.open(&path)?.sync_all()?;
+                std::fs::File::open(dir)?.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.mark_failed();
+                return Err(error);
+            }
+            Some(path)
+        } else {
+            None
+        };
+        self.pending_writers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(AuditWriteGuard {
+            logger: self.clone(),
+            pending,
+            completed: false,
+        })
+    }
+
+    pub async fn drain_checked(&self) -> anyhow::Result<()> {
+        loop {
+            let changed = self.writers_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .pending_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                break;
+            }
+            changed.await;
+        }
+        if self.anchored.is_some() {
+            self.protected_health()?;
+        }
+        Ok(())
+    }
+
+    pub fn protected_health(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.anchored.is_some(), "protected audit required");
+        anyhow::ensure!(
+            !self.audit_failed.load(std::sync::atomic::Ordering::Acquire)
+                && !self.failure_path.as_ref().is_some_and(|p| p.exists()),
+            "workflow audit lost a record"
+        );
+        anyhow::ensure!(
+            self.pending_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "workflow audit writers have not drained"
+        );
+        if let Some(dir) = &self.pending_dir {
+            anyhow::ensure!(
+                std::fs::read_dir(dir)?.next().is_none(),
+                "workflow audit has interrupted writer receipts"
+            );
+        }
+        let result = self.anchored.as_ref().unwrap().append(serde_json::json!({
+            "actor": "controller", "kind": "audit_integrity_check"
+        }));
+        if result.is_err() {
+            self.mark_failed();
+        }
+        result
     }
 
     /// The process-wide logger every preset shares (#1004). One instance so
@@ -390,6 +741,12 @@ impl AuditLogger {
     /// logged at `warn!` and swallowed — auditing never blocks the
     /// reasoner's reply.
     pub async fn record(&self, record: &AuditRecord) {
+        if self.anchored.is_some() {
+            if let Err(error) = self.record_checked(record).await {
+                warn!("tool-audit: protected append failed: {error}");
+            }
+            return;
+        }
         let line = match serde_json::to_string(record) {
             Ok(s) => s,
             Err(e) => {
@@ -452,6 +809,15 @@ pub trait AuditNotifier: Send + Sync + std::fmt::Debug {
     async fn notify(&self, session_id: &str, record: &AuditRecord);
 }
 
+fn is_private_imessage_compose(tool: &str, args: &serde_json::Value) -> bool {
+    static COMPOSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+        regex::Regex::new(r#"(?i)\bimessage["']?\s+["']?compose\b"#).expect("compose audit pattern"));
+    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
+        .is_some_and(|command| COMPOSE.is_match(&command.replace("\\\n", "")))
+}
+
+const PRIVATE_COMPOSE_COMMAND: &str = "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
+
 /// Pair a captured `tool_use` block with its later `tool_result` and produce
 /// the [`AuditRecord`] both the log and the notifier consume. `provider` is
 /// the adapter that served the call (#1047).
@@ -469,7 +835,14 @@ pub fn build_audit_record(
     result_content: &str,
     is_error: bool,
 ) -> AuditRecord {
-    let (captured, _truncated) = truncate_stream(result_content);
+    // Both the durable record and the notification consume this sanitized
+    // value. Omit the whole payload, including descriptions, pipes/heredocs,
+    // and result echoes, rather than attempting to parse private shell args.
+    let private_compose = is_private_imessage_compose(&tool, &args);
+    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) } else { args };
+    let (captured, _truncated) = truncate_stream(if private_compose {
+        "[iMessage compose output omitted; inspect approval card]"
+    } else { result_content });
     // Bash failures from the CLI surface as `is_error=true` with the command
     // output in the result content. We have no real exit code from the
     // stream-json event shape, but recording the captured text on the
@@ -483,8 +856,14 @@ pub fn build_audit_record(
     // The Claude lane runs every Bash command in a host shell unless its
     // permission check refused it. The Codex caller overrides this with the
     // runner its bridge reports.
-    let runner = (tool == "Bash")
-        .then(|| if is_error && is_claude_refusal(result_content) { "none" } else { "host" }.to_string());
+    let runner = (tool == "Bash").then(|| {
+        if is_error && is_claude_refusal(result_content) {
+            "none"
+        } else {
+            "host"
+        }
+        .to_string()
+    });
     AuditRecord {
         provider: Some(provider.name().to_string()),
         model: None,
@@ -506,16 +885,18 @@ pub fn format_notice(record: &AuditRecord) -> String {
     // Try common arg keys first; fall back to a compact JSON dump capped
     // at ~200 chars so the message doesn't blow Discord's char limit on a
     // pathological input.
-    let arg_summary = record
-        .args
+    let safe_args = if is_private_imessage_compose(&record.tool, &record.args) {
+        serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND})
+    } else { record.args.clone() };
+    let arg_summary = safe_args
         .get("file_path")
-        .or_else(|| record.args.get("path"))
-        .or_else(|| record.args.get("command"))
-        .or_else(|| record.args.get("query"))
+        .or_else(|| safe_args.get("path"))
+        .or_else(|| safe_args.get("command"))
+        .or_else(|| safe_args.get("query"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            let dump = record.args.to_string();
+            let dump = safe_args.to_string();
             if dump.len() > 200 {
                 format!("{}…", &dump[..200])
             } else {
@@ -682,6 +1063,31 @@ mod tests {
         assert!(!notice.contains("\"content\""));
     }
 
+    #[tokio::test]
+    async fn compose_payloads_never_reach_audit_files_or_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let logger = AuditLogger::new(path.clone());
+        for command in [
+            "augmentagent imessage compose --to 'PRIVATE_RECIPIENT' --body 'PRIVATE_BODY' --post",
+            "printf 'PRIVATE_BODY' | /repo/augmentagent imessage compose --to=PRIVATE_RECIPIENT --body-file - --post",
+            "augmentagent 'imessage' 'compose' --to PRIVATE_RECIPIENT --body-file - <<'EOF'\nPRIVATE_BODY\nEOF",
+        ] {
+            for failed in [false, true] {
+                let record = build_audit_record(ProviderKind::Claude, "now".into(), "session".into(), "Bash".into(),
+                    serde_json::json!({"command":command,"description":"PRIVATE_BODY to PRIVATE_RECIPIENT"}),
+                    "PRIVATE_BODY PRIVATE_RECIPIENT", failed);
+                logger.record(&record).await;
+                let notice = format_notice(&record);
+                assert!(notice.contains("imessage compose"));
+                assert!(!notice.contains("PRIVATE_BODY") && !notice.contains("PRIVATE_RECIPIENT"));
+            }
+        }
+        let audit = std::fs::read_to_string(path).unwrap();
+        assert!(!audit.contains("PRIVATE_BODY") && !audit.contains("PRIVATE_RECIPIENT"));
+        assert_eq!(audit.lines().count(), 6);
+    }
+
     #[test]
     fn format_notice_includes_bash_exit_code() {
         let rec = AuditRecord {
@@ -754,8 +1160,15 @@ mod tests {
             ("timeout 60 cargo test", "Exit code 101\nerror", true),
             ("git status", "clean", false),
         ] {
-            let record = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Bash".into(),
-                serde_json::json!({"command": command}), content, is_error);
+            let record = build_audit_record(
+                ProviderKind::Claude,
+                "ts".into(),
+                "s".into(),
+                "Bash".into(),
+                serde_json::json!({"command": command}),
+                content,
+                is_error,
+            );
             assert_eq!(record.runner.as_deref(), Some("host"), "{command}");
             assert_eq!(serde_json::to_value(&record).unwrap()["runner"], "host");
         }
@@ -765,14 +1178,34 @@ mod tests {
             "Permission to use Bash with command cargo build has been denied.",
             "Hook PreToolUse:Bash denied this tool",
         ] {
-            let record = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Bash".into(),
-                serde_json::json!({"command": "cargo build"}), denial, true);
+            let record = build_audit_record(
+                ProviderKind::Claude,
+                "ts".into(),
+                "s".into(),
+                "Bash".into(),
+                serde_json::json!({"command": "cargo build"}),
+                denial,
+                true,
+            );
             assert_eq!(record.runner.as_deref(), Some("none"), "{denial}");
         }
-        let write = build_audit_record(ProviderKind::Claude, "ts".into(), "s".into(), "Write".into(),
-            serde_json::json!({"command": "cargo test"}), "ok", false);
+        let write = build_audit_record(
+            ProviderKind::Claude,
+            "ts".into(),
+            "s".into(),
+            "Write".into(),
+            serde_json::json!({"command": "cargo test"}),
+            "ok",
+            false,
+        );
         assert!(write.runner.is_none());
-        assert!(serde_json::to_value(&write).unwrap().get("runner").is_none(), "non-Bash rows stay unchanged");
+        assert!(
+            serde_json::to_value(&write)
+                .unwrap()
+                .get("runner")
+                .is_none(),
+            "non-Bash rows stay unchanged"
+        );
     }
 
     /// #1047 C2 — every writer of `tool-audit.log` stamps the provider that
@@ -790,7 +1223,14 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"note.md"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"synthetic"}]}}"#,
         ] {
-            crate::reasoner::audit_stream_line(line, &mut pending, "synthetic-claude", Some("synthetic-claude-model"), Some(&logger), None);
+            crate::reasoner::audit_stream_line(
+                line,
+                &mut pending,
+                "synthetic-claude",
+                Some("synthetic-claude-model"),
+                Some(&logger),
+                None,
+            );
         }
         let mut options = crate::reasoner::lint_opts("synthetic".into(), tmp.path().into());
         options.audit_logger = Some(logger.clone());
@@ -805,19 +1245,32 @@ mod tests {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for _ in 0..40 {
             let body = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-            rows = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-            if rows.len() >= 2 { break; }
+            rows = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            if rows.len() >= 2 {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert_eq!(rows.len(), 2, "{rows:?}");
         for row in &rows {
-            assert!(row["provider"].is_string(), "audit row without a provider: {row}");
+            assert!(
+                row["provider"].is_string(),
+                "audit row without a provider: {row}"
+            );
         }
-        let by_session = |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["provider"].clone();
+        let by_session =
+            |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["provider"].clone();
         assert_eq!(by_session("synthetic-claude"), "claude");
         assert_eq!(by_session("synthetic-codex"), "codex");
-        let model_by_session = |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["model"].clone();
-        assert_eq!(model_by_session("synthetic-claude"), "synthetic-claude-model");
+        let model_by_session =
+            |s: &str| rows.iter().find(|r| r["session_id"] == s).unwrap()["model"].clone();
+        assert_eq!(
+            model_by_session("synthetic-claude"),
+            "synthetic-claude-model"
+        );
         assert!(model_by_session("synthetic-codex").is_string());
     }
 
@@ -872,5 +1325,47 @@ mod tests {
         assert_eq!(parsed1.tool, "Write");
         assert_eq!(parsed2.tool, "Bash");
         assert_eq!(parsed2.exit_code, Some(0));
+    }
+    fn protected_fixture() -> (tempfile::TempDir, AuditLogger, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::create_dir(dir.path().join("anchors")).unwrap();
+        let log = dir.path().join("logs/workflow.log");
+        let anchor = dir.path().join("anchors/workflow.json");
+        let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
+        (dir, logger, log, anchor)
+    }
+
+    #[tokio::test]
+    async fn protected_drain_waits_for_registered_writer() {
+        let (_dir, logger, _, _) = protected_fixture();
+        let ticket = logger.begin_write().unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), logger.drain_checked())
+                .await
+                .is_err()
+        );
+        ticket.complete();
+        logger.drain_checked().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_audit_writer_blocks_approval_after_restart() {
+        let (_dir, logger, log, anchor) = protected_fixture();
+        drop(logger.begin_write().unwrap());
+        assert!(logger.drain_checked().await.is_err());
+        let reopened = AuditLogger::protected(log, anchor, &[]).unwrap();
+        assert!(reopened.protected_health().is_err());
+    }
+
+    #[tokio::test]
+    async fn truncated_protected_log_fails_after_restart() {
+        let (_dir, logger, log, anchor) = protected_fixture();
+        logger
+            .record_controller(serde_json::json!({"actor":"controller","kind":"verified"}))
+            .unwrap();
+        std::fs::write(&log, b"").unwrap();
+        let reopened = AuditLogger::protected(log, anchor, &[]).unwrap();
+        assert!(reopened.drain_checked().await.is_err());
     }
 }

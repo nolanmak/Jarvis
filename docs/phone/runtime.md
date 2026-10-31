@@ -57,6 +57,8 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 
 | Variable | Meaning |
 | --- | --- |
+| `AUGMENTAGENT_PHONE_VOICE_BACKEND` | `conversation_relay` (default until live qualification) or `openai_live`. Live uses signed Twilio Media Streams with exact `gpt-live-1` and feminine `gleam`; its startup greeting and native delegation use the original chat. |
+| `OPENAI_API_KEY` | OpenAI project credential with GPT-Live access, loaded from the private credential store with service-environment fallback. Required only for `openai_live`; Twilio credentials and CLI subscriptions do not supply this API access. |
 | `AUGMENTAGENT_PHONE_ENABLED` | `1` enables configuration; absent or `0` defaults off. Other values fail configuration. |
 | `AUGMENTAGENT_PHONE_BARGE_MIN_WORDS` | Barge-in filter (#1550): speech after an `interrupt` with fewer words than this that matches a backchannel phrase does not cancel the answer. Default `3`, range 1–10; `1` disables the filter so every interrupt invalidates immediately. |
 | `AUGMENTAGENT_PHONE_BACKCHANNEL_PHRASES` | Comma-separated backchannel phrases, compared case-insensitively with punctuation and hyphens ignored (`Mm-hmm.` matches `mm hmm`). Default `ok, okay, yeah, yes, mm, mhm, mm hm, mm hmm, uh huh, right, sure, got it`; 1–64 phrases. |
@@ -287,6 +289,26 @@ without final usage retain conservative budget accounting even after usage
 retries are exhausted. For a known provider ID, use the explicit recovery command below after
 investigation. Unknown-ID association remains unresolved; no retry-reset or
 manual active-slot clearing command is provided.
+
+## Abandoned GPT-Live readiness checks
+
+A GPT-Live reservation that never completed its durable preflight has not reached
+Twilio create. Maintenance (or `phone-reconcile`) can retire it after 60 seconds
+only when it is stopped, uncertain, has no provider SID or answer evidence, and
+still has an unfinished preflight receipt. Recovery seals that receipt atomically
+so a concurrent readiness probe cannot advance to dialing. OpenAI usage stays
+unknown. A successful preflight followed by an uncertain Twilio create is **not**
+covered by this recovery and still requires provider evidence.
+
+To check the production Rust TLS and Live protocol without dialing, export
+`OPENAI_API_KEY` privately and run:
+
+```sh
+./scripts/cargo-managed.sh run -p augmentagent-phone --example live_preflight
+```
+
+This silent check prints only readiness and final reported seconds; it does not
+validate PSTN audio or conversation latency.
 
 ## Explicit provider reconciliation
 
@@ -552,7 +574,7 @@ Before enabling the fast/preemptive flags, check the selected provider's model
 catalog and a synthetic streaming/tool request using the daemon's credentials.
 CLI subscription authentication does not grant the fast HTTP client's API
 access. Leave the flags off on rejected authentication, unavailable models or
-billing failures. GPT-Live 1 is a separate planned audio backend (#1591), not an
+billing failures. GPT-Live 1 is a separate opt-in audio backend (#1591), not an
 additional value of `AUGMENTAGENT_PHONE_FAST_PROVIDER`.
 
 ### Preemptive generation (#1555)
@@ -865,3 +887,98 @@ three attempts, 60 s doubling lease) that the runtime's memory worker retries
 after a failure or restart; the outbox rejects a replayed key, so the message
 is never duplicated.
 
+
+
+## GPT-Live rollout and evidence (#1591)
+
+Set `AUGMENTAGENT_PHONE_VOICE_BACKEND=openai_live` only for the allowlisted owner
+canary after provisioning the OpenAI project credential privately. Existing
+Twilio dialing, caller number and callback authentication stay in place. Live
+uses neither ConversationRelay nor its fast/preemptive/STT/TTS settings. Keep
+`conversation_relay` available for rollback until the owner-call gate passes.
+Apply configuration through the normal deployment/updater path; do not pin a
+systemd binary or restart the daemon to interrupt a running owner call.
+
+The daemon emits a `phone.health` startup report with local runtime health,
+selected transport, audio model and voice. `requires_per_call_preflight` means
+OpenAI availability is unknown until an explicit owner call passes its bounded
+readiness probe; it is not a successful access test. Startup and health checks
+never dial or open a provider session. An unhealthy runtime emits the same
+content-free report. Credentials, public endpoints, phone numbers and transcripts
+are excluded.
+
+Before dialing, Live reserves the existing owner call, records its backend and
+original chat, then probes the exact model/voice/codec. Rejected access, missing
+final usage or startup/finalization failure retires that reservation without a
+Twilio dial or automatic retry. Confirm the owner concurrency/duration limits and
+cost budget before testing. The existing private key must belong to an OpenAI
+project that actually supports this model; a configured key alone proves no
+provider capability.
+
+Take a managed deploy snapshot, merge the reviewed source, let the normal updater
+deploy it, and record the running source identity. Record final-source Linux and
+macOS offline results and strict lint. Verify rollback on synthetic/managed state:
+queued task and delivery recovery must survive, uncertain execution must not
+replay, and returning to ConversationRelay must never initiate a call. Restore
+Live only for the next explicit owner request.
+
+Use one deployed commit for the epic's live gate. Keep private call/session/task
+correlation and the measurement evidence outside the public repository. Publish
+only the commit, measurement method, counts, timing distributions, redacted
+outcomes and costs with their basis. Record observed failures as failures; do not
+fill missing measurements with zero or a server-send timestamp.
+
+- Have the owner ask `call me` through their existing chat. Confirm no DTMF,
+  the feminine voice, and the startup greeting. Invalid and replayed callbacks
+  must create zero sessions or native agent invocations.
+- Measure at least 15 conversational turns over at least eight minutes. For each,
+  independently observe end of owner speech and first audible response on the
+  caller side. Compute nearest-rank p50 and p95; require <=1200 ms and <=2500 ms.
+  Record server model/forwarding timestamps separately. Do not record raw audio
+  by default; obtain explicit consent before retaining an audio recording.
+- Give two slow tasks. Each needs an audible acknowledgement within 1500 ms,
+  continued conversation, one execution and one original-chat result. Verify
+  completion after hangup, queued work after restart, and no automatic replay
+  of an uncertain running task. Retain native approval/execution evidence.
+- Exercise two backchannels and two true interruptions. Confirm continuity,
+  no stale queued audio, no unexpected disconnect, and goodbye hangup <=5 s.
+  Keep provider failure, app stop and ambiguous peer closure distinct from
+  an evidenced owner hangup. Native full-duplex fixtures do not prove these
+  acoustic behaviors.
+- On a second call, verify use of an approved saved profile fact. Forget it
+  through the existing authorized profile controls, then verify its absence
+  from the next call. A history-capacity warning disables automatic memory
+  extraction for that incomplete call; do not count it as a successful memory
+  trial.
+- Record confirmed provider usage for readiness probes and conversations
+  separately, plus backend usage and Twilio costs. Label rate-based estimates
+  separately from provider-reported charges; missing final usage remains
+  unknown. Review diagnostics for transcript/credential/number disclosure.
+- Obtain owner confirmation and attach the redacted receipt to #1596/#1591.
+  Only then change the production default and close the epic.
+
+`phone metrics --last N` reports Live transport counters and usage, without
+private identifiers. A mark acknowledges buffer drain, not audible speech onset;
+cleared marks are not played audio. The existing `scripts/phone-live-receipt.py`
+validator belongs to the separate ConversationRelay retirement gate (#1496).
+It does not validate this GPT-Live gate, and a passing legacy receipt must not
+be used to claim GPT-Live qualification.
+
+### Live task handoff (#1620)
+
+Live transcript deltas are fragments, often individual words. The handoff keeps
+up to 512 fragments / 64 KB and joins adjacent same-role fragments into the
+12 KB native task envelope. A delegation timestamp does not cut a complete
+fragment in half. Already-consumed speech is context, never a second task.
+When metadata arrives before the transcript, the audio loop waits up to two
+seconds for missing text and allows 250 ms of transcript settling before dispatch.
+Absent or genuinely lost context starts no task.
+
+Completed native results no longer require a second model call to become spoken.
+Results up to 64 KB are returned as ordered commentary pieces, each at most
+500 UTF-8 bytes, preferring sentence/whitespace boundaries. Each piece waits for
+its matching provider acceptance before advancing; only the final acceptance
+marks the voice result delivered. Provider acceptance is not proof of playback.
+The original chat result is unchanged. Oversized results receive an explicit
+voice-limit notice; they are never silently truncated. Legacy summary-job tables
+remain readable for rollback compatibility but the Live summary worker is retired.

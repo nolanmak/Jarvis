@@ -543,3 +543,131 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), names.len());
     }
 }
+
+/// #1629 — the human filename behind an opaque `/tmp/aa-{doc,txt,img}-<n>-<i>.<ext>`
+/// download. Those paths have to stay opaque (the ask agent's Read carve-out
+/// admits only that shape), but re-attaching one to an email must not ship
+/// `aa-doc-1875…-0.pdf` to the recipient. Each writer records the original
+/// name beside the file; `gmail compose --attach` reads it back.
+pub fn original_name_sidecar(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".name");
+    PathBuf::from(name)
+}
+
+/// Is `path` one of the opaque inbound download names (`aa-<kind>-<n>-<i>.<ext>`)?
+pub fn is_opaque_download(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+    let Some(rest) = ["aa-doc-", "aa-txt-", "aa-img-"].iter().find_map(|p| name.strip_prefix(p)) else {
+        return false;
+    };
+    let Some((digits, ext)) = rest.split_once('.') else { return false };
+    let Some((a, b)) = digits.split_once('-') else { return false };
+    [a, b].iter().all(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+        && !ext.is_empty()
+        && ext.bytes().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The original filename made safe to put in a MIME header while staying
+/// recognisable: last path component only, control characters and quotes
+/// dropped, at most 200 characters. `None` when nothing usable is left.
+pub fn display_filename(original: &str) -> Option<String> {
+    let base = original.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"')
+        .take(200)
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    (!cleaned.is_empty() && cleaned != "." && cleaned != "..").then_some(cleaned)
+}
+
+/// Record `original` as the display name of the opaque download at `path`.
+pub async fn record_original_name(path: &Path, original: &str) -> std::io::Result<()> {
+    let Some(name) = display_filename(original) else { return Ok(()) };
+    write_private_attachment(&original_name_sidecar(path), name.as_bytes()).await
+}
+
+/// The recorded display name for an opaque download, if one is trustworthy:
+/// a regular owner-only file of ours (never a symlink — `/tmp` names are
+/// predictable), no older than the download itself.
+pub fn recorded_original_name(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if !is_opaque_download(path) {
+        return None;
+    }
+    let sidecar = original_name_sidecar(path);
+    let meta = std::fs::symlink_metadata(&sidecar).ok()?;
+    let file = std::fs::metadata(path).ok()?;
+    let ours = meta.file_type().is_file()
+        && meta.nlink() == 1
+        && meta.uid() == file.uid()
+        && meta.mode() & 0o077 == 0
+        && meta.len() <= 1024
+        && meta.modified().ok()? >= file.modified().ok()?;
+    if !ours {
+        return None;
+    }
+    display_filename(std::fs::read_to_string(&sidecar).ok()?.trim())
+}
+
+#[cfg(test)]
+mod original_name_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_opaque_inbound_shapes_qualify() {
+        for ok in ["/tmp/aa-doc-1875167429129085044-0.pdf", "/tmp/aa-txt-1-2.md", "/tmp/aa-img-9-0.PNG"] {
+            assert!(is_opaque_download(Path::new(ok)), "{ok}");
+        }
+        for no in ["/tmp/Proposal.pdf", "/tmp/aa-doc-1-0", "/tmp/aa-doc-1-0.pdf.name", "/tmp/aa-pdf-1-0.pdf",
+                   "/tmp/aa-doc-x-0.pdf", "/tmp/aa-doc--0.pdf", "/tmp/aa-doc-1-0.p df"] {
+            assert!(!is_opaque_download(Path::new(no)), "{no}");
+        }
+    }
+
+    #[test]
+    fn display_names_keep_the_human_name_but_not_paths_or_header_breakers() {
+        assert_eq!(display_filename("Acme - Audit Summary (Plain Language).pdf").as_deref(),
+                   Some("Acme - Audit Summary (Plain Language).pdf"));
+        assert_eq!(display_filename("../../etc/Q3 \"final\".pdf").as_deref(), Some("Q3 final.pdf"));
+        assert_eq!(display_filename("a\r\nBcc: injected.pdf").as_deref(), Some("aBcc: injected.pdf"));
+        assert_eq!(display_filename("Résumé.docx").as_deref(), Some("Résumé.docx"));
+        assert!(display_filename("  ").is_none() && display_filename("dir/").is_none() && display_filename("..").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_name_round_trips_and_untrusted_sidecars_are_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("aa-doc-12-0.pdf");
+        write_private_attachment(&file, b"%PDF-1.7").await.unwrap();
+        assert_eq!(recorded_original_name(&file), None, "no sidecar yet");
+        record_original_name(&file, "Quarterly Report.pdf").await.unwrap();
+        assert_eq!(recorded_original_name(&file).as_deref(), Some("Quarterly Report.pdf"));
+
+        // Group/world-writable sidecar: someone else could have written it.
+        let sidecar = original_name_sidecar(&file);
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(recorded_original_name(&file), None);
+
+        // A symlink planted at the sidecar path is never followed.
+        std::fs::remove_file(&sidecar).unwrap();
+        let elsewhere = dir.path().join("planted");
+        std::fs::write(&elsewhere, "Invoice.pdf").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &sidecar).unwrap();
+        assert_eq!(recorded_original_name(&file), None);
+
+        // A download rewritten after its sidecar makes the old name stale.
+        std::fs::remove_file(&sidecar).unwrap();
+        record_original_name(&file, "Old.pdf").await.unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(later).unwrap();
+        assert_eq!(recorded_original_name(&file), None);
+
+        // Ordinary files are never renamed.
+        let plain = dir.path().join("Proposal.pdf");
+        std::fs::write(&plain, b"x").unwrap();
+        assert_eq!(recorded_original_name(&plain), None);
+    }
+}

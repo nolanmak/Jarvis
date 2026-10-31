@@ -258,6 +258,14 @@ impl ApprovalBroker for DiscordApprovalBroker {
             .map_err(|e|ApprovalError::Discord(e.to_string()))?;
         Ok(format!("https://discord.com/channels/{}/{}/{}",guild,self.channel_id,posted.id))
     }
+    async fn note_compose_activity(&self, action_id: &str, email: &Email) -> Result<(), ApprovalError> {
+        match crate::note_compose_card(&self.http, self.channel_id, action_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => self.post_flag_notice(email, &format!("You texted this person since composing; Approve still sends the composed text (ref {}).", &action_id[..8.min(action_id.len())])).await,
+            Err(error) => Err(ApprovalError::Discord(error.to_string())),
+        }
+    }
+
     async fn post_approval(
         &self,
         action_id: &str,
@@ -268,6 +276,11 @@ impl ApprovalBroker for DiscordApprovalBroker {
         // / quick-refine re-renders go through the event handler, which reads
         // the persisted count.
         let message = approval_message(action_id, email, draft, 0);
+        // Match the one-shot compose poster if a response was lost in transit.
+        let message = if email.platform == "imessage" && email.kind == "compose" {
+            let key: String = action_id.chars().filter(|c| *c != '-').take(20).collect();
+            message.nonce(serenity::all::Nonce::String(format!("imsg-{key}"))).enforce_nonce(true)
+        } else { message };
         self.channel_id
             .send_message(&*self.http, message)
             .await

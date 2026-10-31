@@ -236,7 +236,7 @@ pub fn card(input: &CardInput<'_>) -> (String, Value) {
         }
         blocks.push(section(lines.join("\n")));
     }
-    if !email.body.trim().is_empty() && !merge {
+    if !email.body.trim().is_empty() && !merge && !compose {
         blocks.push(section(format!(
             "*Their message*\n{}",
             quote(&truncate(email.body.trim(), 1200))
@@ -676,6 +676,21 @@ mod tests {
             offer_retry: false,
             scheduled_for: None,
         }
+    }
+
+    #[test]
+    fn imessage_compose_shows_recipient_without_inbound_quote() {
+        let mut email = email();
+        email.platform = "imessage".into();
+        email.kind = "compose".into();
+        email.body = "owner instructions, not an inbound".into();
+        let (_, blocks) = card(&input(&email, None));
+        let rendered = blocks.to_string();
+        assert!(rendered.contains("New message"));
+        assert!(rendered.contains("iMessage"));
+        assert!(rendered.contains("*To*"));
+        assert!(!rendered.contains("Their message"));
+        assert!(!rendered.contains("owner instructions"));
     }
 
     fn action_ids(blocks: &Value) -> Vec<String> {

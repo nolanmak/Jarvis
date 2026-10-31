@@ -33,6 +33,18 @@ after the enclosing build finishes. On other platforms, use Cargo directly
 with the inherited target inside an already managed command; native evidence
 for nested lease reuse is unavailable.
 
+Required Autoship native-VM builders acquire the global build/prune lease for
+each actual VM build command, not for the whole model conversation. Reading and
+thinking leave the lease available to interactive builds. VM commands retain
+their private scratch-image ownership and aggregate growth reservations; they
+check the configured admission/free-space floor before and during execution.
+The bridge, descendant supervisor, and QEMU share the locked descriptor, so
+canceling a model cannot unlock storage before its build descendants exit.
+Repository `cargo-managed.sh` tool requests map to managed Cargo inside the VM;
+they never execute a candidate-controlled host wrapper. Deterministic host gates
+and explicit host/legacy builders retain verified target leases and parent-proof
+checks. No model output can opt into the narrower admission path.
+
 For ad hoc session names, opt a dedicated build parent into discovery once:
 
 ```sh
@@ -65,8 +77,15 @@ replacement, missing evidence, recent writes, and running builds prevent whole
 root deletion. Registration records contain paths, not source or credentials.
 
 Admission reconciles before each build, eliminating dependence on finding an
-idle gap between lanes. Managed builds are serialized to avoid spending the same
-free-space reserve twice. `AUGMENTAGENT_GATE_CACHE_MAX_MB` retains its existing
+idle gap between lanes. Normal managed builds serialize per state directory.
+Linux deployment builds use `disk build --update --target-dir CHECKOUT/target`
+to protect release outputs and dedicated scratch while auto-ship continues on
+its separate gate outputs. Linked debug profiles do not block a release build.
+A private per-user, per-filesystem reservation ledger atomically accounts for
+each active writer's growth budget, including snapshot creation, across state
+directories. Conflicting physical output leases still prevent pruning or two
+writers using the same output. Legacy writers without reservations defer the
+first deployment until their boundary. `AUGMENTAGENT_GATE_CACHE_MAX_MB` retains its existing
 20000 default. `AUGMENTAGENT_GATE_MIN_FREE_GB` defaults to 15 GiB;
 `AUGMENTAGENT_BUILD_GROWTH_GB` adds 10 GiB of anticipated in-flight growth before
 admission. Size the latter from measured peak growth for larger builds.
@@ -80,6 +99,69 @@ The daily pruner and pressure-triggered health reconciliation use the same
 exclusion and report deferral when a build owns the lease. The updater uses
 `disk build` for release builds once the deployed binary
 supports it, and never falls back to deleting a cache outside the pruner's lease.
+
+When age-based cleanup leaves a filesystem below its admission threshold,
+managed admission and discovering `disk prune` runs reclaim rebuildable Cargo
+cache directories from idle owned targets on that filesystem. This includes
+recent cache data: `incremental`, `build`, `deps`, and `.fingerprint`, in that
+order. The pass measures free space after each removal and stops once the
+reserve plus build growth and other writers' reservations fit. Scheduled
+housekeeping uses the same policy before the next build needs the space.
+
+Pressure cleanup preserves the profile directory and everything directly in
+it, including deployed and rollback binaries. It does not traverse linked
+cache directories or linked external profiles, touch source/state/snapshot
+directories, or remove a cache used by a build or a detected process/service
+reference. Missing process/reference evidence and held physical leases keep
+the cache. Reports record pressure removals and any remaining deficit; dry-run
+reports estimates without deleting. If protected or unrelated data consumes
+the disk, admission still refuses rather than lowering the reserve. Reclaimed
+dependencies can make the next build slower, but do not require relocating or
+replacing the deployed executable.
+
+The same pass retires registered Autoship worktrees under
+`.self-improve-worktrees` after 24 hours without writes. It holds the fresh,
+resume, and per-PR run locks, requires HEAD to be reachable from `origin/main`,
+and requires a clean tracked, untracked, and ignored-file inventory. Git locks,
+process references (including working directories), and unavailable evidence
+keep the checkout. Compiler inventory and readable process status/command lines
+are mandatory. For these reproducible resources only, permission-denied
+ptrace handles (`exe`, `cwd`, `fd`) from non-dumpable login/key agents are
+optional; otherwise normal SSH sessions would freeze all cleanup. Visible
+references still protect resources, and rollback snapshot retention retains
+its stricter all-reference policy. Removal uses `git worktree remove` without force and retains
+branches. External or unrecognized worktrees, unmerged commits (including
+squash-merged heads without ancestry proof), dirty work, and ignored private
+files are preserved; a deleted remote branch alone is not proof of safety.
+
+## Updates during auto-ship (Linux)
+
+The updater provisions `augmentagent-autopr.service` and a daemon drop-in without
+changing its ExecStart. The independently managed worker uses the daemon's
+environment files and dry-run setting; `AUGMENTAGENT_AUTOPR` must still be enabled
+to run auto-ship. A shared `augmentagent-runtime.slice` keeps the existing total
+CPU/memory/task budget across both processes. The worker inherits the daemon's
+run-resource delegation so native builds keep their per-run limits.
+Provisioning enables the worker but
+does not start it alongside a legacy embedded loop: first startup is ordered
+after the daemon restart. The initial legacy run may still defer this migration.
+
+After migration, a daemon restart leaves the worker and its child processes
+alive. The updater bypasses in-flight restart deferral only after verifying the
+actual daemon's external-worker mode, process birth identity, separate service
+cgroup, and ownership of every held fresh/resume run lock. Unknown or legacy
+owners retain the existing restart deferral. The worker detects an executable
+replacement but finishes its active run and persists accounting before reloading
+between runs. A supervisor lock prevents two new workers from polling at once.
+
+`disk build` exits 75 for contention, 73 for capacity/budget refusal, and 76 when
+preflight cannot establish safety. The updater logs these as distinct deferrals,
+withholds its deployment stamp, and retries on its next normal tick. Compiler
+errors still fail the build. Compatibility handling recognizes the old binary's
+mislabelled lock timeout without treating compiler diagnostics as contention.
+`disk-reconcile.json` also reports headroom reserved by other writers. macOS
+retains the embedded loop and serialized storage path until launchd handoff is
+implemented and verified; see issue #1599 and the parity inventory.
 
 ## Snapshots and rollout backups
 

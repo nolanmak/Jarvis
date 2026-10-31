@@ -24,6 +24,10 @@ use crate::sync::PollDelta;
 /// Entries of context shown to triage and draft, newest last.
 const CONTEXT_ENTRIES: usize = 10;
 
+/// `emails.kind` of a message the owner started with `imessage compose`
+/// (#1635). Such cards are never retired by inbound traffic.
+pub const COMPOSE_KIND: &str = "compose";
+
 #[derive(Debug, Clone)]
 pub struct ImessageReplyConfig {
     pub skill_dir: PathBuf,
@@ -128,11 +132,17 @@ fn newest_is_echo_of_own_send(store: &Store, delta: &PollDelta) -> bool {
 /// Split the delta's `me` entries into (agent's own sends, manual replies).
 /// Each sent outbox row accounts for at most one entry.
 fn split_own_entries(store: &Store, delta: &PollDelta) -> (usize, usize) {
+    split_own_entries_since(store, delta, None)
+}
+
+fn split_own_entries_since(store: &Store, delta: &PollDelta, after: Option<i64>) -> (usize, usize) {
     let mine: Vec<&crate::bundle::MessageEntry> = delta
         .new_entries
         .iter()
         .map(|(_, e)| e)
         .filter(|e| e.sender == "me")
+        .filter(|e| after.is_none_or(|after| chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+            .is_ok_and(|ts| ts.timestamp_millis() > after)))
         .collect();
     if mine.is_empty() {
         return (0, 0);
@@ -177,10 +187,27 @@ impl ImessageReplier {
                 if manual > 0 {
                     // The operator answered by hand; the pending draft is stale.
                     let thread = format!("imessage:{}", delta.conversation.identifier);
-                    match self
-                        .store
-                        .mark_pending_drafts_superseded_by_thread(&thread, "superseded by manual reply")
-                    {
+                    match self.store.pending_action_ids_for_thread_kind(&thread, COMPOSE_KIND) {
+                        Ok(ids) => for id in ids {
+                            if let Ok(Some(row)) = self.store.get_action_with_email(&id) {
+                                let Ok(created) = chrono::DateTime::parse_from_rfc3339(&row.action.created_at) else { continue; };
+                                if split_own_entries_since(&self.store, delta, Some(created.timestamp_millis())).1 == 0 { continue; }
+                                if let Err(error) = self.approvals.note_compose_activity(&id, &row.email).await {
+                                    warn!(action_id=%id, "compose manual-activity note failed: {error}");
+                                    stats.errors += 1;
+                                }
+                            }
+                        },
+                        Err(error) => warn!("compose manual-activity lookup failed: {error}"),
+                    }
+                    // #1635 — a pending *compose* (a text the owner started)
+                    // is not answered by the owner texting something else;
+                    // only drafted replies go stale.
+                    match self.store.mark_pending_drafts_superseded_by_thread_except_kind(
+                        &thread,
+                        "superseded by manual reply",
+                        COMPOSE_KIND,
+                    ) {
                         Ok(ids) => stats.superseded += ids.len(),
                         Err(e) => {
                             warn!("imessage supersede on manual reply failed: {e}");
@@ -274,11 +301,16 @@ impl ImessageReplier {
         if drafted.is_empty() {
             anyhow::bail!("draft came back empty");
         }
-        // One live card per conversation: the newer message replaces it.
+        // One live reply card per conversation: the newer message replaces
+        // it. A pending compose the owner started stays (#1635).
         let thread = email.thread_id.clone().unwrap_or_default();
         let superseded = self
             .store
-            .mark_pending_drafts_superseded_by_thread(&thread, "superseded by a newer iMessage")?
+            .mark_pending_drafts_superseded_by_thread_except_kind(
+                &thread,
+                "superseded by a newer iMessage",
+                COMPOSE_KIND,
+            )?
             .len();
         let action_id = self.log(&email, Some(&drafted), ActionStatus::Pending)?;
         if let Err(e) = self.approvals.post_approval(&action_id, &email, &drafted).await {
@@ -342,6 +374,7 @@ mod tests {
     struct Broker {
         cards: Mutex<Vec<(String, String)>>,
         flags: Mutex<usize>,
+        activity: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -349,6 +382,9 @@ mod tests {
         async fn post_approval(&self, id: &str, _e: &Email, d: &str) -> Result<(), ApprovalError> {
             self.cards.lock().unwrap().push((id.into(), d.into()));
             Ok(())
+        }
+        async fn note_compose_activity(&self, id: &str, _e: &Email) -> Result<(), ApprovalError> {
+            self.activity.lock().unwrap().push(id.into()); Ok(())
         }
         async fn post_flag_notice(&self, _e: &Email, _r: &str) -> Result<(), ApprovalError> {
             *self.flags.lock().unwrap() += 1;
@@ -743,4 +779,99 @@ mod tests {
         assert!(only_own_sends(&store, &own));
         assert!(!only_own_sends(&store, &mixed));
     }
+
+    // ---- #1635: a compose the owner started survives inbound traffic ----
+
+    /// A pending `imessage compose` card on PHONE's thread, as the CLI stores it.
+    fn pending_compose(store: &Store, body: &str) -> String {
+        let msg = format!("imessage-compose:{body}");
+        store
+            .upsert_email(&Email {
+                attachments: Vec::new(),
+                to: PHONE.into(),
+                cc: String::new(),
+                message_id: msg.clone(),
+                thread_id: Some(format!("imessage:{PHONE}")),
+                from: format!("Alex <{PHONE}>"),
+                subject: "New iMessage to Alex".into(),
+                body: String::new(),
+                date: "2026-09-29T11:00:00Z".into(),
+                account_entity_id: Some("imessage".into()),
+                platform: "imessage".into(),
+                kind: COMPOSE_KIND.into(),
+            })
+            .unwrap();
+        store
+            .log_action(
+                &msg,
+                Some(&format!("imessage:{PHONE}")),
+                &format!("Alex <{PHONE}>"),
+                "New iMessage to Alex",
+                None,
+                Some(body),
+                ActionStatus::Pending,
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn manual_reply_retires_the_reply_card_but_not_the_compose() {
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let d1 = one_to_one(&[(PHONE, "free tonight?")]);
+        ingest(&f.store, &d1);
+        let rep = replier(&f, Scripted::new(&[REPLY, "yes"]));
+        rep.handle_deltas(&[d1]).await;
+        let reply_card = pending(&f.store).remove(0);
+        let compose = pending_compose(&f.store, "here's the address");
+        let mut d2 = one_to_one(&[("me", "typed by hand")]);
+        d2.new_entries[0].1.timestamp = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+        let stats = rep.handle_deltas(&[d2]).await;
+        assert_eq!(stats.manual_replies, 1);
+        assert_eq!(stats.superseded, 1, "only the reply card");
+        let r = f.store.get_action_with_email(&reply_card).unwrap().unwrap();
+        assert_eq!(r.action.status, "superseded");
+        let c = f.store.get_action_with_email(&compose).unwrap().unwrap();
+        assert_eq!(c.action.status, "pending");
+        assert_eq!(*f.broker.activity.lock().unwrap(), vec![compose]);
+    }
+
+    #[tokio::test]
+    async fn delayed_export_of_old_manual_text_does_not_warn_on_new_compose() {
+        let f = fx();
+        let compose = pending_compose(&f.store, "new owner text");
+        let delta = one_to_one(&[("me", "old manual text")]);
+        let rep = replier(&f, Scripted::new(&[]));
+        rep.handle_deltas(&[delta]).await;
+        assert!(f.broker.activity.lock().unwrap().is_empty());
+        assert_eq!(f.store.get_action_with_email(&compose).unwrap().unwrap().action.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn newer_inbound_leaves_a_pending_compose_in_place() {
+        let f = fx();
+        f.store.allow_imessage_inbound(PHONE).unwrap();
+        let compose = pending_compose(&f.store, "here's the address");
+        let d = one_to_one(&[(PHONE, "what's the address?")]);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[REPLY, "sending it now"]))
+            .handle_deltas(&[d])
+            .await;
+        assert_eq!((stats.cards, stats.superseded), (1, 0));
+        let c = f.store.get_action_with_email(&compose).unwrap().unwrap();
+        assert_eq!(c.action.status, "pending");
+        assert_eq!(pending(&f.store).len(), 2, "the compose and the new reply card");
+    }
+    #[tokio::test]
+    async fn sent_compose_echo_is_an_own_send_and_never_a_manual_reply_or_new_card() {
+        let f=fx(); f.store.allow_imessage_inbound(PHONE).unwrap();
+        let id=pending_compose(&f.store, "agent composed this");
+        sent_row(&f.store, &id, "agent composed this", ts_ms(TS));
+        let d=one_to_one(&[("me", "agent composed this")]);
+        ingest(&f.store,&d);
+        let stats=replier(&f,Scripted::new(&[])).handle_deltas(&[d]).await;
+        assert_eq!((stats.own_sends,stats.manual_replies,stats.cards),(1,0,0));
+        assert!(f.broker.activity.lock().unwrap().is_empty());
+    }
+
 }
