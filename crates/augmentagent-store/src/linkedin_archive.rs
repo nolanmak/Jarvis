@@ -2,10 +2,17 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CategoryInventory {
+    pub observed_at_ms: i64,
+    pub categories: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountStatus {
     pub account: String,
     pub last_error: Option<String>,
     pub retry_at_ms: i64,
+    pub inventory: Option<CategoryInventory>,
 }
 
 pub fn account_status(c: &Connection, account: &str) -> rusqlite::Result<AccountStatus> {
@@ -17,10 +24,18 @@ pub fn account_status(c: &Connection, account: &str) -> rusqlite::Result<Account
         )
         .optional()?
         .unwrap_or((None, 0));
+    let inventory = c.query_row(
+        "SELECT observed_at_ms,categories_json FROM linkedin_archive_inventory WHERE account=?1", [account], |r| {
+            let encoded: String = r.get(1)?;
+            let categories = serde_json::from_str(&encoded).map_err(|e| rusqlite::Error::FromSqlConversionFailure(1,rusqlite::types::Type::Text,Box::new(e)))?;
+            Ok(CategoryInventory { observed_at_ms: r.get(0)?, categories })
+        }
+    ).optional()?;
     Ok(AccountStatus {
         account: account.into(),
         last_error,
         retry_at_ms,
+        inventory,
     })
 }
 

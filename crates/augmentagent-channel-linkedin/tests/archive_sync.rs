@@ -519,3 +519,57 @@ async fn one_failed_history_page_preserves_other_threads_and_resumes_after_resta
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 55);
 }
+
+#[tokio::test]
+async fn discovery_only_budget_persists_every_unvisited_category() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        "data":{"messengerMailboxCountsByMailbox":{"elements":[{"category":"PRIMARY_INBOX"},{"category":"ARCHIVE"}]}}
+    }))).expect(1).mount(&server).await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(file.path()).unwrap();
+    archive_live_poll_discovery(&reader, &store).await;
+    drop(store);
+    let reopened = Store::open(file.path()).unwrap();
+    let coverage = reopened
+        .with_conn(|c| {
+            augmentagent_store::linkedin_archive::search_coverage(
+                c,
+                augmentagent_messages::EXTRACTOR_VERSION,
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        coverage.scopes.len(),
+        2,
+        "unvisited discovered categories must remain visible after restart"
+    );
+    assert!(coverage
+        .scopes
+        .iter()
+        .all(|c| !c.complete && c.last_success_ms.is_none()));
+    let value = serde_json::to_value(coverage).unwrap();
+    assert_eq!(
+        value["accounts"][0]["inventory"]["categories"],
+        json!(["ARCHIVE", "PRIMARY_INBOX"])
+    );
+    assert!(
+        value["accounts"][0]["inventory"]["observed_at_ms"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+}
+
+async fn archive_live_poll_discovery(reader: &ArchiveReader, store: &Store) {
+    assert!(augmentagent_channel_linkedin::archive_live::poll(
+        reader,
+        store,
+        1,
+        &CancellationToken::new()
+    )
+    .await
+    .unwrap()
+    .is_empty());
+}

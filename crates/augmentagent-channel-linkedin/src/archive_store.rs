@@ -256,3 +256,26 @@ fn count_page(
     tx.execute("INSERT INTO linkedin_archive_page_stats(account,scope,committed,current_cycle) VALUES(?1,?2,1,1) ON CONFLICT(account,scope) DO UPDATE SET committed=committed+1,current_cycle=current_cycle+1", params![account,scope])?;
     Ok(())
 }
+
+/// Persist discovery and seed incomplete scopes together, including categories
+/// a bounded invocation has no remaining requests to enumerate.
+pub fn record_inventory(
+    store: &Store,
+    account: &str,
+    categories: &[String],
+    observed_at_ms: i64,
+) -> anyhow::Result<()> {
+    let encoded = serde_json::to_string(categories)?;
+    store.with_conn(|c| {
+        let tx = c.unchecked_transaction()?;
+        let changed = tx.execute("INSERT INTO linkedin_archive_inventory(account,observed_at_ms,categories_json) VALUES(?1,?2,?3) ON CONFLICT(account) DO UPDATE SET observed_at_ms=excluded.observed_at_ms,categories_json=excluded.categories_json WHERE observed_at_ms<=excluded.observed_at_ms",params![account,observed_at_ms,encoded])?;
+        tx.execute("INSERT OR IGNORE INTO linkedin_archive_accounts(account) VALUES(?1)",[account])?;
+        if changed > 0 {
+            for category in categories {
+                tx.execute("INSERT OR IGNORE INTO linkedin_archive_mailboxes(account,category) VALUES(?1,?2)",params![account,category])?;
+            }
+        }
+        tx.commit()
+    })?;
+    Ok(())
+}

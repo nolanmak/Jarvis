@@ -185,6 +185,7 @@ pub async fn categories(
     };
     match fetched {
         Ok(categories) => {
+            db::record_inventory(store, reader.mailbox(), &categories, started)?;
             db::clear_account_failure(store, reader.mailbox(), started)?;
             Ok(Some(categories))
         }

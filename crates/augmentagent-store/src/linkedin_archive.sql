@@ -71,3 +71,7 @@ CREATE TABLE IF NOT EXISTS linkedin_archive_page_stats (
  committed INTEGER NOT NULL, current_cycle INTEGER NOT NULL,
  PRIMARY KEY(account,scope)
 );
+-- The last observed API category inventory, separate from completed ingestion.
+CREATE TABLE IF NOT EXISTS linkedin_archive_inventory (
+ account TEXT PRIMARY KEY, observed_at_ms INTEGER NOT NULL, categories_json TEXT NOT NULL
+);

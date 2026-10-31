@@ -288,7 +288,12 @@ return `account_id` with hits. Pass that identity with `thread_id` when reading
 stored threads. Search responses include `linkedin_coverage` whenever LinkedIn
 is in scope, including zero-hit results. Its scope is explicitly
 `known_categories_only`; recorded categories do not prove that every current
-mailbox category has been discovered. Per-category results expose last success,
+mailbox category has been discovered. A successful category discovery persists
+its `inventory.categories` and `inventory.observed_at_ms` on the account, and
+creates incomplete progress records even when no request budget remains for
+those categories. The inventory is an observation, not a guarantee that today's
+API category set is unchanged. Previously stored categories and messages remain
+available when absent from a later inventory. Per-category results expose last success,
 last error, retry time, failed thread count, and search-index health.
 
 `archive-status` reads persisted state without requiring working cookies. Its
