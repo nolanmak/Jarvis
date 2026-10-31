@@ -489,7 +489,7 @@ impl SweepGuard {
                 );
             }
         }
-        let worktree = prepare_resume_worktree(repo, pr, &self.branch).await?;
+        let worktree = prepare_resume_worktree_at_head(repo, pr, &self.branch,Some(&expected)).await?;
         let reference = {
             let store = inner
                 .store
@@ -1667,6 +1667,12 @@ pub(super) async fn prepare_resume_worktree(
     pr: u64,
     branch: &str,
 ) -> Result<PathBuf> {
+    prepare_resume_worktree_at_head(repo_root,pr,branch,None).await
+}
+
+pub(super) async fn prepare_resume_worktree_at_head(
+    repo_root:&Path, pr:u64, branch:&str, expected_head:Option<&str>,
+)->Result<PathBuf> {
     anyhow::ensure!(pr > 0, "PR identity required");
     let primary = workspace::primary_root(repo_root).await?;
     let path = primary.join(".self-improve-worktrees").join(format!("resume-pr-{pr}"));
@@ -1679,6 +1685,15 @@ pub(super) async fn prepare_resume_worktree(
     anyhow::ensure!(valid, "invalid resumed PR branch");
     let (ok, _, _) = run("git", &["fetch", "origin", branch], repo_root).await?;
     anyhow::ensure!(ok, "cannot refresh resumed PR branch");
+    let fetched=git_evidence(repo_root,&["rev-parse","--verify",&format!("origin/{branch}^{{commit}}")]).await?;
+    if let Some(expected)=expected_head {
+        anyhow::ensure!(matches!(expected.len(),40|64) && expected.bytes().all(|b|b.is_ascii_hexdigit())
+            && fetched.eq_ignore_ascii_case(expected),"resolved PR head changed before execution; candidate preserved");
+        if exists {
+            anyhow::ensure!(git_evidence(&path,&["rev-parse","HEAD"]).await?.eq_ignore_ascii_case(expected),
+                "resumed candidate differs from authorized PR head; candidate preserved");
+        }
+    }
     if exists {
         return Ok(path);
     }
@@ -1689,7 +1704,7 @@ pub(super) async fn prepare_resume_worktree(
             "add",
             "--detach",
             &path.to_string_lossy(),
-            &format!("origin/{branch}"),
+            &fetched,
         ],
         repo_root,
     )

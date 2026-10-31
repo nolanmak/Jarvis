@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Process-bound effective configuration; never print environment or credentials."""
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -89,7 +90,9 @@ def snapshot(role,pid,binary,binary_sha,policy,policy_sha,declaration,receipts):
         if config.get('AUGMENTAGENT_AUTOPR','').strip().lower() not in ('1','true'):raise Refused('autoship-disabled')
         actual=config.get('AUGMENTAGENT_NATIVE_VM_POLICY')
         if not actual:raise Refused('policy-not-selected')
-        if actual!=str(policy) or digest(private(Path(actual),2*1024**2))!=policy_sha:raise Refused('policy-selection-mismatch')
+        if actual!=str(policy):raise Refused('policy-selection-mismatch')
+        if value.get('policy_sha256')!=policy_sha:raise Refused('policy-content-mismatch')
+        if digest(private(Path(actual),2*1024**2))!=policy_sha:raise Refused('policy-selection-mismatch')
         if os.readlink(proc/'exe')!=str(binary) or file_hash(proc/'exe')!=binary_sha:raise Refused('executable-mismatch')
         providers={}
         for provider in declaration['providers']:
@@ -152,6 +155,8 @@ def record(role,pid,receipts,dry_run,external):
     identity=birth(pid)
     config={key:value for key,value in os.environ.items() if key in KEYS}
     value={'version':1,'role':role,'pid':pid,'birth':identity,'boot_id':boot(),'dry_run':dry_run,'external':external,'config':config}
+    policy=config.get('AUGMENTAGENT_NATIVE_VM_POLICY')
+    value['policy_sha256']=digest(private(Path(policy),2*1024**2)) if policy else None
     data=json.dumps(value,sort_keys=True).encode()
     if len(data)>65536:raise Refused('configuration-exceeds-bound')
     receipts.parent.mkdir(parents=True,exist_ok=True)
@@ -159,29 +164,59 @@ def record(role,pid,receipts,dry_run,external):
     except FileExistsError:pass
     info=receipts.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:raise Refused('receipt-directory-invalid')
-    path=receipts/(role+'.json')
-    if path.exists() or path.is_symlink():
-        previous=json.loads(private(path))
-        if previous.get('version')!=1 or previous.get('role')!=role:raise Refused('preserving-unmanaged-receipt')
-    temporary=None
+    lock=os.open(receipts,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
     try:
-        with tempfile.NamedTemporaryFile(dir=receipts,prefix='.effective-',delete=False) as stream:
-            temporary=Path(stream.name);stream.write(data);stream.flush();os.fsync(stream.fileno())
-        if birth(pid)!=identity:raise Refused('process-changed')
-        os.replace(temporary,path)
-        descriptor=os.open(receipts,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
-        try:os.fsync(descriptor)
-        finally:os.close(descriptor)
-    finally:
-        if temporary is not None:temporary.unlink(missing_ok=True)
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        path=receipts/(role+'.json')
+        if path.exists() or path.is_symlink():
+            previous=json.loads(private(path))
+            if previous.get('version')!=1 or previous.get('role')!=role:raise Refused('preserving-unmanaged-receipt')
+            prior_pid=previous.get('pid')
+            if isinstance(prior_pid,int) and prior_pid>0 and prior_pid!=pid:
+                try:live=previous.get('boot_id')==boot() and previous.get('birth')==birth(prior_pid)
+                except FileNotFoundError:live=False
+                if live:raise Refused('preserving-live-receipt')
+        temporary=None
+        try:
+            with tempfile.NamedTemporaryFile(dir=receipts,prefix='.effective-',delete=False) as stream:
+                temporary=Path(stream.name);stream.write(data);stream.flush();os.fsync(stream.fileno())
+            if birth(pid)!=identity:raise Refused('process-changed')
+            os.replace(temporary,path)
+            descriptor=os.open(receipts,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            try:os.fsync(descriptor)
+            finally:os.close(descriptor)
+        finally:
+            if temporary is not None:temporary.unlink(missing_ok=True)
+    finally:os.close(lock)
+
+def activation_needed(selection,receipts,pid_for=service_pid):
+    # Read-only signal for the updater. The worker reloads independently at a
+    # completed tick/sweep boundary, so the updater never interrupts its work.
+    try:policy,_,policy_sha,_=selected(selection)
+    except FileNotFoundError:return False
+    pid=pid_for('daemon')
+    if pid<=0:raise Refused('daemon-not-running')
+    value=json.loads(private(receipts/'daemon.json'))
+    if value.get('version')!=1 or value.get('role')!='daemon' or value.get('pid')!=pid or value.get('birth')!=birth(pid) or value.get('boot_id')!=boot():
+        raise Refused('daemon-receipt-unverified')
+    config=value.get('config',{})
+    if config.get('AUGMENTAGENT_AUTOPR','').strip().lower() not in ('1','true'):return False
+    if value.get('external') is not True:raise Refused('daemon-worker-mode-unverified')
+    pending=config.get('AUGMENTAGENT_NATIVE_VM_POLICY')!=str(policy) or value.get('policy_sha256')!=policy_sha
+    if pid_for('daemon')!=pid or birth(pid)!=value['birth']:raise Refused('process-changed')
+    return pending
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary',type=Path);parser.add_argument('--selection',type=Path)
     parser.add_argument('--receipts',type=Path,required=True)
     parser.add_argument('--record',choices=ROLES);parser.add_argument('--pid',type=int)
+    parser.add_argument('--activation-needed',action='store_true')
     parser.add_argument('--dry-run',action='store_true');parser.add_argument('--external',action='store_true')
     args=parser.parse_args()
+    if args.activation_needed:
+        try:return 10 if activation_needed(args.selection,args.receipts) else 0
+        except Exception:return 1
     if args.record:
         try:record(args.record,args.pid,args.receipts,args.dry_run,args.external)
         except Exception:

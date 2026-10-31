@@ -153,7 +153,7 @@ else:
     let before_wait = git(&remote, &["rev-parse", "refs/heads/agent-fix/issue-700001"]);
     let history_before_wait = std::fs::read(root.join("history.json")).ok();
     let unavailable = augmentagent_channel_core::build_reasoner();
-    let waiting = resume_draft_pr(&repo, &unavailable, 1, 700001, "agent-fix/issue-700001", false).await.unwrap();
+    let waiting = resume_draft_pr(&repo, &unavailable, 1, 700001, "agent-fix/issue-700001", false, None).await.unwrap();
     // #1037 — held, unbilled, and named for what it is: the one independent
     // reviewer is latched, which is neither missing capacity nor provenance.
     assert!(waiting.message.contains("independent review unavailable")
@@ -172,7 +172,7 @@ else:
         // provider history stay intact. The fresh reasoner reloads authors.
         augmentagent_channel_core::CooldownLatch::system().clear("claude");
         let reasoner = augmentagent_channel_core::build_reasoner();
-        let resumed = resume_draft_pr(&repo, &reasoner, 1, 700001, "agent-fix/issue-700001", false).await.unwrap();
+        let resumed = resume_draft_pr(&repo, &reasoner, 1, 700001, "agent-fix/issue-700001", false, None).await.unwrap();
         assert!(resumed.message.contains("resumed and MERGED"), "{}\n{}", resumed.message,
             std::fs::read_to_string(root.join("gh-calls.jsonl")).unwrap_or_default());
         let merged = std::fs::read_to_string(root.join("merged-sha")).unwrap();

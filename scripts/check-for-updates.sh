@@ -120,6 +120,33 @@ not restarting"
   return 1
 }
 
+# Policy selection can change without a Git or executable update. Use the
+# ordinary daemon restart guards; the independent worker drains and reloads
+# itself at its next completed tick/sweep boundary.
+reconcile_native_selection() {
+  [ "$(uname -s)" = Linux ] || return 0
+  local helper="$REPO_ROOT/scripts/autoship-deployment-readiness.py" status=0
+  [ -f "$helper" ] || return 0
+  /usr/bin/python3 "$helper" --activation-needed \
+    --selection "${XDG_CONFIG_HOME:-$HOME/.config}/augmentagent/autoship-native.env" \
+    --receipts "$LOG_DIR/autoship-effective-config" || status=$?
+  case "$status" in
+    0) return 0 ;;
+    10) ;;
+    *) log "native policy activation evidence unavailable; keeping services and retrying next tick"; return 0 ;;
+  esac
+  if deploy_pinned_elsewhere || maybe_defer_restart || ! memory_pressure_ok || ! restart_budget_ok; then
+    log "native policy activation deferred by deployment guards; retrying next tick"
+    return 0
+  fi
+  if systemctl --user daemon-reload >> "$LOG" 2>&1 && restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+    record_restart
+    log "native policy activated for daemon; worker reloads after its active work drains; verify autoship readiness"
+  else
+    log "native policy activation failed; receipt remains pending for next tick"
+  fi
+}
+
 # Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
 # restart the corresponding services. On Rust build failure we exit non-zero
 # WITHOUT restarting and WITHOUT advancing the stamp, so the daemon keeps
@@ -379,6 +406,7 @@ will retry via the build-stamp mismatch path."
   fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
+  reconcile_native_selection
   # #1571 — a verified deploy on our own binary closes any pinned-deploy
   # alert; the next pin is a new incident and gets a new Discord message.
   rm -f "$PINNED_ALERT_STAMP"
@@ -414,6 +442,7 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   # (correctness over cost — this path only fires when something already went
   # wrong, not on the steady-state hot path).
   if [ "$BUILT" = "$LOCAL" ]; then
+    reconcile_native_selection
     log "up to date ($LOCAL)"
     exit 0
   fi

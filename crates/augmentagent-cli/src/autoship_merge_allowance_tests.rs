@@ -3,6 +3,22 @@ use super::*;
 const DAY: i64 = 86_400_000;
 
 #[test]
+fn legacy_read_only_merge_status_never_migrates_or_requires_a_ledger() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+    let mut store=WorkflowStore::open(&path).unwrap();
+    let (_,op)=fixture(&mut store,1,100*DAY);
+    store.conn.execute("DROP TABLE merge_allowance_dispatch",[]).unwrap();drop(store);
+    let before=std::fs::read(&path).unwrap();
+    let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+    let allowance=store.merge_allowance(100*DAY,5).unwrap();
+    assert_eq!((allowance.confirmed,allowance.pending,allowance.remaining,allowance.available),(0,0,5,5));
+    assert!(!store.merge_reconciliation_needed(&op.workflow).unwrap());
+    assert!(store.pending_merge_dispatches("owner/repo").unwrap().is_empty());
+    assert!(store.merge_dispatch(&op.id).unwrap().is_none());
+    assert_eq!(std::fs::read(path).unwrap(),before);
+}
+
+#[test]
 fn expired_undispatched_reservation_can_be_explicitly_settled_but_not_reused() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();

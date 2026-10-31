@@ -199,8 +199,16 @@ fn validate_external_merge(conn: &Connection, op: &Operation, receipt: &serde_js
     Ok(())
 }
 
+fn has_merge_ledger(conn:&Connection)->Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_allowance_dispatch')",[],|row|row.get(0))?)
+}
+
 fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
     ensure!(now >= 0 && cap > 0, "invalid merge allowance day or cap");
+    if !has_merge_ledger(conn)? {
+        return Ok(MergeAllowance {confirmed:0,pending:0,remaining:cap,available:cap,cap,
+            oldest_pending_at_ms:None,last_merged_at_ms:None});
+    }
     let start = now.div_euclid(86_400_000) * 86_400_000;
     let confirmed: u32 = conn.query_row(
         "SELECT count(*) FROM merge_allowance_dispatch WHERE state='confirmed' AND merged_at_ms>=?1 AND merged_at_ms<?2",
@@ -307,6 +315,7 @@ impl WorkflowStore {
     /// Operation completion alone does not settle autonomous attribution. A
     /// lost response can leave a completed operation with an uncertain ledger.
     pub fn merge_reconciliation_needed(&self, workflow: &str) -> Result<bool> {
+        if !has_merge_ledger(&self.conn)? {return Ok(false);}
         Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_allowance_dispatch d
             JOIN operation o ON o.id=d.operation JOIN workflow w ON w.id=o.workflow
             WHERE o.workflow=?1 AND (d.state='dispatched' OR
@@ -319,6 +328,7 @@ impl WorkflowStore {
     }
 
     pub fn pending_merge_dispatches(&self, repository: &str) -> Result<Vec<MergeDispatchRecord>> {
+        if !has_merge_ledger(&self.conn)? {return Ok(Vec::new());}
         let ids = self.conn.prepare("SELECT operation FROM merge_allowance_dispatch WHERE repository=?1 AND state='dispatched' ORDER BY dispatched_at_ms,operation")?
             .query_map([repository], |row| row.get::<_,String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -329,6 +339,7 @@ impl WorkflowStore {
     }
 
     pub fn merge_dispatch(&self, id: &str) -> Result<Option<MergeDispatchRecord>> {
+        if !has_merge_ledger(&self.conn)? {return Ok(None);}
         let row: Option<(String,String,String,Option<String>,String,u64,String,String,Option<String>)> = self.conn.query_row(
             "SELECT o.workflow,o.kind,o.binding,o.receipt,d.repository,d.pr,d.pr_node_id,d.state,d.resolution FROM operation o
              JOIN merge_allowance_dispatch d ON d.operation=o.id WHERE o.id=?1", [id],

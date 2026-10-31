@@ -17,6 +17,7 @@ def show(key):
 def escaped(value):
  if '\n' in value or '\r' in value: raise RuntimeError('newline in service configuration')
  return value.replace('\\','\\\\').replace('"','\\"').replace('%','%%')
+plan={}
 def write(path,text):
  path.parent.mkdir(parents=True,exist_ok=True)
  if path.exists():
@@ -24,9 +25,14 @@ def write(path,text):
   if not previous.startswith('# Managed by ensure-autopr-worker.sh'):
    raise RuntimeError('preserving unmanaged unit '+str(path))
   if previous==text:return
- with tempfile.NamedTemporaryFile(mode='w',dir=path.parent,prefix='.autopr-',delete=False) as f:
-  f.write(text); temporary=pathlib.Path(f.name)
- temporary.replace(path)
+ plan[path]=text.encode()
+def replace(path,data,mode=0o600):
+ with tempfile.NamedTemporaryFile(dir=path.parent,prefix='.autopr-',delete=False) as f:
+  temporary=pathlib.Path(f.name)
+  try:
+   f.write(data);f.flush();os.fsync(f.fileno());os.fchmod(f.fileno(),mode)
+   temporary.replace(path)
+  finally:temporary.unlink(missing_ok=True)
 def setting(name,override,fallback):
  value=os.environ.get(override) or show(name) or fallback
  if not re.fullmatch(r'(?:[0-9]+[KMGTPE]?|infinity)',value):
@@ -48,6 +54,7 @@ while raw:
 # This validates safe configuration storage, not live provider readiness.
 selection=unit_dir.parent.parent/'augmentagent/autoship-native.env'
 selected=os.environ.get('AUGMENTAGENT_NATIVE_VM_POLICY')
+selection_text=None
 if selected:
  path=pathlib.Path(selected)
  if not path.is_absolute() or '\n' in selected or '\r' in selected:
@@ -61,7 +68,7 @@ if selected:
   raise RuntimeError('invalid native policy declaration')
  # EnvironmentFile does not expand systemd specifiers or shell variables.
  value=selected.replace('\\','\\\\').replace('"','\\"')
- write(selection,'# Managed by ensure-autopr-worker.sh\nAUGMENTAGENT_NATIVE_VM_POLICY="'+value+'"\n')
+ selection_text='# Managed by ensure-autopr-worker.sh\nAUGMENTAGENT_NATIVE_VM_POLICY="'+value+'"\n'
 shared_environment='EnvironmentFile=-"'+escaped(str(selection))+'"'
 extra.append(shared_environment)
 dry=os.environ.get('AUGMENTAGENT_AUTOSTART_DRY_RUN')
@@ -116,7 +123,23 @@ Environment=AUGMENTAGENT_AUTOPR_EXTERNAL=1
 {shared_environment}
 Slice=augmentagent-runtime.slice
 ''')
+# Validate every destination before changing any managed file. Selection is
+# committed last; manager failures restore the prior units and selection.
+if selection_text is not None:write(selection,selection_text)
 log_dir.mkdir(parents=True,exist_ok=True)
+previous={path:(path.read_bytes(),stat.S_IMODE(path.stat().st_mode)) if path.exists() else None for path in plan}
+written=[]
+try:
+ for path,data in plan.items():
+  replace(path,data);written.append(path)
+ subprocess.run(['systemctl','--user','daemon-reload'],check=True)
+ subprocess.run(['systemctl','--user','enable','augmentagent-autopr.service'],check=True,stdout=subprocess.DEVNULL)
+except BaseException:
+ for path in reversed(written):
+  if path.read_bytes()!=plan[path]:raise RuntimeError('preserving concurrently changed unit '+str(path))
+  old=previous[path]
+  if old is None:path.unlink()
+  else:replace(path,*old)
+ subprocess.run(['systemctl','--user','daemon-reload'],check=False)
+ raise
 PY
-systemctl --user daemon-reload
-systemctl --user enable augmentagent-autopr.service >/dev/null

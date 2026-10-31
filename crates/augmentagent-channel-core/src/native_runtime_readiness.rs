@@ -211,20 +211,12 @@ fn inspect_provider(guest:&Path,provider:&str)->ProviderRuntimeReport {
 }
 
 fn provider_runtime_at(guest:&Path,_provider:&str,executable:&Path)->Result<String> {
-    use sha2::{Digest,Sha256};
-    use std::io::Read;
     let executable=executable.canonicalize().context("provider-executable-missing")?;
     let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&executable).context("provider-executable-unreadable")?;
     let metadata=file.metadata().context("provider-executable-unreadable")?;
     ensure!(metadata.is_file() && (metadata.uid()==0 || metadata.uid()==unsafe{libc::geteuid()})
         && metadata.mode() & 0o022==0 && metadata.mode() & 0o111!=0 && metadata.len()<=512*1024*1024,"provider-executable-untrusted");
-    let mut digest=Sha256::new();let mut bytes=0u64;let mut buffer=[0u8;65536];
-    loop {let count=file.read(&mut buffer).context("provider-executable-unreadable")?;if count==0{break;}
-        bytes+=count as u64;ensure!(bytes<=metadata.len(),"provider-executable-changed");digest.update(&buffer[..count]);}
-    let after=file.metadata().context("provider-executable-unreadable")?;
-    ensure!(bytes==metadata.len() && metadata.mtime()==after.mtime() && metadata.mtime_nsec()==after.mtime_nsec()
-        && metadata.ctime()==after.ctime() && metadata.ctime_nsec()==after.ctime_nsec(),"provider-executable-changed");
-    let digest=format!("{:x}",digest.finalize());
+    let digest=cached_file_digest(&mut file,&metadata,"provider-executable-unreadable","provider-executable-changed")?;
     // Match the launcher's executable-based companion contract, including
     // Codex-backed routes. A fixture executable is not a live provider proof.
     if executable.file_name().is_none_or(|name|name!="codex") {return Ok(digest);}
@@ -240,16 +232,53 @@ fn provider_runtime_at(guest:&Path,_provider:&str,executable:&Path)->Result<Stri
     let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).context("provider-runtime-companion-missing")?;
     let metadata=file.metadata().context("provider-runtime-companion-invalid")?;
     ensure!(metadata.is_file() && metadata.len()<=128*1024*1024,"provider-runtime-companion-invalid");
-    let mut companion=Sha256::new();let mut count=0u64;
-    loop {let read=file.read(&mut buffer).context("provider-runtime-companion-unreadable")?;if read==0 {break;}
-        count+=read as u64;ensure!(count<=metadata.len(),"provider-runtime-companion-changed");companion.update(&buffer[..read]);}
-    ensure!(count==metadata.len() && format!("{:x}",companion.finalize())==hash,"provider-runtime-companion-digest-mismatch");
+    ensure!(cached_file_digest(&mut file,&metadata,"provider-runtime-companion-unreadable","provider-runtime-companion-changed")?==hash,
+        "provider-runtime-companion-digest-mismatch");
+    Ok(digest)
+}
+
+// Revalidate identity and permissions on every dispatch. Immutable file bytes
+// need hashing only once per metadata generation; in-place edits, replacements
+// and permission changes invalidate this bounded process-local cache.
+fn cached_file_digest(file:&mut std::fs::File,metadata:&std::fs::Metadata,unreadable:&'static str,changed:&'static str)->Result<String> {
+    use sha2::{Digest,Sha256};
+    use std::io::Read;
+    use std::sync::{Mutex,OnceLock};
+    type Identity=(u64,u64,u64,i64,i64,i64,i64,u32,u32);
+    fn identity(m:&std::fs::Metadata)->Identity {(m.dev(),m.ino(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec(),m.mode(),m.uid())}
+    static CACHE:OnceLock<Mutex<BTreeMap<Identity,String>>>=OnceLock::new();
+    let cache=CACHE.get_or_init(||Mutex::new(BTreeMap::new()));
+    let key=identity(metadata);
+    let cached=cache.lock().map_err(|_|anyhow::anyhow!("provider-digest-cache-unavailable"))?.get(&key).cloned();
+    if let Some(hash)=cached {
+        ensure!(identity(&file.metadata().context(unreadable)?)==key,"{changed}");
+        return Ok(hash);
+    }
+    let mut digest=Sha256::new();let mut bytes=0u64;let mut buffer=[0u8;65536];
+    loop {let count=file.read(&mut buffer).context(unreadable)?;if count==0{break;}
+        bytes+=count as u64;ensure!(bytes<=metadata.len(),"{changed}");digest.update(&buffer[..count]);}
+    ensure!(bytes==metadata.len() && identity(&file.metadata().context(unreadable)?)==key,"{changed}");
+    let digest=format!("{:x}",digest.finalize());
+    let mut cache=cache.lock().map_err(|_|anyhow::anyhow!("provider-digest-cache-unavailable"))?;
+    if cache.len()>=64 {cache.clear();}
+    cache.insert(key,digest.clone());
     Ok(digest)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_digest_cache_invalidates_in_place_edits_and_permission_changes() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("synthetic-provider");
+        for bytes in [b"first-executable",b"other-executable"] {
+            std::fs::write(&path,bytes).unwrap();std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let expected=format!("{:x}",Sha256::digest(bytes));
+            for _ in 0..2 {assert_eq!(provider_runtime_at(root.path(),"claude",&path).unwrap(),expected);}
+        }
+        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o722)).unwrap();
+        assert!(provider_runtime_at(root.path(),"claude",&path).is_err());
+    }
     use sha2::{Digest,Sha256};
     #[test]
     fn codex_runtime_must_match_the_current_executable_and_manifested_companion() {

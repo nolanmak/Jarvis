@@ -349,7 +349,7 @@ fn readiness_never_treats_the_callers_profile_as_deployed_service_configuration(
     assert_eq!(output.status.code(),Some(3));
     let report:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["deployment"]["matches"],false);
-    assert_eq!(report["deployment"]["status"],if cfg!(target_os="linux") {"selection-missing"} else {"platform-unverified"});
+    assert_eq!(report["deployment"]["status"],"deployment-repository-unavailable");
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),0);
 }
 
@@ -436,4 +436,27 @@ fn queued_worker_failure_survives_restart_and_status_never_claims_worker_livenes
         assert!(body["head"].is_null());
         assert_eq!(std::fs::read(&path).unwrap(),before);
     }
+}
+
+#[cfg(target_os="linux")]
+#[test]
+fn readiness_from_a_subdirectory_inspects_the_repository_deployment_without_writes() {
+    let root=tempfile::tempdir().unwrap();
+    assert!(Command::new("git").args(["init","-q"]).current_dir(root.path()).status().unwrap().success());
+    let nested=root.path().join("src/nested");std::fs::create_dir_all(&nested).unwrap();
+    let binary=root.path().join("target/release/augmentagent");std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::copy("/usr/bin/true",&binary).unwrap();std::fs::set_permissions(&binary,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config=root.path().join("config/augmentagent");std::fs::create_dir_all(&config).unwrap();
+    let policy=root.path().join("policy.json");std::fs::write(&policy,r#"{"version":1,"providers":{"claude":{}}}"#).unwrap();
+    std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+    let selection=config.join("autoship-native.env");std::fs::write(&selection,format!("AUGMENTAGENT_NATIVE_VM_POLICY=\"{}\"\n",policy.display())).unwrap();
+    std::fs::set_permissions(&selection,std::fs::Permissions::from_mode(0o600)).unwrap();
+    let output=Command::new(env!("CARGO_BIN_EXE_augmentagent")).current_dir(&nested)
+        .env_clear().env("PATH","/usr/bin:/bin").env("HOME",root.path())
+        .env("XDG_CONFIG_HOME",root.path().join("config")).env("XDG_STATE_HOME",root.path().join("state"))
+        .args(["autopr","readiness","--json"]).output().unwrap();
+    assert_eq!(output.status.code(),Some(3),"{}",String::from_utf8_lossy(&output.stderr));
+    let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["deployment"]["expected_executable_sha256"],format!("{:x}",Sha256::digest(std::fs::read(&binary).unwrap())));
+    assert!(!root.path().join("state").exists());
 }

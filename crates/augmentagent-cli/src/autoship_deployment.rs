@@ -66,7 +66,7 @@ pub struct Report {
     pub selected_policy_sha256: Option<String>,
 }
 impl Report {
-    fn unavailable(status: &str) -> Self {
+    pub(crate) fn unavailable(status: &str) -> Self {
         Self {
             status: status.into(),
             matches: false,

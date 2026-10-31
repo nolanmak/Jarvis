@@ -184,13 +184,25 @@ continue to resolve. Runtime upgrades require a newly staged manifest and an
 atomic policy update pointing to it; retain the prior runtime until old native
 runs have drained. Do not copy a host home directory into a runtime image.
 
-Select the native profile with an environment-only drop-in on the existing
-daemon unit, preserving its `ExecStart` and existing drop-ins:
+Select the reviewed native profile through the managed installer from the deployed
+checkout. It writes the shared final environment file for both services and
+preserves their launch commands:
 
-```ini
-[Service]
-Environment=AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/private/policy.json
+```sh
+AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/private/policy.json \
+  bash scripts/ensure-autopr-worker.sh
 ```
+
+The installer validates all settings before replacing managed files and rolls
+back the prior selection and units if installation or manager reload fails.
+An `Environment=` drop-in cannot override this shared `EnvironmentFile=`.
+The normal updater detects a changed selection or policy digest even when Git
+and the build stamp are current. It activates the daemon through its usual
+in-flight-work, memory, restart-budget and executable checks. The independent
+worker notices selection and policy changes and reloads after its current
+builder tick and reconciliation sweep finish. Activation remains pending when
+a guard refuses; a later updater tick retries. Confirm both process-bound
+policy digests with `autopr readiness --json` after they have drained.
 
 This selects a profile only; it does **not** enroll run resources. A service
 with `Delegate=no` or no `DelegateSubgroup=daemon` cannot admit required
@@ -212,8 +224,8 @@ provisioning helper itself is read directly from the updated checkout. A missing
 profile keeps required Autoship native calls closed while unrelated interactive
 calls and ordinary updater operation retain their existing behavior.
 
-No installer in this patch writes that drop-in, expands gateway grants or
-refreshes the original authentication file automatically. All profile paths are
+The managed selection does not expand gateway grants or refresh the original
+authentication file automatically. All profile paths are
 controller inputs. This document describes the reviewed rollout artifact, not
 an assertion that production has been configured or authenticated acceptance
 has passed.

@@ -3116,7 +3116,12 @@ async fn main() -> Result<()> {
         std::process::exit(autoship_commands::run_command::run(args).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Readiness { json } } = cli.cmd {
-        std::process::exit(autoship_commands::run_readiness(json).await);
+        let root=match tokio::process::Command::new("git").args(["rev-parse","--show-toplevel"]).output().await {
+            Ok(output) if output.status.success()=>String::from_utf8(output.stdout).ok()
+                .map(|root|PathBuf::from(root.trim())).filter(|root|root.is_absolute()),
+            _=>None,
+        };
+        std::process::exit(autoship_commands::run_readiness(root.as_deref(),json).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Status { ref workflow, json } } = cli.cmd {
         std::process::exit(autoship_commands::run_status(workflow, json));
@@ -3534,11 +3539,15 @@ async fn main() -> Result<()> {
             no_email,
         } => {
             let external_autopr = autoship_worker::external_enabled();
-            if let Err(error) = autoship_deployment::record("daemon", dry_run, external_autopr).await {
-                warn!(%error, "could not publish effective autoship configuration; deployment remains unverified");
-            }
-            if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
-                warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+            match autoship_deployment::record("daemon", dry_run, external_autopr).await {
+                Ok(()) => {
+                    // A second serve must preserve both live configuration
+                    // evidence and the updater's matching isolation receipt.
+                    if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                        warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+                    }
+                }
+                Err(error) => warn!(%error, "could not publish effective autoship configuration; preserving existing host evidence"),
             }
             // #1287 — a Discord configuration error must not stop the
             // surfaces that are configured (Slack alone, for one): report it

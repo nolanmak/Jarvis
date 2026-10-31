@@ -440,10 +440,16 @@ fn cli_rejects_stale_or_contradictory_proof_without_writing_state() {
 
 #[test]
 fn cli_settles_same_head_external_merge_only_with_immutable_private_protocol_proof() {
-    for scenario in ["valid","partial","accepted_external","own_marker","legacy","wrong_commit","active","wrong_digest"] {
+    for scenario in ["valid","partial","accepted_autonomous","no_echo","other_echo","own_marker","legacy","wrong_commit","active","wrong_digest"] {
         let response = match scenario {
             "partial"|"wrong_digest" => Some(json!({"data":null,"errors":[{"message":"timeout"}]})),
-            "accepted_external" => Some(accepted()),
+            "accepted_autonomous" => Some(accepted()),
+            "no_echo"|"other_echo" => {
+                let mut response=accepted();
+                response["data"]["mergePullRequest"].as_object_mut().unwrap().remove("clientMutationId");
+                if scenario=="other_echo" {response["data"]["mergePullRequest"]["clientMutationId"]="another-operation".into();}
+                Some(response)
+            },
             _ => None,
         };
         let dir = fixture(response,true,&"a".repeat(40)); let root=dir.path();
@@ -461,7 +467,7 @@ fn cli_settles_same_head_external_merge_only_with_immutable_private_protocol_pro
             v["response_sha256"]="0".repeat(64).into(); std::fs::write(path,v.to_string()).unwrap();
         }
         let before=Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap());
-        if !matches!(scenario,"valid"|"partial"|"accepted_external") {
+        if !matches!(scenario,"valid"|"partial"|"no_echo"|"other_echo") {
             assert_code(&invoke(root,"manual"),3);
             assert_eq!(Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap()),before,"{scenario}");
         } else {

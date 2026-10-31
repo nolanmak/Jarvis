@@ -25,6 +25,7 @@ class InstallTests(unittest.TestCase):
             stub = binary / 'systemctl'
             stub.write_text('''#!/usr/bin/env python3
 import os,sys
+if os.environ.get('FAIL_MANAGER') in sys.argv:sys.exit(1)
 with open(os.environ['CALLS'],'a') as f:f.write(' '.join(sys.argv[1:])+'\\n')
 if 'show' in sys.argv:
  key=sys.argv[sys.argv.index('-p')+1]
@@ -90,6 +91,16 @@ if 'show' in sys.argv:
             self.assertIn(shared,(units/'augmentagent-autopr.service').read_text())
             self.assertIn(shared,dropin.read_text())
             prior=selection.read_bytes()
+            alternate=base/'alternate.json'
+            alternate.write_bytes(policy.read_bytes());alternate.chmod(0o600)
+            watched=[selection,units/'augmentagent-autopr.service',units/'augmentagent-runtime.slice',dropin]
+            before_failed={p:p.read_bytes() for p in watched}
+            for failure in ({'AUGMENTAGENT_AUTOSTART_DRY_RUN':'invalid'},
+                            {'AUGMENTAGENT_UNIT_MEMORY_MAX':'invalid'},
+                            {'FAIL_MANAGER':'daemon-reload'},{'FAIL_MANAGER':'enable'}):
+                rejected=subprocess.run(command,env=dict(env,AUGMENTAGENT_NATIVE_VM_POLICY=str(alternate),**failure),capture_output=True,text=True)
+                self.assertNotEqual(rejected.returncode,0)
+                self.assertEqual(before_failed,{p:p.read_bytes() for p in watched},'failed install must restore every managed file')
             subprocess.run(command,env=env,check=True)
             self.assertEqual(selection.read_bytes(),prior)
             self.assertEqual(hashlib.sha256(policy.read_bytes()).hexdigest(),original,'installer must not enlarge credential grants')

@@ -330,6 +330,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorized_resume_refuses_remote_advance_and_preserves_local_head_mismatch() {
+        let root=repo();let branch="agent-fix/issue-19";
+        let original=git(root.path(),&["rev-parse","HEAD"]);
+        git(root.path(),&["branch",branch]);git(root.path(),&["remote","add","origin",root.path().to_str().unwrap()]);
+        std::fs::write(root.path().join("code"),"remote advanced").unwrap();
+        git(root.path(),&["add","code"]);git(root.path(),&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","advance"]);
+        let advanced=git(root.path(),&["rev-parse","HEAD"]);git(root.path(),&["branch","-f",branch,&advanced]);
+        assert!(workflow::prepare_resume_worktree_at_head(root.path(),19,branch,Some(&original)).await.is_err());
+        assert!(!root.path().join(".self-improve-worktrees/resume-pr-19").exists());
+        let candidate=workflow::prepare_resume_worktree_at_head(root.path(),19,branch,Some(&advanced)).await.unwrap();
+        assert_eq!(git(&candidate,&["rev-parse","HEAD"]),advanced);
+        std::fs::write(candidate.join("code"),"unpublished candidate work").unwrap();
+        git(&candidate,&["add","code"]);git(&candidate,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","local"]);
+        let head=git(&candidate,&["rev-parse","HEAD"]);
+        assert!(workflow::prepare_resume_worktree_at_head(root.path(),19,branch,Some(&advanced)).await.is_err());
+        assert_eq!(git(&candidate,&["rev-parse","HEAD"]),head);
+        assert_eq!(std::fs::read_to_string(candidate.join("code")).unwrap(),"unpublished candidate work");
+    }
+
+    #[tokio::test]
     async fn dirty_owner_and_resumed_candidate_keep_their_bytes_and_index() {
         let root = repo();
         git(root.path(), &["branch", "agent-fix/issue-10"]);

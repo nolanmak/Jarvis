@@ -313,7 +313,7 @@ pub(super) async fn execute_pr(
     }
     let builder = workflow_builder(repo, Target::Pr(pr.pr)).await?;
     if let Some(issue) = pr.source_issue {
-        resume_draft_pr(repo, &builder, pr.pr, issue, &pr.branch, dry_run).await
+        resume_draft_pr(repo, &builder, pr.pr, issue, &pr.branch, dry_run, Some(&pr.head)).await
     } else {
         adopted_execution::resume(repo, &builder, pr, dry_run).await
     }

@@ -1764,7 +1764,9 @@ mod tests {
 }
 
 fn deployment_finding(report: &crate::autoship_deployment::Report) -> Option<Finding> {
-    if !report.expected_active || (report.matches && report.status == "configuration-matched") {
+    let inspection_failed=matches!(report.status.as_str(),"state-directory-unavailable"|
+        "deployment-inspection-timeout"|"deployment-inspection-unavailable"|"deployment-report-invalid");
+    if (!report.expected_active && !inspection_failed) || (report.matches && report.status == "configuration-matched") {
         return None;
     }
     let services = ["daemon", "worker"].into_iter().filter_map(|role| {
@@ -1790,6 +1792,11 @@ mod deployment_tests {
         assert_eq!(finding.code,"autoship-deployment-unverified");
         assert!(finding.detail.contains("worker: policy-not-selected"));
         report.expected_active=false;assert!(super::deployment_finding(&report).is_none());
+        for status in ["state-directory-unavailable","deployment-inspection-timeout","deployment-inspection-unavailable","deployment-report-invalid"] {
+            report.status=status.into();
+            assert!(super::deployment_finding(&report).is_some(),"inspection failure {status} must be visible");
+        }
+        report.status="platform-unverified".into();assert!(super::deployment_finding(&report).is_none());
         report.expected_active=true;report.matches=true;report.status="configuration-matched".into();
         assert!(super::deployment_finding(&report).is_none());
     }

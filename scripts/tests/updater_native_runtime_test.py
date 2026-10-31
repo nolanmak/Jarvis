@@ -5,9 +5,11 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
 
 ROOT=Path(__file__).resolve().parents[2]
 
+@unittest.skipUnless(sys.platform == "linux" and Path("/usr/bin/python3").is_file(),"Linux updater with system Python")
 class UpdaterRuntimeTests(unittest.TestCase):
     def test_reconciliation_runs_even_when_git_and_build_stamp_are_current(self):
         with tempfile.TemporaryDirectory() as directory:

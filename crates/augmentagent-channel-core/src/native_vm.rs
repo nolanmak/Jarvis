@@ -44,11 +44,13 @@ pub mod readiness;
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
 pub fn declared_native_auth(provider:&str)->Result<bool> {
-    Ok(readiness::credentials(provider).permits_attempt())
+    declared_auth(readiness::credentials(provider))
 }
 #[cfg(test)]
 fn native_auth_at(path:&Path,provider:&str,environment:impl Fn(&str)->Option<String>)->Result<bool> {
-    let report=readiness::credentials_at(Some(path),provider,chrono::Utc::now().timestamp_millis(),environment);
+    declared_auth(readiness::credentials_at(Some(path),provider,chrono::Utc::now().timestamp_millis(),environment))
+}
+fn declared_auth(report:readiness::CredentialReport)->Result<bool> {
     ensure!(!matches!(report.status,readiness::CredentialStatus::PolicyInvalid|readiness::CredentialStatus::CredentialInvalid),"invalid private credential declaration");
     Ok(report.permits_attempt())
 }

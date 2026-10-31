@@ -4862,7 +4862,8 @@ async fn baseline_failures(
     let worktree = workspace::candidate_parent(repo_root).await?
         .join(format!("{lane}-baseline"));
     let branch = format!("agent-baseline/{lane}");
-    reclaim_worktree(repo_root, &worktree, &branch).await?;
+    reclaim_worktree(repo_root, &worktree, &branch).await
+        .with_context(||format!("baseline checkout preserved at {}",worktree.display()))?;
     let (ok, _o, e) = run(
         "git",
         &[
@@ -4887,7 +4888,9 @@ async fn baseline_failures(
     let filters = tests.join(" ");
     info!(%pkg_args, %filters, "baseline check: cargo test on origin/main (sandboxed env)");
     let result = shared_ci::baseline(&worktree, pkgs, tests, audit).await;
-    reclaim_worktree(repo_root, &worktree, &branch).await?;
+    if let Err(error)=reclaim_worktree(repo_root, &worktree, &branch).await {
+        warn!(path=%worktree.display(),"baseline cleanup failed; preserving gate result and checkout: {error:#}");
+    }
     let (_ok, out, err) = result?;
     let text = format!("{out}{err}");
     if text.contains("could not compile") || text.contains("error: package ID specification") {
@@ -5026,7 +5029,8 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
     let worktree = workspace::candidate_parent(repo_root).await?
         .join(format!("{lane}-baseline"));
     let branch = format!("agent-baseline/{lane}");
-    reclaim_worktree(repo_root, &worktree, &branch).await?;
+    reclaim_worktree(repo_root, &worktree, &branch).await
+        .with_context(||format!("baseline checkout preserved at {}",worktree.display()))?;
     let (ok, _o, e) = run(
         "git",
         &[
@@ -5043,7 +5047,9 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
         bail!("baseline: worktree add from origin/main failed: {e}");
     }
     let verdict = verification_gate(&worktree, &standalone_resource_audit(&worktree)?).await;
-    reclaim_worktree(repo_root, &worktree, &branch).await?;
+    if let Err(error)=reclaim_worktree(repo_root, &worktree, &branch).await {
+        warn!(path=%worktree.display(),"baseline cleanup failed; preserving gate verdict and checkout: {error:#}");
+    }
     Ok(verdict)
 }
 
@@ -6334,6 +6340,7 @@ async fn resume_draft_pr(
     issue_no: u64,
     branch: &str,
     dry_run: bool,
+    expected_head: Option<&str>,
 ) -> Result<RunReport> {
     let gh = gh_bin();
     note_current_issue(issue_no);
@@ -6479,7 +6486,7 @@ async fn resume_draft_pr(
         return Ok(RunReport::held(format!("PR #{pr}: another worker owns its worktree")));
     };
     let repository = workflow::canonical_repository(repo_root).await?;
-    let worktree = workflow::prepare_resume_worktree(repo_root, pr, branch).await?;
+    let worktree = workflow::prepare_resume_worktree_at_head(repo_root, pr, branch, expected_head).await?;
     let contract = format!("{}\n{}\n{}", issue.title, issue.body, pr_body);
     let (toolchain_ok, toolchain, _) = run("rustc", &["--version", "--verbose"], &worktree).await?;
     anyhow::ensure!(toolchain_ok, "cannot identify verifier toolchain");
@@ -7665,6 +7672,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                                 issue_no,
                                 &resume_branch,
                                 dry_run,
+                                None,
                             )
                             .await;
                         }
@@ -7711,7 +7719,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() && !prefer_build {
         if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
             let reasoner = workflow_builder(repo_root, crate::autoship_workflow::submission::Target::Pr(pr)).await?;
-            return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
+            return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run, None)
                 .await
                 .map(|mut r| {
                     r.resumed = true;
@@ -7747,6 +7755,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
                             issue_no,
                             &resume_branch,
                             dry_run,
+                            None,
                         )
                         .await
                         .map(|mut r| {
@@ -14588,7 +14597,7 @@ CODEX-REVIEW: lgtm").0);
         // Simulate a run killed mid-flight: the directory survives with no
         // `.git/worktrees` registration at all, so `git worktree remove`
         // cannot clear it.
-        let worktree = repo.join(".self-improve-worktrees").join("current");
+        let worktree = workspace::candidate_parent(repo).await.unwrap().join("current-baseline");
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join("half-written.rs"), "fn main() {}\n").unwrap();
         let add = |args: &[&str]| {
@@ -14599,14 +14608,14 @@ CODEX-REVIEW: lgtm").0);
                 .expect("git")
         };
         assert!(
-            !add(&["worktree", "add", "-b", "agent-fix/issue-1",
+            !add(&["worktree", "add", "-b", "agent-baseline/current",
                    &worktree.to_string_lossy(), "main"])
                 .status
                 .success(),
             "precondition: worktree add refuses the existing path"
         );
 
-        assert!(reclaim_worktree(repo, &worktree, "agent-fix/issue-1").await.is_err());
+        assert!(reclaim_worktree(repo, &worktree, "agent-baseline/current").await.is_err());
         assert!(worktree.exists(), "unregistered data must be preserved");
         assert_eq!(std::fs::read_to_string(worktree.join("half-written.rs")).unwrap(), "fn main() {}\n");
     }
@@ -19260,7 +19269,7 @@ else:
 
         // Dry run: the same decision, nothing written anywhere.
         let dry_reasoner = build_reasoner();
-        let dry = resume_draft_pr(&repo, &dry_reasoner, 71000, 70994, &branch, true).await.unwrap();
+        let dry = resume_draft_pr(&repo, &dry_reasoner, 71000, 70994, &branch, true, None).await.unwrap();
         assert!(!dry.billed && dry.is_idle(), "held and unbilled: {}", dry.message);
         assert!(dry.message.contains("DRY RUN") && dry.message.contains("provenance unknown"), "{}", dry.message);
         assert!(
@@ -19273,7 +19282,7 @@ else:
 
         // The real tick.
         let reasoner = build_reasoner();
-        let report = resume_draft_pr(&repo, &reasoner, 71000, 70994, &branch, false).await.unwrap();
+        let report = resume_draft_pr(&repo, &reasoner, 71000, 70994, &branch, false, None).await.unwrap();
         assert!(!report.billed, "C1: no daily-cap run: {}", report.message);
         assert!(
             !report.is_idle(),
@@ -19394,7 +19403,7 @@ else:
         let state = root.join("unreviewable.json");
         for (pr, issue, branch) in [(71005u64, 70998u64, &corrupt), (71006, 70999, &exposed)] {
             let reasoner = build_reasoner();
-            let report = resume_draft_pr(&repo, &reasoner, pr, issue, branch, false)
+            let report = resume_draft_pr(&repo, &reasoner, pr, issue, branch, false, None)
                 .await
                 .unwrap_or_else(|e| panic!("an unreadable record must hold, not fail the tick: {e:#}"));
             assert!(!report.billed && report.is_idle(), "{}", report.message);

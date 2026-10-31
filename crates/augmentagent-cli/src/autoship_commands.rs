@@ -222,11 +222,14 @@ pub fn run_status(workflow: &str, json_output: bool) -> i32 {
 
 /// Credential declaration evidence is deliberately separate from role/runtime
 /// readiness. The latter requires controller-bound acceptance evidence.
-pub async fn run_readiness(json_output:bool) -> i32 {
+pub async fn run_readiness(repo:Option<&Path>,json_output:bool) -> i32 {
     let claude=augmentagent_channel_core::native_vm::readiness::credentials("claude");
     let codex=augmentagent_channel_core::native_vm::readiness::credentials("codex");
     let runtime=augmentagent_channel_core::native_vm::readiness::runtime::inspect();
-    let deployment=crate::autoship_deployment::inspect(&std::env::current_dir().unwrap_or_default()).await;
+    let deployment=match repo {
+        Some(repo)=>crate::autoship_deployment::inspect(repo).await,
+        None=>crate::autoship_deployment::Report::unavailable("deployment-repository-unavailable"),
+    };
     let mut unverified=vec!["live-guarded-probe"];
     if !deployment.matches { unverified.push("deployed-policy-equality"); }
     let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified","runtime":runtime,
