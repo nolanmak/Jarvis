@@ -425,7 +425,7 @@ mod tests {
                 async fn verify_owner_dm(&self,_:&gateway::Context)->Result<bool> {Ok(true)}
                 async fn send(&self,_:&gateway::Context,r:&gateway::Reply)->Result<u64> {
                     self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
-                    assert!(r.content.contains("Completion has not been observed") || r.content.contains("has not edited the PR"));
+                    assert!(r.content.contains("Completion has not been observed") || r.content.contains("has not edited the PR") || r.content.starts_with("Autoship"));
                     Ok(55)
                 }
             }
@@ -454,6 +454,37 @@ mod tests {
             assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),1);
             assert_eq!(gateway::drain_queued(&adapter,&wire,11,22).await.unwrap(),0);
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),3);
+            let control_context=|message|gateway::Context {message,..gateway_context.clone()};
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(100),"!autoship pause").await.unwrap());
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(100),"!autoship pause").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let paused=store.owner_control(&discord.admission.workflow).unwrap().unwrap();
+            assert!(paused.paused);assert_eq!(paused.revision,1);drop(store);
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),4);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(101),"!autoship resume").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let digest=|text:&str| {use sha2::{Digest,Sha256};format!("{:x}",Sha256::digest(text.as_bytes()))};
+            let origin=|message|crate::autoship_workflow::discord_ingress::DiscordOrigin {message,..context.origin.clone()};
+            assert_eq!(store.replay_discord_control(&origin(101),&digest("!autoship resume")).unwrap().unwrap().reason,"execution-readiness-blocked");
+            assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap(),paused);drop(store);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(102),"!autoship status").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            let status=store.replay_discord_control(&origin(102),&digest("!autoship status")).unwrap().unwrap();
+            assert!(status.reply.contains("owner-pause-requested"));assert!(status.reply.contains("Deployment: unknown"));drop(store);
+            let select=format!("!autoship use {}",discord.admission.workflow);
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(103),&select).await.unwrap());
+            scenario(serde_json::json!({"permission":"READ","pr":pr}));
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(104),"!autoship pause").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.replay_discord_control(&origin(104),&digest("!autoship pause")).unwrap().unwrap().reason,"target-authorization-failed");
+            assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap(),paused);drop(store);
+            scenario(serde_json::json!({"permission":"WRITE","pr":pr}));
+            // A permission recovery cannot turn the same refused message into a mutation.
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(104),"!autoship pause").await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap(),paused);
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),8);
+
             return;
         }
         let dir = tempfile::tempdir().unwrap();

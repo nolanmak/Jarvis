@@ -17,8 +17,16 @@ impl WorkflowStore {
     /// Resume additionally requires readiness admission at the public adapter.
     /// Compare-and-swap prevents a delayed resume from erasing a newer pause.
     pub fn set_owner_pause(&mut self,workflow:&str,principal:&str,expected_revision:i64,paused:bool,now:i64)->Result<OwnerControl> {
-        ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let control=apply_in_transaction(&tx,workflow,principal,expected_revision,paused,now)?;
+        tx.commit()?;Ok(control)
+    }
+
+    pub fn require_owner_dispatch(&self,workflow:&str)->Result<()> {require_dispatch(&self.conn,workflow)}
+}
+
+pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&str,expected_revision:i64,paused:bool,now:i64)->Result<OwnerControl> {
+        ensure!(!principal.is_empty() && principal.len()<=256 && principal.bytes().all(|b|b.is_ascii_graphic()),"invalid owner principal");
         let checkpoint:Option<String>=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[workflow],|r|r.get(0)).optional()?;
         let queued:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)",[workflow],|r|r.get(0))?;
         ensure!(checkpoint.is_some() || queued,"unknown workflow");
@@ -33,10 +41,7 @@ impl WorkflowStore {
         tx.execute("INSERT INTO workflow_owner_control VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workflow) DO UPDATE SET revision=excluded.revision,paused=excluded.paused,principal=excluded.principal,updated_at=excluded.updated_at",
             params![workflow,revision,paused,principal,now])?;
         tx.execute("INSERT INTO workflow_owner_control_event VALUES(?1,?2,?3,?4,?5)",params![workflow,revision,paused,principal,now])?;
-        tx.commit()?;Ok(control)
-    }
-
-    pub fn require_owner_dispatch(&self,workflow:&str)->Result<()> {require_dispatch(&self.conn,workflow)}
+        Ok(control)
 }
 
 pub(super) fn read(conn:&Connection,workflow:&str)->Result<Option<OwnerControl>> {

@@ -11,7 +11,7 @@ pub struct DiscordOrigin {
     pub message: u64,
 }
 impl DiscordOrigin {
-    fn validate(&self)->Result<()> {
+    pub(super) fn validate(&self)->Result<()> {
         ensure!([self.bot,self.owner,self.channel,self.message].iter().all(|id|*id>0),"Discord identity missing");
         Ok(())
     }
@@ -25,12 +25,30 @@ pub struct DiscordAdmission {
     pub reply:String,
     pub nonce:String,
 }
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+pub struct DiscordReply {pub request_id:String,pub reply:String,pub nonce:String}
+
+// Table names come exclusively from this fixed list, never from message text.
+fn ack_table(conn:&Connection,id:&str)->Result<Option<&'static str>> {
+    let mut found=None;
+    for table in ["discord_command_ingress","discord_control_request"] {
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[table],|r|r.get(0))?;
+        if exists && conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE request_id=?1)"),[id],|r|r.get::<_,bool>(0))? {
+            ensure!(found.is_none(),"Discord request identity collision");found=Some(table);
+        }
+    }
+    Ok(found)
+}
 impl WorkflowStore {
     pub fn queued_discord_acks(&self,bot:u64,owner:u64)->Result<Vec<DiscordOrigin>> {
         ensure!(bot>0 && owner>0,"Discord recovery identity missing");
         let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_command_ingress')",[],|r|r.get(0))?;
         if !exists {return Ok(Vec::new());}
-        let mut statement=self.conn.prepare("SELECT i.origin FROM discord_command_ingress i JOIN command_request r ON r.request_id=i.request_id WHERE i.state='queued' AND r.principal=?1 ORDER BY i.created_at,i.request_id LIMIT 128")?;
+        let controls:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_control_request')",[],|r|r.get(0))?;
+        let base="SELECT i.origin,i.created_at,i.request_id FROM discord_command_ingress i JOIN command_request r ON r.request_id=i.request_id WHERE i.state='queued' AND r.principal=?1";
+        let query=if controls {format!("SELECT origin FROM ({base} UNION ALL SELECT origin,created_at,request_id FROM discord_control_request WHERE state='queued' AND principal=?1) ORDER BY created_at,request_id LIMIT 128")}
+            else {format!("SELECT origin FROM ({base}) ORDER BY created_at,request_id LIMIT 128")};
+        let mut statement=self.conn.prepare(&query)?;
         let rows=statement.query_map([format!("discord:{bot}:{owner}")],|r|r.get::<_,String>(0))?;
         rows.map(|row| {
             let origin:DiscordOrigin=serde_json::from_str(&row?)?;
@@ -46,6 +64,7 @@ impl WorkflowStore {
         let request_id=origin.request_id();let principal=origin.principal();
         let encoded_origin=serde_json::to_string(origin)?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(ack_table(&tx,&request_id)?!=Some("discord_control_request"),"Discord message already belongs to control");
         let admission=super::submission::submit_in_transaction(&tx,&request_id,&principal,request,now)?;
         let prior:Option<(String,String,String)>=tx.query_row(
             "SELECT origin,message_sha256,response FROM discord_command_ingress WHERE request_id=?1",[&request_id],
@@ -73,31 +92,21 @@ impl WorkflowStore {
     /// Multiple workflows require an explicit selector; arrival order never
     /// silently changes which candidate an owner's follow-up would edit.
     pub fn discord_workflow(&self,origin:&DiscordOrigin,explicit:Option<&str>)->Result<Option<String>> {
-        origin.validate()?;
-        let exists:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_workflow_binding')",[],|r|r.get(0))?;
-        if !exists {ensure!(explicit.is_none(),"workflow is not bound to this Discord conversation");return Ok(None);}
-        let mut statement=self.conn.prepare("SELECT workflow FROM discord_workflow_binding WHERE bot=?1 AND owner=?2 AND channel=?3 ORDER BY workflow")?;
-        let rows=statement.query_map(params![origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string()],|r|r.get::<_,String>(0))?;
-        let workflows=rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        if let Some(id)=explicit {
-            ensure!(workflows.iter().any(|bound|bound==id),"workflow is not bound to this Discord conversation");
-            return Ok(Some(id.into()));
-        }
-        ensure!(workflows.len()<=1,"workflow-selection-required");
-        Ok(workflows.into_iter().next())
+        bound_workflow(&self.conn,origin,explicit)
     }
 
     /// Persist uncertainty BEFORE the remote send. A process death can never
     /// turn an attempted send back into safely queued work or authorize replay.
-    pub fn claim_discord_ack(&mut self,origin:&DiscordOrigin,now:i64)->Result<Option<DiscordAdmission>> {
+    pub fn claim_discord_ack(&mut self,origin:&DiscordOrigin,now:i64)->Result<Option<DiscordReply>> {
         origin.validate()?;
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let prior:Option<(String,String,String)>=tx.query_row("SELECT origin,response,state FROM discord_command_ingress WHERE request_id=?1",
+        let Some(table)=ack_table(&tx,&origin.request_id())? else {return Ok(None);};
+        let prior:Option<(String,String,String)>=tx.query_row(&format!("SELECT origin,response,state FROM {table} WHERE request_id=?1"),
             [origin.request_id()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let Some((recorded,response,state))=prior else {return Ok(None);};
         ensure!(recorded==serde_json::to_string(origin)?,"Discord acknowledgement origin changed");
         if state!="queued" {return Ok(None);}
-        tx.execute("UPDATE discord_command_ingress SET state='uncertain',dispatched_at=?2 WHERE request_id=?1",params![origin.request_id(),now])?;
+        tx.execute(&format!("UPDATE {table} SET state='uncertain',dispatched_at=?2 WHERE request_id=?1"),params![origin.request_id(),now])?;
         let response=serde_json::from_str(&response)?;
         tx.commit()?;
         Ok(Some(response))
@@ -108,16 +117,38 @@ impl WorkflowStore {
     pub fn confirm_discord_ack(&mut self,origin:&DiscordOrigin,message:u64,now:i64)->Result<()> {
         origin.validate()?;ensure!(message>0,"Discord remote message missing");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let table=ack_table(&tx,&origin.request_id())?.context("Discord acknowledgement missing")?;
         let (recorded,state,remote):(String,String,Option<String>)=tx.query_row(
-            "SELECT origin,state,remote_message FROM discord_command_ingress WHERE request_id=?1",[origin.request_id()],
+            &format!("SELECT origin,state,remote_message FROM {table} WHERE request_id=?1"),[origin.request_id()],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         ensure!(recorded==serde_json::to_string(origin)?,"Discord acknowledgement origin changed");
         if state=="confirmed" {ensure!(remote.as_deref()==Some(message.to_string().as_str()),"Discord acknowledgement receipt conflict");return Ok(());}
         ensure!(state=="uncertain","Discord acknowledgement was never dispatched");
-        tx.execute("UPDATE discord_command_ingress SET state='confirmed',remote_message=?2,confirmed_at=?3 WHERE request_id=?1",
+        tx.execute(&format!("UPDATE {table} SET state='confirmed',remote_message=?2,confirmed_at=?3 WHERE request_id=?1"),
             params![origin.request_id(),message.to_string(),now])?;
         tx.commit()?;Ok(())
     }
+}
+
+pub(super) fn bound_workflow(conn:&Connection,origin:&DiscordOrigin,explicit:Option<&str>)->Result<Option<String>> {
+        origin.validate()?;
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_workflow_binding')",[],|r|r.get(0))?;
+        if !exists {ensure!(explicit.is_none(),"workflow is not bound to this Discord conversation");return Ok(None);}
+        let mut statement=conn.prepare("SELECT workflow FROM discord_workflow_binding WHERE bot=?1 AND owner=?2 AND channel=?3 ORDER BY workflow")?;
+        let rows=statement.query_map(params![origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string()],|r|r.get::<_,String>(0))?;
+        let workflows=rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if let Some(id)=explicit {
+            ensure!(workflows.iter().any(|bound|bound==id),"workflow is not bound to this Discord conversation");
+            return Ok(Some(id.into()));
+        }
+        let selection_exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_workflow_selection')",[],|r|r.get(0))?;
+        if selection_exists {
+            let selected:Option<String>=conn.query_row("SELECT workflow FROM discord_workflow_selection WHERE bot=?1 AND owner=?2 AND channel=?3",
+                params![origin.bot.to_string(),origin.owner.to_string(),origin.channel.to_string()],|r|r.get(0)).optional()?;
+            if let Some(selected)=selected {ensure!(workflows.contains(&selected),"workflow-selection-stale");return Ok(Some(selected));}
+        }
+        ensure!(workflows.len()<=1,"workflow-selection-required");
+        Ok(workflows.into_iter().next())
 }
 
 #[cfg(test)]
@@ -187,7 +218,7 @@ mod tests {
         assert_eq!(store.queued_discord_acks(11,22).unwrap(),vec![origin()]);
         assert!(store.queued_discord_acks(11,23).unwrap().is_empty());
         assert!(store.queued_discord_acks(12,22).unwrap().is_empty());
-        assert_eq!(store.claim_discord_ack(&origin(),3).unwrap(),Some(replay));
+        assert_eq!(store.claim_discord_ack(&origin(),3).unwrap(),Some(serde_json::from_value(serde_json::to_value(replay).unwrap()).unwrap()));
         assert!(store.claim_discord_ack(&origin(),4).unwrap().is_none());
     }
 

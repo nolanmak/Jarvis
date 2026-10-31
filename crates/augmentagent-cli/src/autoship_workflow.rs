@@ -13,6 +13,8 @@ mod merge_allowance;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_discord_controls.rs"]
+pub(crate) mod discord_controls;
 #[path = "autoship_owner_control.rs"]
 pub(crate) mod owner_control;
 #[path = "autoship_submission.rs"]
@@ -292,6 +294,18 @@ impl WorkflowStore {
                 request_id TEXT PRIMARY KEY REFERENCES command_request(request_id), origin TEXT NOT NULL,
                 message_sha256 TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL,
                 created_at INTEGER NOT NULL, dispatched_at INTEGER, remote_message TEXT, confirmed_at INTEGER);
+            CREATE TABLE IF NOT EXISTS discord_control_request (
+                request_id TEXT PRIMARY KEY, principal TEXT NOT NULL, origin TEXT NOT NULL,
+                message_sha256 TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES command_job(workflow),
+                response TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+                dispatched_at INTEGER, remote_message TEXT, confirmed_at INTEGER);
+            CREATE TABLE IF NOT EXISTS discord_workflow_selection (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                workflow TEXT NOT NULL REFERENCES command_job(workflow), message TEXT NOT NULL,
+                PRIMARY KEY(bot,owner,channel));
+            CREATE TABLE IF NOT EXISTS discord_control_frontier (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES command_job(workflow),
+                message TEXT NOT NULL, PRIMARY KEY(bot,owner,workflow));
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);

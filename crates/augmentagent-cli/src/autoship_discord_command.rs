@@ -39,6 +39,59 @@ fn parse(text:&str)->Result<Request> {
     Request {repository:format!("{}/{}",parts[0],parts[1]),target:Target::Pr(parts[3].parse()?),provider,until:Milestone::Merged}.normalized()
 }
 
+use crate::autoship_workflow::discord_controls::{Action,PreparedControl};
+
+fn parse_control(text:&str)->Result<Option<(Action,Option<String>)>> {
+    ensure!(text.len()<=1024,"autoship-command-too-large");
+    let words:Vec<_>=text.split_whitespace().collect();
+    if words.first()!=Some(&"!autoship") {return Ok(None);}
+    let action=match words.get(1).copied() {
+        Some("status")=>Action::Status,Some("pause")=>Action::Pause,
+        Some("resume")=>Action::Resume,Some("use")=>Action::Use,_=>return Ok(None),
+    };
+    let workflow=if action==Action::Use {
+        ensure!(words.len()==3,"expected !autoship use ID");Some(words[2].to_string())
+    } else {
+        ensure!(words.len()==2 || (words.len()==4 && words[2]=="--workflow"),"expected !autoship status|pause|resume [--workflow ID]");
+        words.get(3).map(|id|id.to_string())
+    };
+    Ok(Some((action,workflow)))
+}
+
+async fn control(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,action:Action,explicit:Option<&str>)->Result<()> {
+    let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
+    let store=WorkflowStore::open_read_only(path)?.ok_or_else(||anyhow::anyhow!("workflow-not-found"))?;
+    // Replays resolve their immutable target before consulting today's selection.
+    let replay=store.replay_discord_control(origin,&digest)?;
+    let workflow=if let Some(reply)=&replay {
+        store.discord_workflow(origin,Some(&reply.workflow))?.unwrap()
+    } else {store.discord_workflow(origin,explicit)?.ok_or_else(||anyhow::anyhow!("workflow-not-found"))?};
+    let request=store.command_request(&workflow)?.ok_or_else(||anyhow::anyhow!("workflow-not-found"))?;
+    let revision=store.owner_control(&workflow)?.map_or(0,|c|c.revision);
+    drop(store);
+    let authorized=crate::self_improve::targeted::authorize_command(repo,&request).await;
+    if replay.is_some() {authorized?;return Ok(());}
+    let mut refusal=authorized.err().map(|_|"target-authorization-failed".to_string());
+    if refusal.is_none() && action==Action::Resume && crate::self_improve::targeted::command_readiness(repo,&request).await.is_err() {
+        refusal=Some("execution-readiness-blocked".into());
+    }
+    let status=if action==Action::Status && refusal.is_none() {
+        let (code,value)=crate::autoship_commands::status(path,&workflow,chrono::Utc::now().timestamp_millis(),0);
+        if code==2 || code==4 {refusal=Some("workflow-state-unavailable".into());None}
+        else {
+            // Only bounded shared status fields, never raw provider or auth errors.
+            let field=|key:&str|value[key].as_str().unwrap_or("unknown").chars().take(160).collect::<String>();
+            Some(format!("Autoship {workflow}: stage {}; reason {}; provider {}; PR {}. Merge: {}. Deployment: {}. Completion observed: {}.",
+                field("stage"),field("reason"),field("provider"),field("pr_url"),
+                value["merge"]["state"].as_str().unwrap_or("unknown"),value["deployment"]["state"].as_str().unwrap_or("unknown"),value["complete"]==true))
+        }
+    } else {None};
+    WorkflowStore::open(path)?.commit_discord_control(origin,&digest,&PreparedControl {
+        workflow,action,explicit:explicit.is_some(),revision,refusal,status,
+    },chrono::Utc::now().timestamp_millis())?;
+    Ok(())
+}
+
 pub(crate) async fn admit(repo:&Path,path:&Path,policy:OwnerPolicy,context:&Context,text:&str)->Result<DiscordAdmission> {
     authorize(policy,context)?;
     let request=parse(text)?;
@@ -81,8 +134,18 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
         ensure!(gateway_bound(path,context)?,"autoship conversation is not bound");
         return Ok(plain("This conversation is bound to Autoship. PR coding follow-ups are not connected yet; this message has not edited the PR. Track the workflow with `autopr status --workflow ID`."));
     }
+    match parse_control(text) {
+        Ok(Some((action,explicit)))=> {
+            if control(repo,path,&origin,text,action,explicit.as_deref()).await.is_err() {
+                return Ok(plain("Autoship control could not be recorded. Use `!autoship use ID` or `--workflow ID` to select a workflow bound to this DM; check current GitHub access and durable state from the CLI. No control change is confirmed."));
+            }
+            return gateway_claim_ack(path,context);
+        }
+        Err(_)=>return Ok(plain("Use `!autoship status|pause|resume [--workflow ID]` or `!autoship use ID`. Extra options are not supported.")),
+        Ok(None)=>{},
+    }
     if parse(text).is_err() {
-        return Ok(plain("Use `!autoship https://github.com/OWNER/REPO/pull/N [--provider codex|claude]` in your private DM. This queues or joins a workflow; it does not confirm a merge. Discord session controls and coding follow-ups are not connected yet."));
+        return Ok(plain("Use `!autoship https://github.com/OWNER/REPO/pull/N [--provider codex|claude]` in your private DM. This queues or joins a workflow; it does not confirm a merge. Use `!autoship status|pause|resume [--workflow ID]` or `!autoship use ID`. PR coding follow-ups are not connected yet."));
     }
     let policy=OwnerPolicy {bot:context.bot,owner:context.owner.unwrap_or(0)};
     let verified=Context {origin:origin.clone(),guild:context.guild,owner_dm_verified:true};
@@ -113,6 +176,13 @@ pub(crate) fn gateway_acknowledged(path:&Path,context:&GatewayContext,message:u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discord_control_grammar_requires_exact_selection_and_options() {
+        assert_eq!(parse_control("!autoship pause").unwrap(),Some((Action::Pause,None)));
+        assert_eq!(parse_control("!autoship use owner/repo#42").unwrap(),Some((Action::Use,Some("owner/repo#42".into()))));
+        assert_eq!(parse_control("!autoship resume --workflow owner/repo#42").unwrap(),Some((Action::Resume,Some("owner/repo#42".into()))));
+        for text in ["!autoship use","!autoship use a b","!autoship pause --until merged","!autoship resume --workflow", "!autoship status extra"] {assert!(parse_control(text).is_err());}
+    }
     #[test]
     fn discord_target_grammar_cannot_turn_prose_or_extra_flags_into_authority() {
         for text in ["!autoship https://github.com.evil.invalid/owner/repo/pull/42",

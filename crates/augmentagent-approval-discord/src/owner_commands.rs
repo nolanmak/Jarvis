@@ -69,8 +69,8 @@ pub const LIVE_VOICE_BLOCKER: &str = "Live voice needs the app to join a huddle 
 pub static OWNER_COMMANDS: &[OwnerCommand] = &[
     OwnerCommand {
         name: "autoship", aliases: &[],
-        usage: "autoship <GitHub PR URL> [--provider codex|claude]",
-        description: "Queue or join an Autoship workflow from the owner's private Discord DM. Acceptance does not confirm completion; coding follow-ups and session controls are not connected yet.",
+        usage: "autoship <GitHub PR URL> [--provider codex|claude] | status|pause|resume [--workflow ID] | use ID",
+        description: "Queue or join an Autoship workflow from the owner's private Discord DM. Inspect status, request pause/resume, or select a bound workflow. Acceptance does not confirm completion or teardown; PR coding follow-ups are not connected yet.",
         discord: &["!autoship"],
         slack: SlackMapping::Blocked { issue: 1713, reason: "Autoship admission currently requires the verified owner Discord DM; Slack workflow routing is not connected." },
         plain: PlainText::Sigil,
