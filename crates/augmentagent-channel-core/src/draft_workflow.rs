@@ -50,7 +50,23 @@ impl PreparedDraftContext {
         if !self.enabled {
             return Ok(true);
         }
-        store.attach_draft_context_receipt(&self.receipt_id, action_id)
+        if store.attach_draft_context_receipt(&self.receipt_id, action_id)? {
+            return Ok(true);
+        }
+        // A failed code-mode attempt may already own the original receipt.
+        // Repair/fallback gets a separate immutable receipt, preserving both
+        // attempts without moving evidence away from the earlier action.
+        let Some(message_id) = self
+            .seed
+            .audience
+            .get("trigger_message_id")
+            .and_then(Value::as_str)
+        else {
+            return Ok(false);
+        };
+        let copy =
+            store.save_draft_context_receipt(message_id, &receipt(&self.seed, &self.evidence))?;
+        store.attach_draft_context_receipt(&copy, action_id)
     }
 }
 

@@ -221,6 +221,20 @@ async fn workflow_receipt_omits_source_bodies_and_guards_material_gaps() {
     let receipt = store.draft_context_receipts(&action).unwrap().join("");
     assert!(!receipt.contains("SYNTHETIC_PRIVATE_MESSAGE_BODY"));
     assert!(receipt.contains("email archive is unavailable"));
+    let repair = store
+        .log_action(
+            &incoming.message_id,
+            incoming.thread_id.as_deref(),
+            &incoming.from,
+            &incoming.subject,
+            Some(&incoming.body),
+            Some("Repaired draft"),
+            augmentagent_store::ActionStatus::Pending,
+        )
+        .unwrap();
+    assert!(context.attach(&store, &repair).unwrap());
+    assert_eq!(store.draft_context_receipts(&action).unwrap().len(), 1);
+    assert_eq!(store.draft_context_receipts(&repair).unwrap().len(), 1);
 }
 
 #[test]
@@ -279,4 +293,148 @@ fn owner_requested_context_refreshes_turns_after_the_original_inbound() {
         "Already answered by hand"
     );
     assert_eq!(refreshed.audience["trigger_message_id"], "m00");
+}
+
+#[tokio::test]
+async fn retrieval_discovers_and_reads_project_wiki_before_citing_it() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let wiki = dir.path().join("wiki");
+    std::fs::create_dir_all(wiki.join("projects")).unwrap();
+    std::fs::write(
+        wiki.join("projects/cobalt.md"),
+        "Cobalt launch was moved to Friday.",
+    )
+    .unwrap();
+    let seed = load_seed(&store, &message(1), Some(&wiki)).unwrap();
+    let agent = script(vec![
+        json!({"action":"search_wiki","query":"cobalt","reason":"locate launch plan"}),
+        json!({"action":"read_wiki","path":"projects/cobalt.md","reason":"verify date"}),
+        json!({"action":"ready","facts":[{"text":"Launch is Friday","source_ids":["projects/cobalt.md"]}],"gaps":[]}),
+    ]);
+    let result = augmentagent_channel_core::draft_evidence::gather(
+        &store,
+        &agent,
+        &seed,
+        "draft launch reply",
+        Some(&wiki),
+    )
+    .await;
+    assert!(result.complete);
+    assert_eq!(result.reads[0].result["paths"][0], "projects/cobalt.md");
+    assert!(result.reads[1].result["text"]
+        .as_str()
+        .unwrap()
+        .contains("Friday"));
+}
+
+#[tokio::test]
+async fn revision_refreshes_history_and_preserves_all_owner_feedback() {
+    struct RevisionAgent;
+    #[async_trait::async_trait]
+    impl augmentagent_channel_core::Reasoner for RevisionAgent {
+        async fn call(
+            &self,
+            opts: &augmentagent_channel_core::ReasonerOpts,
+            prompt: &str,
+        ) -> anyhow::Result<String> {
+            assert!(prompt.contains("Keep it brief"));
+            assert!(prompt.contains("Use the updated plan"));
+            assert!(prompt.contains("newer confirmed plan"));
+            if opts.system_prompt.contains("You select evidence") {
+                Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into())
+            } else {
+                Ok("Friday works.".into())
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let original = message(1);
+    store.upsert_email_backfill(&original, 1).unwrap();
+    let mut newer = message(2);
+    newer.body = "newer confirmed plan: Friday".into();
+    store.upsert_email_backfill(&newer, 2).unwrap();
+    let action = store
+        .log_action(
+            &original.message_id,
+            original.thread_id.as_deref(),
+            &original.from,
+            &original.subject,
+            Some(&original.body),
+            Some("Thursday works"),
+            augmentagent_store::ActionStatus::Pending,
+        )
+        .unwrap();
+    store
+        .record_revision_triple(&action, "Thursday works", "Keep it brief", "Thursday")
+        .unwrap();
+    let draft = augmentagent_channel_core::draft_workflow::redraft(
+        &store,
+        &RevisionAgent,
+        &original,
+        &action,
+        "Thursday",
+        "Use the updated plan",
+        None,
+        "Write a reply",
+    )
+    .await
+    .unwrap();
+    assert_eq!(draft, "Friday works.");
+    assert_eq!(store.draft_context_receipts(&action).unwrap().len(), 1);
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn older_and_cross_platform_sources_can_be_paged_without_search_snippet_citations() {
+    use serde_json::json;
+    for platform in [
+        "imessage",
+        "gmail",
+        "whatsapp",
+        "slack",
+        "discord",
+        "linkedin",
+        "instagram",
+        "twitter",
+        "telegram",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        let mut source = message(0);
+        source.platform = platform.into();
+        source.body = format!(
+            "document {} https://example.invalid/final-plan",
+            "x".repeat(8_100)
+        );
+        store.upsert_email_backfill(&source, 1).unwrap();
+        for i in 1..15 {
+            store.upsert_email_backfill(&message(i), 1).unwrap();
+        }
+        augmentagent_messages::index::drain_batch(&store, 100).unwrap();
+        let seed = load_seed(&store, &message(15), None).unwrap();
+        assert!(!seed.messages.iter().any(|m| m.message_id == "m00"));
+        let agent = script(vec![
+            json!({"action":"search","query":format!("in:{platform} document"),"reason":"find older document"}),
+            json!({"action":"read_message","message_id":"m00","reason":"inspect source"}),
+            json!({"action":"read_message","message_id":"m00","offset":8000,"reason":"read omitted link"}),
+            json!({"action":"ready","facts":[{"text":"Document https://example.invalid/final-plan","source_ids":["m00"]}],"gaps":[]}),
+        ]);
+        let evidence = augmentagent_channel_core::draft_evidence::gather(
+            &store,
+            &agent,
+            &seed,
+            "send me the document we discussed",
+            None,
+        )
+        .await;
+        assert!(evidence.complete, "{platform}: {:?}", evidence.gaps);
+        assert_eq!(evidence.reads[1].result["next_offset"], 8000);
+        assert!(evidence.reads[2].result["text"]
+            .as_str()
+            .unwrap()
+            .contains("https://example.invalid/final-plan"));
+    }
 }

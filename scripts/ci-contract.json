@@ -590,7 +590,7 @@
       "shell": "bash"
     },
     "platform/platform/7": {
-      "body": "cargo test -p augmentagent-store --test owner_alerts --test imessage_outbox --test imessage_compose\ncargo test -p augmentagent-cli --test imessage_outbox_cli --test imessage_compose_cli\ncargo test -p augmentagent-cli --bin augmentagent imessage\ncargo test -p augmentagent-channel-imessage\n",
+      "body": "cargo test -p augmentagent-store --test owner_alerts --test imessage_outbox --test imessage_compose\ncargo test -p augmentagent-cli --test imessage_outbox_cli --test imessage_compose_cli\ncargo test -p augmentagent-cli --bin augmentagent imessage\ncargo test -p augmentagent-channel-imessage\ncargo test -p augmentagent-store --test conversation_context --test draft_context_receipts\ncargo test -p augmentagent-channel-core --test draft_context --test capability_inventory\ncargo test -p augmentagent-wiki search::tests\ncargo test -p augmentagent-cli --test draft_context_cli\n",
       "shell": "bash"
     },
     "platform/platform/8": {
