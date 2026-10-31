@@ -30,6 +30,7 @@ TESTS = {
     "adjudicator": "self_improve::native_acceptance::live_native_final_adjudicator_resolves_synthetic_contradiction",
     "writer": "self_improve::native_acceptance::live_native_writer_inventory_replay_1538",
     "file_edit": "self_improve::native_route_acceptance::live_native_guarded_file_edit",
+    "claude_file_edit": "self_improve::native_route_acceptance::live_native_guarded_claude_file_edit",
     "routed_transport": "self_improve::native_route_acceptance::live_native_operator_routed_transport",
 }
 
@@ -40,7 +41,7 @@ def reachable_build_memory(probe, declared_build_mb):
     # fixture observation runs in the controller's bounded command scope.
     # Routed transport uses the production configured constructor with no Bash.
     # Issue/adoption exercise builder and repair paths with guarded VM builds.
-    roles={'issue':'builder','adoption':'builder','writer':'reviewer','adjudicator':'reviewer','routed_transport':'reviewer','file_edit':'file_only'}
+    roles={'issue':'builder','adoption':'builder','writer':'reviewer','adjudicator':'reviewer','routed_transport':'reviewer','file_edit':'file_only','claude_file_edit':'file_only'}
     if set(roles)!=set(TESTS) or probe not in roles:
         raise ValueError('probe capabilities must be explicitly classified')
     if roles[probe] in ('reviewer','file_only'):
