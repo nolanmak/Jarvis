@@ -302,6 +302,7 @@ pub struct AuditLogger {
     path: PathBuf,
     model_call_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
+    dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
@@ -429,6 +430,18 @@ impl AuditLogger {
         Ok(())
     }
 
+    /// Workflow admission for both model and verification launches. This must
+    /// run again at the supervisor's final release, after asynchronous setup.
+    pub fn set_dispatch_observer(&self,observer:Arc<dyn Fn()->anyhow::Result<()>+Send+Sync>)->anyhow::Result<()> {
+        *self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?=Some(observer);
+        Ok(())
+    }
+    pub fn dispatch_allowed(&self)->anyhow::Result<()> {
+        let observer=self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?.clone();
+        if let Some(observer)=observer {observer()?;}
+        Ok(())
+    }
+
     pub fn set_model_call_observer(
         &self,
         observer: Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
@@ -473,6 +486,7 @@ impl AuditLogger {
         Self {
             path,
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
+            dispatch_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1713,
+    1712,
+    1709
+  ],
+  "status": "owner-request-bound-contract-metadata-activation-verified-not-native-consumption",
+  "parent_commit": "eda30a94c89df591407a9adf02a1de183ac8d392",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-owner-revision.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Registered owner revision cannot activate.",
+      "command": "CARGO_TARGET_DIR=/mnt/build/augmentagent-session-targets/jarvis-autoship-1598-09482344886d3206 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent owner_revision_rebinds_once"
+    },
+    "full_cli_green": {
+      "command": "CARGO_TARGET_DIR=/mnt/build/augmentagent-session-targets/jarvis-autoship-1598-09482344886d3206 scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent --test autoship_commands_cli --test autoship_submit_cli --test autoship_resolution_cli",
+      "log": "/tmp/autoship-1703-green-owner-revision-full.log",
+      "exit": 0,
+      "passed": 1495,
+      "failed": 0,
+      "ignored": 25,
+      "compiled_cli_passed": 43
+    }
+  },
+  "verified": [
+    "Controller activation binds the exact owner request/body digest, lease, pause revision, previous registered contract hash and next candidate binding in one transaction.",
+    "Registration metadata is rehashed and validated independently from current verifier-file integrity, allowing the previous contract metadata to remain verifiable after an independently prepared verifier replacement.",
+    "Activation requires same source and baseline, exactly one revision increment, unchanged candidate head, retained prior owner criteria, no protected-control scope and no new broad directory scope.",
+    "Checkpoint and owner-turn bindings advance together, prior current review/fragment/ready indexes are invalidated and immutable revision/audit receipts remain. Old turn tokens reject; replay returns the revised token without a second activation.",
+    "Injected audit failure rolls back registration receipt, checkpoint, turn binding and review invalidation. Tampered metadata, changed verifier files, changed prior requirements and newer owner intent refuse activation.",
+    "Restart replay remains bound to the original activation and cannot substitute a different evidence binding. Message remains pending, stage requires owner-revision verification, and publication remains paused."
+  ],
+  "limits": [
+    "Metadata activation is not independent scoper approval, executed baseline/candidate proof or a completed owner turn. The trusted controller caller must establish independent preparation, canonical workspace provenance and native quiescence before use.",
+    "No production public consumer invokes this activation yet. Guard/prepared-acceptance integration, real Codex/Claude edit/test, candidate commit, completion receipts and fresh independent review remain open.",
+    "Prior owner requirements are retained; conflicting replacement intent needs an explicit authorized policy rather than silent criterion removal.",
+    "Protocol fixtures use synthetic registered programs and do not demonstrate that the additional requirement was executed or passed.",
+    "No production rollout, live Discord/native acceptance, hosted CI acceptance or required soak completion. No child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_contract.rs",
+      "sha256": "0efa127d3edd3f4b08daa83bbe39bca0a48442e7f0a70563c23ff6c5758f09a2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "28f54f1c587d7b22eee46b11be4ea1ac6f97278ce9181888b8e79fa16f1839ba"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "833aafe967df1a37d94cb08f416fda745fb4e2d8ba630a9d847cc00df8831d05"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_revision.rs",
+      "sha256": "551bc29eddd0458ed01949fc9e9e1050bc9f0412b1b937c60cbce89914bfe59f"
+    }
+  ]
+}

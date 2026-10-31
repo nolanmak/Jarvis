@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1707,
+  "status": "controller-isolation-implemented-local-verification",
+  "parent_commit": "077af7f90f4e485998f5efbeed875c783c691fdb",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/self_improve_recovery.rs": "7bfc48fad0e8277550046182172b7efc0eff2921e9e189e6bd21d9fb83f89f37",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "44d391b98ab0479f401fb1f74e03ddfde6971b377250646a96695e1081353abb"
+  },
+  "regressions": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-recovery-paths.log",
+      "cargo_exit": 101,
+      "managed_wrapper_exit": 1,
+      "passed": 2,
+      "failed": 3
+    },
+    "green": {
+      "log": "/tmp/autoship-1703-green-recovery-paths.log",
+      "exit": 0,
+      "passed": 7
+    },
+    "workflow_suite": {
+      "log": "/tmp/autoship-1703-green-workflow-paths.log",
+      "exit": 0,
+      "passed": 22,
+      "ignored": 1
+    },
+    "progress_suite": {
+      "log": "/tmp/autoship-1703-green-progress-paths.log",
+      "exit": 0,
+      "passed": 9,
+      "seconds": 92.61,
+      "boundary": "real local Git; scripted GitHub; no models"
+    }
+  },
+  "verified": [
+    "Fresh preparation rejects symlinked parent before branch/worktree creation.",
+    "Resume preparation rejects symlinked parent before fetch.",
+    "Ordinary owner subdirectories cannot inherit parent Git identity and masquerade as candidates.",
+    "Recovery requires an exact registered worktree and rejects copied Git pointers and dangling parents.",
+    "Dirty candidate contents and index survive resume; owner tracked/untracked bytes, index and HEAD remain unchanged."
+  ],
+  "limits": [
+    "Local tests exercise real Git and production controller/recovery functions; a complete deployed dirty-owner issue/PR run remains unverified.",
+    "Controllers share Git object/ref storage but have separate working directories and indexes. Owner index, HEAD and file contents are preserved; fetches update remote-tracking refs.",
+    "Ownership receipts reject unowned/replaced controllers. A crash before receipt completion leaves a preserved checkout requiring explicit recovery; no automatic deletion.",
+    "This does not attest race-proof filesystem isolation against a hostile same-user process.",
+    "Targeted CLI execution, Discord initiation/sessions/updates, deployment and live soak remain open."
+  ],
+  "controller_followup": {
+    "parent_commit": "35e553ea8a20bad436e94f44206eba410dbbea50",
+    "source_sha256": {
+      "crates/augmentagent-cli/src/self_improve.rs": "2aeeebdfaac099d17b084782102bb56f73e60fc1cf5c43fd12d96f701b198558",
+      "crates/augmentagent-cli/src/self_improve_workspace.rs": "591be3dbf0d38d87eae40dd8ab1bbc63cf4bc20ac18b193638215e4caae866dd",
+      "crates/augmentagent-cli/src/self_improve_recovery.rs": "dbee33f1de37c3ff166055dbfd06f12d8950ca61e97856cd33501aadb366d1a1",
+      "crates/augmentagent-cli/src/self_improve_workflow.rs": "79d2193ba556f8547e5cb50634b78dd1221ed32486f5898543bcc12731c60a24"
+    },
+    "changes": [
+      "Production run_once validates deployment at the real deploy checkout, then prepares a receipt-bound controller pinned to fetched origin/main.",
+      "Build/resume and sweep use separate lifetime locks. Merge dispatch reconciliation precedes controller preparation so a setup hold cannot hide an uncertain remote mutation.",
+      "Candidate and baseline paths resolve through the primary shared Git repository, preserving pre-existing candidate locations.",
+      "Cleanup only considers clean registered detached baseline checkouts with HEAD already in origin/main; unknown, ignored, dirty and unmerged work is preserved."
+    ],
+    "tests": {
+      "controller_red": {
+        "log": "/tmp/autoship-1703-red-controller.log",
+        "failed": 2,
+        "cargo_exit": 101
+      },
+      "unknown_baseline_red": {
+        "log": "/tmp/autoship-1703-red-baseline-reclaim.log",
+        "failed": 1,
+        "cargo_exit": 101
+      },
+      "ignored_unmerged_red": {
+        "log": "/tmp/autoship-1703-red-baseline-data.log",
+        "failed": 2,
+        "cargo_exit": 101
+      },
+      "controller_green": {
+        "log": "/tmp/autoship-1703-green-controller.log",
+        "passed": 6,
+        "exit": 0
+      },
+      "autoship_suite_before_final_cleanup_hardening": {
+        "log": "/tmp/autoship-1703-green-isolation-suite.log",
+        "passed": 498,
+        "ignored": 17,
+        "exit": 0
+      },
+      "final_cli_suite": {
+        "log": "/tmp/autoship-1703-green-isolation-cli.log",
+        "passed": 1416,
+        "ignored": 25,
+        "failed": 0,
+        "exit": 0,
+        "seconds": 129.62
+      }
+    }
+  }
+}

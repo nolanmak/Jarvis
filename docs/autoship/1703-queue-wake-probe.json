@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1706,
+    1708,
+    1712
+  ],
+  "status": "queue-wake-and-attempt-results-verified-not-deployed",
+  "parent_commit": "854ef5f984382270184565ca0da58f61042ea1b1",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_commands.rs": "fd8c60e282c6d90eb1d9507bdd962633a235dfa4686b381a4264ed7f3f15a63c",
+    "crates/augmentagent-cli/src/autoship_submission.rs": "e056e7cbd0bf80f3efc96c3383d96078cf3ccb884c4af79e50d1bed499579a3c",
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "a5ba9781e174232e6c985136878a247b43d4d4abda31240fd99c9cb169c6b4eb",
+    "crates/augmentagent-cli/src/self_improve.rs": "1f977df2d0d8774656d2ea548bca6079f8426cf6c5667348217f27335e4fbc87",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "3e6a25941965b8046c93d01c54ff357e1766f5fb4ded931f9421c875ad348ad4",
+    "crates/augmentagent-cli/tests/autoship_commands_cli.rs": "67e1963b2a3d6756fd1dcbc137fe29638e012db3b6f7541a6a4508b23228ad7f"
+  },
+  "tests": {
+    "wake_red": {
+      "log": "/tmp/autoship-1703-red-queue-wake.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "A request submitted during the normal 30-minute sleep was not picked up within the 31-second fixture window."
+    },
+    "status_red": {
+      "log": "/tmp/autoship-1703-red-queue-attempt-status.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Compiled status ignored the durable attempt and reported awaiting-worker-claim with exit 0."
+    },
+    "test_compile_correction": {
+      "log": "/tmp/autoship-1703-green-queue-wake-unit.log",
+      "note": "Replaced test unwrap_err with err().expect because RunReport does not implement Debug; not behavioral red evidence."
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-queue-wake-final.log",
+      "exit": 0,
+      "passed": 1447,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 140.76
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-queue-wake-final.log",
+      "exit": 0,
+      "status_readiness_passed": 14,
+      "submission_work_passed": 11,
+      "resolution_passed": 10,
+      "failed": 0
+    },
+    "retry_exit_red": {
+      "log": "/tmp/autoship-1703-red-queue-retry-exit.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "A failed but retryable queued attempt incorrectly returned terminal failure exit 4 instead of deferred exit 3."
+    }
+  },
+  "verified": [
+    "Idle background workers poll a read-only, repository-scoped due-job hint every 30 seconds; an unavailable repository identity is retried while normal polling remains available.",
+    "The hint uses the same eligibility predicate as transactional selection; unrelated and delayed jobs do not accelerate builder ticks. Active productive stages are not interrupted.",
+    "Selection atomically records an unconfirmed attempt. Finished results are fenced by selection time and may not replace a newer selection or an already finished result.",
+    "The real targeted background entry point persists missing-runtime deferral before any workflow checkpoint or worktree; a fresh status reader sees execution-readiness-blocked with unknown worker liveness.",
+    "Attempt records hold bounded machine reasons, not raw provider output. Existing checkpoints remain authoritative; their JSON includes the latest background attempt separately.",
+    "Compiled CLI status reads selected, deferred and failed attempt records without database writes, reports exit 3 while the job remains retryable, and does not fabricate a live worker or head."
+  ],
+  "limits": [
+    "The 30-second poll is an idle wake-up interval, not a completion or queue-wait SLA. Active builds, normal-lane fairness, resource/readiness gates and merge-capacity admission still affect pickup.",
+    "Status does not infer a currently live worker from historical attempt receipts. Detailed worker/down and global capacity health reporting remains open.",
+    "Direct local work-once attempts do not create background scheduling receipts. Their execution checkpoints remain visible through shared status.",
+    "Tests use fake clocks, real SQLite, temporary Git and scripted GitHub boundaries. This is not deployed or live native-model acceptance.",
+    "Wait/control commands, stale-input re-verification, legacy-hold recovery, Discord sessions/updates, native CLI acceptance, normal updater rollout and required soaks remain open."
+  ]
+}

@@ -21,7 +21,7 @@
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/5": {
-      "body": "python3 scripts/test-native-provider-gateway.py\npython3 scripts/test-native-provider-vm.py\npython3 scripts/test-native-provider-io.py\npython3 scripts/test-native-provider-codex-auth-probe.py\npython3 scripts/test-native-provider-claude-auth-probe.py\npython3 scripts/test-autoship-native-acceptance-probe.py\npython3 scripts/test-native-probe-routing.py\npython3 scripts/test-provision-native-vm.py\n",
+      "body": "python3 scripts/test-native-provider-gateway.py\npython3 scripts/test-native-provider-vm.py\npython3 scripts/test-native-provider-io.py\npython3 scripts/test-native-provider-codex-auth-probe.py\npython3 scripts/test-native-provider-claude-auth-probe.py\npython3 scripts/test-autoship-native-acceptance-probe.py\npython3 scripts/test-native-probe-routing.py\npython3 scripts/test-provision-native-vm.py\npython3 scripts/tests/native_runtime_reconcile_test.py\npython3 scripts/tests/updater_native_runtime_test.py\npython3 scripts/tests/updater_policy_activation_test.py\npython3 scripts/tests/run_resource_readiness_test.py\npython3 scripts/tests/autoship_deployment_readiness_test.py\npython3 scripts/tests/run_resource_scope_test.py\n",
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/6": {
@@ -410,7 +410,7 @@
       "shell": "bash"
     },
     "rust/agents/12": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1",
+      "body": "cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --locked\n",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"

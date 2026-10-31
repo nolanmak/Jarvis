@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1712,
+  "status": "builder-pin-connected-to-existing-execution",
+  "parent_commit": "e9974d498193bcf1e3030be174d892a10598839e",
+  "source_sha256": {
+    "crates/augmentagent-channel-core/src/fallback.rs": "781956a080b90c36adf58d4adb3896f8818b1a6ad6a5880dcdff69e0a8daec50",
+    "crates/augmentagent-channel-core/src/lib.rs": "b991b6044beec2ab5f311ff7e556a951587b5f785867abae438142893df8ea4b",
+    "crates/augmentagent-cli/src/autoship_submission.rs": "4bf0e1cb1ba9820139c5b4e6cc6646cbccac09d42b085557d2cd880223f205ee",
+    "crates/augmentagent-cli/src/self_improve.rs": "f2164718d14bd67066f464a79001e424e92ae279059bfa4c11da55987713f9ba",
+    "crates/augmentagent-cli/src/self_improve_adopted.rs": "a1d028603f946775a99a77c87e78870f8c8babc9641e7d41b1658f1de45bf050",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "3cbf1da1cd0af640caa9aebaa20f08c189d0ee41a51c79ed46b428ca9f3823bf"
+  },
+  "changes": [
+    "Explicit builder selection is immutable per reasoner instance and overrides interactive selection only during that instance's calls.",
+    "Lane availability and call dispatch use the same effective selection; operator pause, capability, credential and cooldown checks remain enforced.",
+    "Fresh issue, resumed PR and adopted PR builder construction reads the durable command pin. The workflow guard rejects a builder whose pin differs from the request before model calls.",
+    "Independent reviewer/adjudicator constructors retain their own selection. No global selection file or environment mutation is used.",
+    "Reading command pins is compatible with old workflow stores and does not create or migrate state."
+  ],
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-builder-pin.log",
+      "failed": 2,
+      "cargo_exit": 101
+    },
+    "routing_green": {
+      "log": "/tmp/autoship-1703-green-builder-pin.log",
+      "passed": 51,
+      "failed": 0,
+      "exit": 0,
+      "boundary": "production routing with scripted provider adapters; no native model call"
+    },
+    "cli_green": {
+      "log": "/tmp/autoship-1703-green-builder-pin-cli.log",
+      "passed": 1430,
+      "failed": 0,
+      "ignored": 25,
+      "exit": 0,
+      "seconds": 130.2
+    }
+  },
+  "limits": [
+    "Targeted CLI commands and queue consumption are not exposed yet.",
+    "Target-specific readiness for work-once without a worker is still required; the normal scheduler continues to use its deployment preflight.",
+    "Native paid acceptance of explicit pins, Discord sessions/updates, rollout and live soak remain unverified."
+  ]
+}

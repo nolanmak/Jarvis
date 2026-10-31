@@ -146,6 +146,22 @@ def sync_runtime(root):
             os.close(descriptor)
 
 
+def discard_unpublished_generation(guest, policy_path):
+    """Delete only our own generation after proving it is not published."""
+    if not guest.exists():
+        return
+    try:
+        current=json.loads(helper('native-provider-vm.py').private_bytes(policy_path,2*1024**2))
+    except FileNotFoundError:
+        current={}
+    except Exception:
+        # An unreadable/uncertain pointer cannot justify deleting its runtime.
+        return
+    if not isinstance(current,dict) or current.get('guest_runtime')==str(guest):
+        return
+    shutil.rmtree(guest)
+
+
 def provision(args):
     runtime_helper = helper('native-provider-vm.py')
     policy_path = args.extend_policy
@@ -183,6 +199,7 @@ def provision(args):
         raise ValueError('invalid declared native resource budget')
     lock = os.open(root / 'provision.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     published = False
+    publication_attempted = False
     guest = root / ('runtime-' + uuid.uuid4().hex)
     try:
         info = os.fstat(lock)
@@ -234,6 +251,7 @@ def provision(args):
             stream.write(json.dumps(policy, sort_keys=True).encode())
             stream.flush()
             os.fsync(stream.fileno())
+        publication_attempted = True
         os.replace(temporary, policy_path)
         published = True
         directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -243,12 +261,44 @@ def provision(args):
             os.close(directory)
         return policy_path
     finally:
-        if not published and guest.exists():
-            shutil.rmtree(guest)  # only this invocation's unpublished random generation
+        # Once publication was attempted, completion can be uncertain (or
+        # another actor may already have moved the pointer again). Retain the
+        # generation for any workflow that could have observed it.
+        if not published and not publication_attempted:
+            discard_unpublished_generation(guest,policy_path)
         os.close(lock)
 
 
-def refresh_runtime_policy(policy_path, native):
+def runtime_matches_native(policy, native):
+    """Validate the current generation before deciding whether refresh is needed."""
+    runtime = Path(policy['guest_runtime'])
+    helper('native-provider-vm.py').validate_runtime(runtime)
+    native = Path(native).resolve(strict=True)
+    info = native.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022 or not info.st_mode & 0o111 or info.st_size > 512 * 1024**2:
+        raise ValueError('native executable is not trusted')
+    companions = native_companions(native)
+    if not companions:
+        return True
+    def digest(path):
+        result = hashlib.sha256()
+        with Path(path).open('rb') as stream:
+            for chunk in iter(lambda:stream.read(1024*1024), b''):
+                result.update(chunk)
+        return result.hexdigest()
+    manifest = json.loads((runtime/'manifest.json').read_text())
+    declared = {item['path']:item['sha256'] for item in manifest['files']}
+    entries = manifest.get('native_companions', {}).get(digest(native))
+    if not isinstance(entries, list) or len(entries) != len(companions):
+        return False
+    for companion, entry in zip(companions, entries):
+        relative = str(helper('native-provider-vm.py').safe_relative(entry['path']))
+        if entry.get('name') != companion.name or declared.get(relative) != entry.get('sha256') or entry.get('sha256') != digest(companion):
+            return False
+    return True
+
+
+def refresh_runtime_policy(policy_path, native, only_if_needed=False):
     """Publish only a new immutable runtime pointer; never import auth/grants."""
     policy_path = Path(policy_path)
     if policy_path.absolute() != policy_path.resolve():
@@ -265,6 +315,7 @@ def refresh_runtime_policy(policy_path, native):
     lock = os.open(root/'provision.lock', os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC, 0o600)
     guest = root / ('runtime-' + uuid.uuid4().hex)
     published = False
+    publication_attempted = False
     try:
         info = os.fstat(lock)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
@@ -272,18 +323,28 @@ def refresh_runtime_policy(policy_path, native):
         fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB)
         if runtime_helper.private_bytes(policy_path, 2*1024**2) != baseline:
             raise ValueError('provider policy changed before runtime refresh')
+        # Recheck under the same publication lock: concurrent updater ticks
+        # must not create successive generations for one executable update.
+        if only_if_needed and runtime_matches_native(policy, native):
+            if runtime_helper.private_bytes(policy_path, 2*1024**2) != baseline:
+                raise ValueError('provider policy changed during runtime inspection')
+            return policy_path
         stage_runtime(guest, native, [Path(policy['guest_runtime'])])
         sync_runtime(guest)
         if runtime_helper.private_bytes(policy_path, 2*1024**2) != baseline:
             raise ValueError('provider policy changed during runtime refresh')
         policy['guest_runtime'] = str(guest)
+        publication_attempted = True
         runtime_helper.atomic(policy_path, json.dumps(policy, sort_keys=True).encode())
         published = True
         return policy_path
     finally:
         os.close(lock)
-        if not published and guest.exists():
-            shutil.rmtree(guest)
+        # Once publication was attempted, completion can be uncertain (or
+        # another actor may already have moved the pointer again). Retain the
+        # generation for any workflow that could have observed it.
+        if not published and not publication_attempted:
+            discard_unpublished_generation(guest,policy_path)
 
 
 def main():

@@ -199,6 +199,7 @@ pub fn check_requirement(
     provider: &str,
     logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
 ) -> Result<()> {
+    if let Some(logger)=logger {logger.dispatch_allowed()?;}
     let Some(logger) = logger.filter(|logger| logger.run_resources_required()) else {
         return Ok(());
     };
@@ -507,4 +508,59 @@ s.close();p.wait()
         assert_eq!(blocked.load(Ordering::SeqCst), 1);
         assert!(logger.resource_capacity_seen());
     }
+}
+
+/// This is a point-in-time observation, never a reservation or live proof.
+#[derive(Debug, serde::Serialize)]
+pub struct Readiness {
+    pub status: String,
+    pub permits_attempt: bool,
+    pub live_verified: bool,
+    pub policy: Option<serde_json::Value>,
+    pub observation: Option<serde_json::Value>,
+}
+impl Readiness {
+    fn unavailable(status:&str)->Self {
+        Self{status:status.into(),permits_attempt:false,live_verified:false,policy:None,observation:None}
+    }
+    pub fn preflight(&self)->Result<()> {
+        anyhow::ensure!(self.permits_attempt,"workflow-resource:{}",self.status);
+        Ok(())
+    }
+}
+
+pub async fn readiness()->Readiness {
+    match declared_policy() {
+        Ok(None)=>return Readiness::unavailable("declaration-missing"),
+        Err(_)=>return Readiness::unavailable("declaration-invalid"),
+        Ok(Some(_))=>(),
+    }
+    let policy=match crate::native_vm::readiness::builder_resource_policy() {
+        Ok(policy)=>policy,
+        Err(_)=>return Readiness::unavailable("native-build-envelope-invalid"),
+    };
+    let mut report=Readiness::unavailable("inspection-unavailable");
+    report.policy=Some(policy.clone());
+    // Execute only packaged controller code, isolated from Python environment
+    // and without writing a helper, credentials, cgroup or workflow directory.
+    let mut command=tokio::process::Command::new("/usr/bin/python3");
+    command.args(["-I","-c",include_str!("../../../scripts/run-resource-scope.py"),"--inspect"])
+        .arg(policy.to_string()).env_clear().stdin(std::process::Stdio::null()).kill_on_drop(true);
+    let output=match tokio::time::timeout(std::time::Duration::from_secs(5),command.output()).await {
+        Ok(Ok(output)) if output.status.success() && output.stdout.len()<=65536=>output,
+        Err(_)=>{report.status="inspection-timeout".into();return report;},
+        _=>return report,
+    };
+    let value:serde_json::Value=match serde_json::from_slice(&output.stdout) {Ok(value)=>value,Err(_)=>return report};
+    let Some(status)=value["status"].as_str() else {return report};
+    let permits=match status {
+        "available"=>true,
+        "capacity-unverified" if value["reason"]=="controller-initialization-required"=>true,
+        "declaration-invalid"|"declaration-exceeds-service"|"delegation-unavailable"|
+        "inspection-busy"|"capacity-exhausted"|"inspection-unavailable"=>false,
+        _=>return report,
+    };
+    if value["live_verified"]!=false || value["permits_attempt"]!=permits {return report;}
+    report.status=status.into();report.permits_attempt=permits;report.observation=Some(value);
+    report
 }

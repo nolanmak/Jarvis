@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1713,
+    1712
+  ],
+  "status": "durable-owner-followup-inbox-and-dispatch-pause-verified-native-consumer-not-connected",
+  "parent_commit": "4a552348038f4e3ce7dc88f4985a199c22f044e2",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-owner-inbox.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Owner inbox unavailable; follow-up cannot be persisted with its pause and acknowledgement."
+    },
+    "full_cli_green": {
+      "log": "/tmp/autoship-1703-green-owner-inbox.log",
+      "exit": 0,
+      "passed": 1480,
+      "failed": 0,
+      "ignored": 25,
+      "compiled_cli_passed": 43
+    }
+  },
+  "verified": [
+    "Authenticated ordinary Discord follow-ups resolve their bound workflow, recheck current GitHub grant and persist immutable request identity/body before acknowledgement. Replay is pinned to its original result/workflow and changed text rejects.",
+    "Inbox insertion, owner pause intent and durable acknowledgement commit atomically. Injected inbox failure rolls all three back. Owner instructions never appear in acknowledgement text.",
+    "New dispatch uses the existing owner-pause fences and candidate-preserving error paths. Resume cannot clear pause while pending owner input exists; direct dispatch checks also refuse pending input.",
+    "Foreign bindings, selection drift/ambiguity and terminal workflows cannot queue a coding message. Confirmed merge ledger state also refuses input even before checkpoint reconciliation. Refusals replay without becoming an accepted operation after authorization changes.",
+    "Read-only CLI status exposes owner_messages_pending with legacy-schema compatibility. Stored bodies remain in the existing owner-private workflow database.",
+    "Production gateway-adapter fixture queues one follow-up and acknowledgement across duplicate delivery, advances pause revision exactly once and rejects productive dispatch."
+  ],
+  "limits": [
+    "Native coding consumption is not connected. Pending input remains paused and unapplied; acknowledgement explicitly reports this. This is not an edit/test or session-continuation acceptance result.",
+    "Active already-admitted work may finish; pause is not verified quiescence. An already-dispatched merge may reconcile before any future owner-input consumer; terminal revalidation remains required.",
+    "Safe-boundary owner turn acquisition, real Codex/Claude continuation, scope/contract revision, approval invalidation and independent re-review remain open.",
+    "No production rollout, live Discord/native acceptance or soak completed; no child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_commands.rs",
+      "sha256": "7f51afdb95c83a2474bc33c0f07cd807a5c12a92528ece45e2cfa6be0177dfde"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_control_command.rs",
+      "sha256": "dd59697957313ecb09c50954abe411f13401adfd3c64ed1d03f0bc8ca76f15fc"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "52273bbb33bee28f6608d108254c33db1c028d365482338bc44b9116779146e9"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_controls.rs",
+      "sha256": "79cceefbf99f068281aa72e87ef66812a887c927dd8f299a774471a618e66902"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "c5173bb8770148fd5b76993a87f886243f8268d6ecb4106e2762f15cf4e719d4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "8adc8c0f4e05a17d60faff67cd10cd4adb5b870855a07403cc31c2299830056e"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "b49251a057ae1ddb3a7af713f81992a580725f79338083be72b421692df4e528"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_inbox.rs",
+      "sha256": "49349900650739bcfa3a610930d81a0dddd06ca31ed0f872bfce4cea3af70587"
+    }
+  ]
+}

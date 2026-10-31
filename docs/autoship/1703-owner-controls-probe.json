@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1706,
+    1712,
+    1713
+  ],
+  "status": "basic-cli-owner-controls-and-dispatch-fences-verified-not-deployed",
+  "parent_commit": "e27cc964832c2725c6409ec54baaf487b58cdb74",
+  "tests": {
+    "state_red": {
+      "log": "/tmp/autoship-1703-red-owner-pause.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "No durable owner pause existed to fence new calls while preserving in-flight receipts."
+    },
+    "cli_red": {
+      "log": "/tmp/autoship-1703-red-owner-pause-cli.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "The compiled CLI rejected the pause subcommand."
+    },
+    "supervisor_red": {
+      "log": "/tmp/autoship-1703-red-owner-pause-supervisor.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "A waiting verifier/model supervisor ignored an owner pause set after setup."
+    },
+    "authority_red": {
+      "log": "/tmp/autoship-1703-red-paused-work-authority.log",
+      "exit": 1,
+      "observed_command_exit": 3,
+      "expected_command_exit": 2,
+      "assertion": "A stored pause masked a revoked GitHub grant on work-once."
+    },
+    "core_green": {
+      "log": "/tmp/autoship-1703-green-owner-pause-supervisor.log",
+      "exit": 0,
+      "passed": 668,
+      "failed": 0,
+      "ignored": 14
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-owner-controls-final.log",
+      "exit": 0,
+      "passed": 1461,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 139.46
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-owner-controls-final.log",
+      "exit": 0,
+      "status_readiness_passed": 14,
+      "submission_work_wait_control_passed": 19,
+      "resolution_passed": 10,
+      "failed": 0
+    }
+  },
+  "verified": [
+    "Owner control is a separate durable record and append-only revision history; pause and audit commit atomically, including queued jobs before execution exists. An injected audit failure rolls back the control update and reports storage failure.",
+    "Compare-and-swap revisions prevent stale resume from clearing a newer pause. Repeated new pause requests advance the revision. Clearing pause preserves candidate binding, checkpoint, security holds, provider pin and merge authority.",
+    "Paused jobs do not starve other queue entries. Productive/free-merge claims, new model charges, operation intents, publication reservations and merge reservation/dispatch reject owner pause. Replay of existing accounting and operation/merge completion receipts remains allowed.",
+    "Workflow-bound audit observers check the current lease and owner pause both before setup and before supervisor release. A real supervised Python command creates no effect after late pause, for both model and verifier admission.",
+    "A real-Git WorkflowGuard regression refuses productive transition, model admission, verifier admission and publication validation after pause, preserves checkpoint/evidence, and still records an already-started operation receipt. Pause is not reported as resource exhaustion.",
+    "Recovery/pause deferrals preserve candidates instead of entering destructive failure cleanup; background attempt receipts distinguish owner pause from execution failure without masking authorization rejection.",
+    "Compiled autopr pause/resume uses repository authorization; resume shares the normal native/provider-role/resource preflight. Unready or unauthorized resume leaves pause unchanged. Background dispatch still performs its own deployed-service equality check.",
+    "Read-only status exposes pause intent, and detached wait returns blocked while preserving work. Revoked authorization on work-once retains exit 2 even when pause is set.",
+    "Already-dispatched autonomous merges can still reconcile and debit exactly once after a pause. Pause never claims it can undo an in-flight remote mutation."
+  ],
+  "limits": [
+    "Pause is a dispatch request, not proof that current processes stopped. Active admitted work may finish; CLI responses explicitly leave live-worker enforcement and quiescence unverified. Older deployed workers do not gain support from writing the new state.",
+    "Resume currently clears only explicit pause. Resume --wait, merge-authority upgrades, cancel/teardown, provider switch, and adopt/readopt controls remain unfinished.",
+    "Successful ready native resume has not been accepted live; compiled tests prove durable pause and failed readiness/authorization refusal, while store/guard tests prove safe clearing and hold preservation.",
+    "Discord pause/resume/selection controls, durable owner follow-up inbox, owned-candidate native conversation handoff, scope revision/re-review, and durable progress/deployment updates remain open.",
+    "No production rollout, live Discord/native acceptance, hosted CI acceptance, fault soak or unattended live soak completed in this change. No child issue is closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "7967964dbdd0d80559a799965793415aa2d4454abce4317b6dc5963818758990"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/run_resources.rs",
+      "sha256": "1f1c0ecd033b0203973f9319037fa780641371dc410fd13d46f479760431afae"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "18a169d87368a677383fc3c7da16dfe52f2bf686f31879043128c3816f92fe2b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_commands.rs",
+      "sha256": "626b6d192b42092b0c1135157150fe6515ebaad1b3d864f6eaf5c8cb124e4dfb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_control_command.rs",
+      "sha256": "d9fbaf8bf215211d8e0c32e7648eb72aa481575b625e3e2de68025fca4bf7c7a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_merge_allowance.rs",
+      "sha256": "88b69dc7313f44d74a2770d26e87b695d5b75a9d2dc37b45010d0fdf1beb902b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_merge_allowance_tests.rs",
+      "sha256": "d1c2c52f2f8b72a5e88cf4bcd2a03f37b5cfbf06ca73d86e1cb5b1e486bbea16"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "f8213db026fccd0df09578074994c1b87ea60648e162df965e131807b712a679"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_submission.rs",
+      "sha256": "3e743272e1900c548433a43a17b44b3494350330c17a4d4016f0d7d123bf7cd0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_wait.rs",
+      "sha256": "c82bb842b6535c1c69ac6d9c5b091dc36468d7cc04061d69dad2a24594774470"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_work_command.rs",
+      "sha256": "7e729b864b41b5ee87ee7a2694eba9c83e1e823bf6e925f773d8f89018f2e579"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "d8050cbc4f70f20a226d63d77ff64f9afa68d6acaa23fe1df471f4d0017163e5"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "ade490226a1283d4692cf950b14e198029995b5cd19c94aa1af692790ab90431"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve.rs",
+      "sha256": "61ebc9c7a04a57ab6bf4daaf9734c699404a6d6cd3862aa45dda90e602eb4243"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_publication_checkout.rs",
+      "sha256": "1844510721590cc7e34f37b233eae390f8632c88b5adadf6733da59abd6d09ff"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "5e8d428d1b079e0f75d40e9d8c87bac7a04d3d93db2ad4d01d8ebac124766af6"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "d537cd0d9c153113fb8891ae8883ff7a4f03874a167df3c844cdfe5ea56441d1"
+    },
+    {
+      "path": "crates/augmentagent-cli/tests/autoship_submit_cli.rs",
+      "sha256": "8951f904b421f338fcfe2d145962abab0b65a197cc28fda5124bd4ce9bad1750"
+    }
+  ]
+}

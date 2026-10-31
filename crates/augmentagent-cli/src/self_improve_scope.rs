@@ -200,7 +200,7 @@ async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,
 }
 #[derive(Debug)]
 pub(super) struct CompletedInvalid(pub String);
-impl std::fmt::Display for CompletedInvalid {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"independent scope returned two invalid completed responses: {}",self.0)}}
+impl std::fmt::Display for CompletedInvalid {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"independent scope exhausted bounded completed-response retries: {}",self.0)}}
 impl std::error::Error for CompletedInvalid {}
 /// Persist completed model output before parsing/side effects. Provider or
 /// infrastructure errors do not consume the bounded *completed-response*

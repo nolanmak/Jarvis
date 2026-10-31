@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1714,
+    1712,
+    1713
+  ],
+  "status": "durable-progress-projection-verified-delivery-not-connected-not-deployed",
+  "parent_commit": "c21ec2491863ae2a11dba7c33badc6409a5ea9d0",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-progress.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Committed blocked checkpoint has no durable progress event."
+    },
+    "initial_compile_failure": {
+      "log": "/tmp/autoship-1703-green-progress.log",
+      "cargo_exit": 101,
+      "reason": "SQLite mapped rows temporary outlived its statement; fixed by binding rows before collection."
+    },
+    "full_binary_green_before_final_intent_label": {
+      "log": "/tmp/autoship-1703-green-progress-final.log",
+      "exit": 0,
+      "passed": 1473,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 149.4
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-progress-final.log",
+      "exit": 0,
+      "passed": 43,
+      "failed": 0
+    },
+    "final_focused_green": {
+      "log": "/tmp/autoship-1703-green-progress-intent.log",
+      "exit": 0,
+      "passed": 181,
+      "failed": 0,
+      "note": "Final change labels owner resume as resume-requested and worker results as worker-progress; regression verifies another hold remains intact."
+    }
+  },
+  "verified": [
+    "Queued submission, checkpoint, finished command attempt, owner control and authoritative autonomous merge receipt project durable progress within the same transaction.",
+    "Per-workflow sequences survive restart. Identical blocker, head and dependency fingerprints do not append another event solely because polling changes eligibility time.",
+    "Injected projection insert failure rolls back checkpoint and audit. Process exit immediately after checkpoint commit leaves progress queued and recoverable.",
+    "Only confirmed autonomous ledger state with authoritative receipt produces observed-autonomous-merge. A Merged checkpoint alone does not. Late review updates and receipt replay do not replace or duplicate terminal progress.",
+    "Explicit reason/action vocabulary prevents arbitrary prose or machine-shaped private strings entering progress payloads; raw binding/evidence/change inputs are hashed.",
+    "Provider request is separate from unknown actual execution provider. Deployment remains unknown; notifications cannot manufacture deployment confirmation.",
+    "CLI read-only status exposes pending retained progress and absent destination. Legacy schemas remain readable without creating projection tables.",
+    "Owner resume is recorded as a request with existing stage/holds preserved, never as proof of productive worker activity."
+  ],
+  "limits": [
+    "Progress dispatcher is not connected. No automatic progress message was sent or verified live by this change.",
+    "Configured operational destination routing, thread authorization/rebind generations, current-status/history compaction, editable status throttling, and milestone delivery remain open.",
+    "Delivery 429/backoff, degraded/dead-letter states, uncertain-send history reconciliation, explicit resolution/duplicate-authorized retry and legacy notify_review deduplication remain open.",
+    "Actual provider receipt projection, full health/blocker vocabulary, verified deployment applicability and containing-running-revision receipts remain open. Unrecognized outward codes use generic inspect-workflow guidance.",
+    "The final intent label change was verified by the focused autoship suite; the full binary and compiled CLI suites ran immediately before that final change.",
+    "No rollout, current-build live/native acceptance or fault/unattended soaks completed; no child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_commands.rs",
+      "sha256": "30aaec05c7614e24b2d81abf9ebb5d0993709e4b98fd9dba48aa3ab8e8815493"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_merge_allowance_tests.rs",
+      "sha256": "8069c7f517218581d0b026d6ca45f922e07850e6f703821162f2f7aa3e04bddb"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "f741a6543b4dae94f248f139f5cb6822f8eb435a66e4b136a5e91fca74e4655d"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_submission.rs",
+      "sha256": "d73019df43f2e1f354ffae4c73537271b6339d257267b065e9c75dcb615ac469"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "cadb90b5cf8b81e4c8c87fc0746dcc1b0c214ba88aeb6fa31a8b8e37a17fbe4e"
+    },
+    {
+      "path": "crates/augmentagent-cli/tests/autoship_commands_cli.rs",
+      "sha256": "ba69adfdc65a4e8f33624c3de5443584fd29bc985cdc827475e5702dc0769b72"
+    },
+    {
+      "path": "crates/augmentagent-cli/tests/autoship_submit_cli.rs",
+      "sha256": "da59ac6fe3a2c935f011fb5c36ee8cb19ca9239a50bacc6202d51d6bba3bbeca"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_progress.rs",
+      "sha256": "11e5aad8e78e3453b8cab3132c19913f1449a133d61c8bf6b067b2ef0f7480e3"
+    }
+  ]
+}

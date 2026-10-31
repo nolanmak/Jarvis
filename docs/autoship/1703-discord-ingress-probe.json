@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1712,
+    1713,
+    1714
+  ],
+  "status": "discord-admission-backend-verified-gateway-not-connected-not-deployed",
+  "parent_commit": "928e83eac67b478de497ca6d23b2a78f558a6553",
+  "tests": {
+    "admission_red": {
+      "log": "/tmp/autoship-1703-red-discord-ingress.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Discord could not atomically admit and replay the existing CLI workflow with its conversation binding and acknowledgement."
+    },
+    "private_destination_red": {
+      "log": "/tmp/autoship-1703-red-discord-private-destination.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Absence of a guild was accepted without positive owner-only DM verification."
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-discord-ingress-verified.log",
+      "exit": 0,
+      "passed": 1457,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 138.99
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-discord-ingress-verified.log",
+      "exit": 0,
+      "status_readiness_passed": 14,
+      "submission_work_wait_passed": 17,
+      "resolution_passed": 10,
+      "failed": 0
+    }
+  },
+  "verified": [
+    "CLI and Discord use the same transaction-level admission implementation, preserving provider pins, PR-only ceilings, canonical aliases and immutable request replay.",
+    "Discord admission commits the request, job, owner/conversation/workflow binding and queued acknowledgement atomically. An injected acknowledgement insert failure rolls all new records back.",
+    "Discord identity is supplied as immutable bot/owner/channel/message IDs; message edits and destination changes cannot replay an old response as a new command.",
+    "The adapter requires configured bot/owner identity and a positive transport-provided owner-only DM verification flag before target lookup or state creation. Exact GitHub PR URL grammar rejects spoofed hosts, prose and extra authority flags.",
+    "The production adapter rechecks the GitHub write grant on replay and uses shared target validation for new requests. A scripted-GitHub/real-Git test replays after target closure and refuses a revoked grant.",
+    "Conversation selection is scoped to owner/bot/channel; multiple bound workflows require an explicit selector rather than whichever message arrived last.",
+    "A subprocess exits immediately after committed admission; restart recovers the original response. Concurrent acknowledgement claims permit only one attempt and persist uncertainty before transport send. Confirmed message receipts are immutable and origin-bound."
+  ],
+  "limits": [
+    "The Discord gateway, owner-command/help registry, Slack parity entry and outbound transport are not connected to this backend yet. No live !autoship availability is claimed.",
+    "The DM verification flag must be derived from actual Discord channel metadata by that future gateway adapter; tests supply controlled metadata and do not validate live Discord access.",
+    "This binding records workflow routing only. Owned-workspace native session binding, ordinary coding follow-ups, stage-boundary serialization, provider handoff and control commands remain open.",
+    "Queued-ack draining, uncertain-send history reconciliation, retry/rebind controls and durable progress/deployment updates remain open. No exactly-once platform delivery claim is made.",
+    "No production rollout, live Discord/native acceptance or required fault/unattended soak has completed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_submission.rs",
+      "sha256": "bc4226620ee3aa1c685446617be094e3ad19e77b8b6a6c29dfea11c687945172"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "25f0817f5edd484f89c04e4516a014a7cb05f5c4c7c35e0a7ebafa03de7d237b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "ebcaed892336262de64a95d3ade8f444e9b7c91ab9420bbc508db88f6c71e60b"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "b2e41f8345766cde5b7aaaa86d505fb45d8eea2a778999accc6f3e4d7aecda47"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "894410fa35837a1b7919aa2887e504b60eb3890d1f0725d1f6a1ea838f687651"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_ingress.rs",
+      "sha256": "aac8b0cb3f5a7a8ec27396437ebe8ba922acef73156fca2ad668afc34b09bbb8"
+    }
+  ]
+}

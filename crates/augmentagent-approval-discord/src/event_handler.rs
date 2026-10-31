@@ -332,6 +332,27 @@ impl EventHandler for Handler {
         // context for follow-ups.
         let bot_user_id = ready.user.id;
         let _ = self.state.bot_user_id.set(bot_user_id);
+        if self.state.query_handler.is_some() && self.state.allowed_user_id.is_some()
+            && !self.state.autoship_delivery_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let state = Arc::downgrade(&self.state);
+            let transport = crate::autoship::DiscordTransport(Arc::clone(&ctx.http));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let Some(state) = state.upgrade() else { break; };
+                    let handler = state.query_handler.clone();
+                    let owner = state.allowed_user_id;
+                    let bot = state.bot_user_id.get().copied();
+                    drop(state);
+                    let (Some(handler), Some(owner), Some(bot)) = (handler, owner, bot) else { break; };
+                    if crate::autoship::drain_queued(handler.as_ref(), &transport, bot.get(), owner.get()).await.is_err() {
+                        warn!("could not read queued autoship acknowledgements");
+                    }
+                }
+            });
+        }
         if let Some(bridge) = &self.state.voice_bridge {
             bridge.set_shard(ctx.shard.clone()).await;
         }
@@ -482,6 +503,18 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        let autoship_context = crate::autoship::Context {
+            bot: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
+            owner: self.state.allowed_user_id.map(|id| id.get()),
+            author: msg.author.id.get(), channel: msg.channel_id.get(), message: msg.id.get(),
+            guild: msg.guild_id.map(|id| id.get()),
+        };
+        match crate::autoship::dispatch(handler.as_ref(), &crate::autoship::DiscordTransport(Arc::clone(&ctx.http)),
+            &autoship_context, &user_text).await {
+            Ok(false) => {},
+            Ok(true) => return,
+            Err(_) => { warn!("autoship command or delivery failed; message withheld from ordinary chat"); return; }
+        }
         // #1496: consume phone setup before attachments, history, native turn
         // claims or model inference, even if the phone adapter is unavailable.
         let phone_context = crate::phone::PhoneCommandContext {

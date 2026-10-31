@@ -13,7 +13,8 @@ use augmentagent_approval_discord::owner_commands::{
 
 const EVENT_HANDLER: &str = include_str!("../src/event_handler.rs");
 
-const KNOWN_DISCORD_TRIGGERS: [&str; 7] = [
+const KNOWN_DISCORD_TRIGGERS: [&str; 8] = [
+    "!autoship",
     "model",
     "loop",
     "!journal",
