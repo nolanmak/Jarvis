@@ -48,7 +48,7 @@ pub(crate) async fn apply(repo:&Path,path:&Path,id:&str,paused:bool)->(i32,Value
         Ok(control)=>(0,json!({"schema_version":1,"workflow":id,"accepted":true,"complete":false,
             "reason":if paused {"owner-pause-requested"} else {"owner-resume-accepted"},
             "owner_control":control,"worker_enforcement":"unverified","quiescence":"unverified","execution":"not-confirmed"})),
-        Err(e) if matches!(e.to_string().as_str(),"owner-control-revision-conflict"|"terminal workflow cannot change owner control"|"unknown workflow")=>failure(&id,3,"owner-control-rejected",e),
+        Err(e) if matches!(e.to_string().as_str(),"owner-followup-pending"|"owner-control-revision-conflict"|"terminal workflow cannot change owner control"|"unknown workflow")=>failure(&id,3,"owner-control-rejected",e),
         Err(e)=>failure(&id,4,"workflow-state-unavailable",e),
     }
 }

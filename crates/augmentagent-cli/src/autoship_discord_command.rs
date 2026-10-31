@@ -92,6 +92,20 @@ async fn control(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str,action:Ac
     Ok(())
 }
 
+async fn owner_followup(repo:&Path,path:&Path,origin:&DiscordOrigin,text:&str)->Result<()> {
+    ensure!(!text.trim().is_empty() && text.len()<=16*1024,"owner message exceeds bound");
+    let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
+    let store=WorkflowStore::open_read_only(path)?.ok_or_else(||anyhow::anyhow!("workflow-not-found"))?;
+    let replay=store.replay_discord_control(origin,&digest)?;
+    let workflow=if let Some(reply)=&replay {store.discord_workflow(origin,Some(&reply.workflow))?.unwrap()}
+        else {store.discord_workflow(origin,None)?.ok_or_else(||anyhow::anyhow!("workflow-selection-required"))?};
+    let request=store.command_request(&workflow)?.ok_or_else(||anyhow::anyhow!("workflow-not-found"))?;drop(store);
+    let authorization=crate::self_improve::targeted::authorize_command(repo,&request).await;
+    if replay.is_some() {authorization?;return Ok(());}
+    WorkflowStore::open(path)?.enqueue_owner_message(origin,&workflow,text,authorization.err().map(|_|"target-authorization-failed"),chrono::Utc::now().timestamp_millis())?;
+    Ok(())
+}
+
 pub(crate) async fn admit(repo:&Path,path:&Path,policy:OwnerPolicy,context:&Context,text:&str)->Result<DiscordAdmission> {
     authorize(policy,context)?;
     let request=parse(text)?;
@@ -132,7 +146,10 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
     let plain=|content:&str|Some(GatewayReply {content:content.into(),nonce:None});
     if !augmentagent_approval_discord::autoship::recognizes(text) {
         ensure!(gateway_bound(path,context)?,"autoship conversation is not bound");
-        return Ok(plain("This conversation is bound to Autoship. PR coding follow-ups are not connected yet; this message has not edited the PR. Track the workflow with `autopr status --workflow ID`."));
+        if owner_followup(repo,path,&origin,text).await.is_err() {
+            return Ok(plain("Autoship owner message could not be queued. Select a bound workflow with `!autoship use ID` and verify GitHub access. No edit is confirmed."));
+        }
+        return gateway_claim_ack(path,context);
     }
     match parse_control(text) {
         Ok(Some((action,explicit)))=> {

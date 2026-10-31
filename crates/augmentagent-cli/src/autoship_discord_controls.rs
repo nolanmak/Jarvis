@@ -57,6 +57,7 @@ impl WorkflowStore {
             if refusal.is_none() {
                 if let Err(error)=super::owner_control::apply_in_transaction(&tx,&prepared.workflow,&origin.principal(),prepared.revision,prepared.action==Action::Pause,now) {
                     refusal=Some(match error.to_string().as_str() {
+                        "owner-followup-pending"=>"owner-followup-pending".into(),
                         "owner-control-revision-conflict"=>"owner-control-revision-conflict".into(),
                         "terminal workflow cannot change owner control"=>"workflow-terminal".into(),
                         _=>return Err(error),
@@ -88,7 +89,7 @@ impl WorkflowStore {
     }
 }
 
-fn replay(conn:&Connection,origin:&DiscordOrigin,digest:&str)->Result<Option<ControlReply>> {
+pub(super) fn replay(conn:&Connection,origin:&DiscordOrigin,digest:&str)->Result<Option<ControlReply>> {
     origin.validate()?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='discord_control_request')",[],|r|r.get(0))?;
     if !exists {return Ok(None);}

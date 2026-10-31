@@ -33,6 +33,7 @@ pub(super) fn apply_in_transaction(tx:&Transaction<'_>,workflow:&str,principal:&
         if let Some(checkpoint)=checkpoint {
             ensure!(!matches!(serde_json::from_str::<Checkpoint>(&checkpoint)?.stage,Stage::Merged|Stage::Retired),"terminal workflow cannot change owner control");
         }
+        if !paused {ensure!(super::owner_inbox::pending(tx,workflow)?==0,"owner-followup-pending");}
         let prior=read(&tx,workflow)?;
         let revision=prior.as_ref().map_or(0,|c|c.revision);
         ensure!(revision==expected_revision,"owner-control-revision-conflict");
@@ -55,6 +56,7 @@ pub(super) fn read(conn:&Connection,workflow:&str)->Result<Option<OwnerControl>>
 
 pub(super) fn require_dispatch(conn:&Connection,workflow:&str)->Result<()> {
     ensure!(!read(conn,workflow)?.is_some_and(|c|c.paused),"owner-paused");
+    ensure!(super::owner_inbox::pending(conn,workflow)?==0,"owner-followup-pending");
     Ok(())
 }
 

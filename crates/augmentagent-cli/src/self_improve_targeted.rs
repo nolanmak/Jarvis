@@ -449,6 +449,7 @@ mod tests {
             assert_eq!(crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&context,text).await.unwrap(),discord);
             assert!(gateway::dispatch(&adapter,&wire,&gateway_context,text).await.unwrap());
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),1);
+            scenario(serde_json::json!({"permission":"READ","pr":closed}));
             assert!(gateway::dispatch(&adapter,&wire,&gateway::Context {message:45,..gateway_context.clone()},"fix the test").await.unwrap());
             assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),2);
             scenario(serde_json::json!({"permission":"READ","pr":closed}));
@@ -525,6 +526,16 @@ mod tests {
             let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
             assert!(store.uncertain_discord_acks(11,22).unwrap().is_empty());
             assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision);
+            drop(store);wire.1.store(false,std::sync::atomic::Ordering::SeqCst);
+            let followup="Please fix the failing test";
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(106),followup).await.unwrap());
+            assert!(gateway::dispatch(&adapter,&wire,&control_context(106),followup).await.unwrap());
+            let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
+            assert_eq!(store.pending_owner_messages(&discord.admission.workflow).unwrap(),1);
+            assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision+1);
+            assert!(store.require_owner_dispatch(&discord.admission.workflow).is_err());
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),12);
+
 
 
 
