@@ -79,7 +79,8 @@ Update the validation column with actual results before release.
 | --- | --- | --- |
 | iMessage automatic reply | Baseline in triage; evidence before draft | 63 existing library tests passed during development |
 | Email | Code generation, repair, classic fallback; native thread/tone/ask context retained | Existing adapter library regressions passed; CI verifies merged head |
-| WhatsApp, Slack, Discord DMs, LinkedIn DMs | Code generation, repair, classic fallback | Existing adapter library regressions passed; CI verifies merged head |
+| Slack, Discord DMs, LinkedIn DMs | Code generation, repair, classic fallback | Existing adapter library regressions passed; CI verifies merged head |
+| WhatsApp | Shared adapter context and searchable imported history | Library regression passed; native contact compose/approval/Revise dispatch remains an explicit transport limitation in [#1234](https://github.com/nolanmak/Jarvis/issues/1234) |
 | Instagram and Twitter native adapters | Code generation, repair, classic fallback | Existing adapter library regressions passed; CI verifies merged head |
 | SocialAPI incoming DMs | Evidence before draft; existing image input retained | Existing adapter library regressions passed; CI verifies merged head |
 | Telegram bot replies | Evidence before draft; bot delivery unchanged | Existing adapter library regressions passed; CI verifies merged head |
