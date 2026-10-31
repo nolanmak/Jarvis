@@ -308,10 +308,27 @@ the card, then the send interval once you approve.
 
 ### Limits
 
-- 1:1 iMessage conversations, text only. SMS and RCS conversations are
+- iMessage conversations, text only. SMS and RCS conversations are
   refused. Group chats need a `chat_guid` in the bundle index (written by
   this exporter, not by older jobs) and their own `allow-outbound` entry;
-  cards are never drafted for groups.
+  a group without a `chat_guid` still gets a card, but Approve is refused.
+  Compose is 1:1 only.
+
+### Group chats (#1738)
+
+A group you opt in with `allow-inbound <chat identifier>` gets reply cards
+like a 1:1 conversation, with a higher bar. Triage drafts only when the
+newest message addresses you (by name, a direct question, or an answer to
+something you said) or asks something that is clearly yours to answer.
+General chatter is ingested and skipped, not flagged. The card's subject is
+`iMessage group: <title>` and its To field lists every member. Approve sends
+to the group's `chat_guid`, never to a member's handle.
+
+Contact defaults never opt a group in, in either direction, and a member's
+own allowlist entry does not cover the group. The chat identifier is the
+key in `conversations/index.json` (a `chat…` id or a 32-character hex id).
+Teammate coverage (#1700) applies to group cards: a rostered teammate
+answering the asker in the group retires the card.
 - The Mac must be logged in and awake, with Messages signed in.
 - No attachments, tapbacks, edits or unsend. BlueBubbles and Messages'
   private API are not used; System Integrity Protection stays enabled.
