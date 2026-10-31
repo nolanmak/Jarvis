@@ -626,6 +626,16 @@ impl AuditLogger {
     /// Register BEFORE spawning a writer. Durable tickets survive cancellation
     /// and process death; a restarted logger cannot silently forget lost rows.
     pub fn begin_write(&self) -> anyhow::Result<AuditWriteGuard> {
+        if let Some(sink)=&self.anchored {
+            let result=sink.with_open_generation(||self.register_writer_ticket());
+            if result.as_ref().is_err_and(|error|!error.is::<crate::audit_chain::GenerationSealed>()) {
+                self.mark_failed();
+            }
+            result
+        } else {self.register_writer_ticket()}
+    }
+
+    fn register_writer_ticket(&self)->anyhow::Result<AuditWriteGuard> {
         let pending = if let Some(dir) = &self.pending_dir {
             let path = dir.join(uuid::Uuid::new_v4().to_string());
             let result = (|| -> anyhow::Result<()> {
@@ -1384,6 +1394,48 @@ mod tests {
         assert!(logger.begin_write().is_err(),"sealed audit accepted a new writer ticket");
         assert_eq!(logger.pending_writers.load(std::sync::atomic::Ordering::Acquire),0);
         assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
+        assert!(!logger.failure_path.as_ref().unwrap().exists(),"expected closed-generation refusal poisoned continuity");
+    }
+
+    #[test]
+    fn audit_seal_serializes_cross_process_writer_registration() {
+        const CHILD:&str="AUDIT_INGRESS_CHILD_ROOT";
+        if let Some(root)=std::env::var_os(CHILD) {
+            let root=PathBuf::from(root);
+            let logger=AuditLogger::protected(root.join("logs/workflow.log"),root.join("anchors/workflow.json"),&[]).unwrap();
+            std::fs::write(root.join("writer-ready"),b"ready").unwrap();
+            assert!(logger.begin_write().is_err(),"writer crossed a sealed generation");
+            return;
+        }
+        let (dir,logger,_,_)=protected_fixture();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
+        let sink=logger.anchored.as_ref().unwrap().clone();
+        let (entered,ready)=std::sync::mpsc::channel();
+        let (release,proceed)=std::sync::mpsc::channel();
+        let sealer=std::thread::spawn(move ||sink.seal_for_recovery(|_| {
+            entered.send(()).unwrap();
+            proceed.recv_timeout(std::time::Duration::from_secs(10))?;
+            Ok(serde_json::json!({"fixture":"sealed"}))
+        }));
+        ready.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","tool_audit::tests::audit_seal_serializes_cross_process_writer_registration","--nocapture"])
+            .env(CHILD,dir.path()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        while !dir.path().join("writer-ready").exists() && std::time::Instant::now()<deadline {
+            if child.try_wait().unwrap().is_some(){break;}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let saw_ready=dir.path().join("writer-ready").exists();
+        let pending_during_seal=std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_some();
+        release.send(()).unwrap();
+        sealer.join().unwrap().unwrap();
+        let output=child.wait_with_output().unwrap();
+        assert!(saw_ready,"child failed before registration: {}",String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert!(!pending_during_seal,"writer registered while the sealer held the anchor gate");
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
+        assert!(!logger.failure_path.as_ref().unwrap().exists());
     }
 
     #[tokio::test]
