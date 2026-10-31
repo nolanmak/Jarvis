@@ -118,8 +118,8 @@ async fn live_cross_platform_fact_changes_draft_and_missing_source_is_disclosed(
     .unwrap();
     assert!(
         missing.evidence.complete,
-        "missing-source review did not finish: {:?}",
-        missing.evidence.gaps
+        "missing-source review did not finish: {:?}; trace {:?}",
+        missing.evidence.gaps, missing.evidence.reads
     );
     assert!(
         !missing.evidence.gaps.is_empty(),

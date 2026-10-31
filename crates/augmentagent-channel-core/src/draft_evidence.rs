@@ -126,12 +126,13 @@ pub async fn gather(
     }
     cited.extend(seed.wiki.iter().map(|p| p.path.clone()));
     let opts = crate::reasoner::draft_opts(CONTRACT.into(), None);
-    let index_health = augmentagent_messages::check(store).ok();
+    // Avoid auditing the whole message index for acknowledgements that need no search.
+    let mut index_health = None;
     let started = std::time::Instant::now();
     let mut protocol_retries = 0;
     for _ in 0..MAX_STEPS {
         let prompt =
-            json!({"request":owner_request,"baseline":seed,"retrieval":out.reads}).to_string();
+            json!({"request":owner_request,"baseline":seed,"retrieval":out.reads,"budget":{"remaining_decisions":MAX_STEPS-out.model_decisions,"remaining_ms":90_000_u128.saturating_sub(started.elapsed().as_millis())},"stop_guidance":"If the material source is still unavailable after a focused search and one broadening, return ready with the missing-source gap now. Finish before the remaining budget; never claim that an empty search proves no communication."}).to_string();
         if prompt.chars().count() > MAX_CHARS {
             out.gaps
                 .push("Evidence budget exhausted; context may be incomplete".into());
@@ -142,9 +143,17 @@ pub async fn gather(
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
         let raw = match response {
             Ok(Ok(raw)) => raw,
-            _ => {
-                out.gaps
-                    .push("Evidence model unavailable or retrieval deadline exceeded".into());
+            Ok(Err(_)) => {
+                out.gaps.push(
+                    "The evidence model was unavailable; relevant sources remain unverified".into(),
+                );
+                break;
+            }
+            Err(_) => {
+                out.gaps.push(
+                    "The context check reached its time limit; relevant sources remain unverified"
+                        .into(),
+                );
                 break;
             }
         };
@@ -182,6 +191,9 @@ pub async fn gather(
                 offset,
                 reason,
             } => {
+                if index_health.is_none() {
+                    index_health = augmentagent_messages::check(store).ok();
+                }
                 let result = store.with_conn(|c| {
                     Ok(augmentagent_messages::query::search(
                         c,
