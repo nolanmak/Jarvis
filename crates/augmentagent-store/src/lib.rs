@@ -6,6 +6,7 @@
 
 // #1289 — durable approval-card pointers per surface.
 pub mod email_guards;
+pub mod conversation_context;
 pub mod approval_cards;
 pub mod approval_history;
 pub mod triage_outcomes;
