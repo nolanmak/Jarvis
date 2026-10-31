@@ -263,6 +263,7 @@ fn read_message(store: &Store, id: &str, offset: usize) -> anyhow::Result<Value>
             FROM emails WHERE messageId=?1 AND kind!='compose'", params![id,offset as i64,PAGE_CHARS as i64], |r| {
                 let text: String = r.get(5)?;
                 let length: usize = r.get(6)?;
+                if offset > 0 && offset >= length { return Ok(json!({"error":"Read offset beyond source length"})); }
                 let next = offset.saturating_add(text.chars().count());
                 Ok(json!({"message_id":id,"platform":r.get::<_,String>(0)?,"account_id":r.get::<_,Option<String>>(1)?,
                     "thread_id":r.get::<_,Option<String>>(2)?,"sender":r.get::<_,String>(3)?,"timestamp":r.get::<_,Option<String>>(4)?,
@@ -300,6 +301,9 @@ fn read_wiki(root: Option<&Path>, relative: &str, offset: usize) -> Value {
     match std::fs::read_to_string(source) {
         Ok(raw) => {
             use sha2::{Digest, Sha256};
+            if offset > 0 && offset >= raw.chars().count() {
+                return json!({"error":"Read offset beyond source length"});
+            }
             let text: String = raw.chars().skip(offset).take(PAGE_CHARS).collect();
             let next = offset.saturating_add(text.chars().count());
             json!({"path":relative,"sha256":format!("{:x}",Sha256::digest(raw.as_bytes())),"text":text,"next_offset":(next<raw.chars().count()).then_some(next)})

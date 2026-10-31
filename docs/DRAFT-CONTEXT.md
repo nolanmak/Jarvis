@@ -9,7 +9,8 @@ implementation is split into focused layers:
   email baseline, supplementing existing native email history), owner and
   verified-person wiki pages, explicit missing/truncated evidence.
 - `channel-core::draft_evidence`: bounded agent-directed search, source reads
-  and wiki reads through existing message search. Search snippets locate
+  and wiki reads through existing message search. Bounded literal wiki search
+  locates project pages without treating search hits as read evidence. Search snippets locate
   evidence; only read sources can support cited facts. Source text is data,
   never an instruction channel.
 - `channel-core::draft_workflow`: coordinate preparation, preserve material
@@ -77,13 +78,13 @@ Update the validation column with actual results before release.
 | Surface | Shared path | Validation |
 | --- | --- | --- |
 | iMessage automatic reply | Baseline in triage; evidence before draft | 63 existing library tests passed during development |
-| Email | Code generation, repair, classic fallback; native thread/tone/ask context retained | Pending full regression |
-| WhatsApp, Slack, Discord DMs, LinkedIn DMs | Code generation, repair, classic fallback | Pending full regression |
-| Instagram and Twitter native adapters | Code generation, repair, classic fallback | Pending full regression |
-| SocialAPI incoming DMs | Evidence before draft; existing image input retained | Pending full regression |
-| Telegram bot replies | Evidence before draft; bot delivery unchanged | Pending full regression |
-| Owner ask | Shared context command and receipt attachment | Pending provider/behavioral acceptance |
-| Revise (email, iMessage, Slack, Discord, LinkedIn, SocialAPI, Telegram) | Shared evidence recovery and accumulated feedback | Pending revision regression |
+| Email | Code generation, repair, classic fallback; native thread/tone/ask context retained | Existing adapter library regressions passed; CI verifies merged head |
+| WhatsApp, Slack, Discord DMs, LinkedIn DMs | Code generation, repair, classic fallback | Existing adapter library regressions passed; CI verifies merged head |
+| Instagram and Twitter native adapters | Code generation, repair, classic fallback | Existing adapter library regressions passed; CI verifies merged head |
+| SocialAPI incoming DMs | Evidence before draft; existing image input retained | Existing adapter library regressions passed; CI verifies merged head |
+| Telegram bot replies | Evidence before draft; bot delivery unchanged | Existing adapter library regressions passed; CI verifies merged head |
+| Owner ask | Shared context command and receipt attachment | CLI context/attachment isolation passed; actual-model evidence-present/missing test passed |
+| Revise (email, iMessage, Slack, Discord, LinkedIn, SocialAPI, Telegram) | Shared evidence recovery and accumulated feedback | Shared refresh/accumulated-feedback regression passed; routing regression in CI |
 | Public feed engagement/comments and GitHub proposals | Separate audience semantics; not migrated by this DM workflow | Explicit limitation; no claim of parity |
 
 Tests must distinguish transport regression, deterministic evidence selection,
@@ -91,3 +92,26 @@ and actual-model behavior. Scripted model tests prove orchestration and source
 citation constraints; they do not prove model judgment or draft faithfulness.
 Live/model evaluations and rollout evidence belong on #1695, using synthetic
 fixtures or private results without publishing real communication content.
+
+## Rollout gates and measured limits
+
+Before deployment, require green platform CI, existing adapter regressions,
+shared source/receipt/revision contracts, CLI no-send and policy-off checks,
+and an actual-model evidence-present/evidence-missing pair. Stage iMessage,
+Gmail and WhatsApp first, inspect a grounded approval card and its receipt,
+then enable the remaining migrated adapters. Every send still needs its
+existing approval. Revert the context policy to `off` if a card invents a
+material fact or exposes private evidence.
+
+The synthetic model run on 2026-10-31 read the referenced email and used its
+updated day/time (two source operations; 66 seconds including drafting).
+The matched missing-email run finished with a material gap after two searches.
+These are individual observations, not population estimates of recall or
+faithfulness. There is no measured before/after owner-edit rate yet; collect
+that through existing revision records rather than inventing a success metric.
+
+Receipts cover the shared context step. Existing channel-specific draft tools
+(such as additional wiki or image reads) retain their existing tracing; this
+receipt is not a complete audit of every subsequent model tool call. Public
+feed/comment drafting and new transport support remain outside this DM
+migration, tracked explicitly under #1693/#1695 rather than claimed as parity.
