@@ -10,6 +10,7 @@ use std::{path::Path, time::Duration};
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
+pub(crate) use merge_allowance::validate_merge_receipt_identity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -754,9 +755,9 @@ impl WorkflowStore {
             serde_json::from_str::<OperationKind>(&kind)? == OperationKind::MergePr,
             "mutation receipt requires merge operation"
         );
+        merge_allowance::validate_merge_receipt_identity(&tx, operation, receipt)?;
         ensure!(
-            receipt["client_mutation_id"].as_str() == Some(operation)
-                && receipt["expected_head"].as_str() == Some(binding.head.as_str()),
+            receipt["expected_head"].as_str() == Some(binding.head.as_str()),
             "mutation response identity differs from intent"
         );
         let pr: Option<u64> = tx.query_row(

@@ -67,9 +67,9 @@ pub fn merge_request_not_executed(raw: &str) -> bool {
 
 /// Legacy stores have no marker table; a read-only preflight must not migrate
 /// them. Marked dispatches always require their exact, unique private proof.
-fn validate_merge_marker(conn: &Connection, operation: &str, receipt: &serde_json::Value) -> Result<()> {
+fn validate_merge_marker(conn: &Connection, operation: &str, receipt: &serde_json::Value) -> Result<bool> {
     let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_private_marker')", [], |r| r.get(0))?;
-    if !exists { return Ok(()); }
+    if !exists { return Ok(false); }
     let marker: Option<(i64, String)> = conn.query_row(
         "SELECT protocol,nonce FROM merge_private_marker WHERE operation=?1", [operation],
         |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
@@ -80,6 +80,20 @@ fn validate_merge_marker(conn: &Connection, operation: &str, receipt: &serde_jso
         let mut markers = message.lines().filter(|line| line.trim_start().starts_with("Autoship-Receipt:"));
         ensure!(markers.next() == Some(expected.as_str()) && markers.next().is_none(),
             "merge commit does not uniquely prove this private dispatch");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub(crate) fn validate_merge_receipt_identity(conn: &Connection, operation: &str, receipt: &serde_json::Value) -> Result<()> {
+    let marked = validate_merge_marker(conn, operation, receipt)?;
+    if receipt.get("commit_marker_operation").is_some() {
+        ensure!(marked && receipt["commit_marker_operation"].as_str() == Some(operation)
+            && receipt.get("client_mutation_id").is_none(),
+            "immutable commit recovery requires private proof and no fabricated mutation echo");
+    } else {
+        ensure!(receipt["client_mutation_id"].as_str() == Some(operation),
+            "merge response mutation identity differs from intent");
     }
     Ok(())
 }
@@ -115,8 +129,14 @@ fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
 }
 
 impl WorkflowStore {
+    pub fn pending_merge_dispatches(&self, repository: &str) -> Result<Vec<MergeDispatchRecord>> {
+        let ids = self.conn.prepare("SELECT operation FROM merge_allowance_dispatch WHERE repository=?1 AND state='dispatched' ORDER BY dispatched_at_ms,operation")?
+            .query_map([repository], |row| row.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter().map(|id| self.merge_dispatch(&id)?.context("pending dispatch disappeared")).collect()
+    }
     pub fn validate_merge_receipt_marker(&self, operation: &str, receipt: &serde_json::Value) -> Result<()> {
-        validate_merge_marker(&self.conn, operation, receipt)
+        validate_merge_receipt_identity(&self.conn, operation, receipt)
     }
 
     pub fn merge_dispatch(&self, id: &str) -> Result<Option<MergeDispatchRecord>> {
@@ -546,10 +566,9 @@ impl WorkflowStore {
             serde_json::from_str::<Binding>(&stored_binding)? == op.binding,
             "merge receipt contract or evidence differs from dispatched intent"
         );
-        validate_merge_marker(&tx, &op.id, receipt)?;
+        validate_merge_receipt_identity(&tx, &op.id, receipt)?;
         ensure!(
-            receipt["client_mutation_id"].as_str() == Some(op.id.as_str())
-                && receipt["expected_head"].as_str() == Some(head.as_str())
+            receipt["expected_head"].as_str() == Some(head.as_str())
                 && receipt["pr_number"].as_u64() == Some(pr)
                 && receipt["pr_node_id"].as_str() == Some(node.as_str()),
             "merge receipt identity differs from reservation"

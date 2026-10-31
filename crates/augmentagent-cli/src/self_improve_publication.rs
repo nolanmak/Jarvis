@@ -278,7 +278,12 @@ pub(super) struct MergeMutationReceipt {
     pub pr_node_id: String,
     pub merge_commit: String,
     pub merged_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_mutation_id: String,
+    /// Present only for independently read immutable commit proof. This is
+    /// local operation attribution, never a fabricated server mutation echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_marker_operation: Option<String>,
     #[serde(default)]
     pub merged_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -420,9 +425,76 @@ pub(super) fn accepted_merge_receipt(raw: &str, node: &str, pr: u64, head: &str,
         merge_commit: commit.into(),
         merged_by: actor.into(),
         client_mutation_id: operation_id.into(),
+        commit_marker_operation: None,
         merged_at: merged_at.into(),
         merge_message: result["mergeCommit"]["message"].as_str().map(str::to_owned),
     })
+}
+
+async fn recover_dispatched_merge(
+    github: &mut impl Github,
+    record: &crate::autoship_workflow::MergeDispatchRecord,
+    store: &mut crate::autoship_workflow::WorkflowStore,
+) -> Result<MergeMutationReceipt> {
+    let repository = record.repository.as_str();
+    let pr = record.pr;
+    let operation = &record.operation;
+    let operation_id = operation.id.as_str();
+    let head = operation.binding.head.as_str();
+    if let Some((raw, node)) = store.merge_response(operation, repository, pr)? {
+        anyhow::ensure!(!crate::autoship_workflow::merge_request_not_executed(&raw),
+            "merge request rejected before execution; release non-execution proof separately");
+        if let Ok(receipt) = accepted_merge_receipt(&raw, &node, pr, head, operation_id) {
+            store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
+            return Ok(receipt);
+        }
+    }
+    // A durable dispatch can never be replayed. Read the authoritative PR
+    // and immutable merge commit; missing/contradictory proof stays pending.
+    let raw = github.call(&["api", &format!("repos/{repository}/pulls/{pr}")]).await?;
+    let remote: serde_json::Value = serde_json::from_str(&raw)?;
+    anyhow::ensure!(remote["merged"] == true
+        && remote["number"].as_u64() == Some(pr)
+        && remote["node_id"].as_str() == Some(record.node.as_str())
+        && remote["head"]["sha"].as_str() == Some(head)
+        && remote["base"]["repo"]["full_name"].as_str().is_some_and(|name| name.eq_ignore_ascii_case(repository)),
+        "merge-reconciliation-required: remote PR does not prove the dispatched identity");
+    let sha = remote["merge_commit_sha"].as_str().context("remote merge commit missing")?;
+    anyhow::ensure!(matches!(sha.len(),40|64) && sha.bytes().all(|c|c.is_ascii_hexdigit()), "invalid remote merge commit");
+    let raw = github.call(&["api", &format!("repos/{repository}/git/commits/{sha}")]).await?;
+    let commit: serde_json::Value = serde_json::from_str(&raw)?;
+    anyhow::ensure!(commit["sha"].as_str() == Some(sha), "immutable commit identity differs");
+    let receipt = MergeMutationReceipt {
+        expected_head: head.into(), pr_number: pr, pr_node_id: record.node.clone(),
+        merge_commit: sha.into(),
+        merged_by: remote["merged_by"]["login"].as_str().context("remote merge actor missing")?.into(),
+        merged_at: remote["merged_at"].as_str().context("remote merge time missing")?.into(),
+        merge_message: Some(commit["message"].as_str().context("immutable commit message missing")?.into()),
+        client_mutation_id: String::new(), commit_marker_operation: Some(operation_id.into()),
+    };
+    store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
+    Ok(receipt)
+}
+
+async fn reconcile_merge_records(github: &mut impl Github, store: &mut crate::autoship_workflow::WorkflowStore, repository: &str) -> Result<usize> {
+    let mut confirmed = 0;
+    // The ledger, not the open-PR inventory, owns uncertain dispatch recovery.
+    // Dispatch capacity bounds this set; accounting recovery spends no model calls.
+    for record in store.pending_merge_dispatches(repository)? {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), recover_dispatched_merge(github, &record, store)).await {
+            Ok(Ok(_)) => confirmed += 1,
+            Ok(Err(error)) => warn!(operation=%record.operation.id, "merge dispatch remains unresolved: {error:#}"),
+            Err(_) => warn!(operation=%record.operation.id, "merge dispatch reconciliation timed out; capacity retained"),
+        }
+    }
+    Ok(confirmed)
+}
+
+pub(super) async fn reconcile_merge_dispatches(root: &Path, dry_run: bool) -> Result<usize> {
+    if dry_run || !workflow::path().exists() { return Ok(0); }
+    let repository = workflow::canonical_repository(root).await?;
+    let mut store = crate::autoship_workflow::WorkflowStore::open(&workflow::path())?;
+    reconcile_merge_records(&mut MergeTransport(root), &mut store, &repository).await
 }
 
 async fn merge_mutation(
@@ -436,6 +508,13 @@ async fn merge_mutation(
     cap: u32,
 ) -> Result<Option<MergeMutationReceipt>> {
     let operation_id = operation.id.as_str();
+    let dispatch = store.merge_dispatch(operation_id)?;
+    if let Some(record) = &dispatch {
+        anyhow::ensure!(record.repository.eq_ignore_ascii_case(repository) && record.pr == pr
+            && record.operation.workflow == operation.workflow && record.operation.kind == operation.kind
+            && record.operation.binding == operation.binding && operation.binding.head == head,
+            "merge recovery differs from stored dispatch identity");
+    }
     if let Some(receipt) = store.confirmed_merge_receipt(operation_id)? {
         return Ok(Some(serde_json::from_value(receipt)?));
     }
@@ -447,6 +526,9 @@ async fn merge_mutation(
         let receipt = accepted_merge_receipt(&raw, &node, pr, head, operation_id)?;
         store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
         return Ok(Some(receipt));
+    }
+    if let Some(record) = dispatch.filter(|record| record.state == "dispatched") {
+        return Ok(Some(recover_dispatched_merge(github, &record, store).await?));
     }
     let raw = github
         .call(&[
@@ -623,6 +705,66 @@ mod tests {
         assert!(merge_transport_output(false,"".into(),"timeout",true).is_err());
         assert!(merge_transport_output(false,"bad JSON".into(),"failure",true).is_err());
         assert!(merge_transport_output(false,raw.into(),"non-GraphQL failure",false).is_err());
+    }
+
+    #[tokio::test]
+    async fn lost_merge_response_recovers_only_from_bound_immutable_marker() {
+        use crate::autoship_workflow::{WorkflowStore, Binding};
+        for scenario in ["valid", "wrong-marker", "wrong-head", "wrong-node", "wrong-commit", "manual", "legacy"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("workflow.db");
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let binding = Binding { head:"head".into(), contract:"contract".into(), evidence_hash:"proof".into() };
+            store.register("owner/repo#12", "fixture", binding.clone(), now).unwrap();
+            let lease = store.claim("owner/repo#12", "fixture", now, 60_000).unwrap().unwrap();
+            store.attach_pr(&lease, 12, now).unwrap();
+            let op = store.begin_operation(&lease, OperationKind::MergePr, &binding, now).unwrap();
+            store.reserve_merge(&lease, &op, "owner/repo", 12, "PR_fixture", now, 5).unwrap();
+            let marker = if scenario == "legacy" { store.dispatch_merge(&lease,&op,now,5).unwrap(); "legacy-no-proof".into() }
+                else { store.dispatch_marked_merge(&lease, &op, now, 5).unwrap() };
+            drop(store);
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let mut remote = serde_json::json!({"node_id":"PR_fixture","number":12,"merged":true,"head":{"sha":"head"},
+                "base":{"repo":{"full_name":"Owner/Repo"}},"merge_commit_sha":"a".repeat(40),"merged_by":{"login":"controller"},
+                "merged_at":chrono::DateTime::from_timestamp_millis(now).unwrap().to_rfc3339()});
+            let mut commit = serde_json::json!({"sha":"a".repeat(40),"message":marker});
+            match scenario {
+                "wrong-marker" | "manual" => commit["message"] = "manually merged with same account and head".into(),
+                "wrong-head" => remote["head"]["sha"] = "other".into(),
+                "wrong-node" => remote["node_id"] = "OTHER".into(),
+                "wrong-commit" => commit["sha"] = "b".repeat(40).into(),
+                _ => (),
+            }
+            let mut github = MergeFake { replies:VecDeque::from([Ok(remote.to_string()),Ok(commit.to_string())]), calls:vec![] };
+            if scenario == "valid" {
+                let mut checkpoint = store.snapshot(&op.workflow).unwrap().unwrap().checkpoint;
+                checkpoint.stage = crate::autoship_workflow::Stage::Merged;
+                store.checkpoint(&lease, &checkpoint, now).unwrap();
+                assert_eq!(reconcile_merge_records(&mut github,&mut store,"other/repo").await.unwrap(),0);
+                assert!(github.calls.is_empty());
+                assert_eq!(reconcile_merge_records(&mut github,&mut store,"owner/repo").await.unwrap(),1,
+                    "a terminal workflow must still recover its pending ledger dispatch without open-PR inventory");
+                assert_eq!(reconcile_merge_records(&mut github,&mut store,"owner/repo").await.unwrap(),0);
+            }
+            let result = merge_mutation(&mut github,"owner/repo",12,"head",&op,&lease,&mut store,5).await;
+            if scenario == "valid" {
+                let receipt = result.unwrap().unwrap();
+                let value = serde_json::to_value(&receipt).unwrap();
+                assert!(value.get("client_mutation_id").is_none(), "recovery must not invent a server mutation echo");
+                assert_eq!(value["commit_marker_operation"], op.id);
+                store.record_merge_mutation(&lease,&op.id,&value,now).unwrap();
+                let again = merge_mutation(&mut github,"owner/repo",12,"head",&op,&lease,&mut store,5).await.unwrap().unwrap();
+                assert_eq!(again, receipt);
+                assert_eq!(github.calls.len(),2);
+                assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,1);
+            } else {
+                assert!(result.is_err(), "{scenario} must stay unresolved");
+                assert_eq!(store.merge_allowance(now,5).unwrap().pending,1);
+                assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,0);
+            }
+            assert!(github.calls.iter().all(|call| call.first().is_some_and(|v| v=="api") && call.get(1).is_some_and(|v|v.starts_with("repos/owner/repo/"))), "recovery uses read-only explicit-repository requests");
+        }
     }
 
     #[tokio::test]

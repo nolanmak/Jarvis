@@ -1565,6 +1565,9 @@ async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
 /// justification is that it finishes work already approved, and acting on a
 /// guess would make it something else.
 async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
+    if let Err(error)=publication::reconcile_merge_dispatches(repo_root,dry_run).await {
+        warn!("merge dispatch reconciliation unavailable: {error:#}");
+    }
     if !dry_run {
         if let Err(error)=workflow::reconcile_runtime_retirements() {
             warn!("native runtime retirement reconciliation unavailable: {error:#}");
@@ -11687,7 +11690,7 @@ impl AutoPrLoop {
     where F: Fn() -> T, T: std::future::Future<Output = Result<RunReport>>,
         S: Fn() -> U, U: std::future::Future<Output = usize>,
     {
-        let interval = self.interval;
+        let interval = self.interval.min(std::time::Duration::from_secs(300));
         let stop = shutdown.clone();
         let upgrade_stop = tokio_util::sync::CancellationToken::new();
         let reconciliation_stop = upgrade_stop.clone();
@@ -12991,6 +12994,29 @@ for tool, arguments in [
         std::fs::write(&path, "partial").unwrap();
         assert!(DailyCounter::update(&path, |counter| Ok(counter.begin_attempt(100))).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "partial");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_runs_every_five_minutes_with_slower_builder_polling() {
+        let state = tempfile::tempdir().unwrap();
+        let mut worker = AutoPrLoop::for_tests(PathBuf::from("/nonexistent"), 5, state.path());
+        worker.interval = std::time::Duration::from_secs(1800);
+        let start = tokio::time::Instant::now();
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = times.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        worker.run_with(shutdown, || async { Ok(RunReport::idle()) }, move || {
+            let times = observed.clone();
+            let stop = stop.clone();
+            async move {
+                let mut times = times.lock().unwrap();
+                times.push((tokio::time::Instant::now()-start).as_secs());
+                if times.len() == 3 { stop.cancel(); }
+                0
+            }
+        }).await.unwrap();
+        assert_eq!(*times.lock().unwrap(), vec![0,300,600]);
     }
 
     #[tokio::test(start_paused = true)]
