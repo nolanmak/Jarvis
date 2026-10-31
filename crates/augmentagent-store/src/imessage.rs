@@ -452,7 +452,8 @@ impl Store {
         self.allow_imessage(true, identifier)
     }
 
-    /// Returns `false` if the conversation was not on the list.
+    /// Persist an exclusion, even when contact defaults are enabled.
+    /// Returns `false` if the conversation was already explicitly denied.
     pub fn deny_imessage_outbound(&self, identifier: &str) -> StoreResult<bool> {
         self.deny_imessage(true, identifier)
     }

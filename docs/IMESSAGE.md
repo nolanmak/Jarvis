@@ -464,8 +464,8 @@ send as a recovery shortcut; reconcile against `chat.db` first.
 ```sh
 python3 -m unittest discover -s scripts/imessage/tests -v
 ./scripts/cargo-managed.sh test -p augmentagent-channel-imessage
-./scripts/cargo-managed.sh test -p augmentagent-store --test imessage_outbox
-./scripts/cargo-managed.sh test -p augmentagent-cli --test imessage_outbox_cli
+./scripts/cargo-managed.sh test -p augmentagent-store --test imessage_outbox --test imessage_compose
+./scripts/cargo-managed.sh test -p augmentagent-cli --test imessage_outbox_cli --test imessage_compose_cli
 ./scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent imessage_send
 ./scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent imessage_compose
 ```
