@@ -1,6 +1,7 @@
 //! `augmentagent` binary.
 
 mod approval_context;
+mod team_coverage;
 mod disk_pressure;
 mod autoship_worktree_cleanup;
 mod document_signing;
@@ -63,7 +64,7 @@ use augmentagent_channel_email::sigextract::{
     SignatureExtractor,
 };
 use augmentagent_channel_email::{
-    parse_rfc2822_or_ms, GmailChannel, GmailChannelConfig, OutboundObserver,
+    GmailChannel, GmailChannelConfig, OutboundObserver,
 };
 use augmentagent_channel_linkedin::{
     build_normshares_body, default_auth_path, is_linkedin_email, ConnectionRequestEngagement,
@@ -402,6 +403,12 @@ enum Cmd {
     Team {
         #[command(subcommand)]
         op: TeamOp,
+    },
+    /// Teammate-coverage shadow report, owner review and rollout gate
+    /// (#1702). The gate must PASS before `AUGMENTAGENT_TEAM_COVERAGE=on`.
+    TeamCoverage {
+        #[command(subcommand)]
+        op: TeamCoverageOp,
     },
     /// Structured cross-channel message index (#1095): backfill and health.
     Messages {
@@ -4534,6 +4541,7 @@ async fn main() -> Result<()> {
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::Team { .. } => unreachable!("handled before database initialization"),
+        Cmd::TeamCoverage { op } => team_coverage_cmd(&store, op),
         Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Disk { .. } => unreachable!("handled before database initialization"),
         Cmd::Deploy { .. } => unreachable!("handled before database initialization"),
@@ -8834,6 +8842,17 @@ async fn run_stale_approval_reconcile(
     for bad in roster.invalid_entries() {
         warn!(entry = %bad, "ignored invalid AUGMENTAGENT_OWNER_TEAM entry");
     }
+    // #1700 — without aliases the hand-back check can't run, so the rule
+    // stays off rather than retire "<owner>, can you take this?".
+    let team = team_coverage::Config::from_env(&store);
+    if !team.roster.is_empty() && team.aliases.is_empty() && team.mode != team_coverage::Mode::Off {
+        warn!(
+            "team coverage inactive: {} is set but {} is empty",
+            augmentagent_messages::team::TeamRoster::ENV,
+            team_coverage::ALIASES_ENV
+        );
+    }
+    info!(mode = team.mode.as_str(), active = team.active(), "team coverage configured");
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -8854,6 +8873,95 @@ async fn run_stale_approval_reconcile(
             }
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum TeamCoverageOp {
+    /// Every coverage decision in the window, with the summary and gate.
+    Report {
+        /// Only decisions from the last N days.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Mark a decision `correct` or `wrong` (re-reviewing replaces it).
+    Review { action_id: String, verdict: String },
+    /// Evaluate the rollout gate over all decisions; exit 1 unless it passes.
+    Gate,
+}
+
+fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
+    use team_coverage::{gate, summarize, summary_line};
+    let now = chrono::Utc::now().timestamp_millis();
+    match op {
+        TeamCoverageOp::Report { days, json } => {
+            let rows = store.team_coverage_report(now - i64::from(days) * 86_400_000)?;
+            let s = summarize(&rows);
+            let g = gate(&s, now);
+            if json {
+                let v = serde_json::json!({
+                    "rows": rows.iter().map(|r| serde_json::json!({
+                        "action_id": r.decision.action_id,
+                        "mode": r.decision.mode,
+                        "platform": r.platform,
+                        "teammate": r.decision.teammate,
+                        "covering_message_id": r.decision.covering_message_id,
+                        "thread_id": r.decision.thread_id,
+                        "covered_at_ms": r.decision.covered_at_ms,
+                        "decided_at_ms": r.decision.decided_at_ms,
+                        "owner_replied_anyway": r.owner_replied_anyway,
+                        "review": r.review,
+                    })).collect::<Vec<_>>(),
+                    "summary": {
+                        "decisions": s.decisions,
+                        "reviewed": s.reviewed,
+                        "wrong": s.wrong,
+                        "replied_anyway": s.replied_anyway,
+                        "first_decided_ms": s.first_decided_ms,
+                    },
+                    "gate": { "pass": g.pass, "reasons": g.reasons },
+                });
+                println!("{v}");
+            } else {
+                for r in &rows {
+                    let at = chrono::DateTime::from_timestamp_millis(r.decision.covered_at_ms)
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    println!(
+                        "{}\t{}\t{}\tteammate={}\tcovered={}\tmsg={}\treplied-anyway={}\treview={}",
+                        r.decision.action_id,
+                        r.decision.mode,
+                        r.platform,
+                        r.decision.teammate,
+                        at,
+                        r.decision.covering_message_id,
+                        r.owner_replied_anyway,
+                        r.review.as_deref().unwrap_or("-"),
+                    );
+                }
+                println!("{}", summary_line(&s, &g, now));
+            }
+        }
+        TeamCoverageOp::Review { action_id, verdict } => {
+            if !store.review_team_coverage(&action_id, &verdict)? {
+                anyhow::bail!("no team-coverage decision for action {action_id}");
+            }
+            println!("reviewed {action_id}: {verdict}");
+        }
+        TeamCoverageOp::Gate => {
+            let s = summarize(&store.team_coverage_report(0)?);
+            let g = gate(&s, now);
+            println!("{}", summary_line(&s, &g, now));
+            for r in &g.reasons {
+                println!("  - {r}");
+            }
+            if !g.pass {
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -8894,6 +9002,14 @@ fn team_list(json: bool) -> Result<()> {
 /// One reconciliation pass. Returns how many cards were retired. Split out from
 /// the loop so it is directly unit-testable.
 fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
+    reconcile_stale_approvals_tick_with(store, &team_coverage::Config::from_env(store))
+}
+
+/// [`reconcile_stale_approvals_tick`] with an explicit teammate-coverage
+/// config (#1700), so tests don't depend on the process environment.
+fn reconcile_stale_approvals_tick_with(store: &Store, team: &team_coverage::Config) -> Result<usize> {
+    let team_active = team.active();
+    let mut covered: Vec<(String, String, team_coverage::Coverage)> = Vec::new();
     let pending = store.pending_actions_for_reconcile()?;
     let scheduled = store.scheduled_actions_for_reconcile()?;
     if pending.is_empty() && scheduled.is_empty() {
@@ -8973,7 +9089,7 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
         let Some(tid) = row.thread_id.as_deref() else {
             continue;
         };
-        let after_ms = match row.received_at.as_deref().map(parse_rfc2822_or_ms) {
+        let after_ms = match row.received_at.as_deref().map(team_coverage::message_time_ms) {
             Some(ms) if ms > 0 => ms,
             _ => row.created_at_ms,
         };
@@ -8986,6 +9102,20 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
                     "stale approval: retiring card, user already replied to this inbound"
                 );
                 answered_ids.push(row.id.clone());
+            }
+            // Rule 4 (#1700) — a rostered teammate already answered the
+            // asker on the owner's behalf. Email cards only; group chats are
+            // #1701. Shadow mode records the decision and retires nothing.
+            Ok(false) if team_active && team_coverage::supported(&row.platform) => {
+                match team_coverage::find_coverage(store, row, after_ms, team) {
+                    Ok(Some(c)) => covered.push((row.id.clone(), tid.to_string(), c)),
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        action_id = %row.id,
+                        thread = %tid,
+                        "team coverage: find_coverage failed: {e:#}"
+                    ),
+                }
             }
             Ok(false) => {}
             Err(e) => warn!(
@@ -9066,6 +9196,35 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
         &answered_ids,
         "superseded: you already replied on this thread",
     )?;
+    let now = chrono::Utc::now().timestamp_millis();
+    for (action_id, thread_id, c) in covered {
+        let decision = augmentagent_store::team_coverage::TeamCoverageDecision {
+            action_id: action_id.clone(),
+            mode: team.mode.as_str().to_string(),
+            teammate: c.teammate.clone(),
+            covering_message_id: c.covering_message_id.clone(),
+            thread_id: thread_id.clone(),
+            covered_at_ms: c.covered_at_ms,
+            decided_at_ms: now,
+        };
+        if store.record_team_coverage_decision(&decision)? {
+            info!(
+                action_id = %action_id,
+                thread = %thread_id,
+                teammate = %c.teammate,
+                covering_message = %c.covering_message_id,
+                mode = team.mode.as_str(),
+                "team coverage: {}",
+                if team.mode == team_coverage::Mode::On { "retiring card" } else { "would retire" }
+            );
+        }
+        if team.mode == team_coverage::Mode::On {
+            retired += store.mark_pending_heuristic_superseded_by_ids(
+                &[action_id],
+                &format!("superseded: covered by teammate {}", c.teammate),
+            )?;
+        }
+    }
     Ok(retired)
 }
 
@@ -23881,3 +24040,5 @@ pub(crate) mod test_support {
         }
     }
 }
+
+
