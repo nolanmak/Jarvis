@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1704,
+  "source_sha256": [
+    {
+      "path": "scripts/ensure-autopr-worker.sh",
+      "sha256": "86327e559d6a82b769c14b5fd3252b1dfed27dfb5ec561677a8654955aea3267"
+    },
+    {
+      "path": "scripts/check-for-updates.sh",
+      "sha256": "3070a5aad6c6a176cff258562e01c8e0049fd7e6000a836dfe0ffe8c92d1dd1e"
+    },
+    {
+      "path": "scripts/tests/autopr_worker_install_test.py",
+      "sha256": "7bf13143f8f16ba9af40df9849a98f2f7d2984a702ddfa428fa5883c49605299"
+    },
+    {
+      "path": "scripts/tests/updater_worker_provision_test.py",
+      "sha256": "24e061e172d973498a4c38252c08d0c8d5d81f1431beb91ad1ed65c60038869c"
+    }
+  ],
+  "observed_production_failure": "Both Cargo release executables were mode 0775 with two hard links; deployment trust checks reject group-write access. Policy selection made this previously hidden check reachable.",
+  "red": [
+    {
+      "commit": "eb654465",
+      "command": "python3 scripts/tests/autopr_worker_install_test.py",
+      "failure": "cached executable modes remain 0775",
+      "log_sha256": "e29a12f63dbd7ccae1d77402c9eb8d4c17e1463dfc41a4da388b7adf8378ddee"
+    },
+    {
+      "commit": "48bf5f9e",
+      "command": "python3 scripts/tests/updater_worker_provision_test.py",
+      "failure": "script-only pull skips worker provisioning and leaves modes 0775",
+      "log_sha256": "b563438df0970d1f88fe37fe3de5b0370f873c4ab06463283b8409b001875b31"
+    }
+  ],
+  "green": {
+    "installer_tests": 1,
+    "whole_updater_tests": 2,
+    "build_wrapper_outcome_cases": 8,
+    "installer_log_sha256": "2d29252106404abedc07d5628b4ebe7fb597fc4b260975732e851312cbf0dc8c",
+    "updater_log_sha256": "544fe7f9ee5d4aa36f7d738d22a83e3d62047ddc3038f99c604f7d8099f85ec7"
+  },
+  "preserved": [
+    "existing Cargo inode/hard links and file bytes",
+    "existing owner-private read permissions",
+    "no symlink/FIFO/non-executable normalization",
+    "both files validate before either mode changes",
+    "failure withholds deployment stamp and service restart",
+    "worker provisioning never forces an active worker restart",
+    "deployment executable trust policy and restart budget unchanged"
+  ],
+  "not_proved": [
+    "Both production processes have loaded the selected native policy",
+    "Full native issue or PR merge acceptance",
+    "Discord coding consumer",
+    "Soak and daily shipping throughput"
+  ]
+}
