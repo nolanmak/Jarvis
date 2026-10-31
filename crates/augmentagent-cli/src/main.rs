@@ -1100,6 +1100,10 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Stop new dispatches; active-work teardown remains separately verified.
+    Pause(autoship_commands::control_command::Args),
+    /// Clear only the explicit owner pause after access and readiness checks.
+    Resume(autoship_commands::control_command::Args),
     /// Execute one admitted workflow attempt through the normal gates.
     Work(autoship_commands::work_command::WorkArgs),
     /// Durably submit an explicit issue or PR; acceptance does not mean execution.
@@ -3101,6 +3105,12 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Autopr { op: AutoprOp::Work(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::work_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Pause(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::control_command::run(args,true).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Resume(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::control_command::run(args,false).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Run(ref args) } = cli.cmd {
         std::process::exit(autoship_commands::run_command::run(args).await);
@@ -5678,6 +5688,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Run(..) } => unreachable!("submission precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readiness { .. } } => unreachable!("readiness precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),

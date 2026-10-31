@@ -40,7 +40,7 @@ pub(crate) async fn observe(repo:&Path, path:&Path, admission:Value, until:Miles
         }
         let held=matches!(body["stage"].as_str(),Some("held"|"retired"|"merged"));
         let queued_blocker=body["stage"]=="queued" && matches!(body["last_attempt"]["outcome"].as_str(),Some("deferred"|"rejected"|"failed"));
-        if code==2 || code==4 || held || queued_blocker {
+        if code==2 || code==4 || held || queued_blocker || body["owner_control"]["paused"]==true {
             body["observation"]=json!({"state":"blocked","detached":true});
             return (if code==2 || code==4 {4} else {3},body);
         }

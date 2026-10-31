@@ -109,12 +109,14 @@ pub(super) struct CapacityAccounting {
 }
 impl CapacityAccounting {
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
-        if !self.audit.resource_capacity_seen() { return Ok(None); }
-        let calls_after = self.store.lock().map_err(|_| anyhow::anyhow!("workflow store lock poisoned"))?
-            .snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
+        let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
+        let paused=store.owner_control(&self.workflow)?.is_some_and(|c|c.paused);
+        if !paused && !self.audit.resource_capacity_seen() { return Ok(None); }
+        let calls_after = store.snapshot(&self.workflow)?.context("capacity workflow missing")?.model_calls;
         let paid = calls_after.checked_sub(self.calls_before).context("durable model admissions decreased")?;
         Ok(Some(RunReport {
-            message: format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)"),
+            message: if paused {format!("Autoship owner pause requested; candidate and evidence preserved ({paid} model admissions this run)")}
+                else {format!("Autoship awaiting declared run capacity; candidate and evidence preserved ({paid} model admissions this run)")},
             billed: paid > 0,
             held: paid == 0,
             resumed: self.resumed,
@@ -767,6 +769,12 @@ impl WorkflowGuard {
     }
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
+        let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
+        self.audit.set_dispatch_observer(Arc::new(move || {
+            let mut store=dispatch_store.lock().map_err(|_|anyhow::anyhow!("workflow dispatch lock poisoned"))?;
+            let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
+            store.validate_dispatch(&dispatch_lease,&binding,millis())
+        }))?;
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
         let capacity_flag = self.capacity_exhausted.clone();
@@ -1329,6 +1337,8 @@ impl WorkflowGuard {
             &actual == expected,
             "workflow evidence changed; fresh verification and review required"
         );
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+            .validate_dispatch(&self.lease,expected,millis())?;
         Ok(())
     }
 
@@ -1364,6 +1374,12 @@ impl WorkflowGuard {
         action: &str,
         eligible_at_ms: i64,
     ) -> Result<()> {
+        // Completion and waiting receipts remain recordable after a pause;
+        // entering another productive stage does not.
+        if !matches!(stage,Stage::Merged|Stage::Retired|Stage::Held|Stage::AwaitChecks) {
+            self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?
+                .require_owner_dispatch(self.id())?;
+        }
         let evidence = self
             .store
             .lock()
@@ -1822,6 +1838,30 @@ mod tests {
             ),
             "transient transport failure must not grant another fresh builder reset"
         );
+        guard.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_pause_fences_live_guard_dispatch_without_losing_completion_receipts() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {
+            repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(7),pr:Some(42),
+            branch:"fix/seven",contract:"C1",environment:"rust-a",
+        },millis()).await.unwrap().unwrap();
+        let operation=guard.intent(OperationKind::Push).unwrap();
+        let accounting=guard.capacity_accounting(false).unwrap();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        WorkflowStore::open(&path).unwrap().set_owner_pause(guard.id(),"github:owner",0,true,millis()).unwrap();
+        assert!(guard.transition(Stage::Review,"review","review",0).await.is_err());
+        assert!(guard.audit_logger().model_call_admitted("claude").is_err());
+        assert!(augmentagent_channel_core::run_resources::check_requirement("verification",Some(&guard.audit_logger())).unwrap_err().to_string().contains("owner-paused"));
+        assert!(!guard.audit_logger().resource_capacity_seen(),"owner pause is not resource exhaustion");
+        assert!(accounting.report().unwrap().unwrap().message.contains("owner pause"));
+        assert!(guard.validate_binding(guard.binding()).await.is_err());
+        guard.observe_remote(&operation,"published-head",None).unwrap();
+        let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.model_calls,before.model_calls);
+        assert!(WorkflowStore::open(&path).unwrap().pending_operations(guard.id()).unwrap().is_empty());
         guard.finish().unwrap();
     }
 

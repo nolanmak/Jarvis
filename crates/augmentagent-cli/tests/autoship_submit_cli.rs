@@ -66,6 +66,55 @@ fn body(output: Output, code: i32) -> serde_json::Value {
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+
+fn control(root:&Path,action:&str,id:&str)->Output {
+    Command::new(env!("CARGO_BIN_EXE_augmentagent")).current_dir(root)
+        .env("FIXTURE",root).env("GH_BIN",root.join("gh"))
+        .env("XDG_STATE_HOME",root.join("state"))
+        .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.join("state/workflow.db"))
+        .env("AUGMENTAGENT_NATIVE_VM_POLICY",root.join("absent-native-policy.json"))
+        .args(["autopr",action,"--workflow",id,"--json"]).output().unwrap()
+}
+
+#[test]
+fn owner_pause_is_durable_and_unready_or_unauthorized_resume_cannot_clear_it() {
+    let root=fixture();let admitted=body(run(root.path(),&[]),0);
+    let id=admitted["workflow"].as_str().unwrap();
+    let paused=body(control(root.path(),"pause",id),0);
+    assert_eq!(paused["accepted"],true);assert_eq!(paused["complete"],false);
+    assert_eq!(paused["owner_control"]["paused"],true);
+    assert_eq!(paused["worker_enforcement"],"unverified");
+    assert_eq!(paused["quiescence"],"unverified");
+    let observed=body(status(root.path(),id),3);
+    assert_eq!(observed["reason"],"owner-pause-requested");
+    let waiting=body(run(root.path(),&["--wait","--timeout-secs","0"]),3);
+    assert_eq!(waiting["observation"]["state"],"blocked");
+    assert_eq!(waiting["reason"],"owner-pause-requested");
+    let deferred=body(work(root.path(),id),3);
+    assert_eq!(deferred["reason"],"owner-pause-requested");
+    let failed_resume=body(control(root.path(),"resume",id),3);
+    assert_eq!(failed_resume["reason"],"execution-readiness-blocked");
+    assert_eq!(body(status(root.path(),id),3)["owner_control"],paused["owner_control"]);
+    std::fs::write(root.path().join("scenario.json"),r#"{"permission":"READ"}"#).unwrap();
+    assert_eq!(body(work(root.path(),id),2)["reason"],"target-authorization-failed");
+    assert_eq!(body(control(root.path(),"resume",id),2)["accepted"],false);
+    assert_eq!(body(control(root.path(),"pause",id),2)["accepted"],false);
+    assert_eq!(body(status(root.path(),id),3)["owner_control"],paused["owner_control"]);
+    assert!(!root.path().join(".self-improve-worktrees").exists());
+    assert!(!root.path().join("data.db").exists());
+}
+
+#[test]
+fn owner_control_audit_failure_rolls_back_pause_and_reports_storage_failure() {
+    let root=fixture();let admitted=body(run(root.path(),&[]),0);
+    let id=admitted["workflow"].as_str().unwrap();
+    let conn=rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER deny_control_audit BEFORE INSERT ON workflow_owner_control_event BEGIN SELECT RAISE(ABORT,'audit unavailable'); END;").unwrap();
+    let refused=body(control(root.path(),"pause",id),4);
+    assert_eq!(refused["accepted"],false);assert_eq!(refused["reason"],"workflow-state-unavailable");
+    assert!(body(status(root.path(),id),0)["owner_control"].is_null());
+    assert_eq!(conn.query_row("SELECT count(*) FROM workflow_owner_control",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+}
 #[test]
 fn dry_run_and_unauthorized_targets_create_no_state() {
     let root = fixture();

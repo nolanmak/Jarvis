@@ -72,6 +72,27 @@ pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<(
     resolve(repo, request).await.map(|_| ())
 }
 
+/// Shared read-only execution admission, also used before clearing owner pause.
+/// Background dispatch still verifies deployed-service equality independently.
+pub(crate) async fn command_readiness(repo:&Path,request:&Request)->Result<()> {
+    execution_preflight(repo,Some(request.target),ExecutionMode::Local).await
+}
+
+pub(super) async fn execution_preflight(repo:&Path,target:Option<Target>,mode:ExecutionMode)->Result<()> {
+    let readiness:Result<()>=async {
+        tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
+            .await.context("native runtime preflight task failed")??;
+        if let Some(target)=target {
+            let builder=workflow_builder(repo,target).await?;
+            provider_readiness::inspect_builder(builder.as_ref()).preflight()?;
+        } else {provider_readiness::inspect().preflight()?;}
+        augmentagent_channel_core::run_resources::readiness().await.preflight()?;
+        if mode==ExecutionMode::Background {crate::autoship_deployment::inspect(repo).await.preflight()?;}
+        Ok(())
+    }.await;
+    readiness.context(CommandFailure {code:3,reason:"execution-readiness-blocked"})
+}
+
 /// Final read-only observation for PR milestone waiters. Closed PRs remain
 /// observable on replay, but the repository grant and exact PR identity must hold.
 pub(crate) async fn published_pr_head(repo: &Path, repository: &str, pr: u64) -> Result<String> {
@@ -191,6 +212,9 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
         .command_request(id)?
         .context("no queued command for workflow")?;
     authorize_command(repo, &request).await.context(CommandFailure {code:2, reason:"target-authorization-failed"})?;
+    // Pending merge accounting remains readable below; no new worker dispatch
+    // may start while the owner pause is set.
+    let paused=store.owner_control(id)?.is_some_and(|c|c.paused);
     let mut waiting_for_checks = false;
     if let Some(snapshot) = store.snapshot(id)? {
         use crate::autoship_workflow::Stage;
@@ -209,6 +233,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
             }
             return Ok(RunReport::held("Merge reconciliation remains pending; no mutation replayed".into()));
         }
+        if paused {return Ok(RunReport::held("Owner pause requested; no new dispatch".into()));}
         if snapshot.checkpoint.stage == Stage::Merged {
             return Ok(RunReport::triage("Workflow is already merged".into()));
         }
@@ -225,6 +250,7 @@ pub(super) async fn work_once_mode(repo: &Path, id: &str, mode: ExecutionMode) -
             waiting_for_checks = true;
         }
     }
+    if paused {return Ok(RunReport::held("Owner pause requested; no new dispatch".into()));}
     let source_issue = if let Target::Issue(n) = request.target {
         Some(n)
     } else {

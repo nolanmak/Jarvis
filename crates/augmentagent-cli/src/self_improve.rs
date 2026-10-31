@@ -4586,6 +4586,7 @@ async fn gate_for_round(worktree: &Path, changed_paths: &str, audit: &Arc<augmen
 }
 
 async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>) -> Result<()> {
+    audit.dispatch_allowed()?;
     gate_disk_guard()?;
     shared_ci::verify(worktree, audit).await
 }
@@ -6824,6 +6825,7 @@ async fn resume_draft_pr(
         };
         if let Err(gate_err) = gate_result {
             if workflow.audit_logger().resource_capacity_seen() { return Err(gate_err); }
+            if let Some(report)=capacity_accounting.report()? {return Ok(report);}
             // #931 — a failure `main` already has is not this draft's; do
             // not spend a repair round on it or count an attempt. The
             // ledger mark at the top of this fn already moves the picker on.
@@ -7563,7 +7565,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             if let Some(id) = next {
                 use crate::autoship_workflow::submission::AttemptOutcome;
                 let result = targeted::work_once_mode(repo_root, &id, targeted::ExecutionMode::Background).await;
-                let (outcome,reason) = match &result {
+                let paused=crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
+                    .owner_control(&id)?.is_some_and(|control|control.paused);
+                let unauthorized=result.as_ref().err().and_then(|error|error.downcast_ref::<targeted::CommandFailure>()).is_some_and(|failure|failure.code==2);
+                let (outcome,reason) = if paused && !unauthorized {(AttemptOutcome::Deferred,"owner-pause-requested")} else {match &result {
                     Ok(report) if report.is_idle() => (AttemptOutcome::Deferred,"workflow-deferred"),
                     Ok(_) => (AttemptOutcome::Progress,"workflow-progressed"),
                     Err(error) => match error.downcast_ref::<targeted::CommandFailure>() {
@@ -7571,7 +7576,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         Some(failure) if failure.code==3 => (AttemptOutcome::Deferred,failure.reason),
                         _ => (AttemptOutcome::Failed,"execution-failed"),
                     },
-                };
+                }};
                 crate::autoship_workflow::WorkflowStore::open(&workflow::path())?
                     .finish_command_attempt(&id,selected_at,outcome,reason,chrono::Utc::now().timestamp_millis())?;
                 return result;
@@ -7588,22 +7593,11 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         // Read-only, before lock/state creation, issue selection or model spend.
         // Hashing runs off the async executor; launches still revalidate their
         // own declarations and retain existing runtime generations.
-        let readiness: Result<()> = async {
-        tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
-            .await.context("native runtime preflight task failed")??;
-        if let Some(selected)=&selected {
-            let target=match selected { targeted::Resolved::Issue(issue)=>crate::autoship_workflow::submission::Target::Issue(issue.number),
-                targeted::Resolved::Pr(pr)=>crate::autoship_workflow::submission::Target::Pr(pr.pr) };
-            let builder=workflow_builder(repo_root,target).await?;
-            provider_readiness::inspect_builder(builder.as_ref()).preflight()?;
-        } else { provider_readiness::inspect().preflight()?; }
-        augmentagent_channel_core::run_resources::readiness().await.preflight()?;
-        if mode == targeted::ExecutionMode::Background {
-            crate::autoship_deployment::inspect(repo_root).await.preflight()?;
-        }
-        Ok(())
-        }.await;
-        readiness.context(targeted::CommandFailure { code:3, reason:"execution-readiness-blocked" })?;
+        let target=selected.as_ref().map(|selected|match selected {
+            targeted::Resolved::Issue(issue)=>crate::autoship_workflow::submission::Target::Issue(issue.number),
+            targeted::Resolved::Pr(pr)=>crate::autoship_workflow::submission::Target::Pr(pr.pr),
+        });
+        targeted::execution_preflight(repo_root,target,mode).await?;
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
@@ -8314,6 +8308,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
         let mut gate_result = verification_gate(&worktree, &workflow_guard.audit_logger()).await;
         while let Err(gate_err) = &gate_result {
             if workflow_guard.audit_logger().resource_capacity_seen() { return Err(gate_result.unwrap_err()); }
+            if let Some(report)=capacity_accounting.report()? {return Ok(report);}
             let gate_text = format!("{gate_err:#}");
             let verdict = preexisting_on_main(repo_root, &gate_text, &workflow_guard.audit_logger()).await;
             let preexisting_only = verdict.as_ref().is_some_and(|v| v.introduced.is_empty())

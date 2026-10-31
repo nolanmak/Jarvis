@@ -268,6 +268,25 @@ fn receipt(op: &Operation, pr: u64, at: i64) -> serde_json::Value {
 }
 
 #[test]
+fn owner_pause_blocks_merge_dispatch_without_discarding_an_inflight_merge_receipt() {
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+    let mut worker=WorkflowStore::open(&path).unwrap();let now=100*DAY;
+    let (lease,op)=fixture(&mut worker,1,now);
+    reserve(&mut worker,&lease,&op,1,now).unwrap();
+    let mut owner=WorkflowStore::open(&path).unwrap();
+    let pause=owner.set_owner_pause(&lease.workflow,"github:owner",0,true,now+1).unwrap();
+    assert!(worker.dispatch_merge(&lease,&op,now+2,5).is_err());
+    assert!(reserve(&mut worker,&lease,&op,1,now+2).is_err());
+    assert_eq!(worker.merge_allowance(now+2,5).unwrap().confirmed,0);
+    owner.set_owner_pause(&lease.workflow,"github:owner",pause.revision,false,now+3).unwrap();
+    worker.dispatch_merge(&lease,&op,now+4,5).unwrap();
+    owner.set_owner_pause(&lease.workflow,"github:owner",pause.revision+1,true,now+5).unwrap();
+    worker.confirm_merge_dispatch(&op,&receipt(&op,1,now+4),now+6).unwrap();
+    worker.complete_operation(&lease,&op.id,"confirmed",now+6).unwrap();
+    assert_eq!(worker.merge_allowance(now+6,5).unwrap().confirmed,1);
+}
+
+#[test]
 fn allowance_reservations_are_not_shipments_and_confirmation_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("workflow.db");

@@ -108,6 +108,13 @@ const DUE_COMMAND_SQL: &str = "SELECT j.workflow FROM command_job j
              ))
              ORDER BY COALESCE(s.attempted_at,0),j.created_at,j.workflow LIMIT 1";
 
+fn due_command_sql(conn:&Connection)->Result<String> {
+    let controls:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_owner_control')",[],|r|r.get(0))?;
+    Ok(if controls {DUE_COMMAND_SQL.replace("WHERE j.repository=?1",
+        "WHERE NOT EXISTS(SELECT 1 FROM workflow_owner_control c WHERE c.workflow=j.workflow AND c.paused=1) AND j.repository=?1")}
+        else {DUE_COMMAND_SQL.into()})
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptOutcome { Selected, Deferred, Rejected, Failed, Progress }
@@ -168,7 +175,7 @@ impl WorkflowStore {
             return Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE repository=?1)",
                 [repository.to_ascii_lowercase()], |row| row.get(0))?);
         }
-        Ok(self.conn.query_row(DUE_COMMAND_SQL, params![repository.to_ascii_lowercase(),now],
+        Ok(self.conn.query_row(&due_command_sql(&self.conn)?, params![repository.to_ascii_lowercase(),now],
             |row| row.get::<_,String>(0)).optional()?.is_some())
     }
 
@@ -187,7 +194,7 @@ impl WorkflowStore {
             return Ok(None);
         }
         let id: Option<String> = tx.query_row(
-            DUE_COMMAND_SQL,
+            &due_command_sql(&tx)?,
             params![repository,now], |row| row.get(0)).optional()?;
         if let Some(id) = &id {
             tx.execute("INSERT INTO command_schedule(workflow,attempted_at,eligible_at) VALUES(?1,?2,?3)

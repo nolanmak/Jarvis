@@ -199,6 +199,7 @@ pub fn check_requirement(
     provider: &str,
     logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
 ) -> Result<()> {
+    if let Some(logger)=logger {logger.dispatch_allowed()?;}
     let Some(logger) = logger.filter(|logger| logger.run_resources_required()) else {
         return Ok(());
     };

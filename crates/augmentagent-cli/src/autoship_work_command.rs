@@ -66,6 +66,12 @@ async fn work(repo: &Path, path: &Path, id: &str) -> (i32, Value) {
     let report = match crate::self_improve::targeted::work_once(repo, &id).await {
         Ok(report) => report,
         Err(e) => {
+            if e.downcast_ref::<crate::self_improve::targeted::CommandFailure>().is_none_or(|failure|failure.code!=2)
+                && WorkflowStore::open_read_only(path).ok().flatten()
+                .and_then(|store|store.owner_control(&id).ok().flatten()).is_some_and(|control|control.paused) {
+                let cap=std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().and_then(|s|s.parse::<u32>().ok()).unwrap_or(5).max(1);
+                return super::status(path,&id,chrono::Utc::now().timestamp_millis(),cap);
+            }
             let (code, reason) = e
                 .downcast_ref::<crate::self_improve::targeted::CommandFailure>()
                 .map(|e| (e.code, e.reason))

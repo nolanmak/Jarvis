@@ -13,6 +13,8 @@ mod merge_allowance;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_owner_control.rs"]
+pub(crate) mod owner_control;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -293,6 +295,12 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_control (
+                workflow TEXT PRIMARY KEY, revision INTEGER NOT NULL, paused INTEGER NOT NULL,
+                principal TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_control_event (
+                workflow TEXT NOT NULL, revision INTEGER NOT NULL, paused INTEGER NOT NULL,
+                principal TEXT NOT NULL, at_ms INTEGER NOT NULL, PRIMARY KEY(workflow,revision));
             CREATE TABLE IF NOT EXISTS pr_ready_receipt (
                 workflow TEXT NOT NULL REFERENCES workflow(id), binding TEXT NOT NULL, pr INTEGER NOT NULL,
                 review_sha256 TEXT NOT NULL, published_at INTEGER NOT NULL, PRIMARY KEY(workflow,binding,pr));
@@ -626,6 +634,7 @@ impl WorkflowStore {
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
         if purpose != ClaimPurpose::General {
+            if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
             let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
             if let Some(policy) = policy {
                 let until: submission::Milestone = serde_json::from_str(&policy)?;
@@ -773,6 +782,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now_ms)?;
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
         tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
         let (receipt, recorded_binding): (Option<String>, String) = tx.query_row(
@@ -1145,6 +1155,7 @@ impl WorkflowStore {
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
         } else {
+            if charge.model_calls>0 {owner_control::require_dispatch(&tx,&lease.workflow)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
@@ -1386,6 +1397,13 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
+        tx.commit()?;Ok(())
+    }
+
     pub fn validate_lease(&mut self, lease: &Lease, binding: &Binding, now_ms: i64) -> Result<()> {
         let tx = self
             .conn
@@ -1612,6 +1630,7 @@ impl WorkflowStore {
         ensure!(operation.kind==OperationKind::CreatePr,"not a publication operation");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,&operation.binding,now)?;
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
         let owner:String=tx.query_row("SELECT workflow FROM operation WHERE id=?1 AND receipt IS NULL",[&operation.id],|r|r.get(0))?;
         ensure!(owner==lease.workflow,"publication operation ownership mismatch");
         let prior:Option<(i64,i64,Option<u64>)>=tx.query_row("SELECT attempt,dispatched_at,pr FROM publication_dispatch WHERE operation=?1",[&operation.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
