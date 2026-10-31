@@ -467,3 +467,23 @@ of model selection observe an atomic published snapshot without creating selecti
 locks or directories. Providers and credentials are rechecked on later admission;
 `declared-available` never asserts a successful live call, sufficient resources,
 matching deployed configuration, or permission to merge.
+
+Resource readiness is reported separately under `resources`. It composes the
+native guest, build guest and declared host overhead with the same memory rule
+used at launch, then checks the calling process's delegated service and aggregate
+ceilings through the packaged resource supervisor. A shared nonblocking admission
+lock protects the memory-capacity snapshot. Existing idle `run-*` reservations
+remain charged at their full ceilings. Invalid declarations, an undersized service,
+missing delegation, exhausted memory headroom and a busy inspector have distinct
+statuses. Inspection has a five-second subprocess deadline and creates no helper
+file, cgroup, workflow state or reservation; it never reclaims cache.
+
+An unused delegated service can report `capacity-unverified` with
+`controller-initialization-required`. That permits the existing locked admission
+step to initialize accounting and attempt reservation; it does not authorize model
+execution or claim readiness. Other resource blockers stop the non-dry-run worker
+before Git access or issue selection. Every actual launch still reserves capacity
+and verifies limits before provider admission. The snapshot is not a reservation,
+and CPU/PID ceilings are declarations, not a promise of future throughput.
+A CLI run outside a delegated service reports its own missing delegation; it does
+not infer the serving worker's effective configuration or capacity.

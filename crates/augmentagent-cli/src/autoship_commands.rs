@@ -161,14 +161,15 @@ pub fn run_status(workflow: &str, json_output: bool) -> i32 {
 
 /// Credential declaration evidence is deliberately separate from role/runtime
 /// readiness. The latter requires controller-bound acceptance evidence.
-pub fn run_readiness(json_output:bool) -> i32 {
+pub async fn run_readiness(json_output:bool) -> i32 {
     let claude=augmentagent_channel_core::native_vm::readiness::credentials("claude");
     let codex=augmentagent_channel_core::native_vm::readiness::credentials("codex");
     let runtime=augmentagent_channel_core::native_vm::readiness::runtime::inspect();
     let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified","runtime":runtime,
         "credentials":{"claude":claude,"codex":codex},
         "roles":crate::self_improve::provider_readiness::inspect(),
-        "unverified":["resource-delegation","capacity","live-guarded-probe","deployed-policy-equality"]});
+        "resources":augmentagent_channel_core::run_resources::readiness().await,
+        "unverified":["live-guarded-probe","deployed-policy-equality"]});
     if json_output {println!("{body}");} else {
         println!("Autoship readiness is unverified.");
         for provider in ["claude","codex"] {
@@ -178,7 +179,8 @@ pub fn run_readiness(json_output:bool) -> i32 {
         for role in ["builder","independent_reviewer","adjudicator"] {
             println!("{role}: {}",body["roles"][role]["status"]);
         }
-        println!("Resource, deployment and live-probe evidence remain unverified.");
+        println!("Resources: {}",body["resources"]["status"]);
+        println!("Deployment and live-probe evidence remain unverified.");
     }
     3
 }

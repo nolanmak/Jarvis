@@ -78,35 +78,48 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     #[tokio::test]
-    async fn unavailable_roles_stop_before_git_selection_or_state_creation() {
+    async fn unavailable_roles_or_resources_stop_before_git_selection_or_state_creation() {
         const CHILD:&str="AUTOSHIP_ROLE_GATE_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
             use sha2::{Digest,Sha256};
-            let root=tempfile::tempdir().unwrap();
-            let fixture=root.path().join("fixture");std::fs::create_dir(&fixture).unwrap();
-            std::fs::set_permissions(&fixture,std::fs::Permissions::from_mode(0o700)).unwrap();
-            let artifact=fixture.join("artifact");std::fs::write(&artifact,b"fixture").unwrap();
-            std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
-            std::fs::write(fixture.join("manifest.json"),serde_json::json!({"version":1,"files":[{"path":"artifact","sha256":format!("{:x}",Sha256::digest(b"fixture"))}]}).to_string()).unwrap();
-            let runtime=root.path().join("runtime.json");
-            std::fs::write(&runtime,serde_json::json!({"qemu":artifact,"kernel":artifact,"busybox":artifact,"firmware":artifact,
-                "data_dir":fixture,"library_dir":fixture,"module_dir":fixture,"modules":[artifact],"memory_mb":1024}).to_string()).unwrap();
-            std::fs::set_permissions(&runtime,std::fs::Permissions::from_mode(0o600)).unwrap();
-            let policy=root.path().join("policy.json");
-            std::fs::write(&policy,serde_json::json!({"version":1,"runtime_config":runtime,"guest_runtime":fixture,
-                "state_root":root.path().join("state"),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}}).to_string()).unwrap();
-            std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
-            let workspace=root.path().join("workspace");std::fs::create_dir(&workspace).unwrap();
-            let status=std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact","self_improve::provider_readiness::tests::unavailable_roles_stop_before_git_selection_or_state_creation","--nocapture"])
-                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",&workspace)
-                .env("XDG_STATE_HOME",workspace.join("state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",policy)
-                .env("AUGMENTAGENT_REASONER_CHAIN","claude").env(CHILD,&workspace).current_dir(&workspace).status().unwrap();
-            assert!(status.success());return;
+            for kind in ["roles","resources"] {
+                let root=tempfile::tempdir().unwrap();
+                let fixture=root.path().join("fixture");std::fs::create_dir(&fixture).unwrap();
+                std::fs::set_permissions(&fixture,std::fs::Permissions::from_mode(0o700)).unwrap();
+                let artifact=fixture.join("artifact");std::fs::write(&artifact,b"fixture").unwrap();
+                std::fs::set_permissions(&artifact,std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::write(fixture.join("manifest.json"),serde_json::json!({"version":1,"files":[{"path":"artifact","sha256":format!("{:x}",Sha256::digest(b"fixture"))}]}).to_string()).unwrap();
+                let runtime=root.path().join("runtime.json");
+                std::fs::write(&runtime,serde_json::json!({"qemu":artifact,"kernel":artifact,"busybox":artifact,"firmware":artifact,
+                    "data_dir":fixture,"library_dir":fixture,"module_dir":fixture,"modules":[artifact],"memory_mb":1024}).to_string()).unwrap();
+                std::fs::set_permissions(&runtime,std::fs::Permissions::from_mode(0o600)).unwrap();
+                let providers=if kind=="resources" {
+                    let claude=root.path().join("claude.json");let codex=root.path().join("codex.json");
+                    std::fs::write(&claude,r#"{"claudeAiOauth":{"accessToken":"fixture","refreshToken":"fixture","expiresAt":9999999999999}}"#).unwrap();
+                    std::fs::write(&codex,r#"{"OPENAI_API_KEY":"fixture"}"#).unwrap();
+                    for path in [&claude,&codex] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).unwrap();}
+                    serde_json::json!({"claude":{"gateway":{},"auth_file":claude,"auth_relative":".claude/.credentials.json"},
+                        "codex":{"gateway":{},"auth_file":codex,"auth_relative":".codex/auth.json"}})
+                } else {serde_json::json!({})};
+                let policy=root.path().join("policy.json");
+                std::fs::write(&policy,serde_json::json!({"version":1,"runtime_config":runtime,"guest_runtime":fixture,
+                    "state_root":root.path().join("state"),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":providers}).to_string()).unwrap();
+                std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+                let workspace=root.path().join("workspace");std::fs::create_dir(&workspace).unwrap();
+                let status=std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","self_improve::provider_readiness::tests::unavailable_roles_or_resources_stop_before_git_selection_or_state_creation","--nocapture"])
+                    .env_clear().env("PATH","/usr/bin:/bin").env("HOME",&workspace)
+                    .env("XDG_STATE_HOME",workspace.join("state")).env("AUGMENTAGENT_NATIVE_VM_POLICY",policy)
+                    .env("AUGMENTAGENT_REASONER_CHAIN","claude").env("CLAUDE_CLI","/usr/bin/true").env("CODEX_CLI","/usr/bin/true")
+                    .env("AUTOSHIP_ADMISSION_CASE",kind).env(CHILD,&workspace).current_dir(&workspace).status().unwrap();
+                assert!(status.success());
+            }
+            return;
         }
         let root=PathBuf::from(std::env::var_os(CHILD).unwrap());
-        let error=super::super::run_once(&root,false).await.err().expect("missing roles must stop selection");
-        assert!(format!("{error:#}").contains("workflow-role:builder:no-eligible-provider"),"{error:#}");
-        assert_eq!(std::fs::read_dir(root).unwrap().count(),0,"no git, lock, workflow, model or build state before role admission");
+        let error=super::super::run_once(&root,false).await.err().expect("missing admission must stop selection");
+        let expected=if std::env::var("AUTOSHIP_ADMISSION_CASE").unwrap()=="resources" {"workflow-resource:declaration-missing"} else {"workflow-role:builder:no-eligible-provider"};
+        assert!(format!("{error:#}").contains(expected),"{error:#}");
+        assert_eq!(std::fs::read_dir(root).unwrap().count(),0,"no git, lock, workflow, model or build state before admission");
     }
 }

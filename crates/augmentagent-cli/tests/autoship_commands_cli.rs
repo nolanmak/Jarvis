@@ -296,3 +296,30 @@ fn readiness_checks_protected_roles_without_spawning_or_creating_state() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("private-fixture"));
     }
 }
+
+#[test]
+fn readiness_separates_resource_selector_and_composed_vm_envelope() {
+    let root=tempfile::tempdir().unwrap();let runtime=root.path().join("runtime.json");
+    std::fs::write(&runtime,r#"{"memory_mb":4096}"#).unwrap();
+    std::fs::set_permissions(&runtime,std::fs::Permissions::from_mode(0o600)).unwrap();
+    let policy=root.path().join("policy.json");
+    std::fs::write(&policy,serde_json::json!({"version":1,"runtime_config":runtime,"guest_runtime":root.path().join("missing-guest"),
+        "state_root":root.path().join("state"),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}}).to_string()).unwrap();
+    std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+    for (selector,memory,status) in [(None,None,"declaration-missing"),(Some("invalid"),None,"declaration-invalid"),
+        (Some("1"),Some("4294967296"),"native-build-envelope-invalid"),(Some("1"),None,"delegation-unavailable")] {
+        let mut command=Command::new(env!("CARGO_BIN_EXE_augmentagent"));
+        command.env_clear().env("PATH","/usr/bin:/bin").env("HOME",root.path())
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",&policy).env("XDG_STATE_HOME",root.path().join("state"));
+        if let Some(value)=selector {command.env("AUGMENTAGENT_RUN_RESOURCES",value);}
+        if let Some(value)=memory {command.env("AUGMENTAGENT_RUN_MEMORY_BYTES",value);}
+        let output=command.args(["autopr","readiness","--json"]).output().unwrap();
+        assert_eq!(output.status.code(),Some(3));
+        let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["resources"]["status"],status,"{body}");
+        assert_eq!(body["resources"]["permits_attempt"],false);
+        if status=="delegation-unavailable" {assert_eq!(body["resources"]["policy"]["memory_bytes"],6u64*1024*1024*1024);}
+        assert!(!root.path().join("state").exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),2);
+    }
+}

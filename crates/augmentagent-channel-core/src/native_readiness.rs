@@ -157,3 +157,15 @@ mod jwt_tests {
 
 #[path = "native_runtime_readiness.rs"]
 pub mod runtime;
+
+/// Autoship can launch both guests in one descendant scope. Match launch-time
+/// composition without pinning/writing a runtime or starting either guest.
+pub(crate) fn builder_resource_policy() -> Result<serde_json::Value> {
+    let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").context("native policy missing")?;
+    let policy:Policy=serde_json::from_slice(&private(Path::new(&path))?)?;
+    ensure!(policy.version==1,"invalid native policy version");
+    let runtime:serde_json::Value=serde_json::from_slice(&private(&policy.runtime_config)?)?;
+    let build_mb=runtime["memory_mb"].as_u64().context("build VM memory missing")?;
+    ensure!((512..=4096).contains(&build_mb),"invalid build VM memory");
+    crate::run_resources::composed_native_policy(u64::from(policy.memory_mb),build_mb)
+}

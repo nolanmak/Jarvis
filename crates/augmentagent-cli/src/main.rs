@@ -3049,7 +3049,7 @@ async fn main() -> Result<()> {
         std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Readiness { json } } = cli.cmd {
-        std::process::exit(autoship_commands::run_readiness(json));
+        std::process::exit(autoship_commands::run_readiness(json).await);
     }
     if let Cmd::Autopr { op: AutoprOp::Status { ref workflow, json } } = cli.cmd {
         std::process::exit(autoship_commands::run_status(workflow, json));

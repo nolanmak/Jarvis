@@ -7517,6 +7517,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
             .await.context("native runtime preflight task failed")??;
         provider_readiness::inspect().preflight()?;
+        augmentagent_channel_core::run_resources::readiness().await.preflight()?;
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
