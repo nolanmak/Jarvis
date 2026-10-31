@@ -46,6 +46,7 @@ tokio::task_local! { pub static FRESH_REVIEW: bool; }
 #[derive(Default)]
 pub struct FreshBuilderSessions {
     sessions: Mutex<Vec<Arc<NativeSession>>>,
+    retain_runtime: bool,
 }
 #[derive(Debug, Clone)]
 pub struct ObservedConversation {
@@ -59,6 +60,8 @@ impl FreshBuilderSessions {
     pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
         FRESH_BUILDERS.scope(Arc::clone(self), call).await
     }
+    /// Restored workflow conversations outlive this controller scope. Their
+    /// native owner/audit fences still apply, and workflow retirement owns GC.
     pub fn from_observed(observed:&[ObservedConversation])->anyhow::Result<Arc<Self>> {
         let mut restored:Vec<Arc<NativeSession>>=Vec::new();
         for observation in observed {
@@ -67,7 +70,7 @@ impl FreshBuilderSessions {
             anyhow::ensure!(!restored.iter().any(|s|s.provider()==observation.provider),"duplicate builder provider conversation");
             restored.push(NativeSession::from_id(observation.provider,Some(observation.id.clone()))?);
         }
-        Ok(Arc::new(Self {sessions:Mutex::new(restored)}))
+        Ok(Arc::new(Self {sessions:Mutex::new(restored),retain_runtime:true}))
     }
     pub fn observed(&self) -> Vec<ObservedConversation> {
         self.sessions.lock().expect("builder sessions mutex poisoned").iter().filter_map(|session| {
@@ -184,7 +187,7 @@ impl Drop for NativeSession {
 }
 impl Lease {
     pub(crate) fn register_vm_retirement(&self, path:std::path::PathBuf) {
-        if is_fresh_review() || FRESH_BUILDERS.try_with(|_|()).is_ok() {
+        if is_fresh_review() || FRESH_BUILDERS.try_with(|builders|!builders.retain_runtime).unwrap_or(false) {
             let mut paths=self.session.retired_vm.lock().expect("native retirement mutex poisoned");
             if !paths.contains(&path) { paths.push(path); }
         }
