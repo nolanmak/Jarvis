@@ -22,6 +22,8 @@ def environment_file(path,optional=False,literal=False):
  # literal filename characters. Only systemd specifiers need escaping.
  if not pathlib.Path(path).is_absolute() or any(c in path for c in '\n\r\0'):
   raise RuntimeError('environment file must be an absolute single-line path')
+ if path.endswith('\\'):
+  raise RuntimeError('environment file path cannot end in a line continuation')
  if literal:
   # EnvironmentFile uses libc glob patterns. Inherited daemon directives keep
   # their patterns; our shared selection names one exact file instead.

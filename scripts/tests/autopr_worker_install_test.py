@@ -30,7 +30,7 @@ with open(os.environ['CALLS'],'a') as f:f.write(' '.join(sys.argv[1:])+'\\n')
 if 'show' in sys.argv:
  key=sys.argv[sys.argv.index('-p')+1]
  print({'Environment':'PATH=/usr/bin RUST_LOG=warn SYNTHETIC=fixture',
- 'EnvironmentFiles':os.environ.get('FIXTURE_ENVIRONMENT_FILES','/fixture/config (ignore_errors=yes) /fixture/required config% (ignore_errors=no)'),
+ 'EnvironmentFiles':os.environ.get('FIXTURE_ENVIRONMENT_FILES','/fixture/config (ignore_errors=yes) /fixture/required config% (ignore_errors=no) /fixture/pattern*.env (ignore_errors=yes)'),
  'ExecStart':'{ argv[]=/fixture/bin serve --dry-run false ; }',
  'MemoryHigh':'8589934592','MemoryMax':'10737418240',
  'TasksMax':'2048','LimitNOFILE':'4096','CPUQuotaPerSecUSec':'4s',
@@ -48,6 +48,7 @@ if 'show' in sys.argv:
             self.assertIn('Environment="SYNTHETIC=fixture"', worker)
             self.assertIn('EnvironmentFile=-/fixture/config', worker)
             self.assertIn('EnvironmentFile=/fixture/required config%%',worker)
+            self.assertIn('EnvironmentFile=-/fixture/pattern*.env',worker)
             self.assertLess(worker.index('EnvironmentFile=-/fixture/config'),
                             worker.index('EnvironmentFile=/fixture/required config%%'))
             self.assertIn('After=network-online.target augmentagent.service', worker)
@@ -92,13 +93,15 @@ if 'show' in sys.argv:
             self.assertTrue(selection.exists(),'explicit native profile selection must persist')
             self.assertEqual(shlex.split(selection.read_text().splitlines()[-1]),['AUGMENTAGENT_NATIVE_VM_POLICY='+str(policy)])
             self.assertEqual(selection.stat().st_mode & 0o777,0o600)
-            shared='EnvironmentFile=-'+str(selection).replace('%','%%')
             import ctypes
             pattern=next(line.removeprefix('EnvironmentFile=-') for line in (units/'augmentagent-autopr.service').read_text().splitlines() if line.startswith('EnvironmentFile=-') and 'autoship-native.env' in line).replace('%%','%')
             fnmatch=ctypes.CDLL(None).fnmatch
             fnmatch.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_int]
             self.assertEqual(fnmatch(os.fsencode(pattern),os.fsencode(selection),0),0,
                              'shared policy path must glob-match its literal filename')
+            self.assertNotEqual(fnmatch(os.fsencode(pattern),
+                os.fsencode(str(selection).replace('*?','ANYTHINGz')),0),0,
+                'literal policy path must not glob-match a neighboring filename')
             shared='EnvironmentFile=-'+pattern.replace('%','%%')
             self.assertIn(shared,dropin.read_text())
             prior=selection.read_bytes()
