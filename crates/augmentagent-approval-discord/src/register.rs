@@ -307,7 +307,13 @@ fn sentence_starts(paragraph: &[&str]) -> (usize, usize) {
                 .trim_matches(|c: char| !c.is_alphanumeric())
                 .contains(['/', '@', '.'])
                 || (first.is_lowercase() && word.chars().skip(1).any(char::is_uppercase));
-            if at_start == Boundary::Sure && !opaque {
+            // A time/amount can open otherwise normally cased prose. Letters
+            // inside `11am` are not a lowercase sentence opener (#1678).
+            let numeric_or_time = word.chars().find(|c| c.is_alphanumeric())
+                .is_some_and(|c| c.is_numeric())
+                || matches!(word.trim_matches(|c: char| !c.is_alphabetic()).to_ascii_lowercase().as_str(),
+                    "noon" | "midnight");
+            if at_start == Boundary::Sure && !opaque && !numeric_or_time {
                 if first.is_uppercase() {
                     upper += 1;
                 } else {
@@ -349,10 +355,33 @@ fn register_of(sample: &str) -> Option<Register> {
         .lines()
         .take_while(|l| !l.trim_start().starts_with('>') && !l.trim_end().ends_with("wrote:"))
         .collect();
-    match sentence_starts(&own) {
+    let (paragraphs, _) = draft_paragraphs(&own, None);
+    let (mut upper, mut lower) = (0, 0);
+    let mut short_capital = false;
+    let last_paragraph = paragraphs.len().saturating_sub(1);
+    for (index, paragraph) in paragraphs.into_iter().enumerate() {
+        let (u, l) = sentence_starts(&paragraph);
+        upper += u;
+        lower += l;
+        // Greetings/signatures remain insufficient to establish standard
+        // register, but their capitals contradict an all-lowercase claim.
+        let words = paragraph.iter().flat_map(|line| line.split_whitespace())
+            .filter(|word| word.chars().any(char::is_alphabetic)).count();
+        let closing = paragraph.first().map(|line| line.trim().trim_end_matches([',', '.', '!']).to_ascii_lowercase())
+            .unwrap_or_default();
+        let signoff = index == last_paragraph && paragraph.len() > 1
+            && matches!(closing.as_str(), "thanks" | "thank you" | "best" | "regards"
+                | "kind regards" | "best regards" | "in gratitude" | "sincerely" | "cheers");
+        if words < 3 || signoff {
+            short_capital |= paragraph.iter().any(|line| {
+                line.chars().find(|c| c.is_alphanumeric()).is_some_and(|c| c.is_uppercase())
+            });
+        }
+    }
+    match (upper, lower) {
         (0, 0) => None,
         (_, 0) => Some(Register::Standard),
-        (0, _) => Some(Register::Lowercase),
+        (0, _) if !short_capital => Some(Register::Lowercase),
         _ => None,
     }
 }
@@ -581,6 +610,33 @@ mod tests {
              ```\nExample Event rooftop vol. 2 is in the books.\n```",
         );
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn issue_1678_numeric_openers_and_signoffs_do_not_force_lowercase() {
+        let standard = "Monday afternoon works for me. Please pick a time.";
+        for inbound in [
+            "11am works for me", "11AM works for me", "11:00am works for me",
+            "$20 works for me", "noon PST is optimal", "midnight works for me",
+            "noon PST is optimal.\n\nThank you,\n\nPat Lee",
+            "that works for me\n\nIn gratitude,\nPat Lee",
+            "that works for me\n\nthanks,\nPat Lee",
+            "that works for me\n\nThank you for checking.",
+        ] {
+            assert!(audit_draft_against_sample(inbound, standard).is_none(), "{inbound:?}");
+        }
+        assert_eq!(register_of("11am works. Please send the invite."), Some(Register::Standard));
+        assert_eq!(register_of("that works for me\n\nPlease send the invite"), None);
+        // Genuine lowercase prose still gates capitalized drafts; a quoted
+        // sender and a name alone cannot establish standard register.
+        assert!(audit_draft_against_sample("that works for me\n\nthanks,\npat", standard).is_some());
+        assert!(audit_draft_against_sample("that works for me\n\n> Thanks, Pat", standard).is_some());
+        assert_eq!(register_of("In gratitude,\nPat Lee"), Some(Register::Standard));
+        assert_eq!(register_of("Pat Lee"), None);
+        for inbound in ["i can meet Monday after lunch", "i can meet\nMonday\nafter lunch"] {
+            assert_eq!(register_of(inbound), Some(Register::Lowercase));
+            assert!(audit_draft_against_sample(inbound, standard).is_some());
+        }
     }
 
     /// #1371: an abbreviation period draws no note under EITHER register, and

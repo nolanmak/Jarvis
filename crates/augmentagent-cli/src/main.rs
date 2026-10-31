@@ -12201,6 +12201,21 @@ mod approval_body_tests {
         assert!(err.contains("records no decision"), "{err}");
     }
 
+    #[test]
+    fn issue_1678_gmail_accepts_standard_time_replies_and_explicit_owner_override() {
+        let draft = "Monday afternoon works for me. Please pick a time.\n";
+        for inbound in ["11am works for me", "noon PST is optimal.\n\nThank you,\n\nPat Lee"] {
+            let body = format!("register: standard\n{draft}");
+            assert_eq!(strip_register_receipt(&body, Some(inbound)).unwrap(), (draft.into(), true));
+        }
+        let lower = "that works for me. please send the invite";
+        assert!(strip_register_receipt(draft, Some(lower)).is_err());
+        let asked = format!("register: standard (you asked)\n{draft}");
+        assert_eq!(strip_register_receipt(&asked, Some(lower)).unwrap(), (draft.into(), true));
+        let undecided = format!("register: unknown (you asked)\n{draft}");
+        assert!(strip_register_receipt(&undecided, Some(lower)).is_err());
+    }
+
     // #962 — who the card's From line (and the actions/emails rows) name.
     #[test]
     fn reply_cards_keep_the_replied_to_sender_as_their_identity() {
