@@ -38,13 +38,20 @@ impl OwnerIdentities {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let _ = raw;
-        todo!()
+        Self(
+            raw.into_iter()
+                .map(|r| {
+                    let r = r.as_ref().trim();
+                    // Connected-account entity ids carry a provider prefix.
+                    handles::canonical(r.strip_prefix("google:").unwrap_or(r))
+                })
+                .collect(),
+        )
     }
 
     pub fn contains(&self, sender: &str) -> bool {
-        let _ = sender;
-        todo!()
+        let c = handles::canonical(sender);
+        c == handles::ME || self.0.contains(&c)
     }
 }
 
@@ -64,8 +71,30 @@ impl TeamRoster {
     pub const ENV: &'static str = "AUGMENTAGENT_OWNER_TEAM";
 
     pub fn parse(raw: &str) -> Self {
-        let _ = raw;
-        todo!()
+        let mut roster = Self::default();
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (label, value) = match entry.split_once('=') {
+                Some((l, v)) => (l.trim(), v.trim()),
+                None => ("", entry),
+            };
+            if let Some(domain) = value.strip_prefix('@') {
+                let domain = domain.to_ascii_lowercase();
+                if domain.contains('.') && !domain.contains(['@', ':']) && !domain.contains(char::is_whitespace) {
+                    let label = if label.is_empty() { format!("@{domain}") } else { label.to_string() };
+                    roster.domains.insert(domain, label);
+                    continue;
+                }
+            } else if !value.is_empty() {
+                let handle = handles::canonical(value);
+                if !handle.starts_with("raw:") && handle != handles::ME {
+                    let label = if label.is_empty() { value } else { label };
+                    roster.exact.insert(handle, label.to_string());
+                    continue;
+                }
+            }
+            roster.invalid.push(entry.to_string());
+        }
+        roster
     }
 
     pub fn from_env() -> Self {
@@ -83,14 +112,34 @@ impl TeamRoster {
 
     /// `(entry, label)` pairs, sorted, for `augmentagent team list`.
     pub fn entries(&self) -> Vec<(String, String)> {
-        todo!()
+        let mut out: Vec<(String, String)> = self
+            .exact
+            .iter()
+            .map(|(h, l)| (h.clone(), l.clone()))
+            .chain(self.domains.iter().map(|(d, l)| (format!("@{d}"), l.clone())))
+            .collect();
+        out.sort();
+        out
     }
 
     /// Owner wins over the roster, so a domain wildcard covering the owner's
     /// own mailbox never makes the owner a teammate.
     pub fn classify(&self, sender: &str, owner: &OwnerIdentities) -> TeamClass {
-        let _ = (sender, owner, handles::ME);
-        todo!()
+        if owner.contains(sender) {
+            return TeamClass::Owner;
+        }
+        let handle = handles::canonical(sender);
+        if let Some(label) = self.exact.get(&handle) {
+            return TeamClass::Teammate { label: label.clone() };
+        }
+        let domain = handle
+            .strip_prefix("email:")
+            .and_then(|addr| addr.rsplit_once('@'))
+            .map(|(_, d)| d);
+        match domain.and_then(|d| self.domains.get(d)) {
+            Some(label) => TeamClass::Teammate { label: label.clone() },
+            None => TeamClass::Other,
+        }
     }
 }
 
