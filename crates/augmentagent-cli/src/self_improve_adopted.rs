@@ -435,6 +435,9 @@ async fn execute(
         if review.approved() {
             guard.push(&pr.branch).await?;
             acceptance::assert_receipt_current(worktree, &prepared, &receipt).await?;
+            if guard.published_pr_ready(pr.pr,&review).await? {
+                return Ok(RunReport::built(format!("PR #{}: validated revision published; PR milestone complete",pr.pr)));
+            }
             let (_, names, _) = run(
                 "git",
                 &["diff", "--name-only", "origin/main...HEAD"],

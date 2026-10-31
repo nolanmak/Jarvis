@@ -1206,6 +1206,27 @@ impl WorkflowGuard {
         self.audit_event("review_fragment_completed",serde_json::json!({"key":key,"payload_sha256":format!("{:x}",Sha256::digest(payload.as_bytes()))}))
     }
 
+    /// Complete the caller's PR milestone only after the validated revision
+    /// and independent approval have both been published under this binding.
+    pub(super) async fn published_pr_ready(&mut self, pr: u64, review: &IndependentReview) -> Result<bool> {
+        anyhow::ensure!(review.approved(), "PR milestone requires independent approval");
+        let structured=review.structured.as_ref().context("PR milestone requires structured review evidence")?;
+        anyhow::ensure!(structured.binding.head==self.binding.head && structured.binding.contract_hash==self.binding.contract,
+            "PR milestone review differs from current candidate or contract");
+        let verdict=review.recorded_verdict().context("PR milestone review evidence missing")?;
+        let encoded=serde_json::to_string(&verdict)?;
+        self.record_review(&format!("pr-ready-{}",uuid::Uuid::new_v4()),true,&encoded)?;
+        let pr_only={
+            let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow lock poisoned"))?;
+            store.record_pr_ready(&self.lease,&self.binding,pr,&encoded,millis())?;
+            store.command_request(&self.lease.workflow)?.is_some_and(|r|r.until==durable::submission::Milestone::Pr)
+        };
+        if pr_only {
+            self.transition(Stage::AwaitChecks,"pr_milestone_reached","await_merge_authorization",0).await?;
+        }
+        Ok(pr_only)
+    }
+
     pub(super) fn record_review(
         &self,
         decision_id: &str,
@@ -2287,6 +2308,38 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn published_pr_milestone_stops_pr_only_work_after_real_push_and_bound_review() {
+        let dir=repo();let remote=tempfile::tempdir().unwrap();
+        assert!(run("git",&["init","--bare","-q"],remote.path()).await.unwrap().0);
+        assert!(run("git",&["remote","add","origin",remote.path().to_str().unwrap()],dir.path()).await.unwrap().0);
+        let state=control_dir();let path=state.path().join("workflow.db");
+        let mut store=WorkflowStore::open(&path).unwrap();
+        let id=store.submit_authorized("pr-only","owner",&durable::submission::Request {
+            repository:"owner/repo".into(),target:durable::submission::Target::Pr(42),provider:None,until:durable::submission::Milestone::Pr
+        },millis()).unwrap().workflow;drop(store);
+        let mut guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
+            source_issue:None,pr:Some(42),branch:"fix/pr",contract:"contract",environment:"rust"},millis()).await.unwrap().unwrap();
+        let mut review=super::super::progress_tests::synthetic_aligned_review(&guard.binding.head,true);
+        let evidence=review.structured.as_mut().unwrap();evidence.binding.contract_hash=guard.binding.contract.clone();
+        for pass in &mut evidence.passes {pass.binding=evidence.binding.clone();pass.coverage.binding=evidence.binding.clone();}
+        evidence.adjudication.as_mut().unwrap().binding=evidence.binding.clone();
+        assert!(guard.published_pr_ready(42,&review).await.is_err(),"approval without publication cannot finish");
+        guard.push("fix/pr").await.unwrap();
+        let mut wrong=super::super::progress_tests::synthetic_aligned_review("other-head",true);
+        assert!(guard.published_pr_ready(42,&wrong).await.is_err());
+        wrong.structured=None;
+        assert!(guard.published_pr_ready(42,&wrong).await.is_err(),"legacy booleans are not a fresh receipt");
+        assert!(guard.published_pr_ready(42,&review).await.unwrap());
+        guard.finish().unwrap();
+        let store=WorkflowStore::open_read_only(&path).unwrap().unwrap();
+        let snapshot=store.snapshot(&id).unwrap().unwrap();
+        assert_eq!(snapshot.checkpoint.stage,Stage::AwaitChecks);
+        assert_eq!(snapshot.checkpoint.next.reason,"pr_milestone_reached");
+        assert!(store.pr_ready(&id).unwrap().is_some());
+        assert_eq!(store.merge_allowance(millis(),5).unwrap().confirmed,0);
     }
 
     #[tokio::test]

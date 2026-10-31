@@ -72,6 +72,21 @@ pub(crate) async fn validate_command(repo: &Path, request: &Request) -> Result<(
     resolve(repo, request).await.map(|_| ())
 }
 
+/// Final read-only observation for PR milestone waiters. Closed PRs remain
+/// observable on replay, but the repository grant and exact PR identity must hold.
+pub(crate) async fn published_pr_head(repo: &Path, repository: &str, pr: u64) -> Result<String> {
+    let request=Request {repository:repository.into(),target:Target::Pr(pr),provider:None,
+        until:crate::autoship_workflow::submission::Milestone::Pr};
+    authorized_repository(repo,&request).await?;
+    let raw=read(repo,&["pr","view",&pr.to_string(),"--repo",repository,"--json","number,url,headRefOid"]).await?;
+    let value:serde_json::Value=serde_json::from_str(&raw)?;
+    let head=value["headRefOid"].as_str().context("published head missing")?;
+    anyhow::ensure!(value["number"].as_u64()==Some(pr)
+        && value["url"].as_str().is_some_and(|url|url.eq_ignore_ascii_case(&format!("https://github.com/{repository}/pull/{pr}")))
+        && matches!(head.len(),40|64) && head.bytes().all(|b|b.is_ascii_hexdigit()),"published PR identity differs");
+    Ok(head.to_ascii_lowercase())
+}
+
 pub(super) async fn resolve(repo: &Path, request: &Request) -> Result<Resolved> {
     let request = request.normalized()?;
     let repository = authorized_repository(repo, &request).await?;

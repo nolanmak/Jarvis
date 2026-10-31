@@ -13,7 +13,7 @@ fn fixture() -> tempfile::TempDir {
         .success());
     let gh = root.path().join("gh");
     std::fs::write(&gh, r#"#!/usr/bin/env python3
-import json,os,pathlib,sys,datetime
+import json,os,pathlib,sys,datetime,time
 r=pathlib.Path(os.environ['FIXTURE']);a=sys.argv[1:]
 s=json.loads((r/'scenario.json').read_text())
 with (r/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
@@ -27,7 +27,8 @@ elif a[:2]==['api','repos/owner/repo/git/commits/'+'c'*40]:
  print(json.dumps({'sha':'c'*40,'message':'Autoship-Receipt: v1:op-42:'+'f'*64}))
 elif a[:2]==['pr','list']: print(json.dumps([{'number':42,'isCrossRepository':False,'headRepositoryOwner':{'login':'owner'}}] if s.get('open_pr') else []))
 elif a[:3]==['pr','view','42']:
- print(json.dumps({'number':42,'state':s.get('pr_state','OPEN'),'url':'https://github.com/owner/repo/pull/42','headRefName':'feature/fix','headRefOid':'a'*40,'baseRefName':'main','isCrossRepository':s.get('fork',False),'author':{'login':'owner'},'title':'Fix arithmetic','body':'Fix addition','closingIssuesReferences':[]}))
+ if s.get('stall_head') and 'number,url,headRefOid' in a: time.sleep(5)
+ print(json.dumps({'number':42,'state':s.get('pr_state','OPEN'),'url':'https://github.com/owner/repo/pull/42','headRefName':'feature/fix','headRefOid':s.get('head','a'*40),'baseRefName':'main','isCrossRepository':s.get('fork',False),'author':{'login':'owner'},'title':'Fix arithmetic','body':'Fix addition','closingIssuesReferences':[]}))
 else: raise Exception('unexpected request '+repr(a))
 "#).unwrap();
     std::fs::set_permissions(gh, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -445,4 +446,102 @@ fn work_once_keeps_unknown_merges_pending_and_respects_live_ownership() {
         assert_eq!(calls.contains("pulls/42"), !active);
         assert!(!root.path().join(".self-improve-worktrees").exists());
     }
+}
+
+fn status(root:&Path,id:&str)->Output {
+    Command::new(env!("CARGO_BIN_EXE_augmentagent")).current_dir(root)
+        .env("XDG_STATE_HOME",root.join("state"))
+        .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.join("state/workflow.db"))
+        .args(["autopr","status","--workflow",id,"--json"]).output().unwrap()
+}
+fn seed_pr_milestone(root:&Path,id:&str,receipt:bool) {
+    let conn=rusqlite::Connection::open(root.join("state/workflow.db")).unwrap();
+    let binding=serde_json::json!({"head":"a".repeat(40),"contract":"contract","evidence_hash":"evidence"});
+    let cp=serde_json::json!({"stage":"await_checks","binding":binding,"evidence":[],"next":{"reason":"pr_milestone_reached","action":"await_merge_authorization","eligible_at_ms":0}});
+    conn.execute("INSERT INTO workflow(id,branch,pr,checkpoint,heartbeat_at,progress_at) VALUES(?1,'branch',42,?2,10,10) ON CONFLICT(id) DO UPDATE SET checkpoint=excluded.checkpoint",rusqlite::params![id,cp.to_string()]).unwrap();
+    if receipt {conn.execute("INSERT INTO pr_ready_receipt VALUES(?1,?2,42,'protected-review-digest',10)",rusqlite::params![id,format!(r#"{{"head":"{}","contract":"contract","evidence_hash":"evidence"}}"#,"a".repeat(40))]).unwrap();}
+}
+#[test]
+fn pr_only_completion_requires_published_validation_receipt_for_current_binding() {
+    let root=fixture();let admitted=body(run(root.path(),&["--until","pr"]),0);
+    let id=admitted["workflow"].as_str().unwrap();
+    seed_pr_milestone(root.path(),id,false);
+    assert_eq!(body(status(root.path(),id),3)["complete"],false);
+    seed_pr_milestone(root.path(),id,true);
+    let done=body(status(root.path(),id),0);
+    assert_eq!(done["complete"],true);
+    assert_eq!(done["merge"]["state"],"not-confirmed");
+    assert_eq!(done["milestones"]["pr"]["head"],"a".repeat(40));
+    let conn=rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+    conn.execute("UPDATE workflow SET checkpoint=json_set(checkpoint,'$.binding.head',?1)",["b".repeat(40)]).unwrap();drop(conn);
+    assert_eq!(body(status(root.path(),id),3)["complete"],false);
+}
+#[test]
+fn waiting_timeout_detaches_without_starting_or_canceling_the_durable_job() {
+    let root=fixture();
+    let result=body(run(root.path(),&["--wait","--timeout-secs","0","--request-id","waiting"]),5);
+    assert_eq!(result["accepted"],true);assert_eq!(result["complete"],false);
+    assert_eq!(result["reason"],"wait-timeout");
+    assert_eq!(result["observation"]["detached"],true);
+    let queued=body(status(root.path(),"owner/repo#7"),0);
+    assert_eq!(queued["stage"],"queued");
+    assert!(!root.path().join(".self-improve-worktrees").exists());
+    assert_eq!(body(run(root.path(),&["--request-id","waiting"]),0)["reason"],"queued");
+}
+
+#[test]
+fn pr_observer_wait_completes_without_downgrading_merge_authority_or_rewriting_admission() {
+    let root=fixture();let admitted=body(run(root.path(),&["--request-id","merge-owner"]),0);
+    let id=admitted["workflow"].as_str().unwrap();seed_pr_milestone(root.path(),id,true);
+    let conn=rusqlite::Connection::open(root.path().join("state/workflow.db")).unwrap();
+    conn.execute("UPDATE workflow SET checkpoint=json_set(checkpoint,'$.next.reason','ci_pending','$.next.action','reconcile_checks')",[]).unwrap();drop(conn);
+    let observed=body(run(root.path(),&["--until","pr","--wait","--timeout-secs","5","--request-id","observer"]),0);
+    assert_eq!(observed["complete"],true);assert_eq!(observed["requested_until"],"pr");
+    assert_eq!(observed["workflow_until"],"merged");assert_eq!(observed["merge"]["state"],"not-confirmed");
+    assert_eq!(observed["admission"]["complete"],false);
+    assert_eq!(body(status(root.path(),id),3)["complete"],false);
+    let replay=body(run(root.path(),&["--until","pr","--request-id","observer"]),0);
+    assert_eq!(replay["complete"],false);assert_eq!(replay["workflow_until"],"merged");
+}
+#[test]
+fn wait_observes_worker_completion_and_killed_waiter_preserves_submission() {
+    let root=fixture();body(run(root.path(),&["--until","pr","--request-id","waiter"]),0);
+    let spawn=|| Command::new(env!("CARGO_BIN_EXE_augmentagent")).current_dir(root.path())
+        .env("FIXTURE",root.path()).env("GH_BIN",root.path().join("gh"))
+        .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS","owner")
+        .env("XDG_STATE_HOME",root.path().join("state"))
+        .env("AUGMENTAGENT_AUTOPR_WORKFLOW_DB",root.path().join("state/workflow.db"))
+        .args(["autopr","run","--repo","owner/repo","--issue","7","--until","pr","--request-id","waiter","--wait","--timeout-secs","10","--json"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let mut killed=spawn();std::thread::sleep(std::time::Duration::from_millis(200));
+    killed.kill().unwrap();killed.wait().unwrap();
+    assert_eq!(body(status(root.path(),"owner/repo#7"),0)["stage"],"queued");
+    let watcher=spawn();std::thread::sleep(std::time::Duration::from_millis(400));
+    seed_pr_milestone(root.path(),"owner/repo#7",true);
+    let observed=body(watcher.wait_with_output().unwrap(),0);
+    assert_eq!(observed["complete"],true);
+    assert_eq!(observed["observation"]["state"],"complete");
+    assert_eq!(body(run(root.path(),&["--until","pr","--request-id","waiter"]),0)["complete"],false);
+}
+
+#[test]
+fn waiting_pr_milestone_does_not_complete_from_an_older_published_head() {
+    let root=fixture();let admitted=body(run(root.path(),&["--until","pr","--request-id","old-head"]),0);
+    seed_pr_milestone(root.path(),admitted["workflow"].as_str().unwrap(),true);
+    std::fs::write(root.path().join("scenario.json"),serde_json::json!({"head":"b".repeat(40)}).to_string()).unwrap();
+    let observed=body(run(root.path(),&["--until","pr","--wait","--timeout-secs","5","--request-id","old-head"]),3);
+    assert_eq!(observed["complete"],false);assert_eq!(observed["reason"],"published-head-changed");
+    assert_eq!(observed["observation"]["detached"],true);
+}
+
+#[test]
+fn waiting_timeout_bounds_final_remote_head_observation_without_touching_the_job() {
+    let root=fixture();let admitted=body(run(root.path(),&["--until","pr","--request-id","slow-head"]),0);
+    let id=admitted["workflow"].as_str().unwrap();seed_pr_milestone(root.path(),id,true);
+    std::fs::write(root.path().join("scenario.json"),r#"{"stall_head":true}"#).unwrap();
+    let started=std::time::Instant::now();
+    let observed=body(run(root.path(),&["--until","pr","--wait","--timeout-secs","1","--request-id","slow-head"]),5);
+    assert!(started.elapsed()<std::time::Duration::from_secs(3),"wait deadline was ignored by final GitHub read");
+    assert_eq!(observed["complete"],false);assert_eq!(observed["reason"],"wait-timeout");
+    assert_eq!(body(status(root.path(),id),0)["milestones"]["pr"]["head"],"a".repeat(40));
 }

@@ -21,8 +21,12 @@ pub(crate) struct RunArgs {
     until: String,
     #[arg(long)]
     request_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with="wait")]
     dry_run: bool,
+    #[arg(long)]
+    wait: bool,
+    #[arg(long, requires="wait", value_parser=clap::value_parser!(u64).range(0..=604800))]
+    timeout_secs: Option<u64>,
     #[arg(long)]
     json: bool,
 }
@@ -164,10 +168,16 @@ async fn submit(repo: &Path, path: &Path, args: &RunArgs) -> (i32, Value) {
 }
 
 pub(crate) async fn run(args: &RunArgs) -> i32 {
-    let (code, body) = match std::env::current_dir() {
-        Ok(repo) => submit(&repo, &crate::autoship_workflow::default_path(), args).await,
+    let repo=std::env::current_dir();
+    let (mut code, mut body) = match &repo {
+        Ok(repo) => submit(repo, &crate::autoship_workflow::default_path(), args).await,
         Err(e) => failure(4, "checkout-unavailable", e),
     };
+    if args.wait && code==0 && body["accepted"]==true {
+        (code,body)=super::wait::observe(repo.as_deref().expect("accepted submission has checkout"),&crate::autoship_workflow::default_path(),body,
+            if args.until=="pr" {Milestone::Pr} else {Milestone::Merged},
+            std::time::Duration::from_secs(args.timeout_secs.unwrap_or(3600))).await;
+    }
     if args.json {
         println!("{body}");
     } else {
@@ -182,7 +192,9 @@ pub(crate) async fn run(args: &RunArgs) -> i32 {
         if let Some(e) = body["error"].as_str() {
             println!("{e}");
         }
-        if body["accepted"] == true {
+        if body["complete"] == true {
+            println!("Requested milestone complete.");
+        } else if body["accepted"] == true {
             println!(
                 "Accepted; execution is incomplete. Inspect with autopr status --workflow {}",
                 body["workflow"].as_str().unwrap_or("unknown")

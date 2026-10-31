@@ -1,3 +1,5 @@
+#[path = "autoship_wait.rs"]
+pub(crate) mod wait;
 #[path = "autoship_work_command.rs"]
 pub(crate) mod work_command;
 #[path = "autoship_run_command.rs"]
@@ -43,6 +45,11 @@ fn error(workflow: &str, reason: &str, detail: &str) -> Value {
 /// Common read model for CLI and owner-authorized channel adapters. Unknown
 /// provider/deployment evidence stays unknown rather than inferred from main.
 pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
+    status_for_milestone(path,workflow,now,cap,None)
+}
+
+pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
+    requested: Option<crate::autoship_workflow::submission::Milestone>) -> (i32,Value) {
     let (repository, target) = match target(workflow) {
         Ok(target) => target,
         Err(e) => return (2, error(workflow, "invalid-workflow", &e.to_string())),
@@ -103,12 +110,19 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             }
             pending.push(op.id);
         }
-        let code = if recovery_needed || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks) {
+        let merged = snapshot.checkpoint.stage == Stage::Merged && !recovery_needed;
+        let pr_ready=store.pr_ready(workflow)?;
+        let milestone=requested.or(command.as_ref().map(|c|c.until))
+            .unwrap_or(crate::autoship_workflow::submission::Milestone::Merged);
+        let complete=match milestone {
+            crate::autoship_workflow::submission::Milestone::Merged=>merged,
+            crate::autoship_workflow::submission::Milestone::Pr=>pr_ready.is_some() && !recovery_needed && snapshot.checkpoint.stage != Stage::Retired,
+        };
+        let code = if complete {0} else if recovery_needed || matches!(snapshot.checkpoint.stage, Stage::Held | Stage::AwaitChecks | Stage::Merged) {
             3
         } else {
             0
         };
-        let complete = snapshot.checkpoint.stage == Stage::Merged && !recovery_needed;
         let pr_url = snapshot
             .pr
             .map(|pr| format!("https://github.com/{repository}/pull/{pr}"));
@@ -119,7 +133,8 @@ pub fn status(path: &Path, workflow: &str, now: i64, cap: u32) -> (i32, Value) {
             "stage":snapshot.checkpoint.stage,"reason":snapshot.checkpoint.next.reason,
             "next_action":snapshot.checkpoint.next.action,"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
             "provider":command.as_ref().and_then(|c| c.provider),"workflow_until":command.as_ref().map(|c| c.until),"pr_url":pr_url,
-            "merge":{"state":if complete {"observed-merged"} else if recovery_needed || !pending.is_empty() {"pending"} else {"not-confirmed"}},
+            "requested_until":milestone,"milestones":{"pr":pr_ready,"merged":merged},
+            "merge":{"state":if merged {"observed-merged"} else if recovery_needed || !pending.is_empty() {"pending"} else {"not-confirmed"}},
             "deployment":{"state":"unknown"},"allowance":allowance,"pending_merge_operations":pending,"pending_merge_evidence":pending_evidence,
             "resources":{"attempts":snapshot.attempts,"model_calls":snapshot.model_calls,"tokens":snapshot.tokens,"wall_ms":snapshot.wall_ms},
             "lease":{"active":snapshot.lease_until_ms > now,"generation":snapshot.generation},

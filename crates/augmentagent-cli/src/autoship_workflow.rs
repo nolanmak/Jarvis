@@ -9,6 +9,8 @@ use std::{path::Path, time::Duration};
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
+#[path = "autoship_milestone.rs"]
+mod milestone;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -281,6 +283,9 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS pr_ready_receipt (
+                workflow TEXT NOT NULL REFERENCES workflow(id), binding TEXT NOT NULL, pr INTEGER NOT NULL,
+                review_sha256 TEXT NOT NULL, published_at INTEGER NOT NULL, PRIMARY KEY(workflow,binding,pr));
             CREATE TABLE IF NOT EXISTS command_attempt (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), selected_at INTEGER NOT NULL,
                 finished_at INTEGER, outcome TEXT NOT NULL, reason TEXT NOT NULL, eligible_at INTEGER NOT NULL);

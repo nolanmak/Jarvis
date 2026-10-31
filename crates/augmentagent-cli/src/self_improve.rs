@@ -7123,8 +7123,13 @@ async fn resume_draft_pr(
             // Push whatever the rounds committed (the merge-with-main commit
             // included), surface the verdicts, and merge per policy.
             workflow.push(branch).await?;
-            // A pending check or failed merge must not discard this LGTM.
+            acceptance::assert_receipt_current(&worktree,&prepared_acceptance,&acceptance_receipt).await?;
+            // Preserve approval for a future explicit merge authorization too.
             opened_prs::record(issue.number, pr, reviewed_head, independent.recorded_verdict());
+            if workflow.published_pr_ready(pr,&independent).await? {
+                workflow.finish()?;
+                return Ok(RunReport::built(format!("PR #{pr}: validated revision published; PR milestone complete")));
+            }
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
@@ -9240,6 +9245,14 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             issue.number,
             reason.headline()
         )));
+    }
+    if independent.approved() && !repaired_after_review {
+        if let Some(pr)=pr_number {
+            if workflow_guard.published_pr_ready(pr,&independent).await? {
+                workflow_guard.finish()?;
+                return Ok(RunReport::built(format!("issue #{}: validated PR published; PR milestone complete — {pr_url}",issue.number)));
+            }
+        }
     }
     if !automerge {
         // Visibility (#851): drafts sat unseen for three days. Tell the owner.
