@@ -5,7 +5,6 @@
 //! single place that knows those shapes. Unknown platforms get conservative
 //! defaults instead of guesses, and nothing here can panic on odd input.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 use crate::handles::{self, ME};
@@ -86,27 +85,7 @@ fn display_name(from: &str) -> Option<String> {
     non_empty(from[..open].trim().trim_matches('"'))
 }
 
-pub fn parse_ts_ms(raw: &str) -> Option<i64> {
-    let r = raw.trim();
-    if r.is_empty() {
-        return None;
-    }
-    if let Ok(t) = DateTime::parse_from_rfc3339(r) {
-        return Some(t.timestamp_millis());
-    }
-    if let Ok(t) = DateTime::parse_from_rfc2822(r) {
-        return Some(t.timestamp_millis());
-    }
-    if let Ok(t) = NaiveDateTime::parse_from_str(r, "%Y-%m-%d %H:%M:%S") {
-        return Some(t.and_utc().timestamp_millis());
-    }
-    if let Ok(d) = NaiveDate::parse_from_str(r, "%Y-%m-%d") {
-        return d
-            .and_hms_opt(12, 0, 0)
-            .map(|t| t.and_utc().timestamp_millis());
-    }
-    r.parse::<i64>().ok().filter(|n| *n > 1_000_000_000_000)
-}
+pub use augmentagent_store::conversation_context::parse_source_timestamp_ms as parse_ts_ms;
 
 fn has_attachment(body: &str) -> bool {
     body.lines().any(|l| {

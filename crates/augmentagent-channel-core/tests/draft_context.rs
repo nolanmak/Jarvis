@@ -438,3 +438,31 @@ async fn older_and_cross_platform_sources_can_be_paged_without_search_snippet_ci
             .contains("https://example.invalid/final-plan"));
     }
 }
+
+#[test]
+fn slack_trigger_uses_source_time_for_the_history_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    let mut current = message(1);
+    current.platform = "slack".into();
+    current.date = "1767225660.000001".into();
+    for (i, date) in [
+        (0, "1767225600.000001"),
+        (1, "1767225660.000001"),
+        (2, "1767225720.000001"),
+    ] {
+        let mut source = message(i);
+        source.platform = "slack".into();
+        source.date = date.into();
+        store.upsert_email_backfill(&source, 1).unwrap();
+    }
+    let seed = load_seed(&store, &current, None).unwrap();
+    assert_eq!(
+        seed.messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["m00", "m01"]
+    );
+    assert!(!seed.gaps.iter().any(|g| g.contains("timestamp")));
+}

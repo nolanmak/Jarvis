@@ -87,3 +87,37 @@ fn context_source_restores_normalized_recipients_without_retry_context() {
     assert_eq!(source.to, "owner@example.invalid");
     assert_eq!(source.cc, "collaborator@example.invalid");
 }
+
+#[test]
+fn window_orders_slack_and_email_source_times_instead_of_backfill_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("db")).unwrap();
+    for (platform, early, late) in [
+        ("slack", "1767225600.000001", "1767225660.000001"),
+        (
+            "gmail",
+            "Thu, 01 Jan 2026 00:00:00 +0000",
+            "Thu, 01 Jan 2026 00:01:00 +0000",
+        ),
+    ] {
+        store.with_conn(|c| {
+            for (suffix,date,seen) in [("early",early,9),("late",late,1)] {
+                c.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,firstSeenAt,platform,kind) VALUES (?1,'thread','peer','test','body',?2,?3,?4,'dm')",params![format!("{platform}-{suffix}"),date,seen,platform])?;
+            }
+            Ok(())
+        }).unwrap();
+        let scope = ConversationScope {
+            platform,
+            account_id: None,
+            thread_id: "thread",
+        };
+        let rows = store.conversation_window(&scope, i64::MAX, 10).unwrap();
+        assert!(rows[0].message_id.ends_with("early"));
+        assert_eq!(rows[0].timestamp_ms, 1_767_225_600_000);
+        let cutoff = store
+            .conversation_window(&scope, 1_767_225_600_000, 10)
+            .unwrap();
+        assert_eq!(cutoff.len(), 1);
+        assert!(cutoff[0].message_id.ends_with("early"));
+    }
+}

@@ -115,9 +115,9 @@ fn load_seed_at(
         wiki: Vec::new(),
         gaps: Vec::new(),
     };
-    let cutoff = chrono::DateTime::parse_from_rfc3339(&current.date)
-        .ok()
-        .map(|d| d.timestamp_millis());
+    let cutoff = augmentagent_store::conversation_context::conversation_timestamp_ms(
+        &current.platform, &current.date,
+    );
     if cutoff.is_none() {
         seed.gaps.push(
             "Trigger timestamp unavailable; history uses the current observation time".into(),
