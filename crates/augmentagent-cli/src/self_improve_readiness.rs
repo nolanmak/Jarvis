@@ -62,7 +62,7 @@ fn validate(assessment:&Assessment,owner:&str,files:&BTreeMap<String,String>)->R
         for cited in evidence {
             ensure!(!cited.quote.trim().is_empty() && cited.quote.len()<=4000,"invalid readiness quote");
             let source=match &cited.path {None=>owner,Some(path)=>files.get(path).context("readiness cited unobserved source")?};
-            ensure!(source.contains(&cited.quote),"readiness quote is not present in immutable owner/source evidence");
+            ensure!(source.contains(&cited.quote),"readiness slot {name} quote is not present in immutable evidence ({}); quote an exact substring without added indentation or display line numbers",cited.path.as_deref().unwrap_or("owner request"));
         }
     }
     Ok(gaps)
@@ -140,7 +140,7 @@ async fn assess_source(root:&Path,source:AcceptanceSource,title:&str,body:&str,h
         decision:"REPLACE with a grounded decision for this slot".into(),
         evidence:vec![Evidence {path:None,quote:"REPLACE with an exact literal quote from the owner request".into()}],
     })).collect() };
-    let prompt=format!("Assess codification readiness BEFORE producing a spec. The slots object must have EXACTLY these six keys: {}. No additional keys are allowed. Resolve routine gaps from exact owner/repository evidence. A not-applicable slot MUST use status=resolved with decision explaining why it is not applicable and evidence grounding that conclusion. Never emit a separate not_applicable status. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON using this complete shape, replacing EVERY placeholder with grounded content:\n{}\nExternal slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. Do not add slots named resolve, resolve_routine, or other instructions. Owner request:\n{owner}",serde_json::to_string(&SLOTS)?,serde_json::to_string(&shape)?);
+    let prompt=format!("Assess codification readiness BEFORE producing a spec. The slots object must have EXACTLY these six keys: {}. No additional keys are allowed. Resolve routine gaps from exact owner/repository evidence. A not-applicable slot MUST use status=resolved with decision explaining why it is not applicable and evidence grounding that conclusion. Never emit a separate not_applicable status. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON using this complete shape, replacing EVERY placeholder with grounded content:\n{}\nExternal slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. Do not add slots named resolve, resolve_routine, or other instructions. For evidence, prefer a short exact source substring without indentation or display line numbers. Do not reconstruct whitespace or copy a whole escaped shell command when a short literal substring suffices. Ensure all strings are valid JSON. Owner request:\n{owner}",serde_json::to_string(&SLOTS)?,serde_json::to_string(&shape)?);
     let epoch=amendment::digest(serde_json::to_string(&(source,hash,&base,&current_main,&prompt)).unwrap().as_bytes());
     let key=|attempt|amendment::digest(format!("readiness-grounding-v2:{epoch}:{attempt}").as_bytes());
     let read_workflow=&*workflow;
@@ -184,7 +184,10 @@ async fn recover_assessment<R,W,G,F,V,VF>(prompt:&str,read:R,write:W,mut generat
 where R:Fn(u32)->Result<Option<String>>,W:Fn(u32,&str)->Result<()>,G:FnMut(String)->F,F:std::future::Future<Output=Result<String>>,
       V:Fn(String)->VF,VF:std::future::Future<Output=Result<(Assessment,Vec<String>)>> {
     let mut failure=String::new();
-    for attempt in 0..2 {
+    // One initial response and at most two corrections: a syntax correction
+    // may expose a separate evidence error. Completed outputs stay immutable
+    // and replayed; every real model admission remains charged by the audit.
+    for attempt in 0..3 {
         let raw=if let Some(raw)=read(attempt)? {raw} else {
             let request=if attempt==0 {prompt.to_owned()} else {format!("{prompt}\nYour previous completed assessment failed controller validation: {failure}. Return all six slots, each exactly resolved with decision/evidence or external_decision with question/alternatives/evidence. Not-applicable uses resolved. Cite exact supplied literal evidence. Do not invent material decisions to satisfy schema.")};
             let raw=generate(request).await?;write(attempt,&raw)?;raw
@@ -311,6 +314,35 @@ mod tests {
         let duplicate=format!("{{\"slots\":{{{},\"guards\":{}}}}}",&slots[1..slots.len()-1],valid["slots"]["guards"]);
         assert!(decode(&duplicate).is_err(), "duplicate gap evidence must not silently replace a decision");
         assert!(decode(&valid.to_string()).is_ok());
+    }
+    #[tokio::test]
+    async fn malformed_then_inexact_quote_can_correct_once_without_replaying_completed_work() {
+        let responses=std::sync::Mutex::new(BTreeMap::<u32,String>::new());
+        let calls=std::sync::atomic::AtomicUsize::new(0);
+        let valid=serde_json::to_value(resolved()).unwrap();
+        let mut inexact=valid.clone();
+        inexact["slots"]["trigger"]["evidence"][0]["quote"]=" fn status_cli()".into();
+        let validate=|raw:String|async move {
+            let assessment=decode(&raw)?;
+            let files=BTreeMap::from([("src/main.rs".into(),"fn status_cli() {}".into())]);
+            let gaps=super::validate(&assessment,"request",&files)?;Ok((assessment,gaps))
+        };
+        let read=|attempt|Ok(responses.lock().unwrap().get(&attempt).cloned());
+        let write=|attempt,raw:&str|{responses.lock().unwrap().insert(attempt,raw.into());Ok(())};
+        let result=recover_assessment("request",read,write,|prompt| {
+            let index=calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            let inexact=inexact.to_string();let valid=valid.to_string();
+            async move { match index {
+                0=>Ok("{malformed".into()),
+                1=>Ok(inexact),
+                2=>{assert!(prompt.contains("slot trigger"),"{prompt}");Ok(valid)},
+                _=>panic!("correction must remain bounded"),
+            }}
+        },validate).await;
+        assert!(result.is_ok(),"{result:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),3);
+        assert_eq!(responses.lock().unwrap().len(),3);
+        recover_assessment("request",read,write,|_|async {panic!("restart must reuse completed correction")},validate).await.unwrap();
     }
     fn adopted()->adoption::AdoptedPr {
         adoption::AdoptedPr {repository:"owner/repo".into(),pr:970,source_issue:None,branch:"worktree/imported".into(),head:"candidate-a".into(),base:"main".into(),author:"owner".into(),title:"Expose status".into(),body:"Choose destination externally".into(),dependency:adoption::Dependency::Main}

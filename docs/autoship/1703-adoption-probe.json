@@ -57,13 +57,26 @@
   },
   "repair_followup": {
     "root": "/tmp/autoship-native-acceptance-w21t6q9t",
-    "status": "running-not-accepted",
+    "status": "failed-readiness-before-repair",
     "change": "Commit model repairs through existing candidate checkpoint before shared CI attests source",
     "local_recovery_tests_passed": 2,
     "local_shared_ci_tests_passed": 5,
     "logs": [
       "/tmp/autoship-1703-green-repair-checkpoint.log",
       "/tmp/autoship-1703-green-repair-ci.log"
+    ],
+    "exit_code": 101,
+    "model_calls": 4,
+    "failure": "First response malformed JSON; correction cited YAML with an added indentation space, rejected by exact evidence validation."
+  },
+  "citation_followup": {
+    "root": "/tmp/autoship-native-acceptance-5fns0vx5",
+    "status": "running-not-accepted",
+    "change": "Name offending readiness slot/source; prefer short literal citations; at most two corrections after initial response, preserving all completed outputs",
+    "local_acceptance_tests_passed": 31,
+    "logs": [
+      "/tmp/autoship-1703-red-readiness-citation.log",
+      "/tmp/autoship-1703-green-readiness-citation.log"
     ]
   }
 }
