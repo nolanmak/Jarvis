@@ -229,7 +229,7 @@
       "shell": "bash"
     },
     "linkedin/linkedin/3": {
-      "body": "cargo test -p augmentagent-channel-linkedin --lib --tests --locked\ncargo test -p augmentagent-messages -p augmentagent-mcp-memory --lib --locked\ncargo test -p augmentagent-cli --test linkedin_archive_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent linkedin --locked\ncargo test -p augmentagent-channel-core --lib ask_mode_social_card_allowlist_tests --locked\ncargo test -p augmentagent-store --lib --test email_recipients --test team_coverage_store --locked\ncargo test -p augmentagent-auth --lib --tests --locked\ncargo test -p augmentagent-cli --test team_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent team_coverage --locked\ncargo test -p augmentagent-cli --bin augmentagent stale_reconcile_tests --locked\n",
+      "body": "cargo test -p augmentagent-channel-linkedin --lib --tests --locked\ncargo test -p augmentagent-messages -p augmentagent-mcp-memory --lib --locked\ncargo test -p augmentagent-cli --test linkedin_archive_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent linkedin --locked\ncargo test -p augmentagent-channel-core --lib ask_mode_social_card_allowlist_tests --locked\ncargo test -p augmentagent-store --lib --test email_recipients --test team_coverage_store --locked\ncargo test -p augmentagent-auth --lib --tests --locked\ncargo test -p augmentagent-cli --test team_cli --test team_coverage_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent team_coverage --locked\ncargo test -p augmentagent-cli --bin augmentagent stale_reconcile_tests --locked\n",
       "shell": "bash"
     },
     "model-router/adapter-compose/1": {
