@@ -228,6 +228,10 @@
       "body": "python3 -m unittest discover -s scripts/imessage/tests -v",
       "shell": "bash"
     },
+    "linkedin/linkedin/3": {
+      "body": "cargo test -p augmentagent-channel-linkedin --lib --tests --locked\ncargo test -p augmentagent-messages -p augmentagent-mcp-memory --lib --locked\ncargo test -p augmentagent-cli --test linkedin_archive_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent linkedin --locked\ncargo test -p augmentagent-channel-core --lib ask_mode_social_card_allowlist_tests --locked\ncargo test -p augmentagent-store --lib --test email_recipients --test team_coverage_store --locked\ncargo test -p augmentagent-auth --lib --tests --locked\ncargo test -p augmentagent-cli --test team_cli --test team_coverage_cli --locked\ncargo test -p augmentagent-cli --bin augmentagent team_coverage --locked\ncargo test -p augmentagent-cli --bin augmentagent stale_reconcile_tests --locked\n",
+      "shell": "bash"
+    },
     "model-router/adapter-compose/1": {
       "body": "python3 scripts/runpod-adapter/test_compose_deployment.py",
       "shell": "bash",
@@ -590,7 +594,7 @@
       "shell": "bash"
     },
     "platform/platform/7": {
-      "body": "cargo test -p augmentagent-store --test owner_alerts --test imessage_outbox --test imessage_compose\ncargo test -p augmentagent-cli --test imessage_outbox_cli --test imessage_compose_cli\ncargo test -p augmentagent-cli --bin augmentagent imessage\ncargo test -p augmentagent-channel-imessage\n",
+      "body": "cargo test -p augmentagent-store --test owner_alerts --test imessage_outbox --test imessage_compose\ncargo test -p augmentagent-cli --test imessage_outbox_cli --test imessage_compose_cli\ncargo test -p augmentagent-cli --bin augmentagent imessage\ncargo test -p augmentagent-channel-imessage\ncargo test -p augmentagent-store --test conversation_context --test draft_context_receipts\ncargo test -p augmentagent-channel-core --test draft_context --test capability_inventory\ncargo test -p augmentagent-wiki search::tests\ncargo test -p augmentagent-cli --test draft_context_cli\n",
       "shell": "bash"
     },
     "platform/platform/8": {
@@ -1445,6 +1449,64 @@
       "reason": "issue-driven implementation and publication, not PR validation",
       "role": "excluded",
       "sha256": "c9b351c41ade38928a1a84a3d746002aafc128756fc6b2165f96d5ff8b243f6d"
+    },
+    ".github/workflows/linkedin.yml": {
+      "defaults": {},
+      "env": {},
+      "events": {
+        "pull_request": null,
+        "push": {
+          "branches": [
+            "main"
+          ]
+        }
+      },
+      "jobs": {
+        "linkedin": {
+          "env": {
+            "AUGMENTAGENT_GH_DISABLE": "1",
+            "CARGO_BUILD_JOBS": 2,
+            "CARGO_PROFILE_DEV_DEBUG": 0,
+            "CARGO_PROFILE_TEST_DEBUG": 0
+          },
+          "name": "linkedin (${{ matrix.os }})",
+          "runs-on": "${{ matrix.os }}",
+          "steps": [
+            {
+              "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+            },
+            {
+              "uses": "dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec",
+              "with": {
+                "toolchain": "1.94.1"
+              }
+            },
+            {
+              "uses": "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+              "with": {
+                "key": "linkedin"
+              }
+            },
+            {
+              "command_id": "linkedin/linkedin/3",
+              "name": "LinkedIn archive, recall, and approval contracts",
+              "shell": "bash"
+            }
+          ],
+          "strategy": {
+            "fail-fast": false,
+            "matrix": {
+              "os": [
+                "ubuntu-latest",
+                "macos-latest"
+              ]
+            }
+          },
+          "timeout-minutes": 45
+        }
+      },
+      "role": "validation",
+      "sha256": "a1329ccbc925a04b523a9f21c6a5870dc247996411415667c592e1e4edd0e57f"
     },
     ".github/workflows/model-router.yml": {
       "defaults": {},

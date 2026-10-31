@@ -1230,6 +1230,7 @@ impl Store {
         }
         // #1699 — after retryGuardContext: the backfill reads it.
         crate::recipients::migrate(conn)?;
+        crate::team_coverage::migrate(conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS email_guard_observations (
             id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT NOT NULL,
             attempt_n INTEGER NOT NULL, guard TEXT NOT NULL, disposition TEXT NOT NULL,
@@ -2700,11 +2701,13 @@ impl Store {
         )?;
 
         crate::imessage::migrate(conn)?;
+        crate::draft_context_receipts::migrate(conn)?;
         crate::owner_alerts::migrate(conn)?;
         crate::alert_schedule::migrate(conn)?;
         crate::slack_contact::migrate(conn)?;
         // #1296 — one record per Slack message across live/poll/catch-up.
         crate::slack_ingest::migrate(conn)?;
+        conn.execute_batch(include_str!("linkedin_archive.sql"))?;
 
         Ok(())
     }
@@ -3334,6 +3337,19 @@ impl Store {
             params![action_id, status.as_str(), draft_body, error_message, now],
         )?;
         Ok(())
+    }
+
+    /// Replace a draft and defer its next nudge only while it remains pending.
+    /// A redraft that finishes after an approval claim must not reopen the send.
+    pub fn revise_pending_action(&self, action_id: &str, draft_body: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE actions SET draftBody = ?2, nextNudgeAtMs = ?3, updatedAt = ?4 \
+             WHERE id = ?1 AND status = 'pending'",
+            params![action_id, draft_body, now + NUDGE_INTERVAL_MS, now],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Persist a (draft, feedback, revised_draft) triple for action `action_id`
@@ -4706,7 +4722,9 @@ impl Store {
                     e.receivedAt, \
                     (a.recomposedAtMs IS NOT NULL), \
                     COALESCE(e.platform, ''), \
-                    a.createdAt \
+                    a.createdAt, \
+                    e.accountEntityId, \
+                    a.messageId \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -4727,6 +4745,8 @@ impl Store {
                 recomposed: r.get(7)?,
                 platform: r.get(8)?,
                 created_at_ms: r.get(9)?,
+                account_entity_id: r.get(10)?,
+                message_id: r.get(11)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -8993,6 +9013,11 @@ pub struct PendingActionRow {
     /// inbound arrived, so it is a safe Rule 1 fallback bound when
     /// `received_at` is missing or unparseable.
     pub created_at_ms: i64,
+    /// The inbound's mailbox (`emails.accountEntityId`). #1700 — teammate
+    /// coverage only looks at messages in the same mailbox.
+    pub account_entity_id: Option<String>,
+    /// The inbound's message id. #1701 — locates a Slack card in its thread.
+    pub message_id: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by

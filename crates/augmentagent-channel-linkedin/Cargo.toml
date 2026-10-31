@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+augmentagent-messages = { path = "../augmentagent-messages" }
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
@@ -26,6 +27,7 @@ uuid = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
+augmentagent-mcp-memory = { path = "../augmentagent-mcp-memory" }
 tempfile = "3"
 rusqlite = { workspace = true }
 wiremock = { workspace = true }

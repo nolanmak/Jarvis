@@ -1189,6 +1189,13 @@ impl ClaudeCliReasoner {
         } else {
             args.push("--allowedTools".into());
             args.push(opts.allowed_tools.join(" "));
+            // An empty auto-approval list is not the same as removing tools.
+            // Evidence selection and other text-only transforms execute reads
+            // through their coordinator, never through ambient CLI tools/MCP.
+            if !fresh_review && crate::providers::classify(opts) == crate::providers::CapabilityClass::TextOnly {
+                args.extend(["--tools".into(), "".into(), "--strict-mcp-config".into(),
+                    "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()]);
+            }
         }
 
         // `--system-prompt` REPLACES Claude Code's default system (tools list,
@@ -2122,6 +2129,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_imessage_compose_bare = "Bash(augmentagent imessage compose *)".to_string();
     let bash_imessage_allowlist_abs = format!("Bash({} imessage allowlist)", bin.display());
     let bash_imessage_allowlist_bare = "Bash(augmentagent imessage allowlist)".to_string();
+    let bash_message_context_abs = format!("Bash({} messages context *)", bin.display());
+    let bash_message_context_bare = "Bash(augmentagent messages context *)".to_string();
+    let bash_message_context_attach_abs = format!("Bash({} messages context-attach *)", bin.display());
+    let bash_message_context_attach_bare = "Bash(augmentagent messages context-attach *)".to_string();
     // #1061 — the same for the Apple Notes bundle, into the same session dir.
     let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
     let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
@@ -2250,7 +2261,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         }
     }
     // The compose subprocess must use the daemon's existing bundle and gate.
-    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED"] {
+    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED", "AUGMENTAGENT_DRAFT_CONTEXT_PLATFORMS"] {
         if let Ok(value) = std::env::var(key) {
             if !value.trim().is_empty() { env.push((key.into(), value)); }
         }
@@ -2369,6 +2380,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_recent_bare,
             bash_linkedin_recent_abs_noargs,
             bash_linkedin_recent_bare_noargs,
+            format!("Bash({} linkedin thread *)", bin.display()),
+            "Bash(augmentagent linkedin thread *)".into(),
+            format!("Bash({} linkedin archive-status)", bin.display()),
+            "Bash(augmentagent linkedin archive-status)".into(),
+            format!("Bash({} linkedin archive-status *)", bin.display()),
+            "Bash(augmentagent linkedin archive-status *)".into(),
             bash_linkedin_dm_abs,
             bash_linkedin_dm_bare,
             bash_linkedin_comment_abs,
@@ -2377,6 +2394,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_imessage_fetch_bare,
             bash_imessage_compose_abs,
             bash_imessage_compose_bare,
+            bash_message_context_abs,
+            bash_message_context_bare,
+            bash_message_context_attach_abs,
+            bash_message_context_attach_bare,
             bash_imessage_allowlist_abs,
             bash_imessage_allowlist_bare,
             bash_notes_fetch_abs,
@@ -4785,6 +4806,8 @@ mod ask_mode_social_card_allowlist_tests {
             // that was never ingested — the dead end that made the agent fall
             // back to "paste it yourself".
             "linkedin recent-dms",
+            "linkedin thread *",
+            "linkedin archive-status",
         ] {
             assert!(
                 tools.iter().any(|t| t.contains(needle)),

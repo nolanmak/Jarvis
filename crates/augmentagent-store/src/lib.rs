@@ -6,6 +6,8 @@
 
 // #1289 — durable approval-card pointers per surface.
 pub mod email_guards;
+pub mod conversation_context;
+pub mod draft_context_receipts;
 pub mod approval_cards;
 pub mod approval_history;
 pub mod triage_outcomes;
@@ -15,6 +17,7 @@ pub mod daemon_report;
 pub mod delivery;
 pub mod imessage;
 pub mod models;
+pub mod linkedin_archive;
 pub mod notes;
 pub mod owner;
 pub mod phone;
@@ -22,6 +25,7 @@ mod local_chat;
 pub mod owner_alerts;
 pub mod recipients;
 pub mod redact;
+pub mod team_coverage;
 // #1290 — Slack contact send targets and the per-action send ledger.
 pub mod slack_contact;
 // #1296 — live/poll reconciliation ledger for subscribed Slack messages.

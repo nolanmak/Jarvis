@@ -6,13 +6,36 @@ use std::time::Duration;
 
 use anyhow::Result;
 use augmentagent_messages::{check, drain, enqueue_stale, index::drain_batch, YIELD_PAUSE};
-use augmentagent_store::Store;
+use augmentagent_store::{approval_cards::ActionRefMatch, Store};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 #[derive(clap::Subcommand)]
 pub enum Op {
+    /// Prepare conversation/wiki evidence for a draft. Reads history and calls
+    /// the evidence model; stores a private receipt, never drafts or sends.
+    Context {
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        request: String,
+    },
+    /// Inspect private evidence receipts attached to an approval action.
+    ContextReceipts {
+        /// Full action ID or an unambiguous short approval-card reference.
+        #[arg(long)]
+        action_id: String,
+    },
+    /// Link a prepared receipt to a draft in the same account/conversation.
+    /// Changes evidence metadata only; never approves or sends the action.
+    ContextAttach {
+        #[arg(long)]
+        receipt_id: String,
+        /// Full action ID or an unambiguous short approval-card reference.
+        #[arg(long)]
+        action_id: String,
+    },
     /// Backfill / refresh the message index: queue every stored message that
     /// has no index row (or one from an older extractor), then drain the
     /// queue. Resumable — the queue persists — and a no-op when complete.
@@ -89,8 +112,37 @@ pub enum Op {
     ResolvePeople,
 }
 
+fn resolve_context_action(store: &Store, reference: &str) -> Result<String> {
+    match store.resolve_action_ref(reference)? {
+        ActionRefMatch::One(id) => Ok(id),
+        ActionRefMatch::None => anyhow::bail!("Action reference not found; use the full action ID or a unique card reference"),
+        ActionRefMatch::Ambiguous(_) => anyhow::bail!("Action reference is ambiguous; use the full action ID"),
+    }
+}
+
 pub async fn run(store: Arc<Store>, op: Op, wiki_dir: Option<std::path::PathBuf>) -> Result<()> {
+    let wiki_dir=wiki_dir.or_else(||std::env::var_os("WIKI_ROOT").map(PathBuf::from).filter(|p|p.is_dir()));
     match op {
+        Op::ContextAttach {receipt_id,action_id} => {
+            let action_id = resolve_context_action(&store, &action_id)?;
+            anyhow::ensure!(store.attach_draft_context_receipt(&receipt_id,&action_id)?,"Receipt and action do not identify the same conversation, or the receipt is already attached elsewhere");
+            println!("{}",json!({"attached":true,"action_id":action_id,"receipt_id":receipt_id}));
+            Ok(())
+        }
+        Op::Context {message_id,request} => {
+            let source=store.context_source(&message_id)?.ok_or_else(||anyhow::anyhow!("Message source not found"))?;
+            let reasoner=augmentagent_channel_core::build_reasoner();
+            let prepared=augmentagent_channel_core::draft_workflow::prepare_latest(&store,reasoner.as_ref(),&source,&request,wiki_dir.as_deref()).await?;
+            let approval_context_notice = prepared.guard_draft("");
+            println!("{}",serde_json::to_string(&json!({"enabled":prepared.enabled,"receipt_id":prepared.receipt_id,"context":prepared.seed,"evidence":prepared.evidence,"approval_context_notice":approval_context_notice}))?);
+            Ok(())
+        }
+        Op::ContextReceipts {action_id} => {
+            let action_id = resolve_context_action(&store, &action_id)?;
+            let receipts=store.draft_context_receipts(&action_id)?.iter().map(|r|serde_json::from_str::<serde_json::Value>(r)).collect::<Result<Vec<_>,_>>()?;
+            println!("{}",serde_json::to_string(&receipts)?);
+            Ok(())
+        }
         Op::Reindex {
             platform,
             dry_run,
