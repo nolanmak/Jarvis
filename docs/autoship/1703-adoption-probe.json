@@ -1,5 +1,5 @@
 {
-  "status": "live-probe-running-not-accepted",
+  "status": "live-probe-failed-contract-schema",
   "implementation": "adoption fixture and acceptance completion corrections after 87e8f8be",
   "invalidated_probe": {
     "root": "/tmp/autoship-native-acceptance-_kg99_md",
@@ -25,5 +25,19 @@
     "/tmp/autoship-1703-green-probe-completion.log",
     "/tmp/autoship-1703-pdf-ci-failure.log",
     "/tmp/autoship-1703-green-deployment-rebuild.log"
-  ]
+  ],
+  "live_result": {
+    "exit_code": 101,
+    "test_completed": true,
+    "model_calls": 4,
+    "stage": "held",
+    "reason": "independent acceptance proposal rejected unknown contract.source field; expected pull_request",
+    "elapsed_seconds": 223.69
+  },
+  "followup_probe": {
+    "root": "/tmp/autoship-native-acceptance-_0l_2gk7",
+    "status": "running-not-accepted",
+    "change": "Explicit direct source identity fields in contract prompt; parser remains strict",
+    "local_contract_tests_passed": 29
+  }
 }
