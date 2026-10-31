@@ -166,7 +166,8 @@
         "capability_inventory::imessage_compose_matches_social_card_scope_and_forbids_send_controls"
       ],
       "provider_conformance": "verified",
-      "imessage_compose": "imessage compose --to --body --post creates an approval card only; imessage allowlist is read-only. No approve, allow-outbound, alerts, or outbox mutation permission."
+      "imessage_compose": "imessage compose --to --body --post creates an approval card only; imessage allowlist is read-only. No approve, allow-outbound, alerts, or outbox mutation permission.",
+      "draft_context": "messages context --message-id --request invokes shared read-only evidence recovery and stores a private receipt; never sends or changes contact policy. Request and evidence output are omitted from ordinary tool audit notices."
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::digest_opts",

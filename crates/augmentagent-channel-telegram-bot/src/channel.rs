@@ -455,7 +455,12 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
                     std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                         .unwrap_or_default();
                 let draft = draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+                let shared_draft_context = augmentagent_channel_core::draft_workflow::prepare(
+                    &self.store, self.reasoner.as_ref(), &email,
+                    "Draft a response using relevant conversation and cross-platform evidence.",
+                    self.config.wiki_root.as_deref(),
+                ).await?;
+                let draft_prompt = draft_user_message(&email, &shared_draft_context.prompt(), "", "", "", "");
                 let drafted = match self.reasoner.call(&draft, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -473,6 +478,7 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
                     }
                 };
 
+                let drafted = shared_draft_context.guard_draft(&drafted);
                 if self.config.dry_run {
                     self.store.log_action(
                         &email.message_id,
@@ -511,6 +517,7 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
                     Some(&drafted),
                     ActionStatus::Pending,
                 )?;
+                anyhow::ensure!(shared_draft_context.attach(&self.store, &action_id)?, "Could not attach draft evidence receipt");
                 if let Err(e) = self
                     .approvals
                     .post_approval(&action_id, &email, &drafted)
@@ -935,6 +942,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Reasoner for ScriptedReasoner {
         async fn call(&self, _opts: &ReasonerOpts, _msg: &str) -> anyhow::Result<String> {
+            // Evidence selection is tested independently; keep the existing
+            // triage/draft script focused on the adapter's transport behavior.
+            if _opts.system_prompt.starts_with("You select evidence for a messaging draft") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             Ok(self
                 .responses
                 .lock()

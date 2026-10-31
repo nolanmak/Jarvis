@@ -1,7 +1,10 @@
 //! Read-only, source-preserving conversation windows for drafting (#1691).
 //! This layer selects stored messages; it neither decides relevance nor sends.
 
-use crate::{rusqlite::params, Store, StoreResult};
+use crate::{
+    rusqlite::{params, OptionalExtension},
+    Email, Store, StoreResult,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,6 +29,26 @@ pub struct ConversationScope<'a> {
 }
 
 impl Store {
+    /// Read an exact source for owner-requested context preparation. Restore
+    /// persisted envelope/attachment metadata when available.
+    pub fn context_source(&self, message_id: &str) -> StoreResult<Option<Email>> {
+        let mut source = self.with_conn(|c| c.query_row(
+            "SELECT messageId,threadId,fromEmail,subject,COALESCE(body,''),COALESCE(receivedAt,''),accountEntityId,platform,kind FROM emails WHERE messageId=?1",
+            [message_id], |r| Ok(Email {
+                message_id:r.get(0)?,thread_id:r.get(1)?,from:r.get(2)?,subject:r.get(3)?,body:r.get(4)?,
+                date:r.get(5)?,account_entity_id:r.get(6)?,platform:r.get(7)?,kind:r.get(8)?,
+                to:String::new(),cc:String::new(),attachments:Vec::new(),
+            })).optional())?;
+        if let Some(email) = source.as_mut() {
+            if let Some((to, cc, attachments)) = self.email_retry_guard_context(message_id)? {
+                email.to = to;
+                email.cc = cc;
+                email.attachments = attachments;
+            }
+        }
+        Ok(source)
+    }
+
     /// Latest real messages at or before a trigger, returned oldest first.
     /// Synthetic compose rows are intentions, even when their action is sent;
     /// the transport's ingested message is the authoritative history record.

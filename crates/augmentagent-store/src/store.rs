@@ -2698,6 +2698,7 @@ impl Store {
         )?;
 
         crate::imessage::migrate(conn)?;
+        crate::draft_context_receipts::migrate(conn)?;
         crate::owner_alerts::migrate(conn)?;
         crate::alert_schedule::migrate(conn)?;
         crate::slack_contact::migrate(conn)?;

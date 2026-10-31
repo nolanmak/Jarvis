@@ -662,6 +662,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approve_imessage_never_sends_private_context_warnings() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let draft = augmentagent_approval_discord::append_needs_input_marker(
+            "Can you resend the email?", &[("context".into(), "PRIVATE_CONTEXT_WARNING".into())],
+        );
+        let id=seed(&f.store, PHONE, &draft);
+        assert!(matches!(f.approver.run_approve(&id).await, ApprovalActionOutcome::Approved));
+        let rows=f.store.list_imessage_outbox(10).unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].body,"Can you resend the email?");
+    }
+
+    #[tokio::test]
     async fn approve_imessage_enqueues_once_and_never_reaches_gmail() {
         let f = fixture(true);
         f.store.allow_imessage_outbound(PHONE).unwrap();

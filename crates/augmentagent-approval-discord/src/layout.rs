@@ -176,15 +176,16 @@ pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
 }
 
 /// Scrub every trace of the assumes marker from a body bound for a real
-/// recipient. Stricter than [`split_assumes`], which deliberately leaves a
+/// recipient. Also strips needs-input metadata now shared by all messaging
+/// adapters (#1690); context warnings belong on the card, never in a text.
+/// Stricter than [`split_assumes`], which deliberately leaves a
 /// malformed fence alone so the card never shows half-parsed markup: a Gmail
 /// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
 pub fn strip_assumes_for_send(body: &str) -> String {
     let (clean, _) = split_assumes(body);
-    match clean.rfind(ASSUMES_OPEN_PREFIX) {
-        Some(at) => clean[..at].trim_end().to_string(),
-        None => clean,
-    }
+    let cutoff = [ASSUMES_OPEN_PREFIX, "<!--aa:needs-input"].iter()
+        .filter_map(|marker|clean.find(marker)).min();
+    cutoff.map(|at|clean[..at].trim_end().to_string()).unwrap_or(clean)
 }
 
 /// Split a persisted draft into the human-facing draft and any needs-input
@@ -1245,6 +1246,15 @@ mod tests {
         let unclosed = format!("Hello.\n\n{ASSUMES_OPEN}a guess");
         assert_eq!(strip_assumes_for_send(&unclosed), "Hello.");
         assert_eq!(strip_assumes_for_send("Hello."), "Hello.");
+    }
+
+    #[test]
+    fn send_scrubber_removes_context_warnings_even_if_incomplete() {
+        let needs=append_needs_input_marker("Hello.", &[("context".into(),"private source unavailable".into())]);
+        assert_eq!(strip_assumes_for_send(&needs),"Hello.");
+        assert_eq!(strip_assumes_for_send("Hello.\n\n<!--aa:needs-input\ncontext|private"),"Hello.");
+        let both=append_needs_input_marker(&append_assumes_marker("Hello.",&["private assumption".into()]),&[("context".into(),"private source".into())]);
+        assert_eq!(strip_assumes_for_send(&both),"Hello.");
     }
 
     #[test]

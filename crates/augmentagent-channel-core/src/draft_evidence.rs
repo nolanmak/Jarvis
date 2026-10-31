@@ -2,24 +2,57 @@
 //! The model requests typed read operations; this coordinator executes them.
 //! No provider needs write tools or implicit access to the deployment directory.
 
-use std::collections::BTreeSet;
-use std::path::Path;
-use augmentagent_store::{Store, rusqlite::params};
+use crate::{draft_context::ContextSeed, Reasoner};
+use augmentagent_store::{rusqlite::params, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::{draft_context::ContextSeed, Reasoner};
+use std::collections::BTreeSet;
+use std::path::Path;
 
 const MAX_STEPS: usize = 8;
 const MAX_CHARS: usize = 64_000;
 const PAGE_CHARS: usize = 8_000;
 
+fn parse_decision(raw: &str) -> serde_json::Result<EvidenceDecision> {
+    let candidate =
+        crate::decision::extract_json_blob(raw).unwrap_or_else(|| raw.trim().to_string());
+    if let Some(at) = raw.find(&candidate) {
+        if crate::decision::extract_json_blob(&raw[..at]).is_some()
+            || crate::decision::extract_json_blob(&raw[at + candidate.len()..]).is_some()
+        {
+            return Err(serde::de::Error::custom(
+                "Expected one retrieval decision, received multiple JSON objects",
+            ));
+        }
+    }
+    serde_json::from_str(&candidate)
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(tag="action", rename_all="snake_case", deny_unknown_fields)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EvidenceDecision {
-    Search { query: String, #[serde(default)] offset: usize, reason: String },
-    ReadMessage { message_id: String, #[serde(default)] offset: usize, reason: String },
-    ReadWiki { path: String, #[serde(default)] offset: usize, reason: String },
-    Ready { facts: Vec<GroundedFact>, gaps: Vec<String> },
+    Search {
+        query: String,
+        #[serde(default)]
+        offset: usize,
+        reason: String,
+    },
+    ReadMessage {
+        message_id: String,
+        #[serde(default)]
+        offset: usize,
+        reason: String,
+    },
+    ReadWiki {
+        path: String,
+        #[serde(default)]
+        offset: usize,
+        reason: String,
+    },
+    Ready {
+        facts: Vec<GroundedFact>,
+        gaps: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,61 +96,142 @@ pub async fn gather(
     owner_request: &str,
     wiki_root: Option<&Path>,
 ) -> EvidenceOutcome {
-    let mut out = EvidenceOutcome {facts: Vec::new(), gaps: Vec::new(), reads: Vec::new(), complete: false};
-    let mut readable: BTreeSet<String> = seed.messages.iter().map(|m|m.message_id.clone()).collect();
+    let mut out = EvidenceOutcome {
+        facts: Vec::new(),
+        gaps: Vec::new(),
+        reads: Vec::new(),
+        complete: false,
+    };
+    let mut readable: BTreeSet<String> =
+        seed.messages.iter().map(|m| m.message_id.clone()).collect();
     let mut cited = readable.clone();
-    cited.extend(seed.wiki.iter().map(|p|p.path.clone()));
+    if let Some(id) = seed
+        .audience
+        .get("trigger_message_id")
+        .and_then(Value::as_str)
+    {
+        readable.insert(id.to_string());
+    }
+    cited.extend(seed.wiki.iter().map(|p| p.path.clone()));
     let opts = crate::reasoner::draft_opts(CONTRACT.into(), None);
+    let index_health = augmentagent_messages::check(store).ok();
     let started = std::time::Instant::now();
+    let mut protocol_retries = 0;
     for _ in 0..MAX_STEPS {
-        let prompt = json!({"request":owner_request,"baseline":seed,"retrieval":out.reads}).to_string();
+        let prompt =
+            json!({"request":owner_request,"baseline":seed,"retrieval":out.reads}).to_string();
         if prompt.chars().count() > MAX_CHARS {
-            out.gaps.push("Evidence budget exhausted; context may be incomplete".into()); break;
+            out.gaps
+                .push("Evidence budget exhausted; context may be incomplete".into());
+            break;
         }
         let remaining = std::time::Duration::from_secs(90).saturating_sub(started.elapsed());
         let response = tokio::time::timeout(remaining, reasoner.call(&opts, &prompt)).await;
         let raw = match response {
             Ok(Ok(raw)) => raw,
-            _ => { out.gaps.push("Evidence model unavailable or retrieval deadline exceeded".into()); break; }
+            _ => {
+                out.gaps
+                    .push("Evidence model unavailable or retrieval deadline exceeded".into());
+                break;
+            }
         };
-        let decision: EvidenceDecision = match serde_json::from_str(raw.trim()) {
+        let decision: EvidenceDecision = match parse_decision(&raw) {
             Ok(value) => value,
-            Err(_) => {out.gaps.push("Evidence model returned an invalid retrieval decision".into());break;}
+            Err(error) => {
+                out.reads.push(EvidenceRead {operation:"protocol_error".into(),reason:"Retry the decision using exactly one of the documented JSON schemas; no tools were executed".into(),result:json!({"error":error.to_string().chars().take(300).collect::<String>()})});
+                if protocol_retries == 0 {
+                    protocol_retries += 1;
+                    continue;
+                }
+                out.gaps.push(
+                    "The context check could not finish; relevant sources remain unverified".into(),
+                );
+                break;
+            }
         };
         let (operation, reason, result) = match decision {
             EvidenceDecision::Ready { facts, gaps } => {
-                if facts.iter().any(|f| f.source_ids.is_empty() || f.source_ids.iter().any(|id|!cited.contains(id))) {
-                    out.gaps.push("Evidence model cited a source it has not read".into()); break;
+                if facts.iter().any(|f| {
+                    f.source_ids.is_empty() || f.source_ids.iter().any(|id| !cited.contains(id))
+                }) {
+                    out.gaps
+                        .push("Evidence model cited a source it has not read".into());
+                    break;
                 }
-                out.facts = facts; out.gaps.extend(gaps); out.complete = true;
+                out.facts = facts;
+                out.gaps.extend(gaps);
+                out.complete = true;
                 return out;
             }
-            EvidenceDecision::Search { query, offset, reason } => {
-                let result = store.with_conn(|c| Ok(augmentagent_messages::query::search(c,&query,Some(10),offset)));
+            EvidenceDecision::Search {
+                query,
+                offset,
+                reason,
+            } => {
+                let result = store.with_conn(|c| {
+                    Ok(augmentagent_messages::query::search(
+                        c,
+                        &query,
+                        Some(10),
+                        offset,
+                    ))
+                });
                 let result = match result {
                     Ok(Ok(response)) => {
-                        readable.extend(response.hits.iter().map(|h|h.message_id.clone()));
-                        serde_json::to_value(response).unwrap_or(Value::Null)
+                        readable.extend(response.hits.iter().map(|h| h.message_id.clone()));
+                        let mut value = serde_json::to_value(response).unwrap_or(Value::Null);
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(
+                                "index_health".into(),
+                                serde_json::to_value(&index_health).unwrap_or(Value::Null),
+                            );
+                        }
+                        value
                     }
-                    _ => json!({"error":"Message search unavailable; do not interpret as no matches"}),
+                    _ => {
+                        json!({"error":"Message search unavailable; do not interpret as no matches"})
+                    }
                 };
                 ("search".to_string(), reason, result)
             }
-            EvidenceDecision::ReadMessage { message_id, offset, reason } => {
-                let result = if !readable.contains(&message_id) { json!({"error":"Message must first be located by search"}) }
-                else { read_message(store, &message_id, offset).unwrap_or_else(|_|json!({"error":"Message source unavailable"})) };
-                if result.get("message_id").is_some() {cited.insert(message_id);}
+            EvidenceDecision::ReadMessage {
+                message_id,
+                offset,
+                reason,
+            } => {
+                let result = if !readable.contains(&message_id) {
+                    json!({"error":"Message must first be located by search"})
+                } else {
+                    read_message(store, &message_id, offset)
+                        .unwrap_or_else(|_| json!({"error":"Message source unavailable"}))
+                };
+                if result.get("message_id").is_some() {
+                    cited.insert(message_id);
+                }
                 ("read_message".to_string(), reason, result)
             }
-            EvidenceDecision::ReadWiki { path, offset, reason } => {
+            EvidenceDecision::ReadWiki {
+                path,
+                offset,
+                reason,
+            } => {
                 let result = read_wiki(wiki_root, &path, offset);
-                if result.get("path").is_some() {cited.insert(path);}
+                if result.get("path").is_some() {
+                    cited.insert(path);
+                }
                 ("read_wiki".to_string(), reason, result)
             }
         };
-        out.reads.push(EvidenceRead {operation, reason, result});
+        out.reads.push(EvidenceRead {
+            operation,
+            reason,
+            result,
+        });
     }
-    if out.gaps.is_empty() {out.gaps.push("Retrieval step limit reached; evidence review unfinished".into());}
+    if out.gaps.is_empty() {
+        out.gaps
+            .push("Retrieval step limit reached; evidence review unfinished".into());
+    }
     out
 }
 
@@ -138,22 +252,53 @@ fn read_message(store: &Store, id: &str, offset: usize) -> anyhow::Result<Value>
 }
 
 fn read_wiki(root: Option<&Path>, relative: &str, offset: usize) -> Value {
-    let Some(root)=root else {return json!({"error":"Wiki unavailable"});};
-    let path=Path::new(relative);
-    if path.is_absolute() || path.components().any(|c| !matches!(c,std::path::Component::Normal(_)))
-        || !matches!(path.components().next().and_then(|c|c.as_os_str().to_str()),Some("people"|"projects"|"threads"|"about")) {
+    let Some(root) = root else {
+        return json!({"error":"Wiki unavailable"});
+    };
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || !matches!(
+            path.components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str()),
+            Some("people" | "projects" | "threads" | "about")
+        )
+    {
         return json!({"error":"Wiki path outside permitted context directories"});
     }
-    let resolved=root.canonicalize().ok().zip(root.join(path).canonicalize().ok());
-    let Some((root,source))=resolved.filter(|(r,p)|p.starts_with(r)) else {return json!({"error":"Wiki source unavailable"});};
-    let _=root;
+    let resolved = root
+        .canonicalize()
+        .ok()
+        .zip(root.join(path).canonicalize().ok());
+    let Some((root, source)) = resolved.filter(|(r, p)| p.starts_with(r)) else {
+        return json!({"error":"Wiki source unavailable"});
+    };
+    let _ = root;
     match std::fs::read_to_string(source) {
         Ok(raw) => {
-            use sha2::{Digest,Sha256};
-            let text:String=raw.chars().skip(offset).take(PAGE_CHARS).collect();
-            let next=offset.saturating_add(text.chars().count());
+            use sha2::{Digest, Sha256};
+            let text: String = raw.chars().skip(offset).take(PAGE_CHARS).collect();
+            let next = offset.saturating_add(text.chars().count());
             json!({"path":relative,"sha256":format!("{:x}",Sha256::digest(raw.as_bytes())),"text":text,"next_offset":(next<raw.chars().count()).then_some(next)})
         }
-        Err(_)=>json!({"error":"Wiki source unreadable"}),
+        Err(_) => json!({"error":"Wiki source unreadable"}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn decision_accepts_one_fenced_json_after_reasoning_but_not_ambiguous_actions() {
+        let ready = r#"{"action":"ready","facts":[],"gaps":[]}"#;
+        assert!(parse_decision(&format!(
+            "The sources are sufficient.\n```json\n{ready}\n```"
+        ))
+        .is_ok());
+        assert!(parse_decision(&format!("{ready}\n{ready}")).is_err());
+        assert!(parse_decision(r#"{"action":"send","body":"not authorized"}"#).is_err());
     }
 }

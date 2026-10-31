@@ -801,7 +801,12 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
         let skill_system =
             std::fs::read_to_string(self.config.skill_dir.join("SKILL.md")).unwrap_or_default();
         let draft_opts = socialapi_draft_opts(skill_system, self.config.wiki_root.clone());
-        let mut draft_prompt = draft_user_message(&email, "", "", "", "", "");
+        let shared_draft_context = augmentagent_channel_core::draft_workflow::prepare(
+            &self.store, self.reasoner.as_ref(), &email,
+            "Draft a response using relevant conversation and cross-platform evidence.",
+            self.config.wiki_root.as_deref(),
+        ).await?;
+        let mut draft_prompt = draft_user_message(&email, &shared_draft_context.prompt(), "", "", "", "");
         // #858: let the drafter SEE a shared image. Best-effort — a failed fetch
         // leaves the #573 URL note as the fallback; the guard drops the tempfile.
         let image = match dm.attachment_url.as_deref() {
@@ -819,6 +824,7 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
             .trim()
             .to_string();
         drop(image);
+        let draft = shared_draft_context.guard_draft(&draft);
 
         if self.config.dry_run {
             if let Some(p) = permit {
@@ -855,6 +861,7 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
             Some(&draft),
             ActionStatus::Pending,
         )?;
+        anyhow::ensure!(shared_draft_context.attach(&self.store, &action_id)?, "Could not attach draft evidence receipt");
         if let Err(e) = self.approvals.post_approval(&action_id, &email, &draft).await {
             if let Some(p) = permit {
                 let _ = self
@@ -952,7 +959,12 @@ mod tests {
     }
     #[async_trait]
     impl Reasoner for ScriptedReasoner {
-        async fn call(&self, _: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+        async fn call(&self, opts: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+            // Evidence selection is tested independently; keep the existing
+            // triage/draft script focused on the adapter's transport behavior.
+            if opts.system_prompt.starts_with("You select evidence for a messaging draft") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             self.prompts.lock().unwrap().push(prompt.to_string());
             let seen = augmentagent_channel_core::images::extract_image_markers(prompt).images;
             self.images_seen.lock().unwrap().extend(seen);

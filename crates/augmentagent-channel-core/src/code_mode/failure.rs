@@ -246,6 +246,7 @@ fn find_exact_title(list_json: &serde_json::Value, title: &str) -> Option<u64> {
 /// [`report_classic_fallback`]. Built once per code-mode attempt by the
 /// channel; refs only — nothing here is owned.
 pub struct FailureCtx<'a> {
+    pub draft_context: Option<&'a crate::draft_workflow::PreparedDraftContext>,
     /// Reasoner for the repair retry.
     pub reasoner: &'a dyn Reasoner,
     /// Opts mirroring the first `call_code_mode` (same system prompt etc).
@@ -371,7 +372,8 @@ pub async fn handle_code_mode_failure(
         ctx.message_ctx.clone(),
         repaired_source.clone(),
     )
-    .with_wiki_hint(ctx.wiki_hint.clone());
+    .with_wiki_hint(ctx.wiki_hint.clone())
+    .with_draft_context(ctx.draft_context);
 
     if let Err(e) = code_mode::run_program(&repaired_source, &ctx.manifest, &dispatcher).await {
         warn!(
@@ -845,6 +847,7 @@ mod tests {
         email: Email,
     ) -> FailureCtx<'a> {
         FailureCtx {
+                            draft_context: None,
             reasoner,
             opts: ReasonerOpts {
                 system_prompt: String::new(),

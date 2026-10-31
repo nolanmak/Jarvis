@@ -21,6 +21,7 @@ pub mod cooldown;
 pub mod decision;
 pub mod draft_context;
 pub mod draft_evidence;
+pub mod draft_workflow;
 pub mod engagement;
 pub mod fallback;
 pub mod gemini;
