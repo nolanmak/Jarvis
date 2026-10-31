@@ -100,6 +100,7 @@ mod imessage_compose;
 mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
+mod autoship_commands;
 mod autoship_contract;
 mod autoship_episode;
 mod autoship_metrics;
@@ -1090,6 +1091,13 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Inspect a durable workflow without starting work or changing state.
+    Status {
+        #[arg(long)]
+        workflow: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Put `agent-gave-up` issues back in the pool by recorded reason code
     /// (`stuck:gate-red:<fp>`, `attempts:review-reject`, `scoper:not-fixable`,
     /// …). `--reason` matches the whole code or any whole `:` segment of it.
@@ -3027,6 +3035,9 @@ async fn main() -> Result<()> {
 
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Status { ref workflow, json } } = cli.cmd {
+        std::process::exit(autoship_commands::run_status(workflow, json));
     }
     if let Cmd::AutoPrWorker { dry_run } = cli.cmd {
         return autoship_worker::run(std::env::current_dir()?, dry_run).await;
@@ -5586,6 +5597,7 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
+        Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             for n in self_improve::readmit(&root, &reason, dry_run, reset_history).await? {
