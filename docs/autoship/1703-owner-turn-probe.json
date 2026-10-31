@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1713,
+    1712,
+    1706
+  ],
+  "status": "owner-turn-ownership-protocol-verified-native-dispatch-not-connected",
+  "parent_commit": "61f81a2551d327f2d97ee3d3e8f07913a181ffa8",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-owner-turn.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Owner turn cannot acquire its paused candidate."
+    },
+    "full_cli_green_before_body_integrity_check": {
+      "log": "/tmp/autoship-1703-green-owner-turn-full.log",
+      "exit": 0,
+      "passed": 1485,
+      "failed": 0,
+      "ignored": 25,
+      "compiled_cli_passed": 43
+    },
+    "final_focused_green": {
+      "log": "/tmp/autoship-1703-green-owner-turn-final.log",
+      "exit": 0,
+      "passed": 192,
+      "failed": 0,
+      "note": "Includes final stored-message-body integrity validation."
+    }
+  },
+  "verified": [
+    "Explicit owner-turn claim acquires one durable inbox request under a new fenced workflow lease while keeping ordinary productive dispatch paused.",
+    "Active worker lease, unretired native owner, unresolved remote operation/merge, independent Held state and terminal workflow prevent owner-turn acquisition. Lease expiry alone never proves process quiescence or resets a previously claimed owner turn.",
+    "Independent SQLite consumers race for one turn and only one succeeds. Reopened stores do not repeat an expired claimed turn.",
+    "Turn validation binds request identity, immutable message body, workflow lease/generation, pause revision and candidate binding. A later owner intent or expired lease invalidates the token.",
+    "Owner clarification invalidates only the current approval index while retaining historical review events. An injected audit failure rolls back lease, turn reservation and approval deletion atomically."
+  ],
+  "limits": [
+    "This is ownership protocol only. No production native consumer calls it yet, and no model, verifier, edit or live owner session was accepted by this change.",
+    "No completion/reset API is added. Claimed interrupted turns require future explicit native outcome/quiescence reconciliation, not automatic retry.",
+    "Workspace preparation/provenance, actual Codex/Claude continuation and session receipts, protected scope/contract revision, all dependent review-cache invalidation and independent re-review remain unfinished.",
+    "Native runtime retirement evidence is consumed conservatively; this does not implement a new teardown mechanism or prove an active child stopped.",
+    "Full binary and compiled CLI tests ran before final stored-body integrity validation; the final focused autoship suite covers that small change.",
+    "No production rollout, live Discord/native acceptance, hosted CI acceptance or required soak completion. No child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "0239ec46c1436b3458db51eabe767b4ef3a7ef15d16de7964dbd883289cddef4"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "0713981981eb2c0c1b214bd48a7fbe661bb4f3f125e910269ec413849ecd5e01"
+    }
+  ]
+}

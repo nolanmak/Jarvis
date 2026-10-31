@@ -15,6 +15,8 @@ pub(crate) mod progress;
 mod milestone;
 #[path = "autoship_discord_ingress.rs"]
 pub(crate) mod discord_ingress;
+#[path = "autoship_owner_turn.rs"]
+pub(crate) mod owner_turn;
 #[path = "autoship_owner_inbox.rs"]
 pub(crate) mod owner_inbox;
 #[path = "autoship_discord_controls.rs"]
@@ -313,6 +315,11 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_turn (
+                workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
+                owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,
+                binding TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_owner_turn ON workflow_owner_turn(workflow) WHERE state IN ('claimed','uncertain');
             CREATE TABLE IF NOT EXISTS workflow_owner_message (
                 request_id TEXT PRIMARY KEY REFERENCES discord_control_request(request_id),
                 workflow TEXT NOT NULL REFERENCES command_job(workflow), body TEXT NOT NULL,
