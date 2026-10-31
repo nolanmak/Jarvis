@@ -242,7 +242,10 @@ consumes one request from `--max-pages`; a zero budget performs no requests or
 credential reads and reports incomplete coverage. Missing credentials fail
 without creating database or credential files.
 Repeat bounded invocations to resume durable progress; `--refresh` reconciles
-mailbox heads while preserving imported history. Completion requires mailbox
+mailbox heads while preserving imported history. Each invocation with a positive page budget indexes at most 1,000 queued
+entries, checking cancellation between batches. Remaining LinkedIn index work
+keeps coverage incomplete; another bounded invocation resumes it. A zero-page
+budget performs no indexing. Completion requires mailbox
 and thread exhaustion and a healthy search index. A successful request alone
 does not establish complete coverage.
 

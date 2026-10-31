@@ -162,3 +162,116 @@ async fn parsed_cli_reads_all_intro_threads_and_full_owner_replies() {
         .iter()
         .all(|r| r.method.as_str() == "GET"));
 }
+
+#[tokio::test]
+async fn linkedin_thread_cross_page_copies_are_consistent_and_chronological() {
+    for conflict in ["none", "body", "timestamp"] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(move |r: &wiremock::Request| {
+                let q = r.url.query_pairs().collect::<BTreeMap<_, _>>();
+                if r.url.path().ends_with("graphql") {
+                    return wiremock::ResponseTemplate::new(200).set_body_json(
+                        json!({"data":{"messengerConversationsById":support::conversation(2)}}),
+                    );
+                }
+                let second = q.contains_key("nextCursor");
+                let mut duplicate = json!({"backendUrn":"new","senderUrn":support::OWNER,"deliveredAt":2000,"body":{"text":"new body"}});
+                if second && conflict == "body" { duplicate["body"]["text"] = json!("changed body"); }
+                if second && conflict == "timestamp" { duplicate["deliveredAt"] = json!(2001); }
+                let items = if second {
+                    vec![duplicate, json!({"backendUrn":"old","senderUrn":"person:2","deliveredAt":1000,"body":{"text":"old body"}})]
+                } else { vec![duplicate] };
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({"elements":items,"metadata":{"nextCursor":(!second).then_some("second")}}))
+            })
+            .mount(&server).await;
+        let reader = augmentagent_channel_linkedin::archive::ArchiveReader::for_test(
+            support::auth(),
+            server.uri(),
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["augmentagent", "linkedin", "thread", "thread:2", "--json"])
+            .unwrap();
+        let Cmd::Linkedin { op } = cli.cmd else {
+            panic!("wrong route")
+        };
+        let result = dispatch_linkedin_read(&op, &reader).await;
+        if conflict == "none" {
+            let result: Value = serde_json::from_str(&result.unwrap()).unwrap();
+            assert_eq!(result["complete"], true);
+            let messages = result["messages"].as_array().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|m| m["urn"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["old", "new"]
+            );
+            assert_eq!(messages[1]["from_me"], true);
+        } else {
+            assert!(
+                result.is_err(),
+                "conflicting {conflict} must not be reported complete"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn linkedin_backfill_indexing_is_bounded_and_cancellable() {
+    for (budget, cancelled, expected_remaining) in
+        [(0, false, 1001), (1, true, 1001), (1, false, 1)]
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(support::respond)
+            .mount(&server)
+            .await;
+        let reader = augmentagent_channel_linkedin::archive::ArchiveReader::for_test(
+            support::auth(),
+            server.uri(),
+        )
+        .unwrap();
+        let store = Store::open(":memory:").unwrap();
+        // Deletions from unrelated channels also occupy this shared queue.
+        store
+            .with_conn(|c| {
+                for i in 0..1001 {
+                    c.execute(
+                        "INSERT INTO message_index_queue(message_id) VALUES (?1)",
+                        [format!("unrelated-deleted-{i}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        if cancelled {
+            cancel.cancel();
+        }
+        let result = linkedin_archive::backfill_with_reader(
+            &reader,
+            &store,
+            Some("PRIMARY_INBOX"),
+            budget,
+            false,
+            false,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["complete"], false);
+        let remaining: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM message_index_queue", [], |r| r.get(0))
+            })
+            .unwrap();
+        assert_eq!(
+            remaining, expected_remaining,
+            "budget={budget}, cancelled={cancelled}"
+        );
+        if budget == 0 || cancelled {
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+}

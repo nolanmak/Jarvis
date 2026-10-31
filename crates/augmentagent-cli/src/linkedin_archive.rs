@@ -4,7 +4,10 @@ use augmentagent_channel_linkedin::{
     archive::ArchiveReader, archive_store as db, archive_sync, LinkedInAuth,
 };
 use augmentagent_store::Store;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) fn reader() -> Result<ArchiveReader> {
@@ -68,8 +71,7 @@ pub async fn thread_output(
         "conversation is not in this account"
     );
     let mut next = cursor.map(str::to_string);
-    let mut messages = Vec::new();
-    let mut ids = BTreeSet::new();
+    let mut messages = BTreeMap::new();
     let mut cursors = BTreeSet::new();
     let mut pages = 0;
     let mut complete = false;
@@ -77,8 +79,13 @@ pub async fn thread_output(
         let page = api.messages(urn, next.as_deref()).await?;
         pages += 1;
         for m in page.items {
-            if ids.insert(m.urn.clone()) {
-                messages.push(m);
+            if let Some(previous) = messages.get(&m.urn) {
+                anyhow::ensure!(
+                    previous == &m,
+                    "conflicting message copies across history pages; restart the read"
+                );
+            } else {
+                messages.insert(m.urn.clone(), m);
             }
         }
         next = page.next;
@@ -88,6 +95,7 @@ pub async fn thread_output(
         }
         anyhow::ensure!(cursors.insert(next.clone()), "pagination cursor loop");
     }
+    let mut messages: Vec<_> = messages.into_values().collect();
     messages.sort_by(|a, b| (a.delivered_at_ms, &a.urn).cmp(&(b.delivered_at_ms, &b.urn)));
     if json {
         return Ok(format!(
@@ -202,7 +210,20 @@ pub async fn backfill_with_reader(
             break;
         }
     }
-    augmentagent_messages::index::drain(store, 100, std::time::Duration::from_millis(10))?;
+    // The shared queue can include a large backlog from unrelated channels.
+    // Keep this command finite even while other writers continuously enqueue.
+    if max_pages > 0 {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                break;
+            }
+            let indexed = augmentagent_messages::index::drain_batch(store, 100)?;
+            if indexed.remaining == 0 || indexed.indexed + indexed.removed == 0 {
+                break;
+            }
+        }
+    }
     for (report, category) in reports.iter_mut().zip(&categories) {
         report.coverage = db::coverage(store, api.mailbox(), category)?;
     }
