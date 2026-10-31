@@ -7507,6 +7507,13 @@ impl std::fmt::Display for RunReport {
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
+    if !dry_run {
+        // Read-only, before lock/state creation, issue selection or model spend.
+        // Hashing runs off the async executor; launches still revalidate their
+        // own declarations and retain existing runtime generations.
+        tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
+            .await.context("native runtime preflight task failed")??;
+    }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
     let _lock = match RunLock::try_acquire(&run_lock_path())? {
@@ -19706,5 +19713,28 @@ mod iterate_not_delete_tests {
         assert!(section.contains("run registered acceptance and repair"));
         assert!(!section.contains("GIVE_UP_OWNER_TRIAGE"));
         assert!(!section.contains("label_gave_up"));
+    }
+}
+
+#[cfg(test)]
+mod runtime_readiness_gate_tests {
+    #[tokio::test]
+    async fn missing_runtime_stops_before_issue_selection_or_workflow_state() {
+        const CHILD:&str="AUTOSHIP_RUNTIME_GATE_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root=tempfile::tempdir().unwrap();
+            let status=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","self_improve::runtime_readiness_gate_tests::missing_runtime_stops_before_issue_selection_or_workflow_state","--nocapture"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",root.path())
+                .env("XDG_STATE_HOME",root.path().join("state"))
+                .env(CHILD,root.path()).current_dir(root.path()).status().unwrap();
+            assert!(status.success());return;
+        }
+        let root=std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let result=super::run_once(&root,false).await;
+        assert!(result.is_err());
+        let error=format!("{:#}",result.err().unwrap());
+        assert!(error.contains("native-runtime:policy-missing"),"{error}");
+        assert_eq!(std::fs::read_dir(root).unwrap().count(),0,"no lock, workflow, model or build state before readiness");
     }
 }

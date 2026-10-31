@@ -389,5 +389,24 @@ existing profile authorizes refresh of its imported controller credential.
 This does not enable refresh or modify a credential grant.
 
 Credential declarations alone cannot establish workflow readiness. The command
-keeps `ready: false` and names the runtime, role, resource and live-probe evidence
+keeps `ready: false` and names the role, resource, deployment and live-probe evidence
 that remains unverified; exit 3 means readiness has not been established.
+
+
+The readiness report also verifies the selected native guest's complete manifest
+and reports its digest, file count and byte count. It rejects missing or changed
+artifacts, path traversal, duplicate entries, symlinks, extra files and an unsafe
+guest root. Hashing streams bounded reads; inspection never repairs files or
+retires runtime generations. Every invocation rechecks the inventory.
+
+Build-runtime inspection validates the private configuration, required fields,
+memory range, module declarations and trusted artifact/directory permissions.
+It reports the configuration digest and individual hashes for QEMU, kernel,
+BusyBox, firmware and modules. Dependency directory contents are not certified
+by these hashes; the guest launch and acceptance probes retain their checks.
+`build-declaration-verified` is a declaration check, not evidence that a VM booted.
+
+Non-dry-run `run_once` calls this read-only preflight before acquiring a run lock,
+creating workflow state, inspecting Git or selecting issues. Missing/invalid
+declarations return a `native-runtime:` blocker. Hashing runs off the async
+executor, and the actual launch independently revalidates its declaration.

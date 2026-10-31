@@ -154,3 +154,6 @@ mod jwt_tests {
         assert_eq!(jwt_expiry_ms("a.invalid!.b"),None);
     }
 }
+
+#[path = "native_runtime_readiness.rs"]
+pub mod runtime;

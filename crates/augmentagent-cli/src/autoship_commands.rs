@@ -164,16 +164,18 @@ pub fn run_status(workflow: &str, json_output: bool) -> i32 {
 pub fn run_readiness(json_output:bool) -> i32 {
     let claude=augmentagent_channel_core::native_vm::readiness::credentials("claude");
     let codex=augmentagent_channel_core::native_vm::readiness::credentials("codex");
-    let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified",
+    let runtime=augmentagent_channel_core::native_vm::readiness::runtime::inspect();
+    let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified","runtime":runtime,
         "credentials":{"claude":claude,"codex":codex},
-        "unverified":["runtime-integrity","builder-capability","independent-reviewer","adjudicator-capability",
+        "unverified":["builder-capability","independent-reviewer","adjudicator-capability",
             "resource-delegation","capacity","live-guarded-probe","deployed-policy-equality"]});
     if json_output {println!("{body}");} else {
         println!("Autoship readiness is unverified.");
         for provider in ["claude","codex"] {
             println!("{provider}: {}",body["credentials"][provider]["status"].as_str().unwrap_or("unknown"));
         }
-        println!("Runtime, role, resource, deployment and live-probe evidence remain unverified.");
+        println!("Native guest: {}; build runtime: {}",body["runtime"]["status"],body["runtime"]["build_status"]);
+        println!("Role, resource, deployment and live-probe evidence remain unverified.");
     }
     3
 }

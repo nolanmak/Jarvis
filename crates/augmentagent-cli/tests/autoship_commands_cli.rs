@@ -177,3 +177,28 @@ fn readiness_reports_expired_credentials_without_refreshing_or_leaking_them() {
     assert_eq!(Sha256::digest(std::fs::read(&policy).unwrap()),digest);
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),2);
 }
+
+#[test]
+fn readiness_rechecks_guest_artifacts_and_keeps_missing_build_runtime_explicit() {
+    let root=tempfile::tempdir().unwrap();let guest=root.path().join("guest");
+    std::fs::create_dir(&guest).unwrap();std::fs::set_permissions(&guest,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let artifact=guest.join("fixture");std::fs::write(&artifact,b"runtime").unwrap();
+    std::fs::write(guest.join("manifest.json"),serde_json::json!({"version":1,"files":[{"path":"fixture","sha256":format!("{:x}",Sha256::digest(b"runtime"))}]}).to_string()).unwrap();
+    let policy=root.path().join("policy.json");
+    std::fs::write(&policy,serde_json::json!({"version":1,"runtime_config":root.path().join("missing-runtime.json"),"guest_runtime":guest,
+        "state_root":root.path(),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}}).to_string()).unwrap();
+    std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+    for changed in [false,true] {
+        if changed {std::fs::write(&artifact,b"changed").unwrap();}
+        let output=Command::new(env!("CARGO_BIN_EXE_augmentagent")).current_dir(root.path())
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",&policy).env("XDG_STATE_HOME",root.path().join("state"))
+            .args(["autopr","readiness","--json"]).output().unwrap();
+        assert_eq!(output.status.code(),Some(3));
+        let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["runtime"]["status"],if changed {"guest-artifact-digest-mismatch"} else {"native-guest-verified"});
+        assert_eq!(body["runtime"]["build_status"],"build-runtime-missing");
+        assert_eq!(body["ready"],false);
+        assert!(!root.path().join("state").exists());
+    }
+    assert_eq!(std::fs::read(artifact).unwrap(),b"changed","inspection must not repair artifacts");
+}
