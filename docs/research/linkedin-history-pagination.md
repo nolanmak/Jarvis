@@ -30,7 +30,13 @@ encode each scalar value, not the whole tuple a second time.
   `urn:li:msg_messagingParticipant:` prefix removed; timestamp: `deliveredAt`.
 
 A short live thread returned one message followed by an empty terminal page
-when `nextCursor` was used. Passing `cursor` returned the same first-page IDs:
+when `nextCursor` was used. The live archived-thread preflight confirmed on
+two threads that this terminal page **echoes the requested cursor**, rather than
+setting it to null: `elements: []`, `metadata.nextCursor: <requested-cursor>`,
+`paging: {count: 50, start: 0, links: []}`. The history reader accepts that exact
+empty terminal envelope. Repeated nonempty pages, missing metadata/paging, and
+nonempty paging links remain errors; mailbox loop handling is unchanged.
+Passing `cursor` returned the same first-page IDs:
 a dangerous false-pagination failure. A group history request with count 2
 returned two messages, then one distinct message on the next page. These checks
 verify continuation mechanics, not full-mailbox coverage.

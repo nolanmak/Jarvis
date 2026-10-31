@@ -243,3 +243,42 @@ async fn transport_failures_are_typed_bounded_and_do_not_echo_payloads() {
         });
     }
 }
+
+#[tokio::test]
+async fn history_empty_terminal_page_may_echo_the_requested_cursor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(query_param("nextCursor", "history:end"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "elements":[], "metadata":{"nextCursor":"history:end"},
+            "paging":{"count":50,"start":0,"links":[]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let page = reader
+        .messages("thread:1", Some("history:end"))
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next.is_none());
+}
+
+#[tokio::test]
+async fn repeated_history_cursor_requires_the_observed_empty_terminal_shape() {
+    for value in [
+        json!({"elements":[{"backendUrn":"msg:1","senderUrn":"peer","deliveredAt":1}],"metadata":{"nextCursor":"repeat"},"paging":{"count":50,"start":0,"links":[]}}),
+        json!({"elements":[],"metadata":{"nextCursor":"repeat"}}),
+        json!({"elements":[],"metadata":{},"paging":{"count":50,"start":0,"links":[]}}),
+        json!({"elements":[],"metadata":{"nextCursor":"repeat"},"paging":{"count":50,"start":0,"links":[{"rel":"next","href":"more"}]}}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(value))
+            .mount(&server)
+            .await;
+        let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+        assert!(reader.messages("thread:1", Some("repeat")).await.is_err());
+    }
+}

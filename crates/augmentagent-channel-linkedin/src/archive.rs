@@ -284,10 +284,19 @@ impl ArchiveReader {
         }
         let mut items: Vec<_> = unique.into_values().collect();
         items.sort_by(|a, b| (a.delivered_at_ms, &a.urn).cmp(&(b.delivered_at_ms, &b.urn)));
-        Ok(Page {
-            items,
-            next: next_cursor(&value, cursor)?,
-        })
+        // Voyager history echoes the requested cursor on its empty terminal
+        // page. This is distinct from a nonempty repeated page (a loop), and
+        // applies only to the observed history paging envelope, not mailboxes.
+        let next = match next_cursor(&value, cursor) {
+            Err(ArchiveError::CursorLoop)
+                if items.is_empty()
+                    && value.pointer("/paging/count").and_then(Value::as_u64) == Some(50)
+                    && value.pointer("/paging/start").and_then(Value::as_u64) == Some(0)
+                    && value.pointer("/paging/links").and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty) => None,
+            result => result?,
+        };
+        Ok(Page { items, next })
     }
 }
 fn transport_error(error: reqwest::Error) -> ArchiveError {
