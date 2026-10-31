@@ -2369,6 +2369,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_recent_bare,
             bash_linkedin_recent_abs_noargs,
             bash_linkedin_recent_bare_noargs,
+            format!("Bash({} linkedin thread *)", bin.display()),
+            "Bash(augmentagent linkedin thread *)".into(),
+            format!("Bash({} linkedin archive-status)", bin.display()),
+            "Bash(augmentagent linkedin archive-status)".into(),
+            format!("Bash({} linkedin archive-status *)", bin.display()),
+            "Bash(augmentagent linkedin archive-status *)".into(),
             bash_linkedin_dm_abs,
             bash_linkedin_dm_bare,
             bash_linkedin_comment_abs,
@@ -4785,6 +4791,8 @@ mod ask_mode_social_card_allowlist_tests {
             // that was never ingested — the dead end that made the agent fall
             // back to "paste it yourself".
             "linkedin recent-dms",
+            "linkedin thread *",
+            "linkedin archive-status",
         ] {
             assert!(
                 tools.iter().any(|t| t.contains(needle)),

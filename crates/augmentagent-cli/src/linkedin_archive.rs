@@ -1,11 +1,9 @@
 //! Explicit archive/read commands. No broker or reasoner is constructed.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use augmentagent_channel_linkedin::{
-    archive::{ArchiveReader, Conversation},
-    archive_store as db, archive_sync, LinkedInAuth,
+    archive::ArchiveReader, archive_store as db, archive_sync, LinkedInAuth,
 };
 use augmentagent_store::Store;
-use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
@@ -13,22 +11,6 @@ fn reader() -> Result<ArchiveReader> {
     let auth = LinkedInAuth::load_with_migration(&std::env::current_dir()?)?;
     Ok(ArchiveReader::new(auth)?)
 }
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Cursor {
-    category: String,
-    provider: Option<String>,
-    offset: usize,
-}
-#[derive(Serialize)]
-struct ConversationResults {
-    schema_version: u32,
-    conversations: Vec<Conversation>,
-    next_cursor: Option<String>,
-    complete: bool,
-    category: String,
-    pages: usize,
-}
-
 pub async fn recent(
     limit: usize,
     json: bool,
@@ -37,71 +19,11 @@ pub async fn recent(
     max_pages: usize,
 ) -> Result<()> {
     let api = reader()?;
-    let mut position = cursor
-        .map(serde_json::from_str::<Cursor>)
-        .transpose()
-        .context("invalid continuation")?
-        .unwrap_or_else(|| Cursor {
-            category: category.into(),
-            ..Default::default()
-        });
-    anyhow::ensure!(
-        position.category == category,
-        "cursor belongs to another category"
-    );
-    let mut rows = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut cursors = BTreeSet::new();
-    let mut pages = 0;
-    let mut complete = false;
-    while rows.len() < limit && pages < max_pages {
-        let page = api
-            .conversations(category, position.provider.as_deref())
-            .await?;
-        pages += 1;
-        anyhow::ensure!(
-            position.offset <= page.items.len(),
-            "page changed; restart the listing"
-        );
-        for (i, conv) in page.items.iter().enumerate().skip(position.offset) {
-            position.offset = i + 1;
-            if seen.insert(conv.urn.clone()) {
-                rows.push(conv.clone());
-            }
-            if rows.len() == limit {
-                break;
-            }
-        }
-        if position.offset < page.items.len() {
-            break;
-        }
-        position = Cursor {
-            category: category.into(),
-            provider: page.next,
-            offset: 0,
-        };
-        if position.provider.is_none() {
-            complete = true;
-            break;
-        }
-        anyhow::ensure!(
-            cursors.insert(position.provider.clone()),
-            "pagination cursor loop"
-        );
-    }
-    let next_cursor = if complete {
-        None
-    } else {
-        Some(serde_json::to_string(&position)?)
-    };
-    let result = ConversationResults {
-        schema_version: 2,
-        conversations: rows,
-        next_cursor,
-        complete,
-        category: category.into(),
-        pages,
-    };
+    let result = augmentagent_channel_linkedin::archive_listing::recent(
+        &api, limit, category, cursor, max_pages,
+    )
+    .await?;
+    let complete = result.complete;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {

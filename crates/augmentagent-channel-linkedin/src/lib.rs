@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod archive;
+pub mod archive_listing;
 pub mod archive_store;
 pub mod archive_sync;
 pub mod auth;

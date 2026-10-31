@@ -475,7 +475,12 @@ augmentagent linkedin comment --post-urn <urn> [--author "<name>"] \
   `mcp__memory__search_conversation_history`, which searches ingested messages
   — a stored LinkedIn DM keeps its conversation urn as `thread_id`; (3) for
   LinkedIn specifically, `augmentagent linkedin recent-dms` lists recent
-  threads with their urns. Only if all three come up empty, ask the user — a
+  threads with their urns, including groups and owner-latest threads. Follow
+  `next_cursor` when `complete` is false; a page budget is not mailbox exhaustion.
+  `augmentagent linkedin thread <urn> --json` reads live message history with
+  continuation, and `augmentagent linkedin archive-status --category INBOX`
+  reports stored scope and index coverage. Group reads do not authorize group
+  replies. Only if these lookups cannot resolve the thread, ask the user — a
   wrong id cards a reply into someone else's thread. Do NOT fall back to
   "paste this yourself" without trying the lookup first.
 - **Pass `--platform`** when you know it, so the card title reads

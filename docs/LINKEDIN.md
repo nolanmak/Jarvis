@@ -177,3 +177,47 @@ browser fallback.
 - **Account**: LinkedIn's ToS discourages automated access. Conservative poll cadence + jitter keeps the footprint small, but there's always non-zero risk your account gets flagged. Don't send dozens of replies per day; don't run this on an account you can't afford to lose.
 - **Cookie theft**: if `linkedin-auth.json` leaks (git commit, backup, shared drive), the attacker has full DM read + send until you log out of linkedin.com. Rotate by logging out + re-harvesting.
 - **queryId rotation**: LinkedIn can change the `messengerConversations.xxx` id any deploy. When that happens, re-capture it via Chrome network tab and export `AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID`.
+
+## Archive reads and backfill
+
+`linkedin recent-dms --limit 40 --json` follows mailbox pages and includes group
+conversations and conversations whose newest message is yours. `--category`
+selects the mailbox category (default `INBOX`); `--max-pages` bounds requests.
+A limit of zero performs no requests. A page budget of zero returns a resumable
+partial result. Limits above the mailbox size stop at server exhaustion.
+
+The JSON contract is version 2: an object with `schema_version`, `conversations`,
+`category`, `pages`, `complete`, and `next_cursor`, replacing the old flat DM
+array. Each conversation contains its stable `urn`, `title`, `group` flag,
+`participants`, and source `last_activity_ms`. These are conversation records,
+not message snippets or proof of complete message history. Agent integrations
+must read `conversations` and inspect `complete` instead of counting text lines.
+
+Pass the returned `next_cursor` unchanged with the same category to resume.
+Continuation retains seen IDs across overlapping pages and is bound to the
+signed-in account. If a partially consumed page changes order or membership,
+the command reports that the listing must restart; it does not silently skip
+messages. A continuation is read state, not authentication material.
+
+```sh
+augmentagent linkedin recent-dms --limit 40 --category PRIMARY_INBOX --json
+augmentagent linkedin recent-dms --limit 40 --category PRIMARY_INBOX --cursor '<returned-cursor>' --json
+augmentagent linkedin thread '<conversation-urn>' --max-pages 10 --json
+augmentagent linkedin backfill --max-pages 100
+augmentagent linkedin archive-status --category PRIMARY_INBOX
+```
+
+Backfill defaults to all categories exposed by the account's mailbox inventory.
+It stores group and owner messages without drafting, raising cards or sending.
+Repeat bounded invocations to resume durable progress; `--refresh` reconciles
+mailbox heads while preserving imported history. Completion requires mailbox
+and thread exhaustion and a healthy search index. A successful request alone
+does not establish complete coverage.
+
+For stored messages, use `search_messages` with `with:<name-or-stable-identity>`
+and `in:linkedin`, then `read_conversation_thread`. Membership includes silent
+participants; `from:` restricts actual authorship. Equal display names return
+ambiguity. Continue stored thread reads using `next_offset`, `next_body_offset`,
+`account_id`, and `snapshot_max_rowid` to reconstruct full Unicode text. Inspect
+the returned coverage state and observation time before describing a thread as
+complete or an introduction as unanswered.
