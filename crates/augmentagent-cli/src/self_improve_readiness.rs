@@ -16,14 +16,36 @@ enum Slot {
 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Assessment { slots:BTreeMap<String,Slot> }
+struct Assessment {
+    #[serde(deserialize_with="unique_slots")]
+    slots:BTreeMap<String,Slot>
+}
+fn unique_slots<'de,D:serde::Deserializer<'de>>(deserializer:D)->std::result::Result<BTreeMap<String,Slot>,D::Error> {
+    struct UniqueSlots;
+    impl<'de> serde::de::Visitor<'de> for UniqueSlots {
+        type Value=BTreeMap<String,Slot>;
+        fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result { f.write_str("unique readiness slot keys") }
+        fn visit_map<A:serde::de::MapAccess<'de>>(self,mut map:A)->std::result::Result<Self::Value,A::Error> {
+            let mut slots=BTreeMap::new();
+            while let Some((key,value))=map.next_entry::<String,Slot>()? {
+                if slots.insert(key,value).is_some() { return Err(serde::de::Error::custom("duplicate readiness slot")); }
+            }
+            Ok(slots)
+        }
+    }
+    deserializer.deserialize_map(UniqueSlots)
+}
 fn request_hash(issue:&Issue)->String { amendment::digest(serde_json::to_string(&(issue.number,&issue.title,&issue.body)).unwrap().as_bytes()) }
 fn decode(raw:&str)->Result<Assessment> {
     let raw=raw.trim();
     let raw=raw.strip_prefix("```json").and_then(|s|s.strip_suffix("```")).unwrap_or(raw).trim();
     ensure!(raw.len()<=64*1024,"readiness output exceeds bound");
     let assessment:Assessment=serde_json::from_str(raw)?;
-    ensure!(assessment.slots.keys().map(String::as_str).collect::<BTreeSet<_>>()==SLOTS.into_iter().collect(),"readiness must assess every fixed gap slot exactly once");
+    let observed=assessment.slots.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected=SLOTS.into_iter().collect::<BTreeSet<_>>();
+    let missing=expected.difference(&observed).copied().collect::<Vec<_>>().join(",");
+    let unexpected=observed.difference(&expected).copied().collect::<Vec<_>>().join(",");
+    ensure!(observed==expected,"readiness slots mismatch: missing=[{missing}]; unexpected=[{unexpected}]; allowed=[{}]",SLOTS.join(","));
     Ok(assessment)
 }
 fn validate(assessment:&Assessment,owner:&str,files:&BTreeMap<String,String>)->Result<Vec<String>> {
@@ -114,7 +136,11 @@ async fn assess_source(root:&Path,source:AcceptanceSource,title:&str,body:&str,h
     let base=actual_head(root).await?;
     let current_main=workflow::remote_main_head(root,workflow.repository()).await?;
     let owner=format!("{title}\n{body}");
-    let prompt=format!("Assess codification readiness BEFORE producing a spec. For each fixed slot trigger, failure, surface, persistence, guards, rollout, resolve routine gaps from exact owner/repository evidence. A not-applicable slot MUST use status=resolved with decision explaining why it is not applicable and evidence grounding that conclusion. Never emit a separate not_applicable status. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON {{\"slots\":{{\"trigger\":{{\"status\":\"resolved\",\"decision\":\"...\",\"evidence\":[{{\"path\":null,\"quote\":\"exact owner text\"}}]}},...}}}}. External slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. All six slots mandatory. Owner request:\n{owner}");
+    let shape=Assessment { slots:SLOTS.into_iter().map(|name| (name.into(),Slot::Resolved {
+        decision:"REPLACE with a grounded decision for this slot".into(),
+        evidence:vec![Evidence {path:None,quote:"REPLACE with an exact literal quote from the owner request".into()}],
+    })).collect() };
+    let prompt=format!("Assess codification readiness BEFORE producing a spec. The slots object must have EXACTLY these six keys: {}. No additional keys are allowed. Resolve routine gaps from exact owner/repository evidence. A not-applicable slot MUST use status=resolved with decision explaining why it is not applicable and evidence grounding that conclusion. Never emit a separate not_applicable status. Do not guess a material owner decision. Only genuinely unavailable externally controlled choices use external_decision; neither hard work, missing tests, unseen files nor provider trouble is an external decision. Return ONLY JSON using this complete shape, replacing EVERY placeholder with grounded content:\n{}\nExternal slots instead contain status=external_decision, question, alternatives (2-4), evidence. path=null cites owner text; otherwise exact tracked file path and literal source quote. Do not add slots named resolve, resolve_routine, or other instructions. Owner request:\n{owner}",serde_json::to_string(&SLOTS)?,serde_json::to_string(&shape)?);
     let epoch=amendment::digest(serde_json::to_string(&(source,hash,&base,&current_main,&prompt)).unwrap().as_bytes());
     let key=|attempt|amendment::digest(format!("readiness-grounding-v2:{epoch}:{attempt}").as_bytes());
     let read_workflow=&*workflow;
@@ -269,6 +295,22 @@ mod tests {
         recover_assessment("request",read,write,|_|async {panic!("completed responses must be reused")},validate).await.unwrap();
         let mut ungrounded=serde_json::to_value(resolved()).unwrap();ungrounded["slots"]["rollout"]["evidence"]=serde_json::json!([]);
         assert!(validate(serde_json::to_string(&ungrounded).unwrap()).await.is_err(),"status alias is not an evidence exemption");
+    }
+    #[test]
+    fn schema_feedback_names_extra_slots_and_rejects_duplicate_keys() {
+        let mut value=serde_json::to_value(resolved()).unwrap();
+        value["slots"]["resolve"]=value["slots"]["trigger"].clone();
+        let error=decode(&value.to_string()).unwrap_err().to_string();
+        assert!(error.contains("unexpected=[resolve]"), "{error}");
+        value["slots"].as_object_mut().unwrap().remove("resolve");
+        value["slots"].as_object_mut().unwrap().remove("guards");
+        let error=decode(&value.to_string()).unwrap_err().to_string();
+        assert!(error.contains("missing=[guards]"), "{error}");
+        let valid=serde_json::to_value(resolved()).unwrap();
+        let slots=serde_json::to_string(&valid["slots"]).unwrap();
+        let duplicate=format!("{{\"slots\":{{{},\"guards\":{}}}}}",&slots[1..slots.len()-1],valid["slots"]["guards"]);
+        assert!(decode(&duplicate).is_err(), "duplicate gap evidence must not silently replace a decision");
+        assert!(decode(&valid.to_string()).is_ok());
     }
     fn adopted()->adoption::AdoptedPr {
         adoption::AdoptedPr {repository:"owner/repo".into(),pr:970,source_issue:None,branch:"worktree/imported".into(),head:"candidate-a".into(),base:"main".into(),author:"owner".into(),title:"Expose status".into(),body:"Choose destination externally".into(),dependency:adoption::Dependency::Main}

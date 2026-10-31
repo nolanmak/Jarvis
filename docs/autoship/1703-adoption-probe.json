@@ -36,8 +36,19 @@
   },
   "followup_probe": {
     "root": "/tmp/autoship-native-acceptance-_0l_2gk7",
-    "status": "running-not-accepted",
+    "status": "failed-readiness-extra-slot",
     "change": "Explicit direct source identity fields in contract prompt; parser remains strict",
-    "local_contract_tests_passed": 29
+    "local_contract_tests_passed": 29,
+    "exit_code": 101,
+    "model_calls": 4,
+    "failure": "responses included all six required slots plus unexpected resolve / resolve_routine"
+  },
+  "readiness_followup": {
+    "root": "/tmp/autoship-native-acceptance-x1vmelii",
+    "status": "running-not-accepted",
+    "change": "Serialize complete six-key readiness shape, diagnose missing/extra keys, reject duplicate keys",
+    "local_acceptance_tests_passed": 30,
+    "red_log": "/tmp/autoship-1703-red-readiness-slots.log",
+    "green_log": "/tmp/autoship-1703-green-readiness-slots.log"
   }
 }
