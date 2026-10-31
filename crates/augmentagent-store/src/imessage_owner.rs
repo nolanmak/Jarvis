@@ -1,4 +1,6 @@
 //! Durable owner-only iMessage input. Contact permissions never confer control.
+//! Writers acquire IMMEDIATE transactions before reading: capture and the daemon
+//! use independent connections, so deferred read-to-write upgrades can lose races.
 use crate::{Store, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -578,7 +580,7 @@ impl Store {
             ));
         }
         self.with_conn(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             if !binding(&tx)?.is_some_and(|b| b.enabled && b.revision == context.revision) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
@@ -806,7 +808,7 @@ impl Store {
             return Err(StoreError::InvalidInput("invalid owner output".into()));
         }
         self.with_conn(|c| {
-            let tx=c.unchecked_transaction()?;
+            let tx=Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let Some(b)=binding(&tx)?.filter(|b|b.enabled && b.revision==revision) else {return Ok(0)};
             if let Some((action,status,digest))=guard {
                 let current:Option<String>=tx.query_row("SELECT status FROM actions WHERE id=?1",[action],|r|r.get(0)).optional()?;
@@ -851,7 +853,7 @@ impl Store {
     /// Release self-chat only after every possible agent echo is accounted for.
     pub fn reconcile_imessage_owner_echoes(&self, now: i64) -> StoreResult<usize> {
         self.with_conn(|c| {
-            let tx=c.unchecked_transaction()?;
+            let tx=Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let Some(b)=binding(&tx)?.filter(|b|b.enabled && b.self_chat) else {return Ok(0)};
             let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM imessage_outbox
                 WHERE status IN ('queued','claimed','unknown') AND target IN (?2,?3)) OR EXISTS(SELECT 1 FROM imessage_owner_deliveries d
@@ -889,7 +891,7 @@ impl Store {
             return Err(StoreError::InvalidInput("invalid owner binding".into()));
         }
         self.with_conn(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let old = binding(&tx)?;
             if let Some(ref b) = old {
                 if b.enabled
@@ -931,7 +933,7 @@ impl Store {
 
     pub fn disable_imessage_owner(&self) -> StoreResult<()> {
         self.with_conn(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             tx.execute(
                 "UPDATE imessage_owner_binding SET enabled=0 WHERE singleton=1",
                 [],
@@ -973,7 +975,7 @@ impl Store {
             return Err(StoreError::InvalidInput("invalid owner event batch".into()));
         }
         self.with_conn(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let b = binding(&tx)?
                 .filter(|b| b.enabled && b.revision == revision)
                 .ok_or(rusqlite::Error::InvalidQuery)?;
@@ -1037,7 +1039,7 @@ impl Store {
     /// commands too: automatic restart never executes it a second time.
     pub fn claim_imessage_owner_event(&self, now: i64) -> StoreResult<Option<OwnerEvent>> {
         self.with_conn(|c| {
-            let tx=c.unchecked_transaction()?;
+            let tx=Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let Some(b)=binding(&tx)?.filter(|b|b.enabled) else {return Ok(None)};
             let first:Option<(String,String,String,Option<String>)>=tx.query_row(
                 "SELECT guid,kind,state,payload FROM imessage_owner_events WHERE revision=?1
@@ -1064,7 +1066,7 @@ impl Store {
     }
     pub fn finish_imessage_owner_event(&self, event: &OwnerEvent, now: i64) -> StoreResult<bool> {
         Ok(self.with_conn(|c| {
-            let tx = c.unchecked_transaction()?;
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let changed = tx.execute(
                 "UPDATE imessage_owner_events SET state='completed',updated_at_ms=?4
             WHERE revision=?1 AND guid=?2 AND kind=?3 AND state='claimed'",
@@ -1094,7 +1096,7 @@ impl Store {
 
     pub fn compact_imessage_owner_event_bodies(&self, before: i64) -> StoreResult<usize> {
         self.with_conn(|c| {
-            let tx=c.unchecked_transaction()?;
+            let tx=Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
             let count=tx.execute("UPDATE imessage_owner_events SET payload=NULL
                 WHERE state IN ('completed','ignored') AND updated_at_ms<?1 AND payload IS NOT NULL",[before])?;
             tx.execute("UPDATE imessage_outbox SET body='[Owner output body expired after 30 days]'

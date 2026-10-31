@@ -333,6 +333,19 @@ pub fn run(store: &Store, op: &Op) -> Result<()> {
     Ok(())
 }
 
+fn record_dispatch_result(store: &Store, result: &anyhow::Result<bool>) {
+    let error = match result {
+        Ok(false) => return, // An idle lane cannot establish recovery.
+        Ok(true) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    let _ = store.report_imessage_owner_runtime(
+        false,
+        error.as_deref(),
+        chrono::Utc::now().timestamp_millis(),
+    );
+}
+
 /// Started only by serve, never by a one-shot compose running beside it.
 pub fn start_runtime(
     surface: std::sync::Arc<augmentagent_approval_discord::imessage_owner::OwnerSurface>,
@@ -436,12 +449,8 @@ pub fn start_runtime(
                         .dispatch_control_one(handler.as_ref(), query.as_ref(), context)
                         .await
                 };
+                record_dispatch_result(&surface.store, &result);
                 if let Err(error) = result {
-                    let _ = surface.store.report_imessage_owner_runtime(
-                        false,
-                        Some(&error.to_string()),
-                        chrono::Utc::now().timestamp_millis(),
-                    );
                     tracing::warn!(
                         "owner iMessage dispatcher stopped at uncertain work: {error:#}"
                     );
@@ -504,6 +513,22 @@ async fn ensure_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_dispatch_clears_a_diagnostic_but_idle_poll_does_not() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .bind_imessage_owner("owner-chat", "owner@example.invalid", false, 0)
+            .unwrap();
+        record_dispatch_result(&store, &Err(anyhow::anyhow!("database is locked")));
+        record_dispatch_result(&store, &Ok(false));
+        assert_eq!(
+            store.imessage_owner_status(0).unwrap()["dispatch_error"],
+            "database is locked"
+        );
+        record_dispatch_result(&store, &Ok(true));
+        assert!(store.imessage_owner_status(0).unwrap()["dispatch_error"].is_null());
+    }
+
     #[tokio::test]
     async fn cancellation_reaches_the_existing_turn_token_and_preserves_approval_input() {
         let root = tempfile::tempdir().unwrap();
