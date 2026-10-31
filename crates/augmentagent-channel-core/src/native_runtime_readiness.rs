@@ -9,6 +9,7 @@ pub struct RuntimeReport {
     pub build_status: String,
     pub build_config_sha256: Option<String>,
     pub build_artifact_sha256: BTreeMap<String,String>,
+    pub providers: BTreeMap<String,ProviderRuntimeReport>,
     pub verified_files: usize,
     pub verified_bytes: u64,
     pub live_verified: bool,
@@ -22,13 +23,16 @@ pub fn inspect() -> RuntimeReport {
 pub fn inspect_at(path:Option<&Path>) -> RuntimeReport {
     use sha2::{Digest,Sha256};
     let mut report=RuntimeReport {status:"policy-missing".into(),policy_sha256:None,guest_manifest_sha256:None,
-        build_status:"unverified".into(),build_config_sha256:None,build_artifact_sha256:BTreeMap::new(),
+        build_status:"unverified".into(),build_config_sha256:None,build_artifact_sha256:BTreeMap::new(),providers:BTreeMap::new(),
         verified_files:0,verified_bytes:0,live_verified:false};
     let Some(path)=path else{return report};
     let bytes=match private(path) {Ok(bytes)=>bytes,Err(_)=>{report.status="policy-invalid".into();return report}};
     report.policy_sha256=Some(format!("{:x}",Sha256::digest(&bytes)));
     let policy=match serde_json::from_slice::<Policy>(&bytes) {Ok(policy) if policy.version==1=>policy,
         _=>{report.status="policy-invalid".into();return report}};
+    for provider in policy.providers.keys() {
+        report.providers.insert(provider.clone(),inspect_provider(&policy.guest_runtime,provider));
+    }
     match verify_build_config(&policy.runtime_config) {
         Ok((config,artifacts))=>{report.build_status="build-declaration-verified".into();report.build_config_sha256=Some(config);report.build_artifact_sha256=artifacts;},
         Err(_)=>report.build_status=if policy.runtime_config.exists() {"build-runtime-invalid"} else {"build-runtime-missing"}.into(),
@@ -174,10 +178,103 @@ pub fn preflight() -> Result<RuntimeReport> {
     Ok(report)
 }
 
+#[derive(Debug,Serialize)]
+pub struct ProviderRuntimeReport {
+    pub status:String,
+    pub executable_sha256:Option<String>,
+}
+
+pub fn provider_runtime(provider:&str)->ProviderRuntimeReport {
+    let observed=(||->Result<ProviderRuntimeReport>{
+        let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").context("policy-missing")?;
+        let policy:Policy=serde_json::from_slice(&private(Path::new(&path))?).context("policy-invalid")?;
+        ensure!(policy.version==1 && policy.providers.contains_key(provider),"route-undeclared");
+        Ok(inspect_provider(&policy.guest_runtime,provider))
+    })();
+    observed.unwrap_or(ProviderRuntimeReport{status:"provider-runtime-declaration-unavailable".into(),executable_sha256:None})
+}
+
+fn inspect_provider(guest:&Path,provider:&str)->ProviderRuntimeReport {
+    let observed=(||->Result<String>{
+        let (key,default)=match provider {"claude"=>("CLAUDE_CLI","claude"),"codex"|"qwen"|"glm"=>("CODEX_CLI","codex"),_=>anyhow::bail!("provider-runtime-unsupported")};
+        let program=PathBuf::from(std::env::var_os(key).unwrap_or_else(||default.into()));
+        let executable=if program.is_absolute(){program} else {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_else(||"/usr/bin:/bin".into()))
+                .map(|root|root.join(&program)).find(|path|path.is_file()).context("provider-executable-missing")?
+        };
+        provider_runtime_at(guest,provider,&executable)
+    })();
+    match observed {
+        Ok(hash)=>ProviderRuntimeReport{status:"executable-compatible".into(),executable_sha256:Some(hash)},
+        Err(error)=>ProviderRuntimeReport{status:error.to_string(),executable_sha256:None},
+    }
+}
+
+fn provider_runtime_at(guest:&Path,_provider:&str,executable:&Path)->Result<String> {
+    use sha2::{Digest,Sha256};
+    use std::io::Read;
+    let executable=executable.canonicalize().context("provider-executable-missing")?;
+    let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&executable).context("provider-executable-unreadable")?;
+    let metadata=file.metadata().context("provider-executable-unreadable")?;
+    ensure!(metadata.is_file() && (metadata.uid()==0 || metadata.uid()==unsafe{libc::geteuid()})
+        && metadata.mode() & 0o022==0 && metadata.mode() & 0o111!=0 && metadata.len()<=512*1024*1024,"provider-executable-untrusted");
+    let mut digest=Sha256::new();let mut bytes=0u64;let mut buffer=[0u8;65536];
+    loop {let count=file.read(&mut buffer).context("provider-executable-unreadable")?;if count==0{break;}
+        bytes+=count as u64;ensure!(bytes<=metadata.len(),"provider-executable-changed");digest.update(&buffer[..count]);}
+    let after=file.metadata().context("provider-executable-unreadable")?;
+    ensure!(bytes==metadata.len() && metadata.mtime()==after.mtime() && metadata.mtime_nsec()==after.mtime_nsec()
+        && metadata.ctime()==after.ctime() && metadata.ctime_nsec()==after.ctime_nsec(),"provider-executable-changed");
+    let digest=format!("{:x}",digest.finalize());
+    // Match the launcher's executable-based companion contract, including
+    // Codex-backed routes. A fixture executable is not a live provider proof.
+    if executable.file_name().is_none_or(|name|name!="codex") {return Ok(digest);}
+    let manifest:serde_json::Value=serde_json::from_slice(&private(&guest.join("manifest.json")).context("provider-runtime-manifest-unavailable")?).context("provider-runtime-manifest-invalid")?;
+    let entries=manifest["native_companions"][&digest].as_array().filter(|entries|entries.len()==1).context("provider-runtime-companion-missing")?;
+    let entry=&entries[0];ensure!(entry["name"]=="codex-code-mode-host","provider-runtime-companion-invalid");
+    let relative=entry["path"].as_str().context("provider-runtime-companion-invalid")?;
+    ensure!(!relative.split('/').any(|part|part.is_empty()||part=="."||part==".."),"provider-runtime-companion-invalid");
+    let hash=entry["sha256"].as_str().context("provider-runtime-companion-invalid")?;
+    ensure!(manifest["files"].as_array().is_some_and(|files|files.iter().any(|file|file["path"]==relative && file["sha256"]==hash)),"provider-runtime-companion-unmanifested");
+    let mut path=guest.to_path_buf();
+    for part in relative.split('/') {path.push(part);ensure!(!std::fs::symlink_metadata(&path).context("provider-runtime-companion-missing")?.file_type().is_symlink(),"provider-runtime-companion-invalid");}
+    let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path).context("provider-runtime-companion-missing")?;
+    let metadata=file.metadata().context("provider-runtime-companion-invalid")?;
+    ensure!(metadata.is_file() && metadata.len()<=128*1024*1024,"provider-runtime-companion-invalid");
+    let mut companion=Sha256::new();let mut count=0u64;
+    loop {let read=file.read(&mut buffer).context("provider-runtime-companion-unreadable")?;if read==0 {break;}
+        count+=read as u64;ensure!(count<=metadata.len(),"provider-runtime-companion-changed");companion.update(&buffer[..read]);}
+    ensure!(count==metadata.len() && format!("{:x}",companion.finalize())==hash,"provider-runtime-companion-digest-mismatch");
+    Ok(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest,Sha256};
+    #[test]
+    fn codex_runtime_must_match_the_current_executable_and_manifested_companion() {
+        for scenario in ["valid","updated-executable","missing-map","unmanifested","changed-companion"] {
+            let root=tempfile::tempdir().unwrap();let executable=root.path().join("codex");
+            write(&executable,b"native executable").unwrap();
+            std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let digest=format!("{:x}",Sha256::digest(b"native executable"));
+            let companion=root.path().join("companion");write(&companion,b"native companion").unwrap();
+            let hash=format!("{:x}",Sha256::digest(b"native companion"));
+            let mut manifest=serde_json::json!({"version":1,"files":[{"path":"companion","sha256":hash}],
+                "native_companions":{digest.clone():[{"name":"codex-code-mode-host","path":"companion","sha256":hash}]}});
+            match scenario {
+                "updated-executable"=>std::fs::write(&executable,b"updated native executable").unwrap(),
+                "missing-map"=>manifest["native_companions"]=serde_json::json!({}),
+                "unmanifested"=>manifest["files"]=serde_json::json!([]),
+                "changed-companion"=>std::fs::write(&companion,b"changed companion").unwrap(),
+                _=>(),
+            }
+            write(&root.path().join("manifest.json"),manifest.to_string().as_bytes()).unwrap();
+            let result=provider_runtime_at(root.path(),"codex",&executable);
+            assert_eq!(result.is_ok(),scenario=="valid","{scenario}: {result:?}");
+            if scenario=="valid" {assert_eq!(result.unwrap(),digest);}
+        }
+    }
     #[test]
     fn build_runtime_requires_complete_trusted_declaration_and_hashes_executables() {
         for scenario in ["valid","missing","public-config","writable-artifact","unknown-field","bad-memory","no-modules"] {

@@ -202,3 +202,35 @@ fn readiness_rechecks_guest_artifacts_and_keeps_missing_build_runtime_explicit()
     }
     assert_eq!(std::fs::read(artifact).unwrap(),b"changed","inspection must not repair artifacts");
 }
+
+#[test]
+fn readiness_detects_provider_binary_updates_against_runtime_companions() {
+    let root=tempfile::tempdir().unwrap();let guest=root.path().join("guest");
+    std::fs::create_dir(&guest).unwrap();std::fs::set_permissions(&guest,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable=root.path().join("codex");std::fs::write(&executable,b"native fixture").unwrap();
+    std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let digest=format!("{:x}",Sha256::digest(b"native fixture"));
+    std::fs::write(guest.join("companion"),b"companion fixture").unwrap();
+    let hash=format!("{:x}",Sha256::digest(b"companion fixture"));
+    let mut manifest=serde_json::json!({"version":1,"files":[{"path":"companion","sha256":hash}]});
+    let manifest_path=guest.join("manifest.json");
+    let policy=root.path().join("policy.json");
+    std::fs::write(&policy,serde_json::json!({"version":1,"runtime_config":root.path().join("missing-runtime.json"),"guest_runtime":guest,
+        "state_root":root.path(),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+        "providers":{"codex":{"gateway":{},"auth_relative":".codex/auth.json"}}}).to_string()).unwrap();
+    std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+    for step in 0..3 {
+        if step==1 {manifest["native_companions"]=serde_json::json!({digest.clone():[{"name":"codex-code-mode-host","path":"companion","sha256":hash}]});}
+        if step==2 {std::fs::write(&executable,b"updated native fixture").unwrap();}
+        std::fs::write(&manifest_path,manifest.to_string()).unwrap();
+        std::fs::set_permissions(&manifest_path,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let output=Command::new(env!("CARGO_BIN_EXE_augmentagent")).current_dir(root.path())
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",&policy).env("CODEX_CLI",&executable)
+            .env("XDG_STATE_HOME",root.path().join("state")).args(["autopr","readiness","--json"]).output().unwrap();
+        assert_eq!(output.status.code(),Some(3));
+        let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["runtime"]["providers"]["codex"]["status"],if step==1 {"executable-compatible"} else {"provider-runtime-companion-missing"});
+        assert_eq!(body["ready"],false);
+        assert!(!root.path().join("state").exists());
+    }
+}

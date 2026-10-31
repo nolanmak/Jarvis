@@ -410,3 +410,25 @@ Non-dry-run `run_once` calls this read-only preflight before acquiring a run loc
 creating workflow state, inspecting Git or selecting issues. Missing/invalid
 declarations return a `native-runtime:` blocker. Hashing runs off the async
 executor, and the actual launch independently revalidates its declaration.
+
+Provider compatibility is checked separately from the guest inventory. The
+readiness report hashes the currently resolved provider executable. For a Codex
+executable, the runtime must declare its matching `codex-code-mode-host`, and
+that companion must appear in the file manifest with matching bytes. A Codex
+upgrade can invalidate this mapping even when every old guest artifact still
+matches its manifest. Protected provider admission rechecks this compatibility,
+including calls through an already-constructed chain.
+
+Use the existing runtime-only provisioning operation to prepare a new generation:
+
+```sh
+python3 scripts/provision-native-vm-probe.py \
+  --refresh-runtime-policy /absolute/controller/policy.json \
+  --native-executable /absolute/path/to/codex
+```
+
+This preserves credentials, grants, resources and state paths and retains the
+old generation. It changes only the guest-runtime pointer after syncing the new
+artifacts. Do not delete old generations while leases may still use them. Validate
+the refreshed generation with the current packaged guarded-edit/review probes;
+a compatibility hash alone does not prove provider execution.

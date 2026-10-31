@@ -217,11 +217,14 @@ pub fn workflow_native_ineligible_reason(kind:ProviderKind)->Option<String> {
     if !matches!(kind,ProviderKind::Codex|ProviderKind::Claude) {return Some("provider has no declared native VM identity".into());}
     if let Some(reason)=gateway_ineligible_reason(kind){return Some(reason);}
     let report=crate::native_vm::readiness::credentials(kind.name());
-    (!report.permits_attempt()).then(||format!("native-provider:{}:{}",kind.name(),report.reason()))
+    if !report.permits_attempt() {return Some(format!("native-provider:{}:{}",kind.name(),report.reason()));}
+    let runtime=crate::native_vm::readiness::runtime::provider_runtime(kind.name());
+    (runtime.status!="executable-compatible").then(||format!("native-provider:{}:{}",kind.name(),runtime.status))
 }
 fn workflow_route_auth(kind: ProviderKind, routed: bool) -> bool {
-    if routed { crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false) }
-    else { crate::native_vm::declared_native_auth(kind.name()).unwrap_or(false) }
+    let auth=if routed { crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false) }
+        else { crate::native_vm::declared_native_auth(kind.name()).unwrap_or(false) };
+    auth && crate::native_vm::readiness::runtime::provider_runtime(kind.name()).status=="executable-compatible"
 }
 
 fn workflow_entry_for(kind:ProviderKind)->Option<Entry> {
@@ -1472,14 +1475,27 @@ mod tests {
             std::fs::write(&auth,r#"{"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}"#).unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+            let executable=home.path().join("codex");
+            std::fs::write(&executable,b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let guest=home.path().join("guest");std::fs::create_dir(&guest).unwrap();
+            std::fs::set_permissions(&guest,std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(guest.join("companion"),b"companion fixture").unwrap();
+            use sha2::{Digest,Sha256};
+            let digest=format!("{:x}",Sha256::digest(std::fs::read(&executable).unwrap()));
+            let companion=format!("{:x}",Sha256::digest(b"companion fixture"));
+            let manifest=guest.join("manifest.json");
+            std::fs::write(&manifest,serde_json::json!({"version":1,"files":[{"path":"companion","sha256":companion}],
+                "native_companions":{digest:[{"name":"codex-code-mode-host","path":"companion","sha256":companion}]}}).to_string()).unwrap();
+            std::fs::set_permissions(&manifest,std::fs::Permissions::from_mode(0o600)).unwrap();
             let policy=home.path().join("policy.json");
-            std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":"/declared/state","memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+            std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/declared/runtime.json","guest_runtime":guest,"state_root":"/declared/state","memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
                 "providers":{"codex":{"gateway":{},"auth_file":auth,"auth_relative":".codex/auth.json","environment":[]}}})).unwrap()).unwrap();
             std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
             let status=std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact","fallback::tests::required_native_review_uses_declared_credential_without_host_login","--nocapture"])
                 .env_clear().env("PATH","/usr/bin:/bin").env("HOME",home.path())
-                .env("XDG_STATE_HOME",home.path().join("state")).env("CODEX_CLI","/usr/bin/true")
+                .env("XDG_STATE_HOME",home.path().join("state")).env("CODEX_CLI",executable)
                 .env("AUGMENTAGENT_NATIVE_VM_POLICY",policy).env("AUTOSHIP_DECLARED_AUTH_FIXTURE","1")
                 .status().unwrap();
             assert!(status.success());return;
@@ -1508,6 +1524,14 @@ mod tests {
         let result=crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.unwrap();
         assert_eq!(result,"supplied-evidence fixture");
         assert_eq!(scripted.count(),1);
+        let executable=std::path::PathBuf::from(std::env::var_os("CODEX_CLI").unwrap());
+        let original=std::fs::read(&executable).unwrap();
+        std::fs::write(&executable,b"#!/bin/sh\n# updated executable\nexit 0\n").unwrap();
+        assert!(build_workflow_pinned(ProviderKind::Codex).is_none());
+        assert_eq!(workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),Some("native-provider:codex:provider-runtime-companion-missing"));
+        assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"stale runtime must not dispatch")).await.is_err());
+        assert_eq!(scripted.count(),1,"a binary update cannot spend another call against a stale runtime");
+        std::fs::write(executable,original).unwrap();
         // Recheck the credential at dispatch, even for an already-built chain.
         let policy:serde_json::Value=serde_json::from_slice(&std::fs::read(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap()).unwrap()).unwrap();
         let auth=policy["providers"]["codex"]["auth_file"].as_str().unwrap();
