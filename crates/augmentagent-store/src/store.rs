@@ -4699,7 +4699,8 @@ impl Store {
                     (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = ''), \
                     e.receivedAt, \
                     (a.recomposedAtMs IS NOT NULL), \
-                    COALESCE(e.platform, '') \
+                    COALESCE(e.platform, ''), \
+                    a.createdAt \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -4719,6 +4720,7 @@ impl Store {
                 received_at: r.get(6)?,
                 recomposed: r.get(7)?,
                 platform: r.get(8)?,
+                created_at_ms: r.get(9)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -4902,6 +4904,38 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Has the owner answered `thread_id` after `after_ms` by ANY route — a
+    /// manual reply from Gmail web/mobile (`outbound_thread_log`) OR a reply
+    /// the daemon sent on their behalf from an approved card
+    /// (`self_sent_messages`)? Strictly greater than, like
+    /// [`Self::thread_has_user_reply_after`].
+    ///
+    /// The reconcile sweep's Rule 1 needs both. The OutboundObserver
+    /// deliberately keeps daemon sends OUT of `outbound_thread_log` (#449), so
+    /// approving the newest card on a thread left every older card on that
+    /// thread pending forever: the owner had replied, but only through us.
+    /// The inbound triage gate and the scheduled-send pass keep the narrower
+    /// manual-only check — a daemon send must never cancel a scheduled reply.
+    pub fn thread_has_owner_send_after(
+        &self,
+        thread_id: &str,
+        after_ms: i64,
+    ) -> StoreResult<bool> {
+        if self.thread_has_user_reply_after(thread_id, after_ms)? {
+            return Ok(true);
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let hit: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM self_sent_messages \
+                 WHERE thread_id = ?1 AND sent_at_ms > ?2 LIMIT 1",
+                params![thread_id, after_ms],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
     }
 
     /// Load a single action row plus its email body. Used by the Discord
@@ -8949,6 +8983,10 @@ pub struct PendingActionRow {
     /// join finds no email). The bulk-sender rule reads an email address,
     /// which a Slack contact's `from` never is.
     pub platform: String,
+    /// When the card was raised (`actions.createdAt`). Always after its
+    /// inbound arrived, so it is a safe Rule 1 fallback bound when
+    /// `received_at` is missing or unparseable.
+    pub created_at_ms: i64,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
@@ -12595,6 +12633,33 @@ mod tests {
         s.record_outbound_thread_event("ent-1", "msg-noth", None, 20_000)
             .unwrap();
         assert!(!s.thread_has_user_reply_after("T-other", 0).unwrap());
+    }
+
+    /// An approved card the daemon sent counts as the owner answering the
+    /// thread for Rule 1, alongside a manual Gmail reply — but only on that
+    /// thread and only strictly after the bound.
+    #[test]
+    fn thread_has_owner_send_after_counts_daemon_and_manual_sends() {
+        let (s, _f) = fresh_store();
+        assert!(!s.thread_has_owner_send_after("T1", 0).unwrap());
+
+        s.record_self_sent_message("sent-1", Some("T1"), Some("ent-1"), Some("act-1"))
+            .unwrap();
+        let sent_at: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT sent_at_ms FROM self_sent_messages WHERE message_id='sent-1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(s.thread_has_owner_send_after("T1", sent_at - 1).unwrap());
+        assert!(!s.thread_has_owner_send_after("T1", sent_at).unwrap());
+        assert!(!s.thread_has_owner_send_after("T2", 0).unwrap());
+        // The manual-only check stays blind to daemon sends.
+        assert!(!s.thread_has_user_reply_after("T1", 0).unwrap());
+
+        s.record_outbound_thread_event("ent-1", "manual-1", Some("T2"), 5_000)
+            .unwrap();
+        assert!(s.thread_has_owner_send_after("T2", 4_999).unwrap());
     }
 
     /// #1503 — a pending PDF-signing card is an owner decision, not an inbound
