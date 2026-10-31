@@ -21,6 +21,12 @@ class InstallTests(unittest.TestCase):
                 shutil.copy(ROOT / 'scripts' / name, repo / 'scripts' / name)
             runner=repo/'scripts/run-rs.sh'
             runner.write_text('#!/bin/sh\nexit 0\n');runner.chmod(0o700)
+            release=repo/'target/release';release.mkdir(parents=True)
+            artifacts=[release/name for name in ('augmentagent','augmentagent-mcp-memory')]
+            for artifact in artifacts:
+                artifact.write_text('#!/bin/sh\nexit 0\n');artifact.chmod(0o775)
+            # Cargo's public artifact and deps entry share the executable inode.
+            os.link(artifacts[0],release/'cargo-deps-link')
             binary = base / 'bin'; binary.mkdir()
             stub = binary / 'systemctl'
             stub.write_text('''#!/usr/bin/env python3
@@ -42,6 +48,9 @@ if 'show' in sys.argv:
                        CALLS=str(base/'calls'))
             command = ['bash', str(repo/'scripts/ensure-autopr-worker.sh')]
             subprocess.run(command, env=env, check=True)
+            self.assertEqual([p.stat().st_mode & 0o777 for p in artifacts],[0o755,0o755],
+                'normal worker installation must make cached Cargo executables pass deployment trust checks')
+            self.assertEqual((release/'cargo-deps-link').stat().st_mode & 0o777,0o755)
             units = base/'config fixture%[prod]*?\\folder/systemd/user'
             worker = (units/'augmentagent-autopr.service').read_text()
             self.assertIn('--dry-run false', worker)
