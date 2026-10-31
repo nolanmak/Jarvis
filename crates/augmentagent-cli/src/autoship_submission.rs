@@ -296,6 +296,15 @@ impl WorkflowStore {
         request: &Request,
         now: i64,
     ) -> Result<Admission> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admission=submit_in_transaction(&tx,request_id,principal,request,now)?;
+        tx.commit()?;
+        Ok(admission)
+    }
+}
+
+/// Shared atomic admission body for CLI and authenticated transport ingress.
+pub(super) fn submit_in_transaction(tx:&Transaction<'_>,request_id:&str,principal:&str,request:&Request,now:i64)->Result<Admission> {
         ensure!(
             !request_id.is_empty()
                 && request_id.len() <= 128
@@ -314,9 +323,6 @@ impl WorkflowStore {
         );
         let request = request.normalized()?;
         let payload = serde_json::to_string(&request)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let prior: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT principal,payload,admission FROM command_request WHERE request_id=?1",
@@ -343,7 +349,7 @@ impl WorkflowStore {
         } else {
             identity
         };
-        let queued = policy(&tx, &workflow)?;
+        let queued = policy(tx, &workflow)?;
         let registered: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow WHERE id=?1)",
             [&workflow],
@@ -385,9 +391,7 @@ impl WorkflowStore {
         }
         tx.execute("INSERT INTO command_request(request_id,principal,payload,admission,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![request_id,principal,payload,serde_json::to_string(&admission)?,now])?;
-        tx.commit()?;
         Ok(admission)
-    }
 }
 
 /// Check inside the merge admission transaction, before reserving or sending.

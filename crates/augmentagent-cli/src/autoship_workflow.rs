@@ -11,6 +11,8 @@ use std::{path::Path, time::Duration};
 mod merge_allowance;
 #[path = "autoship_milestone.rs"]
 mod milestone;
+#[path = "autoship_discord_ingress.rs"]
+pub(crate) mod discord_ingress;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
@@ -280,6 +282,14 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS command_job (
                 workflow TEXT PRIMARY KEY, repository TEXT NOT NULL, target TEXT NOT NULL,
                 until_milestone TEXT NOT NULL, provider TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS discord_workflow_binding (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                workflow TEXT NOT NULL REFERENCES command_job(workflow), created_at INTEGER NOT NULL,
+                PRIMARY KEY(bot,owner,channel,workflow));
+            CREATE TABLE IF NOT EXISTS discord_command_ingress (
+                request_id TEXT PRIMARY KEY REFERENCES command_request(request_id), origin TEXT NOT NULL,
+                message_sha256 TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL,
+                created_at INTEGER NOT NULL, dispatched_at INTEGER, remote_message TEXT, confirmed_at INTEGER);
             CREATE TABLE IF NOT EXISTS command_schedule (
                 workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
                 attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);

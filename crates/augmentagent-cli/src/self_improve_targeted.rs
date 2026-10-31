@@ -373,6 +373,18 @@ mod tests {
             assert_eq!(status["worker"]["state"],"unknown");
             assert!(status["head"].is_null());
             assert!(!root.join(".self-improve-worktrees").exists());
+            let context=crate::autoship_discord_command::Context {origin:crate::autoship_workflow::discord_ingress::DiscordOrigin {
+                bot:11,owner:22,channel:33,message:44},guild:None,owner_dm_verified:true};
+            let policy=crate::autoship_discord_command::OwnerPolicy {bot:11,owner:22};
+            scenario(serde_json::json!({"permission":"WRITE","pr":pr}));
+            let text="!autoship https://github.com/owner/repo/pull/42 --provider codex";
+            let discord=crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&context,text).await.unwrap();
+            assert!(discord.admission.accepted);assert!(!discord.admission.complete);
+            let mut closed=pr.clone();closed["state"]="CLOSED".into();
+            scenario(serde_json::json!({"permission":"WRITE","pr":closed}));
+            assert_eq!(crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&context,text).await.unwrap(),discord);
+            scenario(serde_json::json!({"permission":"READ","pr":closed}));
+            assert!(crate::autoship_discord_command::admit(&root,&workflow::path(),policy,&context,text).await.is_err());
             return;
         }
         let dir = tempfile::tempdir().unwrap();

@@ -103,6 +103,7 @@ mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
 mod autoship_commands;
+mod autoship_discord_command;
 mod autoship_deployment;
 mod autoship_contract;
 mod autoship_episode;
