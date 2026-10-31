@@ -6,7 +6,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export REPO_ROOT
 python3 - <<'PY'
-import os, pathlib, re, shlex, subprocess, tempfile, json, stat
+import os, pathlib, re, shlex, subprocess, tempfile, json, stat, contextlib
 repo=pathlib.Path(os.environ['REPO_ROOT'])
 home=pathlib.Path.home()
 unit_dir=pathlib.Path(os.environ.get('XDG_CONFIG_HOME',str(home/'.config')))/'systemd/user'
@@ -50,6 +50,25 @@ def setting(name,override,fallback):
  if not re.fullmatch(r'(?:[0-9]+[KMGTPE]?|infinity)',value):
   raise RuntimeError('invalid resource setting '+name)
  return value
+def secure_release_executables():
+ # Cargo links its public executable to the deps artifact. Keep those links
+ # and bytes intact; remove only group/other write access on the opened inode.
+ paths=[repo/'target/release'/name for name in ('augmentagent','augmentagent-mcp-memory')]
+ if not any(path.exists() or path.is_symlink() for path in paths):return
+ with contextlib.ExitStack() as opened:
+  files=[]
+  for path in paths:
+   stream=opened.enter_context(os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK),'rb'))
+   info=os.fstat(stream.fileno())
+   if not stat.S_ISREG(info.st_mode) or info.st_uid not in (0,os.geteuid()) or not info.st_mode & 0o111 or not 0<info.st_size<=1024**3:
+    raise RuntimeError('unsafe release executable')
+   current=path.stat(follow_symlinks=False)
+   if (current.st_dev,current.st_ino)!=(info.st_dev,info.st_ino):raise RuntimeError('release executable changed')
+   files.append((stream,info))
+  for stream,info in files:
+   mode=stat.S_IMODE(info.st_mode)
+   if mode & 0o022:
+    os.fchmod(stream.fileno(),mode & ~0o022);os.fsync(stream.fileno())
 env=shlex.split(show('Environment'))
 extra=['Environment="'+escaped(value)+'"' for value in env]
 # systemctl expands EnvironmentFile specifiers; preserve the resolved paths,
@@ -138,6 +157,7 @@ Slice=augmentagent-runtime.slice
 # Validate every destination before changing any managed file. Selection is
 # committed last; manager failures restore the prior units and selection.
 if selection_text is not None:write(selection,selection_text)
+secure_release_executables()
 log_dir.mkdir(parents=True,exist_ok=True)
 previous={path:(path.read_bytes(),stat.S_IMODE(path.stat().st_mode)) if path.exists() else None for path in plan}
 written=[]
