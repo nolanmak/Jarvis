@@ -284,6 +284,32 @@ fn cli_releases_only_proven_unexecuted_or_external_merges() {
     }
 }
 #[test]
+fn cli_settles_expired_reservation_only_with_nonexecution_proof() {
+    for scenario in ["expired","dispatched","journal","active"] {
+        let dir = fixture(None,false,&"a".repeat(40));
+        let root = dir.path();
+        {
+            let conn = rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+            conn.execute("UPDATE merge_allowance_dispatch SET state='released',resolution='expired_before_dispatch',dispatched_at_ms=NULL",[]).unwrap();
+            if scenario=="dispatched" { conn.execute("UPDATE merge_allowance_dispatch SET dispatched_at_ms=11",[]).unwrap(); }
+            if scenario=="journal" { conn.execute("INSERT INTO merge_transport_response VALUES('op-pending','{}',12)",[]).unwrap(); }
+            if scenario=="active" { conn.execute("UPDATE workflow SET owner='new-worker',lease_until=?1",[chrono::Utc::now().timestamp_millis()+60_000]).unwrap(); }
+        }
+        let before = Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap());
+        if scenario != "expired" {
+            assert_code(&invoke(root,"not-merged"),3);
+            assert_eq!(Sha256::digest(std::fs::read(root.join("workflow.db")).unwrap()),before,"{scenario}");
+            continue;
+        }
+        for _ in 0..2 { assert_code(&invoke(root,"not-merged"),0); }
+        let conn = rusqlite::Connection::open(root.join("workflow.db")).unwrap();
+        let (decision,completed):(String,String) = conn.query_row("SELECT d.resolution,o.receipt FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(decision,completed);
+        assert_eq!(serde_json::from_str::<Value>(&decision).unwrap()["proof"]["kind"],"never_dispatched");
+    }
+}
+
+#[test]
 fn cli_repeats_controller_resolution_without_rewriting_audit_or_live_work() {
     let dir = fixture(Some(request_error()), false, &"a".repeat(40));
     assert_code(&invoke(dir.path(),"not-merged"),0);

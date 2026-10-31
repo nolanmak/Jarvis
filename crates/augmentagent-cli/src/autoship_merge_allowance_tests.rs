@@ -3,6 +3,24 @@ use super::*;
 const DAY: i64 = 86_400_000;
 
 #[test]
+fn expired_undispatched_reservation_can_be_explicitly_settled_but_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    let (lease,op) = fixture(&mut store,1,now);
+    reserve(&mut store,&lease,&op,1,now).unwrap();
+    store.release(&lease,now).unwrap();
+    let (next,next_op) = fixture(&mut store,2,now+1);
+    reserve(&mut store,&next,&next_op,2,now+1).unwrap();
+    assert_eq!(store.merge_dispatch(&op.id).unwrap().unwrap().resolution.as_deref(),Some("expired_before_dispatch"));
+    store.resolve_merge_without_debit(&op,"not-merged","owner",&MergeReleaseProof::NeverDispatched,now+2).unwrap();
+    store.resolve_merge_without_debit(&op,"not-merged","owner",&MergeReleaseProof::NeverDispatched,now+3).unwrap();
+    let retry = store.claim(&op.workflow,"retry",now+4,1000).unwrap().unwrap();
+    assert!(reserve(&mut store,&retry,&op,1,now+4).is_err(),"explicit settlement forbids later dispatch");
+    assert_eq!(store.merge_allowance(now,5).unwrap().confirmed,0);
+}
+
+#[test]
 fn late_equivalent_merge_proof_preserves_first_receipt_and_debits_once() {
     for marker_first in [true,false] {
         let dir = tempfile::tempdir().unwrap();

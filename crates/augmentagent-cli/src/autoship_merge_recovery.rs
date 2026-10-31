@@ -256,6 +256,12 @@ pub async fn resolve(
             return Ok((Some(receipt), None));
         }
         if record.state == "released" {
+            if record.resolution.as_deref() == Some("expired_before_dispatch") {
+                ensure!(remote["merged"].as_bool() == Some(classification == "manual"),
+                    "classification differs from remote merged state");
+                store.validate_undispatched_resolution(&record.operation)?;
+                return Ok((None,Some(MergeReleaseProof::NeverDispatched)));
+            }
             let decision: Value = serde_json::from_str(
                 record
                     .resolution
@@ -290,6 +296,7 @@ pub async fn resolve(
             "classification differs from remote merged state"
         );
         if record.state == "reserved" {
+            store.validate_undispatched_resolution(&record.operation)?;
             return Ok((None, Some(MergeReleaseProof::NeverDispatched)));
         }
         if let Some((raw, _)) = &journal {

@@ -131,6 +131,27 @@ fn validate_existing_autonomous_resolution(conn:&Connection, operation:&str, raw
     Ok(())
 }
 
+fn validate_undispatched_resolution(conn:&Connection, op:&Operation) -> Result<()> {
+    let (workflow,kind,binding,completed,state,resolution,dispatched,journal):(String,String,String,Option<String>,String,Option<String>,Option<i64>,bool) = conn.query_row(
+        "SELECT o.workflow,o.kind,o.binding,o.receipt,d.state,d.resolution,d.dispatched_at_ms,
+         EXISTS(SELECT 1 FROM merge_transport_response r WHERE r.operation=o.id)
+         FROM operation o JOIN merge_allowance_dispatch d ON d.operation=o.id WHERE o.id=?1",[&op.id],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
+    ensure!(workflow == op.workflow && op.kind == OperationKind::MergePr
+        && serde_json::from_str::<OperationKind>(&kind)? == op.kind
+        && serde_json::from_str::<Binding>(&binding)? == op.binding,
+        "undispatched intent differs");
+    ensure!(completed.is_none() && dispatched.is_none() && !journal
+        && (state == "reserved" || (state == "released" && resolution.as_deref() == Some("expired_before_dispatch"))),
+        "intent does not prove non-dispatch");
+    let marker_table:bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_private_marker')",[],|r|r.get(0))?;
+    if marker_table {
+        let marked:bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM merge_private_marker WHERE operation=?1)",[&op.id],|r|r.get(0))?;
+        ensure!(!marked,"marked dispatch cannot be classified as never dispatched");
+    }
+    Ok(())
+}
+
 fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
     ensure!(now >= 0 && cap > 0, "invalid merge allowance day or cap");
     let start = now.div_euclid(86_400_000) * 86_400_000;
@@ -162,6 +183,9 @@ fn allowance(conn: &Connection, now: i64, cap: u32) -> Result<MergeAllowance> {
 }
 
 impl WorkflowStore {
+    pub fn validate_undispatched_resolution(&self, op:&Operation) -> Result<()> {
+        validate_undispatched_resolution(&self.conn,op)
+    }
     pub fn validate_confirmed_merge_proof(&self, operation:&str, receipt:&serde_json::Value) -> Result<()> {
         let first = self.confirmed_merge_receipt(operation)?.context("confirmed merge proof missing")?;
         validate_merge_receipt_equivalence(&self.conn,operation,&first,receipt)
@@ -332,7 +356,8 @@ impl WorkflowStore {
                 && serde_json::from_str::<Binding>(&binding)? == op.binding,
             "resolution intent differs"
         );
-        if state == "released" {
+        let expired = state == "released" && prior.as_deref() == Some("expired_before_dispatch");
+        if state == "released" && !expired {
             ensure!(
                 prior.as_deref() == Some(decision.as_str()),
                 "immutable merge resolution conflict"
@@ -341,7 +366,7 @@ impl WorkflowStore {
             return Ok(());
         }
         ensure!(
-            matches!(state.as_str(), "reserved" | "dispatched"),
+            matches!(state.as_str(), "reserved" | "dispatched") || expired,
             "confirmed merge cannot be released"
         );
         let (owner, until, generation): (Option<String>, i64, i64) = tx.query_row(
@@ -363,10 +388,7 @@ impl WorkflowStore {
             );
         }
         match proof {
-            MergeReleaseProof::NeverDispatched => ensure!(
-                state == "reserved",
-                "dispatched mutation requires remote evidence"
-            ),
+            MergeReleaseProof::NeverDispatched => validate_undispatched_resolution(&tx,op)?,
             MergeReleaseProof::RequestNotExecuted { response_sha256 } => {
                 let raw: String = tx.query_row(
                     "SELECT response FROM merge_transport_response WHERE operation=?1",
