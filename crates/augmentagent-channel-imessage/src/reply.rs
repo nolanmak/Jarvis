@@ -263,10 +263,15 @@ impl ImessageReplier {
     }
 
     async fn handle_one(&self, email: Email) -> anyhow::Result<Handled> {
+        let baseline = if augmentagent_channel_core::draft_workflow::enabled_for(&email.platform) {
+            augmentagent_channel_core::draft_context::load_seed(
+                &self.store, &email, self.config.wiki_root.as_deref(),
+            )?.prompt()
+        } else { String::new() };
         let triage = triage_opts(self.config.wiki_root.clone());
         let raw = self
             .reasoner
-            .call(&triage, &triage_user_message(&email, "", ""))
+            .call(&triage, &triage_user_message(&email, &baseline, ""))
             .await?;
         let decision = parse_decision(&raw)?;
         match decision.decision {
@@ -291,16 +296,22 @@ impl ImessageReplier {
 
         let skill = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
             .unwrap_or_default();
+        let context = augmentagent_channel_core::draft_workflow::prepare(
+            &self.store, self.reasoner.as_ref(), &email,
+            "Draft a response to the latest incoming message using relevant conversation and cross-platform evidence.",
+            self.config.wiki_root.as_deref(),
+        ).await?;
         let draft_opts = draft_opts(skill, self.config.wiki_root.clone());
         let drafted = self
             .reasoner
-            .call(&draft_opts, &draft_user_message(&email, "", "", "", "", ""))
+            .call(&draft_opts, &draft_user_message(&email, &context.prompt(), "", "", "", ""))
             .await?
             .trim()
             .to_string();
         if drafted.is_empty() {
             anyhow::bail!("draft came back empty");
         }
+        let drafted = context.guard_draft(&drafted);
         // One live reply card per conversation: the newer message replaces
         // it. A pending compose the owner started stays (#1635).
         let thread = email.thread_id.clone().unwrap_or_default();
@@ -313,6 +324,7 @@ impl ImessageReplier {
             )?
             .len();
         let action_id = self.log(&email, Some(&drafted), ActionStatus::Pending)?;
+        anyhow::ensure!(context.attach(&self.store, &action_id)?, "draft evidence receipt could not be attached");
         if let Err(e) = self.approvals.post_approval(&action_id, &email, &drafted).await {
             self.store.update_action_status(
                 &action_id,
@@ -359,7 +371,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Reasoner for Scripted {
-        async fn call(&self, _o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+        async fn call(&self, o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+            // These fixtures count triage/draft decisions; evidence recovery
+            // has its own scripted cross-platform suite in channel-core.
+            if o.system_prompt.starts_with("You select evidence for a messaging draft") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             *self.1.lock().unwrap() += 1;
             Ok(self
                 .0

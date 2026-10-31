@@ -553,7 +553,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Reasoner for Redraft {
-        async fn call(&self, _o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+        async fn call(&self, opts: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+            if opts.system_prompt.contains("You select evidence") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             Ok("a better reply".into())
         }
     }
@@ -659,6 +662,20 @@ mod tests {
             ApprovalActionOutcome::Failed { message } => message,
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn approve_imessage_never_sends_private_context_warnings() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let draft = augmentagent_approval_discord::append_needs_input_marker(
+            "Can you resend the email?", &[("context".into(), "PRIVATE_CONTEXT_WARNING".into())],
+        );
+        let id=seed(&f.store, PHONE, &draft);
+        assert!(matches!(f.approver.run_approve(&id).await, ApprovalActionOutcome::Approved));
+        let rows=f.store.list_imessage_outbox(10).unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].body,"Can you resend the email?");
     }
 
     #[tokio::test]
@@ -807,6 +824,7 @@ mod tests {
         let a = f.store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(a.action.status, "pending");
         assert_eq!(a.action.draft_body.as_deref(), Some("a better reply"));
+        assert_eq!(f.store.draft_context_receipts(&id).unwrap().len(), 1);
         assert_eq!(outbox_len(&f.store), 0);
     }
 

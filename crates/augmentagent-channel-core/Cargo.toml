@@ -13,6 +13,7 @@ test-isolation = []
 
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-messages = { path = "../augmentagent-messages" }
 augmentagent-phone = { path = "../augmentagent-phone" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 # #58 engagement engine surfaces preview / failure cards through the shared
@@ -52,7 +53,6 @@ futures = { workspace = true }
 [dev-dependencies]
 # #1548 — paused-clock timing tests for the phone queue notices.
 tokio = { workspace = true, features = ["test-util"] }
-augmentagent-messages = { path = "../augmentagent-messages" }
 syn = { version = "2", features = ["full", "visit"] }
 # #501 — timeparse DST fixture tests pin America/New_York (chrono::Local
 # reads TZ once at process start, so env-pinning in tests is unreliable).

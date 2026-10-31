@@ -54,12 +54,15 @@ struct SpyReasoner {
 }
 #[async_trait]
 impl Reasoner for SpyReasoner {
-    async fn call(&self, _: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+    async fn call(&self, opts: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
         for i in 0..3 {
             assert!(
                 prompt.contains(&format!("burst message {i}")),
                 "missing burst context {i}"
             );
+        }
+        if opts.system_prompt.contains("You select evidence") {
+            return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
         }
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if self.skip_only {
@@ -165,6 +168,11 @@ async fn exercise(group: bool, owner_latest: bool, historical: bool, concurrent:
     } else {
         assert_eq!(first.awaiting_approval, 1);
         assert_eq!(broker.cards.load(Ordering::SeqCst), 1);
+        let receipts: i64 = store.with_conn(|c| c.query_row(
+            "SELECT COUNT(*) FROM draft_context_receipts WHERE action_id IS NOT NULL",
+            [], |r| r.get(0),
+        )).unwrap();
+        assert_eq!(receipts, 1, "the live card retains its shared context receipt");
     }
     let before = reasoner.calls.load(Ordering::SeqCst);
     channel.poll_once().await.unwrap();

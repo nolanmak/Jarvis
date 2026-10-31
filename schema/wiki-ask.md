@@ -23,6 +23,41 @@ When the user asks for **content** — a post, an email, a message, a bio, copy 
 
 ## Register matching (drafts)
 
+Before writing a non-verbatim messaging reply or revision, prepare its evidence
+using the shared drafting workflow. Resolve the intended person/thread with
+`search_messages`, then run:
+
+```
+augmentagent messages context --message-id "<source message id>" --request "<owner's drafting request>"
+```
+
+This command reads the latest conversation turns and relevant wiki pages, lets
+the evidence agent search other platforms when facts are missing, and returns
+the gathered evidence plus a private receipt ID. It does not send or create an
+approval card. Use its facts and source bodies to write the draft; do not merely
+call the command and ignore its results. Material missing context must be
+surfaced to the owner rather than filled with invented dates, commitments, or
+links. If a referenced email or WhatsApp discussion cannot be found, say so.
+Read/retrieve additional evidence if the returned context is insufficient.
+Keep the request, evidence bodies and source identities out of tool-notice prose.
+After creating the approval card, link its returned action ID to the receipt:
+`augmentagent messages context-attach --receipt-id "<receipt>" --action-id "<action>"`.
+This updates private evidence metadata only. It refuses a different account or
+conversation; never substitute another receipt to bypass that refusal. If
+linking fails, report that the draft's context receipt could not be attached.
+If context preparation returns `enabled: false`, the rollout policy disabled
+this workflow for that platform. Do not claim that evidence was checked; use
+the existing read tools and disclose material gaps.
+
+The ten-message chat window is the starting point, not the entire available
+history. Explicit platform references and implicit references such as "that
+plan" require relevant source retrieval or an honest missing-context result.
+An explicit verbatim instruction ("send exactly hello world") preserves those
+bytes and does not require content-generation retrieval. If there is no stored
+source conversation, report the missing history and use verified wiki context;
+never fabricate a message ID to invoke the command. Platform send/approval
+rules below still apply.
+
 The owner's standing rule is to be a chameleon: capitalize when the other person capitalizes, go lowercase when they do. That rule is injected as an owner rule and was still ignored (#994: an all-lowercase text drafted for someone who writes in sentence case), so it is now a **mandatory protocol** with a receipt the delivery layer checks, not a style hint.
 
 Before emitting ANY outbound draft — text, DM, email, social reply, comment — do this in order:

@@ -265,6 +265,7 @@ pub struct DefaultDispatcher<'a> {
     /// `"primary"` per the architect note in #50; kept as a field so a
     /// future channel can override without forking the dispatcher.
     pub calendar_id: String,
+    draft_context: Option<&'a crate::draft_workflow::PreparedDraftContext>,
     trace: Mutex<Vec<ToolCallRecord>>,
     last_action_id: Mutex<Option<String>>,
 }
@@ -285,6 +286,7 @@ impl<'a> DefaultDispatcher<'a> {
             generated_source: generated_source.into(),
             wiki_hint: String::new(),
             calendar_id: "primary".to_string(),
+            draft_context: None,
             trace: Mutex::new(Vec::new()),
             last_action_id: Mutex::new(None),
         }
@@ -316,6 +318,11 @@ impl<'a> DefaultDispatcher<'a> {
     /// `"primary"`.
     pub fn with_calendar_id(mut self, id: impl Into<String>) -> Self {
         self.calendar_id = id.into();
+        self
+    }
+
+    pub fn with_draft_context(mut self, context: Option<&'a crate::draft_workflow::PreparedDraftContext>) -> Self {
+        self.draft_context = context;
         self
     }
 
@@ -484,6 +491,7 @@ impl<'a> DefaultDispatcher<'a> {
             "draft" => {
                 let (channel, body, reason) =
                     parse_draft_args(args).map_err(DispatchError::BadArgs)?;
+                let body = self.draft_context.map(|ctx|ctx.guard_draft(&body)).unwrap_or(body);
                 // The `.d.ts` never declares the `Channel` union and every
                 // prompt example says `"gmail"`, so the model's channel arg
                 // is unreliable (#989). Route on the wired channel — the
@@ -528,6 +536,11 @@ impl<'a> DefaultDispatcher<'a> {
                         &trace_json,
                     )
                     .map_err(|e| DispatchError::Internal(e.to_string()))?;
+                if let Some(context) = self.draft_context {
+                    let attached = context.attach(&self.store, &action_id)
+                        .map_err(|e| DispatchError::Internal(e.to_string()))?;
+                    if !attached { return Err(DispatchError::Internal("Could not attach draft evidence receipt".into())); }
+                }
                 *self
                     .last_action_id
                     .lock()

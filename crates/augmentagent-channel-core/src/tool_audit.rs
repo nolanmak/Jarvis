@@ -818,6 +818,13 @@ fn is_private_imessage_compose(tool: &str, args: &serde_json::Value) -> bool {
 
 const PRIVATE_COMPOSE_COMMAND: &str = "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
 
+fn is_private_draft_context(tool: &str, args: &serde_json::Value) -> bool {
+    static CONTEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+        regex::Regex::new(r#"(?i)\bmessages["']?\s+["']?context(?:-receipts)?\b"#).expect("context audit pattern"));
+    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
+        .is_some_and(|command|CONTEXT.is_match(&command.replace("\\\n", "")))
+}
+
 /// Pair a captured `tool_use` block with its later `tool_result` and produce
 /// the [`AuditRecord`] both the log and the notifier consume. `provider` is
 /// the adapter that served the call (#1047).
@@ -839,9 +846,13 @@ pub fn build_audit_record(
     // value. Omit the whole payload, including descriptions, pipes/heredocs,
     // and result echoes, rather than attempting to parse private shell args.
     let private_compose = is_private_imessage_compose(&tool, &args);
-    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) } else { args };
+    let private_context = is_private_draft_context(&tool, &args);
+    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) }
+        else if private_context {serde_json::json!({"command":"augmentagent messages context [private request and evidence omitted]"})} else { args };
     let (captured, _truncated) = truncate_stream(if private_compose {
         "[iMessage compose output omitted; inspect approval card]"
+    } else if private_context {
+        "[Private draft evidence omitted; inspect the context receipt]"
     } else { result_content });
     // Bash failures from the CLI surface as `is_error=true` with the command
     // output in the result content. We have no real exit code from the
