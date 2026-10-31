@@ -38,6 +38,7 @@ import {
   addSender,
   removeSender,
   resolveActionIfPending,
+  OwnerDecisionConflict,
   addPushSubscription,
   removePushSubscription,
   getActiveGmailAccounts,
@@ -231,11 +232,18 @@ v1.post("/actions/:id", (req, res) => {
   // read above is advisory only. A Rust-side writer (Schedule pick, send
   // engine claim) landing between the read and this UPDATE wins, and this
   // route must not silently disarm it.
-  const resolved = resolveActionIfPending(req.params.id, status as ActionStatus, {
+  let resolved: boolean;
+  try {
+    resolved = resolveActionIfPending(req.params.id, status as ActionStatus, {
     draftBody,
     errorMessage,
     recipientEmail,
-  });
+    });
+  } catch (error) {
+    if (!(error instanceof OwnerDecisionConflict)) throw error;
+    res.status(409).json({ error: error.message, action: getActionById(req.params.id) });
+    return;
+  }
   if (!resolved) {
     res.status(409).json({
       error: "action was resolved by another surface",

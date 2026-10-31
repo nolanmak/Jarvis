@@ -63,7 +63,8 @@ async fn active_voice_binding_injects_tool_only_into_its_owner_conversation_turn
         conversation_store: None,
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: true,
-        phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new(),
+        phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(), running_text_turns: Default::default(),
+        final_spoken_turns: dashmap::DashMap::new(),
     };
     handler.attach_voice_tools(Arc::clone(&service));
     let mut ctx = augmentagent_approval_discord::AuditCtx {
@@ -143,6 +144,7 @@ async fn voice_flag_preserves_unbound_qwen_and_glm_text_routes() {
         conversation_store: Some(Arc::clone(&store)),
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: true, phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     };
     for channel in [2, 3] {
@@ -202,6 +204,7 @@ async fn guild_text_uses_one_native_session_and_bootstraps_history_only_once() {
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: true,
         phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     };
     let mut ctx = augmentagent_approval_discord::AuditCtx {
@@ -273,6 +276,7 @@ async fn uncertain_native_turn_is_persisted_and_blocks_replay() {
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: true,
         phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     };
     let mut ctx = augmentagent_approval_discord::AuditCtx {
@@ -331,6 +335,7 @@ async fn failed_turn_without_native_id_is_not_replayed_after_restart() {
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
             voice_enabled: true,
             phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
+            running_text_turns: Default::default(),
             final_spoken_turns: dashmap::DashMap::new(),
         };
         assert!(handler.answer_turn(&ctx, "", "must not replay").await.is_err());
@@ -341,6 +346,7 @@ async fn failed_turn_without_native_id_is_not_replayed_after_restart() {
         conversation_store: Some(Arc::new(Store::open(root.join("data.db")).unwrap())),
         conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()),
         voice_enabled: true, phone_tools: std::sync::OnceLock::new(), voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     };
     let next = augmentagent_approval_discord::AuditCtx { session_id: "2:2".into(), ..ctx };

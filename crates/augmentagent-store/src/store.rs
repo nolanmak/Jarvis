@@ -659,6 +659,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::migrate(&conn)?;
+        crate::imessage_owner::install_guards(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             path: path.to_path_buf(),
@@ -1004,6 +1005,7 @@ impl Store {
         crate::surface_health::migrate(conn)?;
         // #1289 — approval-card pointers per surface.
         crate::approval_cards::migrate(conn)?;
+        crate::imessage_owner::migrate(conn)?;
         crate::approval_history::migrate(conn)?;
         crate::document_signatures::migrate(conn)?;
         // #1299 — the daemon's own start report (credential backend, notices).
@@ -1140,6 +1142,10 @@ impl Store {
         // are comma-joined bare-address lists; NULL on rows from flows that
         // never set an envelope (auto-triage replies, non-gmail platforms),
         // which keep the pre-#473 from-based behavior.
+        // Legacy databases may predate the dashboard recipient override.
+        if !column_exists(conn, "actions", "recipientEmail")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN recipientEmail TEXT", [])?;
+        }
         if !column_exists(conn, "actions", "toEmails")? {
             conn.execute("ALTER TABLE actions ADD COLUMN toEmails TEXT", [])?;
         }
@@ -3332,10 +3338,13 @@ impl Store {
     ) -> StoreResult<()> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
+        let tx = rusqlite::Transaction::new_unchecked(&guard, rusqlite::TransactionBehavior::Immediate)?;
+        crate::imessage_owner::guard_action(&tx, action_id, true)?;
+        tx.execute(
             "UPDATE actions SET status = ?2, draftBody = COALESCE(?3, draftBody), errorMessage = COALESCE(?4, errorMessage), updatedAt = ?5 WHERE id = ?1",
             params![action_id, status.as_str(), draft_body, error_message, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3344,11 +3353,14 @@ impl Store {
     pub fn revise_pending_action(&self, action_id: &str, draft_body: &str) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
-        let changed = guard.execute(
+        let tx = rusqlite::Transaction::new_unchecked(&guard, rusqlite::TransactionBehavior::Immediate)?;
+        crate::imessage_owner::guard_action(&tx, action_id, true)?;
+        let changed = tx.execute(
             "UPDATE actions SET draftBody = ?2, nextNudgeAtMs = ?3, updatedAt = ?4 \
              WHERE id = ?1 AND status = 'pending'",
             params![action_id, draft_body, now + NUDGE_INTERVAL_MS, now],
         )?;
+        tx.commit()?;
         Ok(changed == 1)
     }
 
@@ -4968,6 +4980,7 @@ impl Store {
     /// event handler on approve/revise/skip clicks to reconstruct context.
     pub fn get_action_with_email(&self, action_id: &str) -> StoreResult<Option<ActionWithEmail>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
+        crate::imessage_owner::guard_action(&guard, action_id, false)?;
         let row: Option<ActionWithEmail> = guard
             .query_row(
                 // #1412 — a compacted row's body lives only in `emails`.
@@ -7009,7 +7022,9 @@ impl Store {
         reason: Option<&str>,
     ) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
+        let tx = rusqlite::Transaction::new_unchecked(&guard, rusqlite::TransactionBehavior::Immediate)?;
+        crate::imessage_owner::guard_action(&tx, action_id, true)?;
+        let n = tx.execute(
             "UPDATE actions \
                 SET status = ?2, status_source = ?3, status_updated_at = ?4, \
                     updatedAt = ?4, \
@@ -7023,6 +7038,7 @@ impl Store {
                 reason,
             ],
         )?;
+        tx.commit()?;
         Ok(n == 1)
     }
 
@@ -7094,13 +7110,16 @@ impl Store {
     ) -> StoreResult<bool> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
+        let tx = rusqlite::Transaction::new_unchecked(&guard, rusqlite::TransactionBehavior::Immediate)?;
+        crate::imessage_owner::guard_action(&tx, action_id, true)?;
+        let n = tx.execute(
             "UPDATE actions \
                 SET status = 'sending', \
                     status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
               WHERE id = ?1 AND status = ?2",
             params![action_id, from_status.as_str(), source, now],
         )?;
+        tx.commit()?;
         Ok(n == 1)
     }
 
