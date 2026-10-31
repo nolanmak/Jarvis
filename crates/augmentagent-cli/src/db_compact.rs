@@ -70,10 +70,10 @@ pub async fn run_loop(
     store: Arc<Store>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    let Some(days) = retention_days() else {
-        tracing::info!("action-body compaction disabled (AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS=0)");
-        return Ok(());
-    };
+    let days = retention_days();
+    if days.is_none() {
+        tracing::info!("action-body compaction disabled (AUGMENTAGENT_ACTION_BODY_RETENTION_DAYS=0); owner message retention remains active");
+    }
     let mut wait = FIRST_PASS_DELAY;
     loop {
         tokio::select! {
@@ -82,9 +82,13 @@ pub async fn run_loop(
         }
         wait = PASS_INTERVAL;
         let store = Arc::clone(&store);
-        let cutoff = cutoff_ms(chrono::Utc::now().timestamp_millis(), days);
+        let now=chrono::Utc::now().timestamp_millis();
         let pass = tokio::task::spawn_blocking(move || {
-            compact(&store, cutoff, BATCH_ROWS, BATCHES_PER_PASS, PAUSE_BETWEEN_BATCHES)
+            store.compact_imessage_owner_event_bodies(cutoff_ms(now,30.0))?;
+            match days {
+                Some(days)=>compact(&store,cutoff_ms(now,days),BATCH_ROWS,BATCHES_PER_PASS,PAUSE_BETWEEN_BATCHES),
+                None=>Ok(BodyCompaction::default()),
+            }
         })
         .await;
         match pass {

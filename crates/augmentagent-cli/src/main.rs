@@ -12013,7 +12013,7 @@ mod query_delivery_contract_tests {
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
             conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
             phone_tools: std::sync::OnceLock::new(),
-            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
+            voice_tools: std::sync::OnceLock::new(), running_text_turns: Default::default(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
             ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
@@ -12076,7 +12076,7 @@ mod query_delivery_contract_tests {
             repo_root: fixture.path().to_path_buf(), conversation_store: None,
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
             phone_tools: std::sync::OnceLock::new(),
-            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
+            voice_tools: std::sync::OnceLock::new(), running_text_turns: Default::default(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
         let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();

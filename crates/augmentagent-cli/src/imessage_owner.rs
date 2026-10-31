@@ -381,14 +381,6 @@ pub fn start_runtime(
                 );
             }
             tick = tick.wrapping_add(1);
-            if tick % 17_280 == 1 {
-                if let Err(error) = mirror.store.compact_imessage_owner_event_bodies(
-                    chrono::Utc::now().timestamp_millis() - 30 * 24 * 60 * 60 * 1000,
-                ) {
-                    tracing::warn!("owner iMessage retention failed: {error}");
-                }
-            }
-
             if tick % 3 != 1 {
                 continue;
             }

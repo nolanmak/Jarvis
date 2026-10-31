@@ -243,5 +243,6 @@ receipt states and uncertain/failed deliveries. `bind`, `disable`, `ingest`,
 `capture-error`, and `discard-input` are operator/transport commands, not agent
 query tool grants. Bind starts from the current native ROWID. The Mac owner job
 runs every five seconds independently of the existing sender job. Retention
-clears completed input bodies and terminal generic output bodies after thirty
-days while retaining identity tombstones, native GUIDs and approval associations.
+runs in the daemon's existing hourly body housekeeping, even when the mirror
+is disabled. It clears completed input bodies and terminal generic output bodies
+after thirty days while retaining identity tombstones, native GUIDs and approval associations.

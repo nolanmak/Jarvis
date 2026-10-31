@@ -1048,7 +1048,7 @@ impl Store {
             let count=tx.execute("UPDATE imessage_owner_events SET payload=NULL
                 WHERE state IN ('completed','ignored') AND updated_at_ms<?1 AND payload IS NOT NULL",[before])?;
             tx.execute("UPDATE imessage_outbox SET body='[Owner output body expired after 30 days]'
-                WHERE created_at_ms<?1 AND status IN ('sent','failed') AND id IN
+                WHERE created_at_ms<?1 AND status IN ('sent','failed') AND body!='[Owner output body expired after 30 days]' AND id IN
                 (SELECT outbox_id FROM imessage_owner_deliveries WHERE action_id IS NULL)", [before])?;
             tx.commit()?;Ok(count)
         })
