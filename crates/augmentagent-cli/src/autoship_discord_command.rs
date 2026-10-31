@@ -146,10 +146,7 @@ pub(crate) async fn gateway_command(repo:&Path,path:&Path,context:&GatewayContex
     let plain=|content:&str|Some(GatewayReply {content:content.into(),nonce:None});
     if !augmentagent_approval_discord::autoship::recognizes(text) {
         ensure!(gateway_bound(path,context)?,"autoship conversation is not bound");
-        if owner_followup(repo,path,&origin,text).await.is_err() {
-            return Ok(plain("Autoship owner message could not be queued. Select a bound workflow with `!autoship use ID` and verify GitHub access. No edit is confirmed."));
-        }
-        return gateway_claim_ack(path,context);
+        return Ok(plain("Autoship coding sessions are unavailable in this build. This message was not queued and did not pause the workflow. Use `!autoship status`, `pause`, or `resume` to control the PR."));
     }
     match parse_control(text) {
         Ok(Some((action,explicit)))=> {

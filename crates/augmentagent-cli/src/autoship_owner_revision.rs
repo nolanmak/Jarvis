@@ -20,23 +20,28 @@ impl WorkflowStore {
         }
         let registration=serde_json::to_string(next)?;ensure!(registration.len()<=4*1024*1024,"owner revision registration exceeds bound");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_lease(&tx,&turn.lease,now)?;
         let body_hash=format!("{:x}",Sha256::digest(turn.body.as_bytes()));
         let prior:Option<(String,String,String,String)>=tx.query_row("SELECT previous_contract,next_contract,binding,owner_message_sha256 FROM workflow_owner_revision WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        let revised=OwnerTurn {binding:binding.clone(),..turn.clone()};
         if let Some((old,new,recorded,body))=prior {
             ensure!(old==previous.contract_hash() && new==next.contract_hash() && recorded==serde_json::to_string(binding)? && body==body_hash,"owner revision replay changed");
+            let fence:Option<(i64,i64)>=tx.query_row("SELECT previous_generation,next_generation FROM workflow_owner_revision_fence WHERE request_id=?1",[&turn.request_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let (before,after)=fence.context("unfenced legacy owner revision requires reconciliation")?;
+            ensure!(turn.lease.generation==before || turn.lease.generation==after,"owner revision lease changed");
+            let revised=OwnerTurn {lease:Lease {generation:after,..turn.lease.clone()},binding:binding.clone(),..turn.clone()};
             super::owner_turn::validate_turn(&tx,&revised,now)?;return Ok(revised);
         }
         super::owner_turn::validate_turn(&tx,turn,now)?;
         ensure!(turn.binding.contract==previous.contract_hash(),"previous contract differs from claimed owner turn");
         tx.execute("INSERT INTO workflow_owner_revision VALUES(?1,?2,?3,?4,?5,?6,?7)",params![turn.request_id,previous.contract_hash(),next.contract_hash(),serde_json::to_string(binding)?,body_hash,registration,now])?;
+        let generation=turn.lease.generation.checked_add(1).context("owner revision generation overflow")?;
+        let revised=OwnerTurn {lease:Lease {generation,..turn.lease.clone()},binding:binding.clone(),..turn.clone()};
+        tx.execute("INSERT INTO workflow_owner_revision_fence VALUES(?1,?2,?3)",params![turn.request_id,turn.lease.generation,generation])?;
         let checkpoint=Checkpoint {stage:Stage::Scope,binding:binding.clone(),evidence:Vec::new(),next:NextAction {reason:"owner_contract_revised".into(),action:"verify_owner_revision".into(),eligible_at_ms:now}};
-        tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3 WHERE id=?1",params![turn.lease.workflow,serde_json::to_string(&checkpoint)?,now])?;
-        tx.execute("UPDATE workflow_owner_turn SET binding=?2 WHERE request_id=?1",params![turn.request_id,serde_json::to_string(binding)?])?;
+        tx.execute("UPDATE workflow SET checkpoint=?2,progress_at=?3,generation=?4 WHERE id=?1",params![turn.lease.workflow,serde_json::to_string(&checkpoint)?,now,generation])?;
+        tx.execute("UPDATE workflow_owner_turn SET binding=?2,lease_generation=?3 WHERE request_id=?1",params![turn.request_id,serde_json::to_string(binding)?,generation])?;
         super::review_epoch::invalidate(&tx,&turn.lease.workflow,&turn.request_id)?;
-        event(&tx,&turn.lease.workflow,turn.lease.generation,"owner_contract_revised",&serde_json::json!({"request_id":turn.request_id,"previous_contract":previous.contract_hash(),"next_contract":next.contract_hash(),"revision":next.contract().revision,"owner_message_sha256":body_hash}).to_string(),now)?;
-        event(&tx,&turn.lease.workflow,turn.lease.generation,"checkpoint",&serde_json::to_string(&checkpoint)?,now)?;
+        event(&tx,&turn.lease.workflow,generation,"owner_contract_revised",&serde_json::json!({"request_id":turn.request_id,"previous_contract":previous.contract_hash(),"next_contract":next.contract_hash(),"revision":next.contract().revision,"owner_message_sha256":body_hash}).to_string(),now)?;
+        event(&tx,&turn.lease.workflow,generation,"checkpoint",&serde_json::to_string(&checkpoint)?,now)?;
         tx.commit()?;Ok(revised)
     }
 }
@@ -101,9 +106,18 @@ mod tests {
         store.activate_owner_revision(&turn,&previous,&next,&binding,dir.path(),5).unwrap();drop(store);
         let mut store=WorkflowStore::open(&dir.path().join("state.db")).unwrap();
         let revised=store.activate_owner_revision(&turn,&previous,&next,&binding,dir.path(),6).unwrap();
-        assert_eq!(store.owner_turn_for_lease(&turn.lease,7).unwrap().binding,revised.binding);
+        assert_eq!(store.owner_turn_for_lease(&revised.lease,7).unwrap().binding,revised.binding);
         let altered=Binding {evidence_hash:"changed".into(),..binding};assert!(store.activate_owner_revision(&turn,&previous,&next,&altered,dir.path(),8).is_err());
         assert_eq!(store.events(&turn.lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="owner_contract_revised").count(),1);
+    }
+
+    #[test]
+    fn owner_revision_fences_pre_activation_dispatch_callbacks() {
+        let dir=tempfile::tempdir().unwrap();let (mut store,turn,previous,next,binding)=setup(dir.path());
+        let revised=store.activate_owner_revision(&turn,&previous,&next,&binding,dir.path(),5).unwrap();
+        assert!(store.validate_dispatch(&turn.lease,&binding,6).is_err(),"old guard callback can dispatch against the new contract");
+        assert!(store.charge(&turn.lease,"old-native-call",ResourceCharge {model_calls:1,..Default::default()},6).is_err());
+        store.validate_dispatch(&revised.lease,&binding,6).unwrap();
     }
 
 }

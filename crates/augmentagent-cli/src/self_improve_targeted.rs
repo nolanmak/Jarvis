@@ -531,10 +531,9 @@ mod tests {
             assert!(gateway::dispatch(&adapter,&wire,&control_context(106),followup).await.unwrap());
             assert!(gateway::dispatch(&adapter,&wire,&control_context(106),followup).await.unwrap());
             let store=crate::autoship_workflow::WorkflowStore::open(&workflow::path()).unwrap();
-            assert_eq!(store.pending_owner_messages(&discord.admission.workflow).unwrap(),1);
-            assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision+1);
-            assert!(store.require_owner_dispatch(&discord.admission.workflow).is_err());
-            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),12);
+            assert_eq!(store.pending_owner_messages(&discord.admission.workflow).unwrap(),0,"unavailable native consumer must not queue messages or strand a workflow");
+            assert_eq!(store.owner_control(&discord.admission.workflow).unwrap().unwrap().revision,revision);
+            assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst),13);
 
 
 
