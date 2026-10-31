@@ -546,7 +546,13 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
         // Empty tone/thread/archetype/resolve blocks — Twitter doesn't run
         // those Phase-2/3/5 pre-resolvers (yet); the prompt accepts empty
         // strings as "no injection" so the bytes degrade cleanly.
-        let user_msg = code_mode_user_message(&email, &wiki_hint, "", "", "", "");
+        let shared_draft_context = augmentagent_channel_core::draft_workflow::prepare(
+                    &self.store, self.reasoner.as_ref(), &email,
+                    "Draft a response using relevant conversation and cross-platform evidence.",
+                    self.config.wiki_root.as_deref(),
+                ).await?;
+                let user_msg = code_mode_user_message(&email, &wiki_hint, "", "", "", "");
+                let user_msg = format!("{user_msg}\n\n{}", shared_draft_context.prompt());
         // #1046: pin the quality tier. `model: None` emits no `--model`, so this
         // draft inherited the owner's interactive model and quota (#448).
         let code_mode_opts = augmentagent_channel_core::ReasonerOpts::pinned(
@@ -577,7 +583,8 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
                 message_ctx.clone(),
                 ts_source.clone(),
             )
-            .with_wiki_hint(wiki_hint.clone());
+            .with_wiki_hint(wiki_hint.clone())
+                    .with_draft_context(Some(&shared_draft_context));
             if let Err(e) = code_mode::run_program(&ts_source, &manifest, &dispatcher).await {
                 let wrapped = code_mode::CodeModeError::ReasonerFailed(anyhow::anyhow!(
                     "run_program: {e}"
@@ -610,6 +617,7 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
                     "code-mode attempt failed: {cme}; invoking self-repair"
                 );
                 let failure_ctx = FailureCtx {
+                            draft_context: Some(&shared_draft_context),
                     reasoner: self.reasoner.as_ref(),
                     opts: code_mode_opts.clone(),
                     user_msg: user_msg.clone(),
@@ -690,6 +698,7 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
         // prompt is empty (mirrors `LinkedInChannel`).
         let draft_opts_ = draft_opts(String::new(), self.config.wiki_root.clone());
         let draft_prompt = draft_user_message(&email, &wiki_hint, "", "", "", "");
+                let draft_prompt = format!("{draft_prompt}\n\n{}", shared_draft_context.prompt());
         let draft = match self.reasoner.call(&draft_opts_, &draft_prompt).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
@@ -707,7 +716,9 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
             }
         };
 
-        if self.config.dry_run {
+        let draft = shared_draft_context.guard_draft(&draft);
+
+                if self.config.dry_run {
             let action_id = self.store.log_action(
                 &email.message_id,
                 email.thread_id.as_deref(),
@@ -717,6 +728,7 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
                 Some(&draft),
                 ActionStatus::DryRun,
             )?;
+                anyhow::ensure!(shared_draft_context.attach(&self.store, &action_id)?, "Could not attach draft evidence receipt");
             self.store
                 .mark_email_processed(&email.message_id, TriageResult::Reply)?;
             println!(
@@ -728,6 +740,7 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
             // returns Some(action_id) above).
             if let Some(record) = pending_classic_record {
                 let failure_ctx = FailureCtx {
+                            draft_context: Some(&shared_draft_context),
                     reasoner: self.reasoner.as_ref(),
                     opts: code_mode_opts.clone(),
                     user_msg: user_msg.clone(),
@@ -759,8 +772,10 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
             Some(&draft),
             ActionStatus::Pending,
         )?;
+        anyhow::ensure!(shared_draft_context.attach(&self.store, &classic_action_id)?, "Could not attach draft evidence receipt");
         if let Some(record) = pending_classic_record.as_ref() {
             let failure_ctx = FailureCtx {
+                            draft_context: Some(&shared_draft_context),
                 reasoner: self.reasoner.as_ref(),
                 opts: code_mode_opts.clone(),
                 user_msg: user_msg.clone(),
@@ -1122,6 +1137,11 @@ mod tests {
     #[async_trait]
     impl Reasoner for ScriptedReasoner {
         async fn call(&self, _opts: &ReasonerOpts, _u: &str) -> anyhow::Result<String> {
+            // Evidence selection is tested independently; keep the existing
+            // triage/draft script focused on the adapter's transport behavior.
+            if _opts.system_prompt.starts_with("You select evidence for a messaging draft") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             let mut q = self.responses.lock().unwrap();
             Ok(q.pop_front()
                 .unwrap_or_else(|| "{\"decision\":\"skip\",\"reason\":\"stub\"}".into()))

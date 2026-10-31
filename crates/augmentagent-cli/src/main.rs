@@ -13854,13 +13854,10 @@ impl ReplyApprover {
         // LinkedIn has no server-side draft to swap — we just regenerate
         // text, update the action row, and re-post the card.
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => strip_approval_envelope_markers(s.trim()),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -13960,13 +13957,10 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -14145,13 +14139,10 @@ impl ReplyApprover {
         // text, update the action row in place, and let the broker re-post the
         // card. Mirrors `revise_discord` / `revise_linkedin`.
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -14251,13 +14242,10 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -14395,13 +14383,10 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -15353,10 +15338,10 @@ impl ReplyApprover {
         };
 
         // 1. Generate revised draft via reasoner.
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt =
-            augmentagent_channel_core::prompt::redraft_message(&action.email, &previous_draft, feedback);
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
