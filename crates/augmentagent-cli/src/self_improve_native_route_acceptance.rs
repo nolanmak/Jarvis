@@ -1,6 +1,6 @@
 //! Explicit paid constructor/route transport proof, not issue shipping proof.
 use super::*;
-use augmentagent_channel_core::{native_session::FreshBuilderSessions, ProviderKind::Codex};
+use augmentagent_channel_core::{native_session::FreshBuilderSessions, ProviderKind, ProviderKind::{Claude, Codex}};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -336,6 +336,34 @@ fn file_edit_opts(root: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     opts
 }
 
+fn file_edit_audit_tool(provider: ProviderKind, tool: &str) -> Result<bool> {
+    let tool = match provider {
+        Claude => tool.strip_prefix("mcp__jarvis__").context("Claude guarded tool namespace missing")?,
+        Codex => tool,
+        _ => anyhow::bail!("guarded edit requires a native provider"),
+    };
+    anyhow::ensure!(
+        ["Read", "Grep", "Glob", "Write", "Edit"].contains(&tool),
+        "file-only probe observed undeclared tool"
+    );
+    Ok(["Write", "Edit"].contains(&tool))
+}
+
+#[test]
+fn file_edit_audit_checks_provider_namespace_and_keeps_shells_forbidden() {
+    for provider in [Claude, Codex] {
+        for name in ["Read", "Grep", "Glob", "Write", "Edit"] {
+            let tool=if provider==Claude {format!("mcp__jarvis__{name}")} else {name.into()};
+            assert_eq!(file_edit_audit_tool(provider,&tool).unwrap(),matches!(name,"Write"|"Edit"));
+        }
+        for name in ["Bash", "mcp__jarvis__Bash", "mcp__other__Write", "mcp__jarvis__WriteExtra", "mcp__jarvis__mcp__jarvis__Write"] {
+            assert!(file_edit_audit_tool(provider,name).is_err(),"{provider:?}: {name}");
+        }
+    }
+    assert!(file_edit_audit_tool(Claude,"Write").is_err());
+    assert!(file_edit_audit_tool(Codex,"mcp__jarvis__Write").is_err());
+}
+
 #[test]
 fn file_edit_diagnostic_cannot_reach_a_build_backend() {
     let opts = file_edit_opts(PathBuf::from("/tmp/synthetic-file-only"));
@@ -349,6 +377,17 @@ fn file_edit_diagnostic_cannot_reach_a_build_backend() {
 #[tokio::test]
 #[ignore = "paid guarded native file edit only; no full issue or shipping authority"]
 async fn live_native_guarded_file_edit() -> Result<()> {
+    guarded_file_edit(Codex).await
+}
+
+#[tokio::test]
+#[ignore = "paid guarded Claude file edit through configured provider route; no full issue or shipping authority"]
+async fn live_native_guarded_claude_file_edit() -> Result<()> {
+    guarded_file_edit(Claude).await
+}
+
+async fn guarded_file_edit(provider: ProviderKind) -> Result<()> {
+    anyhow::ensure!(matches!(provider, Claude | Codex), "guarded edit requires a native provider");
     let state =
         PathBuf::from(std::env::var_os("XDG_STATE_HOME").context("isolated state required")?)
             .canonicalize()?;
@@ -380,7 +419,7 @@ async fn live_native_guarded_file_edit() -> Result<()> {
         ],
         vec![],
     )?;
-    let reasoner = augmentagent_channel_core::build_workflow_pinned(Codex)
+    let reasoner = augmentagent_channel_core::build_workflow_pinned(provider)
         .context("production native constructor unavailable")?;
     guard.bind_reasoner(reasoner.as_ref())?;
     let mut opts = file_edit_opts(fixture.clone());
@@ -405,16 +444,16 @@ async fn live_native_guarded_file_edit() -> Result<()> {
     );
     let observed = sessions.observed();
     anyhow::ensure!(
-        observed.len() == 1 && observed[0].provider == Codex && !observed[0].uncertain,
+        observed.len() == 1 && observed[0].provider == provider && !observed[0].uncertain,
         "actual native session missing"
     );
     let policy = private_json(&PathBuf::from(
         std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").context("native VM policy required")?,
     ))?;
-    let provider =
-        PathBuf::from(policy["state_root"].as_str().context("VM state missing")?).join("codex");
+    let provider_state =
+        PathBuf::from(policy["state_root"].as_str().context("VM state missing")?).join(provider.name());
     let alias = private_json(
-        &provider
+        &provider_state
             .join("aliases")
             .join(crate::autoship_review::digest(observed[0].id.as_bytes())),
     )?;
@@ -423,7 +462,7 @@ async fn live_native_guarded_file_edit() -> Result<()> {
         alias.starts_with("session-") && Path::new(alias).components().count() == 1,
         "invalid native session alias"
     );
-    let runtime = provider.join(alias);
+    let runtime = provider_state.join(alias);
     let owner = private_json(&runtime.join("owned.json"))?;
     anyhow::ensure!(
         owner["owner"]
@@ -451,11 +490,7 @@ async fn live_native_guarded_file_edit() -> Result<()> {
     for line in std::fs::read_to_string(guard.audit_logger().path())?.lines() {
         let row: Value = serde_json::from_str(line)?;
         if let Some(tool) = row["tool"].as_str() {
-            anyhow::ensure!(
-                ["Read", "Grep", "Glob", "Write", "Edit"].contains(&tool),
-                "file-only probe observed undeclared tool"
-            );
-            if ["Write", "Edit"].contains(&tool) && row["stderr_truncated"].is_null() {
+            if file_edit_audit_tool(provider, tool)? && row["stderr_truncated"].is_null() {
                 let path = row["args"]["file_path"]
                     .as_str()
                     .or_else(|| row["args"]["path"].as_str())
@@ -477,7 +512,7 @@ async fn live_native_guarded_file_edit() -> Result<()> {
         calls == 1,
         "file edit must charge exactly one native dispatch"
     );
-    guard.audit_logger().record_controller(serde_json::json!({"kind":"native_file_edit_diagnostic","native_session":observed[0].id,
+    guard.audit_logger().record_controller(serde_json::json!({"kind":"native_file_edit_diagnostic","provider":provider.name(),"native_session":observed[0].id,
         "before_sha256":before,"after_sha256":crate::autoship_review::digest(&std::fs::read(&target)?),"guarded_edit_receipts":edits,
         "host_completion":completion,"model_calls":calls,"shipping_authority":false,"full_issue_pass":false,"reachable_build_memory_mb":0}))?;
     guard.finish()?;
