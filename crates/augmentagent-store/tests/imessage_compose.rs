@@ -76,3 +76,39 @@ fn failed_insert_rolls_back_email_and_supersession() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[test]
+fn restoring_an_older_compose_replaces_the_current_pending_compose() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("test.db")).unwrap();
+    let (old, _) = store
+        .create_imessage_compose(&mail("old"), "old owner text")
+        .unwrap();
+    let (new, _) = store
+        .create_imessage_compose(&mail("new"), "new owner text")
+        .unwrap();
+    assert!(store.recompose_action(&old, "discord").unwrap());
+    assert_eq!(
+        store
+            .pending_action_ids_for_thread_kind("imessage:+15555550100", "compose")
+            .unwrap(),
+        vec![old.clone()]
+    );
+    let restored = store.get_action_with_email(&old).unwrap().unwrap();
+    assert_eq!(restored.email.kind, "compose");
+    assert_eq!(
+        restored.action.draft_body.as_deref(),
+        Some("old owner text")
+    );
+    assert_eq!(
+        store
+            .get_action_with_email(&new)
+            .unwrap()
+            .unwrap()
+            .action
+            .status,
+        "superseded"
+    );
+    assert!(!store.recompose_action(&old, "discord").unwrap());
+    assert!(store.list_imessage_outbox(10).unwrap().is_empty());
+}

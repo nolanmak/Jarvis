@@ -7109,8 +7109,22 @@ impl Store {
     /// post a second card in the window.
     pub fn recompose_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
         let now = now_millis();
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Restoring an older owner compose is a replacement too. Serialize
+        // against new composes so a conversation never gains two pending texts.
+        let compose_thread: Option<String> = tx.query_row(
+            "SELECT a.threadId FROM actions a JOIN emails e ON e.messageId=a.messageId
+             WHERE a.id=?1 AND a.status='superseded' AND e.platform='imessage' AND e.kind='compose'",
+            [action_id], |r| r.get(0),
+        ).optional()?;
+        if let Some(thread) = compose_thread {
+            tx.execute("UPDATE actions SET status='superseded',errorMessage='superseded by restored compose',updatedAt=?3
+                WHERE threadId=?1 AND id!=?2 AND status='pending' AND scheduledAtMs IS NULL
+                AND messageId IN (SELECT messageId FROM emails WHERE platform='imessage' AND kind='compose')",
+                params![thread,action_id,now])?;
+        }
+        let n = tx.execute(
             "UPDATE actions \
                 SET status = 'pending', recomposedAtMs = ?4, errorMessage = NULL, \
                     nudgeCount = 1, nextNudgeAtMs = ?2, \
@@ -7118,6 +7132,7 @@ impl Store {
               WHERE id = ?1 AND status = 'superseded'",
             params![action_id, now + NUDGE_INTERVAL_MS, source, now],
         )?;
+        tx.commit()?;
         Ok(n == 1)
     }
 
