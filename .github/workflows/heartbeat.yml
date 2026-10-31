@@ -11,8 +11,17 @@ on:
       - 'docs/reasoner-capabilities.json'
       - '.github/workflows/heartbeat.yml'
       - 'Cargo.*'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
 jobs:
   heartbeat:
     runs-on: ubuntu-latest
@@ -22,23 +31,22 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Format heartbeat crate
-        run: cargo fmt -p augmentagent-heartbeat -- --check
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id heartbeat/heartbeat/3"
+
       - name: Heartbeat lint
-        run: cargo clippy -p augmentagent-heartbeat --all-targets --no-deps -- -D warnings
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id heartbeat/heartbeat/4"
+
       - name: Heartbeat behavior
-        run: cargo test -p augmentagent-heartbeat
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id heartbeat/heartbeat/5"
+
       - name: Store schema and capability manifest
-        run: |
-          cargo test -p augmentagent-store --test heartbeat_schema
-          cargo test -p augmentagent-channel-core --test capability_inventory -- inventory_accounts every_production
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id heartbeat/heartbeat/6"
       - name: CLI unit and process tests
-        run: |
-          cargo test -p augmentagent-cli --bin augmentagent heartbeat_cmd::tests
-          cargo test -p augmentagent-cli --test heartbeat_cli
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id heartbeat/heartbeat/7"

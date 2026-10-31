@@ -377,9 +377,11 @@ where
             store.mark_surface_conversation_uncertain(chat)?;
         }
     }
-    // A refusal before NativeSession::begin has no native side effects.
-    // Preserve this turn ID as consumed, but let a later turn proceed.
-    // A dropped lease marks the session uncertain and blocks replay.
+    // A refusal before the prompt reached the native CLI (before
+    // NativeSession::begin, or a pre-spawn check / spawn failure after it,
+    // #1626) has no native side effects. Preserve this turn ID as consumed,
+    // but let a later turn proceed. A lease dropped once submission started
+    // marks the session uncertain and blocks replay until inspected.
     store.finish_surface_turn(turn, !session.is_uncertain())?;
     answer.map(SurfaceTurnOutcome::Answered)
 }

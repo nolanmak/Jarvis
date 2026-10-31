@@ -1,6 +1,8 @@
 //! `augmentagent` binary.
 
 mod approval_context;
+mod disk_pressure;
+mod autoship_worktree_cleanup;
 mod document_signing;
 #[cfg(test)]
 mod provider_migration_tests;
@@ -97,6 +99,11 @@ mod imessage_send;
 mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
+mod autoship_contract;
+mod autoship_episode;
+mod autoship_metrics;
+mod autoship_review;
+mod autoship_workflow;
 mod channel_router;
 mod code_mode;
 mod compute_cli;
@@ -108,6 +115,8 @@ mod snapshot_refs;
 mod disk;
 mod build_storage;
 mod storage_leases;
+mod storage_reservations;
+mod autoship_worker;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
@@ -211,6 +220,11 @@ enum Cmd {
     },
     /// List active gmail accounts from the shared db.
     AccountsList,
+    /// Run opted-in auto-ship independently of the serving daemon.
+    AutoPrWorker {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
     /// Resolve + persist each connected Gmail's real address via Composio
     /// `GMAIL_GET_PROFILE`, so the dashboard + invoice entity picker show
     /// who's who instead of opaque IDs. Safe to re-run.
@@ -370,6 +384,8 @@ enum Cmd {
         #[command(subcommand)]
         op: ImessageOp,
     },
+    /// Independently replay owner-outcome calibration before changing triage guidance.
+    TriageCalibration { #[command(subcommand)] op: self_improve::triage_calibration::Op },
     /// Similarity triage pre-filter (#1127): calibrate, stats, reset.
     TriagePrefilter {
         #[command(subcommand)]
@@ -618,6 +634,9 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Join triage flag/pending decisions to recorded owner outcomes.
+        #[arg(long, default_value_t = false)]
+        outcomes: bool,
     },
     /// #1011 — grade the SCOPING pass against fixed, cached issues.
     ///
@@ -1014,6 +1033,9 @@ enum DiskOp {
     Build {
         #[arg(long)]
         target_dir: PathBuf,
+        /// Release-only deployment build; reserve space alongside auto-ship.
+        #[arg(long)]
+        update: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -2392,10 +2414,11 @@ enum GmailOp {
         /// compose --post replaces the pending follow-up card (#596).
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         allow_duplicate: bool,
-        /// Attach a local file to the draft (#417). One file; uploaded via
-        /// Composio's attachment store before the draft is created.
+        /// Attach a local file to the draft (#417). Repeat for several
+        /// (`--attach a.pdf --attach b.pdf`); each is sent byte-for-byte, in
+        /// the order given.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// Gmail messageId of the inbound message we're replying to. Used as
         /// the action row's messageId so the Approve / Revise / Skip handlers
         /// resolve the same way they do for auto-triage replies. Pass it
@@ -2458,11 +2481,11 @@ enum GmailOp {
         /// detected and preserved automatically where possible.
         #[arg(long)]
         thread_id: Option<String>,
-        /// Attach a local file to the REPLACEMENT draft (#417). Note: the
-        /// replacement carries only what you pass here — an attachment on
-        /// the old draft is NOT carried over (Composio can't read it back).
+        /// Attach a local file to the REPLACEMENT draft (#417); repeatable.
+        /// Note: the replacement carries only what you pass here — an
+        /// attachment on the old draft is NOT carried over.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// #994 — the recipient's own message, so the register check can hold
         /// this body to THEIR casing rather than trusting the drafter's
         /// receipt. Same flags as `gmail compose`; omitting them leaves the
@@ -2508,9 +2531,9 @@ enum GmailOp {
         body_file: Option<String>,
         #[arg(long)]
         thread_id: Option<String>,
-        /// Attach a local file (#417).
+        /// Attach a local file (#417); repeatable.
         #[arg(long)]
-        attach: Option<PathBuf>,
+        attach: Vec<PathBuf>,
         /// #994 — the recipient's own message, so the register check can hold
         /// this body to THEIR casing rather than trusting the drafter's
         /// receipt. Same flags as `gmail compose`; omitting them leaves the
@@ -2985,6 +3008,9 @@ async fn main() -> Result<()> {
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
+    if let Cmd::AutoPrWorker { dry_run } = cli.cmd {
+        return autoship_worker::run(std::env::current_dir()?, dry_run).await;
+    }
     if let Cmd::ComposioAuthTool = cli.cmd {
         return composio_auth_tool::serve().await;
     }
@@ -3094,10 +3120,36 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&record)?);
                 Ok(())
             }
-            DiskOp::Build { target_dir, command } => {
-                let lease = if build_storage::inherited_lease(target_dir)? { None }
-                    else { Some(build_storage::admit_session(&repo_root, target_dir).await?) };
-                build_storage::run_command(target_dir, command, lease.as_ref()).await
+            DiskOp::Build { target_dir, command, update } => {
+                let result = async {
+                    let admitted: Result<Option<build_storage::Lease>> = async {
+                        if build_storage::inherited_mode(target_dir, *update)? { Ok(None) }
+                        else if *update { build_storage::admit_update(&repo_root, target_dir).await.map(Some) }
+                        else { build_storage::admit_session(&repo_root, target_dir).await.map(Some) }
+                    }.await;
+                    let lease = match admitted {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            let code = if error.downcast_ref::<storage_reservations::Busy>().is_some() { 75 }
+                                else if error.chain().any(|e| e.to_string().contains(disk::LOW_DISK_REFUSAL)) { 73 }
+                                else { 76 };
+                            eprintln!("build admission deferred: {error:#}");
+                            std::process::exit(code);
+                        }
+                    };
+                    build_storage::run_command(target_dir, command, lease.as_ref(), *update).await
+                }.await;
+                if let Err(ref error) = result {
+                    if error.downcast_ref::<storage_reservations::Busy>().is_some() {
+                        eprintln!("update/build deferred: {error:#}");
+                        std::process::exit(75);
+                    }
+                    if error.chain().any(|e| e.to_string().contains(disk::LOW_DISK_REFUSAL)) {
+                        eprintln!("{error:#}");
+                        std::process::exit(73);
+                    }
+                }
+                result
             }
             DiskOp::Prune { dry_run, json, root, cap_mb, stale_days } => disk::run_prune(
                 &repo_root,
@@ -3365,6 +3417,10 @@ async fn main() -> Result<()> {
             dry_run,
             no_email,
         } => {
+            let external_autopr = autoship_worker::external_enabled();
+            if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+            }
             // #1287 — a Discord configuration error must not stop the
             // surfaces that are configured (Slack alone, for one): report it
             // and run without the Discord approval broker, as an unset
@@ -4068,7 +4124,9 @@ async fn main() -> Result<()> {
             // run spawns the claude CLI on the owner's subscription (#448),
             // so it must never start billing as a side effect of a deploy.
             // Serve's --dry-run flows through: the gate runs but no PR opens.
-            match self_improve::AutoPrLoop::from_env(
+            if external_autopr {
+                info!("auto-PR loop hosted by augmentagent-autopr.service");
+            } else { match self_improve::AutoPrLoop::from_env(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 dry_run,
             ) {
@@ -4077,7 +4135,7 @@ async fn main() -> Result<()> {
                     tasks.push(tokio::spawn(async move { ap.run(sd).await }));
                 }
                 None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
-            }
+            } }
             // #427 — ShadowNote journal → wiki ingest. Self-gates on the
             // SHADOWNOTE_* keyring/env config (plus AWS creds via the SDK
             // default chain); an unconfigured box logs and moves on, same
@@ -4202,6 +4260,13 @@ async fn main() -> Result<()> {
             // counters with no visible card is pointless.
             if !dry_run {
                 if !no_email {
+                    let calibration_store=Arc::clone(&store);
+                    let calibration_skill=cli.skill_dir.clone();
+                    let calibration_shutdown=shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        self_improve::triage_calibration::run_background(calibration_store,calibration_skill,calibration_shutdown).await;
+                        Ok(())
+                    }));
                     let assessment_store=Arc::clone(&store);
                     let assessment_reasoner=build_reasoner();
                     let assessment_wiki=cli.wiki_dir.clone();
@@ -4924,6 +4989,7 @@ async fn main() -> Result<()> {
         Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
+        Cmd::TriageCalibration { op } => self_improve::triage_calibration::run(store, op).await,
         Cmd::TriagePrefilter { op } => triage_prefilter_cmd::run(store, op).await,
         Cmd::AppleNotes { op } => match op {
             apple_notes::Op::PollOnce { dry_run } => apple_notes::poll_command(store, dry_run).await,
@@ -5434,7 +5500,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::TokenUsage { days, json } => {
+        Cmd::TokenUsage { days, json, outcomes } => {
             use augmentagent_channel_core::token_usage as tu;
             let path = tu::default_usage_log_path();
             // #1413 — a report window can straddle a rotation.
@@ -5443,10 +5509,21 @@ async fn main() -> Result<()> {
             if rolled.len() > days as usize {
                 rolled.drain(..rolled.len() - days as usize);
             }
-            if json {
+            let outcome_report = if outcomes || !json {
+                let since = chrono::Utc::now().timestamp_millis().saturating_sub(i64::from(days) * 86_400_000);
+                Some(store.triage_outcome_report(since, 20)?)
+            } else { None };
+            if json && outcomes {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"token_usage":rolled,"triage_outcomes":outcome_report}))?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&rolled)?);
             } else {
                 print!("{}", tu::format_report(&rolled));
+                if let Some(report) = outcome_report {
+                    println!("Triage outcomes: flag precision {} ({} observed owner resolutions); flagged then aged out {}; unresolved flags {}; unknown original cohort {}.",
+                        report.flag_precision.map(|v| format!("{:.1}%",v*100.0)).unwrap_or_else(|| "not observed".into()),
+                        report.observed_owner_resolutions, report.flagged_then_aged_out, report.flagged.unresolved, report.unknown_cohort.total());
+                }
                 if raw.is_empty() {
                     println!("  (log: {})", path.display());
                 }
@@ -5506,6 +5583,7 @@ async fn main() -> Result<()> {
         Cmd::Phone { op: PhoneOp::Metrics { last } } => phone_metrics::run(&store, last),
         Cmd::PhoneReconcile { ref call_id, ref provider_id } => phone_runtime::reconcile_local(&store, call_id, provider_id.as_deref()).await,
         Cmd::ComputeTool => compute_tool::serve(),
+        Cmd::AutoPrWorker { .. } => unreachable!("worker dispatch precedes database initialization"),
         Cmd::ReasonerSelftest { ref prompt, ref profile, tool_probe } =>
             run_reasoner_selftest(prompt, profile.as_deref(), tool_probe).await,
         Cmd::Install { component } => installers::run_install(component).await,
@@ -6488,38 +6566,63 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// #417 — Upload `--attach` (when given) to Composio's attachment store,
-/// printing what was attached so the operator can SEE it happened. Fails
-/// loudly on a missing/unreadable file before any draft is created.
+/// #417 — Stage every `--attach` file, printing each so the operator can SEE
+/// what was attached. Fails loudly on a missing/unreadable file before any
+/// draft is created.
 async fn upload_attach_if_given(
     gmail: &ComposioClient,
-    attach: Option<PathBuf>,
-) -> Result<(Option<Attachment>, Option<String>)> {
+    attach: Vec<PathBuf>,
+) -> Result<(
+    Vec<Attachment>,
+    Option<String>,
+    Vec<tempfile::NamedTempFile>,
+)> {
     use sha2::{Digest, Sha256};
-    let Some(path) = attach else {
-        return Ok((None, None));
-    };
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("attachment not found: {}", path.display()))?;
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("attachment");
-    let review = format!(
-        "{}; source path: {}; {} bytes; SHA-256: {:x}",
-        name,
-        path.display(),
-        bytes.len(),
-        Sha256::digest(&bytes)
-    );
-    // Keep the retained original as the deferred upload source. This lets a
-    // direct-Google mailbox send the same bytes without passing through Composio.
-    let att = gmail
-        .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
-        .await
-        .context("attachment upload failed")?;
-    println!("attached: {review}");
-    Ok((Some(att), Some(review)))
+    use std::io::Write;
+    let mut out = Vec::with_capacity(attach.len());
+    let mut reviews = Vec::with_capacity(attach.len());
+    let mut snapshots = Vec::with_capacity(attach.len());
+    for path in attach {
+        anyhow::ensure!(
+            std::fs::metadata(&path)?.is_file(),
+            "attachment is not a regular file: {}",
+            path.display()
+        );
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("attachment not found: {}", path.display()))?;
+        // Both direct Google and Composio read at draft time. Keep a private
+        // snapshot alive through draft creation so its review digest cannot drift.
+        let suffix = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_default();
+        let mut snapshot = tempfile::Builder::new().suffix(&suffix).tempfile()?;
+        snapshot.write_all(&bytes)?;
+        let mut att = gmail
+            .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", snapshot.path())
+            .await
+            .context("attachment upload failed")?;
+        att.name = augmentagent_docs::inbound::recorded_original_name(&path).unwrap_or_else(|| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let review = format!(
+            "{}; source path: {}; {} bytes; SHA-256: {:x}",
+            att.name,
+            path.display(),
+            bytes.len(),
+            Sha256::digest(&bytes)
+        );
+        println!("attached: {review}");
+        reviews.push(review);
+        out.push(att);
+        snapshots.push(snapshot);
+    }
+    let review = (!reviews.is_empty()).then(|| reviews.join(" | "));
+    Ok((out, review, snapshots))
 }
 
 #[cfg(test)]
@@ -6533,16 +6636,23 @@ mod original_attachment_tests {
         let client = ComposioClient::new("test".into());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aa-doc-1457-1.pdf");
+        let second = dir.path().join("second.pdf");
         std::fs::write(&path, bytes).unwrap();
-        let (attached, review) = upload_attach_if_given(&client, Some(path.clone()))
+        std::fs::write(&second, b"second document").unwrap();
+        augmentagent_docs::inbound::record_original_name(&path, "Signed agreement.pdf")
             .await
             .unwrap();
+        let (attached, review, snapshots) =
+            upload_attach_if_given(&client, vec![path.clone(), second])
+                .await
+                .unwrap();
         let review = review.unwrap();
-        let attached = attached.unwrap();
-        assert!(attached.s3key.is_empty());
-        assert_eq!(attached.path.as_deref(), Some(path.as_path()));
+        assert_eq!(attached.len(), 2);
+        assert_eq!(attached[0].name, "Signed agreement.pdf");
+        assert_eq!(attached[1].name, "second.pdf");
         assert!(review.contains("aa-doc-1457-1.pdf"));
         assert!(review.contains(&format!("SHA-256: {:x}", Sha256::digest(bytes))));
+        assert!(review.contains("second.pdf"));
         let body = augmentagent_approval_discord::append_envelope_markers(
             "email body".into(),
             None,
@@ -6552,14 +6662,37 @@ mod original_attachment_tests {
         );
         assert!(body.contains(&review));
         std::fs::write(&path, b"corrected revision").unwrap();
-        let (_, revised_review) = upload_attach_if_given(&client, Some(path)).await.unwrap();
+        assert_eq!(
+            std::fs::read(attached[0].path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        let (_, revised_review, _new_snapshots) =
+            upload_attach_if_given(&client, vec![path.clone()])
+                .await
+                .unwrap();
         assert_ne!(Some(review), revised_review);
+        let snapshot_path = attached[0].path.clone().unwrap();
+        drop(snapshots);
+        assert!(!snapshot_path.exists());
         assert!(
-            upload_attach_if_given(&client, Some(dir.path().join("missing.pdf")))
+            upload_attach_if_given(&client, vec![dir.path().join("missing.pdf")])
                 .await
                 .is_err()
         );
+        let (empty, review, guards) = upload_attach_if_given(&client, vec![]).await.unwrap();
+        assert!(empty.is_empty() && review.is_none() && guards.is_empty());
     }
+}
+
+/// The card's single `[attachment: …]` marker value, or `None` without any.
+fn attachment_names(attachments: &[Attachment]) -> Option<String> {
+    (!attachments.is_empty()).then(|| {
+        attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 /// Canonicalize a user-supplied `--thread-id` before any draft is created
@@ -7053,7 +7186,7 @@ async fn run_gmail_compose(
     json: bool,
     post: bool,
     allow_duplicate: bool,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_message_id: Option<String>,
     reply_to_from: Option<String>,
     reply_to_subject: Option<String>,
@@ -7156,7 +7289,7 @@ async fn run_gmail_compose(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let (attachment, attachment_review) = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -7164,7 +7297,7 @@ async fn run_gmail_compose(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -7232,7 +7365,8 @@ async fn run_gmail_compose(
                     "bcc": bcc,
                     "subject": subject,
                     "thread_id": thread_id,
-                    "attachment": attachment.as_ref().map(|a| a.name.clone()),
+                    "attachment": attachment_names(&attachments),
+                    "attachments": attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                     "approval_card_posted": true,
                 })
             );
@@ -7253,7 +7387,8 @@ async fn run_gmail_compose(
                 "bcc": bcc,
                 "subject": subject,
                 "thread_id": thread_id,
-                "attachment": attachment.as_ref().map(|a| a.name.clone()),
+                "attachment": attachment_names(&attachments),
+                    "attachments": attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                 "open_in_gmail": format!("https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"),
             })
         );
@@ -7268,7 +7403,7 @@ async fn run_gmail_compose(
             println!("bcc:     {}", bcc.join(", "));
         }
         println!("subject: {subject}");
-        if let Some(a) = &attachment {
+        for a in &attachments {
             println!("attachment: {} ({})", a.name, a.mimetype);
         }
         println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={draft_id}");
@@ -8124,7 +8259,7 @@ async fn run_gmail_update_draft(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
@@ -8172,7 +8307,7 @@ async fn run_gmail_update_draft(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let (attachment, attachment_review) = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let new_id = gmail
         .update_draft_with_attachment(
             &entity_id,
@@ -8181,7 +8316,7 @@ async fn run_gmail_update_draft(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -8390,7 +8525,7 @@ async fn run_gmail_send_now(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
-    attach: Option<PathBuf>,
+    attach: Vec<PathBuf>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
@@ -8412,7 +8547,7 @@ async fn run_gmail_send_now(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
-    let (attachment, _attachment_review) = upload_attach_if_given(&gmail, attach).await?;
+    let (attachments, _attachment_review, _attachment_snapshots) = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -8420,7 +8555,7 @@ async fn run_gmail_send_now(
             &subject,
             &body_str,
             thread_id.as_deref(),
-            attachment.as_ref(),
+            &attachments,
             &cc,
             &bcc,
         )
@@ -8908,6 +9043,20 @@ async fn run_stale_draft_sweep(
     }
 }
 
+fn optional_digest_rows<T,E:std::fmt::Display>(ctx:&mut String,section:&str,result:std::result::Result<Vec<T>,E>)->Vec<T> {
+    match result { Ok(rows)=>rows,Err(error)=>{ctx.push_str(&format!("{section} unavailable: {error}\n"));vec![]} }
+}
+
+#[test]
+fn optional_digest_query_failure_preserves_other_sections() {
+    let mut ctx=String::from("Inbox evidence\n");
+    let rows:Vec<String>=optional_digest_rows(&mut ctx,"Retry failure evidence",Err("malformed row"));
+    assert!(rows.is_empty());
+    let rows=optional_digest_rows(&mut ctx,"Loop evidence",Ok::<_,&str>(vec!["successful occurrence"]));
+    ctx.push_str(rows[0]);
+    assert!(ctx.contains("Inbox evidence") && ctx.contains("Retry failure evidence unavailable") && ctx.contains("successful occurrence"));
+}
+
 async fn run_digest(
     cli: &Cli,
     store: Arc<Store>,
@@ -8946,6 +9095,60 @@ async fn run_digest(
     } else {
         for (status, n) in &counts {
             ctx.push_str(&format!("- {status}: {n}\n"));
+        }
+    }
+
+    ctx.push_str("\n## Autoship native reviewer canary\n");
+    match self_improve::review_canary_summary() {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Canary evidence unavailable: {error:#}\n")),
+    }
+    ctx.push_str("\n## Autoship observed throughput and resources\n");
+    match autoship_metrics::summary(since_ms, chrono::Utc::now().timestamp_millis()) {
+        Ok(summary) => ctx.push_str(&format!("{summary}\n")),
+        Err(error) => ctx.push_str(&format!("Workflow evidence unavailable: {error:#}\n")),
+    }
+    ctx.push_str("\n## Autoship readiness dependencies\n");
+    match self_improve::readiness_summary() { Ok(summary)=>ctx.push_str(&summary),Err(error)=>ctx.push_str(&format!("Readiness evidence unavailable: {error}\n")) }
+    ctx.push_str("\n## Triage outcomes (observed owner decisions; missing evidence stays unresolved)\n");
+    match store.triage_outcome_report(since_ms,25) {
+        Ok(triage_outcomes) => {
+    for (cohort, counts) in [("flagged", &triage_outcomes.flagged), ("pending", &triage_outcomes.pending), ("unknown original cohort", &triage_outcomes.unknown_cohort)] {
+        ctx.push_str(&format!("- {cohort}: approved {}, revised {}, skipped {}, aged out {}, unresolved {}\n",
+            counts.approved, counts.revised, counts.skipped, counts.aged_out, counts.unresolved));
+    }
+    match triage_outcomes.flag_precision {
+        Some(precision) => ctx.push_str(&format!("- Flag precision among {} observed owner resolutions: {:.1}% (aged-out and unresolved excluded)\n",
+            triage_outcomes.observed_owner_resolutions, precision * 100.0)),
+        None => ctx.push_str("- Flag precision unavailable: no observed owner resolutions.\n"),
+    }
+    ctx.push_str(&format!("- Flagged then aged out: {}.\n", triage_outcomes.flagged_then_aged_out));
+    for case in &triage_outcomes.disagreement_review_set {
+        ctx.push_str(&format!("- Disagreement review case {}: {:?}; {}. Review only; no automatic policy change.\n",
+            case.action_id, case.owner_outcome, case.evidence));
+    }
+        },
+        Err(error) => ctx.push_str(&format!("Triage outcome evidence unavailable: {error}\n")),
+    }
+    ctx.push_str("\n## Retry failure memory (latest 25; full history retained)\n");
+    for failure in optional_digest_rows(&mut ctx,"Retry failure evidence",store.email_retry_failures_since(since_ms, 25)) {
+        ctx.push_str(&format!("- action {} / message {}: attempt {}, guard {}, failure {}\n",
+            failure.action_id, failure.message_id, failure.attempt_n,
+            truncate(&failure.guard, 80), truncate(&failure.failure_class, 240)));
+    }
+    ctx.push_str("\n## Email guard observations (intentional dispositions, not retry failures)\n");
+    for guard in optional_digest_rows(&mut ctx,"Email guard evidence",store.email_guards_since(since_ms,25)) {
+        ctx.push_str(&format!("- attempt {}: guard {}; disposition {}\n",guard.attempt_n,guard.guard,guard.disposition));
+    }
+    ctx.push_str("\n## Scheduled loop progress (latest 25 occurrences; full evidence retained)\n");
+    for occurrence in optional_digest_rows(&mut ctx,"Scheduled loop evidence",store.loop_occurrences_since(since_ms, 25)) {
+        let coverage = optional_digest_rows(&mut ctx,&format!("Loop {} coverage",occurrence.loop_id),store.loop_coverage(&occurrence.loop_id, 5));
+        ctx.push_str(&format!("- loop {} / occurrence {}: {}; covered observations shown {}; outcome {}\n",
+            occurrence.loop_id, occurrence.request_id, occurrence.state, coverage.len(),
+            truncate(occurrence.error.as_deref().or(occurrence.answer.as_deref()).unwrap_or("pending"), 300)));
+        for finding in coverage {
+            ctx.push_str(&format!("  - {} [evidence: {}]\n", truncate(&finding.finding, 160),
+                truncate(&finding.evidence.join(", "), 200)));
         }
     }
     ctx.push_str(&format!("\n## Pending replies (awaiting approval)\n- {pending}\n"));
@@ -12085,6 +12288,21 @@ mod approval_body_tests {
         assert!(err.contains("records no decision"), "{err}");
     }
 
+    #[test]
+    fn issue_1678_gmail_accepts_standard_time_replies_and_explicit_owner_override() {
+        let draft = "Monday afternoon works for me. Please pick a time.\n";
+        for inbound in ["11am works for me", "noon PST is optimal.\n\nThank you,\n\nPat Lee"] {
+            let body = format!("register: standard\n{draft}");
+            assert_eq!(strip_register_receipt(&body, Some(inbound)).unwrap(), (draft.into(), true));
+        }
+        let lower = "that works for me. please send the invite";
+        assert!(strip_register_receipt(draft, Some(lower)).is_err());
+        let asked = format!("register: standard (you asked)\n{draft}");
+        assert_eq!(strip_register_receipt(&asked, Some(lower)).unwrap(), (draft.into(), true));
+        let undecided = format!("register: unknown (you asked)\n{draft}");
+        assert!(strip_register_receipt(&undecided, Some(lower)).is_err());
+    }
+
     // #962 — who the card's From line (and the actions/emails rows) name.
     #[test]
     fn reply_cards_keep_the_replied_to_sender_as_their_identity() {
@@ -15013,7 +15231,7 @@ impl ReplyApprover {
                 &subject,
                 &gmail_redraft,
                 draft_thread_id,
-                None,
+                &[],
                 &cc,
                 &bcc,
             )

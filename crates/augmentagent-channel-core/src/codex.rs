@@ -202,9 +202,11 @@ impl CodexCliReasoner {
         clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
-        let mut native_lease = crate::native_session::CURRENT
-            .try_with(|session| std::sync::Arc::clone(session))
-            .ok()
+        if crate::native_session::is_fresh_review() {
+            anyhow::ensure!(opts.allowed_tools.is_empty() && opts.settings_json.is_none() && opts.handoff_path.is_none(),
+                "fresh review must use supplied evidence without tools, settings or handoff history");
+        }
+        let mut native_lease = crate::native_session::current_for(self.kind)?
             .map(|session| session.begin(self.kind))
             .transpose()?;
         let native_launch = native_lease.as_ref().map(|lease| lease.launch());
@@ -351,7 +353,19 @@ impl CodexCliReasoner {
         // policy, never exposed to native tools or placed on argv.
 
 
-        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, true, clean, opts.handoff_path.as_deref()).map_err(|e| {
+        let launch_audit=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
+        crate::run_resources::check_requirement(provider,launch_audit.as_ref())?;
+        let native_vm = if crate::native_vm::required(launch_audit.as_ref()) {
+            Some(crate::native_vm::Launch::prepare(provider, opts, &cmd, Some(&bridge), native_launch.as_ref())?)
+        } else { None };
+        if let (Some(vm),Some(lease))=(&native_vm,&native_lease) {vm.register_retirement(lease);}
+        // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
+        let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
+        let spawned = match &native_vm {
+            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref(), &vm.resource_policy),
+            None => crate::process_tree::spawn_admitted_with_policy(&cmd, true, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
+        };
+        let (mut child, process_group) = spawned.map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 anyhow::Error::new(ReasonerError::CleanupUncertain { provider: provider.into() })
             } else if e.kind() == std::io::ErrorKind::NotFound {
@@ -366,7 +380,11 @@ impl CodexCliReasoner {
             }
         })?;
 
+        process_group.admit_model(provider,launch_audit.as_ref()).await?;
+
         if let Some(mut stdin) = child.stdin.take() {
+            // #1626 — from the first byte on, the CLI may have the turn.
+            if let Some(lease) = native_lease.as_ref() { lease.mark_submitting(); }
             stdin.write_all(user_message.as_bytes()).await?;
             stdin.shutdown().await?;
             if let Some(lease) = native_lease.as_ref() { lease.observe_native_submission(); }
@@ -415,6 +433,9 @@ impl CodexCliReasoner {
             };
             let kind = v.get("type").and_then(|t| t.as_str());
             if kind == Some("thread.started") {
+                if let (Some(vm), Some(id)) = (&native_vm, v.get("thread_id").and_then(|value|value.as_str())) {
+                    vm.observe_session(id)?;
+                }
                 if let (Some(lease), Some(id)) =
                     (native_lease.as_mut(), v.get("thread_id").and_then(|value| value.as_str()))
                 {
@@ -481,7 +502,10 @@ impl CodexCliReasoner {
         }
 
         let status = child.wait().await?;
+        let logger=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
+        let resources=process_group.resource_outcome(provider, logger.as_ref());
         drop(process_group);
+        resources?;
         let stderr_buf = match stderr_task {
             Some(t) => t.await.unwrap_or_default(),
             None => String::new(),
@@ -537,6 +561,7 @@ impl CodexCliReasoner {
 
 #[async_trait]
 impl Reasoner for CodexCliReasoner {
+    fn defers_model_admission(&self) -> bool { true }
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         self.call_capture(opts, user_message, false).await
     }
@@ -692,6 +717,45 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
         assert!(all.contains("scratch note") && all.contains("decision"));
+    }
+
+    #[tokio::test]
+    async fn fresh_codex_review_refuses_write_capability_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("unexpected-spawn");
+        let bin = stub(&dir, "should-not-run", &format!("touch '{}'\n", marker.display()));
+        let reasoner = CodexCliReasoner::with_bin(bin);
+        let mut options = opts();
+        options.allowed_tools.push("Write".into());
+        let result = crate::native_session::fresh_review_scope(ProviderKind::Codex,
+            reasoner.call(&options, "write a file")).await;
+        assert!(result.is_err());
+        assert!(!marker.exists(), "write-capable reviewer reached native transport");
+    }
+
+    #[tokio::test]
+    async fn fresh_codex_review_uses_new_conversation_and_ignores_project_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_path = dir.path().join("argv.txt");
+        let bin = stub(&dir, "fake-fresh-codex", &format!(r#"
+printf '%s\n' "$@" > '{}'
+cat >/dev/null
+echo '{{"type":"thread.started","thread_id":"new-review-thread"}}'
+echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"reviewed"}}}}'
+echo '{{"type":"turn.completed"}}'
+"#, args_path.display()));
+        let reasoner = CodexCliReasoner::with_bin(bin);
+        let builder = crate::native_session::NativeSession::from_id(ProviderKind::Codex, Some("builder-thread".into())).unwrap();
+        let (answer, native_id) = crate::native_session::CURRENT.scope(builder.clone(),
+            crate::native_session::fresh_review_scope(ProviderKind::Codex, reasoner.call(&opts(), "review supplied evidence"))).await.unwrap();
+        assert_eq!(answer, "reviewed");
+        assert_eq!(native_id, "new-review-thread");
+        assert_eq!(builder.id().as_deref(), Some("builder-thread"));
+        let argv = std::fs::read_to_string(args_path).unwrap();
+        for required in ["--ignore-user-config", "--ignore-rules", "--strict-config", "project_doc_max_bytes=0"] {
+            assert!(argv.contains(required), "missing {required}: {argv}");
+        }
+        assert!(!argv.lines().any(|arg| arg == "resume" || arg == "builder-thread"));
     }
 
     #[tokio::test]

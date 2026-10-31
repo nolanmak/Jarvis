@@ -687,3 +687,22 @@ async fn relay_ended_with_malformed_handoff_is_categorized_without_the_payload()
     assert!(text.contains("handoff_data_invalid"), "categorized: {text}");
     assert!(!text.contains("raw-handoff-marker"), "{text}");
 }
+
+#[tokio::test]
+async fn live_summary_waits_for_durable_transcript_delivery_without_spending_retry() {
+    let f = fixture();
+    let id = relayed_call(&f, "live-history").await;
+    f.store.phone_bind_live_session(&id, "session-one").unwrap();
+    f.store.phone_append_live_transcript(&id, "session-one", &augmentagent_store::phone::LiveTranscript {
+        event_id: "fact".into(), user: true, text: "I prefer short calls.".into(), start_ms: 0., end_ms: 20.,
+    }).unwrap();
+    status_completed(&f, &id);
+    let wiki = tempfile::tempdir().unwrap();
+    let agent = summarizer(wiki.path(), json!({"summary":"Short call.","facts":[]}));
+    assert_eq!(f.service.run_call_summaries(&agent).await.unwrap(), 0);
+    assert!(agent.requests.lock().unwrap().is_empty());
+    let batch = f.store.phone_live_history_batches().unwrap().remove(0);
+    f.store.phone_live_history_delivered(&id, &batch.key).unwrap();
+    assert_eq!(f.service.run_call_summaries(&agent).await.unwrap(), 1);
+    assert_eq!(agent.requests.lock().unwrap().len(), 1);
+}

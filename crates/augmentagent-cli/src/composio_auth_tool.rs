@@ -62,7 +62,7 @@ pub fn configure(
         opts.allowed_tools
             .push(format!("mcp__composio_auth__{tool}"));
     }
-    opts.system_prompt.push_str("\nComposio authentication: when the owner asks to connect Gmail, Google Calendar, Google Drive, or Slack, call mcp__composio_auth__start_auth. Return auth_url verbatim and ask the owner to finish consent and tell you when done. Keep attempt_id for follow-up. Calendar selects the only Gmail entity automatically; if ambiguous, ask which account using the returned entity_id choices. After consent, call auth_status with attempt_id; if ACTIVE, call complete_auth with attempt_id to save the integration. Only claim it is connected when complete_auth returns connected=true. Status checks are live; do not repeat start_auth to check progress. When the response carries transport=google (Gmail on the operator's own Google OAuth client) the consent must finish in a browser that can reach the dashboard's callback (normally the dashboard host itself), the mailbox is saved automatically when it does, and complete_auth simply reports connected; relay the response's note. Otherwise consent works on another device without a local callback.\n");
+    opts.system_prompt.push_str("\nComposio authentication: when the owner asks to connect Gmail, Google Calendar, Google Drive, or Slack, call mcp__composio_auth__start_auth. Return auth_url verbatim and ask the owner to finish consent and tell you when done. Keep attempt_id for follow-up. Calendar selects the only Gmail entity automatically; if ambiguous, ask which account using the returned entity_id choices. After consent, call auth_status with attempt_id; if ACTIVE, call complete_auth with attempt_id to save the integration. Only claim it is connected when complete_auth returns connected=true. Status checks are live; do not repeat start_auth to check progress. For Gmail always pass email (the mailbox address): Google preselects that account, and connecting several mailboxes means one start_auth per address, which you may do in a single turn. Present every auth_url as a clickable masked link on its own line, e.g. [Connect name@example.com](<auth_url>), never inside a code block or backticks, and never as bare pasted text. When the response carries transport=google (Gmail on the operator's own Google OAuth client) the consent must finish in a browser that can reach the dashboard's callback (normally the dashboard host itself), the mailbox is saved automatically when it does, and complete_auth simply reports connected; relay the response's note. Otherwise consent works on another device without a local callback.\n");
     Ok(())
 }
 
@@ -103,7 +103,7 @@ fn validate_args(operation: &str, args: &Value) -> Result<()> {
         anyhow::ensure!(
             object
                 .keys()
-                .all(|key| key == "provider" || key == "entity_id"),
+                .all(|key| key == "provider" || key == "entity_id" || key == "email"),
             "Invalid authentication arguments"
         );
         let provider = args["provider"].as_str().context("provider is required")?;
@@ -111,6 +111,13 @@ fn validate_args(operation: &str, args: &Value) -> Result<()> {
             matches!(provider, "gmail" | "calendar" | "googledrive" | "slack"),
             "Unsupported provider"
         );
+        if let Some(email) = object.get("email") {
+            let email = email.as_str().context("email must be a string")?.trim();
+            anyhow::ensure!(
+                provider == "gmail" && email.contains('@') && email.len() <= 254,
+                "email requires gmail and a mailbox address"
+            );
+        }
         if let Some(entity) = object.get("entity_id") {
             let entity = entity.as_str().context("entity_id must be a string")?;
             anyhow::ensure!(
@@ -178,7 +185,7 @@ async fn dispatch(req: &Value) -> Value {
         "tools/list" => {
             let attempt_schema = json!({"type":"object","properties":{"attempt_id":{"type":"string","description":"The attempt_id returned by start_auth."}},"required":["attempt_id"],"additionalProperties":false});
             json!({"tools":[
-                {"name":"start_auth","description":"Create consent for Gmail, Calendar, Drive or Slack; return auth_url to the owner. Gmail uses the operator's own Google OAuth client when configured (transport=google: saved automatically once the browser callback lands); otherwise Composio hosted consent, where consent alone does not save the integration.","inputSchema":{"type":"object","properties":{"provider":{"type":"string","enum":["gmail","calendar","googledrive","slack"]},"entity_id":{"type":"string","description":"Calendar only: select an existing Gmail entity when ambiguous."}},"required":["provider"],"additionalProperties":false}},
+                {"name":"start_auth","description":"Create consent for Gmail, Calendar, Drive or Slack; return auth_url to the owner. Gmail uses the operator's own Google OAuth client when configured (transport=google: saved automatically once the browser callback lands); otherwise Composio hosted consent, where consent alone does not save the integration.","inputSchema":{"type":"object","properties":{"provider":{"type":"string","enum":["gmail","calendar","googledrive","slack"]},"email":{"type":"string","description":"Gmail only: the mailbox address to connect. Google preselects it; pass a different address per call to connect several mailboxes."},"entity_id":{"type":"string","description":"Calendar only: select an existing Gmail entity when ambiguous."}},"required":["provider"],"additionalProperties":false}},
                 {"name":"auth_status","description":"Read current consent status for an attempt. If ACTIVE, call complete_auth to save it.","inputSchema":attempt_schema},
                 {"name":"complete_auth","description":"Verify active consent and save the integration. Safe to retry; never completes inactive consent.","inputSchema":attempt_schema}
             ]})
@@ -301,6 +308,8 @@ mod tests {
             json!({"provider":"gmail","entity_id":null}),
             json!({"provider":"gmail","entity_id":"other"}),
             json!({"provider":"gmail","extra":true}),
+            json!({"provider":"slack","email":"me@example.com"}),
+            json!({"provider":"gmail","email":"not-an-address"}),
             json!(null),
         ] {
             assert!(validate_args("start", &args).is_err());
@@ -308,6 +317,7 @@ mod tests {
         assert!(
             validate_args("start", &json!({"provider":"calendar","entity_id":"owner"})).is_ok()
         );
+        assert!(validate_args("start", &json!({"provider":"gmail","email":"me@example.com"})).is_ok());
         assert!(validate_args("status", &json!({"attempt_id":42})).is_err());
     }
 

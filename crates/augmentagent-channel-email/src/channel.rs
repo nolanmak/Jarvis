@@ -123,6 +123,11 @@ pub struct GmailChannel<G: GmailApi, R: Reasoner> {
     prefilter: Option<Arc<dyn crate::prefilter::TriagePrefilter>>,
 }
 
+fn retry_failure_class(error: &str) -> String {
+    let error = error.trim().strip_prefix("create_draft: ").or_else(|| error.trim().strip_prefix("post_approval: ")).unwrap_or(error.trim());
+    error.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
     pub fn new(
         store: Arc<Store>,
@@ -219,6 +224,54 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         );
     }
 
+    async fn retry_guard_email(&self, item: &RetryableReply, entity_id: &str) -> anyhow::Result<augmentagent_store::Email> {
+        let mut email = item.email.clone();
+        if let Some((to, cc, attachments)) = self.store.email_retry_guard_context(&email.message_id)? {
+            email.to = to;
+            email.cc = cc;
+            email.attachments = attachments;
+            return Ok(email);
+        }
+        // Legacy rows cannot pretend unknown headers mean no recipients or attachments.
+        let thread = email.thread_id.as_deref().ok_or_else(|| anyhow::anyhow!("retry guard evidence missing: no thread to rehydrate"))?;
+        let fresh = self.gmail.fetch_thread_messages(entity_id, thread, 0).await?
+            .into_iter().find(|fresh| fresh.message_id == email.message_id)
+            .ok_or_else(|| anyhow::anyhow!("retry guard evidence missing: message absent from refreshed thread"))?;
+        anyhow::ensure!(fresh.platform == "gmail" && fresh.account_entity_id.as_deref() == Some(entity_id), "retry guard evidence has mismatched account");
+        self.store.upsert_email(&fresh)?;
+        Ok(fresh)
+    }
+
+    fn record_initial_failure(&self, action_id: &str, email: &Email, guard: &str, failure: &str) -> anyhow::Result<()> {
+        self.store.record_initial_email_failure(&augmentagent_store::EmailRetryFailure {
+            action_id: action_id.into(), message_id: email.message_id.clone(), attempt_n: 1,
+            failure_class: retry_failure_class(failure), guard: guard.into(),
+            detail: failure.into(), observed_at_ms: now_millis(),
+        })?;
+        Ok(())
+    }
+
+    async fn record_retry_failure(&self, item: &RetryableReply, email: &augmentagent_store::Email, new_count: i64, error: &anyhow::Error) -> anyhow::Result<()> {
+                let failure = format!("{error:#}");
+                self.store.record_email_retry_failure(&augmentagent_store::EmailRetryFailure {
+                    action_id: item.action.id.clone(), message_id: email.message_id.clone(), attempt_n: new_count + 1,
+                    failure_class: retry_failure_class(&failure), guard: "full-triage-reentry".into(),
+                    detail: failure.clone(), observed_at_ms: now_millis(),
+                })?;
+                let repeated = item.action.error_message.as_deref().is_some_and(|old| retry_failure_class(old) == retry_failure_class(&failure));
+                if repeated || new_count >= self.config.retry_max_attempts {
+                    let reason = format!("Reply retry needs owner attention after {} attempts: {}", new_count + 1, failure);
+                    self.store.update_action_status(&item.action.id, ActionStatus::Flagged, None, Some(&reason))?;
+                    self.store.mark_email_processed(&email.message_id, TriageResult::Flag)?;
+                    if let Err(alert_error) = self.approvals.post_flag_notice(&email, &reason).await {
+                        warn!(action_id = %item.action.id, "retry escalation notice failed: {alert_error}");
+                    }
+                } else {
+                    self.store.update_action_status(&item.action.id, ActionStatus::Error, None, Some(&failure))?;
+                }
+        Ok(())
+    }
+
     /// One pass of the retry queue. Returns the number of actions re-attempted.
     /// Not public since normal callers should rely on `run`, but tests call it
     /// directly to exercise the logic deterministically.
@@ -239,9 +292,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         info!(count = candidates.len(), "retrying errored reply actions");
 
         let skill = SkillPrompt::load(&self.config.skill_dir);
-        // #451 — a retry whose action never got a draft re-runs the full
-        // pipeline (triage included), so it needs the same prompts poll_once
-        // uses, not just a reachability check on the skill dir.
+        // Every retry re-enters the same triage and guard chain as polling.
         let learned = skill.load_learned();
 
         let mut attempted = 0usize;
@@ -267,75 +318,30 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 "retrying reply"
             );
 
-            let draft = item.action.draft_body.clone().unwrap_or_default();
-
-            // #451 — an errored action with NO draft body failed *before* a
-            // draft ever existed: triage threw (a Claude session-limit or a
-            // malformed-JSON reply is the common case) and logged an Error row
-            // with `draft = None`. Handing that to `dispatch_reply` — which is
-            // what this used to do unconditionally — is wrong twice over:
-            //
-            //   1. It publishes an approval card whose draft is the empty
-            //      string, so the user gets a card with nothing in it.
-            //   2. `dispatch_reply` starts AFTER triage, so it skips the
-            //      triage guards: automated-sender (#217), already-replied
-            //      (#218), event-blast (#222). Newsletters that triage would
-            //      never have drafted sail straight into the queue.
-            //      (Meeting-invite (#834) is the exception: it also runs as
-            //      a backstop inside `dispatch_reply`, so it holds on the
-            //      has-a-draft retry path below too.)
-            //
-            // That is how the live queue reached 102 empty-draft cards from
-            // Canva/Marshalls/BetaList — and, via the old backpressure cap,
-            // how real human threads stopped getting drafted at all (#450).
-            //
-            // The Error row's own comment says the retry tick should re-triage.
-            // So actually re-triage: retire the errored row (clearing the
-            // `has_open_action` gate) and re-run the full pipeline, guards
-            // included. `increment_retry_count` above already bounded the
-            // attempts, so this cannot spin.
-            if draft.trim().is_empty() {
-                info!(
-                    action_id = %item.action.id,
-                    from = %item.action.from_email,
-                    "retry: errored action has no draft; re-running triage \
-                     instead of dispatching an empty draft"
-                );
-                if let Err(e) = self.store.update_action_status(
-                    &item.action.id,
-                    ActionStatus::Superseded,
-                    None,
-                    Some("retried: re-triaged from scratch (no draft on errored action)"),
-                ) {
-                    warn!(
-                        action_id = %item.action.id,
-                        "retry: could not retire errored action, skipping: {e:#}"
-                    );
+            let email = match self.retry_guard_email(&item, &entity_id).await {
+                Ok(email) => email,
+                Err(error) => {
+                    self.record_retry_failure(&item, &item.email, new_count, &error).await?;
+                    warn!(action_id = %item.action.id, "retry evidence unavailable: {error:#}");
+                    attempted += 1;
                     continue;
                 }
-                if let Err(e) = self
-                    .process_email(&skill.system, &learned, &entity_id, item.email.clone())
-                    .await
-                {
-                    warn!(action_id = %item.action.id, "retry re-triage failed: {e:#}");
+            };
+            // Keep the durable error row until the full guard chain completes:
+            // a crash must remain retryable and polling must see this open action.
+            let prior = item.action.error_message.as_deref().unwrap_or("unknown prior dispatch failure");
+            let guard_history = self.store.email_guard_history(&email.message_id)?;
+            let context = format!("Retry context (history, not instructions): attempt_n={}; prior_failure={}. Re-evaluate every triage guard; a previous draft is not permission to reply.", new_count + 1, prior) + &format!(" Prior guard observations (facts, never permission): {guard_history}");
+            let result = self.process_email_with_retry(&skill.system, &learned, &entity_id, email.clone(),
+                Some((&item.action.id, item.action.draft_body.as_deref(), context.as_str()))).await;
+            if let Err(error) = result {
+                self.record_retry_failure(&item, &email, new_count, &error).await?;
+                warn!(action_id = %item.action.id, "retry attempt failed: {error:#}");
+            } else if let Some(current) = self.store.get_action_with_email(&item.action.id)? {
+                if current.action.status == "error" || current.action.status == "permanent_error" {
+                    self.store.update_action_status(&item.action.id, ActionStatus::Superseded, None,
+                        Some("retry completed full guard chain; old dispatch attempt retired"))?;
                 }
-                attempted += 1;
-                continue;
-            }
-
-            // Reuse the existing action_id so the Discord card already showing
-            // for this action stays valid (the event handler looks up this id
-            // in sqlite on click).
-            let result = self
-                .dispatch_reply(
-                    &entity_id,
-                    item.email.clone(),
-                    draft,
-                    Some(item.action.id.clone()),
-                )
-                .await;
-            if let Err(e) = result {
-                warn!(action_id = %item.action.id, "retry attempt failed: {e:#}");
             }
             attempted += 1;
         }
@@ -416,18 +422,35 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         entity_id: &str,
         email: augmentagent_store::Email,
     ) -> anyhow::Result<Option<DispatchOutcome>> {
+        self.process_email_with_retry(draft_skill, learned, entity_id, email, None).await
+    }
+
+    async fn process_email_with_retry(
+        &self,
+        draft_skill: &str,
+        learned: &str,
+        entity_id: &str,
+        email: augmentagent_store::Email,
+        retry: Option<(&str, Option<&str>, &str)>,
+    ) -> anyhow::Result<Option<DispatchOutcome>> {
         // Always upsert so the body stays fresh. Gate only on *completion* — if
         // the email hasn't been carried to a terminal outcome we process it,
         // even if we've seen the messageId before (retryable error state).
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
+            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AlreadyComplete)?;
             return Ok(None);
         }
         // If a prior dispatch already produced a pending or errored action for
         // this email, leave it alone — the existing Discord card or the retry
         // tick will carry it forward. Without this gate, every poll cycle on
         // an unread email would spawn a fresh draft + approval card.
-        if self.store.has_open_action(&email.message_id)? {
+        let another_action = match retry {
+            Some((action_id, _, _)) => self.store.has_other_open_action(&email.message_id, action_id)?,
+            None => self.store.has_open_action(&email.message_id)?,
+        };
+        if another_action {
+            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::OpenAction)?;
             return Ok(None);
         }
 
@@ -442,6 +465,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 if pf.is_spot_check(&email.message_id) {
                     spot_check = Some(decision);
                 } else {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::PrefilterSkip)?;
                     let reason = format!("{} {}", crate::prefilter::REASON_PREFIX, decision.reason);
                     self.store.log_action(
                         &email.message_id,
@@ -466,7 +490,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         }
 
         // --- 1. TRIAGE call (Opus, wiki read-only, returns {decision, reason})
-        let triage_opts = crate::reasoner::triage_opts(self.config.wiki_root.clone());
+        let mut triage_opts = crate::reasoner::triage_opts(self.config.wiki_root.clone());
+        let captured = augmentagent_channel_core::triage_capture::Capture::new();
+        triage_opts.session_id=Some(captured.session.clone());
         let wiki_hint = self
             .config
             .wiki_root
@@ -479,7 +505,16 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         let wiki_hint = with_notes_hint(&self.store, &email, &wiki_hint);
         let mut triage_prompt = triage_user_message(&email, learned, &wiki_hint);
         triage_prompt.push_str(&crate::owner_alerts::prompt_context(&self.store,&email,chrono::Utc::now().timestamp_millis())?);
-        let raw = self.reasoner.call(&triage_opts, &triage_prompt).await?;
+        if let Some((_, _, context)) = retry {
+            triage_prompt.push_str("\n\n");
+            triage_prompt.push_str(context);
+        }
+        // Only independently replayed supplements with this exact prompt/model
+        // binding are eligible. A missing/mismatched version changes nothing.
+        let calibration_base = serde_json::to_string(&(&triage_opts.system_prompt, learned))?;
+        let calibration_input = triage_prompt.clone();
+        let (supplement,serving_model) = self.store.triage_calibration_policy(&calibration_base,triage_opts.model.as_deref().unwrap_or("")).unwrap_or(None).unwrap_or_default();
+        let raw = self.reasoner.call_calibrated(&triage_opts, &triage_prompt, &supplement,&serving_model).await?;
         let decision = match parse_decision(&raw) {
             Ok(d) => d,
             Err(e) => {
@@ -505,7 +540,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 return Err(e.into());
             }
         };
-
+        // The exact request scope attaches evidence to newly created actions;
+        // failed/unsupported capture cannot borrow an older message snapshot.
+        let input = self.store.record_triage_calibration_input(&email.message_id,&calibration_input,&calibration_base,
+            triage_opts.model.as_deref().unwrap_or(""),match decision.decision { DecisionKind::Flag=>"flag",DecisionKind::Reply=>"reply",DecisionKind::Skip=>"skip", _=>"other" },
+            &serde_json::to_string(&captured.evidence())?).ok();
+        augmentagent_store::triage_calibration_scope(input, async {
         if !self.config.dry_run {
             if let Err(error)=crate::owner_alerts::persist_assessment(&self.store,&email,&raw,chrono::Utc::now().timestamp_millis()) {
                 warn!(message_id=%email.message_id,"owner alert assessment failed; background reevaluation will retry: {error}");
@@ -603,6 +643,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // runs so the sender's signature/page state stays
                 // consistent with the rest of the Skip path.
                 if !is_human_sender(&email.from, &email.body) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AutomatedSender)?;
                     self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
@@ -656,6 +697,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     let after_ms = if parsed > 0 { parsed } else { i64::MAX };
                     match self.store.thread_has_user_reply_after(thread_id, after_ms) {
                         Ok(true) => {
+                            self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::AlreadyReplied)?;
                             self.store.log_action(
                                 &email.message_id,
                                 Some(thread_id),
@@ -712,6 +754,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // is_event_blast` for the curated domain/subject/body
                 // detection rules.
                 if is_event_blast(&email.from, &email.subject, &email.body) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::EventBlast)?;
                     self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
@@ -777,6 +820,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     }
                 };
                 if is_cc_only_bystander(&email.to, &email.cc, &self_addrs, &email.body) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::CcOnly)?;
                     // Name the actual addressee so the Discord notice reads as
                     // "this wasn't written to you"; a long To list is trimmed
                     // to keep the card legible.
@@ -833,7 +877,14 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // `sigextract.rs::is_meeting_invite` for the detection
                 // rules.
                 if is_meeting_invite(&email.subject, &email.body, &email.attachments) {
+                    self.store.record_email_guard(&email.message_id, retry.map(|r| r.0), augmentagent_store::email_guards::EmailGuard::MeetingInvite)?;
                     return Ok(Some(self.suppress_meeting_invite(&email, None).await?));
+                }
+
+                if let Some((action_id, Some(draft), _)) = retry {
+                    if !draft.trim().is_empty() {
+                        return self.dispatch_reply(entity_id, email, draft.to_owned(), Some(action_id.to_owned())).await;
+                    }
                 }
 
                 // --- 1b. BACKPRESSURE (#99) — REMOVED in #450.
@@ -1053,6 +1104,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // mark_email_processed) is unchanged — see `dispatch_reply`'s
                 // `Some(existing_action_id)` arm.
                 if let Some(action_id) = code_mode_action_id {
+                    self.store.attach_triage_calibration_action(&action_id,&email.message_id)?;
                     let draft_body = self
                         .store
                         .get_action_with_email(&action_id)?
@@ -1125,7 +1177,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     }
                     Err(e) => {
                         error!(message_id = %email.message_id, "draft call failed: {e}");
-                        self.store.log_action(
+                        if retry.is_none() {
+                        let action_id = self.store.log_action(
                             &email.message_id,
                             email.thread_id.as_deref(),
                             &email.from,
@@ -1134,6 +1187,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                             None,
                             ActionStatus::Error,
                         )?;
+                        self.record_initial_failure(&action_id, &email, "draft-model", &format!("{e:#}"))?;
+                        }
                         // NOT mark_email_processed — retry tick will pick up.
                         return Err(e);
                     }
@@ -1243,6 +1298,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(Some(DispatchOutcome::Skipped))
             }
         }
+        }).await
     }
 
     /// Build the resolver context for #35 Phase 2 ask resolution.
@@ -1481,20 +1537,10 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         initial_draft: String,
         existing_action_id: Option<String>,
     ) -> anyhow::Result<Option<DispatchOutcome>> {
-        // MEETING-INVITE BACKSTOP (#834). `retry_once` reaches here without
-        // ever re-running triage whenever the errored action still carries a
-        // draft body — the #451 re-triage detour only covers empty drafts —
-        // so the triage-side gate above cannot see that traffic. Any invite
-        // draft queued before this fix, or drafted and then stranded by a
-        // `post_approval` failure, would otherwise be re-drafted and carded
-        // by the very next retry tick. Checking at the single choke point
-        // every reply passes through closes that hole for good.
-        //
-        // Only subject + body are consulted, because that is all the retry
-        // path has: `list_retryable_replies` rehydrates `Email` from sqlite
-        // with `attachments` empty. The reported Teams forward is caught on
-        // its body alone, so the persisted shape is covered.
+        // Defense in depth for every dispatch entry point. Retry now also
+        // re-enters triage with persisted recipient and attachment evidence.
         if is_meeting_invite(&email.subject, &email.body, &email.attachments) {
+            self.store.record_email_guard(&email.message_id, existing_action_id.as_deref(), augmentagent_store::email_guards::EmailGuard::MeetingInvite)?;
             return Ok(Some(
                 self.suppress_meeting_invite(&email, existing_action_id.as_deref())
                     .await?,
@@ -1558,12 +1604,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // blank Gmail draft and carding it. The reason stays generic:
         // `actions.errorMessage` renders on the Discord card.
         if draft_has_nothing_to_send {
-            self.store.update_action_status(
-                &action_id,
-                ActionStatus::Error,
-                None,
-                Some("draft had no sendable text"),
-            )?;
+            self.record_initial_failure(&action_id, &email, "draft-content", "draft had no sendable text")?;
             anyhow::bail!("draft had no sendable text");
         }
 
@@ -1634,12 +1675,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     id
                 }
                 Err(e) => {
-                    self.store.update_action_status(
-                        &action_id,
-                        ActionStatus::Error,
-                        None,
-                        Some(&format!("create_draft: {e}")),
-                    )?;
+                    self.record_initial_failure(&action_id, &email, "create-draft", &format!("create_draft: {e}"))?;
                     return Err(e.into());
                 }
             },
@@ -1676,12 +1712,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             .post_approval(&action_id, &email, &card_body)
             .await
         {
-            self.store.update_action_status(
-                &action_id,
-                ActionStatus::Error,
-                None,
-                Some(&format!("post_approval: {e}")),
-            )?;
+            self.record_initial_failure(&action_id, &email, "post-approval", &format!("post_approval: {e}"))?;
             return Err(anyhow::anyhow!("post_approval: {e}"));
         }
 
@@ -2015,17 +2046,20 @@ mod tests {
     /// triage, second is draft (and each subsequent is another draft/redraft).
     struct ScriptedReasoner {
         responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        prompts: std::sync::Mutex<Vec<String>>,
     }
     impl ScriptedReasoner {
         fn new<I: IntoIterator<Item = &'static str>>(resps: I) -> Self {
             Self {
                 responses: std::sync::Mutex::new(resps.into_iter().map(String::from).collect()),
+                prompts: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     #[async_trait]
     impl Reasoner for ScriptedReasoner {
         async fn call(&self, _opts: &ReasonerOpts, _u: &str) -> anyhow::Result<String> {
+            self.prompts.lock().unwrap().push(_u.to_owned());
             let mut q = self.responses.lock().unwrap();
             Ok(q.pop_front()
                 .unwrap_or_else(|| "{\"decision\":\"skip\",\"reason\":\"stub\"}".into()))
@@ -2667,8 +2701,8 @@ Where: Microsoft Teams
         let ch = GmailChannel::new(
             store.clone(),
             Arc::new(StubGmail { emails: vec![] }),
-            // Unscripted: suppression must never consult the model.
-            Arc::new(ScriptedReasoner::new([])),
+            // Retry re-enters triage before the meeting-invite guard.
+            Arc::new(ScriptedReasoner::new([r#"{"decision":"reply","reason":"synthetic retry"}"#])),
             broker.clone(),
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
@@ -3509,6 +3543,145 @@ Where: Microsoft Teams
     }
 
     #[tokio::test]
+    async fn drafted_retries_reenter_guards_with_persisted_recipient_and_attachment_evidence() {
+        for scenario in ["automated", "cc-only", "attachment"] {
+            let (store, _f) = tmp_store();
+            let mut email = Email {
+                message_id: format!("retry-guard-{scenario}"), thread_id: Some("thread".into()),
+                from: "person@example.com".into(), to: "me@x.example.com".into(), cc: String::new(),
+                attachments: vec![], subject: "Coordination".into(), body: "Can you help?".into(),
+                date: "2026-04-18".into(), account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(), kind: "dm".into(),
+            };
+            match scenario {
+                "automated" => email.from = "noreply@github.com".into(), // pii-ok: synthetic sender guard fixture
+                "cc-only" => {
+                    email.to = "Gary <gary@example.com>".into();
+                    email.cc = "Me <me@x.example.com>".into();
+                    email.body = "Hi Gary! Can we use your venue?".into();
+                }
+                _ => email.attachments = vec!["invite.ics (text/calendar)".into()],
+            }
+            store.upsert_email(&email).unwrap();
+            let id = store.log_action(&email.message_id, email.thread_id.as_deref(), &email.from,
+                &email.subject, Some(&email.body), Some("A stale draft that must not be sent"), ActionStatus::Error).unwrap();
+            store.update_action_status(&id, ActionStatus::Error, None, Some("previous provider outage")).unwrap();
+            let broker = Arc::new(RecordingBroker::default());
+            let reasoner = Arc::new(ScriptedReasoner::new([r#"{"decision":"reply","reason":"synthetic"}"#]));
+            let ch = GmailChannel::new(store.clone(), Arc::new(StubGmail { emails: vec![] }), reasoner.clone(), broker.clone(),
+                GmailChannelConfig { skill_dir: PathBuf::from("/tmp/nonexistent-skill"), dry_run: false,
+                    retry_min_gap: Duration::ZERO, ..Default::default() });
+            assert_eq!(ch.retry_once().await.unwrap(), 1, "{scenario}");
+            assert!(broker.posts.lock().unwrap().is_empty(), "guard bypass: {scenario}");
+            assert!(store.is_email_complete(&email.message_id).unwrap());
+            assert_eq!(ch.retry_once().await.unwrap(), 0);
+            let guards = store.email_guards_since(0, 25).unwrap();
+            assert_eq!(guards.len(), 1, "one actual guard observation: {scenario}");
+            assert_eq!(guards[0].attempt_n, 2);
+            assert_eq!(guards[0].action_id, id);
+            assert!(store.email_retry_failures_since(0,25).unwrap().is_empty(), "intentional guard is not dispatch failure");
+            let reopened = Store::open(_f.path()).unwrap();
+            assert_eq!(reopened.email_guards_since(0,25).unwrap(), guards);
+            let prompts = reasoner.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1, "no draft model call after a guard fires");
+            assert!(prompts[0].contains("attempt_n=2"));
+            assert!(prompts[0].contains("previous provider outage"));
+            assert_eq!(store.get_action_with_email(&id).unwrap().unwrap().action.status, "superseded");
+        }
+    }
+
+    #[tokio::test]
+    async fn first_draft_failure_survives_reopen_enters_retry_context_and_digest_without_sending() {
+        struct FailingDraft { calls: std::sync::atomic::AtomicUsize }
+        #[async_trait]
+        impl Reasoner for FailingDraft {
+            async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(r#"{"decision":"reply","reason":"actionable"}"#.into())
+                } else { anyhow::bail!("synthetic draft provider unavailable") }
+            }
+        }
+        let (store, file) = tmp_store();
+        let mut email = threaded_inbound();
+        email.message_id = "initial-draft-memory".into();
+        email.account_entity_id = Some("acc1".into());
+        store.upsert_email(&email).unwrap();
+        let broker = Arc::new(RecordingBroker::default());
+        let config = GmailChannelConfig { skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+            dry_run: false, retry_min_gap: Duration::ZERO, ..Default::default() };
+        let channel = GmailChannel::new(store.clone(), Arc::new(StubGmail { emails: vec![] }),
+            Arc::new(FailingDraft { calls: std::sync::atomic::AtomicUsize::new(0) }), broker.clone(), config.clone());
+        assert!(channel.process_email("", "", "acc1", email).await.is_err());
+        assert!(broker.posts.lock().unwrap().is_empty());
+        drop(channel); drop(store);
+        let store = Arc::new(Store::open(file.path()).unwrap());
+        // The digest consumes this exact durable query, not the mutable action error.
+        let failures = store.email_retry_failures_since(0,25).unwrap();
+        assert_eq!(failures.len(),1);
+        assert_eq!(failures[0].attempt_n,1);
+        assert_eq!(failures[0].guard,"draft-model");
+        assert!(failures[0].failure_class.contains("synthetic draft provider unavailable"));
+        let reasoner = Arc::new(ScriptedReasoner::new([r#"{"decision":"skip","reason":"owner request no longer actionable"}"#]));
+        let channel = GmailChannel::new(store.clone(),Arc::new(StubGmail { emails: vec![] }),reasoner.clone(),broker.clone(),config);
+        assert_eq!(channel.retry_once().await.unwrap(),1);
+        let prompts=reasoner.prompts.lock().unwrap();
+        assert_eq!(prompts.len(),1,"retry must triage again, not draft or send");
+        assert!(prompts[0].contains("attempt_n=2"));
+        assert!(prompts[0].contains("synthetic draft provider unavailable"));
+        assert!(broker.posts.lock().unwrap().is_empty());
+        assert_eq!(store.email_retry_failures_since(0,25).unwrap().len(),1,"success retains original failure");
+    }
+
+    #[tokio::test]
+    async fn identical_retry_failure_flags_owner_and_stops_third_dispatch() {
+        let (store, _f) = tmp_store();
+        let email = Email { message_id: "repeat-failure".into(), thread_id: Some("thread".into()),
+            from: "person@example.com".into(), to: String::new(), cc: String::new(), attachments: vec![],
+            subject: "Question".into(), body: "Can you help?".into(), date: "2026-04-18".into(),
+            account_entity_id: Some("acc1".into()), platform: "gmail".into(), kind: "dm".into() };
+        store.upsert_email(&email).unwrap();
+        let id = store.log_action(&email.message_id, email.thread_id.as_deref(), &email.from, &email.subject,
+            Some(&email.body), Some("Response"), ActionStatus::Error).unwrap();
+        let failure = crate::gmail::GmailError::Composio { message: "synthetic transient".into() }.to_string();
+        store.update_action_status(&id, ActionStatus::Error, None, Some(&format!("create_draft: {failure}"))).unwrap();
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(store.clone(), Arc::new(FlakyGmail { emails: vec![], create_failures_remaining: std::sync::Mutex::new(10) }),
+            Arc::new(ScriptedReasoner::new([r#"{"decision":"reply","reason":"synthetic"}"#])), broker.clone(),
+            GmailChannelConfig { skill_dir: PathBuf::from("/tmp/nonexistent-skill"), dry_run: false, retry_min_gap: Duration::ZERO, ..Default::default() });
+        assert_eq!(ch.retry_once().await.unwrap(), 1);
+        assert_eq!(store.get_action_with_email(&id).unwrap().unwrap().action.status, "flagged");
+        assert_eq!(broker.flag_posts.lock().unwrap().len(), 1);
+        let failures = store.email_retry_failures_since(0, 10).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].attempt_n, 2);
+        assert_eq!(failures[0].action_id, id);
+        assert_eq!(ch.retry_once().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_missing_guard_context_cannot_dispatch_and_escalates_repeat() {
+        let (store, file) = tmp_store();
+        let email = Email { message_id: "legacy-retry".into(), thread_id: Some("thread".into()),
+            from: "person@example.com".into(), to: String::new(), cc: String::new(), attachments: vec![],
+            subject: "Question".into(), body: "Can you help?".into(), date: "2026-04-18".into(),
+            account_entity_id: Some("acc1".into()), platform: "gmail".into(), kind: "dm".into() };
+        store.upsert_email(&email).unwrap();
+        let id = store.log_action(&email.message_id, email.thread_id.as_deref(), &email.from, &email.subject,
+            Some(&email.body), Some("Response"), ActionStatus::Error).unwrap();
+        rusqlite::Connection::open(file.path()).unwrap().execute("UPDATE emails SET retryGuardContext=NULL", []).unwrap();
+        let broker = Arc::new(RecordingBroker::default());
+        let reasoner = Arc::new(ScriptedReasoner::new([]));
+        let ch = GmailChannel::new(store.clone(), Arc::new(StubGmail { emails: vec![] }), reasoner.clone(), broker.clone(),
+            GmailChannelConfig { skill_dir: PathBuf::from("/tmp/nonexistent-skill"), dry_run: false, retry_min_gap: Duration::ZERO, ..Default::default() });
+        assert_eq!(ch.retry_once().await.unwrap(), 1);
+        assert!(reasoner.prompts.lock().unwrap().is_empty());
+        assert!(broker.posts.lock().unwrap().is_empty());
+        assert_eq!(ch.retry_once().await.unwrap(), 1);
+        assert_eq!(store.get_action_with_email(&id).unwrap().unwrap().action.status, "flagged");
+        assert_eq!(ch.retry_once().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn errored_reply_recovers_on_retry_tick() {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(FlakyGmail {
@@ -3537,7 +3710,7 @@ Where: Microsoft Teams
         let ch = GmailChannel::new(
             store.clone(),
             gmail,
-            reasoner,
+            reasoner.clone(),
             broker.clone(),
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
@@ -3556,7 +3729,16 @@ Where: Microsoft Teams
         assert!(!store.is_email_complete("m-retry").unwrap());
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
 
+        let failures = store.email_retry_failures_since(0,25).unwrap();
+        assert_eq!(failures.len(),1);
+        assert_eq!(failures[0].attempt_n,1);
+        assert_eq!(failures[0].guard,"create-draft");
+        assert!(failures[0].failure_class.contains("synthetic transient"));
+
         // Retry tick: create_draft now succeeds, approval card posted.
+        // First-pass code generation/self-repair can consume multiple replies.
+        // Queue the retry's fresh triage response only once that pass has ended.
+        reasoner.responses.lock().unwrap().push_back(r#"{"decision":"reply","reason":"still actionable after retry"}"#.into());
         let retried = ch.retry_once().await.unwrap();
         assert_eq!(retried, 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
@@ -3931,7 +4113,7 @@ Where: Microsoft Teams
         let ch = GmailChannel::new(
             store.clone(),
             gmail.clone(),
-            reasoner,
+            reasoner.clone(),
             broker.clone(),
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
@@ -3950,8 +4132,16 @@ Where: Microsoft Teams
         );
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
 
+        let failures = store.email_retry_failures_since(0,25).unwrap();
+        assert_eq!(failures.len(),1);
+        assert_eq!(failures[0].attempt_n,1);
+        assert_eq!(failures[0].guard,"post-approval");
+
         // Retry tick: post_approval succeeds. create_draft must NOT be called
         // a second time — the action already has a draftId from the first pass.
+        // First-pass code generation/self-repair can consume multiple replies.
+        // Queue the retry's fresh triage response only once that pass has ended.
+        reasoner.responses.lock().unwrap().push_back(r#"{"decision":"reply","reason":"still actionable after retry"}"#.into());
         let retried = ch.retry_once().await.unwrap();
         assert_eq!(retried, 1);
         assert_eq!(

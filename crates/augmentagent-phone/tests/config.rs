@@ -83,7 +83,7 @@ fn ac03_voice_providers_default_to_deepgram_and_elevenlabs_and_fail_closed_on_ba
     assert_eq!(voice.stt_provider(), SttProvider::Deepgram);
     assert_eq!(voice.stt_model(), "nova-3-general");
     assert_eq!(voice.tts_provider(), TtsProvider::ElevenLabs);
-    assert_eq!(voice.tts_voice(), "UgBBYS2sOqTuMpoF3BR0-flash_v2_5");
+    assert_eq!(voice.tts_voice(), "r1KmysJdVYZjJCm4mL3b-flash_v2_5");
     assert_eq!(*voice, VoiceConfig::default());
 
     let mut env = values();
@@ -476,4 +476,58 @@ fn proposal_quiet_hours_and_time_zone_fail_closed_on_junk() {
         env.insert(key, value.into());
         assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_err(), "{key}={value}");
     }
+}
+
+#[test]
+fn live_backend_is_explicit_requires_its_own_key_and_keeps_legacy_flags_inert() {
+    use augmentagent_phone::live_config::VoiceBackend;
+    let mut env = values();
+    assert_eq!(Settings::from_lookup(|k|env.get(k).cloned()).unwrap().unwrap().voice_backend(),VoiceBackend::ConversationRelay);
+    env.insert("AUGMENTAGENT_PHONE_VOICE_BACKEND","openai_live".into());
+    assert!(Settings::from_lookup(|k|env.get(k).cloned()).is_err());
+    env.insert("OPENAI_API_KEY","synthetic-project-key".into());
+    // Live must not depend on a legacy text model's credentials/configuration.
+    env.insert("AUGMENTAGENT_PHONE_FAST_LAYER","1".into());
+    env.insert("AUGMENTAGENT_PHONE_PREEMPTIVE","1".into());
+    let settings=Settings::from_lookup(|k|env.get(k).cloned()).unwrap().unwrap();
+    assert_eq!(settings.voice_backend(),VoiceBackend::OpenAiLive);
+    let dir=tempfile::tempdir().unwrap();
+    let configured=settings.build(std::sync::Arc::new(augmentagent_store::Store::open(dir.path().join("db")).unwrap())).unwrap();
+    assert!(configured.service.fast_layer().is_none());
+    for invalid in ["gpt-realtime","gpt-live-1","unknown"] {
+        env.insert("AUGMENTAGENT_PHONE_VOICE_BACKEND",invalid.into());
+        assert!(Settings::from_lookup(|k|env.get(k).cloned()).is_err());
+    }
+}
+
+#[test]
+fn live_credential_is_validated_without_exposing_its_value() {
+    let mut env=values();
+    env.insert("AUGMENTAGENT_PHONE_VOICE_BACKEND","openai_live".into());
+    for key in ["", "private\nsecret", "   "] {
+        env.insert("OPENAI_API_KEY",key.into());
+        let error=Settings::from_lookup(|k|env.get(k).cloned()).err().expect("invalid key");
+        assert!(!error.to_string().contains("private"));
+    }
+}
+
+#[test]
+fn live_voice_settings_validate_before_runtime_construction() {
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_VOICE_BACKEND", "openai_live".into());
+    env.insert("OPENAI_API_KEY", "synthetic-key".into());
+    for voice in ["gleam", "willow", "quartz", "delta"] {
+        env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", voice.into());
+        assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_ok());
+    }
+    for voice in ["", "wrong", "voice_"] {
+        env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", voice.into());
+        assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_err());
+    }
+    env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", "voice_synthetic".into());
+    assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_err());
+    env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE_DESCRIPTION", "Warm adult feminine voice.".into());
+    assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_ok());
+    env.insert("AUGMENTAGENT_PHONE_LIVE_VOICE", "gleam".into());
+    assert!(Settings::from_lookup(|key| env.get(key).cloned()).is_err());
 }

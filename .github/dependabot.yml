@@ -1,0 +1,67 @@
+# Dependency updates wait 7 days after a release before Dependabot proposes them,
+# so a compromised version has time to be caught and pulled. Security updates
+# are not delayed.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directories:
+      - "/"
+      - "/sidecars/computer-use"
+      - "/sidecars/discord-voice"
+      - "/sidecars/fetch"
+      - "/sidecars/renderer"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      all:
+        patterns:
+          - "*"
+  - package-ecosystem: pip
+    directories:
+      - "/crates/augmentagent-docs/python"
+      - "/sidecars/browser"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      all:
+        patterns:
+          - "*"
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      all:
+        patterns:
+          - "*"
+  - package-ecosystem: gomod
+    directory: "/sidecars/wa-sidecar"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      all:
+        patterns:
+          - "*"
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
+    groups:
+      all:
+        patterns:
+          - "*"

@@ -28,12 +28,21 @@ on:
       - 'scripts/phone-live-receipt.py'
       - 'scripts/tests/phone_live_receipt_test.py'
       - '.github/workflows/phone.yml'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 
 jobs:
   offline:
@@ -47,43 +56,46 @@ jobs:
       AUGMENTAGENT_GH_DISABLE: '1'
       AUGMENTAGENT_PHONE_ENABLED: '0'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.94.1
           components: clippy
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: phone-offline
       - name: Check that the runner rejects missing or skipped coverage
-        run: python3 -m unittest discover -s scripts/tests -p phone_offline_ci_test.py -v
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/4"
       - name: Live receipt validator (synthetic fixtures only)
-        run: python3 -m unittest discover -s scripts/tests -p phone_live_receipt_test.py -v
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/5"
       - name: Portable bridge search and parent lifetime
-        run: python3 -m unittest scripts.tests.codex_tool_bridge_test.PortableGrepTests scripts.tests.codex_tool_bridge_test.TransportTests -v
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/6"
       - name: Journal write guard including portable path resolution
-        run: bash scripts/tests/aa-journal-guard.test.sh
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/7"
       - name: Compile opt-in native phone probes (no model calls)
-        run: cargo test --locked -p augmentagent-channel-core --test phone_native_live --no-run
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/8"
       - name: Required offline suites
-        run: python3 scripts/phone-offline-tests.py
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/9"
       - name: Service installation preserves private phone configuration
-        run: bash scripts/tests/install-autostart.test.sh
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/10"
       - name: Pre-phone database upgrade and rollback compatibility
-        run: python3 scripts/phone-upgrade-test.py
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/11"
+      - name: ConversationRelay rollback preserves GPT-Live tasks and receipts
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/12"
       - name: CLI integration compiles
-        run: cargo check -p augmentagent-cli --locked
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/13"
       - name: Phone lint
-        run: cargo clippy -p augmentagent-phone --all-targets --no-deps --locked -- -D warnings
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id phone/offline/14"
       - name: Upload offline evidence (not live qualification)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: phone-offline-${{ matrix.os }}
           path: |
             target/phone-offline/
             target/phone-upgrade/
+            target/phone-live-upgrade/
           if-no-files-found: error

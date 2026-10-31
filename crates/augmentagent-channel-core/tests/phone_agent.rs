@@ -817,6 +817,11 @@ mod fast {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(sends(&reopened, &f.origin, &key).len(), 1);
         assert_eq!(provider.calls().len(), 1, "dispatched work never re-runs");
+        let (goodbye_id, speech, _rx) = speech_for(&f.call.id, "goodbye");
+        let goodbye = bridge.answer(&f.call, &format!("{goodbye_id}-goodbye"), "goodbye", speech, CancellationToken::new()).await.unwrap();
+        assert_eq!(goodbye, augmentagent_phone::end_call::DEFAULT_GOODBYE,
+            "a duplicate must not leave phantom work blocking the deterministic goodbye");
+
     }
 
     /// Revokes the owner's authority while the model is answering, then asks
@@ -885,6 +890,187 @@ mod fast {
             f.store.claim_surface_turn(&dispatch_turn).is_ok(),
             "no surface turn was claimed for the refused dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_dispatch_recovers_queued_uncertain_and_ready_without_replaying_tools() {
+        let f = connected().await;
+        let provider = Arc::new(RecordingNativeProvider::new(ProviderKind::Claude));
+        let heavy = Arc::new(BlockedHeavy {
+            provider: provider.clone(),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            seen: Mutex::new(Vec::new()),
+        });
+        for key in ["queued-job", "uncertain-job", "ready-job"] {
+            f.store
+                .phone_enqueue_dispatch(&f.call.id, key, "Synthetic task")
+                .unwrap();
+        }
+        assert!(f
+            .store
+            .phone_start_dispatch(&f.call.id, "uncertain-job")
+            .unwrap());
+        assert!(f
+            .store
+            .phone_start_dispatch(&f.call.id, "ready-job")
+            .unwrap());
+        f.store
+            .phone_finish_dispatch(&f.call.id, "ready-job", "Persisted result")
+            .unwrap();
+        // A new Store handle and adapter represent startup after intent/result commit.
+        let reopened = Arc::new(Store::open(f.dir.path().join("db")).unwrap());
+        let recovered = PhoneAgent::new(
+            reopened.clone(),
+            f.service.clone(),
+            heavy.clone(),
+            Arc::new(OutboxIo {
+                store: reopened.clone(),
+            }),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        );
+        for key in ["queued-job", "uncertain-job", "ready-job"] {
+            recovered.resume_task(&f.call, key).await.unwrap();
+            recovered.resume_task(&f.call, key).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), heavy.entered.notified())
+            .await
+            .unwrap();
+        heavy.release.notify_one();
+        wait_for(|| reopened.phone_pending_dispatches().unwrap().is_empty()).await;
+        assert_eq!(provider.calls().len(), 1, "only queued work executes");
+        assert!(sends(&reopened, &f.origin, "uncertain-job")[0].contains("outcome is unknown"));
+        assert_eq!(
+            sends(&reopened, &f.origin, "ready-job"),
+            ["Persisted result"]
+        );
+        for key in ["queued-job", "uncertain-job", "ready-job"] {
+            recovered.resume_task(&f.call, key).await.unwrap();
+            assert_eq!(sends(&reopened, &f.origin, key).len(), 1);
+        }
+        assert_eq!(provider.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_delivery_failure_retains_result_without_reexecution() {
+        struct OfflineIo(OutboxIo);
+        #[async_trait]
+        impl ConversationIo for OfflineIo {
+            async fn history(&self, _: &PhoneOrigin) -> anyhow::Result<String> {
+                panic!("no execution on delivery retry")
+            }
+            async fn mirror(&self, _: &PhoneOrigin, _: &str, _: &str) -> anyhow::Result<()> {
+                anyhow::bail!("offline")
+            }
+            fn audit_context(&self, origin: &PhoneOrigin, key: &str) -> AuditCtx {
+                self.0.audit_context(origin, key)
+            }
+        }
+        let f = connected().await;
+        f.store
+            .phone_enqueue_dispatch(&f.call.id, "retry-job", "Synthetic task")
+            .unwrap();
+        f.store
+            .phone_finish_dispatch(&f.call.id, "retry-job", "Saved result")
+            .unwrap();
+        let offline = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            Arc::new(MarkdownAgent),
+            Arc::new(OfflineIo(OutboxIo {
+                store: f.store.clone(),
+            })),
+            "/fixture".into(),
+            Arc::new(|_| Ok(None)),
+        );
+        offline.resume_task(&f.call, "retry-job").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let jobs = f.store.phone_pending_dispatches().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].result.as_deref(), Some("Saved result"));
+        let online = bridge(&f, Arc::new(MarkdownAgent), Scripted::new(vec![]));
+        online.resume_task(&f.call, "retry-job").await.unwrap();
+        wait_for(|| f.store.phone_pending_dispatches().unwrap().is_empty()).await;
+        assert_eq!(sends(&f.store, &f.origin, "retry-job"), ["Saved result"]);
+    }
+
+    #[tokio::test]
+    async fn revoked_binding_cancels_recovered_task_without_executing_or_delivering() {
+        let f = connected().await;
+        f.store.phone_enqueue_dispatch(&f.call.id, "revoked-job", "Synthetic task").unwrap();
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
+        let recovered = bridge(&f, Arc::new(MarkdownAgent), Scripted::new(vec![]));
+        recovered.resume_task(&f.call, "revoked-job").await.unwrap();
+        wait_for(|| f.store.phone_pending_dispatches().unwrap().is_empty()).await;
+        assert!(sends(&f.store, &f.origin, "revoked-job").is_empty());
+        let turn = SurfaceTurnRef::new(f.origin.conversation.clone(), "revoked-job").unwrap();
+        assert!(f.store.claim_surface_turn(&turn).is_ok(), "native turn was never claimed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_history_is_bounded_cached_and_does_not_block_speech() {
+        struct SlowHistory {
+            reads: std::sync::atomic::AtomicUsize,
+            outbox: OutboxIo,
+        }
+        #[async_trait]
+        impl ConversationIo for SlowHistory {
+            async fn history(&self, _: &PhoneOrigin) -> anyhow::Result<String> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending().await
+            }
+            async fn mirror(
+                &self,
+                origin: &PhoneOrigin,
+                key: &str,
+                text: &str,
+            ) -> anyhow::Result<()> {
+                self.outbox.mirror(origin, key, text).await
+            }
+            fn audit_context(&self, origin: &PhoneOrigin, key: &str) -> AuditCtx {
+                self.outbox.audit_context(origin, key)
+            }
+        }
+        let f = connected().await;
+        let io = Arc::new(SlowHistory {
+            reads: 0.into(),
+            outbox: OutboxIo {
+                store: f.store.clone(),
+            },
+        });
+        let model = Scripted::new(vec![vec![token("Hello.")], vec![token("Still here.")]]);
+        let agent = PhoneAgent::new(
+            f.store.clone(),
+            f.service.clone(),
+            Arc::new(MarkdownAgent),
+            io.clone(),
+            "/fixture".into(),
+            Arc::new(|_| Ok(Some(ProviderKind::Claude))),
+        )
+        .with_fast_layer(model, FastLayerConfig::default());
+        for (index, expected) in ["Hello.", "Still here."].into_iter().enumerate() {
+            let (id, speech, _rx) = speech_for(&f.call.id, "hello");
+            let start = tokio::time::Instant::now();
+            let answer = tokio::time::timeout(
+                Duration::from_millis(250),
+                agent.answer(
+                    &f.call,
+                    &format!("{id}-{index}"),
+                    "hello",
+                    speech,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("history blocked voice")
+            .unwrap();
+            assert_eq!(answer, expected);
+            if index == 1 {
+                assert!(start.elapsed() < Duration::from_millis(10));
+            }
+        }
+        assert_eq!(io.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     // AC6 wiring: the operator flag alone decides; without it the bridge is
@@ -1605,4 +1791,47 @@ mod proposals {
         assert!(systems[0].contains(AGENDA_INSTRUCTION), "{}", systems[0]);
         assert!(systems[0].contains("- Reply to the venue\n- Confirm Friday dinner"));
     }
+
+}
+
+mod live_results {
+    use super::*;
+    use super::fast::{connected, OutboxIo};
+    use augmentagent_phone::ingress::ConversationAgent;
+    #[tokio::test]
+    async fn live_result_summary_is_tool_free_bounded_and_contains_only_result_data() {
+        struct SpokenReasoner(Mutex<Vec<(augmentagent_channel_core::reasoner::ReasonerOpts,String)>>,Mutex<String>);
+        #[async_trait]
+        impl Reasoner for SpokenReasoner {
+            async fn call(&self,opts:&augmentagent_channel_core::reasoner::ReasonerOpts,message:&str)->anyhow::Result<String> {
+                self.0.lock().unwrap().push((opts.clone(),message.into()));
+                Ok(self.1.lock().unwrap().clone())
+            }
+        }
+        let f=connected().await;
+        let reasoner=Arc::new(SpokenReasoner(Mutex::new(Vec::new()),Mutex::new(r#"{"spoken_summary":"There are three options. None has been booked."}"#.into())));
+        let agent=PhoneAgent::new(f.store.clone(),f.service.clone(),Arc::new(MarkdownAgent),Arc::new(OutboxIo{store:f.store.clone()}),"/fixture".into(),Arc::new(|_|Ok(Some(ProviderKind::Claude)))).with_summary_reasoner(reasoner.clone());
+        let full="Untrusted tool result. ".repeat(100);
+        assert_eq!(agent.summarize_live_result(&f.call,&full).await.unwrap(),"There are three options. None has been booked.");
+        {
+        let seen=reasoner.0.lock().unwrap();
+        assert_eq!(seen.len(),1);
+        assert!(seen[0].0.model.is_some());
+        assert!(seen[0].0.allowed_tools.is_empty());
+        assert!(seen[0].0.add_dirs.is_empty());
+        let settings:serde_json::Value=serde_json::from_str(seen[0].0.settings_json.as_ref().unwrap()).unwrap();
+        assert_eq!(settings["mcpServers"],serde_json::json!({}));
+        assert!(settings["permissions"]["deny"].as_array().unwrap().contains(&serde_json::json!("Bash")));
+        let data:serde_json::Value=serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(data,serde_json::json!({"completed_task_result":full}));
+        }
+        *reasoner.1.lock().unwrap()=serde_json::json!({"spoken_summary":"x".repeat(501)}).to_string();
+        assert!(agent.summarize_live_result(&f.call,&full).await.is_err());
+        *reasoner.1.lock().unwrap()="Not JSON".into();
+        assert!(agent.summarize_live_result(&f.call,&full).await.is_err());
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
+        assert!(agent.summarize_live_result(&f.call,"Private").await.is_err());
+        assert_eq!(reasoner.0.lock().unwrap().len(),3);
+    }
+
 }

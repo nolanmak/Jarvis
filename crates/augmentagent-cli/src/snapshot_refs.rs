@@ -21,6 +21,22 @@ impl References {
 }
 
 pub fn collect() -> References {
+    collect_with_policy(true)
+}
+
+/// Rebuildable caches and clean merged worktrees additionally require compiler
+/// inventory and writer leases. Unlike rollback retention, they need not be
+/// frozen by non-dumpable login/key agents hiding ptrace-only handles. Status
+/// and command-line evidence remain mandatory; visible references still protect.
+pub fn collect_rebuildable() -> References {
+    collect_with_policy(false)
+}
+
+fn required_handle_error(strict: bool, error: &std::io::Error) -> bool {
+    strict || error.kind() != std::io::ErrorKind::PermissionDenied
+}
+
+fn collect_with_policy(strict: bool) -> References {
     use std::os::unix::fs::MetadataExt;
     let mut out = References {
         reliable: true,
@@ -65,12 +81,17 @@ pub fn collect() -> References {
             Ok(exe) => out.paths.push(PathBuf::from(
                 exe.to_string_lossy().trim_end_matches(" (deleted)"),
             )),
-            Err(_) if p.exists() => {
-                out.reliable = false;
+            Err(error) if p.exists() => {
+                out.reliable &= !required_handle_error(strict, &error);
             }
             Err(_) => {}
         }
         // Command arguments include script paths and configured rollback dirs.
+        match std::fs::read_link(p.join("cwd")) {
+            Ok(cwd) => out.paths.push(cwd),
+            Err(error) if p.exists() => out.reliable &= !required_handle_error(strict, &error),
+            Err(_) => {}
+        }
         if let Ok(args) = std::fs::read(p.join("cmdline")) {
             out.config.push_str(&String::from_utf8_lossy(&args));
             out.config.push('\n');
@@ -85,8 +106,8 @@ pub fn collect() -> References {
                     }
                 }
             }
-            Err(_) if p.exists() => {
-                out.reliable = false;
+            Err(error) if p.exists() => {
+                out.reliable &= !required_handle_error(strict, &error);
             }
             Err(_) => {}
         }
@@ -147,6 +168,18 @@ fn read_config_tree(path: &Path, out: &mut References) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_login_agent_handles_do_not_freeze_rebuildable_caches_but_still_protect_rollbacks() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let rollback = References { reliable: !required_handle_error(true, &denied), ..Default::default() };
+        let cache = References { reliable: !required_handle_error(false, &denied), ..Default::default() };
+        let path = Path::new("/fixture/target/release/deps");
+        assert!(rollback.protects(path));
+        assert!(!cache.protects(path));
+        let unexpected = std::io::Error::from(std::io::ErrorKind::Other);
+        assert!(required_handle_error(false, &unexpected), "unexpected evidence failure must still retain caches");
+    }
 
     #[test]
     fn canonical_process_references_protect_symlinked_and_relative_candidates() {

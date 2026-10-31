@@ -35,6 +35,9 @@ fn concurrent_or_uncertain_writers_are_rejected() {
     let lease = session.begin(ProviderKind::Codex).unwrap();
     assert!(session.begin(ProviderKind::Codex).is_err());
     assert!(session.begin(ProviderKind::Claude).is_err());
+    // Only a turn that reached submission can become uncertain on Drop.
+    // Pre-submission capacity refusal is retryable (#1626).
+    lease.mark_submitting();
     drop(lease);
     assert!(session.begin(ProviderKind::Codex).is_err());
     assert!(session.is_uncertain());

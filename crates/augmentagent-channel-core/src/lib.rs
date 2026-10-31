@@ -8,6 +8,9 @@
 //! one work-source contract instead of inventing their own per platform.
 
 pub mod archetype;
+pub mod audit_chain;
+pub mod autoship_scope;
+pub mod autoship_write_scope;
 pub mod build_scratch;
 pub mod cerebras;
 pub mod cli_gate;
@@ -34,6 +37,7 @@ pub mod providers;
 pub mod public_report;
 pub mod reasoner;
 pub mod resolve;
+pub mod run_resources;
 pub mod secret_loader;
 pub mod skills;
 pub mod state_dir;
@@ -65,7 +69,7 @@ pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurf
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerError, ReasonerOpts};
 // #655 — multi-provider failover: one Reasoner seam, N provider adapters.
 pub use cooldown::CooldownLatch;
-pub use fallback::{build_pinned, build_reasoner, ineligible_reason, FallbackReasoner, LaneAvailability};
+pub use fallback::{build_workflow_pinned, build_workflow_reasoner, build_pinned, build_reasoner, ineligible_reason, FallbackReasoner, LaneAvailability};
 // #1040 — content-level endings and the completed-work re-dispatch guard.
 pub use handoff_outcome::CompletedWithoutSummary;
 pub use turn_failure::{FailureClass, TurnFailure};
@@ -89,6 +93,7 @@ pub use trigger::{
 pub mod model_router;
 pub mod model_selection;
 pub mod native_session;
+pub mod native_vm;
 // #1288 — the transport-neutral conversation turn (native sessions, turn
 // claims, cancellation) shared by Discord and Slack, and its conformance
 // fixtures.
@@ -97,3 +102,5 @@ pub mod surface_turn;
 
 pub mod phone_agent;
 pub mod phone_fast;
+
+pub mod triage_capture;

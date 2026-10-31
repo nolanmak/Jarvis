@@ -759,6 +759,10 @@ impl EventHandler for Handler {
                     }
                 }
                 Err(e) => {
+                    // #1626 — the owner sees this text in Discord; keep it in
+                    // the daemon log too so a failed turn can be diagnosed
+                    // without correlating Discord and the store by hand.
+                    warn!(%channel_id, %msg_id, error = %e, "discord query failed");
                     let mut err_msg = format!("wiki query failed: {e}");
                     if let Some(f) = &footer {
                         err_msg.push_str("\n\n");
@@ -2470,6 +2474,15 @@ fn extension_for(att: &Attachment) -> String {
     inbound::extension_for(&att.filename, att.content_type.as_deref())
 }
 
+/// #1629 — remember the owner's filename beside its opaque download, so a
+/// re-attach (`gmail compose --attach`) sends it under that name. Best-effort:
+/// the turn still works without it.
+async fn record_original_name(path: &Path, original: &str) {
+    if let Err(e) = augmentagent_docs::inbound::record_original_name(path, original).await {
+        warn!("record original name for {} failed: {e}", path.display());
+    }
+}
+
 /// Download each attachment to `/tmp/aa-img-<msg_id>-<idx>.<ext>`. Returns the
 /// paths that succeeded; failures are logged and skipped.
 async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf> {
@@ -2480,7 +2493,10 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
         match reqwest::get(&att.url).await {
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => match augmentagent_docs::inbound::write_private_attachment(&path, &bytes).await {
-                    Ok(()) => out.push(path),
+                    Ok(()) => {
+                        record_original_name(&path, &att.filename).await;
+                        out.push(path)
+                    }
                     Err(e) => warn!("write image tempfile {} failed: {e}", path.display()),
                 },
                 Err(e) => warn!("read image bytes from {} failed: {e}", att.url),
@@ -2523,12 +2539,15 @@ async fn download_text_files(
                 Ok(bytes) => {
                     let (to_write, truncated) = truncate_text_bytes(&bytes);
                     match augmentagent_docs::inbound::write_private_attachment(&path, to_write).await {
-                        Ok(()) => out.push(DownloadedTextFile {
-                            path,
-                            truncated,
-                            original_size: u64::from(att.size),
-                            note: None,
-                        }),
+                        Ok(()) => {
+                            record_original_name(&path, &att.filename).await;
+                            out.push(DownloadedTextFile {
+                                path,
+                                truncated,
+                                original_size: u64::from(att.size),
+                                note: None,
+                            })
+                        }
                         Err(e) => warn!("write text tempfile {} failed: {e}", path.display()),
                     }
                 }
@@ -2631,6 +2650,7 @@ async fn extract_doc_attachments(attachments: &[Attachment], msg_id: u64, signab
                 continue;
             }
         };
+        record_original_name(&in_path, &att.filename).await;
         // Preserve main's owner-only signing workflow alongside retained originals.
         if let Some(root) = signable_root.filter(|_| matches!(kind, DocKind::Pdf)) {
             match tokio::fs::read(&in_path).await {

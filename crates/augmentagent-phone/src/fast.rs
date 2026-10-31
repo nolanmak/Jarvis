@@ -279,6 +279,11 @@ impl TaskEvents {
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         }
     }
+    /// A durable duplicate already has a worker or a delivered result. Release
+    /// this invocation's activity count without announcing a second outcome.
+    pub fn duplicate(&self) {
+        self.settle();
+    }
     /// The task's result was delivered to chat. Returns whether a spoken
     /// announcement was queued on the still-live call.
     pub fn completed(&self, result: &str) -> bool {
