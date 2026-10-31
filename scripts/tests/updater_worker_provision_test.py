@@ -12,6 +12,12 @@ ROOT=Path(__file__).resolve().parents[2]
 @unittest.skipUnless(sys.platform=='linux','Linux worker provisioning')
 class WorkerProvisionTests(unittest.TestCase):
     def test_script_only_update_repairs_cached_release_modes_without_restarting_daemon(self):
+        self.run_update(False)
+
+    def test_failed_cached_artifact_validation_withholds_stamp_and_services(self):
+        self.run_update(True)
+
+    def run_update(self,invalid):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             for name in ['check-for-updates.sh','lib/service-restart.sh','lib/update-build.sh',
@@ -46,7 +52,17 @@ if 'show' in sys.argv:
             calls=root/'calls'
             env={'HOME':str(root),'XDG_STATE_HOME':str(root/'state'),'XDG_CONFIG_HOME':str(root/'config'),
                  'PATH':str(tools)+':/usr/bin:/bin','CALLS':str(calls)}
+            stamp=root/'state/augmentagent/built-commit';stamp.parent.mkdir(parents=True)
+            stamp.write_text('a'*40+'\n')
+            if invalid:memory.chmod(0o600)
             result=subprocess.run(['bash',str(root/'scripts/check-for-updates.sh')],env=env,capture_output=True,text=True,timeout=30)
+            if invalid:
+                self.assertNotEqual(result.returncode,0)
+                self.assertEqual(stamp.read_text().strip(),'a'*40)
+                self.assertEqual(cli.stat().st_mode & 0o777,0o775)
+                self.assertNotIn('enable augmentagent-autopr.service',calls.read_text())
+                self.assertNotIn('restart augmentagent.service',calls.read_text())
+                return
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual((root/'state/augmentagent/built-commit').read_text().strip(),'b'*40)
             self.assertEqual([p.stat().st_mode & 0o777 for p in [cli,memory]],[0o755,0o755],

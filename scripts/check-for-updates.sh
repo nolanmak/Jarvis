@@ -190,20 +190,22 @@ apply_update() {
       esac
     fi
     log "rust build ok (augmentagent + augmentagent-mcp-memory)"
-    # Install without starting a duplicate legacy loop. The worker starts
-    # after the daemon restart, and future daemon updates leave it running.
-    local worker_help=""
-    worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
-    case "$worker_help" in
-      *'Usage: augmentagent auto-pr-worker'*)
-        if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
-          log "AUTO-SHIP WORKER PROVISIONING FAILED — deployment stamp withheld"
-          return 1
-        fi ;;
-    esac
   else
     log "no rust code changed; skipping rust rebuild"
   fi
+
+  # Installer/template fixes need provisioning even when Cargo output is
+  # cached or only scripts changed. This reloads configuration without
+  # starting a duplicate loop or forcing an active worker to restart.
+  local worker_help=""
+  worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
+  case "$worker_help" in
+    *'Usage: augmentagent auto-pr-worker'*)
+      if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
+        log "AUTO-SHIP WORKER PROVISIONING FAILED — deployment stamp withheld"
+        return 1
+      fi ;;
+  esac
 
   # The pulled helper or selected profile may be new, and a provider binary
   # may have changed during compilation. Preserve the binary deployment's

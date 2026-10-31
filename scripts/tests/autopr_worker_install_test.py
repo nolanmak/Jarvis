@@ -113,6 +113,24 @@ if 'show' in sys.argv:
                 'literal policy path must not glob-match a neighboring filename')
             shared='EnvironmentFile=-'+pattern.replace('%','%%')
             self.assertIn(shared,dropin.read_text())
+            # Validate both artifacts before changing either mode or units.
+            before_units={p:p.read_bytes() for p in [units/'augmentagent-autopr.service',dropin,selection]}
+            memory_bytes=artifacts[1].read_bytes()
+            foreign=base/'foreign-executable';foreign.write_bytes(memory_bytes);foreign.chmod(0o775)
+            for kind in ['symlink','fifo','non-executable']:
+                artifacts[0].chmod(0o775);artifacts[1].unlink()
+                if kind=='symlink':artifacts[1].symlink_to(foreign)
+                elif kind=='fifo':os.mkfifo(artifacts[1])
+                else:artifacts[1].write_bytes(memory_bytes);artifacts[1].chmod(0o600)
+                rejected=subprocess.run(command,env=env,capture_output=True,text=True,timeout=5)
+                self.assertNotEqual(rejected.returncode,0,kind)
+                self.assertEqual(artifacts[0].stat().st_mode & 0o777,0o775,'partial executable permission change')
+                self.assertEqual(foreign.stat().st_mode & 0o777,0o775,'followed a foreign symlink')
+                self.assertEqual(before_units,{p:p.read_bytes() for p in before_units})
+            artifacts[1].unlink();artifacts[1].write_bytes(memory_bytes);artifacts[1].chmod(0o755)
+            artifacts[0].chmod(0o700)
+            subprocess.run(command,env=env,check=True)
+            self.assertEqual(artifacts[0].stat().st_mode & 0o777,0o700,'installer widened existing read access')
             prior=selection.read_bytes()
             alternate=base/'alternate.json'
             alternate.write_bytes(policy.read_bytes());alternate.chmod(0o600)
