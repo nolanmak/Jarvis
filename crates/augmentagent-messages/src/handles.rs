@@ -85,6 +85,10 @@ pub fn canonical(raw: &str) -> String {
     if let Some(urn) = inner.strip_prefix("linkedin:") {
         return format!("linkedin:{}", urn.trim());
     }
+    // #1701 — Telegram rows store `Name <telegram:USER_ID>`.
+    if let Some(id) = inner.strip_prefix("telegram:") {
+        return format!("telegram:{}", id.trim());
+    }
     // #1296 — Slack rows store `Name <slack:U…>` (the wiki identity form).
     if let Some(id) = inner.strip_prefix("slack:") {
         return format!("slack:{}", id.trim());

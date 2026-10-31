@@ -4708,7 +4708,8 @@ impl Store {
                     (a.recomposedAtMs IS NOT NULL), \
                     COALESCE(e.platform, ''), \
                     a.createdAt, \
-                    e.accountEntityId \
+                    e.accountEntityId, \
+                    a.messageId \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
@@ -4730,6 +4731,7 @@ impl Store {
                 platform: r.get(8)?,
                 created_at_ms: r.get(9)?,
                 account_entity_id: r.get(10)?,
+                message_id: r.get(11)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -8999,6 +9001,8 @@ pub struct PendingActionRow {
     /// The inbound's mailbox (`emails.accountEntityId`). #1700 — teammate
     /// coverage only looks at messages in the same mailbox.
     pub account_entity_id: Option<String>,
+    /// The inbound's message id. #1701 — locates a Slack card in its thread.
+    pub message_id: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by

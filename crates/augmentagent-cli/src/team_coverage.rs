@@ -132,41 +132,126 @@ pub fn mentions_alias(text: &str, aliases: &[String]) -> bool {
     })
 }
 
-/// Conditions 1–6 for one card. `after_ms` is the card's inbound bound
+/// Platforms the rule supports. Email, plus the chat adapters that can raise
+/// a card for a group conversation AND store every group member's messages
+/// with sender, time and the card's thread id (#1701 inventory). WhatsApp,
+/// iMessage and LinkedIn drop groups before drafting; SocialAPI, Twitter and
+/// Instagram cannot attribute group senders — all inert here.
+pub const CHAT_PLATFORMS: [&str; 3] = ["slack", "discord", "telegram"];
+
+pub fn supported(platform: &str) -> bool {
+    platform == augmentagent_channel_email::inbound::PLATFORM || CHAT_PLATFORMS.contains(&platform)
+}
+
+/// A stored message time in ms: RFC 2822 / RFC 3339 / epoch (s or ms), or a
+/// Slack `ts` (`"1700000000.000100"`). `0` when unparseable.
+pub fn message_time_ms(raw: &str) -> i64 {
+    let ms = augmentagent_channel_email::outbound::parse_rfc2822_or_ms(raw);
+    if ms != 0 {
+        return ms;
+    }
+    augmentagent_store::slack_ingest::ts_order(raw.trim())
+        .and_then(|(secs, micros)| i64::try_from(secs * 1000 + micros / 1000).ok())
+        .unwrap_or(0)
+}
+
+/// A conversation id that is 1:1 by construction: Slack `D…` channels and
+/// positive Telegram chat ids. The rule never runs on these.
+fn one_to_one_by_id(platform: &str, thread: &str) -> bool {
+    match platform {
+        "slack" => thread.starts_with('D'),
+        "telegram" => thread.parse::<i64>().is_ok_and(|id| id > 0),
+        _ => false,
+    }
+}
+
+/// Structured `<@ID>` / `<@!ID>` / `<@ID|name>` mentions as canonical handles.
+fn structured_mentions(platform: &str, body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("<@") {
+        rest = &rest[i + 2..];
+        let Some(end) = rest.find('>') else { break };
+        let id = rest[..end].trim_start_matches(['!', '&']).split('|').next().unwrap_or("");
+        if !id.is_empty() {
+            out.push(augmentagent_messages::handles::canonical(&format!("{platform}:{id}")));
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Whether one card is covered. `after_ms` is the card's inbound bound
 /// (receivedAt, else createdAt — the same bound Rule 1 uses).
+///
+/// Email: conditions 1–6 in the module docs. Group chat (#1701): 1–3 and 5
+/// apply; 4 holds by construction (every member sees a group message) except
+/// that a Slack thread reply must be in the asker's thread; 6 has no chat
+/// analogue. On top of that a chat message never covers when it is from the
+/// asker themself or structurally mentions anyone but the asker or a
+/// teammate (the owner included), and 1:1 conversations are exempt.
 pub fn find_coverage(
     store: &Store,
     row: &PendingActionRow,
     after_ms: i64,
     cfg: &Config,
 ) -> anyhow::Result<Option<Coverage>> {
-    use augmentagent_channel_email::outbound::parse_rfc2822_or_ms;
-    use augmentagent_messages::team::TeamClass;
+    use augmentagent_messages::{handles, team::TeamClass};
 
     let (Some(thread), Some(account)) = (row.thread_id.as_deref(), row.account_entity_id.as_deref())
     else {
         return Ok(None);
     };
-    let Some(asker) = augmentagent_store::recipients::parse_addresses(&row.from_email)
-        .into_iter()
-        .next()
-    else {
+    let email = row.platform == augmentagent_channel_email::inbound::PLATFORM;
+    if !supported(&row.platform) || one_to_one_by_id(&row.platform, thread) {
         return Ok(None);
+    }
+    let asker_addr = augmentagent_store::recipients::parse_addresses(&row.from_email).into_iter().next();
+    if email && asker_addr.is_none() {
+        return Ok(None);
+    }
+    let asker_handle = handles::canonical(&row.from_email);
+    let card_thread = if row.platform == "slack" {
+        store.slack_thread_position(&row.message_id)?.map(|(root, _)| root)
+    } else {
+        None
     };
+
     let mut best: Option<Coverage> = None;
     for m in store.thread_messages_in_mailbox(thread, account)? {
         let TeamClass::Teammate { label } = cfg.roster.classify(&m.from, &cfg.owner) else {
             continue;
         };
-        let at = parse_rfc2822_or_ms(&m.received_at);
+        let at = message_time_ms(&m.received_at);
         if at <= 0 || at <= after_ms {
             continue;
         }
-        let Some(r) = &m.recipients else {
-            continue;
-        };
-        if !r.to.iter().chain(&r.cc).any(|a| *a == asker) {
-            continue;
+        if email {
+            let Some(r) = &m.recipients else {
+                continue;
+            };
+            let asker = asker_addr.as_deref().unwrap_or_default();
+            if !r.to.iter().chain(&r.cc).any(|a| a == asker) {
+                continue;
+            }
+        } else {
+            if handles::canonical(&m.from) == asker_handle {
+                continue;
+            }
+            let foreign_mention = structured_mentions(&row.platform, &m.body).iter().any(|h| {
+                *h != asker_handle
+                    && !matches!(cfg.roster.classify(h, &cfg.owner), TeamClass::Teammate { .. })
+            });
+            if foreign_mention {
+                continue;
+            }
+            if row.platform == "slack" {
+                if let Some((root, true)) = store.slack_thread_position(&m.message_id)? {
+                    if card_thread.as_deref() != Some(root.as_str()) {
+                        continue;
+                    }
+                }
+            }
         }
         if mentions_alias(&new_text(&m.body), &cfg.aliases) {
             continue;
