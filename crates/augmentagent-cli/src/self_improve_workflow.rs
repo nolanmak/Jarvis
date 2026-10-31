@@ -1622,27 +1622,16 @@ pub(super) async fn prepare_resume_worktree(
     let path = repo_root
         .join(".self-improve-worktrees")
         .join(format!("resume-pr-{pr}"));
+    recovery::checkout_path(repo_root, &path)?;
+    let exists = path.try_exists()?;
+    if exists {
+        recovery::existing_checkout(repo_root, &path).await?;
+    }
+    let (valid, _, _) = run("git", &["check-ref-format", "--branch", branch], repo_root).await?;
+    anyhow::ensure!(valid, "invalid resumed PR branch");
     let (ok, _, _) = run("git", &["fetch", "origin", branch], repo_root).await?;
     anyhow::ensure!(ok, "cannot refresh resumed PR branch");
-    if path.exists() {
-        anyhow::ensure!(
-            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
-            "resume worktree path is a symlink"
-        );
-        let expected = git_evidence(
-            repo_root,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .await?;
-        let actual = git_evidence(
-            &path,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .await?;
-        anyhow::ensure!(
-            Path::new(&expected).canonicalize()? == Path::new(&actual).canonicalize()?,
-            "preserved resume worktree belongs to another repository"
-        );
+    if exists {
         return Ok(path);
     }
     let (ok, _, error) = run(

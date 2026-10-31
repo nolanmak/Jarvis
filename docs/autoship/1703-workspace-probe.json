@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1707,
+  "status": "partial-workspace-ownership-fix",
+  "parent_commit": "077af7f90f4e485998f5efbeed875c783c691fdb",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/self_improve_recovery.rs": "7bfc48fad0e8277550046182172b7efc0eff2921e9e189e6bd21d9fb83f89f37",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "44d391b98ab0479f401fb1f74e03ddfde6971b377250646a96695e1081353abb"
+  },
+  "regressions": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-recovery-paths.log",
+      "cargo_exit": 101,
+      "managed_wrapper_exit": 1,
+      "passed": 2,
+      "failed": 3
+    },
+    "green": {
+      "log": "/tmp/autoship-1703-green-recovery-paths.log",
+      "exit": 0,
+      "passed": 7
+    },
+    "workflow_suite": {
+      "log": "/tmp/autoship-1703-green-workflow-paths.log",
+      "exit": 0,
+      "passed": 22,
+      "ignored": 1
+    },
+    "progress_suite": {
+      "log": "/tmp/autoship-1703-green-progress-paths.log",
+      "exit": 0,
+      "passed": 9,
+      "seconds": 92.61,
+      "boundary": "real local Git; scripted GitHub; no models"
+    }
+  },
+  "verified": [
+    "Fresh preparation rejects symlinked parent before branch/worktree creation.",
+    "Resume preparation rejects symlinked parent before fetch.",
+    "Ordinary owner subdirectories cannot inherit parent Git identity and masquerade as candidates.",
+    "Recovery requires an exact registered worktree and rejects copied Git pointers and dangling parents.",
+    "Dirty candidate contents and index survive resume; owner tracked/untracked bytes, index and HEAD remain unchanged."
+  ],
+  "limits": [
+    "Tests exercise real local Git and production checkout functions, not a complete issue run.",
+    "Global dirty deployment checkout refusal remains pending owned repository isolation.",
+    "This does not attest race-proof filesystem isolation against a hostile same-user process.",
+    "CLI execution, Discord initiation/sessions/updates, deployment and live soak remain open."
+  ]
+}
