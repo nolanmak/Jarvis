@@ -372,6 +372,48 @@ async fn require_strict_integration(github: &mut impl Github, repository: &str) 
     anyhow::bail!("merge-dependency:strict-integration-protection: main requires strict up-to-date required checks without actor bypass")
 }
 
+fn accepted_merge_receipt(raw: &str, node: &str, pr: u64, head: &str, operation_id: &str) -> Result<MergeMutationReceipt> {
+    let response: serde_json::Value = serde_json::from_str(raw)?;
+    anyhow::ensure!(
+        response.get("errors").is_none_or(
+            |errors| errors.is_null() || errors.as_array().is_some_and(|v| v.is_empty())
+        ),
+        "GitHub merge mutation returned errors"
+    );
+    let mutation = &response["data"]["mergePullRequest"];
+    let result = &mutation["pullRequest"];
+    anyhow::ensure!(
+        mutation["clientMutationId"].as_str() == Some(operation_id)
+            && result["id"].as_str() == Some(node)
+            && result["number"].as_u64() == Some(pr)
+            && result["state"] == "MERGED"
+            && result["headRefOid"].as_str() == Some(head),
+        "GitHub merge response does not prove the requested mutation"
+    );
+    let commit = result["mergeCommit"]["oid"]
+        .as_str()
+        .context("merge response lacks commit")?;
+    anyhow::ensure!(
+        matches!(commit.len(), 40 | 64) && commit.bytes().all(|c| c.is_ascii_hexdigit()),
+        "invalid merge commit identity"
+    );
+    let actor = result["mergedBy"]["login"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("merge response lacks actor")?;
+    let merged_at = result["mergedAt"].as_str().context("merge response lacks remote completion time")?;
+    chrono::DateTime::parse_from_rfc3339(merged_at).context("invalid remote merge time")?;
+    Ok(MergeMutationReceipt {
+        expected_head: head.into(),
+        pr_number: pr,
+        pr_node_id: node.into(),
+        merge_commit: commit.into(),
+        merged_by: actor.into(),
+        client_mutation_id: operation_id.into(),
+        merged_at: merged_at.into(),
+    })
+}
+
 async fn merge_mutation(
     github: &mut impl Github,
     repository: &str,
@@ -385,6 +427,11 @@ async fn merge_mutation(
     let operation_id = operation.id.as_str();
     if let Some(receipt) = store.confirmed_merge_receipt(operation_id)? {
         return Ok(Some(serde_json::from_value(receipt)?));
+    }
+    if let Some((raw, node)) = store.merge_response(operation, repository, pr)? {
+        let receipt = accepted_merge_receipt(&raw, &node, pr, head, operation_id)?;
+        store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
+        return Ok(Some(receipt));
     }
     let raw = github
         .call(&[
@@ -429,45 +476,8 @@ async fn merge_mutation(
             &format!("request={operation_id}"),
         ])
         .await?;
-    let response: serde_json::Value = serde_json::from_str(&raw)?;
-    anyhow::ensure!(
-        response.get("errors").is_none_or(
-            |errors| errors.is_null() || errors.as_array().is_some_and(|v| v.is_empty())
-        ),
-        "GitHub merge mutation returned errors"
-    );
-    let mutation = &response["data"]["mergePullRequest"];
-    let result = &mutation["pullRequest"];
-    anyhow::ensure!(
-        mutation["clientMutationId"].as_str() == Some(operation_id)
-            && result["id"].as_str() == Some(node)
-            && result["number"].as_u64() == Some(pr)
-            && result["state"] == "MERGED"
-            && result["headRefOid"].as_str() == Some(head),
-        "GitHub merge response does not prove the requested mutation"
-    );
-    let commit = result["mergeCommit"]["oid"]
-        .as_str()
-        .context("merge response lacks commit")?;
-    anyhow::ensure!(
-        matches!(commit.len(), 40 | 64) && commit.bytes().all(|c| c.is_ascii_hexdigit()),
-        "invalid merge commit identity"
-    );
-    let actor = result["mergedBy"]["login"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .context("merge response lacks actor")?;
-    let merged_at = result["mergedAt"].as_str().context("merge response lacks remote completion time")?;
-    chrono::DateTime::parse_from_rfc3339(merged_at).context("invalid remote merge time")?;
-    let receipt = MergeMutationReceipt {
-        expected_head: head.into(),
-        pr_number: pr,
-        pr_node_id: node.into(),
-        merge_commit: commit.into(),
-        merged_by: actor.into(),
-        client_mutation_id: operation_id.into(),
-        merged_at: merged_at.into(),
-    };
+    store.record_merge_response(operation, &raw, chrono::Utc::now().timestamp_millis())?;
+    let receipt = accepted_merge_receipt(&raw, node, pr, head, operation_id)?;
     store.confirm_merge_dispatch(operation, &serde_json::to_value(&receipt)?, chrono::Utc::now().timestamp_millis())?;
     Ok(Some(receipt))
 }
@@ -576,6 +586,36 @@ mod tests {
             calls: vec![],
         }
     }
+    #[tokio::test]
+    async fn journaled_merge_response_recovers_without_network_replay() {
+        use crate::autoship_workflow::{WorkflowStore, Binding};
+        for valid in [true, false] {
+            let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("workflow.db");
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let binding = Binding { head:"head".into(), contract:"contract".into(), evidence_hash:"proof".into() };
+            store.register("owner/repo#12", "fixture", binding.clone(), now).unwrap();
+            let lease = store.claim("owner/repo#12", "fixture", now, 60_000).unwrap().unwrap();
+            store.attach_pr(&lease, 12, now).unwrap();
+            let op = store.begin_operation(&lease, OperationKind::MergePr, &binding, now).unwrap();
+            store.reserve_merge(&lease, &op, "owner/repo", 12, "PR_fixture", now, 5).unwrap();
+            store.dispatch_merge(&lease, &op, now, 5).unwrap();
+            let mut response = mutation_response();
+            response["data"]["mergePullRequest"]["clientMutationId"] = op.id.clone().into();
+            if !valid { response["data"]["mergePullRequest"]["pullRequest"]["mergedAt"] = serde_json::Value::Null; }
+            let raw = response.to_string();
+            store.record_merge_response(&op, &raw, now).unwrap();
+            drop(store);
+            let mut store = WorkflowStore::open(&path).unwrap();
+            let mut github = MergeFake { replies:VecDeque::from([Ok(merge_before("MERGED"))]), calls:vec![] };
+            let recovered = merge_mutation(&mut github, "owner/repo", 12, "head", &op, &lease, &mut store, 5).await;
+            if valid { assert!(recovered.unwrap().is_some(), "accepted journal response must recover attribution"); }
+            else { assert!(recovered.is_err(), "incomplete journal response remains unresolved"); }
+            assert!(github.calls.is_empty(), "recovery consumes original response, never a second remote request");
+            assert_eq!(store.merge_allowance(now, 5).unwrap().pending, u32::from(!valid));
+        }
+    }
+
     #[tokio::test]
     async fn successful_merge_records_only_matching_accepted_mutation() {
         let mut github = mutation_fake(Ok(mutation_response().to_string()));

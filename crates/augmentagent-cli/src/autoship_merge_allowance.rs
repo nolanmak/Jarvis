@@ -276,6 +276,70 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Preserve the original transport response before parsing or accounting.
+    /// A late response is evidence even after its worker's lease expires.
+    pub fn record_merge_response(&mut self, op: &Operation, raw: &str, now: i64) -> Result<()> {
+        ensure!(
+            raw.len() <= 64 * 1024,
+            "merge transport response exceeds bound"
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, workflow, binding): (String, String, String) = tx.query_row(
+            "SELECT d.state,o.workflow,o.binding FROM merge_allowance_dispatch d JOIN operation o ON o.id=d.operation WHERE d.operation=?1",
+            [&op.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        ensure!(
+            op.kind == OperationKind::MergePr
+                && op.workflow == workflow
+                && serde_json::from_str::<Binding>(&binding)? == op.binding
+                && matches!(state.as_str(), "dispatched" | "confirmed"),
+            "response lacks matching dispatched intent"
+        );
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT response FROM merge_transport_response WHERE operation=?1",
+                [&op.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            ensure!(prior == raw, "immutable merge transport response conflict");
+        } else {
+            tx.execute(
+                "INSERT INTO merge_transport_response VALUES(?1,?2,?3)",
+                params![op.id, raw, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return only a response bound to the requested immutable intent/PR.
+    pub fn merge_response(
+        &self,
+        op: &Operation,
+        repository: &str,
+        pr: u64,
+    ) -> Result<Option<(String, String)>> {
+        let row: Option<(String,String,String,String,u64,String)> = self.conn.query_row(
+            "SELECT r.response,d.pr_node_id,o.binding,d.repository,d.pr,o.workflow FROM merge_transport_response r
+             JOIN merge_allowance_dispatch d ON d.operation=r.operation JOIN operation o ON o.id=r.operation WHERE r.operation=?1",
+            [&op.id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+        row.map(|(raw, node, binding, repo, number, workflow)| {
+            ensure!(
+                op.kind == OperationKind::MergePr
+                    && op.workflow == workflow
+                    && repo == repository.to_ascii_lowercase()
+                    && pr == number
+                    && serde_json::from_str::<Binding>(&binding)? == op.binding,
+                "journal response identity differs"
+            );
+            Ok((raw, node))
+        })
+        .transpose()
+    }
+
     /// Recovery never fabricates a successful response from `state=MERGED`.
     pub fn confirmed_merge_receipt(&self, operation: &str) -> Result<Option<serde_json::Value>> {
         let raw: Option<String> = self.conn.query_row(

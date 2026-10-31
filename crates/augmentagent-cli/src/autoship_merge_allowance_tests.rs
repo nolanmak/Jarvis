@@ -274,8 +274,13 @@ fn allowance_process_exit_worker() {
     if phase != "intent" {
         reserve(&mut store, &lease, &op, 1, now).unwrap();
     }
-    if matches!(phase.as_str(), "dispatched" | "confirmed") {
+    if matches!(phase.as_str(), "dispatched" | "response" | "confirmed") {
         store.dispatch_merge(&lease, &op, now, 5).unwrap();
+    }
+    if phase == "response" {
+        store
+            .record_merge_response(&op, "original response awaiting parse", now)
+            .unwrap();
     }
     if phase == "confirmed" {
         store
@@ -288,7 +293,7 @@ fn allowance_process_exit_worker() {
 
 #[test]
 fn allowance_process_exit_preserves_dispatch_and_atomic_confirmation() {
-    for phase in ["intent", "reserved", "dispatched", "confirmed"] {
+    for phase in ["intent", "reserved", "dispatched", "response", "confirmed"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workflow.db");
         let test_name = format!(
@@ -312,7 +317,7 @@ fn allowance_process_exit_preserves_dispatch_and_atomic_confirmation() {
         assert_eq!(status.confirmed, u32::from(phase == "confirmed"), "{phase}");
         assert_eq!(
             status.pending,
-            u32::from(matches!(phase, "reserved" | "dispatched")),
+            u32::from(matches!(phase, "reserved" | "dispatched" | "response")),
             "{phase}"
         );
         let receipt_count: u32 = store
@@ -325,11 +330,49 @@ fn allowance_process_exit_preserves_dispatch_and_atomic_confirmation() {
             receipt_count, status.confirmed,
             "receipt and debit must commit together"
         );
+        let response_count: u32 = store
+            .conn
+            .query_row("SELECT count(*) FROM merge_transport_response", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(response_count, u32::from(phase == "response"));
         let after_expiry = store.merge_allowance(104 * DAY, 5).unwrap();
         assert_eq!(
             after_expiry.pending,
-            u32::from(phase == "dispatched"),
+            u32::from(matches!(phase, "dispatched" | "response")),
             "only potentially dispatched work retains capacity after lease expiry"
         );
     }
+}
+
+#[test]
+fn allowance_response_journal_is_bound_and_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open(&dir.path().join("workflow.db")).unwrap();
+    let now = 100 * DAY;
+    let (lease, op) = fixture(&mut store, 1, now);
+    reserve(&mut store, &lease, &op, 1, now).unwrap();
+    assert!(store.record_merge_response(&op, "response", now).is_err());
+    store.dispatch_merge(&lease, &op, now, 5).unwrap();
+    store.record_merge_response(&op, "response", now).unwrap();
+    store
+        .record_merge_response(&op, "response", now + 1)
+        .unwrap();
+    assert!(store
+        .record_merge_response(&op, "replacement", now + 1)
+        .is_err());
+    let mut other = op.clone();
+    other.binding.contract = "unreviewed".into();
+    assert!(store
+        .record_merge_response(&other, "response", now)
+        .is_err());
+    assert!(store.merge_response(&other, "owner/repo", 1).is_err());
+    assert!(store.merge_response(&op, "owner/other", 1).is_err());
+    assert!(store.merge_response(&op, "owner/repo", 2).is_err());
+    assert_eq!(
+        store.merge_response(&op, "owner/repo", 1).unwrap(),
+        Some(("response".into(), "PR_1".into()))
+    );
+    assert_eq!(store.merge_allowance(now, 5).unwrap().confirmed, 0);
 }

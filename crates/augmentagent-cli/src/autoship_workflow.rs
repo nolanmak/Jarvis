@@ -320,6 +320,9 @@ impl WorkflowStore {
                 generation INTEGER NOT NULL, reserved_at_ms INTEGER NOT NULL,
                 dispatched_at_ms INTEGER, merged_at_ms INTEGER, resolution TEXT,
                 state TEXT NOT NULL CHECK(state IN ('reserved','dispatched','confirmed','released')));
+            CREATE TABLE IF NOT EXISTS merge_transport_response (
+                operation TEXT PRIMARY KEY REFERENCES merge_allowance_dispatch(operation),
+                response TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_pr
                 ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node
