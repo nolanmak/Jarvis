@@ -273,3 +273,79 @@ async fn rejected_history_cursor_reconciles_to_exact_corpus_without_duplicates()
         153
     );
 }
+
+#[tokio::test]
+async fn account_throttle_defers_other_categories_and_inventory_after_restart() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "600"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    let cancel = CancellationToken::new();
+    let first = archive_sync::sync(&reader, &s, "PRIMARY_INBOX", 20, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(first.pages, 1);
+    drop(s);
+    let s = Store::open(f.path()).unwrap();
+    let next = archive_sync::sync(&reader, &s, "ARCHIVE", 20, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(
+        next.pages, 0,
+        "a throttle is account-wide, not category-local"
+    );
+    augmentagent_channel_linkedin::archive_live::poll(&reader, &s, 100, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn inventory_throttle_is_durable_before_any_category_is_known() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "600"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    let cancel = CancellationToken::new();
+    assert!(
+        augmentagent_channel_linkedin::archive_live::poll(&reader, &s, 100, &cancel)
+            .await
+            .is_err()
+    );
+    drop(s);
+    let s = Store::open(f.path()).unwrap();
+    augmentagent_channel_linkedin::archive_live::poll(&reader, &s, 100, &cancel)
+        .await
+        .unwrap();
+    let coverage = s
+        .with_conn(|c| {
+            augmentagent_store::linkedin_archive::search_coverage(
+                c,
+                augmentagent_messages::EXTRACTOR_VERSION,
+            )
+        })
+        .unwrap();
+    assert!(coverage.scopes.is_empty());
+    assert_eq!(coverage.accounts.len(), 1);
+    assert!(coverage.accounts[0]
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("rate limited"));
+    assert!(coverage.accounts[0].retry_at_ms > 0);
+    let explicit = archive_sync::sync(&reader, &s, "PRIMARY_INBOX", 20, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(explicit.pages, 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}

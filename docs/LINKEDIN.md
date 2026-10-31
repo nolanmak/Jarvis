@@ -215,6 +215,15 @@ instead of restarting indefinitely. This is a conservative recovery policy,
 not a claim that every 400 response means an expired LinkedIn cursor. A first-page
 failure, authentication error, or throttle does not trigger this recovery.
 
+Authentication, redirect, and rate-limit failures pause archival reads for the
+whole account, including category discovery. The pause survives restarts and
+explicit category changes; `Retry-After` controls throttling, with a 60-second
+backoff for session failures. Inventory failures also persist a backoff.
+Search/status coverage includes `accounts` with the last error and retry time,
+even when discovery failed before any category was recorded. Successful reads
+begun after the pause clear its error; older concurrent requests cannot clear
+a newer pause.
+
 Backfill defaults to all categories exposed by the account's mailbox inventory.
 It stores group and owner messages without drafting, raising cards or sending.
 Repeat bounded invocations to resume durable progress; `--refresh` reconciles

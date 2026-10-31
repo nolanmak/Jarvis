@@ -61,3 +61,7 @@ CREATE TABLE IF NOT EXISTS linkedin_archive_restarts (
  account TEXT NOT NULL, scope TEXT NOT NULL, restarted_at_ms INTEGER NOT NULL,
  PRIMARY KEY(account,scope)
 );
+-- Transport failures that must defer every category, including discovery.
+CREATE TABLE IF NOT EXISTS linkedin_archive_accounts (
+ account TEXT PRIMARY KEY, last_error TEXT, retry_at_ms INTEGER NOT NULL DEFAULT 0
+);

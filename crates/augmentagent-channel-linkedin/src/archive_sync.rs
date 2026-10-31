@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 pub struct SyncReport {
     pub pages: usize,
     pub stopped: String,
+    pub account_deferred: bool,
     pub coverage: Coverage,
 }
 fn now_ms() -> i64 {
@@ -33,10 +34,17 @@ pub async fn sync(
 ) -> anyhow::Result<SyncReport> {
     let account = reader.mailbox();
     let mut pages = 0;
+    let mut account_deferred = false;
     let mut stopped = "page_budget".to_string();
     while pages < max_pages {
         if cancel.is_cancelled() {
             stopped = "cancelled".into();
+            break;
+        }
+        let request_started = now_ms();
+        if db::account_retry_at(store, account)? > request_started {
+            stopped = "retry_deferred".into();
+            account_deferred = true;
             break;
         }
         let cp = db::checkpoint(store, account, category)?;
@@ -52,9 +60,11 @@ pub async fn sync(
             pages += 1;
             match fetched {
                 Ok(page) => {
+                    db::clear_account_failure(store, account, request_started)?;
                     db::commit_conversations(store, account, category, &cp, &page, now_ms())?;
                 }
                 Err(e) => {
+                    account_deferred = defer_account(store, account, &e, now_ms())?;
                     // A cursor-bearing request rejected as bad/gone gets one
                     // bounded reconciliation. This is deliberately not applied
                     // to auth, throttling, or malformed successful responses.
@@ -93,9 +103,11 @@ pub async fn sync(
             pages += 1;
             match fetched {
                 Ok(page) => {
+                    db::clear_account_failure(store, account, request_started)?;
                     db::commit_messages(store, account, &thread, &cp, &page, now_ms())?;
                 }
                 Err(e) => {
+                    account_deferred = defer_account(store, account, &e, now_ms())?;
                     if matches!(e, ArchiveError::Status(400 | 410))
                         && db::restart_cursor(store, account, &thread, true, &cp, now_ms())?
                     {
@@ -111,10 +123,7 @@ pub async fn sync(
                     )?;
                     // Session/throttle failures are account-wide. Other failures
                     // leave this thread partial while allowing other threads.
-                    if matches!(
-                        e,
-                        ArchiveError::Auth | ArchiveError::Redirect | ArchiveError::RateLimited(_)
-                    ) {
+                    if account_deferred {
                         stopped = e.to_string();
                         break;
                     }
@@ -125,6 +134,57 @@ pub async fn sync(
     Ok(SyncReport {
         pages,
         stopped,
+        account_deferred,
         coverage: db::coverage(store, account, category)?,
     })
+}
+
+fn defer_account(
+    store: &Store,
+    account: &str,
+    error: &ArchiveError,
+    now: i64,
+) -> anyhow::Result<bool> {
+    let wide = matches!(
+        error,
+        ArchiveError::Auth | ArchiveError::Redirect | ArchiveError::RateLimited(_)
+    );
+    if wide {
+        db::record_account_failure(store, account, &error.to_string(), retry_at(error, now))?;
+    }
+    Ok(wide)
+}
+
+/// Inventory obeys the same durable account deferral as mailbox/history reads.
+/// None means deferred or cancelled, never an empty accessible mailbox.
+pub async fn categories(
+    reader: &ArchiveReader,
+    store: &Store,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let started = now_ms();
+    if cancel.is_cancelled() || db::account_retry_at(store, reader.mailbox())? > started {
+        return Ok(None);
+    }
+    let fetched = tokio::select! {
+        _=cancel.cancelled()=>return Ok(None),
+        result=reader.categories()=>result,
+    };
+    match fetched {
+        Ok(categories) => {
+            db::clear_account_failure(store, reader.mailbox(), started)?;
+            Ok(Some(categories))
+        }
+        Err(error) => {
+            // Inventory is required for every implicit-scope poll. Persist all
+            // its failures, including malformed responses and transient I/O.
+            db::record_account_failure(
+                store,
+                reader.mailbox(),
+                &error.to_string(),
+                retry_at(&error, now_ms()),
+            )?;
+            Err(error.into())
+        }
+    }
 }

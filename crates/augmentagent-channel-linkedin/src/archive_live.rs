@@ -151,9 +151,8 @@ pub async fn poll(
     if max_pages == 0 || cancel.is_cancelled() {
         return pending(store, reader.mailbox());
     }
-    let categories = tokio::select! {
-        _=cancel.cancelled()=>return pending(store,reader.mailbox()),
-        result=reader.categories()=>result?,
+    let Some(categories) = crate::archive_sync::categories(reader, store, cancel).await? else {
+        return pending(store, reader.mailbox());
     };
     let mut remaining = max_pages - 1;
     for category in categories {
@@ -168,10 +167,7 @@ pub async fn poll(
         }
         let report = crate::archive_sync::sync(reader, store, &category, remaining, cancel).await?;
         remaining = remaining.saturating_sub(report.pages);
-        if report.stopped.contains("session rejected")
-            || report.stopped.contains("rate limited")
-            || report.stopped.contains("redirected")
-        {
+        if report.account_deferred {
             break;
         }
     }

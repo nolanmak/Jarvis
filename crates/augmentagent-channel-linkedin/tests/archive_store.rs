@@ -944,3 +944,26 @@ fn scoped_fallback_identity_cannot_overwrite_unowned_legacy_data() {
         cp.revision
     );
 }
+
+#[test]
+fn account_failure_clear_cannot_erase_a_concurrent_throttle() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    record_account_failure(&s, OWNER, "initial", 1000).unwrap();
+    record_account_failure(&s, OWNER, "newer throttle", 5000).unwrap();
+    // A delayed request/error must neither shorten the pause nor erase it.
+    record_account_failure(&s, OWNER, "older failure", 2000).unwrap();
+    clear_account_failure(&s, OWNER, 1001).unwrap();
+    assert_eq!(account_retry_at(&s, OWNER).unwrap(), 5000);
+    let status = s
+        .with_conn(|c| augmentagent_store::linkedin_archive::account_status(c, OWNER))
+        .unwrap();
+    assert_eq!(status.last_error.as_deref(), Some("newer throttle"));
+    // A successful request begun after the pause can clear the stale error.
+    clear_account_failure(&s, OWNER, 5001).unwrap();
+    assert_eq!(account_retry_at(&s, OWNER).unwrap(), 0);
+    let status = s
+        .with_conn(|c| augmentagent_store::linkedin_archive::account_status(c, OWNER))
+        .unwrap();
+    assert!(status.last_error.is_none());
+}

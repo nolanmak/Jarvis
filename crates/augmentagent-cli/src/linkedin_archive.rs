@@ -119,7 +119,13 @@ pub async fn backfill(
     let api = reader()?;
     let categories = match category {
         Some(c) => vec![c.to_string()],
-        None => api.categories().await?,
+        None => archive_sync::categories(&api, &store, &CancellationToken::new())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LinkedIn account reads deferred; inspect archive-status before retrying"
+                )
+            })?,
     };
     let cancel = CancellationToken::new();
     let signal = cancel.clone();

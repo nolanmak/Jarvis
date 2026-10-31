@@ -204,3 +204,42 @@ pub fn restart_cursor(
         Ok(true)
     })?)
 }
+
+pub fn account_retry_at(store: &Store, account: &str) -> anyhow::Result<i64> {
+    Ok(store.with_conn(|c| {
+        Ok(c.query_row(
+            "SELECT retry_at_ms FROM linkedin_archive_accounts WHERE account=?1",
+            [account],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+    })?)
+}
+
+pub fn record_account_failure(
+    store: &Store,
+    account: &str,
+    error: &str,
+    retry_at_ms: i64,
+) -> anyhow::Result<()> {
+    store.with_conn(|c| {
+        c.execute("INSERT INTO linkedin_archive_accounts(account,last_error,retry_at_ms) VALUES(?1,?2,?3) ON CONFLICT(account) DO UPDATE SET last_error=CASE WHEN excluded.retry_at_ms>=retry_at_ms THEN excluded.last_error ELSE last_error END,retry_at_ms=MAX(retry_at_ms,excluded.retry_at_ms)",params![account,error,retry_at_ms])?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// A successful request may clear an expired failure, but cannot erase a newer
+/// throttle concurrently observed by another importer.
+pub fn clear_account_failure(
+    store: &Store,
+    account: &str,
+    request_started_ms: i64,
+) -> anyhow::Result<()> {
+    store.with_conn(|c| {
+        c.execute("UPDATE linkedin_archive_accounts SET last_error=NULL,retry_at_ms=0 WHERE account=?1 AND retry_at_ms<=?2",params![account,request_started_ms])?;
+        Ok(())
+    })?;
+    Ok(())
+}

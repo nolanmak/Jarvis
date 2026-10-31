@@ -2,10 +2,34 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountStatus {
+    pub account: String,
+    pub last_error: Option<String>,
+    pub retry_at_ms: i64,
+}
+
+pub fn account_status(c: &Connection, account: &str) -> rusqlite::Result<AccountStatus> {
+    let (last_error, retry_at_ms) = c
+        .query_row(
+            "SELECT last_error,retry_at_ms FROM linkedin_archive_accounts WHERE account=?1",
+            [account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, 0));
+    Ok(AccountStatus {
+        account: account.into(),
+        last_error,
+        retry_at_ms,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Coverage {
     pub account: String,
     pub category: String,
     pub mailbox_complete: bool,
+    pub account_status: AccountStatus,
     pub last_success_ms: Option<i64>,
     pub last_error: Option<String>,
     pub retry_at_ms: i64,
@@ -43,11 +67,14 @@ pub fn coverage(
              LEFT JOIN message_index mi ON mi.message_id=m.stored_id
              WHERE k.account=?1 AND k.category=?2",
             params![account,category,extractor_version],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-    let no_errors = last_error.is_none() && failed_threads == 0;
+    let account_status = account_status(c, account)?;
+    let no_errors =
+        last_error.is_none() && failed_threads == 0 && account_status.last_error.is_none();
     Ok(Coverage {
         account: account.into(),
         category: category.into(),
         mailbox_complete,
+        account_status,
         last_success_ms,
         last_error,
         retry_at_ms,
@@ -78,6 +105,7 @@ pub struct SearchCoverage {
     pub scope: &'static str,
     pub state: &'static str,
     pub scopes: Vec<Coverage>,
+    pub accounts: Vec<AccountStatus>,
 }
 /// This is deliberately scoped to recorded categories, never a claim that an
 /// unobserved mailbox category is empty or that a past observation is live.
@@ -92,6 +120,13 @@ pub fn search_coverage(c: &Connection, extractor_version: i64) -> rusqlite::Resu
         .into_iter()
         .map(|(account, category)| coverage(c, &account, &category, extractor_version))
         .collect::<Result<Vec<_>, _>>()?;
+    let accounts = c
+        .prepare("SELECT account FROM linkedin_archive_accounts ORDER BY account")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|account| account_status(c, &account))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(SearchCoverage {
         scope: "known_categories_only",
         state: if scopes.is_empty() {
@@ -100,5 +135,6 @@ pub fn search_coverage(c: &Connection, extractor_version: i64) -> rusqlite::Resu
             "observed_scopes"
         },
         scopes,
+        accounts,
     })
 }
