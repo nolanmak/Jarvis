@@ -1,5 +1,6 @@
 """Checkpoint admission through the real driver; GitHub is a refusing fixture."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,9 @@ import tempfile
 import unittest
 
 DRIVER = Path(__file__).with_name('autoship-github-acceptance.py')
+SPEC = importlib.util.spec_from_file_location('github_acceptance', DRIVER)
+driver = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(driver)
 
 
 class ArtifactAdmissionTests(unittest.TestCase):
@@ -62,6 +66,41 @@ class ArtifactAdmissionTests(unittest.TestCase):
 
     def test_matching_artifact_may_reach_the_github_boundary(self):
         self.check_resume(lambda checkpoint, root: None, 'fixture-github-refused', github=True)
+
+    def test_modified_completed_log_is_not_reused(self):
+        def stage(checkpoint, root):
+            original = b'test result: ok. 1 passed\n'
+            checkpoint['done']['1-accepted'] = {
+                'head': 'a' * 40, 'artifact': checkpoint['artifact'],
+                'log': 'stage.log', 'log_sha256': hashlib.sha256(original).hexdigest()}
+            (root / 'stage.log').write_bytes(original + b'changed\n')
+        self.check_resume(stage, 'checkpoint-stage-log-mismatch')
+
+    def test_path_replacement_cannot_substitute_the_executed_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / 'test-binary'
+            binary.write_text('#!/bin/sh\necho original-artifact\n')
+            binary.chmod(0o700)
+            with binary.open('rb') as stream:
+                artifact = driver.artifact_identity(stream)
+                replacement = binary.with_suffix('.replacement')
+                replacement.write_text('#!/bin/sh\necho substituted-artifact\nexit 99\n')
+                replacement.chmod(0o700)
+                replacement.replace(binary)
+                result = driver.run_probe(stream, artifact, {'PATH': '/usr/bin:/bin'})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'original-artifact')
+
+    def test_in_place_artifact_mutation_refuses_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / 'test-binary'
+            binary.write_text('#!/bin/sh\necho original-artifact\n')
+            binary.chmod(0o700)
+            with binary.open('rb') as stream:
+                artifact = driver.artifact_identity(stream)
+                binary.write_text('#!/bin/sh\necho changed-artifact\n')
+                with self.assertRaisesRegex(ValueError, 'artifact-changed-before-dispatch'):
+                    driver.run_probe(stream, artifact, {'PATH': '/usr/bin:/bin'})
 
 
 if __name__ == '__main__':
