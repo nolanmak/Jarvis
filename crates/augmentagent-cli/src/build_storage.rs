@@ -1086,7 +1086,11 @@ fn reconcile_with_pressure(
     let remaining = crate::disk::disk_bytes(target);
     // Retain the root's small Cargo/ownership records even for an explicit
     // zero cap. Larger unprunable files must not silently defeat the budget.
-    let over_cap = !checkout_target && remaining > cap.saturating_add(1024 * 1024);
+    let available_after = readings.iter().zip(&reservations)
+        .map(|((_, free), reserved)| free.saturating_sub(*reserved)).min().unwrap_or(0);
+    let effective_cap = cap_for_free_space(remaining,
+        cap_mb.saturating_mul(1024 * 1024), available_after, reserve);
+    let over_cap = !checkout_target && remaining > effective_cap.saturating_add(1024 * 1024);
     let report = serde_json::json!({"at": chrono::Utc::now(), "target": target,
             "before_free_bytes": free, "after_free_bytes": after,
             "required_free_bytes": reserve, "admitted": refusal.is_none() && !over_cap && !reserved_busy,
@@ -1435,6 +1439,31 @@ mod tests {
         assert!(records[0].ephemeral);
         assert!(records[0].worktree.is_none());
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pressure_recovery_recomputes_effective_cache_cap() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("repo");
+        repo(&r);
+        let target = t.path().join("cache");
+        let state = t.path().join("state");
+        let _lease = Lease::try_at(&state).unwrap().unwrap();
+        register(&r, &target, None, &state).unwrap();
+        // Protected output cannot be pruned. Reclaiming another owned cache
+        // restores this filesystem's headroom without changing these bytes.
+        let retained = target.join("retained-output");
+        std::fs::write(&retained, vec![1; 2 * 1024 * 1024]).unwrap();
+        let recovered = std::cell::Cell::new(false);
+        let paths = vec![target.clone()];
+        let claims = Default::default();
+        let result = reconcile_with_pressure(&r, &target, &state, 25.0, 20_000,
+            ReconcileContext { held: None, claims: &claims, paths: &paths, update: false },
+            &|_| Some(if recovered.get() { 30 << 30 } else { 1 << 30 }),
+            &|_| { recovered.set(true); Ok(Vec::new()) });
+        assert!(result.is_ok(), "recovered headroom must admit on the same pass: {result:?}");
+        assert_eq!(std::fs::metadata(retained).unwrap().len(), 2 * 1024 * 1024);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn unreclaimable_cache_bytes_refuse_admission_without_deleting_unknown_files() {
