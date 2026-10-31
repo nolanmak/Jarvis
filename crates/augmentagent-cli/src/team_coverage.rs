@@ -137,10 +137,11 @@ pub fn mentions_alias(text: &str, aliases: &[String]) -> bool {
 
 /// Platforms the rule supports. Email, plus the chat adapters that can raise
 /// a card for a group conversation AND store every group member's messages
-/// with sender, time and the card's thread id (#1701 inventory). WhatsApp,
-/// iMessage and LinkedIn drop groups before drafting; SocialAPI, Twitter and
-/// Instagram cannot attribute group senders — all inert here.
-pub const CHAT_PLATFORMS: [&str; 3] = ["slack", "discord", "telegram"];
+/// with sender, time and the card's thread id (#1701 inventory). iMessage
+/// joined with group reply cards (#1738). WhatsApp and LinkedIn drop groups
+/// before drafting; SocialAPI, Twitter and Instagram cannot attribute group
+/// senders — all inert here.
+pub const CHAT_PLATFORMS: [&str; 4] = ["slack", "discord", "telegram", "imessage"];
 
 pub fn supported(platform: &str) -> bool {
     platform == augmentagent_channel_email::inbound::PLATFORM || CHAT_PLATFORMS.contains(&platform)
@@ -158,12 +159,18 @@ pub fn message_time_ms(raw: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// A conversation id that is 1:1 by construction: Slack `D…` channels and
-/// positive Telegram chat ids. The rule never runs on these.
+/// A conversation id that is 1:1 by construction: Slack `D…` channels,
+/// positive Telegram chat ids, and iMessage threads keyed by a person's
+/// phone or email (groups are keyed by a chat id). The rule never runs on these.
 fn one_to_one_by_id(platform: &str, thread: &str) -> bool {
     match platform {
         "slack" => thread.starts_with('D'),
         "telegram" => thread.parse::<i64>().is_ok_and(|id| id > 0),
+        // Same handle shape the iMessage allowlist treats as a person.
+        "imessage" => thread.strip_prefix("imessage:").is_none_or(|id| {
+            id.strip_prefix('+').is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                || id.contains('@')
+        }),
         _ => false,
     }
 }
@@ -734,6 +741,32 @@ mod tests {
         for id in [own, slack_dm, tg_dm] {
             assert_eq!(status(&store, &id).0, "pending");
         }
+    }
+
+    #[test]
+    fn imessage_group_teammate_reply_retires_but_one_to_one_never_does() {
+        let (_d, store) = temp_store();
+        let cfg = Config {
+            roster: TeamRoster::parse("Ana=+14155550123"), // pii-ok synthetic
+            ..chat_cfg()
+        };
+        let msg = |thread: &str, id: &str, from: &str, date: &str| Email {
+            account_entity_id: Some("imessage".into()),
+            ..chat_email("imessage", thread, id, from, date, "deck?")
+        };
+        const DANA: &str = "+14155550124"; // pii-ok synthetic
+        const ANA: &str = "+14155550123"; // pii-ok synthetic
+        let group = "imessage:01052e1cb4f44dba881fe97c5729e1ca";
+        store.upsert_email(&msg(group, "g-in", DANA, "2026-01-01T00:00:00-05:00")).unwrap();
+        let g = card_for(&store, "g-in", group, DANA);
+        store.upsert_email(&msg(group, "g-ana", ANA, "2026-01-02T00:00:00-05:00")).unwrap();
+        let dm = format!("imessage:{DANA}");
+        store.upsert_email(&msg(&dm, "d-in", DANA, "2026-01-01T00:00:00-05:00")).unwrap();
+        let d = card_for(&store, "d-in", &dm, DANA);
+        store.upsert_email(&msg(&dm, "d-ana", ANA, "2026-01-02T00:00:00-05:00")).unwrap();
+        assert_eq!(tick(&store, &cfg), 1);
+        assert_eq!(status(&store, &g).0, "superseded");
+        assert_eq!(status(&store, &d).0, "pending");
     }
 
     #[test]

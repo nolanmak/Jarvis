@@ -751,6 +751,11 @@ mod tests {
         let msg = failed_message(f.approver.run_approve(&id).await);
         assert!(msg.contains("allow-outbound chat901"), "{msg}");
         assert_eq!(outbox_len(&f.store), 0);
+        // #1738 — contact defaults cover 1:1 handles only, never a group.
+        f.store.set_imessage_contact_defaults(true, true).unwrap();
+        let msg = failed_message(f.approver.run_approve(&id).await);
+        assert!(msg.contains("allow-outbound chat901"), "{msg}");
+        assert_eq!(outbox_len(&f.store), 0);
         f.store.allow_imessage_outbound("chat901").unwrap();
         assert!(matches!(
             f.approver.run_approve(&id).await,

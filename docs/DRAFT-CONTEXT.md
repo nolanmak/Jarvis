@@ -91,7 +91,8 @@ Update the validation column with actual results before release.
 | Telegram bot replies | Evidence before draft; bot delivery unchanged | Existing adapter library regressions passed; CI verifies merged head |
 | Owner ask | Shared context command and receipt attachment | CLI context/attachment isolation passed; actual-model evidence-present/missing test passed |
 | Revise (email, iMessage, Slack, Discord, LinkedIn, SocialAPI, Telegram) | Shared evidence recovery and accumulated feedback | Shared refresh/accumulated-feedback regression passed; routing regression in CI |
-| iMessage and WhatsApp groups | Existing adapters reject group auto-drafts; unchanged | Existing group/own-echo regression tests |
+| iMessage groups | Opted-in groups draft with a higher triage bar and send by `chat_guid` (#1738) | `channel-imessage` group reply tests |
+| WhatsApp groups | Existing adapter rejects group auto-drafts; unchanged | Existing group/own-echo regression tests |
 | Slack/Discord subscribed channels | Shared context follows existing subscription policy; participant membership is not inferred from sender | Audience uncertainty is explicit; no claim of private-DM semantics |
 | Public feed engagement/comments and GitHub proposals | Separate audience semantics; not migrated by this DM workflow | Explicit limitation; no claim of parity |
 

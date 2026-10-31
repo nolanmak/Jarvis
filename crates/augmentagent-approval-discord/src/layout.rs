@@ -382,8 +382,12 @@ fn approval_embed_and_rows(
     let mut embed = CreateEmbed::new()
         .title(if composed && email.platform == "imessage" { "New message · iMessage".to_string() } else { truncate(&email.subject, 256) })
         .description(description)
-        .field(if composed { "To" } else { "From" }, truncate(&email.from, 256), true)
-        .field("MessageId", truncate(&email.message_id, 256), true);
+        .field(if composed { "To" } else { "From" }, truncate(&email.from, 256), true);
+    // #1738 — an iMessage group reply goes to every member; say so.
+    if !composed && email.platform == "imessage" && !email.to.trim().is_empty() {
+        embed = embed.field("To (group)", truncate(&email.to, 256), true);
+    }
+    let mut embed = embed.field("MessageId", truncate(&email.message_id, 256), true);
     if !needs.is_empty() {
         embed = embed.field(
             "⚠️ Needs your input",
@@ -1795,6 +1799,28 @@ mod tests {
         assert_eq!(label_for("share_doc"), "Document link");
         assert_eq!(label_for("intro"), "Introduction");
         assert_eq!(label_for("???"), "Detail");
+    }
+
+    /// #1738 — a group reply card lists every member it will go to.
+    #[test]
+    fn imessage_group_card_shows_every_member_in_to() {
+        let field_names = |e: &Email| -> Vec<String> {
+            let v: serde_json::Value =
+                serde_json::from_str(&json(&approval_message("act-g1", e, "yes", 0))).unwrap();
+            v["embeds"][0]["fields"].as_array().unwrap().iter()
+                .map(|f| format!("{}={}", f["name"].as_str().unwrap(), f["value"].as_str().unwrap()))
+                .collect()
+        };
+        let mut e = email();
+        e.platform = "imessage".into();
+        e.from = "+15555550100".into(); // pii-ok synthetic
+        e.subject = "iMessage group: Ski Trip".into();
+        e.to = "+15555550100, +15555550111".into(); // pii-ok synthetic
+        let names = field_names(&e);
+        assert!(names.contains(&"To (group)=+15555550100, +15555550111".to_string()), "{names:?}"); // pii-ok synthetic
+        assert!(names.iter().any(|n| n.starts_with("From=")), "{names:?}");
+        e.to.clear();
+        assert!(!field_names(&e).iter().any(|n| n.starts_with("To")), "1:1 cards unchanged");
     }
 
     /// #1635 — a composed message (Slack/iMessage `kind = compose`) has no
