@@ -336,7 +336,12 @@ fn file_edit_opts(root: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     opts
 }
 
-fn file_edit_audit_tool(_provider: ProviderKind, tool: &str) -> Result<bool> {
+fn file_edit_audit_tool(provider: ProviderKind, tool: &str) -> Result<bool> {
+    let tool = match provider {
+        Claude => tool.strip_prefix("mcp__jarvis__").context("Claude guarded tool namespace missing")?,
+        Codex => tool,
+        _ => anyhow::bail!("guarded edit requires a native provider"),
+    };
     anyhow::ensure!(
         ["Read", "Grep", "Glob", "Write", "Edit"].contains(&tool),
         "file-only probe observed undeclared tool"
