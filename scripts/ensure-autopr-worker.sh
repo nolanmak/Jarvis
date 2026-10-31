@@ -6,7 +6,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export REPO_ROOT
 python3 - <<'PY'
-import os, pathlib, re, shlex, subprocess, tempfile
+import os, pathlib, re, shlex, subprocess, tempfile, json, stat
 repo=pathlib.Path(os.environ['REPO_ROOT'])
 home=pathlib.Path.home()
 unit_dir=pathlib.Path(os.environ.get('XDG_CONFIG_HOME',str(home/'.config')))/'systemd/user'
@@ -43,6 +43,27 @@ while raw:
  name,optional=match.groups()
  extra.append('EnvironmentFile='+('-' if optional=='yes' else '')+'"'+escaped(name)+'"')
  raw=raw[match.end():]
+# Selection is explicit; merely staging a profile never activates it. Keep a
+# shared final EnvironmentFile so both units use the same choice on rollout.
+# This validates safe configuration storage, not live provider readiness.
+selection=unit_dir.parent.parent/'augmentagent/autoship-native.env'
+selected=os.environ.get('AUGMENTAGENT_NATIVE_VM_POLICY')
+if selected:
+ path=pathlib.Path(selected)
+ if not path.is_absolute() or '\n' in selected or '\r' in selected:
+  raise RuntimeError('native policy selection must be an absolute single-line path')
+ with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW),'rb') as f:
+  meta=os.fstat(f.fileno())
+  if not stat.S_ISREG(meta.st_mode) or meta.st_uid!=os.geteuid() or meta.st_mode & 0o077 or meta.st_nlink!=1 or meta.st_size>2*1024*1024:
+   raise RuntimeError('native policy must be an owner-private regular file')
+  policy=json.load(f)
+ if policy.get('version')!=1 or not isinstance(policy.get('providers'),dict) or not policy['providers']:
+  raise RuntimeError('invalid native policy declaration')
+ # EnvironmentFile does not expand systemd specifiers or shell variables.
+ value=selected.replace('\\','\\\\').replace('"','\\"')
+ write(selection,'# Managed by ensure-autopr-worker.sh\nAUGMENTAGENT_NATIVE_VM_POLICY="'+value+'"\n')
+shared_environment='EnvironmentFile=-"'+escaped(str(selection))+'"'
+extra.append(shared_environment)
 dry=os.environ.get('AUGMENTAGENT_AUTOSTART_DRY_RUN')
 if dry is None:
  match=re.search(r'--dry-run\s+(true|false)',show('ExecStart'))
@@ -87,11 +108,12 @@ MemorySwapMax=0
 TasksMax={tasks}
 {cpu}
 ''')
-write(unit_dir/'augmentagent.service.d/autoship-worker.conf','''# Managed by ensure-autopr-worker.sh
+write(unit_dir/'augmentagent.service.d/autoship-worker.conf',f'''# Managed by ensure-autopr-worker.sh
 [Unit]
 Wants=augmentagent-autopr.service
 [Service]
 Environment=AUGMENTAGENT_AUTOPR_EXTERNAL=1
+{shared_environment}
 Slice=augmentagent-runtime.slice
 ''')
 log_dir.mkdir(parents=True,exist_ok=True)

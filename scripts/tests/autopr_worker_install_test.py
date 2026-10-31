@@ -1,5 +1,8 @@
 """Render units in an isolated home; never touches the host service manager."""
 import os
+import json
+import hashlib
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
@@ -72,6 +75,29 @@ if 'show' in sys.argv:
             # enable write actions when reinstalling a dry-run daemon.
             subprocess.run(command, env=dict(env,AUGMENTAGENT_AUTOSTART_DRY_RUN='true'),check=True)
             self.assertIn('--dry-run true',(units/'augmentagent-autopr.service').read_text())
+            # Explicit policy selection persists independently of installer env,
+            # and both service processes receive the same final environment file.
+            policy=base/'private profile.json'
+            policy.write_text(json.dumps({'version':1,'providers':{'claude':{'refresh_auth':False},'codex':{'refresh_auth':False}}}))
+            policy.chmod(0o600)
+            original=hashlib.sha256(policy.read_bytes()).hexdigest()
+            subprocess.run(command,env=dict(env,AUGMENTAGENT_NATIVE_VM_POLICY=str(policy)),check=True)
+            selection=base/'config/augmentagent/autoship-native.env'
+            self.assertTrue(selection.exists(),'explicit native profile selection must persist')
+            self.assertEqual(shlex.split(selection.read_text().splitlines()[-1]),['AUGMENTAGENT_NATIVE_VM_POLICY='+str(policy)])
+            self.assertEqual(selection.stat().st_mode & 0o777,0o600)
+            shared='EnvironmentFile=-"'+str(selection)+'"'
+            self.assertIn(shared,(units/'augmentagent-autopr.service').read_text())
+            self.assertIn(shared,dropin.read_text())
+            prior=selection.read_bytes()
+            subprocess.run(command,env=env,check=True)
+            self.assertEqual(selection.read_bytes(),prior)
+            self.assertEqual(hashlib.sha256(policy.read_bytes()).hexdigest(),original,'installer must not enlarge credential grants')
+            policy.chmod(0o644)
+            rejected=subprocess.run(command,env=dict(env,AUGMENTAGENT_NATIVE_VM_POLICY=str(policy)),capture_output=True,text=True)
+            self.assertNotEqual(rejected.returncode,0,'unsafe explicit profile must fail before replacing selection')
+            self.assertEqual(selection.read_bytes(),prior)
+            policy.chmod(0o600)
             subprocess.run(['bash',str(ROOT/'scripts/uninstall-autostart.sh')],env=env,check=True,capture_output=True)
             self.assertFalse((units/'augmentagent-autopr.service').exists())
             self.assertFalse((units/'augmentagent-runtime.slice').exists())

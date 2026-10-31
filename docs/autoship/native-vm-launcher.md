@@ -5,6 +5,31 @@ Codex-backed Qwen/GLM adapters. Missing policy, missing provider profile or an
 incomplete saved native runtime fails before native dispatch. Interactive calls
 without the required-workflow marker retain their existing transport.
 
+Select an existing private profile for both Linux services through the managed
+installer (run from the deployed checkout during normal rollout):
+
+```sh
+AUGMENTAGENT_NATIVE_VM_POLICY=/absolute/controller/policy.json \
+  bash scripts/ensure-autopr-worker.sh
+```
+
+The installer persists only the selected path in
+`$XDG_CONFIG_HOME/augmentagent/autoship-native.env` (default
+`~/.config/augmentagent/autoship-native.env`), mode 0600. Both the daemon drop-in
+and independent worker load this shared environment file. Later installer runs
+without a selection preserve it. Staging a policy alone does not select it.
+The installer neither edits the profile/credentials nor changes refresh grants,
+and does not restart services. The normal updater owns activation. Removing the
+selection file deselects this shared override on the next normal rollout;
+separately configured environment values still apply.
+
+Successful installation proves configuration persistence, not provider readiness.
+Before accepting rollout, verify both running processes' selected policy hashes,
+packaged executable hashes, runtime integrity, role capabilities, usable auth,
+and a current guarded edit plus independent review. Never dump credential values
+or complete process environments for that check. Existing runtime generations
+remain available while their leases drain.
+
 The daemon reads `AUGMENTAGENT_NATIVE_VM_POLICY` itself, never from model options.
 The file must be owner-private, regular and single-link. Its version 1 shape is:
 
