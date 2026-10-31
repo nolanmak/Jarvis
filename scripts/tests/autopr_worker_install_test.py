@@ -30,7 +30,7 @@ with open(os.environ['CALLS'],'a') as f:f.write(' '.join(sys.argv[1:])+'\\n')
 if 'show' in sys.argv:
  key=sys.argv[sys.argv.index('-p')+1]
  print({'Environment':'PATH=/usr/bin RUST_LOG=warn SYNTHETIC=fixture',
- 'EnvironmentFiles':'/fixture/config (ignore_errors=yes)',
+ 'EnvironmentFiles':'/fixture/config (ignore_errors=yes) /fixture/required config% (ignore_errors=no)',
  'ExecStart':'{ argv[]=/fixture/bin serve --dry-run false ; }',
  'MemoryHigh':'8589934592','MemoryMax':'10737418240',
  'TasksMax':'2048','LimitNOFILE':'4096','CPUQuotaPerSecUSec':'4s',
@@ -38,15 +38,18 @@ if 'show' in sys.argv:
 ''')
             stub.chmod(0o700)
             env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ['PATH'],
-                       XDG_CONFIG_HOME=str(base/'config'), XDG_STATE_HOME=str(base/'state'),
+                       XDG_CONFIG_HOME=str(base/'config fixture%'), XDG_STATE_HOME=str(base/'state'),
                        CALLS=str(base/'calls'))
             command = ['bash', str(repo/'scripts/ensure-autopr-worker.sh')]
             subprocess.run(command, env=env, check=True)
-            units = base/'config/systemd/user'
+            units = base/'config fixture%/systemd/user'
             worker = (units/'augmentagent-autopr.service').read_text()
             self.assertIn('--dry-run false', worker)
             self.assertIn('Environment="SYNTHETIC=fixture"', worker)
-            self.assertIn('EnvironmentFile=-"/fixture/config"', worker)
+            self.assertIn('EnvironmentFile=-/fixture/config', worker)
+            self.assertIn('EnvironmentFile=/fixture/required config%%',worker)
+            self.assertLess(worker.index('EnvironmentFile=-/fixture/config'),
+                            worker.index('EnvironmentFile=/fixture/required config%%'))
             self.assertIn('After=network-online.target augmentagent.service', worker)
             self.assertNotIn('PartOf=', worker)
             self.assertNotIn('BindsTo=', worker)
@@ -85,11 +88,11 @@ if 'show' in sys.argv:
             policy.chmod(0o600)
             original=hashlib.sha256(policy.read_bytes()).hexdigest()
             subprocess.run(command,env=dict(env,AUGMENTAGENT_NATIVE_VM_POLICY=str(policy)),check=True)
-            selection=base/'config/augmentagent/autoship-native.env'
+            selection=base/'config fixture%/augmentagent/autoship-native.env'
             self.assertTrue(selection.exists(),'explicit native profile selection must persist')
             self.assertEqual(shlex.split(selection.read_text().splitlines()[-1]),['AUGMENTAGENT_NATIVE_VM_POLICY='+str(policy)])
             self.assertEqual(selection.stat().st_mode & 0o777,0o600)
-            shared='EnvironmentFile=-"'+str(selection)+'"'
+            shared='EnvironmentFile=-'+str(selection).replace('%','%%')
             self.assertIn(shared,(units/'augmentagent-autopr.service').read_text())
             self.assertIn(shared,dropin.read_text())
             prior=selection.read_bytes()
