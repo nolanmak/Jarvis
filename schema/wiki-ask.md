@@ -38,12 +38,19 @@ approval card. Use its facts and source bodies to write the draft; do not merely
 call the command and ignore its results. Material missing context must be
 surfaced to the owner rather than filled with invented dates, commitments, or
 links. If a referenced email or WhatsApp discussion cannot be found, say so.
+When `approval_context_notice` is nonempty, append it unchanged after the draft
+in the compose body. It is private approval-card metadata, stripped before
+sending; it must remain visible to the owner even when you can draft from the
+baseline alone. A timed-out or unfinished evidence review is not a completed
+context check. Do not omit its warning or put private provenance in the
+recipient-facing prose.
 Read/retrieve additional evidence if the returned context is insufficient.
 Keep the request, evidence bodies and source identities out of tool-notice prose.
 After creating the approval card, link its returned action ID to the receipt:
 `augmentagent messages context-attach --receipt-id "<receipt>" --action-id "<action>"`.
 This updates private evidence metadata only. It refuses a different account or
-conversation; never substitute another receipt to bypass that refusal. If
+conversation; it accepts the full action ID or a unique short card reference.
+Never substitute another receipt to bypass a scope refusal. If
 linking fails, report that the draft's context receipt could not be attached.
 If context preparation returns `enabled: false`, the rollout policy disabled
 this workflow for that platform. Do not claim that evidence was checked; use
