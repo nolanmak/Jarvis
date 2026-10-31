@@ -324,9 +324,9 @@ raises the same approval card: nothing is sent until you approve it, and
 Approve queues the text through the same outbox and Mac sender.
 
 ```sh
-augmentagent imessage compose --to "Jane" --body "running ten minutes late" --post
+augmentagent --wiki-dir /absolute/path/to/wiki imessage compose --to "Jane" --body "running ten minutes late" --post
 augmentagent imessage compose --to +15555550100 --body-file - --post < message.txt
-augmentagent imessage compose --to "Jane" --body "hi"            # preview only
+augmentagent --wiki-dir /absolute/path/to/wiki imessage compose --to "Jane" --body "hi"            # preview only
 ```
 
 `--to` takes a person from the wiki (full or first name, or page slug, matched

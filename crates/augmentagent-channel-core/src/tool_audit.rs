@@ -84,8 +84,8 @@ pub struct AuditRecord {
     /// Tool name as emitted by the claude CLI (e.g. `Write`, `Edit`,
     /// `Bash`, `mcp__gh__issue_create`).
     pub tool: String,
-    /// Tool input arguments verbatim from the stream-json event. Kept as
-    /// a `serde_json::Value` to round-trip whatever shape the CLI used.
+    /// Tool input arguments, with private compose payloads omitted. Kept as
+    /// a `serde_json::Value` for the provider's remaining argument shape.
     pub args: serde_json::Value,
     /// Tool exit code (`Bash` only — `None` for everything else).
     pub exit_code: Option<i32>,
@@ -809,6 +809,15 @@ pub trait AuditNotifier: Send + Sync + std::fmt::Debug {
     async fn notify(&self, session_id: &str, record: &AuditRecord);
 }
 
+fn is_private_imessage_compose(tool: &str, args: &serde_json::Value) -> bool {
+    static COMPOSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+        regex::Regex::new(r#"(?i)\bimessage["']?\s+["']?compose\b"#).expect("compose audit pattern"));
+    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
+        .is_some_and(|command| COMPOSE.is_match(&command.replace("\\\n", "")))
+}
+
+const PRIVATE_COMPOSE_COMMAND: &str = "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
+
 /// Pair a captured `tool_use` block with its later `tool_result` and produce
 /// the [`AuditRecord`] both the log and the notifier consume. `provider` is
 /// the adapter that served the call (#1047).
@@ -826,7 +835,14 @@ pub fn build_audit_record(
     result_content: &str,
     is_error: bool,
 ) -> AuditRecord {
-    let (captured, _truncated) = truncate_stream(result_content);
+    // Both the durable record and the notification consume this sanitized
+    // value. Omit the whole payload, including descriptions, pipes/heredocs,
+    // and result echoes, rather than attempting to parse private shell args.
+    let private_compose = is_private_imessage_compose(&tool, &args);
+    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) } else { args };
+    let (captured, _truncated) = truncate_stream(if private_compose {
+        "[iMessage compose output omitted; inspect approval card]"
+    } else { result_content });
     // Bash failures from the CLI surface as `is_error=true` with the command
     // output in the result content. We have no real exit code from the
     // stream-json event shape, but recording the captured text on the
@@ -869,16 +885,18 @@ pub fn format_notice(record: &AuditRecord) -> String {
     // Try common arg keys first; fall back to a compact JSON dump capped
     // at ~200 chars so the message doesn't blow Discord's char limit on a
     // pathological input.
-    let arg_summary = record
-        .args
+    let safe_args = if is_private_imessage_compose(&record.tool, &record.args) {
+        serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND})
+    } else { record.args.clone() };
+    let arg_summary = safe_args
         .get("file_path")
-        .or_else(|| record.args.get("path"))
-        .or_else(|| record.args.get("command"))
-        .or_else(|| record.args.get("query"))
+        .or_else(|| safe_args.get("path"))
+        .or_else(|| safe_args.get("command"))
+        .or_else(|| safe_args.get("query"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            let dump = record.args.to_string();
+            let dump = safe_args.to_string();
             if dump.len() > 200 {
                 format!("{}…", &dump[..200])
             } else {
@@ -1043,6 +1061,31 @@ mod tests {
         assert!(notice.contains("/tmp/x.txt"));
         // Doesn't leak the content blob in the notice.
         assert!(!notice.contains("\"content\""));
+    }
+
+    #[tokio::test]
+    async fn compose_payloads_never_reach_audit_files_or_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let logger = AuditLogger::new(path.clone());
+        for command in [
+            "augmentagent imessage compose --to 'PRIVATE_RECIPIENT' --body 'PRIVATE_BODY' --post",
+            "printf 'PRIVATE_BODY' | /repo/augmentagent imessage compose --to=PRIVATE_RECIPIENT --body-file - --post",
+            "augmentagent 'imessage' 'compose' --to PRIVATE_RECIPIENT --body-file - <<'EOF'\nPRIVATE_BODY\nEOF",
+        ] {
+            for failed in [false, true] {
+                let record = build_audit_record(ProviderKind::Claude, "now".into(), "session".into(), "Bash".into(),
+                    serde_json::json!({"command":command,"description":"PRIVATE_BODY to PRIVATE_RECIPIENT"}),
+                    "PRIVATE_BODY PRIVATE_RECIPIENT", failed);
+                logger.record(&record).await;
+                let notice = format_notice(&record);
+                assert!(notice.contains("imessage compose"));
+                assert!(!notice.contains("PRIVATE_BODY") && !notice.contains("PRIVATE_RECIPIENT"));
+            }
+        }
+        let audit = std::fs::read_to_string(path).unwrap();
+        assert!(!audit.contains("PRIVATE_BODY") && !audit.contains("PRIVATE_RECIPIENT"));
+        assert_eq!(audit.lines().count(), 6);
     }
 
     #[test]

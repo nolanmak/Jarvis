@@ -507,8 +507,10 @@ augmentagent imessage compose --to "<person, +E.164 number, or Apple-ID email>" 
   --body "<the text>" --post
 ```
 
-**This command posts a card. It does not send anything.** Approve does, through
-the Mac. Say "I've posted the text for your approval", never "I've sent it".
+**This command requests a card. It does not send anything.** Approve does, through
+the Mac. Report the actual command result and its ref: say the card was posted
+only when posting succeeded; if it is queued after a posting failure, say it is
+queued and not yet available. Never say "I've sent it".
 
 - **`--to` is a wiki person or a handle.** A full or first name resolves
   through the people pages' explicit `imessage:` identities; a number or

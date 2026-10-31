@@ -814,16 +814,9 @@
       "selected feature credentials or synthetic fixtures"
     ],
     "owner_issue": "https://github.com/nolanmak/Jarvis/issues/1309",
-    "test_plan": "scripts/cargo-managed.sh test -p augmentagent-cli --test imessage_outbox_cli; scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent imessage; reply evidence in #1309; new compose host acceptance is tracked separately in #1642.",
-    "status": "verified",
-    "evidence": {
-      "commit": "57b1a8414545476db61b54f1c51dc776a70c5035",
-      "macos_version": "macOS 26.4 (25E246)",
-      "architecture": "arm64",
-      "test_command": "cargo test -p augmentagent-cli --test imessage_outbox_cli (13 passed); D1 acceptance AC-1..AC-6 via augmentagent imessage approve/outbox and scripts/imessage/send.py",
-      "result": "pass",
-      "artifact": "https://github.com/nolanmak/Jarvis/issues/1309"
-    }
+    "test_plan": "Managed CLI compose/outbox and imessage unit suites on both hosts; historical reply evidence remains in #1309. Expanded compose/contact-defaults host acceptance is pending #1642.",
+    "status": "unverified",
+    "evidence": null
   },
   {
     "id": "cli:install",

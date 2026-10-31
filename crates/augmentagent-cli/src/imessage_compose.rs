@@ -508,11 +508,11 @@ pub(crate) async fn run(
         }
         ComposeOutcome::Card {
             action_id,
-            email,
             recipient,
             superseded,
+            ..
         } => {
-            let posted = post_card_now(store, &action_id, &email, &body).await;
+            let posted = post_card_now(store, &action_id).await;
             if posted.is_err() {
                 // Release the initial posting reservation to the ordinary queue.
                 store.with_conn(|c| {
@@ -573,12 +573,29 @@ pub(crate) async fn run(
 /// Post the card from this process, as `gmail compose --post` does (#352),
 /// and mark it the active nudge so the daemon's serial queue does not post a
 /// duplicate. Needs `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID`.
-async fn post_card_now(
+fn pending_compose_card(
     store: &Store,
     action_id: &str,
-    email: &Email,
-    draft: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<serenity::all::CreateMessage> {
+    use anyhow::Context as _;
+    let row = store
+        .get_action_with_email(action_id)?
+        .context("compose action disappeared")?;
+    anyhow::ensure!(
+        row.action.status == "pending",
+        "compose was already replaced or resolved"
+    );
+    let draft = row
+        .action
+        .draft_body
+        .as_deref()
+        .context("compose draft missing")?;
+    Ok(augmentagent_approval_discord::approval_message(
+        action_id, &row.email, draft, 0,
+    ))
+}
+
+async fn post_card_now(store: &Store, action_id: &str) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let token = std::env::var("DISCORD_BOT_TOKEN")
         .ok()
@@ -592,7 +609,7 @@ async fn post_card_now(
         .context("DISCORD_CHANNEL_ID must be numeric")?;
     let http = serenity::http::Http::new(&token);
     let channel = serenity::all::ChannelId::new(cid);
-    let card = augmentagent_approval_discord::approval_message(action_id, email, draft, 0)
+    let card = pending_compose_card(store, action_id)?
         .nonce(serenity::all::Nonce::String(format!(
             "imsg-{}",
             &action_id.replace('-', "")[..20]
@@ -619,6 +636,28 @@ mod tests {
     use augmentagent_store::{ImessageOutboxStatus, ImessageTargetKind};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn immediate_card_uses_the_persisted_masked_draft_and_rejects_replaced_actions() {
+        let f = fixture();
+        let body = "Authorization: Bearer sk-fake-1234567890abcdef"; // pii-ok: synthetic redaction fixture
+        let ComposeOutcome::Card { action_id, .. } =
+            compose(&f.store, &f.config, PHONE, body, false)
+        else {
+            panic!("expected compose");
+        };
+        let row = f.store.get_action_with_email(&action_id).unwrap().unwrap();
+        let card =
+            serde_json::to_value(pending_compose_card(&f.store, &action_id).unwrap()).unwrap();
+        assert_eq!(
+            card["embeds"][0]["description"].as_str(),
+            row.action.draft_body.as_deref()
+        );
+        assert!(!card.to_string().contains("sk-fake-1234567890abcdef")); // pii-ok: synthetic redaction fixture
+        assert!(card.to_string().contains("[REDACTED]"));
+        compose(&f.store, &f.config, PHONE, "replacement", false);
+        assert!(pending_compose_card(&f.store, &action_id).is_err());
+    }
 
     const PHONE: &str = "+15555550100"; // pii-ok synthetic
     const PHONE2: &str = "+15555550101"; // pii-ok synthetic
