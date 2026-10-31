@@ -172,3 +172,104 @@ async fn rate_limit_defers_durably_and_does_not_advance_checkpoint() {
     assert_eq!(again.pages, 0);
     assert_eq!(again.stopped, "retry_deferred");
 }
+
+#[tokio::test]
+async fn expired_mailbox_cursor_restarts_once_durably_without_losing_history() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(|request: &wiremock::Request| {
+            let query = request.url.query_pairs().collect::<BTreeMap<_, _>>();
+            if query
+                .get("variables")
+                .is_some_and(|v| v.contains("nextCursor:"))
+            {
+                ResponseTemplate::new(410)
+            } else {
+                respond(request)
+            }
+        })
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    let cancel = CancellationToken::new();
+    let first = archive_sync::sync(&reader, &s, "PRIMARY_INBOX", 2, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(first.pages, 2);
+    assert_eq!(first.coverage.conversations, 20);
+    assert!(
+        db::checkpoint(&s, OWNER, "PRIMARY_INBOX")
+            .unwrap()
+            .cursor
+            .is_none(),
+        "an expired continuation should restart enumeration"
+    );
+    drop(s);
+    let s = Store::open(f.path()).unwrap();
+    let second = archive_sync::sync(&reader, &s, "PRIMARY_INBOX", 20, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.pages, 2,
+        "one restart allowance must survive process restart"
+    );
+    assert_eq!(second.coverage.conversations, 20);
+    assert!(!second.coverage.complete);
+    assert!(second.coverage.last_error.is_some());
+    let deferred = archive_sync::sync(&reader, &s, "PRIMARY_INBOX", 20, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(deferred.pages, 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn rejected_history_cursor_reconciles_to_exact_corpus_without_duplicates() {
+    let server = MockServer::start().await;
+    let rejected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = rejected.clone();
+    Mock::given(method("GET"))
+        .respond_with(move |request: &wiremock::Request| {
+            let q = request.url.query_pairs().collect::<BTreeMap<_, _>>();
+            if q.get("conversationUrn").is_some_and(|v| v == "thread:2")
+                && q.contains_key("nextCursor")
+                && !rejected.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                ResponseTemplate::new(400)
+            } else {
+                respond(request)
+            }
+        })
+        .mount(&server)
+        .await;
+    let reader = ArchiveReader::for_test(auth(), server.uri()).unwrap();
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open(f.path()).unwrap();
+    let report = archive_sync::sync(&reader, &s, "PRIMARY_INBOX", 100, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        report.pages, 56,
+        "one failed continuation plus one replayed head page"
+    );
+    assert_eq!(report.stopped, "history_exhausted");
+    augmentagent_messages::index::drain(&s, 100, std::time::Duration::ZERO).unwrap();
+    let coverage = db::coverage(&s, OWNER, "PRIMARY_INBOX").unwrap();
+    assert!(coverage.complete);
+    assert_eq!(
+        (
+            coverage.messages,
+            coverage.owner_messages,
+            coverage.group_conversations
+        ),
+        (153, 51, 3)
+    );
+    assert_eq!(
+        s.with_conn(|c| c.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get::<_, i64>(0)))
+            .unwrap(),
+        153
+    );
+}

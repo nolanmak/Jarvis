@@ -56,3 +56,8 @@ CREATE TABLE IF NOT EXISTS linkedin_archive_live_seen (
  account TEXT NOT NULL, urn TEXT NOT NULL,
  PRIMARY KEY(account,urn)
 );
+-- One automatic cursor recovery per reconciliation, including across restarts.
+CREATE TABLE IF NOT EXISTS linkedin_archive_restarts (
+ account TEXT NOT NULL, scope TEXT NOT NULL, restarted_at_ms INTEGER NOT NULL,
+ PRIMARY KEY(account,scope)
+);

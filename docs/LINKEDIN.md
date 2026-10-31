@@ -207,6 +207,14 @@ augmentagent linkedin backfill --max-pages 100
 augmentagent linkedin archive-status --category PRIMARY_INBOX
 ```
 
+A rejected continuation (HTTP 400 or 410 on a request carrying a cursor) gets
+one automatic restart per mailbox or thread reconciliation. The restart keeps
+stored messages and deduplicates replayed IDs. Its allowance is durable across
+process restarts; a repeated rejection records an error and defers retries
+instead of restarting indefinitely. This is a conservative recovery policy,
+not a claim that every 400 response means an expired LinkedIn cursor. A first-page
+failure, authentication error, or throttle does not trigger this recovery.
+
 Backfill defaults to all categories exposed by the account's mailbox inventory.
 It stores group and owner messages without drafting, raising cards or sending.
 Repeat bounded invocations to resume durable progress; `--refresh` reconciles

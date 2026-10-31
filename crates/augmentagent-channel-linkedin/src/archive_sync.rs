@@ -55,6 +55,14 @@ pub async fn sync(
                     db::commit_conversations(store, account, category, &cp, &page, now_ms())?;
                 }
                 Err(e) => {
+                    // A cursor-bearing request rejected as bad/gone gets one
+                    // bounded reconciliation. This is deliberately not applied
+                    // to auth, throttling, or malformed successful responses.
+                    if matches!(e, ArchiveError::Status(400 | 410))
+                        && db::restart_cursor(store, account, category, false, &cp, now_ms())?
+                    {
+                        continue;
+                    }
                     db::record_failure(
                         store,
                         account,
@@ -88,6 +96,11 @@ pub async fn sync(
                     db::commit_messages(store, account, &thread, &cp, &page, now_ms())?;
                 }
                 Err(e) => {
+                    if matches!(e, ArchiveError::Status(400 | 410))
+                        && db::restart_cursor(store, account, &thread, true, &cp, now_ms())?
+                    {
+                        continue;
+                    }
                     db::record_failure(
                         store,
                         account,
