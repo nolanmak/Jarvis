@@ -370,3 +370,24 @@ non-network tests cover rotation followed by SIGKILL and fresh-session seeding,
 received-response recovery, original expiry, concurrent/stale requests, scope
 refusal, and persistence-before-delivery. Natural provider refresh and fresh-session
 authentication remain distinct rollout checks; these tests use no actual credentials.
+
+## Read-only credential diagnostics
+
+`augmentagent autopr readiness --json` reports native credential declarations for
+Claude and Codex without invoking a provider or refreshing credentials. It reads
+the selected private policy each time, includes its SHA-256, and reports missing
+policy, invalid policy, undeclared route, missing/invalid credential, known
+expiry, unknown expiry, explicitly authorized refresh, or an unexpired/static
+credential declaration. It never prints credential values.
+
+Claude subscription expiry uses the credential's `expiresAt` milliseconds;
+Codex subscription expiry reads the access token's JWT `exp` seconds. Reading
+that field does not verify the token's signature, revocation status, quota, or
+provider reachability. Opaque tokens retain an explicit unknown-expiry status.
+A known expired token is ineligible for protected native dispatch unless the
+existing profile authorizes refresh of its imported controller credential.
+This does not enable refresh or modify a credential grant.
+
+Credential declarations alone cannot establish workflow readiness. The command
+keeps `ready: false` and names the runtime, role, resource and live-probe evidence
+that remains unverified; exit 3 means readiness has not been established.

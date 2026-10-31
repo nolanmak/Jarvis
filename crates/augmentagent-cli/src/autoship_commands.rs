@@ -158,3 +158,22 @@ pub fn run_status(workflow: &str, json_output: bool) -> i32 {
     }
     code
 }
+
+/// Credential declaration evidence is deliberately separate from role/runtime
+/// readiness. The latter requires controller-bound acceptance evidence.
+pub fn run_readiness(json_output:bool) -> i32 {
+    let claude=augmentagent_channel_core::native_vm::readiness::credentials("claude");
+    let codex=augmentagent_channel_core::native_vm::readiness::credentials("codex");
+    let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified",
+        "credentials":{"claude":claude,"codex":codex},
+        "unverified":["runtime-integrity","builder-capability","independent-reviewer","adjudicator-capability",
+            "resource-delegation","capacity","live-guarded-probe","deployed-policy-equality"]});
+    if json_output {println!("{body}");} else {
+        println!("Autoship readiness is unverified.");
+        for provider in ["claude","codex"] {
+            println!("{provider}: {}",body["credentials"][provider]["status"].as_str().unwrap_or("unknown"));
+        }
+        println!("Runtime, role, resource, deployment and live-probe evidence remain unverified.");
+    }
+    3
+}

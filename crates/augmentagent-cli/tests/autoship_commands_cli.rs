@@ -131,3 +131,49 @@ fn corrupt_status_store_reports_failure_without_reset() {
     assert_eq!(std::fs::read(path).unwrap(), b"corrupt state");
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
+
+#[test]
+fn readiness_without_policy_is_read_only_and_never_claims_live_ready() {
+    let root=tempfile::tempdir().unwrap();
+    let output=Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .current_dir(root.path()).env_remove("AUGMENTAGENT_NATIVE_VM_POLICY")
+        .env("XDG_STATE_HOME",root.path().join("state"))
+        .args(["autopr","readiness","--json"]).output().unwrap();
+    assert_eq!(output.status.code(),Some(3),"{}",String::from_utf8_lossy(&output.stderr));
+    let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["ready"],false);
+    for provider in ["claude","codex"] {
+        assert_eq!(body["credentials"][provider]["status"],"policy-missing");
+        assert_eq!(body["credentials"][provider]["live_verified"],false);
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),0);
+}
+
+#[test]
+fn readiness_reports_expired_credentials_without_refreshing_or_leaking_them() {
+    let root=tempfile::tempdir().unwrap();
+    let auth=root.path().join("auth.json");
+    let policy=root.path().join("policy.json");
+    let raw=r#"{"claudeAiOauth":{"accessToken":"private-access-fixture","refreshToken":"private-refresh-fixture","expiresAt":1}}"#;
+    std::fs::write(&auth,raw).unwrap();
+    std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&policy,serde_json::json!({"version":1,"runtime_config":"/missing/runtime.json","guest_runtime":"/missing/guest",
+        "state_root":root.path(),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+        "providers":{"claude":{"gateway":{},"auth_file":auth,"auth_relative":".claude/.credentials.json","refresh_auth":false}}}).to_string()).unwrap();
+    std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+    let digest=Sha256::digest(std::fs::read(&policy).unwrap());
+    let output=Command::new(env!("CARGO_BIN_EXE_augmentagent"))
+        .current_dir(root.path()).env("AUGMENTAGENT_NATIVE_VM_POLICY",&policy)
+        .env("XDG_STATE_HOME",root.path().join("state"))
+        .args(["autopr","readiness","--json"]).output().unwrap();
+    assert_eq!(output.status.code(),Some(3));
+    let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["ready"],false);
+    assert_eq!(body["credentials"]["claude"]["status"],"credential-expired");
+    assert_eq!(body["credentials"]["codex"]["status"],"route-undeclared");
+    assert_eq!(body["credentials"]["claude"]["policy_sha256"],format!("{digest:x}"));
+    for bytes in [&output.stdout,&output.stderr] {assert!(!String::from_utf8_lossy(bytes).contains("private-access-fixture"));}
+    assert_eq!(std::fs::read_to_string(&auth).unwrap(),raw);
+    assert_eq!(Sha256::digest(std::fs::read(&policy).unwrap()),digest);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),2);
+}

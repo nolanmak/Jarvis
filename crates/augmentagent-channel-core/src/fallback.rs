@@ -216,10 +216,8 @@ pub fn native_ineligible_reason(kind: ProviderKind) -> Option<String> {
 pub fn workflow_native_ineligible_reason(kind:ProviderKind)->Option<String> {
     if !matches!(kind,ProviderKind::Codex|ProviderKind::Claude) {return Some("provider has no declared native VM identity".into());}
     if let Some(reason)=gateway_ineligible_reason(kind){return Some(reason);}
-    match crate::native_vm::declared_native_auth(kind.name()) {
-        Ok(true)=>None,
-        _=>Some("required native VM provider credential is not declared or valid".into()),
-    }
+    let report=crate::native_vm::readiness::credentials(kind.name());
+    (!report.permits_attempt()).then(||format!("native-provider:{}:{}",kind.name(),report.reason()))
 }
 fn workflow_route_auth(kind: ProviderKind, routed: bool) -> bool {
     if routed { crate::native_vm::declared_router_auth(kind.name()).unwrap_or(false) }
@@ -1510,6 +1508,14 @@ mod tests {
         let result=crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"candidate")).await.unwrap();
         assert_eq!(result,"supplied-evidence fixture");
         assert_eq!(scripted.count(),1);
+        // Recheck the credential at dispatch, even for an already-built chain.
+        let policy:serde_json::Value=serde_json::from_slice(&std::fs::read(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap()).unwrap()).unwrap();
+        let auth=policy["providers"]["codex"]["auth_file"].as_str().unwrap();
+        std::fs::write(auth,r#"{"tokens":{"access_token":"e30.eyJleHAiOjF9.signature","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}"#).unwrap();
+        assert!(build_workflow_pinned(ProviderKind::Codex).is_none());
+        assert_eq!(workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),Some("native-provider:codex:credential-expired"));
+        assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"expired credential must not dispatch")).await.is_err());
+        assert_eq!(scripted.count(),1,"expired credentials cannot spend another model call");
         opts.audit_logger=None;
         chain.workflow_native_only=false;
         *chain.workflow_audit.lock().unwrap()=None;

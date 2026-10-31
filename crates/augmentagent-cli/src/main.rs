@@ -1091,6 +1091,8 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Inspect native credential declarations; no provider calls or refresh.
+    Readiness { #[arg(long)] json: bool },
     /// Resolve a pending merge using bound controller and GitHub evidence.
     ResolveMerge {
         #[arg(long)] operation: String,
@@ -3045,6 +3047,9 @@ async fn main() -> Result<()> {
     }
     if let Cmd::Autopr { op: AutoprOp::ResolveMerge { ref operation, ref classification, ref evidence, json } } = cli.cmd {
         std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Readiness { json } } = cli.cmd {
+        std::process::exit(autoship_commands::run_readiness(json));
     }
     if let Cmd::Autopr { op: AutoprOp::Status { ref workflow, json } } = cli.cmd {
         std::process::exit(autoship_commands::run_status(workflow, json));
@@ -5608,6 +5613,7 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Readiness { .. } } => unreachable!("readiness precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
