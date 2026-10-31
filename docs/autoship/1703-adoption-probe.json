@@ -45,10 +45,25 @@
   },
   "readiness_followup": {
     "root": "/tmp/autoship-native-acceptance-x1vmelii",
-    "status": "running-not-accepted",
+    "status": "failed-after-repair-before-ci",
     "change": "Serialize complete six-key readiness shape, diagnose missing/extra keys, reject duplicate keys",
     "local_acceptance_tests_passed": 30,
     "red_log": "/tmp/autoship-1703-red-readiness-slots.log",
-    "green_log": "/tmp/autoship-1703-green-readiness-slots.log"
+    "green_log": "/tmp/autoship-1703-green-readiness-slots.log",
+    "exit_code": 101,
+    "model_calls": 5,
+    "elapsed_seconds": 310.82,
+    "verified_progress": "Readiness and contract generation passed; model repair completed; shared CI refused unstaged edits."
+  },
+  "repair_followup": {
+    "root": "/tmp/autoship-native-acceptance-w21t6q9t",
+    "status": "running-not-accepted",
+    "change": "Commit model repairs through existing candidate checkpoint before shared CI attests source",
+    "local_recovery_tests_passed": 2,
+    "local_shared_ci_tests_passed": 5,
+    "logs": [
+      "/tmp/autoship-1703-green-repair-checkpoint.log",
+      "/tmp/autoship-1703-green-repair-ci.log"
+    ]
   }
 }

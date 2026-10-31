@@ -1774,6 +1774,10 @@ pub(super) async fn verify_with_repair_for(
                     &prompt,
                 )
                 .await?;
+                // The model leaves edits in the worktree. Checkpoint them before
+                // shared CI binds its exact source tree; the next acceptance
+                // iteration still rechecks scope and the independent oracle.
+                recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
                 verification_gate(worktree, &workflow.audit_logger()).await?;
