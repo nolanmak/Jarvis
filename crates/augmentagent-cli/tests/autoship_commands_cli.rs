@@ -234,3 +234,65 @@ fn readiness_detects_provider_binary_updates_against_runtime_companions() {
         assert!(!root.path().join("state").exists());
     }
 }
+
+#[test]
+fn readiness_checks_protected_roles_without_spawning_or_creating_state() {
+    let root=tempfile::tempdir().unwrap();
+    let auth=root.path().join("claude.json");
+    std::fs::write(&auth,r#"{"claudeAiOauth":{"accessToken":"fixture","refreshToken":"fixture","expiresAt":9999999999999}}"#).unwrap();
+    std::fs::set_permissions(&auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+    let codex_auth=root.path().join("codex.json");
+    std::fs::write(&codex_auth,r#"{"OPENAI_API_KEY":"private-fixture"}"#).unwrap();
+    std::fs::set_permissions(&codex_auth,std::fs::Permissions::from_mode(0o600)).unwrap();
+    let guest=root.path().join("guest");std::fs::create_dir(&guest).unwrap();
+    std::fs::set_permissions(&guest,std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(guest.join("artifact"),b"fixture").unwrap();
+    std::fs::write(guest.join("manifest.json"),serde_json::json!({"version":1,"files":[{"path":"artifact","sha256":format!("{:x}",Sha256::digest(b"fixture"))}]}).to_string()).unwrap();
+    let executable=root.path().join("provider-fixture");
+    std::fs::write(&executable,"#!/bin/sh\ntouch \"$HOME/provider-called\"\nexit 1\n").unwrap();
+    std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let policy=root.path().join("policy.json");
+    let mut value=serde_json::json!({"version":1,"runtime_config":"/missing/runtime.json","guest_runtime":guest,
+        "state_root":root.path().join("state"),"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,
+        "providers":{"claude":{"gateway":{},"auth_file":auth,"auth_relative":".claude/.credentials.json"}}});
+    let selection=root.path().join("selection.json");
+    let cooldown=root.path().join("cooldown.json");
+    for phase in 0..9 {
+        if phase==4 || phase==7 {
+            std::fs::write(&selection,serde_json::json!({"version":1,"default":if phase==4 {"codex"} else {"qwen"},"conversations":{}}).to_string()).unwrap();
+            std::fs::set_permissions(&selection,std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        if phase==5 {std::fs::remove_file(&selection).unwrap();}
+        if phase==5 || phase==6 {
+            let mut latch=serde_json::json!({"codex":{"until":"2099-01-01T00:00:00Z","reason":"fixture"}});
+            if phase==6 {latch["claude"]=latch["codex"].clone();}
+            std::fs::write(&cooldown,latch.to_string()).unwrap();
+        }
+        if phase==7 {std::fs::remove_file(&cooldown).unwrap();}
+        if phase==8 {std::fs::write(&selection,"invalid").unwrap();}
+        if phase==1 {value["providers"]["codex"]=serde_json::json!({"gateway":{},"auth_file":codex_auth,"auth_relative":".codex/auth.json"});}
+        std::fs::write(&policy,value.to_string()).unwrap();std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let output=Command::new(env!("CARGO_BIN_EXE_augmentagent")).env_clear().env("PATH","/usr/bin:/bin")
+            .env("HOME",root.path()).env("XDG_STATE_HOME",root.path().join("state"))
+            .env("AUGMENTAGENT_MODEL_SELECTION_CONFIG",&selection).env("AUGMENTAGENT_COOLDOWN_FILE",&cooldown)
+            .env("AUGMENTAGENT_NATIVE_VM_POLICY",&policy).env("CLAUDE_CLI",&executable).env("CODEX_CLI",&executable)
+            .env("AUGMENTAGENT_REASONER_CHAIN",if phase==3 {"gemini"} else {"claude"})
+            .env("AUGMENTAGENT_AUTOPR_REVIEWERS",if phase==2 {"claude"} else {"codex,claude"})
+            .args(["autopr","readiness","--json"]).output().unwrap();
+        assert_eq!(output.status.code(),Some(3));
+        let body:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["roles"]["builder"]["status"],if matches!(phase,3|7|8) {"no-eligible-provider"} else if phase==6 {"provider-cooldown"} else {"declared-available"},"{body}");
+        assert_eq!(body["roles"]["independent_reviewer"]["status"],if matches!(phase,0|2|5) {"independent-reviewer-unavailable"} else if matches!(phase,3|6|7|8) {"builder-unavailable"} else {"declared-available"},"{body}");
+        assert_eq!(body["roles"]["adjudicator"]["status"],if phase==0 {"provider-unavailable"} else if phase==5 || phase==6 {"provider-cooldown"} else {"declared-available"},"{body}");
+        if phase==4 {
+            assert_eq!(body["roles"]["builder"]["providers"],serde_json::json!(["codex"]));
+            assert_eq!(body["roles"]["independent_reviewer"]["providers"],serde_json::json!(["claude"]));
+        }
+        assert!(!root.path().join("selection.json.lock").exists());
+        assert_eq!(body["ready"],false);
+        assert!(!root.path().join("provider-called").exists());
+        assert!(!root.path().join("state").exists());
+        assert!(!root.path().join(".config").exists(),"inspection must not create selection locks");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-fixture"));
+    }
+}

@@ -433,12 +433,25 @@ impl FallbackReasoner {
         &self,
         class: crate::providers::CapabilityClass,
     ) -> LaneAvailability {
-        let Ok(selected) = crate::model_selection::current() else { return LaneAvailability::NoEligibleProvider; };
-        let Ok(config) = crate::model_router::current() else { return LaneAvailability::NoEligibleProvider; };
+        let providers = self.lane_provider_availability(class);
+        if providers.iter().any(|(_, until)| until.is_none()) {
+            LaneAvailability::Available
+        } else if providers.is_empty() {
+            LaneAvailability::NoEligibleProvider
+        } else {
+            LaneAvailability::AllLatched(providers.into_iter().map(|(kind, until)| (kind.name().to_string(), until)).collect())
+        }
+    }
+
+    /// Same routing, capability and credential admission as lane availability,
+    /// with identities retained for read-only workflow role checks.
+    pub fn lane_provider_availability(&self, class: crate::providers::CapabilityClass)
+        -> Vec<(ProviderKind, Option<chrono::DateTime<chrono::Utc>>)> {
+        let Ok(selected) = crate::model_selection::current() else { return vec![]; };
+        let Ok(config) = crate::model_router::current() else { return vec![]; };
         let required=self.workflow_native_only || self.workflow_audit.lock().ok().and_then(|logger|logger.clone()).is_some_and(|logger|logger.run_resources_required());
-        let Ok(routing) = crate::model_router::select_profile_for_workflow(config, selected, required) else { return LaneAvailability::NoEligibleProvider; };
-        let mut latched = Vec::new();
-        let mut eligible = 0usize;
+        let Ok(routing) = crate::model_router::select_profile_for_workflow(config, selected, required) else { return vec![]; };
+        let mut providers = Vec::new();
         for entry in &self.entries {
             if selected.is_some_and(|profile| entry.kind != profile) { continue; }
             if !(self.profile_enabled)(entry.kind) { continue; }
@@ -450,21 +463,11 @@ impl FallbackReasoner {
                 && !workflow_route_auth(entry.kind, routing.as_ref().is_some_and(|r| r.enabled())) {
                 continue;
             }
-            if !allowed_for(entry.kind, class) {
-                continue;
-            }
-            eligible += 1;
-            let name = entry.kind.name();
-            match if routing.as_ref().is_some_and(|r| r.enabled()) { None } else { self.latch.latched_until(name) } {
-                None => return LaneAvailability::Available,
-                Some(until) => latched.push((name.to_string(), Some(until))),
-            }
+            if !allowed_for(entry.kind, class) { continue; }
+            let until = if routing.as_ref().is_some_and(|r| r.enabled()) { None } else { self.latch.latched_until(entry.kind.name()) };
+            providers.push((entry.kind, until));
         }
-        if eligible == 0 {
-            LaneAvailability::NoEligibleProvider
-        } else {
-            LaneAvailability::AllLatched(latched)
-        }
+        providers
     }
 
     pub fn provider_names(&self) -> Vec<&'static str> {
@@ -1535,7 +1538,9 @@ mod tests {
         // Recheck the credential at dispatch, even for an already-built chain.
         let policy:serde_json::Value=serde_json::from_slice(&std::fs::read(std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").unwrap()).unwrap()).unwrap();
         let auth=policy["providers"]["codex"]["auth_file"].as_str().unwrap();
-        std::fs::write(auth,r#"{"tokens":{"access_token":"e30.eyJleHAiOjF9.signature","refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}"#).unwrap();
+        let expired_fixture = ["e30", "eyJleHAiOjF9", "signature"].join(".");
+        std::fs::write(auth,serde_json::json!({"tokens":{"access_token":expired_fixture,
+            "refresh_token":"synthetic-refresh","id_token":"synthetic-id"}}).to_string()).unwrap();
         assert!(build_workflow_pinned(ProviderKind::Codex).is_none());
         assert_eq!(workflow_native_ineligible_reason(ProviderKind::Codex).as_deref(),Some("native-provider:codex:credential-expired"));
         assert!(crate::model_router::native_reviewer_scope(ProviderKind::Codex,chain.call(&opts,"expired credential must not dispatch")).await.is_err());

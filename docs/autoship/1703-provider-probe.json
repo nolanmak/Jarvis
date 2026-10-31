@@ -38,5 +38,43 @@
     "initial": "/tmp/autoship-native-acceptance-x3ep_2_o",
     "file_edit": "/tmp/autoship-native-acceptance-_vo2bi6i",
     "full_issue": "/tmp/autoship-native-acceptance-7sd570tj"
+  },
+  "role_admission_diagnostic": {
+    "exit": 3,
+    "elapsed_seconds": 93.66,
+    "binary_sha256": "5408b525cc9c1a3ea826868aafa8db3d8d6359cf35a9f19a3029433b48a08234",
+    "ready": false,
+    "roles": {
+      "adjudicator": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "builder": {
+        "providers": [
+          "claude"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "independent_reviewer": {
+        "providers": [
+          "codex"
+        ],
+        "reasons": [],
+        "status": "declared-available"
+      },
+      "live_verified": false
+    },
+    "runtime_status": "native-guest-verified",
+    "build_status": "build-declaration-verified",
+    "production_policy_unchanged": true,
+    "created_state": false,
+    "limitation": "debug build; earlier diagnostic timeout at 60 seconds; no production performance or live-provider acceptance claim",
+    "evidence_root": "/tmp/autoship-1703-auto-runtime-g2qovoh1",
+    "implementation": "role admission change following 5fca60f3",
+    "acceptance_scope": "Read-only isolated profile diagnostic, not a live provider call or deployed acceptance. Release-build latency remains to be measured."
   }
 }

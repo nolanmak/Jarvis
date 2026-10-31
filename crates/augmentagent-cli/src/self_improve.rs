@@ -59,6 +59,9 @@ mod legacy_readmission;
 #[path = "self_improve_slicing.rs"]
 mod slicing;
 
+#[path = "self_improve_provider_readiness.rs"]
+pub(crate) mod provider_readiness;
+
 pub(crate) fn readiness_summary()->Result<String> { acceptance::readiness::summary() }
 
 pub(crate) fn policy_held_drafts() -> Vec<(u64, String)> {
@@ -7513,6 +7516,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // own declarations and retain existing runtime generations.
         tokio::task::spawn_blocking(augmentagent_channel_core::native_vm::readiness::runtime::preflight)
             .await.context("native runtime preflight task failed")??;
+        provider_readiness::inspect().preflight()?;
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.

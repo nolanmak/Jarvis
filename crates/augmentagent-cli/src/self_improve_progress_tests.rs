@@ -256,6 +256,10 @@ elif a[:2]==['pr','checks']:
     print(json.dumps([dict(name='rust',state=s['checks']),dict(name='CodeRabbit',state='FAILURE')])); sys.exit(1)
 elif a[:2]==['api','graphql']:
     fields=dict(value.split('=',1) for i,value in enumerate(a) if i>0 and a[i-1]=='-f')
+    if fields['query'].startswith('query AutoshipDirectMergePolicy'):
+        print(json.dumps(dict(data=dict(repository=dict(mergeQueue=None)))))
+        sys.exit(0)
+    assert fields['query'].startswith('mutation ')
     assert fields['head']==s['head']
     if s['fail_merge']: sys.exit(1)
     (root/'merged').write_text(s['head'])
@@ -392,7 +396,11 @@ else: raise Exception('unexpected call '+repr(a))
     assert_eq!(merge_sweep(&root, false).await, 0, "uncertain merge requires explicit reconciliation before another mutation");
     assert!(!fixture_root.join("merged").exists());
     let calls = std::fs::read_to_string(fixture_root.join("calls")).unwrap();
-    let mutations = calls.lines().filter(|line| line.contains(r#"["api", "graphql""#)).count();
+    let mutations = calls.lines().filter(|line| {
+        let args:Vec<String>=serde_json::from_str(line).unwrap();
+        args.starts_with(&["api".into(),"graphql".into()])
+            && args.iter().any(|argument|argument.starts_with("query=mutation "))
+    }).count();
     assert_eq!(mutations, 1, "all later sweeps must preserve the original pending mutation");
     let allowance = merge_allowance_status().unwrap();
     assert_eq!((allowance.confirmed, allowance.pending, allowance.remaining, allowance.available), (0, 1, 5, 4));

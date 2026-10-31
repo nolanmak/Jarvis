@@ -167,15 +167,18 @@ pub fn run_readiness(json_output:bool) -> i32 {
     let runtime=augmentagent_channel_core::native_vm::readiness::runtime::inspect();
     let body=json!({"schema_version":1,"ready":false,"reason":"workflow-readiness-unverified","runtime":runtime,
         "credentials":{"claude":claude,"codex":codex},
-        "unverified":["builder-capability","independent-reviewer","adjudicator-capability",
-            "resource-delegation","capacity","live-guarded-probe","deployed-policy-equality"]});
+        "roles":crate::self_improve::provider_readiness::inspect(),
+        "unverified":["resource-delegation","capacity","live-guarded-probe","deployed-policy-equality"]});
     if json_output {println!("{body}");} else {
         println!("Autoship readiness is unverified.");
         for provider in ["claude","codex"] {
             println!("{provider}: {}",body["credentials"][provider]["status"].as_str().unwrap_or("unknown"));
         }
         println!("Native guest: {}; build runtime: {}",body["runtime"]["status"],body["runtime"]["build_status"]);
-        println!("Role, resource, deployment and live-probe evidence remain unverified.");
+        for role in ["builder","independent_reviewer","adjudicator"] {
+            println!("{role}: {}",body["roles"][role]["status"]);
+        }
+        println!("Resource, deployment and live-probe evidence remain unverified.");
     }
     3
 }

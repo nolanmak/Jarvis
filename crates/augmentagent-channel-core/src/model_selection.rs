@@ -162,7 +162,8 @@ impl SelectionStore {
     }
 
     pub fn selected(&self, conversation: Option<&str>) -> anyhow::Result<Option<ProviderKind>> {
-        let _lock = self.lock()?;
+        // Writers publish by atomic rename. One open observes a complete old
+        // or new snapshot; a read must not create directories or lock files.
         let state = State::read(&self.path)?;
         let name = conversation
             .and_then(|id| state.conversations.get(id))

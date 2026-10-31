@@ -449,3 +449,21 @@ Refresh retains previous generations. If publication is attempted but reports an
 error, it also retains the new generation: a workflow could already have observed
 that pointer, even if another actor subsequently changes it. Reclamation must
 respect runtime ownership and leases; pointer absence alone is insufficient.
+
+Read-only `autopr readiness --json` also reports `roles.builder`,
+`roles.independent_reviewer` and `roles.adjudicator`. Builder admission uses the
+same effective model selection, routing, capability, credential and cooldown
+filters as the workflow chain. Review admission considers all currently available
+builders and the configured native reviewer pool; native Codex can supply the
+existing protected fresh-session review path. Actual review still requires durable
+authorship and its controller-owned conversation receipt. Final adjudication
+requires native Codex separately, even when another provider can build or review.
+Missing capacity and cooldowns stay distinct from declaration availability.
+
+A non-dry-run worker checks these roles after runtime inspection and before
+creating a run lock, inspecting Git or selecting an issue. This catches a usable
+builder with no review/adjudication path before scoping spends model calls. Reads
+of model selection observe an atomic published snapshot without creating selection
+locks or directories. Providers and credentials are rechecked on later admission;
+`declared-available` never asserts a successful live call, sufficient resources,
+matching deployed configuration, or permission to merge.
