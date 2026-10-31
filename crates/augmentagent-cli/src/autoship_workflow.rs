@@ -9,6 +9,8 @@ use std::{path::Path, time::Duration};
 
 #[path = "autoship_merge_allowance.rs"]
 mod merge_allowance;
+#[path = "autoship_submission.rs"]
+pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
 pub(crate) use merge_allowance::validate_merge_receipt_identity;
 
@@ -270,6 +272,12 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS command_job (
+                workflow TEXT PRIMARY KEY, repository TEXT NOT NULL, target TEXT NOT NULL,
+                until_milestone TEXT NOT NULL, provider TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_request (
+                request_id TEXT PRIMARY KEY, principal TEXT NOT NULL, payload TEXT NOT NULL,
+                admission TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS scope_stage_response(workflow TEXT NOT NULL REFERENCES workflow(id),key TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(workflow,key));
             CREATE TABLE IF NOT EXISTS pr_readiness_dependencies(workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_hash TEXT NOT NULL,base TEXT NOT NULL,evidence TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
@@ -897,6 +905,9 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        let submitted_alias: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)", [&alias], |row| row.get(0))?;
+        ensure!(alias == lease.workflow || !submitted_alias, "submission-alias-conflict");
+
         let prior: Option<i64> = tx.query_row(
             "SELECT pr FROM workflow WHERE id=?1",
             [&lease.workflow],

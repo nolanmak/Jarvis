@@ -568,6 +568,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, &op.binding, now)?;
+        super::submission::require_merge_authority(&tx, &op.workflow, &repo, pr)?;
         let (workflow, kind, binding): (String, String, String) = tx.query_row(
             "SELECT workflow,kind,binding FROM operation WHERE id=?1",
             [&op.id],
@@ -683,6 +684,10 @@ impl WorkflowStore {
             && serde_json::from_str::<OperationKind>(&kind)? == op.kind
             && serde_json::from_str::<Binding>(&binding)? == op.binding,
             "merge dispatch differs from stored intent");
+        let (repository, pr): (String, u64) = tx.query_row(
+            "SELECT repository,pr FROM merge_allowance_dispatch WHERE operation=?1", [&op.id],
+            |row| Ok((row.get(0)?, row.get(1)?)))?;
+        super::submission::require_merge_authority(&tx, &op.workflow, &repository, pr)?;
         let status = allowance(&tx, now, cap)?;
         ensure!(
             status.confirmed.saturating_add(status.pending) <= cap,
