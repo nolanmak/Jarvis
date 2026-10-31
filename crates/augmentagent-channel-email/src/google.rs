@@ -132,22 +132,27 @@ impl OAuthApp {
     /// The consent URL for one mailbox connect. `access_type=offline` plus
     /// `prompt=consent` is what makes Google return a refresh token every
     /// time, not only on the first consent for this client.
-    pub fn auth_url(&self, redirect_uri: &str, state: &str) -> String {
+    ///
+    /// `login_hint` (a mailbox address) makes Google preselect that account
+    /// in its chooser, so a caller connecting several mailboxes in a row
+    /// lands each consent on the intended one.
+    pub fn auth_url(&self, redirect_uri: &str, state: &str, login_hint: Option<&str>) -> String {
         let scope = SCOPES.join(" ");
-        let url = reqwest::Url::parse_with_params(
-            AUTH_ENDPOINT,
-            &[
-                ("client_id", self.client_id.as_str()),
-                ("redirect_uri", redirect_uri),
-                ("response_type", "code"),
-                ("scope", scope.as_str()),
-                ("access_type", "offline"),
-                ("prompt", "consent"),
-                ("include_granted_scopes", "true"),
-                ("state", state),
-            ],
-        )
-        .expect("static auth endpoint parses");
+        let mut params = vec![
+            ("client_id", self.client_id.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("response_type", "code"),
+            ("scope", scope.as_str()),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+            ("include_granted_scopes", "true"),
+            ("state", state),
+        ];
+        if let Some(hint) = login_hint.map(str::trim).filter(|h| !h.is_empty()) {
+            params.push(("login_hint", hint));
+        }
+        let url = reqwest::Url::parse_with_params(AUTH_ENDPOINT, &params)
+            .expect("static auth endpoint parses");
         url.to_string()
     }
 }
@@ -221,7 +226,7 @@ pub struct DraftSpec<'a> {
     pub subject: &'a str,
     pub body: &'a str,
     pub thread_id: Option<&'a str>,
-    pub attachment: Option<&'a LocalAttachment>,
+    pub attachments: &'a [LocalAttachment],
 }
 
 struct CachedToken {
@@ -1026,7 +1031,7 @@ struct Threading {
 
 /// An RFC 5322 message for `drafts.create`'s `raw`. Plain-text body, base64
 /// transfer encoding (safe for any line length or charset), multipart/mixed
-/// when an attachment rides along.
+/// with one part per attachment when any ride along.
 fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
     let mut out = String::new();
     push_address_header(&mut out, "To", spec.to);
@@ -1058,15 +1063,16 @@ fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
         out.push_str("\r\n");
     };
 
-    match spec.attachment {
-        None => text_part(&mut out),
-        Some(att) => {
-            let boundary = format!("=_augmentagent_{:x}", wallclock_ms());
-            out.push_str(&format!(
-                "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
-            ));
-            out.push_str(&format!("--{boundary}\r\n"));
-            text_part(&mut out);
+    if spec.attachments.is_empty() {
+        text_part(&mut out);
+    } else {
+        let boundary = format!("=_augmentagent_{:x}", wallclock_ms());
+        out.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
+        ));
+        out.push_str(&format!("--{boundary}\r\n"));
+        text_part(&mut out);
+        for att in spec.attachments {
             out.push_str(&format!("--{boundary}\r\n"));
             let name = att.name.replace('"', "");
             out.push_str(&format!(
@@ -1078,8 +1084,9 @@ fn build_mime(spec: &DraftSpec<'_>, threading: &Threading) -> String {
             ));
             out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
             out.push_str(&wrap_base64(&att.bytes));
-            out.push_str(&format!("\r\n--{boundary}--\r\n"));
+            out.push_str("\r\n");
         }
+        out.push_str(&format!("--{boundary}--\r\n"));
     }
     out
 }
@@ -1277,9 +1284,17 @@ impl GmailMessage {
             attachments,
             subject,
             body,
-            // Epoch ms as a string; `parse_rfc2822_or_ms` reads it exactly
-            // as it reads Composio's `messageTimestamp`.
-            date: self.internal_date.unwrap_or_default(),
+            // RFC 3339, the shape Composio's `messageTimestamp` had, so
+            // listings print a readable date; `parse_rfc2822_or_ms` reads it
+            // back to the same instant.
+            date: self
+                .internal_date
+                .as_deref()
+                .and_then(|d| d.parse::<i64>().ok())
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .or(self.internal_date)
+                .unwrap_or_default(),
             account_entity_id: Some(account_entity_id.to_string()),
             platform: "gmail".into(),
             kind: "dm".into(),
@@ -1514,7 +1529,7 @@ mod tests {
     #[test]
     fn auth_url_requests_offline_access_with_forced_consent_and_every_scope() {
         let app = OAuthApp::new("cid.apps.googleusercontent.com", "s");
-        let url = app.auth_url("http://localhost:3000/oauth/google/callback", "st4te");
+        let url = app.auth_url("http://localhost:3000/oauth/google/callback", "st4te", None);
         let parsed = reqwest::Url::parse(&url).unwrap();
         let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(parsed.host_str(), Some("accounts.google.com"));
@@ -1528,6 +1543,10 @@ mod tests {
             assert!(q["scope"].split(' ').any(|s| s == *scope), "{scope} missing");
         }
         assert!(!url.contains("csecret") && !url.contains("client_secret"));
+        assert!(!q.contains_key("login_hint"));
+        let hinted = app.auth_url("http://localhost:3000/oauth/google/callback", "s", Some("me@example.com"));
+        let hq: HashMap<_, _> = reqwest::Url::parse(&hinted).unwrap().query_pairs().into_owned().collect();
+        assert_eq!(hq["login_hint"], "me@example.com");
     }
 
     #[test]
@@ -1540,7 +1559,7 @@ mod tests {
             subject: "Re: Hello",
             body: "line one\r\nline two — with a dash",
             thread_id: Some("t1"),
-            attachment: None,
+            attachments: &[],
         };
         let threading = Threading {
             in_reply_to: "<abc@mail.example.com>".into(),
@@ -1572,7 +1591,7 @@ mod tests {
             to: "a@example.com",
             subject: "Invoice",
             body: "attached",
-            attachment: Some(&att),
+            attachments: std::slice::from_ref(&att),
             ..Default::default()
         };
         let mime = build_mime(&spec, &Threading::default());
@@ -1582,6 +1601,45 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 fake");
         assert!(mime.contains(&b64));
         assert!(mime.trim_end().ends_with("--"));
+    }
+
+    #[test]
+    fn mime_carries_every_attachment_byte_for_byte_in_order() {
+        let atts: Vec<LocalAttachment> = [
+            ("Proposal.pdf", &b"%PDF-1.7 proposal \x00\xff\r\n"[..]),
+            ("Audit.pdf", &b"%PDF-1.7 audit"[..]),
+            ("Summary (Plain).pdf", &[0u8, 1, 2, 254, 255][..]),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| LocalAttachment {
+            name: name.into(),
+            mimetype: "application/pdf".into(),
+            bytes: bytes.to_vec(),
+        })
+        .collect();
+        let spec = DraftSpec {
+            to: "a@example.com",
+            subject: "Docs",
+            body: "attached",
+            attachments: &atts,
+            ..Default::default()
+        };
+        let mime = build_mime(&spec, &Threading::default());
+        let boundary = mime
+            .split("boundary=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap();
+        let parts: Vec<&str> = mime.split(&format!("--{boundary}")).collect();
+        // preamble, text, three files, closing "--".
+        assert_eq!(parts.len(), 6, "{mime}");
+        assert!(parts[5].starts_with("--"));
+        for (part, att) in parts[2..5].iter().zip(&atts) {
+            assert!(part.contains(&format!("filename=\"{}\"", att.name)), "{part}");
+            let b64 = part.split("\r\n\r\n").nth(1).unwrap().replace("\r\n", "");
+            let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+            assert_eq!(decoded, att.bytes, "{}", att.name);
+        }
     }
 
     #[test]

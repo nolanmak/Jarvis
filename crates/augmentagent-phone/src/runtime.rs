@@ -28,6 +28,17 @@ pub enum RuntimeError {
     #[error("phone runtime task did not finish cleanly")]
     Task,
 }
+/// Local runtime health, not proof of external provider access or audible
+/// quality. Contains no credentials, endpoints, caller identity or transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoneRuntimeHealth {
+    pub running: bool,
+    pub transport: &'static str,
+    pub audio_model: Option<&'static str>,
+    pub voice: String,
+    pub provider_readiness: &'static str,
+}
+
 pub struct PhoneRuntime {
     service: Arc<PhoneService>,
     tools: Arc<ToolServer>,
@@ -46,6 +57,7 @@ impl PhoneRuntime {
         // Synchronous reconciliation marks stale calls stopped before callers
         // get access to the new runtime and can request another call.
         let initial = service.cleanup_due(true)?;
+        service.store.phone_reconcile_live_sessions().map_err(Error::from)?;
         let stop = CancellationToken::new();
         let dispatches = tokio::spawn(dispatch_worker(
             service.clone(),
@@ -53,6 +65,7 @@ impl PhoneRuntime {
             stop.clone(),
         ));
         let memory = tokio::spawn(memory_worker(service.clone(), agent.clone(), stop.clone()));
+        let history = tokio::spawn(history_worker(service.clone(), agent.clone(), stop.clone()));
         let proposals = tokio::spawn(proposal_worker(service.clone(), agent.clone(), stop.clone()));
         let router = crate::ingress::router(service.clone(), auth, agent);
         let listener_stop = stop.clone();
@@ -76,11 +89,21 @@ impl PhoneRuntime {
             service,
             tools,
             stop,
-            tasks: vec![http, watchdog, memory, proposals, dispatches],
+            tasks: vec![http, watchdog, memory, proposals, dispatches, history],
         })
     }
     pub fn tools(&self) -> &Arc<ToolServer> {
         &self.tools
+    }
+    pub fn health(&self) -> PhoneRuntimeHealth {
+        let live = self.service.voice_backend() == crate::live_config::VoiceBackend::OpenAiLive;
+        PhoneRuntimeHealth {
+            running: self.is_running(),
+            transport: self.service.voice_backend().as_str(),
+            audio_model: live.then_some(crate::live_session::MODEL),
+            voice: if let Some(config) = &self.service.config.live { config.voice_label().into() } else { self.service.config.voice.tts_voice().into() },
+            provider_readiness: if live { "requires_per_call_preflight" } else { "not_probed" },
+        }
     }
     pub fn is_running(&self) -> bool {
         !self.stop.is_cancelled() && self.tasks.iter().all(|task| !task.is_finished())
@@ -126,6 +149,7 @@ pub fn mark_cleanup_pending(store: &augmentagent_store::Store) -> Result<bool, R
             store.phone_mark_uncertain(&call.id).map_err(Error::from)?;
         }
     }
+    store.phone_reconcile_live_sessions().map_err(Error::from)?;
     Ok(!calls.is_empty())
 }
 
@@ -148,6 +172,7 @@ pub async fn cleanup_without_runtime(
             verification_key: Vec::new(),
             links: Vec::new(),
             voice: crate::voice::VoiceConfig::default(),
+            live: None,
             owner_first_name: None,
             debug_events: false,
             barge_in: crate::relay::BargeIn::default(),
@@ -280,6 +305,50 @@ async fn watchdog(
     }
 }
 
+// Network delivery never runs on the audio loop or the native task worker.
+async fn history_worker(
+    service: Arc<PhoneService>,
+    agent: Arc<dyn ConversationAgent>,
+    stop: CancellationToken,
+) -> Result<(), RuntimeError> {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = tick.tick() => {},
+        }
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = service.deliver_live_history(agent.as_ref()) => {},
+        }
+    }
+}
+
+impl PhoneService {
+    pub async fn deliver_live_history(&self, agent: &dyn ConversationAgent) -> Result<(), Error> {
+        self.store.phone_expire_live_history(self.clock.now_ms())?;
+        for notice in self.store.phone_live_history_notices()? {
+            let call = self.store.phone_provider_call(&notice.call_id)?;
+            if self.authorize_call_origin(&call).is_err() { continue; }
+            if matches!(tokio::time::timeout(Duration::from_secs(5),
+                agent.call_ended(&call, &notice.key, &notice.text)).await, Ok(Ok(()))) {
+                self.store.phone_live_history_notice_delivered(&call.id)?;
+            }
+        }
+        for batch in self.store.phone_live_history_batches()? {
+            let call = self.store.phone_provider_call(&batch.call_id)?;
+            // Call completion is allowed; revoked or changed chat authority is not.
+            if self.authorize_call_origin(&call).is_err() { continue; }
+            if matches!(tokio::time::timeout(Duration::from_secs(5),
+                agent.mirror_transcript(&call, &batch.key, &batch.text)).await, Ok(Ok(()))) {
+                self.store.phone_live_history_delivered(&call.id, &batch.key)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // Independent of slow post-call summaries: queued work survives daemon restart.
 async fn dispatch_worker(
     service: Arc<PhoneService>,
@@ -290,14 +359,20 @@ async fn dispatch_worker(
     loop {
         tokio::select! {
             _ = stop.cancelled() => return Ok(()),
-            _ = interval.tick() => {
-                let Ok(jobs) = service.store.phone_pending_dispatches() else { continue; };
-                for job in jobs {
-                    if stop.is_cancelled() { return Ok(()); }
-                    if let Ok(call) = service.store.phone_provider_call(&job.call_id) {
-                        let _ = agent.resume_task(&call, &job.task_id).await;
-                    }
-                }
+            _ = interval.tick() => {},
+            _ = service.dispatch_ready.notified() => {},
+        }
+        if service.store.phone_reconcile_live_sessions().is_err() {
+            // Preserve queued jobs and retry on the next tick. Do not log raw
+            // database errors, which can include private stored values.
+            tracing::warn!("phone live session reconciliation failed; retrying");
+            continue;
+        }
+        let Ok(jobs) = service.store.phone_pending_dispatches() else { continue; };
+        for job in jobs {
+            if stop.is_cancelled() { return Ok(()); }
+            if let Ok(call) = service.store.phone_provider_call(&job.call_id) {
+                let _ = agent.resume_task(&call, &job.task_id).await;
             }
         }
     }

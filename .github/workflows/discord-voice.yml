@@ -11,6 +11,10 @@ on:
       - 'docs/discord-voice/**'
       - 'systemd/augmentagent-discord-voice.service'
       - '.github/workflows/discord-voice.yml'
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
   push:
     branches: [main]
     paths:
@@ -23,8 +27,17 @@ on:
       - 'systemd/augmentagent-discord-voice.service'
       - '.github/workflows/discord-voice.yml'
 
+      - "scripts/ci-contract.py"
+      - "scripts/ci-contract.json"
+      - "scripts/ci-contract-sync.py"
+      - "scripts/tests/ci_contract_test.py"
 permissions:
   contents: read
+
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 
 jobs:
   sidecar:
@@ -34,16 +47,20 @@ jobs:
       run:
         working-directory: sidecars/discord-voice
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.17.0'
           cache: npm
           cache-dependency-path: sidecars/discord-voice/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm audit --omit=optional --audit-level=high
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/2"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/3"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/sidecar/5"
+
       # Live calls require a disposable guild and provider credentials. They
       # remain explicit opt-in verification, never synthetic CI success.
 
@@ -51,25 +68,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.94.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: discord-voice
       # augmentagent-channel-core's code_mode_compute tests spawn Deno to run a
       # real program; without it they fail with DenoNotFound. code-mode.yml
       # already installs it for the same crate — this job tests the whole crate
       # and needs it too. Pinned to the same version so both agree.
-      - uses: denoland/setup-deno@v2
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
         with:
           deno-version: 2.7.14
       # augmentagent-cli's document_signing tests render a real PDF, which needs
       # the pinned runtime and its fonts. pdf-generation.yml provisions both for
       # the same code; this job runs those tests too and failed with
       # "run python3 scripts/pdf-runtime.py to provision the pinned runtime".
-      - run: sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils
-      - run: python3 scripts/pdf-runtime.py
-      - run: cargo test -p augmentagent-approval-discord -p augmentagent-channel-core -p augmentagent-store --locked
-      - run: cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/4"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/5"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/6"
+
+      - run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id discord-voice/rust/7"

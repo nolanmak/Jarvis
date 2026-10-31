@@ -40,6 +40,7 @@ make_case() {
   printf 'import sys; sys.exit(0)\n' > "$TMP/work/scripts/pdf-runtime.py"
   printf '#!/bin/sh\nexec ./target/release/augmentagent "$@"\n' > "$TMP/work/scripts/run-rs.sh"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base

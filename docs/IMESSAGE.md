@@ -316,6 +316,63 @@ the card, then the send interval once you approve.
 - No attachments, tapbacks, edits or unsend. BlueBubbles and Messages'
   private API are not used; System Integrity Protection stays enabled.
 
+## Composing new messages (#1635)
+
+Replies answer a text that came in. `imessage compose` starts one, the way
+`gmail compose --post` and `slack compose` do on their platforms, and it
+raises the same approval card: nothing is sent until you approve it, and
+Approve queues the text through the same outbox and Mac sender.
+
+```sh
+augmentagent --wiki-dir /absolute/path/to/wiki imessage compose --to "Jane" --body "running ten minutes late" --post
+augmentagent imessage compose --to +15555550100 --body-file - --post < message.txt
+augmentagent --wiki-dir /absolute/path/to/wiki imessage compose --to "Jane" --body "hi"            # preview only
+```
+
+`--to` takes a person from the wiki (full or first name, or page slug, matched
+against the explicit `imessage:` identities on `people/*.md`), an E.164
+phone number, or an Apple-ID email. Resolution fails closed, and every refusal
+names what to do:
+
+- a name matching several people lists them and stores nothing;
+- a person with no explicit iMessage identity in the wiki is refused;
+- the handle must already have a 1:1 `iMessage` conversation in the bundle
+  (SMS, RCS and group chats are refused; a person you have never texted from
+  the Mac is refused until you have);
+- the conversation must be on `allow-outbound`, and
+  `AUGMENTAGENT_IMESSAGE_SEND_ENABLED=1` must be set.
+
+The owner can opt all existing and future one-to-one iMessage conversations into
+incoming reply drafting and outgoing approval cards with:
+
+```sh
+augmentagent imessage contact-defaults --inbound true --outbound true
+```
+
+This policy persists in the database. Both defaults are off until explicitly
+selected by the owner. `deny-inbound <handle>` and `deny-outbound <handle>` are
+persistent exceptions, even while the defaults are on; `allow-inbound` and
+`allow-outbound` remove the corresponding exception. `imessage allowlist` shows
+the defaults and exceptions. Set both flags to `false` to return to explicit
+allowlists. Groups still require explicit permission; compose remains 1:1 only.
+Neither this policy nor composing bypasses Approve or the global send switch.
+The agent cannot change this policy from an ask session.
+
+Only after every check passes is one pending card stored. A second compose to
+the same person while the first is still pending replaces it. The card is
+labelled *New message · iMessage* with a **To** field; Revise redrafts against your
+text with no inbound to quote; Approve runs the same checks again and queues
+the outbox row; Skip discards it. A text you send by hand retires a pending
+*reply* card for that conversation but leaves a pending *compose*, since
+nothing has answered it, and adds a note that you texted since composing. The sent text comes back through the exporter and is
+recognised as the agent's own, so it never produces a reply card.
+
+With `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` in the environment (the
+daemon's `.env`), `--post` posts the card immediately; otherwise the pending
+row waits for the daemon's approval queue. From Discord or an ask session,
+"text Jane that I'm running late" runs this command for you; the agent can
+raise the card but cannot approve it, change the allowlists, or send.
+
 ## Proactive owner alerts (#1393)
 
 Owner alerts share the existing outbox and Mac sender, but have a separate,
@@ -406,10 +463,11 @@ send as a recovery shortcut; reconcile against `chat.db` first.
 
 ```sh
 python3 -m unittest discover -s scripts/imessage/tests -v
-cargo test -p augmentagent-channel-imessage
-cargo test -p augmentagent-store --test imessage_outbox
-cargo test -p augmentagent-cli --test imessage_outbox_cli
-cargo test -p augmentagent-cli --bin augmentagent imessage_send
+./scripts/cargo-managed.sh test -p augmentagent-channel-imessage
+./scripts/cargo-managed.sh test -p augmentagent-store --test imessage_outbox --test imessage_compose
+./scripts/cargo-managed.sh test -p augmentagent-cli --test imessage_outbox_cli --test imessage_compose_cli
+./scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent imessage_send
+./scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent imessage_compose
 ```
 
 Python tests use synthetic SQLite databases and require neither a Mac nor access

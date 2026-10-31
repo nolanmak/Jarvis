@@ -1,0 +1,1239 @@
+{
+  "epic": 1598,
+  "plan": "https://github.com/nolanmak/Jarvis/issues/1598#issuecomment-6410025868",
+  "requirements": [
+    {
+      "issue": 1537,
+      "title": "Autoship: explicitly adopt and review existing PRs outside agent-fix branches",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1537",
+      "implementation_status": "partial",
+      "evidence": [
+        "Selection/provenance/parent-retarget/free holds are integrated; read-only actual selector and audit-generation approval invalidation follow-ups are under central validation. Full native source-less adoption through repair and merge remains required before broad rollout."
+      ],
+      "remaining_acceptance": [
+        "Pass full native source-less adoption through repair, exact-head review and free merge reconciliation after controller-evidence fixes.",
+        "Verify allowed branch prefixes and dependency-targeted PRs in rollout."
+      ]
+    },
+    {
+      "issue": 1531,
+      "title": "Autoship: retire managed drafts when their source issue is already closed",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1531",
+      "implementation_status": "partial",
+      "evidence": [
+        "Source lifecycle tests passed; fresh/resume/sweep checks wired; full deployed acceptance pending"
+      ],
+      "remaining_acceptance": [
+        "Verify deployed retirement and retry behavior without closing useful work on unknown remote state."
+      ]
+    },
+    {
+      "issue": 930,
+      "title": "Auto-PR loop self-heals its own blockers: red `main` and conflicting drafts",
+      "source": "https://github.com/nolanmak/Jarvis/issues/930",
+      "implementation_status": "partial",
+      "evidence": [
+        "Audited existing children; paginated baseline-repair lookup and idempotent durable epic slicing added. Final deployed end-to-end acceptance pending."
+      ],
+      "remaining_acceptance": [
+        "Verify integrated recovery against red main, tractable conflicts and stacked dependencies; preserve shipped children."
+      ]
+    },
+    {
+      "issue": 1082,
+      "title": "Auto-resume: policy and receipt holds on approved drafts bill a slot every day; merge sweep may never reach a draft",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1082",
+      "implementation_status": "partial",
+      "evidence": [
+        "Exact-head approved policy/CI waits now use free reconciliation; actual failed checks/conflicts/main changes reengage repair. Named health observations persisted. Virtual 72-hour five-PR admission/Git/fake-GH soak integrated; full native soak remains pending."
+      ],
+      "remaining_acceptance": [
+        "Verify deployed unchanged holds remain unbilled and changed dependencies resume exactly once; merge sweep remains eligible with exhausted builder budget."
+      ]
+    },
+    {
+      "issue": 1215,
+      "title": "Ship at least two more PRs per day: daily cap 5, quota brake, spread runs across the UTC day",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1215",
+      "implementation_status": "partial",
+      "evidence": [
+        "Calendar spreading and blanket cancellation removed; durable resource/quota reservations and free merge reconciliation implemented. Local-calendar/DST foundation tests passed. Seven-day production throughput observation has not started."
+      ],
+      "remaining_acceptance": [
+        "Complete real capacity-aware five-candidate shipping acceptance.",
+        "Collect seven-day autonomous merge/resource report; manual merges do not count."
+      ]
+    },
+    {
+      "issue": 1363,
+      "title": "Auto-PR loop: add a meta-reasoning controller that keeps a compact run ledger and makes budget-aware continue / restart / stop decisions",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1363",
+      "implementation_status": "partial",
+      "evidence": [
+        "Durable fresh/resume checkpoints, fenced runtime owner registration, terminal/recovery retirement outbox and original-owner resume checks are integrated. Independent delta review passed at 512a8836. Final combined Rust regressions and native crash recovery remain required."
+      ],
+      "remaining_acceptance": [
+        "Validate latest combined controller checkpoints, exact operation receipts and bounded context under full integrated failure injection."
+      ]
+    },
+    {
+      "issue": 1476,
+      "title": "Auto-PR loop: periodic 'forget and restart from best candidate' to break anchoring in iterative repair/review rounds",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1476",
+      "implementation_status": "partial",
+      "evidence": [
+        "Fresh-session recovery preserves contracts/best candidates/adjudications. Protected audit-generation and cancelled-worker recovery passed real isolated process probes. Thirty-day before/after operational analysis remains open."
+      ],
+      "remaining_acceptance": [
+        "Verify fresh-session recovery in final native pipeline without losing candidate, contract or adjudications.",
+        "Collect thirty-day before/after outcome comparison."
+      ]
+    },
+    {
+      "issue": 1426,
+      "title": "Auto-PR loop: add a judge-improvement loop that calibrates reviewer/QA verdicts on human-resolved disagreements when progress plateaus",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1426",
+      "implementation_status": "partial",
+      "evidence": [
+        "Structured final adjudication, immutable replay storage and rubric validation are implemented. Native contradiction test passed8f317dd6; representative PR1538 writer-inventory negative/repaired replay passed7591660b. Production calibration and rollout observations remain open."
+      ],
+      "remaining_acceptance": [
+        "Validate typed controller disputes, missing-evidence recovery and final-authority replay at final head.",
+        "Verify protected calibration promotion preserves hard-case verdicts and excludes duplicate-source observation labels."
+      ]
+    },
+    {
+      "issue": 1453,
+      "title": "Auto-ship/self-improve: executable scope contract with pre-run validation and automatic stop conditions",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1453",
+      "implementation_status": "partial",
+      "evidence": [
+        "Common required native VM launcher, minimal manifest-verified runtime, no guest NIC, declared credential import, guarded MCP relay and exact provider gateway policy are implemented. This supersedes the earlier unimplemented transport-boundary note; authenticated provider acceptance is still pending.",
+        "Real synthetic VM streaming/quiescence stress proof passed at 12b93e3e (service autoship-native-vm-io-proof5, invocation 978329b99e3e41ad81ceae2e7d7bdaf1). This does not prove authenticated provider inference or every fallback.",
+        "Durable native-owner retirement outbox integrated at 8d50b960; Rust crash/reopen regressions and independent review pending.",
+        "Direct Codex authenticated inference and observed-session continuation passed in a real no-NIC VM at8c18caa7 after fixing lost export tail. Host-observed TLS Responses receipts and unchanged auth source retained. Full guarded MCP and other provider/fallback acceptance still pending."
+      ],
+      "remaining_acceptance": [
+        "Implement and validate authenticated streaming native provider calls inside no-NIC VM with declared credentials and guarded MCP relay.",
+        "Prove every admitted provider/fallback has the same boundary, including denied egress/credential probes and cleanup."
+      ]
+    },
+    {
+      "issue": 1472,
+      "title": "Require a machine-checkable verifier on every agent-fixable issue before the self-improve loop picks it up",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1472",
+      "implementation_status": "partial",
+      "evidence": [
+        "Independent red/green registration and final adjudicated amendments integrated across fresh/resume/source-less paths. Old approvals discarded after amendments; complete live acceptance pending."
+      ],
+      "remaining_acceptance": [
+        "Rerun native readiness/specification and independently registered verifier pipeline after schema recovery fixes.",
+        "Verify generated verifiers are relevant and baseline failures are behavioral, not setup failures."
+      ]
+    },
+    {
+      "issue": 810,
+      "title": "Self-improve gate is vacuous: require a pre-registered falsifier that goes red\u2192green",
+      "source": "https://github.com/nolanmak/Jarvis/issues/810",
+      "implementation_status": "partial",
+      "evidence": [
+        "Baseline/no-op/green/tamper verifier fixture passed previously; production call sites integrated. Protected verifier cache and registry integrity checks added; final Rust rerun pending."
+      ],
+      "remaining_acceptance": [
+        "Retain native no-op and seeded-defect negative proofs on the final integrated implementation.",
+        "Verify verifier amendment requires independent authority and fresh baseline; no routine human-only lane."
+      ]
+    },
+    {
+      "issue": 1012,
+      "title": "Acceptance criteria from the scoping pass, graded by both reviewers",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1012",
+      "implementation_status": "audit_pending",
+      "evidence": [
+        "Closed foundation preserved: acceptance criteria parsing, transport, schema, required mapping, and resume coverage remain integrated. No reopening or replacement of the closed issue."
+      ],
+      "remaining_acceptance": [
+        "Preserve already-closed criteria foundation; validate final criteria transport/resume and malformed-criteria rescoping during rollout."
+      ]
+    },
+    {
+      "issue": 1151,
+      "title": "Auto-PR review loop: require measured file-coverage for a LGTM, and fan review out per-file when coverage is incomplete",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1151",
+      "implementation_status": "partial",
+      "evidence": [
+        "Earlier native complete/seeded review passed at 3383566e. Immutable source windows, pinned controller oracle delivery, typed evidence-budget results and iterative NeedEvidence recovery are now implemented. Final native end-to-end validation remains pending."
+      ],
+      "remaining_acceptance": [
+        "Validate final streamed evidence, exact source windows, controller oracle delivery and automatic NeedEvidence recovery end to end.",
+        "Prove incomplete source cannot approve or become a paid builder repair."
+      ]
+    },
+    {
+      "issue": 953,
+      "title": "Add review-constraint checks to the auto-PR loop, mined from real PR review comments, reported separately from functional tests",
+      "source": "https://github.com/nolanmak/Jarvis/issues/953",
+      "implementation_status": "partial",
+      "evidence": [
+        "Authenticated historical comment mining, independent promotion and replay validation integrated. Exact-head contract exceptions persist and are reused only while policy/contract/hunk inputs match. Latest additions need regression run."
+      ],
+      "remaining_acceptance": [
+        "Validate final deterministic constraint promotion and hostile-comment replay with provenance retained."
+      ]
+    },
+    {
+      "issue": 1522,
+      "title": "Triage/auto-PR evaluation: penalise 'safe delaying' decisions that a per-step judge lets through (rollout-scorer gap)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1522",
+      "implementation_status": "partial",
+      "evidence": [
+        "Owner-outcome triage joins, disagreement sample and token-usage/digest metrics implemented; two store tests passed. Episode outcome reducer implemented; operational calibration remains pending.",
+        "Protected triage calibration integrated at e9f0bec7+a0a8cd11; independent review passed. All ten targeted calibration tests passed at 5bfab49d, plus durable daily admitted-call accounting across lost responses, restart and binding changes. Actual native replay/promotion and deployed outcome observation remain pending."
+      ],
+      "remaining_acceptance": [
+        "Verify deployed episode metrics and triage outcome joins/digest; unknown outcomes remain unknown."
+      ]
+    },
+    {
+      "issue": 1512,
+      "title": "EPIC: auto-PR backlog reform \u2014 fair-try scoping, relevance check, epic slicing, wider picker, research dedup",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1512",
+      "implementation_status": "partial",
+      "evidence": [
+        "Complete bounded pagination/readmission, durable slicing recovery and historical research dedup implemented. Verified duplicate #912 consolidated into #674 with preserved mapping. Full policy acceptance pending."
+      ],
+      "remaining_acceptance": [
+        "Complete aggregate backlog acceptance across full-pool selection, refusal readmission, relevance, decomposition and research deduplication.",
+        "Audit existing child receipts and retain historical duplicate mapping."
+      ]
+    },
+    {
+      "issue": 472,
+      "title": "Add a persistent Failure Memory + Coverage Map to the self-improve and retry loops (SOCM-style externalized state)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/472",
+      "implementation_status": "partial",
+      "evidence": [
+        "Email retry full guard-chain and metadata preservation: complete suite 221 passed. Scheduled-loop coverage and digest previously passed 49 tests. Deployed acceptance pending.",
+        "Separate typed guard history integrated at e2e0630f, independently reviewed; intentional skips/flags retain their disposition. Combined core/email/store regression execution is still pending.",
+        "Combined managed regression run passed: core644/email222/store160, including durable guard observations across reopen and real retry guard cases; log /tmp/autoship-1598-e2e0630f-core-email-store.log."
+      ],
+      "remaining_acceptance": [
+        "Verify final durable failure/coverage state and email retry guard chain in deployment.",
+        "Verify pending delivery/backoff and scheduled-loop coverage survive restart without losing original execution/delivery bytes."
+      ]
+    },
+    {
+      "issue": 970,
+      "title": "Self-improve scoper resolves ambiguity by guessing instead of localizing gaps and asking (IdeaAMBIG asymmetry)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/970",
+      "implementation_status": "partial",
+      "evidence": [
+        "Executable contract foundation implemented; material ambiguity routing and production readiness integration pending"
+      ],
+      "remaining_acceptance": [
+        "Rerun native grounded readiness after not_applicable schema correction and raw-response recovery.",
+        "Verify genuine external decisions stay explicit and free while routine gaps progress autonomously."
+      ]
+    },
+    {
+      "issue": 524,
+      "title": "self-improve: verify PR\u2194issue alignment before surfacing a draft PR for review",
+      "source": "https://github.com/nolanmak/Jarvis/issues/524",
+      "implementation_status": "partial",
+      "evidence": [
+        "Independent hunk/criterion mappings run before model review; protected exact-head alignment artifacts and promoted constraints rechecked. Typed PR-scoped sources supported. Production canary and rollout acceptance still pending."
+      ],
+      "remaining_acceptance": [
+        "Verify final native criterion/hunk alignment and required integration checks for exact merge head."
+      ]
+    },
+    {
+      "issue": 1184,
+      "title": "Harden the dual-LGTM auto-merge against reviewer/builder collusion drift",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1184",
+      "implementation_status": "partial",
+      "evidence": [
+        "Distinct actual native builder/reviewer sessions and exact binding/coverage passed the full native clean/seeded probe on 3383566e. Native adjudicator correction uses a fresh session per call and passed on 8f317dd6."
+      ],
+      "remaining_acceptance": [
+        "Validate final independent actual sessions, typed authority and non-overridable deterministic gates after combined changes."
+      ]
+    },
+    {
+      "issue": 1209,
+      "title": "Move tool-audit / token-usage / auto-PR history sinks out of the reasoner subprocess's reach (trace integrity)",
+      "source": "https://github.com/nolanmak/Jarvis/issues/1209",
+      "implementation_status": "partial",
+      "evidence": [
+        "Protected audit storage correctly rejected tests whose control evidence lived in managed writable build scratch. Fixtures separated from worker cache; workflow audit tests passed in latest broad run. Runtime and provider-specific targeted suites still required."
+      ],
+      "remaining_acceptance": [
+        "Validate final native VM/relay cannot alter control-plane audit, approval, token or failure history, and recovery rejects tampered evidence."
+      ]
+    },
+    {
+      "issue": 840,
+      "title": "self-improve: codex cannot run any command on this host (bwrap/AppArmor), so the system-interaction review reviews nothing",
+      "source": "https://github.com/nolanmak/Jarvis/issues/840",
+      "implementation_status": "partial",
+      "evidence": [
+        "Full production native adapter passed clean and seeded-defect probes on 3383566e; native final Codex contradiction probe passed on 8f317dd6. Deployment and ongoing diagnostic observations remain open."
+      ],
+      "remaining_acceptance": [
+        "Run deployed adapter positive/negative diagnostics and verify actual evidence delivery after provider runtime changes."
+      ]
+    }
+  ],
+  "operational_acceptance": {
+    "virtual_soak_72h": "partial_pass: five-PR real-Git/fake-GitHub admission and reconciliation fixture passed; full native integrated soak remains unproven",
+    "live_canary_24h": "not_started",
+    "throughput_report_7d": "not_started",
+    "convergence_comparison_30d": "not_started"
+  },
+  "validation": {
+    "foundation": {
+      "passed": 71,
+      "failed": 0,
+      "revision": "9c09d9da",
+      "note": "Includes review authority, workflow, metrics/local-calendar DST and publication evidence foundations."
+    },
+    "self_improve": {
+      "passed": 388,
+      "failed": 0,
+      "ignored": 7,
+      "revision": "36a6a07e",
+      "note": "Complete managed single-job recovery suite; includes real protected sweep acceptance, isolated verifier canary fixture, workflow namespace, final amendments and calibration fixture tests. Later dependency recovery/native harness/replay corrections need separate validation."
+    },
+    "kernel_scope": {
+      "passed": 6,
+      "failed": 0
+    },
+    "deployed": false,
+    "audit_chain": {
+      "passed": 4,
+      "failed": 0
+    },
+    "native_scope_probe": {
+      "normal_write": true,
+      "protected_write_denials": true,
+      "project_control_suppression": "Earlier probe passed; latest stricter end-to-end probe stopped on provider quota before tool execution.",
+      "does_not_prove": [
+        "full_read_scope",
+        "provider_network_egress"
+      ]
+    },
+    "python_boundary_registry_bridge": {
+      "run": 194,
+      "failed": 0,
+      "skipped": 10,
+      "log": "/tmp/autoship-1598-python-confinement-updated.log"
+    },
+    "scheduled_loops": {
+      "passed": 49,
+      "failed": 0
+    },
+    "triage_outcomes": {
+      "passed": 2,
+      "failed": 0
+    },
+    "latest_rust_admission": "Local93700 terminated storage-busy. Read-only process/lock audit confirms active production issue1593 revision after completed workspace verification; conversation-wide storage lease is a concrete contention gap under implementation. Hosted Rust passed e8970eb2; finalhead11115c45 CI pending. No native final-head or deployment proof.",
+    "github_main_rules": {
+      "observed": "2026-10-26",
+      "rules": [
+        "non_fast_forward",
+        "deletion"
+      ],
+      "coderabbit_required": false,
+      "note": "Legacy branch protection endpoint reports unprotected; branch rules endpoint reports only these rules. This does not prove local autoship code is deployed."
+    },
+    "email_retry": {
+      "passed": 221,
+      "failed": 0,
+      "revision": "374a7f0e",
+      "note": "Complete email library suite, managed single-job run."
+    },
+    "updater_rebuild": {
+      "passed": 61,
+      "failed": 0,
+      "revision": "941c6a78",
+      "log": "/tmp/autoship-1598-updater-resource-rebuild.log",
+      "note": "Includes committed verifier export and resource helper rebuild triggers."
+    },
+    "capability_inventory": {
+      "passed": 10,
+      "failed": 0,
+      "revision": "6896aaa6",
+      "note": "Before adding calibration entry; full production inventory and bridge contract suite."
+    },
+    "notifications": {
+      "passed": 17,
+      "failed": 0,
+      "revision": "d45052b4",
+      "note": "Complete notify_tests suite, including registry coverage of retry escalation."
+    },
+    "core_recovery": {
+      "revision": "941c6a78",
+      "passed": 632,
+      "failed": 0,
+      "ignored": 14,
+      "log": "/tmp/autoship-1598-core-recovery.log"
+    },
+    "kernel_audit_recovery": {
+      "revision": "941c6a78",
+      "passed": 1,
+      "failed": 0,
+      "test": "run_resources::tests::recovery_kernel_proof_refuses_live_descendants_then_accepts_cleanup",
+      "execution": "Compiled managed test binary in isolated delegated transient service; live descendants refused, removed subtree accepted, foreign host rejected."
+    },
+    "self_improve_recovery": {
+      "revision": "3383566e",
+      "passed": 416,
+      "failed": 0,
+      "ignored": 10,
+      "log": "/tmp/autoship-1598-review-packing.log"
+    },
+    "behavior_oracles": {
+      "passed": 21,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-behavior-oracles.log"
+    },
+    "foundation_observations": {
+      "revision": "ad29b3e7",
+      "passed": 77,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-foundation-recovery.log"
+    },
+    "full_native_probe": {
+      "revision": "3383566e",
+      "test": "self_improve::native_acceptance::live_native_disposable_scope_build_verify_review_and_seed",
+      "passed": true,
+      "no_remote_publication": true,
+      "audit_log_sha256": "675e6f3bf3dfcc1dda40e610983bdceeb2de307e1defd534619afe981215b08c",
+      "audit_event_payload_sha256": "e7bcf088c09221d374ad24c239f4ff031c826b28caa18ca133cdf84200574812",
+      "native_builder_count": 1,
+      "clean_review_roles": [
+        "qa",
+        "diff",
+        "system"
+      ],
+      "seeded_review_roles": [
+        "qa",
+        "diff",
+        "system"
+      ],
+      "seeded_finding_count": 3,
+      "log": "/tmp/autoship-1598-native-probe-3383566e.log",
+      "protected_evidence_root": "/tmp/autoship-native-probe-bsayg0sy"
+    },
+    "real_cancelled_workflow_recovery": {
+      "revision": "ae11702b",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-real-workflow-recovery.log",
+      "note": "Real supervised worker cancelled and reaped in isolated delegated service; new fenced audit generation executes a new guarded command; old failed audit retained."
+    },
+    "fresh_reviewer_fallback": {
+      "revision": "309e950b",
+      "passed": 48,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-fresh-review-dispatch.log",
+      "note": "Restricted fresh reviewer dispatch remains tool/history-free; malformed fresh tool request is refused without dispatch or cooldown."
+    },
+    "readmission_comments": {
+      "revision": "d0ccfbc4",
+      "passed": 3,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-bounded-readmit-retry.log",
+      "note": "Explicit bounded per-page REST retrieval; reset/new reason after comment100; untouched histories preserved."
+    },
+    "fresh_reviewer_authless": {
+      "revision": "f8f37ba8",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-fresh-review-authless.log",
+      "note": "Credential-free isolated child passes; replaces accidentally authenticated mocked CI test."
+    },
+    "resource_rollout": {
+      "revision": "2438b628",
+      "passed": 1,
+      "failed": 0,
+      "command": "python3 scripts/tests/run_resource_rollout_test.py",
+      "note": "Synthetic rollout test preserves aggregate caps and ExecStart, installs delegation through normal restart path."
+    },
+    "updater_restart_hygiene": {
+      "revision": "2438b628",
+      "passed": 21,
+      "failed": 0,
+      "command": "bash scripts/tests/updater-restart-hygiene.test.sh"
+    },
+    "github_live_boundary": {
+      "repository": "nolanmak/autoship-acceptance-6073a5330e3a4cae",
+      "passed": true,
+      "assertions": [
+        "strict-base-rejection",
+        "head-race-rejection",
+        "own-receipt",
+        "lost-response-no-replay-no-attribution",
+        "external-merge-no-attribution",
+        "concurrent-external-merge-no-attribution"
+      ],
+      "binary_revision": "8f317dd6",
+      "fixture_revision": "7a09d93d",
+      "archived": true,
+      "evidence_root": "/tmp/autoship-github-acceptance-n0ic5yrv",
+      "log": "/tmp/autoship-1598-github-exact-races.log",
+      "note": "Disposable repository only. All six boundary assertions passed; no production throughput or production branch-protection claim.",
+      "log_sha256": "ebe515aaeb449674fd8956aea144fb6453ac711f6a6a1fb320c3a83be0826a0f"
+    },
+    "review_contract_recovery": {
+      "revision": "3383566e",
+      "passed": 24,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-review-contract-recovery.log"
+    },
+    "default_budget_native_diagnostic": {
+      "revision": "3383566e",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-probe-3383566ecanary.log",
+      "default_daily_cap": 12,
+      "reserved_calls": 8,
+      "actual_charged_calls": 3,
+      "active_workflow_owners_after_completion": 0,
+      "note": "Real native production diagnostic adapter; required resource delegation; no call-cap override."
+    },
+    "native_final_adjudicator": {
+      "revision": "8f317dd6",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-probe-8f317dd6adjudicator.log",
+      "note": "Real independent Codex sessions resolved synthetic contradictory findings using observed arithmetic behavior; mandatory CI remains non-overridable.",
+      "log_sha256": "31249d88f924edc49f6094ab040308270505899b9d8879a3276f92126b20876a"
+    },
+    "adjudicator_correction": {
+      "revision": "8f317dd6",
+      "passed": 26,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-adjudicator-correction.log",
+      "log_sha256": "b205b63eb1cfa54c61ad9fa12c0a68a01e4f8d726db31f8449439e355842df0c"
+    },
+    "reviewed_store_and_scheduled_delivery": {
+      "revision": "abafa0dd",
+      "store_passed": 158,
+      "approval_discord_passed": 263,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-loop-delivery-regression.log",
+      "note": "Full library suites include immutable original execution/delivery bytes, restart backoff, masked history, and triage expiry precedence."
+    },
+    "resource_compatibility": {
+      "revision": "abafa0dd",
+      "rollout_passed": 2,
+      "installer_passed": 60,
+      "updater_passed": 14,
+      "failed": 0,
+      "logs": [
+        "/tmp/autoship-1598-resource-compat.log",
+        "/tmp/autoship-1598-installer-compat.log",
+        "/tmp/autoship-1598-updater-compat.log"
+      ]
+    },
+    "tool_bridge_object_paths": {
+      "revision": "abafa0dd",
+      "run": 177,
+      "skipped": 10,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-object-paths.log"
+    },
+    "reviewed_autoship_gaps": {
+      "revision": "abafa0dd",
+      "passed": 420,
+      "failed": 0,
+      "ignored": 11,
+      "log": "/tmp/autoship-1598-reviewed-gaps.log",
+      "note": "Includes directory amendments, read-only dependency helper, delayed PR visibility, and caller evidence limits. Later selector/publication follow-ups require separate validation."
+    },
+    "expired_loop_delivery": {
+      "revision": "fa64104d",
+      "passed": 63,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-expired-delivery.log",
+      "note": "Full loop tests include expiry/backoff/restart and no additional model execution after final delivery."
+    },
+    "research_and_digest_followups": {
+      "revision": "abafa0dd",
+      "passed": 2,
+      "failed": 0,
+      "tests": [
+        "research::truncation_handles_multibyte_research_issue_text",
+        "optional_digest_query_failure_preserves_other_sections"
+      ]
+    },
+    "publication_fixture_repair": {
+      "revision": "1d42237c",
+      "passed": 8,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-publication-fixture-fix.log",
+      "note": "Earlier 421-pass suite exposed two failures: protected fixture placement and obsolete source assertion. Both corrected; newer dispatch/fairness changes require their own run."
+    },
+    "publication_store_initial": {
+      "revision": "fa64104d",
+      "passed": 24,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-publication-store.log"
+    },
+    "github_duplicate_open_pr_rejection": {
+      "passed": true,
+      "repository": "nolanmak/autoship-acceptance-6073a5330e3a4cae",
+      "head": "candidate-a",
+      "base": "main",
+      "archived_after_test": true,
+      "log": "/tmp/autoship-1598-github-duplicate-create.json",
+      "sha256": "6380e5a100ef5e1a670f8423a83bdf23bed3f349f10b1e56b36074800c938981",
+      "note": "Actual GitHub refused a second OPEN PR for identical repository/head/base; this does not prove exactly-one HTTP or eliminate concurrent terminal-history visibility races."
+    },
+    "publication_dispatch_recovery": {
+      "revision": "7591660b",
+      "passed": 8,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-dispatch-recovery.log",
+      "ignored": 1
+    },
+    "publication_dispatch_store": {
+      "revision": "7591660b",
+      "passed": 26,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-dispatch-store.log"
+    },
+    "adopted_selector_recovery": {
+      "revision": "7591660b",
+      "passed": 6,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-selector-recovery.log"
+    },
+    "readiness_foundation": {
+      "revision": "7591660b",
+      "passed": 3,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-readiness-foundation.log"
+    },
+    "caller_budget_classification": {
+      "revision": "7591660b",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-caller-budget.log"
+    },
+    "native_historical_writer_inventory_replay": {
+      "revision": "7591660b",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-probe-7591660bwriter.log",
+      "sha256": "9df3261b7f041cf9841fbc042c3ea13498ee55bdedcb119177fef4b65e4df2e5",
+      "note": "Representative historical PR1538 case: real second writer loses unrelated record and native adjudicator upholds; repaired complete inventory plus observed preservation dismisses stale objection. Two distinct native sessions, no remote publication or invented reviewer LGTM."
+    },
+    "authority_windows_and_readiness": {
+      "revision": "3c876779",
+      "passed": 75,
+      "failed": 0,
+      "suites": {
+        "autoship_review": 30,
+        "autoship_workflow": 29,
+        "grounded_readiness": 7,
+        "legacy_readmission": 3,
+        "adjudication_windows": 6
+      },
+      "log": "/tmp/autoship-1598-authority-window-tests.log",
+      "note": "Actual managed test binary; does not validate later controller-oracle delivery commits."
+    },
+    "native_vm_feasibility": {
+      "implementation_revision": "3f509a4c",
+      "passed": true,
+      "probe": "scripts/autoship-native-vm-boundary-probe.py",
+      "scope": "Synthetic auth only; no-NIC guest denies direct IPv4/IPv6/DNS and undeclared host credentials, allows declared auth and allowlisted gateway, executes Codex and Claude version commands. Real provider auth/inference, streaming and production wiring remain unproven."
+    },
+    "native_adoption_latest": {
+      "revision": "b961b4ea",
+      "passed": false,
+      "log": "/tmp/autoship-native-acceptance-sit4cxdg/transcript.log",
+      "failure": "Reviewer lacked controller oracle evidence and demanded pinned verifier edits; protected-file guard correctly refused. Controller-oracle delivery fix integrated b919b9e6; final source delivery review found follow-up gap. Full repaired pipeline rerun required."
+    },
+    "native_readiness_latest": {
+      "revision": "b961b4ea",
+      "passed": false,
+      "log": "/tmp/autoship-native-acceptance-ap47kv3f/transcript.log",
+      "failure": "Readiness returned not_applicable variant absent from schema; correction and protected raw-response recovery integrated 229862e2. Seven readiness tests pass at3c876779; native rerun pending."
+    },
+    "authority_full_self_improve": {
+      "revision": "3c876779",
+      "passed": 445,
+      "failed": 2,
+      "ignored": 13,
+      "log": "/tmp/autoship-1598-authority-full-self-improve.log",
+      "failures": [
+        "run_once_failure_sites_carry_typed_records: obsolete NoChanges requirement after acceptance-driven repair",
+        "the_locking_recorder_is_the_codebases_only_writer_of_the_map: inventory omitted probe launcher removing inherited override"
+      ],
+      "followup": "f066c941 updates these assertions; rebuild and rerun required."
+    },
+    "native_provider_gateway": {
+      "revision": "a5e18251",
+      "passed": 9,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-provider-gateway-tests.log",
+      "command": "python3 scripts/test-native-provider-gateway.py",
+      "scope": "Local real HTTP/TLS, SSE and WebSocket transport plus route/redirect/framing/capacity denial. Not native provider auth/inference or VM wiring proof."
+    },
+    "hosted_rust_checkpoint_9b0da846": {
+      "revision": "9b0da846",
+      "run_id": 40343335999,
+      "conclusion": "success",
+      "cli_passed": 1247,
+      "cli_failed": 0,
+      "cli_ignored": 21,
+      "log": "/tmp/autoship-1598-ci-9b0da846.log",
+      "scope": "Before VM launcher and executable NeedEvidence loop integration."
+    },
+    "hosted_rust_checkpoint_e8970eb2": {
+      "revision": "e8970eb2",
+      "run_id": 40344875731,
+      "conclusion": "success",
+      "cli_passed": 1249,
+      "cli_failed": 0,
+      "cli_ignored": 21,
+      "log": "/tmp/autoship-1598-ci-e8970eb2-rust.log",
+      "scope": "Includes initial VM launcher, ContractScope and NeedEvidence loop. Later minimal runtime, atomic admission, cached routing and refresh changes need separate validation. PDF workflow at this revision failed four missing embedded-helper rebuild triggers; corrected in055f2671, not a claim all CI passed."
+    },
+    "selector_capability_inventory": {
+      "revision": "9b0da846",
+      "passed": 1,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-selector-capability-inventory.log",
+      "scope": "Runtime source/manifest inventory using existing managed integration test binary; fixes actual13ea9f26 hosted inventory failure."
+    },
+    "native_vm_unit_refresh": {
+      "revision": "11115c45",
+      "passed": 7,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-vm-refresh-tests.log",
+      "scope": "Local schema/admission/runtime/credential fixtures; no authenticated provider or real refresh proof."
+    },
+    "native_vm_pipe_quiescence": {
+      "revision": "f8f18e27",
+      "passed": 5,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-native-io-tests.log",
+      "scope": "Real local pipe backpressure and synthetic process-list cleanup fixtures; no real guest descendant proof."
+    },
+    "integrated_native_python_8d50b960": {
+      "revision": "8d50b960",
+      "passed": 28,
+      "failed": 0,
+      "suites": {
+        "vm": 8,
+        "io": 6,
+        "gateway": 9,
+        "command_storage": 5
+      },
+      "scope": "Local Python suites; not authenticated transport or final Rust validation."
+    },
+    "hosted_rust_11115c45": {
+      "revision": "11115c45",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40346922286",
+      "conclusion": "success",
+      "scope": "Rust job green. Bridge suite failed strict TLS certificate validation; fixed at fbf1d59b and local gateway suite passed. Later changes require fresh CI."
+    },
+    "hosted_bridge_1bfbc7c1": {
+      "revision": "1bfbc7c1",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40352785569",
+      "conclusion": "success",
+      "scope": "Bridge suite green after strict TLS correction; Rust validation remains separate."
+    },
+    "runtime_retirement_review": {
+      "revision": "8d50b960",
+      "reviewer": "independent review agent",
+      "conclusion": "LGTM",
+      "scope": "Durable terminal/recovery intent, exact owner generation, bounded reconciliation, active-lock pruning protection, terminal model admission. Does not substitute for pending Rust regressions."
+    },
+    "real_qemu_storage_fd": {
+      "revision": "85a9ae90",
+      "conclusion": "pass",
+      "scope": "Synthetic actual configured QEMU q35/TCG64MiB no NIC paused. Inherited FD3 retained flock after bridge FD closure and supervisor death; lock released after QEMU killed/reaped. No authenticated provider inference; probe subtree/files cleaned."
+    },
+    "authenticated_codex_transport_first_attempt": {
+      "revision": "a530abf5",
+      "status": "failed_before_model_admission",
+      "evidence": "/tmp/autoship-native-codex-auth-dfunmr6x/inference-proof1",
+      "completed_turns": 0,
+      "auth_source_unchanged": true,
+      "cause": "111-byte AF_UNIX socket path exceeds Linux pathname capacity; production launcher fixed at 0086786e. Authenticated rerun pending; no transport pass claimed."
+    },
+    "native_vm_long_state_path": {
+      "revision": "0086786e",
+      "passed": 9,
+      "failed": 0,
+      "scope": "Local VM helper suite includes actual UNIX socket bind/connect under a long state path, cleanup, and preserved durable artifact. Not authenticated inference."
+    },
+    "native_resume_owner_delta_review": {
+      "revision": "512a8836",
+      "reviewer": "independent review agent",
+      "conclusion": "LGTM",
+      "scope": "Original-owner resume checks and external audit anchor fixture; later changes require their own validation."
+    },
+    "hosted_rust_0edac218": {
+      "revision": "0edac218",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40353812369",
+      "conclusion": "success",
+      "cli_passed": 1254,
+      "cli_ignored": 21,
+      "core_passed": 637,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-0edac218-rust.log",
+      "scope": "Full listed Rust job passed; later socket, email-history and gateway-receipt changes need separate validation."
+    },
+    "managed_local_workflow_a73ac9ac": {
+      "revision": "a73ac9ac",
+      "build": "managed single-job CLI test build passed",
+      "passed": 51,
+      "ignored": 1,
+      "logs": [
+        "/tmp/autoship-1598-a73ac9ac-workflow-tests.log",
+        "/tmp/autoship-1598-a73ac9ac-guard-tests.log"
+      ],
+      "scope": "29 durable store tests and22 guard tests. Initial incorrectly named guard filter matched zero; corrected self_improve::workflow::tests filter passed22. Later code changes are not covered."
+    },
+    "managed_core_email_store_afc0ee41": {
+      "revision": "afc0ee41",
+      "conclusion": "success",
+      "passed": 1020,
+      "ignored": 14,
+      "suites": {
+        "channel_core": 639,
+        "channel_email": 222,
+        "store": 159
+      },
+      "log": "/tmp/autoship-1598-afc0ee41-core-email-store.log",
+      "scope": "Managed single-job build and serial library tests; includes declared native eligibility, first dispatch failure memory, immutable triage cohorts. No authenticated provider or final rollout claim."
+    },
+    "email_history_cohort_review": {
+      "revisions": [
+        "f0ac9e86",
+        "ccfff8b2"
+      ],
+      "reviewer": "independent review agent",
+      "conclusion": "LGTM",
+      "scope": "First failure journal transaction and original cohort snapshot; newly errored actions without decision snapshots remain explicitly unknown."
+    },
+    "authenticated_codex_vm_8c18caa7": {
+      "revision": "8c18caa7",
+      "conclusion": "success",
+      "turns": 2,
+      "resume_proven": true,
+      "auth_source_unchanged": true,
+      "evidence": "/tmp/autoship-native-codex-auth-dfunmr6x/inference-proof12",
+      "scope": "Real fixed-prompt Codex inference inside no-NIC VM with host-observed authenticated TLS Responses exchanges, exact reply, same native session continuation, quiescent complete runtime export. Does not prove MCP tools, other providers, OAuth refresh or full Autoship shipping."
+    },
+    "native_export_tail_red_green": {
+      "revision": "8c18caa7",
+      "conclusion": "success",
+      "invocation": "1c6e597533494c6b8b151d98e19486bb",
+      "scope": "Actual no-auth synthetic VM,64files/4MiB,host fsync delayed80ms. Before ACK: only40files received,partial export,no completion. After ACK:64files byte-exact and complete after shutdown. Guest ACK waits only for completion progress, not productive model duration."
+    },
+    "hosted_rust_4ba07097": {
+      "revision": "4ba07097",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40360321844",
+      "conclusion": "success",
+      "cli_passed": 1254,
+      "cli_ignored": 21,
+      "core_passed": 639,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-4ba07097-rust.log",
+      "scope": "Corrected auth and low-disk fixtures pass. Later guest diagnostics,FIFO and export ACK require separate validation."
+    },
+    "calibration_5bfab49d": {
+      "passed": 10,
+      "failed": 0,
+      "log": "/tmp/autoship-1598-calibration-anchor-tests.log",
+      "daily_accounting_test_passed": true,
+      "scope": "Targeted local tests, not actual native calibration promotion or production observation."
+    },
+    "delegated_reservations_167dde92": {
+      "passed": true,
+      "log": "/tmp/autoship-1598-resource-reservation-proof-fixed.log",
+      "unit_memory_bytes": 536870912,
+      "concurrent_admissions": 1,
+      "remaining_scopes": 0,
+      "scope": "Actual delegated cgroup idle reservations, concurrent admission, rejection, release/replacement and cleanup. No VM/model; composed full-size native/build VM acceptance still pending.",
+      "negative_before_fix": "/tmp/autoship-1598-resource-reservation-proof.log",
+      "python_passed": 4,
+      "python_skipped": 9
+    },
+    "native_runtime_union_48f611f7": {
+      "actual_dependencies": {
+        "claude": 6,
+        "codex": 0
+      },
+      "baseline_files": 643,
+      "manifest_sha256": "98d06aebbd119f738d54071fe42d6009da435ce483544301a63d7dac3177aac2",
+      "observations": [
+        {
+          "auth_mounted": false,
+          "completion_sha256": "45585ff8f660a09220f66131887a273e8187d4affb7b3b1675e3e39bee2e4fcc",
+          "executable_sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+          "gateway_exchanges": 0,
+          "help_sha256": "70d960401dfe708743865b6338dfe986663345b58cca9ca67308d041e90f4053",
+          "provider": "codex"
+        },
+        {
+          "auth_mounted": false,
+          "completion_sha256": "808aac54534949b3edc98ff5a50372632a61af3a717420a7c2e070b91e79badb",
+          "executable_sha256": "b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56",
+          "gateway_exchanges": 0,
+          "help_sha256": "b10f5c36adfe3285f6c5a0d18284f466e6c4486499de56ef62745e13312a7fbc",
+          "provider": "claude"
+        }
+      ],
+      "scope": "runtime union and actual CLI help only; no inference or shipping authority",
+      "source_policy_unchanged": true,
+      "status": "passed",
+      "union_files": 646,
+      "version": 1,
+      "log": "/tmp/autoship-1598-union-cli-smoke.log",
+      "receipt": "/tmp/autoship-native-codex-auth-dfunmr6x/union-cli-smoke/receipt.json"
+    },
+    "core_email_store_e2e0630f": {
+      "passed": 1026,
+      "core_passed": 644,
+      "core_ignored": 14,
+      "email_passed": 222,
+      "store_passed": 160,
+      "log": "/tmp/autoship-1598-e2e0630f-core-email-store.log",
+      "scope": "Managed single-job serial regression run; includes new capture, calibration migration, memory composition and email guard persistence. Resource helper initialization changed after core compilation; separate rebuild/test required."
+    },
+    "compiled_resource_helper_3c26f77c": {
+      "unit_passed": 3,
+      "delegated_kernel_recovery_passed": 1,
+      "logs": [
+        "/tmp/autoship-1598-a255b304-resource-tests.log",
+        "/tmp/autoship-1598-resource-recovery-proof.log"
+      ],
+      "scope": "Fresh core test binary embeds fixed resource helper; actual delegated test refuses recovery while descendant lives, verifies cleanup and rejects foreign-host identity. CLI native acceptance artifact still needs rebuild."
+    },
+    "capability_inventory_665676a8": {
+      "passed": 10,
+      "log": "/tmp/autoship-1598-capability-inventory-final.log",
+      "scope": "Compiled capability inventory including calibration callsite; production permission presets and model pinning."
+    },
+    "platform_inventory_a0affe91": {
+      "passed": 8,
+      "scope": "Missing cli:triage-calibration inventory row now owned, with macOS native acceptance explicitly unverified. Fixes two bridge/installer CI assertions at7420ee15."
+    },
+    "claude_initial_turn_3943f26e": {
+      "status": "initial_turn_revalidated_after_parser_fix;resume_pending",
+      "evidence_directory": "/tmp/autoship-native-codex-auth-dfunmr6x/claude-inference-proof1",
+      "scope": "Actual host-observed authenticated TLS Messages exchange, native Opus4.8 observed, exact reply and completed quiescent export. Original probe failed parsing UI event string; existing evidence revalidated with corrected parser without rerunning inference. Does not yet prove session continuation or full workflow."
+    },
+    "claude_transport_resume_a10f3cf2": {
+      "status": "passed",
+      "turns": 2,
+      "new_model_turns_for_recovery": 1,
+      "evidence_directory": "/tmp/autoship-native-codex-auth-dfunmr6x/claude-inference-proof1",
+      "log": "/tmp/autoship-1598-claude-inference-proof1-resume.log",
+      "recovery_summary": {
+        "auth_source_unchanged": true,
+        "first_recovery_sha256": "040a927a821c6d96703d55ca4bb8d186a2a0edef3e0a0b96ea633f7c043771a0",
+        "new_model_turns": 1,
+        "resume_proven": true,
+        "scope": "recovered provider transport only; no shipping authority",
+        "second_receipt_sha256": "d1c5760d9d803c1b6559894c26669ba3aaab4372b7fe56224993fa990302ee2a",
+        "status": "passed",
+        "turns": 2,
+        "version": 1
+      },
+      "scope": "Actual Claude Opus4.8 native output, authenticated TLS Messages host receipts, same native session continuation, quiescent export and original source auth unchanged. Original parser failure retained; first completed turn revalidated without rebilling. Not full guarded MCP/shipping proof."
+    },
+    "workflow_665676a8": {
+      "passed": 33,
+      "log": "/tmp/autoship-1598-665676a8-workflow-tests.log",
+      "scope": "Fresh CLI compiled resource helper and durable workflow tests before merge of main892cdf7c."
+    },
+    "hosted_rust_7420ee15": {
+      "conclusion": "success",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40366198751",
+      "cli_passed": 1265,
+      "cli_ignored": 21,
+      "core_passed": 644,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-7420ee15-rust.log",
+      "scope": "Rust job passed; platform inventory failures in other jobs corrected separately; later launcher packaging fix requires fresh validation."
+    },
+    "native_packaged_inventory_689f1e8c": {
+      "passed": 6,
+      "log": "/tmp/autoship-1598-native-embedded-inventory-tests.log",
+      "scope": "Exact embedded helper import, native scope lifecycle/retirement and build memory policy tests. Native workflow rerun still pending."
+    },
+    "workflow_0aac33d1": {
+      "passed": 33,
+      "log": "/tmp/autoship-1598-0aac33d1-workflow-tests.log",
+      "scope": "Rebuilt CLI after main merge and packaged runtime/helper diagnostics fixes."
+    },
+    "native_adjudicator_h3w_9z52": {
+      "status": "failed_second_round_F1_verdict",
+      "log": "/tmp/autoship-native-acceptance-h3w_9z52/transcript.log",
+      "scope": "Actual packaged launch now reaches model, first contradiction round passes, second F1 Uphold assertion failed; response/evidence diagnosis pending. Not accepted as completed adjudicator proof."
+    },
+    "native_setup_classification_0aac33d1": {
+      "passed": 1,
+      "log": "/tmp/autoship-1598-setup-diagnostics-tests.log",
+      "scope": "Typed safe setup category regression; actual native admission proceeded after missing helper fix. Separate resource exhaustion precedence independently reviewed."
+    },
+    "optional_checks_21c26af7": {
+      "passed": 3,
+      "log": "/tmp/autoship-1598-optional-checks-tests.log",
+      "scope": "Verified workflow identity, required overrides and unknown policy; later free unknown-identity followup needs fresh compiled tests."
+    },
+    "policy_hold_21c26af7": {
+      "passed": 7,
+      "log": "/tmp/autoship-1598-policy-hold-tests.log",
+      "scope": "Includes actual fake-GH optional failed review staying free, required failure repair, restart/day holds and virtual72h fivePR soak. Unknown-identity unpaid followup added after this run."
+    },
+    "native_adjudicator_fup0ps20": {
+      "status": "passed",
+      "log": "/tmp/autoship-native-acceptance-fup0ps20/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-fup0ps20/result.json",
+      "scope": "Two distinct actual Codex native sessions each uphold real arithmetic defect and dismiss contradictory claim with grounded target. Exact bindings/fingerprints retained, required CI cannot be waived and adjudication alone cannot mint reviewer LGTM. Original failed probe retained; full issue/adoption still pending."
+    },
+    "hosted_rust_f54acffe": {
+      "conclusion": "success",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40368451321",
+      "cli_passed": 1265,
+      "cli_ignored": 21,
+      "core_passed": 646,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-f54acffe-rust.log",
+      "scope": "Rust job passed alongside bridge and installer; later optional check and fixture changes still require fresh CI."
+    },
+    "policy_hold_76188003": {
+      "passed": 7,
+      "optional_classifier_passed": 3,
+      "log": "/tmp/autoship-1598-76188003-policy-hold-tests.log",
+      "scope": "Actual fake-GH outage/recovery and mixed failed checks; unknown pending/red advisory identity remains unpaid and nonmergeable, terminal green checks do not require exemption, required/different workflow failures repair."
+    },
+    "native_writer_11o86qgg": {
+      "status": "passed",
+      "log": "/tmp/autoship-native-acceptance-11o86qgg/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-11o86qgg/result.json",
+      "operator_route_unchanged": true,
+      "scope": "Actual native historical writer-inventory negative/repaired adjudication replay; uses protected native reviewer, not routed builder or full issue/adoption pipeline."
+    },
+    "native_issue_operator_capacity_refusal": {
+      "status": "not_launched_insufficient_host_capacity",
+      "log": "/tmp/autoship-1598-native-issue-operator.log",
+      "scope": "No model or VM started. Full1Gi native+4Gi build+1Gi host budget preserved; current preflight needs6.5Gi host available including controller allowance and host margin."
+    },
+    "hosted_rust_830d05a2": {
+      "conclusion": "success",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40372022136",
+      "cli_passed": 1270,
+      "cli_ignored": 21,
+      "core_passed": 646,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-830d05a2-rust.log",
+      "scope": "Includes complete advisory-check outage/recovery changes. Later routed probe fixture and structured refusal diagnostics require fresh CI."
+    },
+    "native_routed_transport_abyyp0ev": {
+      "status": "passed",
+      "log": "/tmp/autoship-native-acceptance-abyyp0ev/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-abyyp0ev/result.json",
+      "operator_route_unchanged": true,
+      "scope": "Actual production Rust Codex constructor honors explicit operator auto route; exact authenticated configured loopback Responses host receipt, native session and fenced runtime ownership, exactly one protected model admission and zero tools. Transport-only, not full issue/adoption or upstream model identity proof."
+    },
+    "native_route_fixture_76d94209": {
+      "passed": 2,
+      "log": "/tmp/autoship-1598-native-route-acquisition-tests.log",
+      "scope": "Actual isolated WorkflowGuard acquisition, protected audit/runtime ownership, zero charges, release/reacquire; host receipt negative cases."
+    },
+    "native_issue_r70ipcyq": {
+      "status": "refused_before_model",
+      "log": "/tmp/autoship-native-acceptance-r70ipcyq/transcript.log",
+      "refusal_code": "host_headroom",
+      "available_bytes": 6274179072,
+      "required_bytes": 6710886400,
+      "requested_bytes": 6442450944,
+      "margin_bytes": 268435456,
+      "model_admissions": 0,
+      "scope": "Exact protected supervisor refusal evidence, not a completed issue workflow. Full guest/run budgets unchanged."
+    },
+    "resource_refusal_76d94209": {
+      "python_passed": 6,
+      "python_skipped": 9,
+      "scope": "Fixed codes and bounded numeric facts; real supervisor refusal fixture before child dispatch; independent review passed. Actual host_headroom refusal retained at r70ipcyq."
+    },
+    "hosted_rust_9b0c6ab5": {
+      "head": "9b0c6ab5f31a53bd8e64b357295de7ad0ea1978a",
+      "run": "https://github.com/nolanmak/Jarvis/actions/runs/40376443123",
+      "status": "passed",
+      "cli_passed": 1272,
+      "cli_ignored": 22,
+      "core_passed": 646,
+      "core_ignored": 14,
+      "log": "/tmp/autoship-1598-ci-9b0c6ab5-rust.log",
+      "scope": "Hosted Rust workflow only; full native issue/adoption and production rollout remain pending."
+    },
+    "oauth_rotation_checkpoint_099d90af": {
+      "implementation": [
+        "48c58b97",
+        "099d90af"
+      ],
+      "independent_review": "LGTM for source commits 33b005c8 and 86a3066a",
+      "vm_helper_passed": 17,
+      "gateway_passed": 16,
+      "logs": [
+        "/tmp/autoship-1598-oauth-vm-099d90af.log",
+        "/tmp/autoship-1598-oauth-gateway-099d90af.log"
+      ],
+      "scope": "Synthetic rotation response, SIGKILL and fresh runtime seed; journal recovery, optional Codex response fields, path normalization, scope consistency, all-worker teardown and stale export ordering. Local gateway fixtures only. No live issuer rotation, no VM/provider call, no production credential writes. Packaged rebuild and native pipeline still pending."
+    },
+    "packaged_oauth_e043024e": {
+      "status": "build_passed",
+      "log": "/tmp/autoship-1598-oauth-packaged-build.log",
+      "binary_sha256": "7f7422fc226f0eff5ae0f79fa1e5f7a1aa5f8c725c9a3c033e2ece76c227c6aa",
+      "scope": "Managed one-job CLI test build with updated embedded helpers; exact ignored issue-test inventory verified."
+    },
+    "native_routed_transport_z239adcm": {
+      "status": "passed",
+      "head": "e043024e",
+      "log": "/tmp/autoship-native-acceptance-z239adcm/transcript.log",
+      "result": "/tmp/autoship-native-acceptance-z239adcm/result.json",
+      "operator_route_unchanged": true,
+      "scope": "Actual packaged production Rust routed constructor, protected owner and host Responses exchange after OAuth/helper teardown changes. Transport only; refresh disabled, no full issue/adoption or live token renewal claim."
+    },
+    "main_protection_rollout": {
+      "observed_at": "2026-10-26T19:58:31.361132+00:00",
+      "status": "applied_and_read_back",
+      "repository": "nolanmak/Jarvis",
+      "branch": "main",
+      "strict": true,
+      "enforce_admins": true,
+      "checks": [
+        {
+          "context": "privacy",
+          "app_id": 15368
+        },
+        {
+          "context": "node-release",
+          "app_id": 15368
+        }
+      ],
+      "required_pull_request_reviews": null,
+      "preserved_ruleset": 25861241,
+      "preserved_rules": [
+        "non_fast_forward",
+        "deletion"
+      ],
+      "scope": "Remote branch configuration only. Does not prove daemon deployment or autonomous shipping. Exact Actions app identities confirmed on passing b2098d5e checks."
+    },
+    "production_native_profile_staged": {
+      "status": "staged_not_activated",
+      "policy_sha256": "291e94f729b8216b1ededcb72a9d190e1f10588040375a349035b53646069fd2",
+      "runtime_manifest_sha256": "98d06aebbd119f738d54071fe42d6009da435ce483544301a63d7dac3177aac2",
+      "providers": [
+        "claude",
+        "codex"
+      ],
+      "grants_match_proven_operator_profile": true,
+      "refresh_enabled": false,
+      "outside_worker_roots": true,
+      "scope": "Stable owner-private runtime/profile provisioned with exact previously exercised routes, environment names and read-only original credentials. No daemon environment mutation, provider request or credential renewal. Actual acceptance on this stable profile and daemon activation pending.",
+      "runtime_manifest_validation": "passed_actual_file_digests"
+    }
+  },
+  "remaining_cross_cutting_acceptance": [
+    "Native seeded-defect canary through diagnostic-only authority",
+    "Strategy dispatch crash subcheckpoint recovery",
+    "Atomic protection against main advancing between validation and merge",
+    "Independent versioned verifier amendment and rebaseline",
+    "Historical constraint mining and recurring replay promotion",
+    "Full native/disposable-repository integrated soak and rollout",
+    "24-hour, seven-day and 30-day operational observations",
+    "Durable OAuth rotation crash recovery, exact refresh endpoint grants and fresh-session authentication after renewal under a single-writer credential lineage"
+  ],
+  "known_review_findings": [
+    {
+      "severity": "P1",
+      "gap": "Source-less PR selection can starve newer PRs and reserved new-issue slots",
+      "status": "fair_selection_repository_inventory_and_bounded_comment_history_fixed; 1501_item_and_late_comment_integration_regressions_passed"
+    },
+    {
+      "severity": "P1",
+      "gap": "In-process test success text can be forged by candidate code before assertions execute",
+      "status": "controller_held_black_box_expectations_implemented; behavior_suite_passed; native_validation_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Ignored candidate-local executable inputs such as Python bytecode can differ from reviewed source",
+      "status": "clean_committed_export_implemented; bounded_metadata_and_disk_growth_tests_passed; native_validation_pending",
+      "evidence": "Independent review reproduced baseline red becoming green with same source and timestamp/size-matching ignored pyc."
+    },
+    {
+      "severity": "P1",
+      "gap": "Interrupted audit generations can permanently block retry or resurrect prior approval after binding recalculation",
+      "status": "fixed; central_workflow_and_foundation_regressions_and_real_cancelled_worker_recovery_passed"
+    },
+    {
+      "severity": "P1",
+      "gap": "Restricted environment incorrectly injects mutation handoff history into fresh native reviewer",
+      "status": "fixed_in_309e950b; fallback48passed; full_native_positive_negative_probe_passed_3383566e"
+    },
+    {
+      "severity": "P1",
+      "gap": "Arbitrary two-shard review groups can omit context and stop native review as incomplete",
+      "status": "fixed_in_3383566e; independent_delta_LGTM; central_and_full_native_positive_negative_probe_passed"
+    },
+    {
+      "severity": "P1",
+      "gap": "Primary scoping can guess material requirements or send model-only overtaken/refusal verdicts to human triage",
+      "status": "typed_grounded_readiness_foundation_integrated_7591660b; removal_of_old_human_lanes_and_baseline_relevance_proof_in_progress"
+    },
+    {
+      "severity": "P1",
+      "gap": "Pending publications can starve later entries or lose a returned remote identity during visibility lag",
+      "status": "durable_rotating_scan_dispatch_backoff_and_direct_identity_integrated_320b216c; central_validation_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Caller evidence exceeding collection bounds is misclassified as reviewer capacity and can repeat unchanged work",
+      "status": "typed_evidence_budget_and_immutable_streamed_NeedEvidence_recovery_integrated; final_native_validation_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Authenticated probe stdout alone cannot establish successful provider exchange; partial tool events could escape acceptance checks",
+      "status": "fixed_cf1cc7e6;5probe_and13gateway_tests_passed;actual_provider_acceptance_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "First admission reads child memory accounting before enabling delegated controllers, refusing every run in a fresh service subtree",
+      "status": "fixed_167dde92; actual_delegated_probe_red_then_green; rebuilt_core_helper_and_actual_kernel_recovery_passed"
+    },
+    {
+      "severity": "P1",
+      "gap": "Required native Rust launcher omitted build-dependency-proxy.py from embedded helper inventory, failing readiness before any model call",
+      "status": "fixed_689f1e8c; exact_embedded_inventory_import_passed; actual_packaged_native_adjudication_passed_fup0ps20"
+    },
+    {
+      "severity": "P1",
+      "gap": "Comment-only Claude workflow failure can block merge checks or send approved PRs back into billed repair",
+      "status": "fixed_a19297d2_21c26af7_e2c5b1cf_76188003; helper_and_actual_remote_disposition_regressions_passed; final_CI_and_rollout_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "Live main lacks strict required-status-check protection required by the new publisher for atomic integration",
+      "status": "resolved_configuration_2026_10_26; strict_privacy_node_release_app15368_admin_enforced_read_back; existing_ruleset25861241_preserved; actual_autonomous_merge_pending"
+    },
+    {
+      "severity": "P1",
+      "gap": "OAuth rotation can lose refreshed credentials on cancellation after issuer response but before guest export and shutdown",
+      "status": "fixed_48c58b97_099d90af; independent_LGTM; 17_vm_helper_and_16_gateway_tests_passed; packaged_and_live_refresh_acceptance_pending",
+      "evidence": "Host persists the received rotation before guest delivery and joins gateway workers before export or credential lease release. True issuer-success/lost-response ambiguity remains an explicit uncertain dependency, never reported as healthy. Existing direct profiles still disable refresh."
+    }
+  ],
+  "completion_policy": "Every issue also requires final-head checks, independent review, normal-updater artifact verification and applicable rollout observations. Remaining acceptance entries are explicit required work, not an exhaustive claim that all other acceptance has passed. #1012 remains a preserved closed foundation, not a new closure."
+}

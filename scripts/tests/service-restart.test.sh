@@ -67,7 +67,7 @@ set_stub() { printf '%s' "$2" > "$SR_STUB_DIR/$1"; }
 # macOS has none, so python3's fcntl.flock takes the same lock (#1079).
 hold_lock() {
   if command -v flock >/dev/null 2>&1; then
-    exec flock -x "$1" -c "sleep $2"
+    exec flock --no-fork -x "$1" sleep "$2"
   else
     exec python3 -c 'import fcntl, sys, time
 f = open(sys.argv[1], "a")
@@ -199,11 +199,9 @@ echo "maybe_defer_restart (#844):"
 DEFER_DIR=$(mktemp -d)
 export AUGMENTAGENT_SELFIMPROVE_LOCK="$DEFER_DIR/self-improve.lock"
 export AUGMENTAGENT_RESTART_DEFER_STAMP="$DEFER_DIR/deferred-since"
-export AUGMENTAGENT_RESTART_DEFER_MAX_SECS=2400
 # Re-read the config now that the overrides exist.
 SELF_IMPROVE_LOCK="$AUGMENTAGENT_SELFIMPROVE_LOCK"
 RESTART_DEFER_STAMP="$AUGMENTAGENT_RESTART_DEFER_STAMP"
-RESTART_DEFER_MAX_SECS="$AUGMENTAGENT_RESTART_DEFER_MAX_SECS"
 
 # No lock file at all -> proceed.
 maybe_defer_restart >/dev/null 2>&1
@@ -224,13 +222,19 @@ check "defers while a run holds the lock" "$?" "0"
   && ok "records when the deferral began" \
   || bad "records when the deferral began" "stamp file empty/absent"
 
-# Still held but the budget is exhausted -> proceed anyway.
-printf '%s\n' "$(( $(date +%s) - 3000 ))" > "$AUGMENTAGENT_RESTART_DEFER_STAMP"
+# Process/cgroup/lock evidence is tested by auto_pr_worker_status_test.py.
+# At this boundary an attested worker permits deployment immediately.
+( external_autopr_isolated() { return 0; }; maybe_defer_restart >/dev/null 2>&1 )
+check "independent attested worker does not defer daemon update" "$?" "1"
+[ ! -e "$RESTART_DEFER_STAMP" ] && ok 'worker handoff clears old restart deferral' || bad 'worker handoff clears old restart deferral'
+
+# Elapsed wall time is not permission to kill a live owner, even past six hours.
+printf '%s\n' "$(( $(date +%s) - 21601 ))" > "$AUGMENTAGENT_RESTART_DEFER_STAMP"
 maybe_defer_restart >/dev/null 2>&1
-check "restarts anyway once the deferral budget is exhausted" "$?" "1"
+check "keeps a live run past six hours" "$?" "0"
 [ -e "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
-  && bad "clears its state after a forced proceed" "stamp survived" \
-  || ok "clears its state after a forced proceed"
+  && ok "retains active deferral evidence" \
+  || bad "retains active deferral evidence" "stamp disappeared"
 
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 

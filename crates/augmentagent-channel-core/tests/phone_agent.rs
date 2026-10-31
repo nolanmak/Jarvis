@@ -1791,4 +1791,47 @@ mod proposals {
         assert!(systems[0].contains(AGENDA_INSTRUCTION), "{}", systems[0]);
         assert!(systems[0].contains("- Reply to the venue\n- Confirm Friday dinner"));
     }
+
+}
+
+mod live_results {
+    use super::*;
+    use super::fast::{connected, OutboxIo};
+    use augmentagent_phone::ingress::ConversationAgent;
+    #[tokio::test]
+    async fn live_result_summary_is_tool_free_bounded_and_contains_only_result_data() {
+        struct SpokenReasoner(Mutex<Vec<(augmentagent_channel_core::reasoner::ReasonerOpts,String)>>,Mutex<String>);
+        #[async_trait]
+        impl Reasoner for SpokenReasoner {
+            async fn call(&self,opts:&augmentagent_channel_core::reasoner::ReasonerOpts,message:&str)->anyhow::Result<String> {
+                self.0.lock().unwrap().push((opts.clone(),message.into()));
+                Ok(self.1.lock().unwrap().clone())
+            }
+        }
+        let f=connected().await;
+        let reasoner=Arc::new(SpokenReasoner(Mutex::new(Vec::new()),Mutex::new(r#"{"spoken_summary":"There are three options. None has been booked."}"#.into())));
+        let agent=PhoneAgent::new(f.store.clone(),f.service.clone(),Arc::new(MarkdownAgent),Arc::new(OutboxIo{store:f.store.clone()}),"/fixture".into(),Arc::new(|_|Ok(Some(ProviderKind::Claude)))).with_summary_reasoner(reasoner.clone());
+        let full="Untrusted tool result. ".repeat(100);
+        assert_eq!(agent.summarize_live_result(&f.call,&full).await.unwrap(),"There are three options. None has been booked.");
+        {
+        let seen=reasoner.0.lock().unwrap();
+        assert_eq!(seen.len(),1);
+        assert!(seen[0].0.model.is_some());
+        assert!(seen[0].0.allowed_tools.is_empty());
+        assert!(seen[0].0.add_dirs.is_empty());
+        let settings:serde_json::Value=serde_json::from_str(seen[0].0.settings_json.as_ref().unwrap()).unwrap();
+        assert_eq!(settings["mcpServers"],serde_json::json!({}));
+        assert!(settings["permissions"]["deny"].as_array().unwrap().contains(&serde_json::json!("Bash")));
+        let data:serde_json::Value=serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(data,serde_json::json!({"completed_task_result":full}));
+        }
+        *reasoner.1.lock().unwrap()=serde_json::json!({"spoken_summary":"x".repeat(501)}).to_string();
+        assert!(agent.summarize_live_result(&f.call,&full).await.is_err());
+        *reasoner.1.lock().unwrap()="Not JSON".into();
+        assert!(agent.summarize_live_result(&f.call,&full).await.is_err());
+        f.store.unbind_surface_owner(f.origin.owner.account()).unwrap();
+        assert!(agent.summarize_live_result(&f.call,"Private").await.is_err());
+        assert_eq!(reasoner.0.lock().unwrap().len(),3);
+    }
+
 }

@@ -1,3 +1,6 @@
+#[path = "loop_memory.rs"]
+mod loop_memory;
+pub use loop_memory::{LoopFinding, LoopOccurrence};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,7 +14,7 @@ use crate::surface::{SurfaceConversationRef, SurfaceTurnRef};
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, EmailRetryFailure, FriendWatch, GmailRateRefusal, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SocialapiAccount,
     SocialapiWebhookEvent, SubscriptionMode, TelegramBot,
@@ -168,7 +171,7 @@ const COMPACTABLE_BODY_FROM: &str = "FROM actions a \
       AND e.body = a.originalBody";
 
 pub struct Store {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     path: std::path::PathBuf,
 }
 
@@ -1222,6 +1225,63 @@ impl Store {
                 [],
             )?;
         }
+        // #472: NULL means legacy guard evidence must be fetched again.
+        if !column_exists(conn, "emails", "retryGuardContext")? {
+            conn.execute("ALTER TABLE emails ADD COLUMN retryGuardContext TEXT", [])?;
+        }
+        // #1699 — after retryGuardContext: the backfill reads it.
+        crate::recipients::migrate(conn)?;
+        crate::team_coverage::migrate(conn)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS email_guard_observations (
+            id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT NOT NULL,
+            attempt_n INTEGER NOT NULL, guard TEXT NOT NULL, disposition TEXT NOT NULL,
+            observed_at_ms INTEGER NOT NULL,
+            UNIQUE(message_id,action_id,attempt_n,guard));
+            CREATE INDEX IF NOT EXISTS idx_email_guard_time ON email_guard_observations(observed_at_ms);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS email_retry_failures (
+            id INTEGER PRIMARY KEY, action_id TEXT NOT NULL, message_id TEXT NOT NULL,
+            attempt_n INTEGER NOT NULL, failure_class TEXT NOT NULL, guard TEXT NOT NULL,
+            detail TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_email_retry_failures_time ON email_retry_failures(observed_at_ms);")?;
+        conn.execute_batch("SAVEPOINT triage_calibration_migration; DROP TRIGGER IF EXISTS capture_triage_action_cohort;")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_inputs (
+            id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, prompt TEXT NOT NULL,
+            base TEXT NOT NULL, model TEXT NOT NULL, decision TEXT NOT NULL,
+            replayable INTEGER NOT NULL, observed_at_ms INTEGER NOT NULL);")?;
+        // Snapshot newly created triage cohorts atomically with the action.
+        // Existing mutable status/email labels cannot reconstruct old decisions.
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_action_cohorts (
+            action_id TEXT PRIMARY KEY, cohort TEXT NOT NULL CHECK(cohort IN ('flagged','pending')),
+            observed_at_ms INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS capture_triage_action_cohort AFTER INSERT ON actions
+            WHEN NEW.status IN ('flagged','pending')
+            BEGIN INSERT OR IGNORE INTO triage_action_cohorts(action_id,cohort,observed_at_ms) VALUES(NEW.id,NEW.status,NEW.createdAt); END;")?;
+        if !column_exists(conn, "triage_action_cohorts", "input_id")? {
+            conn.execute("ALTER TABLE triage_action_cohorts ADD COLUMN input_id INTEGER", [])?;
+        }
+        // Input identity is attached by the exact async request scope, never
+        // by a mutable latest-message lookup. Unknown history stays unknown.
+        conn.execute_batch("DROP TRIGGER IF EXISTS capture_triage_action_cohort_with_input;")?;
+        if !column_exists(conn, "triage_calibration_inputs", "evidence")? {
+            conn.execute("ALTER TABLE triage_calibration_inputs ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}'",[])?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_versions (
+            version TEXT PRIMARY KEY, base TEXT NOT NULL, model TEXT NOT NULL,
+            supplement TEXT NOT NULL, receipt TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_active (singleton INTEGER PRIMARY KEY CHECK(singleton=1),version TEXT NOT NULL,disabled INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS triage_calibration_rollbacks (id INTEGER PRIMARY KEY,version TEXT NOT NULL,receipt TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_calls (request_hash TEXT PRIMARY KEY,response TEXT NOT NULL,session TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS triage_calibration_versions_immutable BEFORE UPDATE ON triage_calibration_versions BEGIN SELECT RAISE(ABORT,'immutable calibration version'); END;
+            CREATE TRIGGER IF NOT EXISTS triage_calibration_versions_retained BEFORE DELETE ON triage_calibration_versions BEGIN SELECT RAISE(ABORT,'retained calibration version'); END;")?;
+        if !column_exists(conn, "triage_calibration_versions", "serving_model")? { conn.execute("ALTER TABLE triage_calibration_versions ADD COLUMN serving_model TEXT NOT NULL DEFAULT ''",[])?; }
+        if !column_exists(conn, "triage_calibration_calls", "observed_model")? { conn.execute("ALTER TABLE triage_calibration_calls ADD COLUMN observed_model TEXT NOT NULL DEFAULT ''",[])?; }
+        for column in ["audit_workflow","audit_path","proof_hash"] { if !column_exists(conn,"triage_calibration_calls",column)? {conn.execute(&format!("ALTER TABLE triage_calibration_calls ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"),[])?;} }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS triage_calibration_call_history(body TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS triage_calibration_control(singleton INTEGER PRIMARY KEY CHECK(singleton=1),enabled INTEGER NOT NULL,revision INTEGER NOT NULL);
+            INSERT OR IGNORE INTO triage_calibration_control VALUES(1,1,0);
+            CREATE TABLE IF NOT EXISTS triage_calibration_experiments(id TEXT PRIMARY KEY,base TEXT NOT NULL,model TEXT NOT NULL,revision INTEGER NOT NULL,source TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS triage_calibration_one_pending ON triage_calibration_experiments(base,model,revision) WHERE state='pending';
+            RELEASE triage_calibration_migration;")?;
         // Issue #27: per-channel subscription registry (platform-agnostic).
         // Rows control which Discord/Slack/etc channels the poller watches and
         // which mode (priority / digest / store_only) they route through.
@@ -1532,6 +1592,7 @@ impl Store {
                 ON user_loops(owner, status)",
             [],
         )?;
+        loop_memory::migrate(conn)?;
         // Auto-stop deadline (#104 follow-up). Nullable; pre-existing rows
         // migrate cleanly with `None` (run forever until manually stopped).
         if !column_exists(conn, "user_loops", "expires_at_ms")? {
@@ -2646,6 +2707,7 @@ impl Store {
         crate::slack_contact::migrate(conn)?;
         // #1296 — one record per Slack message across live/poll/catch-up.
         crate::slack_ingest::migrate(conn)?;
+        conn.execute_batch(include_str!("linkedin_archive.sql"))?;
 
         Ok(())
     }
@@ -2666,6 +2728,8 @@ impl Store {
         // the persisted copy is masked.
         let body_masked = redact::mask(&email.body);
         let body_param: &str = &body_masked;
+        let context = serde_json::to_string(&(email.to.clone(), email.cc.clone(), email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
         if existed.is_some() {
             guard.execute(
                 "UPDATE emails SET threadId = ?2, fromEmail = ?3, subject = ?4, body = ?5, receivedAt = ?6 WHERE messageId = ?1",
@@ -2678,6 +2742,9 @@ impl Store {
                     email.date,
                 ],
             )?;
+            guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
+            let (to_addrs, cc_addrs) = crate::recipients::columns(&email.platform, &email.to, &email.cc);
+            guard.execute("UPDATE emails SET toAddrs = ?2, ccAddrs = ?3 WHERE messageId = ?1", params![email.message_id, to_addrs, cc_addrs])?;
             Ok(false)
         } else {
             let now = now_millis();
@@ -2697,8 +2764,51 @@ impl Store {
                     email.kind,
                 ],
             )?;
+            guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
+            let (to_addrs, cc_addrs) = crate::recipients::columns(&email.platform, &email.to, &email.cc);
+            guard.execute("UPDATE emails SET toAddrs = ?2, ccAddrs = ?3 WHERE messageId = ?1", params![email.message_id, to_addrs, cc_addrs])?;
             Ok(true)
         }
+    }
+
+    /// Complete persisted recipient/attachment evidence, or None for legacy rows.
+    pub fn email_retry_guard_context(&self, message_id: &str) -> StoreResult<Option<(String, String, Vec<String>)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let raw: Option<String> = guard.query_row("SELECT retryGuardContext FROM emails WHERE messageId = ?1",
+            params![message_id], |r| r.get(0)).optional()?.flatten();
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|e| StoreError::InvalidInput(e.to_string()))).transpose()
+    }
+
+    pub fn record_email_retry_failure(&self, failure: &EmailRetryFailure) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute("INSERT INTO email_retry_failures(action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![failure.action_id, failure.message_id, failure.attempt_n, redact::mask(&failure.failure_class), failure.guard, redact::mask(&failure.detail), failure.observed_at_ms])?;
+        Ok(())
+    }
+
+    /// Persist the first failure and the retry context together. Retried actions
+    /// are recorded by the retry controller, which also owns escalation.
+    pub fn record_initial_email_failure(&self, failure: &EmailRetryFailure) -> StoreResult<()> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let changed = tx.execute("UPDATE actions SET status='error',errorMessage=?3,updatedAt=?4 WHERE id=?1 AND messageId=?2",
+            params![failure.action_id,failure.message_id,redact::mask(&failure.detail),failure.observed_at_ms])?;
+        if changed > 0 {
+            tx.execute("INSERT INTO email_retry_failures(action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms) SELECT ?1,?2,1,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM actions WHERE id=?1 AND COALESCE(retryCount,0)=0) AND NOT EXISTS(SELECT 1 FROM email_retry_failures WHERE action_id=?1 AND attempt_n=1)",
+                params![failure.action_id,failure.message_id,redact::mask(&failure.failure_class),failure.guard,redact::mask(&failure.detail),failure.observed_at_ms])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Digest seam: durable retry failures, newest first, with an explicit limit.
+    pub fn email_retry_failures_since(&self, since_ms: i64, limit: usize) -> StoreResult<Vec<EmailRetryFailure>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare("SELECT action_id,message_id,attempt_n,failure_class,guard,detail,observed_at_ms FROM email_retry_failures WHERE observed_at_ms >= ?1 ORDER BY observed_at_ms DESC,id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![since_ms, limit as i64], |r| Ok(EmailRetryFailure {
+            action_id:r.get(0)?, message_id:r.get(1)?, attempt_n:r.get(2)?, failure_class:r.get(3)?, guard:r.get(4)?, detail:r.get(5)?, observed_at_ms:r.get(6)?
+        }))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// [`upsert_email`] variant for historical imports (#886): a *new* row's
@@ -2982,6 +3092,13 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// A retry may re-enter for its own action, never bypass a sibling action.
+    pub fn has_other_open_action(&self, message_id: &str, action_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row("SELECT EXISTS(SELECT 1 FROM actions WHERE messageId = ?1 AND id != ?2 AND status IN ('pending','error','scheduled','sending'))",
+            params![message_id, action_id], |r| r.get(0))?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn log_action(
         &self,
@@ -3036,6 +3153,7 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
         // #165: mask free-form bodies before persisting. Borrowed when no
         // secrets matched (zero-alloc fast path), owned otherwise.
         let original_body_masked = original_body.map(redact::mask);
@@ -3047,7 +3165,7 @@ impl Store {
         // populate them as 'classic' / NULL / NULL so the classic path stays
         // byte-identical post-migration. Code-mode callers use the dedicated
         // `log_action_code_mode` helper.
-        guard.execute(
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, toEmails, ccEmails, bccEmails) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, ?11, ?12, ?13)",
             params![
@@ -3066,6 +3184,8 @@ impl Store {
                 nz(bcc),
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3104,6 +3224,7 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.unchecked_transaction()?;
         // #165: mask free-form bodies + the code-mode tool-call trace
         // before persisting. `generated_source` is the LLM-emitted TS
         // program and is also caller-supplied free-form text, so it goes
@@ -3117,7 +3238,7 @@ impl Store {
         let trace_json_masked = redact::mask(trace_json);
         let generated_source_param: &str = &generated_source_masked;
         let trace_json_param: &str = &trace_json_masked;
-        guard.execute(
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, mode, generatedSource, toolCallTrace) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, 'code', ?11, ?12)",
             params![
@@ -3135,6 +3256,8 @@ impl Store {
                 trace_json_param,
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3180,7 +3303,8 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
+        let tx = guard.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'flagged', ?7, ?8, ?8, 0, NULL)",
             params![
@@ -3194,6 +3318,8 @@ impl Store {
                 now,
             ],
         )?;
+        crate::triage_calibration::attach(&tx,&id,message_id)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3211,6 +3337,19 @@ impl Store {
             params![action_id, status.as_str(), draft_body, error_message, now],
         )?;
         Ok(())
+    }
+
+    /// Replace a draft and defer its next nudge only while it remains pending.
+    /// A redraft that finishes after an approval claim must not reopen the send.
+    pub fn revise_pending_action(&self, action_id: &str, draft_body: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let changed = guard.execute(
+            "UPDATE actions SET draftBody = ?2, nextNudgeAtMs = ?3, updatedAt = ?4 \
+             WHERE id = ?1 AND status = 'pending'",
+            params![action_id, draft_body, now + NUDGE_INTERVAL_MS, now],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Persist a (draft, feedback, revised_draft) triple for action `action_id`
@@ -4350,6 +4489,111 @@ impl Store {
         Ok(ids)
     }
 
+    /// #1635 — the thread-wide flip above, minus rows whose `emails.kind` is
+    /// `excluded_kind`. An iMessage conversation can hold two kinds of pending
+    /// card: a drafted *reply* to the other person's newest text, and a
+    /// *compose* the owner started themselves. A newer inbound or a manual
+    /// reply retires the first (the draft answers a message that is no longer
+    /// the newest) but not the second: the owner's composed text still says
+    /// what they meant to say, and nothing has answered it. Same status and
+    /// `scheduledAtMs` scope as [`Self::mark_pending_drafts_superseded_by_thread`].
+    pub fn mark_pending_drafts_superseded_by_thread_except_kind(
+        &self,
+        thread_id: &str,
+        reason: &str,
+        excluded_kind: &str,
+    ) -> StoreResult<Vec<String>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT a.id FROM actions a \
+             LEFT JOIN emails e ON e.messageId = a.messageId \
+             WHERE a.threadId = ?1 AND a.status IN ('pending', 'dry_run') \
+               AND a.scheduledAtMs IS NULL \
+               AND COALESCE(e.kind, '') != ?2",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![thread_id, excluded_kind], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE actions \
+             SET status = 'superseded', \
+                 errorMessage = COALESCE(NULLIF(?1, ''), 'superseded by manual reply'), \
+                 updatedAt = ?2 \
+             WHERE status IN ('pending', 'dry_run') AND id IN ({placeholders})"
+        );
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![reason.to_string().into(), now.into()];
+        values.extend(ids.iter().map(|id| rusqlite::types::Value::from(id.clone())));
+        guard.execute(&sql, rusqlite::params_from_iter(values))?;
+        Ok(ids)
+    }
+
+    /// Atomically replace pending composes and persist their recipient/body.
+    /// Reserve initial card posting for one minute so the daemon cannot race
+    /// the one-shot CLI. A failed post releases it; a crash expires the lease.
+    pub fn create_imessage_compose(&self, email: &Email, body: &str) -> StoreResult<(String, Vec<String>)> {
+        if email.platform != "imessage" || email.kind != "compose" || body.trim().is_empty() {
+            return Err(StoreError::InvalidInput("invalid iMessage compose".into()));
+        }
+        let thread = email.thread_id.as_deref().filter(|s| s.starts_with("imessage:"))
+            .ok_or_else(|| StoreError::InvalidInput("invalid iMessage compose thread".into()))?;
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let context = serde_json::to_string(&(email.to.clone(),email.cc.clone(),email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let superseded = {
+            let mut q = tx.prepare("SELECT a.id FROM actions a JOIN emails e ON e.messageId=a.messageId
+                WHERE a.threadId=?1 AND e.platform='imessage' AND e.kind='compose'
+                AND a.status='pending' AND a.scheduledAtMs IS NULL ORDER BY a.createdAt,a.id")?;
+            let rows = q.query_map([thread], |r| r.get::<_,String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute("INSERT INTO emails(messageId,threadId,fromEmail,subject,body,receivedAt,accountEntityId,firstSeenAt,platform,kind,retryGuardContext)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'imessage','compose',?9)",
+            params![email.message_id,thread,email.from,email.subject,redact::mask(&email.body).as_ref(),email.date,email.account_entity_id,now,context])?;
+        for old in &superseded {
+            tx.execute("UPDATE actions SET status='superseded',errorMessage='superseded by follow-up compose',updatedAt=?2 WHERE id=?1 AND status='pending'",params![old,now])?;
+        }
+        tx.execute("INSERT INTO actions(id,messageId,threadId,fromEmail,subject,originalBody,draftBody,status,createdAt,updatedAt,nudgeCount,nextNudgeAtMs)
+            VALUES(?1,?2,?3,?4,?5,NULL,?6,'pending',?7,?7,1,?7+60000)",
+            params![id,email.message_id,thread,email.from,email.subject,redact::mask(body).as_ref(),now])?;
+        tx.commit()?;
+        Ok((id,superseded))
+    }
+
+    /// #1635 — ids of pending compose cards on `thread_id`: rows whose
+    /// `emails.kind` is `kind`, still `pending` and not carrying a send-at
+    /// proposal. A follow-up compose to the same person replaces these.
+    pub fn pending_action_ids_for_thread_kind(
+        &self,
+        thread_id: &str,
+        kind: &str,
+    ) -> StoreResult<Vec<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT a.id FROM actions a \
+             JOIN emails e ON e.messageId = a.messageId \
+             WHERE a.threadId = ?1 AND e.kind = ?2 AND a.status = 'pending' \
+               AND a.scheduledAtMs IS NULL \
+             ORDER BY a.createdAt ASC",
+        )?;
+        let ids = stmt
+            .query_map(params![thread_id, kind], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
     /// #449 — record a message the daemon itself just sent, so the
     /// OutboundObserver can skip it when it scans the SENT folder instead of
     /// misreading it as a reply the user typed by hand.
@@ -4477,12 +4721,16 @@ impl Store {
                     (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = ''), \
                     e.receivedAt, \
                     (a.recomposedAtMs IS NOT NULL), \
-                    COALESCE(e.platform, '') \
+                    COALESCE(e.platform, ''), \
+                    a.createdAt, \
+                    e.accountEntityId, \
+                    a.messageId \
                FROM actions a \
                LEFT JOIN emails e ON a.messageId = e.messageId \
               WHERE a.status = 'pending' \
                 AND a.scheduledAtMs IS NULL \
                 AND COALESCE(e.kind, '') NOT IN ('identity_merge', 'sign_pdf') \
+                AND NOT (COALESCE(e.platform,'')='imessage' AND COALESCE(e.kind,'')='compose') \
               ORDER BY a.createdAt ASC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -4496,6 +4744,9 @@ impl Store {
                 received_at: r.get(6)?,
                 recomposed: r.get(7)?,
                 platform: r.get(8)?,
+                created_at_ms: r.get(9)?,
+                account_entity_id: r.get(10)?,
+                message_id: r.get(11)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -4679,6 +4930,38 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Has the owner answered `thread_id` after `after_ms` by ANY route — a
+    /// manual reply from Gmail web/mobile (`outbound_thread_log`) OR a reply
+    /// the daemon sent on their behalf from an approved card
+    /// (`self_sent_messages`)? Strictly greater than, like
+    /// [`Self::thread_has_user_reply_after`].
+    ///
+    /// The reconcile sweep's Rule 1 needs both. The OutboundObserver
+    /// deliberately keeps daemon sends OUT of `outbound_thread_log` (#449), so
+    /// approving the newest card on a thread left every older card on that
+    /// thread pending forever: the owner had replied, but only through us.
+    /// The inbound triage gate and the scheduled-send pass keep the narrower
+    /// manual-only check — a daemon send must never cancel a scheduled reply.
+    pub fn thread_has_owner_send_after(
+        &self,
+        thread_id: &str,
+        after_ms: i64,
+    ) -> StoreResult<bool> {
+        if self.thread_has_user_reply_after(thread_id, after_ms)? {
+            return Ok(true);
+        }
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let hit: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM self_sent_messages \
+                 WHERE thread_id = ?1 AND sent_at_ms > ?2 LIMIT 1",
+                params![thread_id, after_ms],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
     }
 
     /// Load a single action row plus its email body. Used by the Discord
@@ -6673,7 +6956,8 @@ impl Store {
             "SELECT id, channel, channel_ref FROM user_loops \
               WHERE status = 'active' \
                 AND expires_at_ms IS NOT NULL \
-                AND expires_at_ms <= ?1",
+                AND expires_at_ms <= ?1 \
+                AND NOT EXISTS (SELECT 1 FROM loop_occurrences o WHERE o.loop_id=user_loops.id AND o.answer IS NOT NULL AND o.state IN ('answered','post_failed'))",
         )?;
         let rows = stmt.query_map(params![now_ms], |r| {
             Ok((
@@ -6694,7 +6978,8 @@ impl Store {
                         updated_at_ms = ?1 \
                   WHERE status = 'active' \
                     AND expires_at_ms IS NOT NULL \
-                    AND expires_at_ms <= ?1",
+                    AND expires_at_ms <= ?1 \
+                AND NOT EXISTS (SELECT 1 FROM loop_occurrences o WHERE o.loop_id=user_loops.id AND o.answer IS NOT NULL AND o.state IN ('answered','post_failed'))",
                 params![now_ms],
             )?;
         }
@@ -6884,8 +7169,22 @@ impl Store {
     /// post a second card in the window.
     pub fn recompose_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
         let now = now_millis();
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Restoring an older owner compose is a replacement too. Serialize
+        // against new composes so a conversation never gains two pending texts.
+        let compose_thread: Option<String> = tx.query_row(
+            "SELECT a.threadId FROM actions a JOIN emails e ON e.messageId=a.messageId
+             WHERE a.id=?1 AND a.status='superseded' AND e.platform='imessage' AND e.kind='compose'",
+            [action_id], |r| r.get(0),
+        ).optional()?;
+        if let Some(thread) = compose_thread {
+            tx.execute("UPDATE actions SET status='superseded',errorMessage='superseded by restored compose',updatedAt=?3
+                WHERE threadId=?1 AND id!=?2 AND status='pending' AND scheduledAtMs IS NULL
+                AND messageId IN (SELECT messageId FROM emails WHERE platform='imessage' AND kind='compose')",
+                params![thread,action_id,now])?;
+        }
+        let n = tx.execute(
             "UPDATE actions \
                 SET status = 'pending', recomposedAtMs = ?4, errorMessage = NULL, \
                     nudgeCount = 1, nextNudgeAtMs = ?2, \
@@ -6893,6 +7192,7 @@ impl Store {
               WHERE id = ?1 AND status = 'superseded'",
             params![action_id, now + NUDGE_INTERVAL_MS, source, now],
         )?;
+        tx.commit()?;
         Ok(n == 1)
     }
 
@@ -8709,6 +9009,15 @@ pub struct PendingActionRow {
     /// join finds no email). The bulk-sender rule reads an email address,
     /// which a Slack contact's `from` never is.
     pub platform: String,
+    /// When the card was raised (`actions.createdAt`). Always after its
+    /// inbound arrived, so it is a safe Rule 1 fallback bound when
+    /// `received_at` is missing or unparseable.
+    pub created_at_ms: i64,
+    /// The inbound's mailbox (`emails.accountEntityId`). #1700 — teammate
+    /// coverage only looks at messages in the same mailbox.
+    pub account_entity_id: Option<String>,
+    /// The inbound's message id. #1701 — locates a Slack card in its thread.
+    pub message_id: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by
@@ -12098,6 +12407,57 @@ mod tests {
         assert_eq!(e1.as_deref(), Some("superseded by manual reply"));
     }
 
+    /// #1635 — the kind-aware variant leaves a pending compose alone and
+    /// the lookup finds exactly the pending composes on a thread.
+    // pii-ok — synthetic test fixture.
+    #[test]
+    fn supersede_except_kind_keeps_composes_and_lookup_finds_them() {
+        let (s, _f) = fresh_store();
+        let email = |id: &str, kind: &str| Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: id.into(),
+            thread_id: Some("imessage:+15555550100".into()), // pii-ok synthetic
+            from: "+15555550100".into(), // pii-ok synthetic
+            subject: "s".into(),
+            body: String::new(),
+            date: String::new(),
+            account_entity_id: Some("imessage".into()),
+            platform: "imessage".into(),
+            kind: kind.into(),
+        };
+        s.upsert_email(&email("r1", "dm")).unwrap();
+        s.upsert_email(&email("c1", "compose")).unwrap();
+        s.upsert_email(&email("c2", "compose")).unwrap();
+        let t = "imessage:+15555550100"; // pii-ok synthetic
+        let reply = s.log_action("r1", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+        let comp1 = s.log_action("c1", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+        let comp2 = s.log_action("c2", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+        // An action with no emails row at all counts as kind '' and is swept.
+        let orphan = s.log_action("o1", Some(t), "x", "s", None, Some("d"), ActionStatus::Pending).unwrap();
+
+        let mut found = s.pending_action_ids_for_thread_kind(t, "compose").unwrap();
+        found.sort();
+        let mut want = vec![comp1.clone(), comp2.clone()];
+        want.sort();
+        assert_eq!(found, want);
+        assert!(s.pending_action_ids_for_thread_kind("imessage:+15555550199", "compose").unwrap().is_empty()); // pii-ok synthetic
+
+        let mut swept = s
+            .mark_pending_drafts_superseded_by_thread_except_kind(t, "superseded by manual reply", "compose")
+            .unwrap();
+        swept.sort();
+        let mut want = vec![reply.clone(), orphan.clone()];
+        want.sort();
+        assert_eq!(swept, want);
+        let status = |id: &str| s.get_action_with_email(id).unwrap().map(|a| a.action.status);
+        assert_eq!(status(&reply).as_deref(), Some("superseded"));
+        assert_eq!(status(&comp1).as_deref(), Some("pending"));
+        assert_eq!(status(&comp2).as_deref(), Some("pending"));
+        assert!(s.pending_action_ids_for_thread_kind(t, "dm").unwrap().is_empty());
+    }
+
     /// `dry_run` rows on the same thread also get swept — they're equivalent
     /// to pending from the user's perspective (a card the daemon would
     /// surface if dry_run flipped off).
@@ -12304,6 +12664,33 @@ mod tests {
         s.record_outbound_thread_event("ent-1", "msg-noth", None, 20_000)
             .unwrap();
         assert!(!s.thread_has_user_reply_after("T-other", 0).unwrap());
+    }
+
+    /// An approved card the daemon sent counts as the owner answering the
+    /// thread for Rule 1, alongside a manual Gmail reply — but only on that
+    /// thread and only strictly after the bound.
+    #[test]
+    fn thread_has_owner_send_after_counts_daemon_and_manual_sends() {
+        let (s, _f) = fresh_store();
+        assert!(!s.thread_has_owner_send_after("T1", 0).unwrap());
+
+        s.record_self_sent_message("sent-1", Some("T1"), Some("ent-1"), Some("act-1"))
+            .unwrap();
+        let sent_at: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT sent_at_ms FROM self_sent_messages WHERE message_id='sent-1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(s.thread_has_owner_send_after("T1", sent_at - 1).unwrap());
+        assert!(!s.thread_has_owner_send_after("T1", sent_at).unwrap());
+        assert!(!s.thread_has_owner_send_after("T2", 0).unwrap());
+        // The manual-only check stays blind to daemon sends.
+        assert!(!s.thread_has_user_reply_after("T1", 0).unwrap());
+
+        s.record_outbound_thread_event("ent-1", "manual-1", Some("T2"), 5_000)
+            .unwrap();
+        assert!(s.thread_has_owner_send_after("T2", 4_999).unwrap());
     }
 
     /// #1503 — a pending PDF-signing card is an owner decision, not an inbound

@@ -5,21 +5,26 @@
 //! concurrently.
 
 // #1289 — durable approval-card pointers per surface.
+pub mod email_guards;
 pub mod approval_cards;
 pub mod approval_history;
+pub mod triage_outcomes;
 pub mod document_signatures;
 pub mod alert_schedule;
 pub mod daemon_report;
 pub mod delivery;
 pub mod imessage;
 pub mod models;
+pub mod linkedin_archive;
 pub mod notes;
 pub mod owner;
 pub mod phone;
 pub mod live_delegation;
 mod local_chat;
 pub mod owner_alerts;
+pub mod recipients;
 pub mod redact;
+pub mod team_coverage;
 // #1290 — Slack contact send targets and the per-action send ledger.
 pub mod slack_contact;
 // #1296 — live/poll reconciliation ledger for subscribed Slack messages.
@@ -44,7 +49,7 @@ pub use surface::{
 
 pub use models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, GmailRateRefusal, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, EmailRetryFailure, FriendWatch, GmailRateRefusal, LearnedPattern,
     LinkedInConnectionSync,
     OwnPost, PhoneIdentity, RateAuditRow, RateEvent, RateHalt, RateWarmup, ScheduledPost,
     ScheduledPostStatus, SlackWorkspace, SocialapiAccount, SocialapiWebhookEvent, SubscriptionMode,
@@ -52,7 +57,7 @@ pub use models::{
 };
 pub use store::{
     ActionCodeModeFields, ActionWithEmail, BodyCompaction, DiscordConversation, InterruptedDiscordTurn,
-    JournalSyncCursor,
+    JournalSyncCursor, LoopFinding, LoopOccurrence,
     NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,
@@ -61,4 +66,8 @@ pub use store::{
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write
 /// `Store::with_conn` closures without taking a direct `rusqlite` dep that
 /// could drift from the version this crate links.
+pub use recipients::Recipients;
 pub use rusqlite;
+
+mod triage_calibration;
+pub use triage_calibration::triage_calibration_scope;

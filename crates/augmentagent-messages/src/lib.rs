@@ -18,6 +18,7 @@ pub mod index;
 pub mod people;
 pub mod query;
 pub mod stats;
+pub mod team;
 
 pub use extract::{extract, EmailRowView, IndexFields, OwnerHandles, EXTRACTOR_VERSION};
 pub use index::{check, drain, enqueue_stale, DrainReport, IndexHealth, YIELD_PAUSE};

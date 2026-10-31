@@ -264,7 +264,7 @@ pub fn auto_rsvp_message_id(entity_id: &str, target_event_id: &str) -> String {
 
 /// Resolve the auto-accept setting for one account. Precedence: the
 /// account's own config value, then the global config value, then the
-/// environment default, then off. Returns the value and where it came from.
+/// environment default, then on. Returns the value and where it came from.
 pub fn auto_accept_enabled(
     account_value: Option<&str>,
     global_value: Option<&str>,
@@ -279,7 +279,7 @@ pub fn auto_accept_enabled(
             return (v, source);
         }
     }
-    (false, "default")
+    (true, "default")
 }
 
 pub fn parse_switch(v: &str) -> Option<bool> {
@@ -483,7 +483,9 @@ mod tests {
 
     #[test]
     fn setting_precedence_is_account_then_global_then_env() {
-        assert_eq!(auto_accept_enabled(None, None, None), (false, "default"));
+        assert_eq!(auto_accept_enabled(None, None, None), (true, "default"));
+        assert_eq!(auto_accept_enabled(None, None, Some("off")), (false, "env"));
+        assert_eq!(auto_accept_enabled(Some("off"), None, None), (false, "account"));
         assert_eq!(auto_accept_enabled(None, None, Some("on")), (true, "env"));
         assert_eq!(auto_accept_enabled(None, Some("off"), Some("on")), (false, "global"));
         assert_eq!(auto_accept_enabled(Some("true"), Some("off"), None), (true, "account"));

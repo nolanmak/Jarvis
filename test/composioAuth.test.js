@@ -143,10 +143,12 @@ test('dashboard persistence adapters save the correct provider and propagate fai
 test('gmail start goes to the operator\'s own Google client when configured and is saved by the callback', async t => {
   const f = await fixture(t);
   const attempts = new Map();
+  const starts = [];
   let configured = true;
   f.deps.google = {
     configured: () => configured,
-    start: async () => {
+    start: async email => {
+      starts.push(email);
       const attempt_id = 'aaaaaaaa-0000-4000-8000-00000000000a';
       attempts.set(attempt_id, {attempt_id, status: 'pending'});
       return {attempt_id, auth_url: 'https://accounts.google.com/o/oauth2/v2/auth?state=' + attempt_id, expires_at: new Date(Date.now() + 600000).toISOString()};
@@ -168,6 +170,11 @@ test('gmail start goes to the operator\'s own Google client when configured and 
   attempts.set(attempt_id, {attempt_id, status: 'failed', error: 'access_denied'});
   const failed = await f.post('status', {attempt_id});
   assert.equal(failed.body.status, 'FAILED'); assert.equal(failed.body.error, 'access_denied');
+  // The mailbox address is forwarded as the login hint; bad or misplaced ones are rejected.
+  assert.equal((await f.post('start', {provider: 'gmail', email: 'me@example.com'})).status, 201);
+  assert.equal(starts.at(-1), 'me@example.com');
+  assert.equal((await f.post('start', {provider: 'gmail', email: 'nope'})).status, 400);
+  assert.equal((await f.post('start', {provider: 'slack', email: 'me@example.com'})).status, 400);
   // Other providers, and Gmail without a Google client, still use Composio.
   configured = false;
   const composio = await f.post('start', {provider: 'gmail'});

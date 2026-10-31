@@ -165,6 +165,7 @@ Environment=PATH=$SERVICE_PATH
 Environment=RUST_LOG=info
 # Deft channel still inert until a token is stored via 'augmentagent deft login'
 Environment=AUGMENTAGENT_DEFT_ENABLED=1
+CPUQuota=${AUGMENTAGENT_UNIT_CPU_QUOTA:-400%}
 Restart=on-failure
 RestartSec=10
 # #902 — die alone: a fan-out is killed inside this cgroup, not by the
@@ -184,6 +185,21 @@ UNIT_EOF
 
   log "Reloading systemd --user"
   systemctl --user daemon-reload
+
+  resource_status=0
+  AUGMENTAGENT_RESOURCE_UNIT="$UNIT_NAME" "$REPO_ROOT/scripts/configure-run-resources.sh" --install || resource_status=$?
+  if [[ "$resource_status" -eq 3 ]]; then
+    log "NOTE: per-run delegation unavailable; required Autoship stays disabled, unrelated service remains available."
+  elif [[ "$resource_status" -ne 0 ]]; then
+    log "Resource configuration failed; refusing to restart with an unverified policy."
+    return 1
+  fi
+  local worker_help=""
+  worker_help=$("$REPO_ROOT/target/release/augmentagent" auto-pr-worker --help 2>/dev/null) || true
+  case "$worker_help" in
+    *'Usage: augmentagent auto-pr-worker'*)
+      AUGMENTAGENT_AUTOSTART_DRY_RUN="$DRY_RUN" bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" ;;
+  esac
 
   log "Enabling + (re)starting $UNIT_NAME"
   systemctl --user enable "$UNIT_NAME" >/dev/null

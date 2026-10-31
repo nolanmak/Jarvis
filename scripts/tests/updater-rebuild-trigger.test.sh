@@ -43,6 +43,7 @@ make_case() {
   cp "$REPO_ROOT/scripts/check-for-updates.sh" "$TMP/work/scripts/"
   printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
   echo "# base" > "$TMP/work/$path"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
@@ -144,10 +145,17 @@ expect_rebuild scripts/codex-command-sandbox.py
 expect_rebuild scripts/codex-build-vm.py
 expect_rebuild scripts/build-dependency-proxy.py
 expect_rebuild scripts/provider-supervisor.py
+expect_rebuild scripts/native-provider-vm.py
+expect_rebuild scripts/native-provider-vm-guest.py
+expect_rebuild scripts/native-provider-mcp-relay.py
+expect_rebuild scripts/native-provider-gateway.py
 expect_rebuild scripts/code-mode-compute.py
 expect_rebuild scripts/code-mode-compute-guest.py
 expect_rebuild scripts/code-mode-compute-prepare.py
 expect_rebuild sidecars/code-mode-runner/runner.ts
+expect_rebuild scripts/ci-build-vm.py
+expect_rebuild scripts/ci-contract.py
+expect_rebuild scripts/ci-contract.json
 expect_rebuild scripts/pdf-runtime.py
 expect_rebuild scripts/run-rs.sh
 expect_rebuild schema/wiki-ask.md

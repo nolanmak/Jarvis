@@ -368,10 +368,20 @@ fn approval_embed_and_rows(
     } else {
         format!("AugmentAgent approval · draft v{}", redraft_count + 1)
     };
+    // #1635 — a composed message (`kind = compose`: a Slack or iMessage text
+    // the owner started) has no inbound. Its address field is the recipient,
+    // so label it To, and show the draft alone instead of an empty quoted
+    // message above the separator.
+    let composed = email.kind == "compose" && matches!(email.platform.as_str(), "imessage" | "slack");
+    let description = if composed {
+        truncate_within(&human_draft, MAX_EMBED_DESCRIPTION)
+    } else {
+        format_body(&email.body, &human_draft)
+    };
     let mut embed = CreateEmbed::new()
-        .title(truncate(&email.subject, 256))
-        .description(format_body(&email.body, &human_draft))
-        .field("From", truncate(&email.from, 256), true)
+        .title(if composed && email.platform == "imessage" { "New message · iMessage".to_string() } else { truncate(&email.subject, 256) })
+        .description(description)
+        .field(if composed { "To" } else { "From" }, truncate(&email.from, 256), true)
         .field("MessageId", truncate(&email.message_id, 256), true);
     if !needs.is_empty() {
         embed = embed.field(
@@ -1775,5 +1785,39 @@ mod tests {
         assert_eq!(label_for("share_doc"), "Document link");
         assert_eq!(label_for("intro"), "Introduction");
         assert_eq!(label_for("???"), "Detail");
+    }
+
+    /// #1635 — a composed message (Slack/iMessage `kind = compose`) has no
+    /// inbound: the address field is the recipient and the card shows the
+    /// draft alone, with the same verbs as a reply card.
+    #[test]
+    fn composed_card_labels_the_recipient_to_and_shows_the_draft_alone() {
+        let mut e = email();
+        e.kind = "compose".into();
+        e.platform = "imessage".into();
+        e.from = "Jane Doe <+15555550100>".into(); // pii-ok synthetic
+        e.subject = "New iMessage to Jane Doe".into();
+        e.body = "owner original instruction".into();
+        let v: serde_json::Value =
+            serde_json::from_str(&json(&approval_message("act-c1", &e, "running late, 10 min", 0)))
+                .unwrap();
+        let embed = &v["embeds"][0];
+        assert_eq!(embed["title"], "New message · iMessage");
+        let names: Vec<&str> = embed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"To"), "{names:?}");
+        assert!(!names.contains(&"From"), "{names:?}");
+        assert_eq!(embed["description"], "running late, 10 min");
+        let s = v.to_string();
+        assert!(s.contains("aa:act-c1:approve") && s.contains("aa:act-c1:revise") && s.contains("aa:act-c1:skip"));
+        // A reply card is untouched: From, and the inbound above the separator.
+        let reply: serde_json::Value =
+            serde_json::from_str(&json(&approval_message("act-r1", &email(), "ok", 0))).unwrap();
+        assert_eq!(reply["embeds"][0]["fields"][0]["name"], "From");
+        assert!(reply["embeds"][0]["description"].as_str().unwrap().contains("— DRAFT —"));
     }
 }

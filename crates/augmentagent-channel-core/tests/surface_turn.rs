@@ -516,3 +516,116 @@ async fn cancellation_during_initial_history_load_never_dispatches_or_claims_a_t
     // A retry can claim the same ID: cancellation happened before submission.
     store.claim_surface_turn(&turn).unwrap();
 }
+
+// #1626 — a provider refusal before the prompt reaches the native CLI (resource
+// capacity, hook preparation, spawn failure) has no native side effect. It must
+// not latch the conversation "uncertain": the owner's next message resumes the
+// same native session.
+fn discord_channel() -> SurfaceConversationRef {
+    SurfaceConversationRef::new(
+        SurfaceAccountRef::new(SurfacePlatform::new("discord").unwrap(), "1000000000000000001")
+            .unwrap(),
+        "2000000000000000002",
+        None,
+    )
+    .unwrap()
+}
+
+async fn refuse_before_submission(
+    store: &Store,
+    turn: &SurfaceTurnRef,
+) -> anyhow::Result<SurfaceTurnOutcome> {
+    use augmentagent_channel_core::native_session::CURRENT;
+    run_surface_turn(
+        store,
+        SurfaceTurnRequest {
+            turn,
+            history: "",
+            current: "schedule a meeting",
+            cwd: "/workspace with space/wiki",
+        },
+        || Ok(None),
+        None,
+        |_prompt| async move {
+            let session = CURRENT.with(Arc::clone);
+            let _lease = session.begin(ProviderKind::Claude)?;
+            anyhow::bail!(
+                "claude resource capacity: declared run resource capacity unavailable or exhausted; reconcile capacity before retry"
+            )
+        },
+    )
+    .await
+}
+
+async fn a_pre_submission_refusal_does_not_latch(chat: SurfaceConversationRef) {
+    let (_dir, store) = store();
+    let provider = RecordingNativeProvider::new(ProviderKind::Claude);
+    let first = SurfaceTurnRef::new(chat.clone(), "u1").unwrap();
+    answered(run(&store, &provider, &first, "", "one", None, None).await.unwrap());
+    let bound = store.surface_conversation(&chat).unwrap().unwrap();
+
+    let refused = SurfaceTurnRef::new(chat.clone(), "u2").unwrap();
+    let error = refuse_before_submission(&store, &refused).await.unwrap_err();
+    assert!(error.to_string().contains("resource capacity"), "{error}");
+    let binding = store.surface_conversation(&chat).unwrap().unwrap();
+    assert!(!binding.uncertain, "nothing reached the CLI; the conversation must not be latched");
+    assert_eq!(binding.native_session_id, bound.native_session_id);
+
+    let third = SurfaceTurnRef::new(chat.clone(), "u3").unwrap();
+    let answer = answered(run(&store, &provider, &third, "", "three", None, None).await.unwrap());
+    assert!(answer.contains("turn=2"), "{answer}");
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1].resumed);
+    assert_eq!(calls[1].native_session_id, bound.native_session_id);
+    if chat.account().platform().as_str() != "discord" {
+        // Discord top-level turns keep their own table; for them the third
+        // turn being claimed at all is the proof that nothing blocks.
+        assert_eq!(
+            store.surface_turn_state(&third).unwrap().unwrap().status,
+            SurfaceTurnStatus::Complete
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_pre_submission_refusal_does_not_latch_a_slack_thread() {
+    a_pre_submission_refusal_does_not_latch(slack("C00000009", Some("1700000000.000900"))).await;
+}
+
+#[tokio::test]
+async fn a_pre_submission_refusal_does_not_latch_a_discord_channel() {
+    a_pre_submission_refusal_does_not_latch(discord_channel()).await;
+}
+
+#[tokio::test]
+async fn a_refusal_after_submission_still_latches_the_conversation() {
+    use augmentagent_channel_core::native_session::CURRENT;
+    let (_dir, store) = store();
+    let provider = RecordingNativeProvider::new(ProviderKind::Claude);
+    let chat = discord_channel();
+    let first = SurfaceTurnRef::new(chat.clone(), "u1").unwrap();
+    answered(run(&store, &provider, &first, "", "one", None, None).await.unwrap());
+    let died = SurfaceTurnRef::new(chat.clone(), "u2").unwrap();
+    let error = run_surface_turn(
+        &store,
+        SurfaceTurnRequest { turn: &died, history: "", current: "two", cwd: "/w" },
+        || Ok(None),
+        None,
+        |_prompt| async move {
+            let session = CURRENT.with(Arc::clone);
+            let lease = session.begin(ProviderKind::Claude)?;
+            lease.mark_submitting();
+            anyhow::bail!("claude exited mid-turn")
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("mid-turn"), "{error}");
+    assert!(store.surface_conversation(&chat).unwrap().unwrap().uncertain);
+    let blocked = run(&store, &provider, &SurfaceTurnRef::new(chat, "u3").unwrap(), "", "three", None, None)
+        .await
+        .unwrap_err();
+    assert!(blocked.to_string().contains("uncertain turn"), "{blocked}");
+    assert_eq!(provider.calls().len(), 1);
+}

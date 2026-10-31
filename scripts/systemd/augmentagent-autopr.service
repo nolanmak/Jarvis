@@ -1,0 +1,31 @@
+# Managed by ensure-autopr-worker.sh
+[Unit]
+Description=AugmentAgent independent auto-ship worker
+After=network-online.target augmentagent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKING_DIR@
+ExecStart="@REPO_ROOT@/scripts/run-rs.sh" auto-pr-worker --dry-run @DRY_RUN@
+Environment="PATH=@SERVICE_PATH@"
+Environment=RUST_LOG=info
+@EXTRA_ENV@
+Slice=augmentagent-runtime.slice
+MemoryHigh=@MEMORY_HIGH@
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=0
+TasksMax=@TASKS_MAX@
+@CPU_QUOTA@
+@DELEGATION@
+Restart=on-failure
+SuccessExitStatus=75
+RestartForceExitStatus=75
+RestartSec=3
+LimitNOFILE=@NOFILE@
+# Preserve the existing health/log-rotation consumers for both processes.
+StandardOutput=append:@LOG_DIR@/stdout.log
+StandardError=append:@LOG_DIR@/stderr.log
+
+[Install]
+WantedBy=default.target

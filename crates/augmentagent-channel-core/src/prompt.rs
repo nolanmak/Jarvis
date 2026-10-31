@@ -704,6 +704,9 @@ pub fn code_mode_repair_user_message(
 /// slack, telegram, …) share this prompt and have no subject at all, so they
 /// keep the pre-#652 bytes.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
+    if email.kind == "compose" && matches!(email.platform.as_str(), "imessage" | "slack") {
+        return redraft_composed_message(email, previous_draft, feedback);
+    }
     let subject_clause = if email.platform == "gmail" {
         " If — and only if — the user's feedback asks for a different subject line, put the new subject on the very first line as `Subject: <new subject>`, followed by one blank line, then the body. Otherwise never include a Subject line."
     } else {
@@ -732,6 +735,37 @@ Write the revised draft now.
         from = sanitize_untrusted(&email.from),
         subject = sanitize_untrusted(&email.subject),
         body = sanitize_untrusted(&email.body),
+    )
+}
+
+/// #1635 — Revise on a card the owner started themselves (`kind = compose`,
+/// Slack or iMessage). There is no inbound to quote: the recipient and the
+/// owner's own draft are the whole context, and the result is a chat
+/// message, not an email.
+pub fn redraft_composed_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
+    let medium = match email.platform.as_str() {
+        "imessage" => "an iMessage text",
+        "slack" => "a Slack message",
+        _ => "a chat message",
+    };
+    format!(
+        r#"You are editing {medium} the user is about to send. Revise the draft based on the user's feedback and return ONLY the revised message text — no JSON, no quotes, no commentary, no greeting line or sign-off unless the draft already had one, except the optional `<!--aa:assumes …-->` block described in your system prompt. Keep it the length and tone of a text message. Do not add To: or other header lines.
+
+<recipient>
+{to}
+</recipient>
+
+<previous_draft>
+{previous_draft}
+</previous_draft>
+
+<user_feedback>
+{feedback}
+</user_feedback>
+
+Write the revised message now.
+"#,
+        to = sanitize_untrusted(&email.from),
     )
 }
 
@@ -1034,6 +1068,9 @@ mod tests {
             got.contains("`Subject: <new subject>`"),
             "gmail redraft lost the subject channel:\n{got}"
         );
+        let mut composed_email = email();
+        composed_email.kind = "compose".into();
+        assert!(redraft_message(&composed_email, "draft", "change subject").contains("Subject: <new subject>"));
         let mut chat = email();
         chat.platform = "slack".into();
         let got = redraft_message(&chat, "the previous draft", "call it Invoice for July");

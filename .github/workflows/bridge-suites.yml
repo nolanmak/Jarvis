@@ -13,6 +13,11 @@ on:
 permissions:
   contents: read
 
+# Superseded PR heads cancel; non-PR runs retain distinct queue slots.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
+
 jobs:
   bridge-suites:
     runs-on: ubuntu-latest
@@ -23,30 +28,25 @@ jobs:
       # instead of skipping them (local runs still skip).
       REQUIRE_ENFORCEABLE_SANDBOX: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install renderer, syscall-filter library and ripgrep
-        run: |
-          sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-            poppler-utils libseccomp2 ripgrep python3-packaging
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/1"
       - name: Report sandbox capabilities
-        run: python3 scripts/tests/host_capabilities.py
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/2"
+
       - name: Require the enforcement and compute suites
         shell: bash
-        run: |
-          set -euo pipefail
-          for suite in codex_tool_bridge_test codex_command_sandbox_test \
-                       codex_build_vm_test build_dependency_proxy_test \
-                       code_mode_compute_test compute_initialization_test compute_package_fixture_test \
-                       qa_code_mode_compute_test compute_ci_test compute_receipt_test; do
-            test -f "scripts/tests/$suite.py" || { echo "missing suite: $suite" >&2; exit 1; }
-          done
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/3"
       - name: Run Python suites
         working-directory: scripts
         # Live and VM suites need explicit opt-in env vars and skip without them.
         env:
           JARVIS_TEST_VM_CONFIG: ""
           JARVIS_TEST_LIVE_DISCOVERY: ""
-        run: python3 -m unittest discover -s tests -p '*_test.py' -v
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/4"
+
+      - name: Test native provider gateway and launcher contracts
+        # Real VM and authenticated provider acceptance run on the provisioned host.
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/5"
       - name: Test the PR verification gate's bridge-suite receipt rule
-        run: bash scripts/tests/agent-pr-verify-gate.test.sh
+        run: "python3 \"${{ github.workspace }}/scripts/ci-contract.py\" step --hosted --id bridge-suites/bridge-suites/6"

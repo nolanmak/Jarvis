@@ -214,6 +214,10 @@ pub async fn run_gmail_get_attachment(
         write_no_follow(&path, &bytes)
             .await
             .with_context(|| format!("write {}", path.display()))?;
+        // #1629 — `--attach` on this path re-sends it under its real name.
+        augmentagent_docs::inbound::record_original_name(&path, &filename)
+            .await
+            .with_context(|| format!("record original name for {}", path.display()))?;
         path
     };
 
