@@ -113,7 +113,10 @@ fn compose_preview_post_approve_and_revoked_allowlist_use_real_cli() {
     assert_eq!(rows[0].body, "hello world");
 }
 
-#[cfg(unix)]
+// The production deployment runs the agent on Linux and the sender on macOS.
+// Its provider supervisor requires Linux prctl/subreaper and /proc support;
+// macOS still runs the direct compose/default-policy/outbox CLI fixtures below.
+#[cfg(target_os = "linux")]
 #[test]
 fn fault_injected_ask_raises_one_pending_compose_and_asks_on_ambiguity() {
     use std::os::unix::fs::{symlink, PermissionsExt};
