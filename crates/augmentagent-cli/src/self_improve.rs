@@ -42,6 +42,8 @@ use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, Fallb
 
 #[path = "self_improve_ci.rs"]
 mod shared_ci;
+#[path = "self_improve_baseline_priority.rs"]
+mod baseline_priority;
 
 #[path = "self_improve_episode.rs"]
 mod episode;
@@ -4954,11 +4956,11 @@ struct RedMain {
 
 /// #932 — is `origin/main` red? The full verification gate runs once per
 /// main SHA on a clean detached worktree (sandboxed env, shared target dir)
-/// and the answer is cached; every later tick costs one `git rev-parse`.
-/// `None` also when the gate itself could not run (worktree/fetch failure)
-/// — the loop then proceeds exactly as before #932.
-async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
-    let sha = origin_main_sha(repo_root).await?;
+/// and the answer is cached against that exact source identity.
+/// Optional diagnosis has a typed deferred outcome when readiness or source
+/// cannot be proven; the loop yields without caching a verdict or model spend.
+async fn main_is_red(repo_root: &Path) -> std::result::Result<Option<RedMain>, baseline_priority::Deferred> {
+    let sha = baseline_priority::fresh_source(repo_root).await?;
     let path = baseline_cache_path();
     let mut cache = BaselineCache::load(&path);
     if cache.needs_full_check(&sha) {
@@ -4967,8 +4969,11 @@ async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
             sha = short,
             "self-improve: full gate on origin/main (once per main commit)"
         );
+        baseline_priority::check(repo_root, &sha).await?;
         let now = chrono::Utc::now();
-        match full_gate_on_main(repo_root).await {
+        let verdict = full_gate_on_main(repo_root, &sha).await;
+        baseline_priority::unchanged(repo_root, &sha).await?;
+        match verdict {
             Ok(Ok(())) => cache.record_full(&sha, &[], None, now),
             Ok(Err(gate_err)) => {
                 let text = format!("{gate_err:#}");
@@ -4981,7 +4986,7 @@ async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
                         "full gate on origin/main failed on infra ({why}); verdict not recorded, \
                          next tick re-runs it"
                     );
-                    return None;
+                    return Err(baseline_priority::Deferred::DiagnosticUnavailable);
                 }
                 let failing = failing_tests(&text);
                 warn!(
@@ -4993,26 +4998,26 @@ async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
                 cache.record_full(&sha, &failing, Some(truncate(&text, 4000)), now);
             }
             Err(e) => {
-                warn!("could not run the full gate on origin/main; proceeding as before: {e:#}");
-                return None;
+                warn!("optional main diagnostic unavailable; yielding this tick: {e:#}");
+                return Err(baseline_priority::Deferred::DiagnosticUnavailable);
             }
         }
         cache.save(&path);
     }
     if !cache.is_red(&sha) {
-        return None;
+        return Ok(None);
     }
     let gate_err = cache.gate_err_for(&sha).cloned();
     let packages = gate_err
         .as_deref()
         .map(failing_packages)
         .unwrap_or_default();
-    Some(RedMain {
+    Ok(Some(RedMain {
         failing: cache.failing_for(&sha).to_vec(),
         packages,
         gate_err,
         sha,
-    })
+    }))
 }
 
 /// `Some(reason)` when a red full-gate result is the harness's fault and must
@@ -5023,7 +5028,7 @@ fn baseline_infra_reason(gate_text: &str) -> Option<&'static str> {
 
 /// Run [`verification_gate`] on a clean detached checkout of `origin/main`.
 /// Outer `Err` = could not even try; inner `Err` = the gate is red.
-async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
+async fn full_gate_on_main(repo_root: &Path, source: &str) -> Result<Result<()>> {
     // Outer `Err`: with no room to build, the gate was not run at all.
     gate_disk_guard()?;
     let lane = lane_from_env().worktree_name();
@@ -5039,7 +5044,7 @@ async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
             "add",
             "--detach",
             &worktree.to_string_lossy(),
-            "origin/main",
+            source,
         ],
         repo_root,
     )
@@ -7658,8 +7663,9 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
     // the tick unbilled rather than buy a doomed build.
     let lane = lane_from_env();
     let red_main_issue: Option<Issue> = if let Some(issue)=selected_issue {Some(issue)} else { match main_is_red(repo_root).await {
-        None => None,
-        Some(red) => {
+        Err(reason) => return Ok(RunReport::held(format!("optional main diagnostic deferred: {reason}"))),
+        Ok(None) => None,
+        Ok(Some(red)) => {
             let short = red.sha.get(..7).unwrap_or(&red.sha).to_string();
             let what = if red.failing.is_empty() {
                 "workspace does not build".to_string()
