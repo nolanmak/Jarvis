@@ -775,6 +775,21 @@ impl WorkflowGuard {
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
             store.validate_dispatch(&dispatch_lease,&binding,millis())
         }))?;
+        if self.audit.native_runtime_owner()?.is_some() {
+            let journal_store=self.store.clone();let journal_lease=self.lease.clone();
+            // The logger owns its callback; a weak reference avoids retaining
+            // the logger/store after the guarded owner has gone away.
+            let journal_audit=Arc::downgrade(&self.audit);
+            self.audit.set_native_launch_observer(Arc::new(move |prepared| {
+                let audit=journal_audit.upgrade().context("native launch audit owner is gone")?;
+                let mut store=journal_store.lock().map_err(|_|anyhow::anyhow!("native launch journal lock poisoned"))?;
+                let binding=if let Ok(call)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
+                    anyhow::ensure!(call.workflow==journal_lease.workflow,"native launch used another workflow scope");call.binding
+                } else {store.snapshot(&journal_lease.workflow)?.context("native launch workflow missing")?.checkpoint.binding};
+                store.record_verified_native_launch(&journal_lease,&binding,&audit,prepared,millis())?;
+                Ok(())
+            }))?;
+        }
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
         let capacity_flag = self.capacity_exhausted.clone();
@@ -2709,6 +2724,23 @@ mod tests {
             "guard returned without installing its native launch journal");
         assert!(guard.store.lock().unwrap().native_owner_binding(guard.id(),guard.lease.generation).unwrap().is_none(),
             "legacy owner must not be backfilled from current policy");
+        // Metadata fixture only: call the same protected preparation boundary
+        // as NativeVM, without inventing a real runtime or submitting a prompt.
+        let audit=guard.audit_logger();
+        let prepared=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:1,
+            intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {
+                workflow_id:guard.id().into(),lease_generation:guard.lease.generation},
+            source_audit_path:audit.path().into(),provider:"codex".into(),runtime_relative_path:"codex/session-fixture".into(),
+            native_session_id:None,launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64)};
+        let error=audit.native_launch_prepared(&prepared).unwrap_err();
+        assert!(error.to_string().contains("original owner binding"),"{error:#}");
+        let mut store=guard.store.lock().unwrap();
+        assert!(store.native_launch_intents(guard.id()).unwrap().is_empty());
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        drop(store);
+        guard.validate_before_side_effect().unwrap();
+        let weak=Arc::downgrade(&audit);drop(audit);guard.finish().unwrap();
+        assert!(weak.upgrade().is_none(),"native launch callback retained the logger after the guard finished");
     }
 
     #[tokio::test]

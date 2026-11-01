@@ -91,11 +91,35 @@ const COLUMNS: &str="record,intent_id,workflow,sequence,lease_generation,provide
 
 impl WorkflowStore {
     /// Verify the original protected controller record before journaling it.
-    pub fn record_verified_native_launch(&mut self, _lease:&Lease, _binding:&Binding,
-        _audit:&augmentagent_channel_core::AuditLogger,
-        _prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,
-        _now:i64)->Result<NativeLaunchRecord> {
-        anyhow::bail!("verified native launch bridge not implemented")
+    pub fn record_verified_native_launch(&mut self, lease:&Lease, binding:&Binding,
+        audit:&augmentagent_channel_core::AuditLogger,
+        prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,
+        now:i64)->Result<NativeLaunchRecord> {
+        self.validate_dispatch(lease,binding,now)?;
+        let source=RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation};
+        ensure!(prepared.intent.version==1 && prepared.intent.source_owner==source
+            && audit.native_runtime_owner()?.as_ref()==Some(&source)
+            && prepared.intent.source_audit_path==audit.path(),"native launch controller identity mismatch");
+        let (original_audit,_)=original_context(&self.conn,&lease.workflow,lease.generation,true)?;
+        ensure!(Path::new(&original_audit)==audit.path(),"native launch original audit mismatch");
+        let mut actual=audit.read_append_receipt(&prepared.controller_receipt)?;
+        actual.as_object_mut().context("native launch audit record is not an object")?.remove("audit_chain");
+        let mut expected=serde_json::to_value(&prepared.intent)?;
+        expected["actor"]="controller".into();expected["kind"]="native_launch_intent".into();
+        ensure!(actual==expected,"native launch controller receipt describes another record");
+        let provider=match prepared.intent.provider.as_str() {
+            "codex"=>submission::Provider::Codex,"claude"=>submission::Provider::Claude,
+            _=>anyhow::bail!("unsupported workflow native launch provider"),
+        };
+        let intent=NativeLaunchIntent {intent_id:prepared.intent.intent_id.clone(),provider,
+            runtime_relative_path:prepared.intent.runtime_relative_path.clone(),
+            native_session_id:prepared.intent.native_session_id.clone(),
+            launch_sha256:prepared.intent.launch_sha256.clone(),
+            creation_receipt_sha256:prepared.intent.creation_receipt_sha256.clone(),
+            controller_receipt:Some(prepared.controller_receipt.clone())};
+        // This transaction rechecks lease/candidate/original registration after
+        // the bounded read and publishes the identity, event and journal atomically.
+        self.record_native_launch_intent(lease,binding,&intent,now)
     }
     /// Persist before releasing a native prompt. This records a launch intent,
     /// including a missing provider ID, without declaring runtime certainty.

@@ -563,7 +563,9 @@ impl AuditLogger {
         anyhow::ensure!(current.is_none(),"native launch observer already installed");
         *current=Some(observer);Ok(())
     }
-    pub(crate) fn native_launch_prepared(&self,intent:&crate::native_vm::PreparedLaunchIntent)->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
+    /// Commit controller-captured preparation and its exact receipt before the
+    /// command can escape to a provider. This does not prove native submission.
+    pub fn native_launch_prepared(&self,intent:&crate::native_vm::PreparedLaunchIntent)->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
         intent.validate()?;
         anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&intent.source_owner)
             && intent.source_audit_path==self.path,"native launch source audit mismatch");
