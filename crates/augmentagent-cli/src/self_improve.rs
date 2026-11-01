@@ -7331,6 +7331,8 @@ async fn reclaim_worktree(repo_root: &Path, worktree: &Path, branch: &str) -> Re
     let primary = workspace::primary_root(repo_root).await?;
     recovery::checkout_path(&primary, worktree)?;
     if !worktree.try_exists()? { return Ok(()); }
+    anyhow::ensure!(crate::build_storage::ci_holds::may_cleanup_after_reconcile(worktree)?,
+        "checkout has an unresolved CI cleanup hold; preserved");
     // Only disposable baseline checkouts are reclaimed here. Candidates use
     // durable recovery; unknown paths and dirty/unmerged work are never erased.
     anyhow::ensure!(matches!(branch, "agent-baseline/current" | "agent-baseline/resume"),

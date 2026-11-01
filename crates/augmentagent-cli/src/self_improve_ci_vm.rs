@@ -10,7 +10,7 @@ const PROXY: &[u8] = include_bytes!("../../../scripts/build-dependency-proxy.py"
 const SUPERVISOR: &[u8] = include_bytes!("../../../scripts/provider-supervisor.py");
 
 pub(super) struct Session {
-    directory: tempfile::TempDir,
+    directory: Option<tempfile::TempDir>,
     memory_mb: u64,
     cache_bytes: u64,
     cache: PathBuf,
@@ -164,6 +164,18 @@ fn private_directory(path: &Path) -> Result<()> {
     );
     Ok(())
 }
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(directory)=self.directory.take() {
+            if crate::build_storage::ci_holds::may_cleanup(directory.path()).unwrap_or(false) {
+                drop(directory);
+            } else {
+                let _ = directory.keep();
+                tracing::error!("CI session preserved for verified cleanup recovery");
+            }
+        }
+    }
+}
 impl Session {
     pub(super) fn prepare(root: &Path, target: &Path) -> Result<Self> {
         use augmentagent_channel_core::codex_tools::{build_runner, BuildRunner};
@@ -228,7 +240,7 @@ impl Session {
             "runtime":digest(&runtime),"adapter":digest(ADAPTER),"build_vm":digest(BUILD_VM),"proxy":digest(PROXY),
             "supervisor":digest(SUPERVISOR),"cache_bytes":limits.cache_bytes}))?);
         Ok(Self {
-            directory,
+            directory: Some(directory),
             memory_mb,
             cache_bytes: limits.cache_bytes,
             cache: cache_root.join("cache.img"),
@@ -267,51 +279,54 @@ impl Session {
         }
         .canonicalize()?;
         let request = serde_json::json!({"version":1,"operation":operation,
-            "runtime_config":self.directory.path().join("runtime.json"),"workspace":source,
-            "state":self.directory.path().join("state"),"git_objects":objects,
-            "runner":self.directory.path().join("ci-contract.py"),"contract":self.directory.path().join("ci-contract.json"),
+            "runtime_config":self.directory.as_ref().expect("owned CI session").path().join("runtime.json"),"workspace":source,
+            "state":self.directory.as_ref().expect("owned CI session").path().join("state"),"git_objects":objects,
+            "runner":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.py"),"contract":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.json"),
             "head":binding.verification_head,"base":binding.base,"id":check.map(|value|&value.id),"changed_files":changed,
             "packages":packages,"filters":filters,"command":owner_command,
-            "scratch":self.directory.path().join("scratch"),
+            "scratch":self.directory.as_ref().expect("owned CI session").path().join("scratch"),
             "build_cache":if operation=="plan" {None} else {Some(&self.cache)},
             "cache_bytes":if operation=="plan" {None} else {Some(self.cache_bytes)},
             "storage":{"fd":fd.as_raw_fd(),"fds":files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
                 "path":lock_path,"device":meta.dev(),"inode":meta.ino(),
                 "floor_bytes":(crate::disk::gate_min_free_gb()*1024.0f64.powi(3)) as u64}});
         let spec = self
-            .directory
+            .directory.as_ref().expect("owned CI session")
             .path()
             .join(format!("request-{}.json", uuid::Uuid::new_v4()));
         private_write(&spec, &serde_json::to_vec(&request)?)?;
         let mut command = Command::new("/usr/bin/python3");
         command
             .arg("-I")
-            .arg(self.directory.path().join("ci-build-vm.py"))
+            .arg(self.directory.as_ref().expect("owned CI session").path().join("ci-build-vm.py"))
             .arg("--spec")
             .arg(&spec)
-            .current_dir(self.directory.path())
+            .current_dir(self.directory.as_ref().expect("owned CI session").path())
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let (mut child, resources) =
-            augmentagent_channel_core::run_resources::spawn_command_with_storage(
-                &command,
-                Some(audit),
-                &files,
-                self.memory_mb,
-            )
-            .context("shared CI prerequisite unavailable: VM resource admission configuration")?;
-        resources.admit("shared_ci_vm", Some(audit)).await?;
+        let mut hold=crate::build_storage::ci_holds::Hold::begin(root,source,
+            self.directory.as_ref().expect("owned CI session").path(),target,
+            &digest(&serde_json::to_vec(binding)?))
+            .context("shared CI prerequisite unavailable: durable cleanup ownership unavailable")?;
+        let spawned=augmentagent_channel_core::run_resources::spawn_command_with_storage_at(
+            &command,Some(audit),&files,self.memory_mb,hold.supervisor());
+        let (mut child,resources)=match spawned {
+            Ok(spawned)=>spawned,
+            Err(error)=>{hold.not_spawned().context("shared CI prerequisite unavailable: failed-spawn cleanup ownership unavailable")?;return Err(error).context("shared CI prerequisite unavailable: VM resource admission configuration");},
+        };
+        resources.admit_with_observer("shared_ci_vm",Some(audit),|admission|hold.bind(admission)).await
+            .context("shared CI prerequisite unavailable: durable resource admission unavailable")?;
         drop(child.stdin.take());
         let output = async { Ok::<_, anyhow::Error>(child.wait_with_output().await?) };
         let output = tokio::time::timeout(
             deadline,
             crate::build_storage::watch_reserve_roots(
                 Some(target),
-                Some(self.directory.path()),
+                Some(self.directory.as_ref().expect("owned CI session").path()),
                 output,
             ),
         )
@@ -327,6 +342,13 @@ impl Session {
             );
         }
         resources.record_outcome("shared_ci_vm", Some(audit))?;
+        let quiescence=resources.verified_quiescence()
+            .context("shared CI prerequisite unavailable: command teardown not verified")?;
+        audit.record_controller(serde_json::json!({"kind":"shared_ci_vm_quiescent", "operation":operation,
+            "binding":binding,"controller_authority_sha256":self.authority_sha256,
+            "proof":quiescence.evidence(),"shipping_authority":false}))?;
+        // Keep the exact scope evidence and storage hold through settlement.
+        hold.settle().context("shared CI prerequisite unavailable: storage cleanup settlement unavailable")?;
         let output = output.unwrap()?;
         ensure!(
             output.stdout.len() <= 20 * 1024 * 1024,

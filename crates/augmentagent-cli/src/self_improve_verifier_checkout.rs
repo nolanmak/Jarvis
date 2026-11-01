@@ -17,7 +17,8 @@ impl OwnedCheckout {
 }
 impl Drop for OwnedCheckout {
     fn drop(&mut self) {
-        if std::fs::read(&self.owner).ok().as_deref() == Some(self.identity.as_slice()) {
+        let cleanup=crate::build_storage::ci_holds::may_cleanup(&self.path).unwrap_or(false);
+        if cleanup && std::fs::read(&self.owner).ok().as_deref() == Some(self.identity.as_slice()) {
             if std::fs::remove_dir_all(&self.path).is_ok() {
                 let _ = std::fs::remove_file(&self.owner);
             }
@@ -74,6 +75,8 @@ pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &st
         "committed verifier source admission busy"
     );
     if path.try_exists()? {
+        ensure!(crate::build_storage::ci_holds::may_cleanup_after_reconcile(&path)?,
+            "verifier source has an unresolved CI cleanup hold; preserved");
         let prior: serde_json::Value = private_json(&owner)?;
         ensure!(
             serde_json::to_vec(&prior)? == identity,
@@ -199,6 +202,32 @@ pub(super) async fn materialize(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os="linux")]
+    #[test]
+    fn verifier_source_drop_and_reallocation_require_settled_cleanup() {
+        crate::build_storage::ci_holds::with_test_registry(|root,_| {
+            let checkout=allocate(root,"head","contract").unwrap();
+            let source=checkout.path().to_owned();std::fs::write(source.join("keep"),b"original source").unwrap();
+            let mut hold=crate::build_storage::ci_holds::Hold::begin(root,&source,root,root,&"a".repeat(64)).unwrap();
+            drop(checkout);
+            assert!(source.join("keep").exists(),"source was deleted without teardown proof");
+            assert!(allocate(root,"head","contract").is_err(),
+                "a restart must not reclaim the retained source");
+            let host=crate::autoship_review::digest(&std::fs::read("/etc/machine-id").unwrap());
+            let boot=std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            let identity=serde_json::json!({"host_sha256":host,"boot_id":boot.trim(),
+                "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
+            hold.bind_fixture_identity(&identity).unwrap();
+            let receipt=hold.supervisor().join("resource-accounting.json");
+            std::fs::write(&receipt,serde_json::to_vec(&serde_json::json!({"phase":"completed","identity":identity})).unwrap()).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
+            hold.settle().unwrap();
+            let next=allocate(root,"head","contract").unwrap();
+            assert!(!next.path().join("keep").exists());
+        });
+    }
+
     use super::*;
     #[test]
     fn released_checkout_unlocks_even_when_a_fork_inherits_its_descriptor() {
