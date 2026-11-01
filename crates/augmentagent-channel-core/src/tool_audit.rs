@@ -639,8 +639,10 @@ impl AuditLogger {
 
     /// Read one historical record through this logger's original anchor. This
     /// does not attest current writer health, ownership, or model admission.
-    pub fn read_append_receipt(&self, _receipt: &crate::audit_chain::AppendReceipt) -> anyhow::Result<serde_json::Value> {
-        anyhow::bail!("protected receipt lookup is not implemented")
+    pub fn read_append_receipt(&self, receipt: &crate::audit_chain::AppendReceipt) -> anyhow::Result<serde_json::Value> {
+        self.anchored.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("protected audit required"))?
+            .read_receipt(receipt)
     }
 
     async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
@@ -1472,12 +1474,14 @@ mod tests {
         let before_pending = pending();
         let mut wrong = receipt.clone(); wrong.record_sha256 = "0".repeat(64);
         assert!(logger.read_append_receipt(&wrong).is_err());
-        logger.protected_health().unwrap();
         let row = logger.read_append_receipt(&receipt).unwrap();
         assert_eq!(row["kind"], "native_launch_fixture");
         assert_eq!(std::fs::read(&log).unwrap(), before_log);
         assert_eq!(std::fs::read(&anchor).unwrap(), before_anchor);
         assert_eq!(pending(), before_pending, "lookup must not register a writer");
+        // The existing health operation appends an integrity-check record.
+        // Keep its separate write outside the receipt read's byte comparison.
+        logger.protected_health().unwrap();
     }
 
     #[test]
