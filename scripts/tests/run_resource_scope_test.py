@@ -20,6 +20,70 @@ resources = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(resources)
 
 
+class AdmissionPublicationTests(unittest.TestCase):
+    """Exercise the real supervisor without delegated cgroups or a provider."""
+    def start_supervisor(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        receipt, effect = root/'cleanup-complete', root/'effect'
+        env = {'PATH':'/usr/bin:/bin', 'JARVIS_SUPERVISOR_ADMISSION':'1',
+               'JARVIS_SUPERVISOR_PARENT_PID':str(os.getpid())}
+        child = subprocess.Popen([
+            '/usr/bin/python3', '-I', str(Path(__file__).parents[1]/'provider-supervisor.py'),
+            str(receipt), '/usr/bin/python3', '-I', '-c',
+            f'from pathlib import Path; Path({str(effect)!r}).write_text("executed")',
+        ], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        def reap():
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)
+        self.addCleanup(reap)
+        deadline = time.monotonic()+5
+        while not (root/'launch-ready').exists() and child.poll() is None and time.monotonic()<deadline:
+            time.sleep(0.005)
+        self.assertTrue((root/'launch-ready').exists(), 'supervisor did not reach admission')
+        return root, child, receipt, effect
+
+    def test_incomplete_admission_waits_for_complete_bytes_before_dispatch(self):
+        for prefix in (b'', b'admit'):
+            with self.subTest(prefix=prefix):
+                root, child, receipt, effect = self.start_supervisor()
+                with (root/'launch-continue').open('xb') as output:
+                    output.write(prefix)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    time.sleep(0.06)
+                    self.assertIsNone(child.poll(), 'partial publication was treated as invalid admission')
+                    self.assertFalse(effect.exists(), 'provider dispatched before full admission')
+                    self.assertFalse(receipt.exists())
+                    output.write(b'admitted\n'[len(prefix):])
+                    output.flush()
+                    os.fsync(output.fileno())
+                _, error = child.communicate(timeout=5)
+                self.assertEqual(child.returncode, 0, error.decode())
+                self.assertTrue(effect.exists())
+                self.assertEqual(receipt.read_bytes(), b'all-descendants-reaped\n')
+
+    def test_malformed_admission_never_dispatches(self):
+        for value in (b'rejected\n', b'admitted\nextra'):
+            with self.subTest(value=value):
+                root, child, _, effect = self.start_supervisor()
+                (root/'launch-continue').write_bytes(value)
+                child.communicate(timeout=5)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertFalse(effect.exists())
+
+    def test_cancel_during_partial_publication_never_dispatches(self):
+        root, child, receipt, effect = self.start_supervisor()
+        (root/'launch-continue').write_bytes(b'admit')
+        time.sleep(0.06)
+        self.assertIsNone(child.poll())
+        child.terminate()
+        child.communicate(timeout=5)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertFalse(effect.exists())
+        self.assertEqual(receipt.read_bytes(), b'all-descendants-reaped\n')
+
+
 class ResourceTests(unittest.TestCase):
     def setUp(self):
         if resources.current_group().name != 'daemon':

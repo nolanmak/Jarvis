@@ -25,7 +25,7 @@
       "shell": "bash"
     },
     "bridge-suites/bridge-suites/6": {
-      "body": "bash scripts/tests/agent-pr-verify-gate.test.sh\npython3 scripts/ci-contract.py verify\npython3 scripts/tests/ci_contract_test.py\n\npython3 scripts/tests/ci_build_vm_test.py\n",
+      "body": "bash scripts/tests/agent-pr-verify-gate.test.sh\nbash scripts/tests/cargo-target-guard.test.sh\npython3 scripts/ci-contract.py verify\npython3 scripts/tests/ci_contract_test.py\n\npython3 scripts/tests/ci_build_vm_test.py\n",
       "shell": "bash"
     },
     "browser-sidecar/synthetic-page/2": {
@@ -322,7 +322,7 @@
       "shell": "bash"
     },
     "platform/platform/33": {
-      "body": "python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test scripts.tests.sync_source_watchdog_test -v",
+      "body": "python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test scripts.tests.sync_source_watchdog_test scripts.tests.secure_release_executables_test -v",
       "shell": "bash"
     },
     "platform/platform/35": {

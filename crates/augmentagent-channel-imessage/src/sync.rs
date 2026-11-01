@@ -832,6 +832,7 @@ mod tests {
             service: "iMessage".into(),
             chat_guid: None,
             newest_entry: None,
+            ..Default::default()
         };
         let entry = |i: usize, body: &str| {
             (

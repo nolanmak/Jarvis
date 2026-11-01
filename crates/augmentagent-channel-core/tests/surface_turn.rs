@@ -629,3 +629,71 @@ async fn a_refusal_after_submission_still_latches_the_conversation() {
     assert!(blocked.to_string().contains("uncertain turn"), "{blocked}");
     assert_eq!(provider.calls().len(), 1);
 }
+
+// #1774 — a deploy restart SIGTERMs the provider mid-turn (after submission).
+// That is our host, not the provider and not an uncertain session: the turn
+// closes as interrupted (consumed, never re-run), the conversation is not
+// latched, the error stays typed for the surface's wording, and the next turn
+// resumes the same native session.
+async fn interrupt_after_submission(store: &Store, turn: &SurfaceTurnRef) -> anyhow::Error {
+    use augmentagent_channel_core::native_session::CURRENT;
+    run_surface_turn(
+        store,
+        SurfaceTurnRequest { turn, history: "", current: "text my cousin", cwd: "/w" },
+        || Ok(None),
+        None,
+        |_prompt| async move {
+            let session = CURRENT.with(Arc::clone);
+            let lease = session.begin(ProviderKind::Claude)?;
+            lease.mark_submitting();
+            Err(augmentagent_channel_core::reasoner::interrupted_error("claude", 15))
+        },
+    )
+    .await
+    .unwrap_err()
+}
+
+async fn a_host_signal_interrupts_without_wedging(chat: SurfaceConversationRef) {
+    use augmentagent_channel_core::reasoner::ReasonerError;
+    let (_dir, store) = store();
+    let provider = RecordingNativeProvider::new(ProviderKind::Claude);
+    let first = SurfaceTurnRef::new(chat.clone(), "c:1").unwrap();
+    answered(run(&store, &provider, &first, "", "one", None, None).await.unwrap());
+    let bound = store.surface_conversation(&chat).unwrap().unwrap();
+
+    let stopped = SurfaceTurnRef::new(chat.clone(), "c:2").unwrap();
+    let error = interrupt_after_submission(&store, &stopped).await;
+    assert!(
+        matches!(ReasonerError::find_in(&error), Some(ReasonerError::Interrupted { signal: 15, .. })),
+        "the surface must still see the typed error: {error:#}"
+    );
+    let binding = store.surface_conversation(&chat).unwrap().unwrap();
+    assert!(!binding.uncertain, "a host signal must not latch the conversation");
+    assert_eq!(binding.native_session_id, bound.native_session_id);
+    let state = store.surface_turn_state(&stopped).unwrap().unwrap();
+    assert_eq!(state.status, SurfaceTurnStatus::Uncertain);
+    assert_eq!(state.resolution, Some(SurfaceTurnResolution::Interrupted));
+    if chat.account().platform().as_str() == "discord" {
+        assert!(store.discord_turn_interrupted(chat.conversation_id(), "c:2").unwrap());
+        assert!(!store.discord_turn_interrupted(chat.conversation_id(), "c:1").unwrap());
+        assert!(store.interrupt_pending_discord_turns().unwrap().is_empty());
+    }
+
+    let next = SurfaceTurnRef::new(chat.clone(), "c:3").unwrap();
+    let answer = answered(run(&store, &provider, &next, "", "three", None, None).await.unwrap());
+    assert!(answer.contains("turn=2"), "{answer}");
+    assert!(provider.calls()[1].resumed);
+    let replay = run(&store, &provider, &stopped, "", "again", None, None).await.unwrap_err();
+    assert!(replay.to_string().contains("already submitted"), "{replay}");
+    assert_eq!(provider.calls().len(), 2, "the interrupted turn is never re-run");
+}
+
+#[tokio::test]
+async fn a_host_signal_interrupts_a_discord_turn_without_wedging_the_channel() {
+    a_host_signal_interrupts_without_wedging(discord_channel()).await;
+}
+
+#[tokio::test]
+async fn a_host_signal_interrupts_a_slack_turn_without_wedging_the_thread() {
+    a_host_signal_interrupts_without_wedging(slack("C00000010", Some("1700000000.001000"))).await;
+}

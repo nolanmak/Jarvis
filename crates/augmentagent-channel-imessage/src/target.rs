@@ -114,6 +114,7 @@ mod tests {
             service: service.into(),
             chat_guid: None,
             newest_entry: None,
+            ..Default::default()
         }
     }
 

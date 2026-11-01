@@ -1,9 +1,11 @@
 # WhatsApp history → Jarvis
 
-Jarvis includes a WhatsApp Desktop exporter, a Mac scheduler and a read-only
-archive importer. Messages are searchable through the agent's memory tools;
-subsequent new messages can update the wiki. This feature does not enable the
-separate live WhatsApp channel, linked-device pairing, triage or outbound sends.
+Jarvis includes a WhatsApp Desktop exporter, a Mac scheduler, an archive
+importer and reply cards. Messages are searchable through the agent's memory
+tools; subsequent new messages can update the wiki; chats your policy covers get
+drafted reply cards, 1:1 and groups (#1761). Nothing is ever sent
+automatically: Approve gives you the text to paste. This feature does not enable
+the separate live WhatsApp channel or linked-device pairing.
 
 ## Export on the Mac
 
@@ -121,6 +123,77 @@ The bundled exporter rejects Git output to prevent accidental publication. To
 migrate the exporting side, stop its old job first and use a separate private
 output directory, then switch the receiver configuration. Preserve old data
 until verification; do not run two exporters into one output directory.
+
+## Group members and sender names (#1762)
+
+WhatsApp now addresses many people by an opaque privacy id (`<digits>@lid`)
+instead of a phone number. On every run the exporter adds to each entry in
+`conversations/index.json`:
+
+- `participants` for groups: active members from WhatsApp's group-member table.
+  When no member is active (you left the group) it lists every known member and
+  sets `"active": false`; reply cards are never drafted for such groups.
+- `participant_names`: member → contact name, first name or push name.
+- `identity`: `<id>@lid` → `+<phone>`, read from WhatsApp Desktop's `LID.sqlite`
+  and `ContactsV2.sqlite` next to `ChatStorage.sqlite`. An id with no mapping
+  stays raw; it is never guessed.
+- `newest_entry`, backfilled from the conversation file when missing.
+
+Entry headers (`### [time] <sender>`) are never rewritten, so message ids and
+cursors stay stable. Imported rows show senders as `Name <+phone>` where known.
+
+## Reply cards (#1764)
+
+After each archive poll (`AUGMENTAGENT_WHATSAPP_HISTORY_POLL_SECS`, default
+1800, minimum 60), a chat whose newest entry is from someone else is triaged
+and, when it needs your answer, gets one Discord approval card. Groups use the
+same higher bar as iMessage groups: a card only when you're addressed or the
+question is clearly yours; chatter is skipped, not flagged. A group card's
+subject is `WhatsApp group: <name>` and its "To (group)" field lists members.
+
+Never drafted: the first sync of a chat, your own newest entry, media-only
+entries, phone-setup messages, groups you left, and catch-up older than
+`AUGMENTAGENT_WHATSAPP_REPLY_MAX_AGE_HOURS` (default 24). WhatsApp Desktop only
+receives messages while it runs, so a sync after it was closed can deliver
+days-old messages. A newer message replaces the chat's pending card; a message
+you type yourself retires it.
+
+### Which chats (#1763)
+
+Off by default. Turn it on for every person and group chat, with exceptions:
+
+```sh
+augmentagent whatsapp-history contact-defaults --inbound true --outbound true
+augmentagent whatsapp-history deny-inbound 120363000000000000@g.us   # one noisy group
+augmentagent whatsapp-history allow-inbound 14155550123@s.whatsapp.net
+augmentagent whatsapp-history allowlist
+```
+
+Chats are named by their JID (the keys of `conversations/index.json`).
+Defaults never cover broadcast lists, status or channels (newsletters). A
+denial wins over the defaults and persists; `allow-*` lifts it. These commands
+are owner-only: no agent session can run them. The same policy applies to the
+separate live channel, which keeps its own send kill-switch.
+
+## Approve and paste (#1765)
+
+There is no WhatsApp sender. Approve sends nothing: the card is replaced by a
+message with the final text in a copy block, plus a `wa.me` link for chats
+addressed by phone number (groups and `@lid` chats have none). Paste it into
+WhatsApp. When the archive shows your message with that text within
+`AUGMENTAGENT_WHATSAPP_MANUAL_SEND_WINDOW_MINS` (default 120), the action
+becomes `sent`. If it never shows up, the action becomes `error` ("manual send
+not confirmed in the archive; nothing was sent automatically"). Nothing is
+ever resent. The window is measured from the message's own time, so a paste
+the archive delivers late (WhatsApp Desktop was closed) still confirms, even
+after the row was marked `error`. A reply too long to show inline arrives as
+an attached `whatsapp-reply.txt`. `deny-outbound <jid>` refuses Approve for
+that chat (the card stays pending); outbound defaults are not needed for
+archive cards. `augmentagent whatsapp-history status` counts replies awaiting
+your paste and those never confirmed. Revise and Skip work as on every card. A different message you type in that chat counts as a manual
+reply. Teammate coverage (#1700) applies to group cards: a rostered teammate
+answering the asker retires the card. Configure teammates by phone number; a
+teammate seen only as an unmapped `@lid` never matches.
 
 ## Ask Jarvis about a conversation
 

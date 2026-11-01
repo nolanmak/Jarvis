@@ -130,6 +130,10 @@ pub enum ApprovalActionOutcome {
     },
     /// A signed PDF was published, or its immutable receipt recovered.
     DocumentSigned { receipt: String, already_existed: bool, output: Option<(std::path::PathBuf, String)> },
+    /// #1765 — approved on a platform with no sender (WhatsApp archive cards):
+    /// nothing was sent. `text` is what the owner pastes; `link` opens the
+    /// chat when one is addressable. The archive later confirms the send.
+    ManualSendReady { text: String, link: Option<String> },
     /// Skip succeeded — draft deleted, action marked Rejected.
     Skipped,
     /// Revise succeeded — a new draft was created and should be re-posted as

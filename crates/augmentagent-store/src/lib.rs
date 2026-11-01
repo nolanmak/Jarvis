@@ -60,7 +60,8 @@ pub use models::{
 pub use store::{
     ActionCodeModeFields, ActionWithEmail, BodyCompaction, DiscordConversation, InterruptedDiscordTurn,
     JournalSyncCursor, LoopFinding, LoopOccurrence,
-    NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
+    NativeConversation, PendingActionRow, whatsapp_default_coverable, MANUAL_SEND_PENDING,
+    MANUAL_SEND_UNCONFIRMED, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,
 };

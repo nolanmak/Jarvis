@@ -68,7 +68,8 @@ def supervise(receipt, argv):
         ready.write_text('ready\n')
         ready.chmod(0o600)
         deadline = time.monotonic() + 10
-        while not proceed.exists():
+        expected = b'admitted\n'
+        while True:
             if stopping or time.monotonic() >= deadline:
                 if scope:
                     resource_path.write_text(json.dumps({'phase':'cancelled_before_dispatch', **scope.observation()}))
@@ -76,9 +77,19 @@ def supervise(receipt, argv):
                 Path(receipt).write_text('all-descendants-reaped\n')
                 Path(receipt).chmod(0o600)
                 return 125
+            try:
+                with proceed.open('rb') as stream:
+                    published = stream.read(len(expected)+1)
+            except FileNotFoundError:
+                published = b''
+            if published == expected:
+                break
+            # Older controllers create the inode before writing its bytes.
+            # A visible empty/prefix file is still publication in progress,
+            # never authority to dispatch. Malformed content still refuses.
+            if not expected.startswith(published):
+                raise RuntimeError('invalid controller launch admission')
             time.sleep(0.005)
-        if proceed.read_text() != 'admitted\n':
-            raise RuntimeError('invalid controller launch admission')
     if vm_preflight:
         os.environ['JARVIS_NATIVE_VM_READY'] = str(Path(receipt).with_name('vm-ready'))
         os.environ['JARVIS_NATIVE_VM_CONTINUE'] = str(Path(receipt).with_name('launch-continue'))

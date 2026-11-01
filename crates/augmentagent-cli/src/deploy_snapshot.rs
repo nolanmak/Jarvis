@@ -29,6 +29,7 @@ pub const MIN_AGE_HOURS: f64 = 48.0;
 pub const STRAY_DAYS: f64 = 7.0;
 
 const DB_NAME: &str = "data.db.gz";
+const FORENSIC_DB_NAME: &str = "forensic.db.gz";
 const BINARY_NAME: &str = "augmentagent";
 const MANIFEST_NAME: &str = "manifest.json";
 
@@ -162,6 +163,27 @@ pub fn snapshot(
     })
 }
 
+/// A forensic page image preserves damaged source bytes under normal ownership
+/// and retention. It is evidence, never a deployable rollback database.
+pub fn snapshot_forensic(db:&Path,root:&Path,label:&str,now:chrono::DateTime<chrono::Utc>)->Result<PathBuf> {
+    forensic_snapshot_budgeted(db,root,label,now,SnapshotLimits {
+        budget_bytes:budget_bytes(),reserve_gb:crate::disk::gate_min_free_gb(),
+    })
+}
+fn forensic_snapshot_budgeted(db:&Path,root:&Path,label:&str,now:chrono::DateTime<chrono::Utc>,
+    limits:SnapshotLimits)->Result<PathBuf> {
+    snapshot_budgeted_mode(db,None,root,label,None,now,limits,true,None)
+}
+
+/// Capture through the maintenance connection so its exclusive database lock
+/// remains held from the preflight through the durable evidence capture.
+pub(crate) fn snapshot_forensic_connection(db: &Path, connection: &rusqlite::Connection,
+    root: &Path, label: &str) -> Result<PathBuf> {
+    snapshot_budgeted_mode(db,None,root,label,None,chrono::Utc::now(),SnapshotLimits {
+        budget_bytes:budget_bytes(),reserve_gb:crate::disk::gate_min_free_gb(),
+    },true,Some(connection))
+}
+
 struct SnapshotLimits {
     budget_bytes: u64,
     reserve_gb: f64,
@@ -169,22 +191,44 @@ struct SnapshotLimits {
 
 fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     git_sha: Option<&str>, now: chrono::DateTime<chrono::Utc>, limits: SnapshotLimits) -> Result<PathBuf> {
+    snapshot_budgeted_mode(db,binary,root,label,git_sha,now,limits,false,None)
+}
+fn create_root_durable(root: &Path) -> Result<()> {
+    let absolute=if root.is_absolute() {root.to_path_buf()}else{std::env::current_dir()?.join(root)};
+    let mut missing=Vec::new();let mut cursor=absolute.as_path();
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor=cursor.parent().context("snapshot root has no existing ancestor")?;
+    }
+    std::fs::create_dir_all(&absolute)?;
+    // Persist every new directory entry before a forensic image can become
+    // durable evidence for a live repair, including multi-level new roots.
+    for directory in missing.iter().rev() {
+        restrict(directory);
+        std::fs::File::open(directory)?.sync_all()?;
+        std::fs::File::open(directory.parent().context("new snapshot directory has no parent")?)?.sync_all()?;
+    }
+    Ok(())
+}
+fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
+    git_sha:Option<&str>,now:chrono::DateTime<chrono::Utc>,limits:SnapshotLimits,forensic:bool,
+    source:Option<&rusqlite::Connection>)->Result<PathBuf> {
     let SnapshotLimits { budget_bytes: budget, reserve_gb } = limits;
     if !db.is_file() {
         bail!("no database at {}", db.display());
     }
     let wal = PathBuf::from(format!("{}-wal", db.to_string_lossy()));
     let db_bytes = std::fs::metadata(db)?.len().saturating_add(std::fs::metadata(wal).map_or(0, |m| m.len()));
-    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    create_root_durable(root).with_context(|| format!("create {}", root.display()))?;
     let _lease = retention_lease(root)?.context("snapshot retention/creation busy; retry")?;
     let refs = crate::snapshot_refs::collect();
     prune_locked(root, None, &[], &PruneOptions { keep: keep_from_env(), ..Default::default() }, SystemTime::now(), &refs);
     let binary_bytes = binary.and_then(|b| std::fs::metadata(b).ok()).map_or(0, |m| m.len());
     let retained = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>();
     if retained.saturating_add(db_bytes).saturating_add(binary_bytes) > budget {
-        bail!("snapshot storage budget exhausted (including protected snapshots); prune, unpin obsolete rollbacks, or increase AUGMENTAGENT_DEPLOY_MAX_GB");
+        bail!("{}", budget_refusal(&refs));
     }
-    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    create_root_durable(root).with_context(|| format!("create {}", root.display()))?;
     // Plain and gzip copies coexist during compression. Include the binary,
     // compression overhead, and final free-space reserve before allocating.
     let _space = {
@@ -212,23 +256,49 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     let result = (|| -> Result<u64> {
         let plain = dir.join("data.db.tmp");
         {
-            let conn = rusqlite::Connection::open_with_flags(
+            let opened;
+            let conn = if let Some(source)=source {source} else {
+                opened = rusqlite::Connection::open_with_flags(
                 db,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .with_context(|| format!("open {}", db.display()))?;
+                &opened
+            };
             conn.busy_timeout(Duration::from_secs(60))?;
-            conn.execute("VACUUM INTO ?1", [plain.to_string_lossy().as_ref()])
-                .context("VACUUM INTO (consistent copy)")?;
+            if forensic {
+                // Backup reads committed pages, including WAL, without walking
+                // damaged btrees or resurrecting deleted rows through recovery.
+                let mut destination=rusqlite::Connection::open(&plain)?;
+                let backup=rusqlite::backup::Backup::new(conn,&mut destination)?;
+                let deadline=std::time::Instant::now()+Duration::from_secs(60);
+                loop {
+                    use rusqlite::backup::StepResult;
+                    match backup.step(128)? {
+                        StepResult::Done=>break,
+                        StepResult::More=>(),
+                        StepResult::Busy|StepResult::Locked=>std::thread::sleep(Duration::from_millis(10)),
+                        _=>bail!("unknown forensic page-copy outcome"),
+                    }
+                    if std::time::Instant::now()>=deadline {bail!("forensic page copy remained busy or changing; retry capture");}
+                }
+            } else {
+                conn.execute("VACUUM INTO ?1", [plain.to_string_lossy().as_ref()])
+                    .context("VACUUM INTO (consistent copy)")?;
+            }
         }
-        let gz_path = dir.join(DB_NAME);
-        {
+        let gz_path = dir.join(if forensic {FORENSIC_DB_NAME}else{DB_NAME});
+        let image_sha256={
+            use std::io::Read;
+            use sha2::{Digest,Sha256};
             let mut input = std::fs::File::open(&plain)?;
             let out = std::fs::File::create(&gz_path)?;
             let mut enc = flate2::write::GzEncoder::new(out, flate2::Compression::fast());
-            std::io::copy(&mut input, &mut enc)?;
+            let mut digest=Sha256::new();let mut buffer=[0u8;65536];
+            loop {let count=input.read(&mut buffer)?;if count==0 {break;}digest.update(&buffer[..count]);enc.write_all(&buffer[..count])?;}
             enc.finish()?.sync_all()?;
-        }
+            format!("{:x}",digest.finalize())
+        };
         std::fs::remove_file(&plain)?;
         if let Some(bin) = binary.filter(|b| b.is_file()) {
             std::fs::copy(bin, dir.join(BINARY_NAME))
@@ -240,6 +310,9 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
         }
         let manifest = serde_json::json!({
             "owner": "augmentagent-snapshot-v1",
+            "kind": if forensic {"forensic-page-image"} else {"rollback"},
+            "restorable": !forensic,
+            "image_sha256": image_sha256,
             "created_at": now.to_rfc3339(),
             "label": sanitize_label(label),
             "git_sha": git_sha,
@@ -247,7 +320,14 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
             "db_gz_bytes": gz_bytes,
             "has_binary": dir.join(BINARY_NAME).is_file(),
         });
+        if forensic {
+            std::fs::write(dir.join(".pin"),"Forensic recovery evidence: verify repair before unpinning; never restore as a rollback")?;
+            std::fs::File::open(dir.join(".pin"))?.sync_all()?;
+        }
         std::fs::write(dir.join(MANIFEST_NAME), serde_json::to_vec_pretty(&manifest)?)?;
+        std::fs::File::open(dir.join(MANIFEST_NAME))?.sync_all()?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        std::fs::File::open(root)?.sync_all()?;
         Ok(gz_bytes)
     })();
     if let Err(e) = result {
@@ -284,6 +364,11 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Decompress a snapshot's database to `to`. Never overwrites without `force`.
 pub fn restore_db(snapshot_dir: &Path, to: &Path, force: bool) -> Result<()> {
+    if std::fs::read(snapshot_dir.join(MANIFEST_NAME)).ok().and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|metadata|metadata.get("kind").and_then(|v|v.as_str())==Some("forensic-page-image")
+            || metadata.get("restorable").and_then(|v|v.as_bool())==Some(false)) {
+        bail!("forensic evidence cannot be restored as a rollback database");
+    }
     let gz_path = snapshot_dir.join(DB_NAME);
     if !gz_path.is_file() {
         bail!("{} holds no {DB_NAME}", snapshot_dir.display());
@@ -349,6 +434,18 @@ pub fn prune(
     opts: &PruneOptions,
     now: SystemTime,
 ) -> Vec<Removal> {
+    prune_with_refs(root, release_dir, strays, opts, now, &crate::snapshot_refs::collect())
+}
+
+/// [`prune`] with the reference evidence supplied by the caller (tests).
+pub fn prune_with_refs(
+    root: &Path,
+    release_dir: Option<&Path>,
+    strays: &[PathBuf],
+    opts: &PruneOptions,
+    now: SystemTime,
+    refs: &crate::snapshot_refs::References,
+) -> Vec<Removal> {
     if !root.exists() && !opts.dry_run {
         if let Err(error) = std::fs::create_dir_all(root) {
             return vec![Removal { kind: "retention", path: root.display().to_string(), bytes: 0,
@@ -360,7 +457,17 @@ pub fn prune(
         return vec![Removal { kind: "retention", path: root.display().to_string(), bytes: 0,
             removed: false, reason: "deferred: retention/creation busy or lock unavailable".into() }];
     };
-    prune_locked(root, release_dir, strays, opts, now, &crate::snapshot_refs::collect())
+    prune_locked(root, release_dir, strays, opts, now, refs)
+}
+
+/// The refusal when retained snapshots leave no room. When missing evidence
+/// is what kept them, say which, so the freeze is diagnosable from the error.
+fn budget_refusal(refs: &crate::snapshot_refs::References) -> String {
+    let mut msg = "snapshot storage budget exhausted (including protected snapshots); prune, unpin obsolete rollbacks, or increase AUGMENTAGENT_DEPLOY_MAX_GB".to_string();
+    if !refs.reliable {
+        msg.push_str(&format!("; retention blocked: reference probe unavailable ({})", refs.unavailable_summary()));
+    }
+    msg
 }
 
 fn budget_bytes() -> u64 {
@@ -374,7 +481,9 @@ fn manifest(path: &Path) -> Option<serde_json::Value> {
     // The original helper's manifest is also recognized; arbitrary dirs are not.
     (value.get("created_at").and_then(|v| v.as_str()).is_some()
         && value.get("db_bytes").and_then(|v| v.as_u64()).is_some()
-        && (path.join(DB_NAME).is_file() || value.get("external_path").is_some())).then_some(value)
+        && (path.join(DB_NAME).is_file() || value.get("external_path").is_some()
+            || (value.get("kind").and_then(|v|v.as_str())==Some("forensic-page-image")
+                && value.get("restorable").and_then(|v|v.as_bool())==Some(false) && path.join(FORENSIC_DB_NAME).is_file()))).then_some(value)
 }
 
 fn external_path(path: &Path) -> Option<PathBuf> {
@@ -412,17 +521,24 @@ fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opt
             let path = dir.join(&name);
             let external = external_path(&path);
             let bytes = items.iter().find(|i| i.name == name).map_or(0, |i| i.bytes);
-            let blocked = refs.protects(&path) || external.as_deref().is_some_and(|p| refs.protects(p));
-            let removed = !blocked && act && !opts.dry_run
+            let kept = refs.retention_reason(&path)
+                .or_else(|| external.as_deref().and_then(|p| refs.retention_reason(p)));
+            let removed = kept.is_none() && act && !opts.dry_run
                 && external.as_deref().is_none_or(remove) && remove(&path);
-            let reason = if blocked { "kept: pinned, referenced, or reference probe unavailable" }
-                else if !act || opts.dry_run { "would remove: past count and minimum age" }
-                else if removed { "removed: past count and minimum age" }
-                else { "failed to remove; no recovery claimed" };
-            out.push(Removal { kind, path: path.display().to_string(), bytes, removed, reason: reason.into() });
+            let reason = if let Some(why) = &kept { format!("kept: {why}") }
+                else if !act || opts.dry_run { "would remove: past count and minimum age".into() }
+                else if removed { "removed: past count and minimum age".into() }
+                else { "failed to remove; no recovery claimed".into() };
+            out.push(Removal { kind, path: path.display().to_string(), bytes, removed, reason });
         }
     };
-    expire("snapshot", root, snapshot_items(root, now), MIN_AGE_HOURS, true);
+    let (forensic,rollbacks): (Vec<_>,Vec<_>)=snapshot_items(root,now).into_iter().partition(|item|
+        manifest(&root.join(&item.name)).and_then(|value|value.get("kind").and_then(|v|v.as_str()).map(str::to_owned))
+            .as_deref()==Some("forensic-page-image"));
+    // Evidence has its own retention slots and is pinned on capture. It must
+    // never evict one of the requested healthy rollback generations.
+    expire("snapshot", root, rollbacks, MIN_AGE_HOURS, true);
+    expire("forensic snapshot",root,forensic,MIN_AGE_HOURS,true);
     if let Some(dir) = release_dir {
         expire("rollback binary", dir, items_in(dir, now, &|name, is_dir| !is_dir && is_rollback_binary(name)), MIN_AGE_HOURS, true);
     }
@@ -498,11 +614,23 @@ pub fn run_prune(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
+    run_prune_with_refs(root, release_dir, opts, json, out, &crate::snapshot_refs::collect())
+}
+
+/// [`run_prune`] with the reference evidence supplied by the caller (tests).
+pub fn run_prune_with_refs(
+    root: &Path,
+    release_dir: Option<&Path>,
+    opts: &PruneOptions,
+    json: bool,
+    out: &mut dyn Write,
+    refs: &crate::snapshot_refs::References,
+) -> Result<()> {
     let strays = stray_dirs(
         data_dir().as_deref(),
         augmentagent_channel_core::state_dir::state_dir().as_deref(),
     );
-    let removals = prune(root, release_dir, &strays, opts, SystemTime::now());
+    let removals = prune_with_refs(root, release_dir, &strays, opts, SystemTime::now(), refs);
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(&removals)?)?;
         return Ok(());
@@ -535,6 +663,75 @@ pub fn run_list(root: &Path, out: &mut dyn Write) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // Fresh fixture corruption only; production captures always use the
+    // supported deploy snapshot command and its managed retention directory.
+    fn forensic_source(path:&std::path::Path,corrupt:bool)->augmentagent_store::rusqlite::Connection {
+        let db=augmentagent_store::rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE authority(id INTEGER PRIMARY KEY, paused INTEGER, confirmed INTEGER); INSERT INTO authority VALUES(7,1,3); CREATE TABLE cached_observation(id INTEGER PRIMARY KEY, record TEXT); INSERT INTO cached_observation VALUES(1,'rebuildable');").unwrap();
+        if corrupt {
+            let page:i64=db.query_row("SELECT rootpage FROM sqlite_schema WHERE name='cached_observation'",[],|r|r.get(0)).unwrap();
+            let size:i64=db.query_row("PRAGMA page_size",[],|r|r.get(0)).unwrap();drop(db);
+            use std::os::unix::fs::FileExt;
+            let file=std::fs::OpenOptions::new().write(true).open(path).unwrap();file.write_all_at(&[0],((page-1)*size) as u64).unwrap();file.sync_all().unwrap();
+            augmentagent_store::rusqlite::Connection::open(path).unwrap()
+        } else {db}
+    }
+    fn forensic_limits()->SnapshotLimits {SnapshotLimits {budget_bytes:64*1024*1024,reserve_gb:0.0}}
+    #[test]
+    fn forensic_capture_preserves_corruption_and_authority_without_becoming_a_rollback() {
+        let temporary=tempfile::tempdir().unwrap();let source=temporary.path().join("source.db");
+        drop(forensic_source(&source,true));let root=temporary.path().join("snapshots");
+        assert!(snapshot_budgeted(&source,None,&root,"normal",None,chrono::Utc::now(),forensic_limits()).is_err());
+        let captured=forensic_snapshot_budgeted(&source,&root,"forensic",chrono::Utc::now(),forensic_limits()).unwrap();
+        assert!(captured.join(FORENSIC_DB_NAME).is_file());assert!(!captured.join(DB_NAME).exists());
+        assert!(captured.join(".pin").is_file());assert!(manifest(&captured).is_some());
+        let metadata:serde_json::Value=serde_json::from_slice(&std::fs::read(captured.join(MANIFEST_NAME)).unwrap()).unwrap();
+        assert_eq!(metadata["kind"],"forensic-page-image");assert_eq!(metadata["restorable"],false);
+        let image=temporary.path().join("fixture-image.db");
+        let mut input=flate2::read::GzDecoder::new(std::fs::File::open(captured.join(FORENSIC_DB_NAME)).unwrap());
+        std::io::copy(&mut input,&mut std::fs::File::create(&image).unwrap()).unwrap();
+        let db=augmentagent_store::rusqlite::Connection::open(&image).unwrap();
+        assert_eq!(db.query_row("SELECT paused,confirmed FROM authority WHERE id=7",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).unwrap(),(1,3));
+        let check=db.query_row("PRAGMA quick_check(1)",[],|r|r.get::<_,String>(0));
+        assert!(check.is_err() || check.unwrap()!="ok","forensic capture silently discarded the damaged cache");
+        let target=temporary.path().join("must-not-restore.db");assert!(restore_db(&captured,&target,true).is_err());
+        assert!(!target.exists());
+    }
+    #[test]
+    fn forensic_capture_includes_committed_live_wal() {
+        let temporary=tempfile::tempdir().unwrap();let source=temporary.path().join("source.db");
+        let db=forensic_source(&source,false);db.execute_batch("PRAGMA journal_mode=WAL; UPDATE authority SET confirmed=4 WHERE id=7;").unwrap();
+        let captured=forensic_snapshot_budgeted(&source,&temporary.path().join("snapshots"),"wal",chrono::Utc::now(),forensic_limits()).unwrap();
+        let image=temporary.path().join("fixture-image.db");
+        let mut input=flate2::read::GzDecoder::new(std::fs::File::open(captured.join(FORENSIC_DB_NAME)).unwrap());
+        std::io::copy(&mut input,&mut std::fs::File::create(&image).unwrap()).unwrap();
+        let image=augmentagent_store::rusqlite::Connection::open(image).unwrap();
+        assert_eq!(image.query_row("SELECT confirmed FROM authority WHERE id=7",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+    }
+    #[test]
+    fn forensic_capture_never_consumes_healthy_rollback_retention_slots() {
+        let temporary=tempfile::tempdir().unwrap();let root=temporary.path().join("snapshots");std::fs::create_dir(&root).unwrap();
+        let now=chrono::Utc::now();
+        for (name,hours,forensic) in [("healthy-old",90,false),("healthy-middle",80,false),("healthy-new",70,false),("evidence-new",60,true)] {
+            let dir=root.join(name);std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join(if forensic {FORENSIC_DB_NAME}else{DB_NAME}),b"fixture").unwrap();
+            std::fs::write(dir.join(MANIFEST_NAME),serde_json::to_vec(&serde_json::json!({"owner":"augmentagent-snapshot-v1","created_at":(now-chrono::Duration::hours(hours)).to_rfc3339(),"db_bytes":7,"kind":if forensic {"forensic-page-image"}else{"rollback"},"restorable":!forensic})).unwrap()).unwrap();
+            if forensic {std::fs::write(dir.join(".pin"),"recovery evidence").unwrap();assert!(manifest(&dir).is_some());}
+        }
+        let refs=crate::snapshot_refs::References {reliable:true,..Default::default()};
+        prune_locked(&root,None,&[],&PruneOptions {keep:2,..Default::default()},SystemTime::from(now),&refs);
+        assert!(!root.join("healthy-old").exists());assert!(root.join("healthy-middle").exists());
+        assert!(root.join("healthy-new").exists());assert!(root.join("evidence-new").exists());
+    }
+    #[test]
+    fn forensic_manifest_blocks_restore_before_creating_any_output() {
+        let temporary=tempfile::tempdir().unwrap();let snapshot=temporary.path().join("evidence");std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(snapshot.join(MANIFEST_NAME),br#"{"kind":"forensic-page-image","restorable":false}"#).unwrap();
+        std::fs::write(snapshot.join(DB_NAME),b"not-a-rollback").unwrap();let target=temporary.path().join("target.db");
+        assert!(restore_db(&snapshot,&target,true).is_err());assert!(!target.exists());
+        assert!(!target.with_extension("restore.tmp").exists(),"restore touched output before rejecting forensic evidence");
+    }
+
     use super::*;
 
     fn item(name: &str, age_hours: f64) -> Item {
@@ -900,7 +1097,8 @@ mod tests {
         // Keep it eligible by mtime too, so this regression isolates reporting.
         aged(&t.path().join("old"), 200.0);
         let mut output = Vec::new();
-        run_prune(t.path(), None, &PruneOptions { keep: 1, dry_run: true, ..Default::default() }, false, &mut output).unwrap();
+        let refs = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        run_prune_with_refs(t.path(), None, &PruneOptions { keep: 1, dry_run: true, ..Default::default() }, false, &mut output, &refs).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("kept: pinned"), "{text}");
         assert!(text.contains("freed 0 MB; 0 MB more would be freed"), "{text}");
@@ -932,4 +1130,63 @@ mod tests {
         assert!(t.path().join("new").exists());
     }
 
+    // #1753: the kept reason names what the operator can act on.
+    fn expired_pair(root: &Path) {
+        for (name, age) in [("old", 200.0), ("new", 1.0)] {
+            let p = root.join(name);
+            std::fs::create_dir(&p).unwrap();
+            std::fs::write(p.join(DB_NAME), vec![0; 1024]).unwrap();
+            std::fs::write(p.join(MANIFEST_NAME), br#"{"created_at":"2026-01-01T00:00:00Z","db_bytes":1}"#).unwrap();
+            aged(&p, age);
+        }
+    }
+
+    fn prune_text(root: &Path, refs: &crate::snapshot_refs::References) -> String {
+        let mut output = Vec::new();
+        run_prune_with_refs(root, None, &PruneOptions { keep: 1, dry_run: true, ..Default::default() }, false, &mut output, refs).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn prune_reports_referenced_distinctly_from_pinned() {
+        let t = tempfile::tempdir().unwrap();
+        expired_pair(t.path());
+        let refs = crate::snapshot_refs::References { reliable: true,
+            config: format!("sqlite3 {}/data.db.gz", t.path().join("old").display()), ..Default::default() };
+        let text = prune_text(t.path(), &refs);
+        assert!(text.contains("kept: referenced: snapshot"), "{text}");
+        assert!(!text.contains("pinned"), "{text}");
+    }
+
+    #[test]
+    fn prune_names_the_blocking_evidence_when_the_probe_is_unavailable() {
+        let t = tempfile::tempdir().unwrap();
+        expired_pair(t.path());
+        let refs = crate::snapshot_refs::References { reliable: false,
+            unavailable: Some("pid 7 agent: exe Other".into()), unavailable_more: 2, ..Default::default() };
+        let text = prune_text(t.path(), &refs);
+        assert!(text.contains("kept: reference probe unavailable (pid 7 agent: exe Other; +2 more): snapshot"), "{text}");
+    }
+
+    #[test]
+    fn a_pin_is_reported_even_when_the_probe_is_unavailable() {
+        let t = tempfile::tempdir().unwrap();
+        expired_pair(t.path());
+        set_pin(t.path(), "old", Some("rollback")).unwrap();
+        aged(&t.path().join("old"), 200.0);
+        let refs = crate::snapshot_refs::References { reliable: false, ..Default::default() };
+        let text = prune_text(t.path(), &refs);
+        assert!(text.contains("kept: pinned: snapshot"), "{text}");
+    }
+
+    #[test]
+    fn budget_refusal_says_why_retention_was_blocked() {
+        let reliable = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        assert!(!budget_refusal(&reliable).contains("retention blocked"));
+        let blocked = crate::snapshot_refs::References { reliable: false,
+            unavailable: Some("systemctl --user cat augmentagent.service failed".into()), ..Default::default() };
+        let msg = budget_refusal(&blocked);
+        assert!(msg.starts_with("snapshot storage budget exhausted"), "{msg}");
+        assert!(msg.contains("retention blocked: reference probe unavailable (systemctl --user cat augmentagent.service failed)"), "{msg}");
+    }
 }

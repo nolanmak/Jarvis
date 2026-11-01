@@ -145,6 +145,7 @@ pub struct PhoneConfig {
     preemptive: bool,
     proposals: proposals::ProposalPolicy,
     silence: silence::SilencePolicy,
+    inbound: Option<inbound::InboundConfig>,
 }
 impl PhoneConfig {
     pub fn new(
@@ -190,6 +191,7 @@ impl PhoneConfig {
             preemptive: false,
             proposals: proposals::ProposalPolicy::default(),
             silence: silence::SilencePolicy::default(),
+            inbound: None,
         })
     }
     pub fn with_live(mut self, live: Option<live_config::LiveConfig>) -> Self {
@@ -199,6 +201,13 @@ impl PhoneConfig {
             self.preemptive = false;
         }
         self
+    }
+    pub fn with_inbound(mut self, inbound: Option<inbound::InboundConfig>) -> Result<Self, Error> {
+        if inbound.as_ref().is_some_and(|config| !self.links.iter().any(|link| config.targets(link))) {
+            return Err(Error::InvalidSetting("AUGMENTAGENT_PHONE_INBOUND_ACCOUNT"));
+        }
+        self.inbound = inbound;
+        Ok(self)
     }
     /// Quiet hours and owner time zone for agent-proposed calls (#1553).
     pub fn with_proposals(mut self, proposals: proposals::ProposalPolicy) -> Self {
@@ -764,6 +773,7 @@ impl PhoneService {
 }
 
 pub mod ingress;
+pub mod inbound;
 
 impl PhoneService {
     /// Revalidate the original transport owner before each phone turn. A call

@@ -104,6 +104,7 @@ mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
 mod autoship_commands;
+mod autoship_cache_recovery;
 mod autoship_discord_command;
 mod autoship_deployment;
 mod autoship_contract;
@@ -419,7 +420,7 @@ enum Cmd {
         #[command(subcommand)]
         op: messages_cmd::Op,
     },
-    /// Read-only WhatsApp archive ingestion (independent of the live channel).
+    /// WhatsApp archive ingestion, reply policy and reply cards (independent of the live channel).
     WhatsappHistory {
         #[command(subcommand)]
         op: whatsapp_history::Op,
@@ -995,6 +996,10 @@ enum DeployOp {
         /// Short name for the snapshot, e.g. the PR number.
         #[arg(long, default_value = "manual")]
         label: String,
+        /// Capture committed pages as pinned forensic evidence, including
+        /// corruption. The result cannot be restored as a rollback.
+        #[arg(long)]
+        forensic: bool,
     },
     /// Snapshots, newest first.
     List,
@@ -1088,6 +1093,11 @@ enum DiskOp {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Only list Cargo caches beside a managed build parent that nothing
+        /// registers (#1754), with size and idle days. With `--json`, an array
+        /// of `{path, bytes, idle_days}`.
+        #[arg(long, default_value_t = false)]
+        unmanaged: bool,
     },
 }
 #[derive(Subcommand)]
@@ -1101,6 +1111,15 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Inspect or repair only a corrupt derived PR adoption cache. Accounting
+    /// and owner controls must remain identical; defaults to read-only inspect.
+    RecoverAdoptionCache {
+        #[arg(long)] workflow_db: PathBuf,
+        #[arg(long)] apply: bool,
+        /// Resume an interrupted repair using its pinned managed snapshot.
+        #[arg(long, requires = "apply")] evidence: Option<PathBuf>,
+        #[arg(long)] json: bool,
+    },
     /// Stop new dispatches; active-work teardown remains separately verified.
     Pause(autoship_commands::control_command::Args),
     /// Clear only the explicit owner pause after access and readiness checks.
@@ -3106,6 +3125,19 @@ async fn main() -> Result<()> {
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
+    if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
+        let result=async {
+            let _storage=if apply {Some(build_storage::acquire().await?)}else{None};
+            let root=deploy_snapshot::snapshot_root().context("no snapshot retention root")?;
+            autoship_cache_recovery::recover(workflow_db,&root,apply,evidence.as_deref())
+        }.await;
+        let (code,value)=match result {
+            Ok(value)=>(0,value),
+            Err(error)=>(4,serde_json::json!({"schema_version":1,"state":"recovery-refused","error":format!("{error:#}")})),
+        };
+        if json {println!("{}",serde_json::to_string(&value)?);}else{println!("{}",serde_json::to_string_pretty(&value)?);}
+        std::process::exit(code);
+    }
     if let Cmd::Autopr { op: AutoprOp::ResolveMerge { ref operation, ref classification, ref evidence, json } } = cli.cmd {
         std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
     }
@@ -3175,7 +3207,7 @@ async fn main() -> Result<()> {
         let release = repo_root.join("target/release");
         let mut out = std::io::stdout().lock();
         return match op {
-            DeployOp::Snapshot { label } => {
+            DeployOp::Snapshot { label, forensic } => {
                 // Snapshot allocation and builds must not spend the same
                 // measured filesystem reserve concurrently.
                 let _storage = build_storage::acquire().await?;
@@ -3184,6 +3216,10 @@ async fn main() -> Result<()> {
                     .clone()
                     .or_else(|| std::env::var("AUGMENTAGENT_DB").ok().map(PathBuf::from))
                     .unwrap_or_else(|| PathBuf::from("data.db"));
+                if *forensic {
+                    let dir=deploy_snapshot::snapshot_forensic(&db,&root,label,chrono::Utc::now())?;
+                    use std::io::Write as _;writeln!(out,"{}",dir.display())?;return Ok(());
+                }
                 let sha = std::process::Command::new("git")
                     .args(["rev-parse", "HEAD"])
                     .output()
@@ -3248,6 +3284,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             DiskOp::Build { target_dir, command, update } => {
+                if let Some(flag) = build_storage::child_target_override(command) {
+                    eprintln!("refusing `{flag}` in the build command: `disk build` already gives cargo its leased target \
+                        (--target-dir {}) and the flag would write to an unregistered directory instead. \
+                        Pass the directory as `--target-dir` to `disk build` (or `CARGO_TARGET_DIR=` before scripts/cargo-managed.sh). #1754",
+                        target_dir.display());
+                    std::process::exit(2);
+                }
                 let result = async {
                     let admitted: Result<Option<build_storage::Lease>> = async {
                         if build_storage::inherited_mode(target_dir, *update)? { Ok(None) }
@@ -3289,8 +3332,8 @@ async fn main() -> Result<()> {
                 },
                 &mut std::io::stdout().lock(),
             ),
-            DiskOp::Status { json } => {
-                disk::run_status(&repo_root, *json, &mut std::io::stdout().lock())
+            DiskOp::Status { json, unmanaged } => {
+                disk::run_status(&repo_root, *json, *unmanaged, &mut std::io::stdout().lock())
             }
         };
     }
@@ -4316,13 +4359,14 @@ async fn main() -> Result<()> {
                 Ok(Some(config)) => {
                     let store_c = Arc::clone(&store);
                     let reasoner = build_reasoner();
+                    let bk = Arc::clone(&broker);
                     let root = cli.wiki_dir.clone();
                     let schema = root
                         .as_ref()
                         .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move {
-                        whatsapp_history::run_loop(config, store_c, reasoner, root, schema, sd)
+                        whatsapp_history::run_loop(config, store_c, reasoner, bk, root, schema, sd)
                             .await
                     }));
                 }
@@ -5126,7 +5170,10 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
+        Cmd::WhatsappHistory { op: whatsapp_history::Op::PollOnce } => {
+            whatsapp_history::poll_command(store).await
+        }
+        Cmd::WhatsappHistory { op } => whatsapp_history::policy_command(&store, &op),
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
         Cmd::TriageCalibration { op } => self_improve::triage_calibration::run(store, op).await,
@@ -5703,6 +5750,7 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
+        Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache { .. } } => unreachable!("cache maintenance precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
@@ -14685,6 +14733,7 @@ impl ApprovalActionHandler for ReplyApprover {
                 | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
                 | ApprovalActionOutcome::DocumentSigned { already_existed: false, .. }
                 | ApprovalActionOutcome::Scheduled { .. }
+                | ApprovalActionOutcome::ManualSendReady { .. }
         ) {
             self.trigger_next_nudge().await;
         }
@@ -14859,6 +14908,11 @@ impl ReplyApprover {
         }
         if action.email.platform == imessage_send::PLATFORM {
             return self.approve_imessage(action_id, action).await;
+        }
+        // #1765 — WhatsApp archive cards have no sender: Approve hands the
+        // owner the text to paste. Never the live sidecar, never Gmail.
+        if augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email) {
+            return whatsapp_history::approve(&self.store, action_id, &action);
         }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
@@ -15308,7 +15362,9 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.skip_socialapi(action_id, action);
         }
-        if action.email.platform == imessage_send::PLATFORM {
+        if action.email.platform == imessage_send::PLATFORM
+            || augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email)
+        {
             return self.skip_imessage(action_id, action);
         }
         if is_linkedin_email(&action.email) {
@@ -15393,7 +15449,11 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.revise_socialapi(action_id, feedback, action).await;
         }
-        if action.email.platform == imessage_send::PLATFORM {
+        // #1765 — WhatsApp archive cards have no server draft either; never
+        // the Gmail tail below (Composio call against the monthly cap).
+        if action.email.platform == imessage_send::PLATFORM
+            || augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email)
+        {
             return self
                 .revise_without_server_draft(action_id, feedback, action)
                 .await;

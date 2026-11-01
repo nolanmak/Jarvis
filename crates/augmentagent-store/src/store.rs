@@ -366,9 +366,21 @@ impl Store {
     ) -> StoreResult<()> {
         let chat = turn.conversation();
         if chat.account().platform().as_str() == "discord" {
-            return Err(StoreError::InvalidInput(
-                "Discord native turns are not resolved through the surface API".into(),
-            ));
+            // #1774 — a host signal stopping the provider is the one
+            // resolution Discord takes from a live process (same record as
+            // the #1396 startup pass). Anything else keeps inspect-first.
+            if !matches!(resolution, SurfaceTurnResolution::Interrupted) {
+                return Err(StoreError::InvalidInput(
+                    "Discord native turns are not resolved through the surface API".into(),
+                ));
+            }
+            if chat.thread_id().is_none() {
+                return self.interrupt_discord_turn(
+                    chat.account().account_id(),
+                    chat.conversation_id(),
+                    turn.turn_id(),
+                );
+            }
         }
         let cols = params![
             chat.account().platform().as_str(),
@@ -502,22 +514,46 @@ impl Store {
         };
         let now = now_millis();
         for turn in &turns {
-            tx.execute(
-                "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
-                 WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
-                params![turn.guild_id, turn.channel_id, turn.turn_id, now],
-            )?;
-            tx.execute(
-                "INSERT INTO surface_turn_resolutions \
-                 (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
-                 VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
-                 ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
-                params![turn.guild_id, turn.channel_id, turn.turn_id,
-                    SurfaceTurnResolution::Interrupted.as_str(), now],
-            )?;
+            close_discord_turn_interrupted(&tx, &turn.guild_id, &turn.channel_id, &turn.turn_id, now)?;
         }
         tx.commit()?;
         Ok(turns)
+    }
+
+    /// #1774 — close one `pending` Discord turn as interrupted, from the live
+    /// process that claimed it, when a host signal stopped its provider. Same
+    /// record as the #1396 startup pass: `uncertain` plus an `interrupted`
+    /// resolution, so the turn stays consumed but no longer blocks the
+    /// channel. Refused for a turn that is not pending.
+    pub fn interrupt_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+    ) -> StoreResult<()> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !close_discord_turn_interrupted(&tx, guild_id, channel_id, turn_id, now_millis())? {
+            return Err(StoreError::InvalidInput("Discord native turn is not pending".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// #1774 — whether this Discord channel turn was closed as interrupted
+    /// (a host signal stopped its provider, or the #1396 startup pass).
+    pub fn discord_turn_interrupted(&self, channel_id: &str, turn_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM surface_turn_resolutions WHERE platform = 'discord' \
+                 AND conversation_id = ?1 AND thread_id = '' AND turn_id = ?2 \
+                 AND resolution = ?3 LIMIT 1",
+                params![channel_id, turn_id, SurfaceTurnResolution::Interrupted.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Only the native runner that claimed a pending turn can resolve it.
@@ -1565,6 +1601,17 @@ impl Store {
                  enabled_at_ms  INTEGER NOT NULL\
              )",
             [],
+        )?;
+        // #1763 — owner defaults (cover every person and group chat) and
+        // persistent per-chat exclusions, the WhatsApp twin of #1687/#1740.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS whatsapp_contact_defaults (\
+                 outbound INTEGER PRIMARY KEY CHECK(outbound IN (0,1)),\
+                 enabled  INTEGER NOT NULL CHECK(enabled IN (0,1)));\
+             CREATE TABLE IF NOT EXISTS whatsapp_contact_denials (\
+                 outbound INTEGER NOT NULL CHECK(outbound IN (0,1)),\
+                 chat_jid TEXT NOT NULL,\
+                 PRIMARY KEY(outbound, chat_jid));",
         )?;
 
         // #104 — user-defined scheduled tasks (`/loop`). Channel-agnostic:
@@ -5031,6 +5078,27 @@ impl Store {
                 },
             )
             .optional()?;
+        // #1764 — a WhatsApp archive group card goes to every member. Every
+        // repost (Revise, nudge, recompose) reloads this row, so restore the
+        // recipients stored at import; scoped so no other platform's `to`
+        // (which feeds Gmail reply routing) changes.
+        let mut row = row;
+        if let Some(r) = row.as_mut().filter(|r| {
+            r.email.platform == "whatsapp" && r.email.account_entity_id.as_deref() == Some("whatsapp-history")
+        }) {
+            let raw: Option<String> = guard
+                .query_row(
+                    "SELECT retryGuardContext FROM emails WHERE messageId = ?1",
+                    params![r.email.message_id],
+                    |q| q.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some((to, cc, _)) = raw.and_then(|raw| serde_json::from_str::<(String, String, Vec<String>)>(&raw).ok()) {
+                r.email.to = to;
+                r.email.cc = cc;
+            }
+        }
         Ok(row)
     }
 
@@ -6015,65 +6083,191 @@ impl Store {
         Ok(())
     }
 
-    /// Opt a chat into outbound sends. Idempotent.
+    /// Opt a chat into outbound sends, lifting any denial. Idempotent.
     pub fn allow_whatsapp_outbound(&self, chat_jid: &str) -> StoreResult<()> {
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
-            "INSERT INTO whatsapp_outbound_allowlist (chat_jid, enabled_at_ms) \
-             VALUES (?1, ?2) ON CONFLICT(chat_jid) DO NOTHING",
-            params![chat_jid, now_millis()],
-        )?;
-        Ok(())
+        self.allow_whatsapp(true, chat_jid)
     }
 
+    /// Remove a chat's opt-in and record a denial that wins over the owner
+    /// defaults (#1763).
     pub fn deny_whatsapp_outbound(&self, chat_jid: &str) -> StoreResult<()> {
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
-            "DELETE FROM whatsapp_outbound_allowlist WHERE chat_jid = ?1",
-            params![chat_jid],
-        )?;
-        Ok(())
+        self.deny_whatsapp(true, chat_jid)
     }
 
     pub fn is_whatsapp_outbound_allowed(&self, chat_jid: &str) -> StoreResult<bool> {
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        let n: i64 = guard.query_row(
-            "SELECT COUNT(*) FROM whatsapp_outbound_allowlist WHERE chat_jid = ?1",
-            params![chat_jid],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        self.is_whatsapp_allowed(true, chat_jid)
     }
 
-    /// Opt a chat into inbound triage. Per review feedback even *reading* a
-    /// chat requires explicit opt-in for ban-risk reasons. Idempotent.
+    /// Opt a chat into inbound triage, lifting any denial. Even *reading* a
+    /// chat requires an opt-in — this entry or the owner's defaults — for
+    /// ban-risk reasons. Idempotent.
     pub fn allow_whatsapp_inbound(&self, chat_jid: &str) -> StoreResult<()> {
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        guard.execute(
-            "INSERT INTO whatsapp_inbound_allowlist (chat_jid, enabled_at_ms) \
-             VALUES (?1, ?2) ON CONFLICT(chat_jid) DO NOTHING",
-            params![chat_jid, now_millis()],
-        )?;
-        Ok(())
+        self.allow_whatsapp(false, chat_jid)
     }
 
     pub fn deny_whatsapp_inbound(&self, chat_jid: &str) -> StoreResult<()> {
+        self.deny_whatsapp(false, chat_jid)
+    }
+
+    pub fn is_whatsapp_inbound_allowed(&self, chat_jid: &str) -> StoreResult<bool> {
+        self.is_whatsapp_allowed(false, chat_jid)
+    }
+
+    /// Owner policy for existing and future WhatsApp chats, groups included
+    /// (#1763). Off until the owner turns it on; explicit denials still win.
+    pub fn set_whatsapp_contact_defaults(&self, inbound: bool, outbound: bool) -> StoreResult<()> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         guard.execute(
-            "DELETE FROM whatsapp_inbound_allowlist WHERE chat_jid = ?1",
-            params![chat_jid],
+            "INSERT INTO whatsapp_contact_defaults(outbound, enabled) VALUES (0, ?1), (1, ?2) \
+             ON CONFLICT(outbound) DO UPDATE SET enabled = excluded.enabled",
+            params![inbound, outbound],
         )?;
         Ok(())
     }
 
-    pub fn is_whatsapp_inbound_allowed(&self, chat_jid: &str) -> StoreResult<bool> {
+    pub fn whatsapp_contact_default(&self, outbound: bool) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
-        let n: i64 = guard.query_row(
-            "SELECT COUNT(*) FROM whatsapp_inbound_allowlist WHERE chat_jid = ?1",
+        Ok(guard.query_row(
+            "SELECT COALESCE((SELECT enabled FROM whatsapp_contact_defaults WHERE outbound = ?1), 0)",
+            params![outbound],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// `(explicit entries, denials)` for one direction, sorted.
+    pub fn list_whatsapp_policy(&self, outbound: bool) -> StoreResult<(Vec<String>, Vec<String>)> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let table = whatsapp_allowlist_table(outbound);
+        let collect = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> StoreResult<Vec<String>> {
+            let mut stmt = guard.prepare(sql)?;
+            let rows = stmt.query_map(p, |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        };
+        Ok((
+            collect(&format!("SELECT chat_jid FROM {table} ORDER BY chat_jid"), &[])?,
+            collect(
+                "SELECT chat_jid FROM whatsapp_contact_denials WHERE outbound = ?1 ORDER BY chat_jid",
+                &[&outbound],
+            )?,
+        ))
+    }
+
+    fn allow_whatsapp(&self, outbound: bool, chat_jid: &str) -> StoreResult<()> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction()?;
+        tx.execute(
+            "DELETE FROM whatsapp_contact_denials WHERE outbound = ?1 AND chat_jid = ?2",
+            params![outbound, chat_jid],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {} (chat_jid, enabled_at_ms) VALUES (?1, ?2) ON CONFLICT(chat_jid) DO NOTHING",
+                whatsapp_allowlist_table(outbound)
+            ),
+            params![chat_jid, now_millis()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn deny_whatsapp(&self, outbound: bool, chat_jid: &str) -> StoreResult<()> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction()?;
+        tx.execute(
+            &format!("DELETE FROM {} WHERE chat_jid = ?1", whatsapp_allowlist_table(outbound)),
             params![chat_jid],
+        )?;
+        tx.execute(
+            "INSERT INTO whatsapp_contact_denials (outbound, chat_jid) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            params![outbound, chat_jid],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn is_whatsapp_allowed(&self, outbound: bool, chat_jid: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            &format!(
+                "SELECT NOT EXISTS(SELECT 1 FROM whatsapp_contact_denials WHERE outbound = ?1 AND chat_jid = ?2) \
+                 AND (EXISTS(SELECT 1 FROM {} WHERE chat_jid = ?2) \
+                      OR (?3 AND EXISTS(SELECT 1 FROM whatsapp_contact_defaults WHERE outbound = ?1 AND enabled = 1)))",
+                whatsapp_allowlist_table(outbound)
+            ),
+            params![outbound, chat_jid, whatsapp_default_coverable(chat_jid)],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// #1765 — Approve on a card with no sender: `pending → approved` with
+    /// [`MANUAL_SEND_PENDING`], the owner pastes the text, and the next archive
+    /// sync confirms it. `false` when the row was not pending (lost a race).
+    pub fn mark_manual_send_pending(&self, action_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions SET status = 'approved', errorMessage = ?2, updatedAt = ?3 \
+              WHERE id = ?1 AND status = 'pending'",
+            params![action_id, MANUAL_SEND_PENDING, now_millis()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// `(action id, approved text, approved at ms)` awaiting confirmation on a
+    /// thread — including ones already expired, so a paste whose archive
+    /// timestamp is inside the window still confirms when the archive was late.
+    pub fn manual_sends_pending_for_thread(&self, thread_id: &str) -> StoreResult<Vec<(String, String, i64)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, COALESCE(draftBody, ''), updatedAt FROM actions \
+              WHERE threadId = ?1 AND ((status = 'approved' AND errorMessage = ?2) \
+                                    OR (status = 'error' AND errorMessage = ?3)) \
+              ORDER BY updatedAt",
+        )?;
+        let rows = stmt.query_map(params![thread_id, MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The owner's pasted message showed up in the archive: `approved → sent`
+    /// (or a late archive: expired `error → sent`).
+    pub fn confirm_manual_send(&self, action_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions SET status = 'sent', errorMessage = NULL, updatedAt = ?4 \
+              WHERE id = ?1 AND ((status = 'approved' AND errorMessage = ?2) \
+                              OR (status = 'error' AND errorMessage = ?3))",
+            params![action_id, MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED, now_millis()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Unconfirmed manual sends approved before `before_ms` become `error`
+    /// (never resent). Returns the ids. `updatedAt` keeps the approval time,
+    /// so a late archive can still confirm against the original window.
+    pub fn expire_manual_sends(&self, before_ms: i64) -> StoreResult<Vec<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "UPDATE actions SET status = 'error', errorMessage = ?3 \
+              WHERE status = 'approved' AND errorMessage = ?1 AND updatedAt < ?2 RETURNING id",
+        )?;
+        let rows = stmt.query_map(
+            params![MANUAL_SEND_PENDING, before_ms, MANUAL_SEND_UNCONFIRMED],
             |r| r.get(0),
         )?;
-        Ok(n > 0)
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// `(awaiting paste, expired unconfirmed)` WhatsApp-style manual sends,
+    /// for the owner's status view (#1765).
+    pub fn manual_send_counts(&self) -> StoreResult<(i64, i64)> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT COALESCE(SUM(status = 'approved' AND errorMessage = ?1), 0), \
+                    COALESCE(SUM(status = 'error' AND errorMessage = ?2), 0) FROM actions",
+            params![MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     // --- tone profiles & examples (issue #73) ---
@@ -12938,4 +13132,61 @@ mod finance_evidence_tests {
         assert_eq!(store.evidence_first_seen_at("plaid/sandbox/item").unwrap(), None);
         assert_eq!(store.evidence_first_seen_at("unknown-email").unwrap(), None);
     }
+}
+
+fn whatsapp_allowlist_table(outbound: bool) -> &'static str {
+    if outbound {
+        "whatsapp_outbound_allowlist"
+    } else {
+        "whatsapp_inbound_allowlist"
+    }
+}
+
+/// Owner defaults cover a person (`<digits>@s.whatsapp.net`, `<digits>@lid`)
+/// or a group (`<digits>[-<digits>]@g.us`) — never broadcast lists, status,
+/// newsletters or a malformed JID (#1763).
+pub fn whatsapp_default_coverable(chat_jid: &str) -> bool {
+    let Some((user, server)) = chat_jid.split_once('@') else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match server {
+        "s.whatsapp.net" | "lid" => digits(user),
+        "g.us" => user.split('-').all(digits),
+        _ => false,
+    }
+}
+
+/// `actions.errorMessage` of an approved reply the owner still has to paste (#1765).
+pub const MANUAL_SEND_PENDING: &str = "manual send pending";
+/// Set when the archive never showed the pasted reply within the window.
+pub const MANUAL_SEND_UNCONFIRMED: &str = "manual send not confirmed in the archive; nothing was sent automatically";
+
+/// #1396/#1774 — the one write that closes a `pending` Discord turn as
+/// interrupted: `uncertain` (its tools may have run) plus an `interrupted`
+/// resolution, so it stays consumed but no longer blocks the channel.
+/// Returns whether a pending turn was closed.
+fn close_discord_turn_interrupted(
+    tx: &rusqlite::Transaction<'_>,
+    guild_id: &str,
+    channel_id: &str,
+    turn_id: &str,
+    now: i64,
+) -> StoreResult<bool> {
+    let changed = tx.execute(
+        "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
+         WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+        params![guild_id, channel_id, turn_id, now],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO surface_turn_resolutions \
+         (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
+         VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
+         ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+        params![guild_id, channel_id, turn_id, SurfaceTurnResolution::Interrupted.as_str(), now],
+    )?;
+    Ok(true)
 }
