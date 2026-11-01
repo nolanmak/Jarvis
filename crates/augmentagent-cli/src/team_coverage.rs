@@ -138,10 +138,11 @@ pub fn mentions_alias(text: &str, aliases: &[String]) -> bool {
 /// Platforms the rule supports. Email, plus the chat adapters that can raise
 /// a card for a group conversation AND store every group member's messages
 /// with sender, time and the card's thread id (#1701 inventory). iMessage
-/// joined with group reply cards (#1738). WhatsApp and LinkedIn drop groups
-/// before drafting; SocialAPI, Twitter and Instagram cannot attribute group
-/// senders — all inert here.
-pub const CHAT_PLATFORMS: [&str; 4] = ["slack", "discord", "telegram", "imessage"];
+/// joined with group reply cards (#1738), WhatsApp archive cards with #1766
+/// (senders stored as `Name <+phone>` once the exporter maps `@lid`).
+/// LinkedIn drops groups before drafting; SocialAPI, Twitter and Instagram
+/// cannot attribute group senders — all inert here.
+pub const CHAT_PLATFORMS: [&str; 5] = ["slack", "discord", "telegram", "imessage", "whatsapp"];
 
 pub fn supported(platform: &str) -> bool {
     platform == augmentagent_channel_email::inbound::PLATFORM || CHAT_PLATFORMS.contains(&platform)
@@ -166,6 +167,7 @@ fn one_to_one_by_id(platform: &str, thread: &str) -> bool {
     match platform {
         "slack" => thread.starts_with('D'),
         "telegram" => thread.parse::<i64>().is_ok_and(|id| id > 0),
+        "whatsapp" => !thread.ends_with("@g.us"),
         // Same handle shape the iMessage allowlist treats as a person.
         "imessage" => thread.strip_prefix("imessage:").is_none_or(|id| {
             id.strip_prefix('+').is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
@@ -767,6 +769,66 @@ mod tests {
         assert_eq!(tick(&store, &cfg), 1);
         assert_eq!(status(&store, &g).0, "superseded");
         assert_eq!(status(&store, &d).0, "pending");
+    }
+
+    // ---- #1766: WhatsApp archive group cards ----
+
+    fn wa_msg(thread: &str, id: &str, from: &str, date: &str, body: &str) -> Email {
+        Email {
+            account_entity_id: Some("whatsapp-history".into()),
+            ..chat_email("whatsapp", thread, id, from, date, body)
+        }
+    }
+
+    const WA_GROUP: &str = "whatsapp-history:120363001234567890@g.us";
+    const WA_DANA: &str = "Dana <+14155550124>"; // pii-ok synthetic
+    const WA_ANA: &str = "Ana <+14155550123>"; // pii-ok synthetic
+
+    fn wa_cfg() -> Config {
+        Config { roster: TeamRoster::parse("Ana=+14155550123"), ..chat_cfg() } // pii-ok synthetic
+    }
+
+    #[test]
+    fn whatsapp_group_teammate_reply_retires_card() {
+        let (_d, store) = temp_store();
+        store.upsert_email(&wa_msg(WA_GROUP, "g-in", WA_DANA, "2026-01-01T00:00:00-05:00", "deck?")).unwrap();
+        let card = card_for(&store, "g-in", WA_GROUP, WA_DANA);
+        store.upsert_email(&wa_msg(WA_GROUP, "g-ana", WA_ANA, "2026-01-02T00:00:00-05:00", "sent it")).unwrap();
+        assert_eq!(tick(&store, &wa_cfg()), 1);
+        assert_eq!(status(&store, &card), ("superseded".into(), Some("superseded: covered by teammate Ana".into())));
+    }
+
+    #[test]
+    fn whatsapp_one_to_one_never_retired_by_team_rule() {
+        let (_d, store) = temp_store();
+        for dm in ["whatsapp-history:14155550124@s.whatsapp.net", "whatsapp-history:111111111111111@lid"] { // pii-ok synthetic
+            store.upsert_email(&wa_msg(dm, &format!("{dm}-in"), WA_DANA, "2026-01-01T00:00:00-05:00", "deck?")).unwrap();
+            let card = card_for(&store, &format!("{dm}-in"), dm, WA_DANA);
+            store.upsert_email(&wa_msg(dm, &format!("{dm}-ana"), WA_ANA, "2026-01-02T00:00:00-05:00", "sent")).unwrap();
+            assert_eq!(tick(&store, &wa_cfg()), 0);
+            assert_eq!(status(&store, &card).0, "pending");
+        }
+    }
+
+    #[test]
+    fn whatsapp_unmapped_lid_sender_never_covers() {
+        let (_d, store) = temp_store();
+        store.upsert_email(&wa_msg(WA_GROUP, "g-in", WA_DANA, "2026-01-01T00:00:00-05:00", "deck?")).unwrap();
+        let card = card_for(&store, "g-in", WA_GROUP, WA_DANA);
+        // The exporter could not map this privacy id to Ana's phone.
+        store.upsert_email(&wa_msg(WA_GROUP, "g-x", "Ana <999999999999999@lid>", "2026-01-02T00:00:00-05:00", "sent")).unwrap();
+        assert_eq!(tick(&store, &wa_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
+    }
+
+    #[test]
+    fn whatsapp_teammate_naming_owner_does_not_retire() {
+        let (_d, store) = temp_store();
+        store.upsert_email(&wa_msg(WA_GROUP, "g-in", WA_DANA, "2026-01-01T00:00:00-05:00", "deck?")).unwrap();
+        let card = card_for(&store, "g-in", WA_GROUP, WA_DANA);
+        store.upsert_email(&wa_msg(WA_GROUP, "g-ana", WA_ANA, "2026-01-02T00:00:00-05:00", "Sam can you send it?")).unwrap();
+        assert_eq!(tick(&store, &wa_cfg()), 0);
+        assert_eq!(status(&store, &card).0, "pending");
     }
 
     #[test]

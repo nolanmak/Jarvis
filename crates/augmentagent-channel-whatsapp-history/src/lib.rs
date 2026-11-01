@@ -1,5 +1,8 @@
-//! Read-only WhatsApp archive → searchable history and incremental wiki capture.
-//! No linked device, live channel, reply drafting, or outbound access is enabled.
+//! WhatsApp archive → searchable history, incremental wiki capture, and reply
+//! cards (#1764). No linked device, live channel or automated send: Approve
+//! hands the owner the text to paste, and the archive confirms it (#1765).
+pub mod reply;
+
 use anyhow::{bail, Context, Result};
 use augmentagent_channel_imessage::{parse_entries, Conversation, MessageEntry};
 use augmentagent_store::{rusqlite::OptionalExtension, Email, Store};
@@ -14,6 +17,42 @@ use tracing::warn;
 
 pub const ENV_DIR: &str = "AUGMENTAGENT_WHATSAPP_HISTORY_DIR";
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Seconds between archive polls; reply cards want minutes, not half-hours.
+pub const ENV_POLL_SECS: &str = "AUGMENTAGENT_WHATSAPP_HISTORY_POLL_SECS";
+/// `emails.accountEntityId` of every archive row and reply card.
+pub const ACCOUNT: &str = "whatsapp-history";
+pub const THREAD_PREFIX: &str = "whatsapp-history:";
+
+/// [`ENV_POLL_SECS`], floored at 60s; [`POLL_INTERVAL`] when unset or invalid.
+pub fn poll_interval() -> Duration {
+    std::env::var(ENV_POLL_SECS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.max(60)))
+        .unwrap_or(POLL_INTERVAL)
+}
+
+pub fn is_group(conv: &Conversation) -> bool {
+    conv.identifier.ends_with("@g.us")
+}
+
+/// `Name <+phone>` when the exporter knows the name, else the best handle:
+/// an `@lid` privacy id resolves through the bundle's identity map (#1762)
+/// and stays raw when unmapped — never guessed.
+pub fn display_sender(conv: &Conversation, sender: &str) -> String {
+    if sender == "me" {
+        return sender.to_string();
+    }
+    let handle = conv.identity.get(sender).map(String::as_str).unwrap_or(sender);
+    let name = conv.participant_names.get(sender).map(String::as_str).or_else(|| {
+        (!is_group(conv) && !conv.title.is_empty() && conv.title != handle && conv.title != sender)
+            .then_some(conv.title.as_str())
+    });
+    match name {
+        Some(name) => format!("{name} <{handle}>"),
+        None => handle.to_string(),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -97,13 +136,14 @@ fn read_entries(root: &Path, conv: &Conversation) -> Result<Vec<MessageEntry>> {
     Ok(parse_entries(&std::fs::read_to_string(path)?))
 }
 
-fn email(conv: &Conversation, idx: usize, entry: &MessageEntry) -> Email {
+pub fn email(conv: &Conversation, idx: usize, entry: &MessageEntry) -> Email {
     let mut email = augmentagent_channel_imessage::synthetic_imessage_email(conv, idx, entry);
-    email.message_id = format!("whatsapp-history:{}:{idx}", conv.identifier);
-    email.thread_id = Some(format!("whatsapp-history:{}", conv.identifier));
+    email.message_id = format!("{THREAD_PREFIX}{}:{idx}", conv.identifier);
+    email.thread_id = Some(format!("{THREAD_PREFIX}{}", conv.identifier));
     email.platform = "whatsapp".into();
-    email.account_entity_id = Some("whatsapp-history".into());
-    email.kind = if conv.identifier.ends_with("@g.us") {
+    email.account_entity_id = Some(ACCOUNT.into());
+    email.from = display_sender(conv, &entry.sender);
+    email.kind = if is_group(conv) {
         "group"
     } else {
         "dm"
@@ -232,4 +272,28 @@ pub fn capture_email(delta: &Delta) -> Email {
         .unwrap_or(0);
     result.body = text[start..].to_string();
     result
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn old_index_without_members_still_imports_and_new_fields_parse() {
+        let old: Conversation = serde_json::from_str(
+            r#"{"identifier":"1@g.us","dir":"g","title":"G","service":"WhatsApp","participants":[]}"#,
+        )
+        .unwrap();
+        assert!(old.participant_names.is_empty() && old.identity.is_empty() && old.active.is_none());
+        let new: Conversation = serde_json::from_str(
+            r#"{"identifier":"1@g.us","dir":"g","title":"G","service":"WhatsApp",
+                "participants":["+14155550999","111@lid","222@lid"],
+                "participant_names":{"111@lid":"Ana"},"identity":{"111@lid":"+14155550777"},"active":false}"#, // pii-ok synthetic
+        )
+        .unwrap();
+        assert_eq!(new.active, Some(false));
+        assert_eq!(display_sender(&new, "111@lid"), "Ana <+14155550777>"); // pii-ok synthetic
+        assert_eq!(display_sender(&new, "222@lid"), "222@lid", "unmapped lid stays raw");
+        assert_eq!(display_sender(&new, "me"), "me");
+    }
 }

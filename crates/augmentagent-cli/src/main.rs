@@ -419,7 +419,7 @@ enum Cmd {
         #[command(subcommand)]
         op: messages_cmd::Op,
     },
-    /// Read-only WhatsApp archive ingestion (independent of the live channel).
+    /// WhatsApp archive ingestion, reply policy and reply cards (independent of the live channel).
     WhatsappHistory {
         #[command(subcommand)]
         op: whatsapp_history::Op,
@@ -4328,13 +4328,14 @@ async fn main() -> Result<()> {
                 Ok(Some(config)) => {
                     let store_c = Arc::clone(&store);
                     let reasoner = build_reasoner();
+                    let bk = Arc::clone(&broker);
                     let root = cli.wiki_dir.clone();
                     let schema = root
                         .as_ref()
                         .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move {
-                        whatsapp_history::run_loop(config, store_c, reasoner, root, schema, sd)
+                        whatsapp_history::run_loop(config, store_c, reasoner, bk, root, schema, sd)
                             .await
                     }));
                 }
@@ -5138,7 +5139,10 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
+        Cmd::WhatsappHistory { op: whatsapp_history::Op::PollOnce } => {
+            whatsapp_history::poll_command(store).await
+        }
+        Cmd::WhatsappHistory { op } => whatsapp_history::policy_command(&store, &op),
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
         Cmd::TriageCalibration { op } => self_improve::triage_calibration::run(store, op).await,
@@ -14871,6 +14875,11 @@ impl ReplyApprover {
         }
         if action.email.platform == imessage_send::PLATFORM {
             return self.approve_imessage(action_id, action).await;
+        }
+        // #1765 — WhatsApp archive cards have no sender: Approve hands the
+        // owner the text to paste. Never the live sidecar, never Gmail.
+        if augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email) {
+            return whatsapp_history::approve(&self.store, action_id, &action);
         }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;

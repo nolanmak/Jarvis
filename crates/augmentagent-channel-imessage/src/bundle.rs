@@ -26,7 +26,7 @@ use augmentagent_store::Email;
 use serde::Deserialize;
 
 /// One conversation from `conversations/index.json`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Conversation {
     /// Stable chat identifier (phone/email for DMs, `chatNNN…` for groups).
     pub identifier: String,
@@ -46,6 +46,16 @@ pub struct Conversation {
     /// existed, so recall reports "unknown freshness" rather than failing.
     #[serde(default)]
     pub newest_entry: Option<String>,
+    /// Member handle → display name, when the exporter knows it (#1762).
+    #[serde(default)]
+    pub participant_names: BTreeMap<String, String>,
+    /// `<id>@lid` → E.164 handle (WhatsApp privacy ids, #1762). Unmapped
+    /// ids are absent, never guessed.
+    #[serde(default)]
+    pub identity: BTreeMap<String, String>,
+    /// `false` when the owner is no longer an active member (left the group).
+    #[serde(default)]
+    pub active: Option<bool>,
 }
 
 impl Conversation {
@@ -290,6 +300,7 @@ mod tests {
             service: "iMessage".into(),
             chat_guid: None,
             newest_entry: None,
+            ..Default::default()
         };
         assert!(group.is_group());
     }
@@ -304,6 +315,7 @@ mod tests {
             service: "iMessage".into(),
             chat_guid: None,
             newest_entry: None,
+            ..Default::default()
         };
         let entries = parse_entries(SAMPLE_MD);
         let email = synthetic_imessage_email(&conv, 1, &entries[1]);

@@ -17,7 +17,9 @@ from whatsapp_sync import (
     core_data_time_to_iso,
     escape_body,
     jid_handle,
+    load_identities,
     slugify,
+    source_staleness,
     sync,
 )
 
@@ -255,6 +257,144 @@ class TestSync(unittest.TestCase):
         add_message(self.con, 1, 1, "when?", None, 0)
         sync(self.db, self.out, self.state)
         self.assertIsNone(self._index().get("newest_entry"))
+
+
+# ---- #1762: group members, sender identity, freshness ----
+
+GROUP = "12036000000000@g.us"
+LID_A = "111111111111111@lid"  # synthetic
+LID_B = "222222222222222@lid"  # synthetic, never resolvable
+
+
+def add_membership_columns(con):
+    """The real ZWAGROUPMEMBER links members to their group session."""
+    for col in ("ZCHATSESSION INTEGER", "ZISACTIVE INTEGER", "ZFIRSTNAME TEXT"):
+        con.execute(f"ALTER TABLE ZWAGROUPMEMBER ADD COLUMN {col}")
+    con.execute("UPDATE ZWAGROUPMEMBER SET ZCHATSESSION = 2, ZISACTIVE = 1")
+    con.execute("INSERT INTO ZWAGROUPMEMBER VALUES (8, ?, 'Ana Lima', 2, 1, 'Ana')", (LID_A,))
+    con.execute("INSERT INTO ZWAGROUPMEMBER VALUES (9, ?, NULL, 2, 1, NULL)", (LID_B,))
+    con.execute("INSERT INTO ZWAGROUPMEMBER VALUES (10, '14155550888@s.whatsapp.net', 'Left', 2, 0, NULL)")
+    con.execute("CREATE TABLE ZWAPROFILEPUSHNAME (Z_PK INTEGER PRIMARY KEY, ZJID TEXT, ZPUSHNAME TEXT)")
+    con.execute("INSERT INTO ZWAPROFILEPUSHNAME VALUES (1, ?, 'bee')", (LID_B,))
+    con.commit()
+
+
+def make_lid_db(path):
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE ZWAZACCOUNT (Z_PK INTEGER PRIMARY KEY, ZIDENTIFIER TEXT, ZPHONENUMBER TEXT)")
+    con.execute("INSERT INTO ZWAZACCOUNT VALUES (1, ?, '14155550777')", (LID_A,))
+    con.execute("INSERT INTO ZWAZACCOUNT VALUES (2, 'bad', '')")
+    con.commit()
+    con.close()
+
+
+class TestIdentity(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = str(self.root / "ChatStorage.sqlite")
+        self.out = self.root / "repo"
+        self.state = self.out / ".sync_state.json"
+        self.con = make_fixture_db(self.db)
+        add_membership_columns(self.con)
+        make_lid_db(self.root / "LID.sqlite")
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def index(self):
+        return json.loads((self.out / "conversations/index.json").read_text())
+
+    def test_group_index_lists_active_members_from_group_member_table(self):
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)
+        sync(self.db, self.out, self.state)
+        group = self.index()[GROUP]
+        self.assertEqual(group["participants"], sorted(["+14155550999", LID_A, LID_B]))
+
+    def test_participant_names_prefer_contact_then_first_then_push_name(self):
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)
+        sync(self.db, self.out, self.state)
+        names = self.index()[GROUP]["participant_names"]
+        self.assertEqual(names, {"+14155550999": "Jane", LID_A: "Ana Lima", LID_B: "bee"})
+
+    def test_lid_sender_maps_to_phone_when_known_and_is_left_raw_otherwise(self):
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)
+        add_message(self.con, 2, 2, "me too", cd(1787745660), 0, group_member=9)
+        sync(self.db, self.out, self.state)
+        self.assertEqual(self.index()[GROUP]["identity"], {LID_A: "+14155550777"})
+        md = (self.out / "conversations/Ski_Trip/messages.md").read_text()
+        # Headers keep the raw JID: the parsing contract and message ids.
+        self.assertIn(f"] {LID_A}\nski?", md)
+        self.assertIn(f"] {LID_B}\nme too", md)
+
+    def test_load_identities_tolerates_missing_or_odd_stores(self):
+        self.assertEqual(load_identities(self.root / "nope"), {})
+        self.assertEqual(load_identities(self.root), {LID_A: "+14155550777"})
+
+    def test_existing_index_entries_gain_members_without_new_messages(self):
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=7)
+        sync(self.db, self.out, self.state)
+        idx = self.index()
+        for k in ("participant_names", "identity"):
+            idx[GROUP].pop(k, None)
+        idx[GROUP]["participants"] = []
+        (self.out / "conversations/index.json").write_text(json.dumps(idx))
+        r = sync(self.db, self.out, self.state)
+        self.assertEqual(r["messages"], 0)
+        self.assertEqual(len(self.index()[GROUP]["participants"]), 3)
+
+    def test_entry_headers_and_bodies_are_unchanged_by_identity_fields(self):
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)
+        sync(self.db, self.out, self.state)
+        md_path = self.out / "conversations/Ski_Trip/messages.md"
+        before = md_path.read_text()
+        (self.root / "LID.sqlite").unlink()
+        make_lid_db(self.root / "LID.sqlite")
+        sync(self.db, self.out, self.state)
+        self.assertEqual(md_path.read_text(), before)
+
+    def test_quiet_run_rewrites_neither_state_nor_index(self):
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)
+        sync(self.db, self.out, self.state)
+        files = [self.state, self.out / "conversations/index.json", self.out / "index.md"]
+        stamps = [f.stat().st_mtime_ns for f in files]
+        state = self.state.read_text()
+        import time; time.sleep(0.01)
+        sync(self.db, self.out, self.state)
+        self.assertEqual([f.stat().st_mtime_ns for f in files], stamps)
+        self.assertEqual(self.state.read_text(), state)
+
+    def test_group_with_no_active_members_lists_all_and_is_marked_inactive(self):
+        self.con.execute("UPDATE ZWAGROUPMEMBER SET ZISACTIVE = 0")
+        self.con.commit()
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)
+        sync(self.db, self.out, self.state)
+        group = self.index()[GROUP]
+        self.assertEqual(len(group["participants"]), 4)
+        self.assertIs(group["active"], False)
+        self.con.execute("UPDATE ZWAGROUPMEMBER SET ZISACTIVE = 1 WHERE Z_PK = 8")
+        self.con.commit()
+        sync(self.db, self.out, self.state)
+        self.assertNotIn("active", self.index()[GROUP])
+
+    def test_newest_entry_backfilled_from_existing_file_headers(self):
+        add_message(self.con, 1, 1, "hey", cd(1787745600), 0)
+        add_message(self.con, 2, 1, "yo", cd(1787745660), 1)
+        sync(self.db, self.out, self.state)
+        key = "14155550123@s.whatsapp.net"
+        idx = self.index()
+        want = idx[key].pop("newest_entry")
+        (self.out / "conversations/index.json").write_text(json.dumps(idx))
+        sync(self.db, self.out, self.state)
+        self.assertEqual(self.index()[key]["newest_entry"], want)
+
+    def test_source_staleness_reported_when_database_is_cold(self):
+        import os
+        old = os.path.getmtime(self.db)
+        self.assertIsNone(source_staleness(self.db, now=old + 60))
+        self.assertGreater(source_staleness(self.db, now=old + 7 * 3600), 6 * 3600)
+        self.assertIsNone(source_staleness(self.root / "missing.sqlite"))
 
 
 if __name__ == "__main__":
