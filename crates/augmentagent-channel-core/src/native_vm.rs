@@ -420,6 +420,11 @@ pub(crate) struct Launch {
     _directory: tempfile::TempDir,
 }
 impl Launch {
+    pub(crate) fn prepared_record(&self)->Result<PreparedLaunchRecord> {
+        let observation=self.observation.as_ref().context("native launch lacks prepared controller context")?;
+        ensure!(observation.logger.upgrade().is_some(),"native launch controller expired");
+        Ok(observation.prepared.clone())
+    }
     pub fn prepare(provider: &str, opts: &crate::reasoner::ReasonerOpts, original: &Command,
         bridge: Option<&crate::codex_tools::BridgeLaunch>, native: Option<&crate::native_session::Launch>) -> Result<Self> {
         let owner_logger=opts.audit_logger.as_ref().context("native runtime owner audit unavailable")?;

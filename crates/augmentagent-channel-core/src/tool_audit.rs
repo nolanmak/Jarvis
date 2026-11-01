@@ -589,6 +589,25 @@ impl AuditLogger {
     /// This records no completion, export validity or transferable certainty.
     pub(crate) fn native_session_observed(&self,prepared:&crate::native_vm::PreparedLaunchRecord,id:&str)->anyhow::Result<crate::audit_chain::AppendReceipt> {
         anyhow::ensure!(!id.is_empty() && id.len()<=256 && id.bytes().all(|byte|byte.is_ascii_graphic()),"invalid observed native session");
+        self.verify_native_launch_reference(prepared)?;
+        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_session_observed","launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
+            "native_session_id":id,"observed_at_ms":chrono::Utc::now().timestamp_millis()}))?;
+        self.dispatch_allowed()?;
+        Ok(receipt)
+    }
+    /// Correlate preparation with the supervisor's exact admitted resource scope.
+    /// This precedes model charge/release and proves neither submission nor completion.
+    pub(crate) fn native_launch_resource_binding(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
+        provider:&str,identity:&serde_json::Value)->anyhow::Result<crate::audit_chain::AppendReceipt> {
+        anyhow::ensure!(prepared.intent.provider==provider && identity.is_object(),"native launch resource provider/identity mismatch");
+        self.verify_native_launch_reference(prepared)?;
+        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_launch_resource_binding","launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
+            "resource_identity":identity,"recorded_at_ms":chrono::Utc::now().timestamp_millis()}))?;
+        self.dispatch_allowed()?;Ok(receipt)
+    }
+    fn verify_native_launch_reference(&self,prepared:&crate::native_vm::PreparedLaunchRecord)->anyhow::Result<()> {
         prepared.intent.validate()?;
         anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner)
             && prepared.intent.source_audit_path==self.path,"native observation source owner mismatch");
@@ -603,11 +622,7 @@ impl AuditLogger {
         expected["actor"]="controller".into();expected["kind"]="native_launch_intent".into();
         anyhow::ensure!(actual==expected,"native observation references another prepared launch");
         self.dispatch_allowed()?;
-        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
-            "kind":"native_session_observed","launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
-            "native_session_id":id,"observed_at_ms":chrono::Utc::now().timestamp_millis()}))?;
-        self.dispatch_allowed()?;
-        Ok(receipt)
+        Ok(())
     }
 
     /// Install a protected original registration, never capture current policy

@@ -18,6 +18,7 @@ pub(crate) struct ProcessGroup {
     vm_preflight: bool,
     resource_observed: AtomicBool,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
+    native_launch:Option<crate::native_vm::PreparedLaunchRecord>,
     _directory: tempfile::TempDir,
 }
 
@@ -79,6 +80,9 @@ impl ProcessGroup {
             logger.ok_or_else(||anyhow::anyhow!("native VM model admission requires protected original binding"))?
                 .validate_native_store_binding()?;
             logger.unwrap().dispatch_allowed()?;
+            let prepared=self.native_launch.as_ref().ok_or_else(||anyhow::anyhow!("native VM model admission requires prepared controller receipt"))?;
+            let identity=resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("native VM model admission requires exact resource identity"))?;
+            logger.unwrap().native_launch_resource_binding(prepared,provider,identity)?;
         }
         if model { if let Some(logger)=logger {
             match &resource_identity {
@@ -556,9 +560,12 @@ pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, cle
     spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[])
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
-pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
+pub(crate) fn spawn_admitted_vm(launch: &crate::native_vm::Launch, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[])
+    let prepared=launch.prepared_record().map_err(std::io::Error::other)?;
+    let (child,mut group)=spawn_supervised_inner(&launch.command,true,clean,journal,true,true,true,Some(&launch.resource_policy),&[])?;
+    group.native_launch=Some(prepared);
+    Ok((child,group))
 }
 pub(crate) fn spawn_admitted_storage(command: &Command, clean: Arc<AtomicBool>, required_resources: bool,
     storage_files: &[std::fs::File], policy: &serde_json::Value) -> std::io::Result<(Child, ProcessGroup)> {
@@ -643,7 +650,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), _directory: directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_launch:None,_directory: directory }))
 }
 
 #[cfg(test)]
@@ -695,7 +702,7 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
         let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),
-            resource_audit:std::sync::Mutex::new(None),_directory:directory};
+            resource_audit:std::sync::Mutex::new(None),native_launch:None,_directory:directory};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
         std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -723,7 +730,7 @@ mod tests {
             let clean=Arc::new(AtomicBool::new(false));
             let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
                 resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
-                resource_audit:std::sync::Mutex::new(None),_directory:directory};
+                resource_audit:std::sync::Mutex::new(None),native_launch:None,_directory:directory};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
         }
@@ -962,6 +969,94 @@ mod tests {
         assert_eq!(model["admission_schema_version"],2);
         assert_eq!(model["actual_provider"],resource["provider"]);
         assert_eq!(count.load(Ordering::SeqCst),1);
+    }
+
+    #[tokio::test]
+    async fn native_model_release_requires_prepared_receipt_before_model_charge() {native_release_context_fixture("missing").await;}
+    #[tokio::test]
+    async fn native_model_release_binds_exact_preparation_and_supervisor_resource() {native_release_context_fixture("bound").await;}
+    #[tokio::test]
+    async fn native_model_release_refuses_changed_preparation_before_charge() {native_release_context_fixture("changed").await;}
+    #[tokio::test]
+    async fn native_model_release_refuses_other_provider_before_charge() {native_release_context_fixture("provider").await;}
+    #[tokio::test]
+    async fn native_model_release_requires_resource_identity_before_charge() {native_release_context_fixture("resource").await;}
+    #[tokio::test]
+    async fn native_model_release_refuses_sealed_audit_before_charge() {native_release_context_fixture("sealed").await;}
+    async fn native_release_context_fixture(mode:&str) {
+        const CHILD:&str="JARVIS_TEST_NATIVE_RELEASE_CONTEXT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let test=match mode {
+                "missing"=>"native_model_release_requires_prepared_receipt_before_model_charge",
+                "bound"=>"native_model_release_binds_exact_preparation_and_supervisor_resource",
+                "changed"=>"native_model_release_refuses_changed_preparation_before_charge",
+                "provider"=>"native_model_release_refuses_other_provider_before_charge",
+                "resource"=>"native_model_release_requires_resource_identity_before_charge",
+                "sealed"=>"native_model_release_refuses_sealed_audit_before_charge",_=>unreachable!(),
+            };
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",&format!("process_tree::tests::{test}"),"--test-threads=1"])
+                .env(CHILD,mode).output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        let root=tempfile::tempdir_in("/tmp").unwrap();
+        let state=root.path().join("native");std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::native_vm::initialize_native_test_store(&state);
+        let policy=root.path().join("policy.json");
+        write_private(&policy,serde_json::json!({"version":1,"state_root":state,"memory_mb":512,"max_state_bytes":8589934592u64,
+            "max_sessions":8,"runtime_config":"/fixture/runtime","guest_runtime":"/fixture/guest","providers":{}}).to_string().as_bytes());
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",policy);
+        for name in ["logs","anchors"] {std::fs::create_dir(root.path().join(name)).unwrap();}
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("logs/audit.jsonl"),root.path().join("anchors/audit.json"),&[]).unwrap());
+        logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}).unwrap();
+        logger.set_native_store_binding(crate::native_vm::ownership::capture_owner_binding(&||Ok(())).unwrap()).unwrap();
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
+        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        // A real supervisor with synthetic admission metadata tests release,
+        // not a real VM, provider call or kernel quiescence.
+        let (mut child,mut group)=spawn_admitted(&Command::new("/usr/bin/true"),true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        let identity=serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot","path":"/sys/fs/cgroup/synthetic-run","inode":42,"limits":{}});
+        write_private(&group.receipt.with_file_name("resource-accounting.json"),serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}).to_string().as_bytes());
+        let prepared=if mode!="missing" {
+            use sha2::{Digest,Sha256};
+            let original=logger.native_store_binding().unwrap().unwrap();
+            let provider=if mode=="provider" {"claude"} else {"codex"};
+            let intent=crate::native_vm::PreparedLaunchIntent {version:2,intent_id:uuid::Uuid::new_v4().to_string(),
+                source_owner:logger.native_runtime_owner().unwrap().unwrap(),source_audit_path:logger.path().into(),
+                provider:provider.into(),runtime_relative_path:format!("{provider}/session-synthetic"),native_session_id:None,
+                launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64),
+                original_store_binding_sha256:format!("{:x}",Sha256::digest(crate::native_vm::ownership::canonical_bytes(&serde_json::to_value(original).unwrap()).unwrap()))};
+            Some(logger.native_launch_prepared(&intent).unwrap())
+        } else {None};
+        group.native_launch=prepared.clone();
+        if mode=="changed" {group.native_launch.as_mut().unwrap().intent.launch_sha256="f".repeat(64);}
+        if mode=="sealed" {
+            crate::audit_chain::AnchoredAudit::new(logger.path().into(),root.path().join("anchors/audit.json"),&[]).unwrap()
+                .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"closed-before-release"}))).unwrap();
+        }
+        group.resource_required=mode!="resource";group.vm_preflight=true;
+        let outcome=group.admit_model("codex",Some(&logger)).await;
+        let proceeded=group.receipt.with_file_name("launch-continue").exists();
+        drop(group);let _=child.wait().await;
+        let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        let binding=rows.iter().find(|row|row["kind"]=="native_launch_resource_binding");
+        if mode=="bound" {
+            outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);
+            let binding=binding.expect("released native model has no exact launch/resource correlation");
+            let prepared=prepared.unwrap();
+            assert_eq!(binding["launch_intent"],serde_json::to_value(prepared.intent).unwrap());
+            assert_eq!(binding["launch_receipt"],serde_json::to_value(prepared.controller_receipt).unwrap());
+            assert_eq!(binding["resource_identity"],identity);
+            let model=rows.iter().find(|row|row["kind"]=="model_call_admitted").unwrap();
+            assert_eq!(model["resource_identity"],binding["resource_identity"]);
+            assert!(binding["audit_chain"]["sequence"].as_u64().unwrap()<model["audit_chain"]["sequence"].as_u64().unwrap());
+        } else {
+            assert!(outcome.is_err(),"native model ignored invalid context ({mode})");
+            assert_eq!(count.load(Ordering::SeqCst),0,"invalid native context charged a model call ({mode})");
+            assert!(!proceeded,"invalid native context published launch-continue ({mode})");
+            assert!(binding.is_none(),"invalid native context recorded a resource binding ({mode})");
+        }
     }
 
     #[tokio::test]
