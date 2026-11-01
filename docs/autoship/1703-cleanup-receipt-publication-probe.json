@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1704,
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "f8f7a255ce72e9012bec6a8e7382aef7e5a3289d0d7cdcdb44977de7f7f2e542"
+    }
+  ],
+  "observed_ci_failure": {
+    "pr": 1750,
+    "job": "https://github.com/nolanmak/Jarvis/actions/runs/41255821188/job/124698719860",
+    "test": "reasoner::failover_error_tests::in_flight_never_exceeds_cap",
+    "message": "claude process cleanup is unverified; recovery requires reconciliation",
+    "scope": "The hosted failure prompted investigation. Its precise interleaving was not captured; the separate receipt-publication race below is reproduced deterministically."
+  },
+  "red": {
+    "commit": "816eeab5",
+    "passed": 0,
+    "failed": 1,
+    "log_sha256": "306af1b846adffd82aa9f6b8d1d9521d776e044e160fb80b8c22d7a3ffebdac3",
+    "failure": "Visible receipt path precedes complete bytes; Drop marks real reaped-child fixture unverified."
+  },
+  "green": {
+    "implementation_commit": "5808ddf1",
+    "lifecycle_tests": 19,
+    "full_core_passed": 673,
+    "full_core_failed": 0,
+    "full_core_ignored": 14,
+    "lifecycle_log_sha256": "7ac8601822184afd11ba2d8ec8bd9c469b590f4b6918e9d1fbc5223cf7923572",
+    "full_core_log_sha256": "44fa0b9db14181d062d39d10cc88370e0e243aee909a6b06edc7af81727ece6e",
+    "wrapper": "scripts/cargo-managed.sh"
+  },
+  "invariants": [
+    "Existing three-second cleanup deadline is unchanged",
+    "Receipt must contain one exact complete proof and pass existing owner/private/regular-file checks",
+    "Partial or missing proof never authorizes recovery/failover",
+    "No changes to required cgroup cleanup or resource admission",
+    "Fixture uses an actual child and writes final proof only after waiting for that child"
+  ],
+  "not_proved": [
+    "Original hosted failure had this exact publication interleaving",
+    "Production rollout",
+    "Native workflow, Discord coding or soak acceptance"
+  ]
+}
