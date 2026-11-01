@@ -120,6 +120,12 @@ def safe_relative(raw):
     return path
 
 
+def export_target(staging, raw):
+    target = staging / safe_relative(raw)
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return target
+
+
 @contextlib.contextmanager
 def short_channel_endpoint():
     """Socket only: AF_UNIX names cannot inherit arbitrarily long state roots.
@@ -741,11 +747,10 @@ def main(spec_path):
                     if exported > MAX_HOME or str(relative) in received or len(received) >= 4096:
                         raise ValueError('native runtime export exceeds budget or duplicates file')
                     received.add(str(relative))
-                    target = staging / relative
                     export_directories.update(str(parent) for parent in relative.parents if str(parent) != '.')
                     if len(export_directories) > 2048:
                         raise ValueError('native runtime directory budget exceeded')
-                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    target = export_target(staging, str(relative))
                     stream = open(target, 'xb')
                     os.fchmod(stream.fileno(), 0o600)
                     active_export = [stream, size, 0]
