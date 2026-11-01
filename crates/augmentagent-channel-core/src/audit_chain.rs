@@ -102,6 +102,17 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
     }
     Ok(path)
 }
+fn verify_recovery_seal(anchor:&Anchor,proof:&serde_json::Value)->Result<()> {
+    ensure!(proof["validation"].get("handoff_context").is_none(),"audit generation is sealed for a native handoff");
+    ensure!(proof["version"].as_u64()==Some(1)
+        && proof["committed_sha256"].as_str()==Some(anchor.hash.as_str())
+        && proof["committed_bytes"].as_u64()==Some(u64::try_from(anchor.bytes)?)
+        && proof["sequence"].as_u64()==Some(anchor.sequence)
+        && proof["interrupted_append"]==serde_json::to_value(&anchor.pending)?,
+        "recovery seal does not describe its original committed authority");
+    Ok(())
+}
+
 impl AnchoredAudit {
     /// Verify a historical append reference against this existing audit only.
     /// This lookup grants no current runtime or transfer authority.
@@ -130,11 +141,20 @@ impl AnchoredAudit {
         (&anchor_file).take(LIMIT + 1).read_to_end(&mut anchor_bytes)?;
         ensure!(anchor_bytes.len() as u64 <= LIMIT, "anchor exceeds budget");
         let anchor: Anchor = serde_json::from_slice(&anchor_bytes)?;
-        ensure!(anchor.version == 1 && anchor.pending.is_none(), "audit has unsupported or uncertain authority");
+        ensure!(anchor.version == 1, "audit has unsupported authority");
+        if anchor.pending.is_some() {
+            verify_recovery_seal(&anchor,anchor.sealed.as_ref().context("open pending audit has uncertain authority")?)?;
+        }
         let mut bytes = Vec::new();
         (&log_file).take(LIMIT + 1).read_to_end(&mut bytes)?;
-        ensure!(bytes.len() as u64 <= LIMIT && bytes.len() == anchor.bytes,
-            "audit has truncated or unanchored bytes");
+        ensure!(bytes.len() as u64 <= LIMIT && bytes.len() >= anchor.bytes,
+            "audit has truncated bytes");
+        let tail=&bytes[anchor.bytes..];
+        ensure!(match &anchor.pending {Some(pending)=>pending.as_bytes().starts_with(tail),None=>tail.is_empty()},
+            "audit has unrecognized uncommitted bytes");
+        // Historical lookup never repairs/replays the interrupted append. Even
+        // a complete-looking pending line is outside this committed prefix.
+        bytes.truncate(anchor.bytes);
         let committed_hash = if bytes.is_empty() { String::new() } else { digest(&bytes) };
         ensure!(committed_hash == anchor.hash, "committed audit modified");
         let mut offset = 0;
@@ -242,6 +262,7 @@ impl AnchoredAudit {
     pub fn seal_for_recovery<F>(&self, validate: F) -> Result<serde_json::Value>
     where F: FnOnce(&[serde_json::Value]) -> Result<serde_json::Value> {
         let (_lock,mut anchor,rows,_)=self.locked_snapshot()?;
+        if let Some(proof)=&anchor.sealed {verify_recovery_seal(&anchor,proof)?;}
         let validation = validate(&rows)?;
         if let Some(proof) = anchor.sealed { return Ok(proof); }
         let proof = serde_json::json!({"version":1,"committed_sha256":anchor.hash,
@@ -489,6 +510,65 @@ mod tests {
                 if mode=="symlink" {assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());}
             }
         }
+    }
+    #[test]
+    fn receipt_lookup_reads_committed_prefix_of_recovery_sealed_pending_audit() {
+        let pending="{\"kind\":\"uncommitted\",\"text\":\"é\"}\n";
+        for length in [0,7,pending.find('é').unwrap()+1,pending.len()] {
+            let (_directory,sink)=setup();
+            let receipt=sink.append_receipted(serde_json::json!({"kind":"committed"})).unwrap();
+            let mut anchor:Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+            anchor.pending=Some(pending.into());sink.save(&anchor).unwrap();
+            private_open(&sink.log,true).unwrap().write_all(&pending.as_bytes()[..length]).unwrap();
+            assert!(sink.read_receipt(&receipt).is_err(),"open pending authority became a receipt source");
+            sink.seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"metadata-only"}))).unwrap();
+            let log=fs::read(&sink.log).unwrap();let anchor=fs::read(&sink.anchor).unwrap();
+            assert_eq!(sink.read_receipt(&receipt).unwrap()["kind"],"committed");
+            let mut future=receipt.clone();future.sequence+=1;
+            future.record_sha256=digest(&pending.as_bytes()[..pending.len()-1]);
+            future.committed_audit_sha256=digest(&log);
+            assert!(sink.read_receipt(&future).is_err(),"uncommitted pending row became a committed receipt");
+            assert_eq!(fs::read(&sink.log).unwrap(),log,"historical lookup replayed pending bytes");
+            assert_eq!(fs::read(&sink.anchor).unwrap(),anchor,"historical lookup rewrote recovery authority");
+            assert!(sink.append(serde_json::json!({"kind":"late"})).is_err());
+        }
+    }
+    #[test]
+    fn recovery_sealed_receipt_refuses_changed_seal_pending_and_tail_without_repair() {
+        for fault in ["tail","seal-hash","seal-pending","pending","sequence","handoff-context","truncated"] {
+            let (_directory,sink)=setup();
+            let receipt=sink.append_receipted(serde_json::json!({"kind":"committed"})).unwrap();
+            let mut anchor:Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+            anchor.pending=Some("{\"kind\":\"pending\"}\n".into());sink.save(&anchor).unwrap();
+            private_open(&sink.log,true).unwrap().write_all(b"{\"kind\":").unwrap();
+            sink.seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"metadata-only"}))).unwrap();
+            let mut anchor:Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+            match fault {
+                "tail"=>private_open(&sink.log,true).unwrap().write_all(b"invalid").unwrap(),
+                "seal-hash"=>anchor.sealed.as_mut().unwrap()["committed_sha256"]="f".repeat(64).into(),
+                "seal-pending"=>anchor.sealed.as_mut().unwrap()["interrupted_append"]="another".into(),
+                "pending"=>anchor.pending=Some("{\"kind\":\"other\"}\n".into()),
+                "sequence"=>{anchor.sequence+=1;anchor.sealed.as_mut().unwrap()["sequence"]=anchor.sequence.into();},
+                "handoff-context"=>anchor.sealed.as_mut().unwrap()["validation"]["handoff_context"]=serde_json::json!({"request":"other"}),
+                "truncated"=>{let bytes=fs::read(&sink.log).unwrap();fs::write(&sink.log,&bytes[..anchor.bytes-1]).unwrap();},
+                _=>unreachable!(),
+            }
+            sink.save(&anchor).unwrap();let before=(fs::read(&sink.log).unwrap(),fs::read(&sink.anchor).unwrap());
+            assert!(sink.read_receipt(&receipt).is_err(),"accepted {fault}");
+            assert_eq!((fs::read(&sink.log).unwrap(),fs::read(&sink.anchor).unwrap()),before,"lookup repaired {fault}");
+        }
+    }
+    #[test]
+    fn recovery_seal_rejects_handoff_before_invoking_recovery_validator() {
+        let (_directory,sink)=setup();
+        let receipt=sink.append_receipted(serde_json::json!({"kind":"committed"})).unwrap();
+        sink.seal_for_handoff(&serde_json::json!({"request":"fixture"}),|_|Ok(serde_json::json!({"fixture":"handoff"}))).unwrap();
+        let anchor=fs::read(&sink.anchor).unwrap();let calls=std::cell::Cell::new(0);
+        let result=sink.seal_for_recovery(|_|{calls.set(calls.get()+1);Ok(serde_json::json!({"fixture":"recovery"}))});
+        assert!(result.is_err(),"a handoff seal was returned as a recovery proof");
+        assert_eq!(calls.get(),0,"recovery validation ran against a handoff-sealed namespace");
+        assert_eq!(fs::read(&sink.anchor).unwrap(),anchor);
+        assert_eq!(sink.read_receipt(&receipt).unwrap()["kind"],"committed");
     }
     #[test]
     fn receipt_lookup_serializes_with_concurrent_appends() {
