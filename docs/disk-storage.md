@@ -55,6 +55,25 @@ they never execute a candidate-controlled host wrapper. Deterministic host gates
 and explicit host/legacy builders retain verified target leases and parent-proof
 checks. No model output can opt into the narrower admission path.
 
+Isolated shared CI also records a private cleanup hold before its supervisor
+starts. The hold binds the exact source, controller and target directories to
+the resource identity observed at admission, before the command is released.
+A completed process or cleanup log alone does not release that ownership:
+normal completion verifies the same kernel scope is quiescent first. A
+resource refusal before admission can release unused storage only when the
+supervisor has reaped its descendants and never received the launch token.
+
+If teardown cannot be proven, CI preserves its source checkout, controller and
+supervisor receipts. The hold survives controller descriptor loss. Every new
+managed storage admission reconciles abandoned holds under the existing
+allocation lock, using the original resource identity and kernel evidence.
+Missing, corrupt, replaced or foreign evidence defers builds and pruning; it
+does not trigger code repair, spend a model call, or change shipping allowance.
+Do not delete hold files, inherited locks or retained checkouts to make an
+admission succeed. Recovery must establish the original correlation and
+positive teardown evidence. The normal updater and worker must use the
+compatible storage implementation before these holds are written.
+
 For ad hoc session names, opt a dedicated build parent into discovery once:
 
 ```sh
