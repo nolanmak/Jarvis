@@ -105,6 +105,7 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
 impl AnchoredAudit {
     /// Verify a historical append reference against this existing audit only.
     /// This lookup grants no current runtime or transfer authority.
+    /// A busy writer returns an I/O WouldBlock error for a fenced retry.
     pub fn read_receipt(&self, receipt: &AppendReceipt) -> Result<serde_json::Value> {
         let hash = |value: &str| value.len() == 64
             && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
@@ -117,7 +118,9 @@ impl AnchoredAudit {
         // lock inode and accidentally coordinate with a different generation.
         let lock = private_existing(&lock_path)?;
         #[cfg(unix)]
-        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "audit lock failed");
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         verify_existing_identity(&lock_path, &lock)?;
         let anchor_file = private_existing(&self.anchor)?;
         let log_file = private_existing(&self.log)?;
@@ -495,8 +498,22 @@ mod tests {
         let task = std::thread::spawn(move || {
             for index in 0..12 {writer.append(serde_json::json!({"kind":"other","index":index})).unwrap();}
         });
+        let read = || {
+            let deadline = std::time::Instant::now()+std::time::Duration::from_secs(5);
+            loop {
+                match sink.read_receipt(&receipt) {
+                    Ok(row) => break row,
+                    Err(error) if error.downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind()==std::io::ErrorKind::WouldBlock) => {
+                        assert!(std::time::Instant::now()<deadline,"writer never settled");
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    },
+                    Err(error) => panic!("{error:#}"),
+                }
+            }
+        };
         for _ in 0..12 {
-            let row = sink.read_receipt(&receipt).unwrap();
+            let row = read();
             assert_eq!(row["kind"],"launch"); assert_eq!(row["request"],"first");
         }
         task.join().unwrap();
@@ -512,7 +529,7 @@ mod tests {
         let (send, receive) = std::sync::mpsc::channel();
         let reader = sink.clone(); let request = receipt.clone();
         let task = std::thread::spawn(move || {send.send(reader.read_receipt(&request)).unwrap();});
-        let result = receive.recv_timeout(std::time::Duration::from_millis(200));
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
         // Release even on failure so this regression never hangs the suite.
         drop(lock); task.join().unwrap();
         let error = result.expect("lookup waited for a held writer lock").unwrap_err();
