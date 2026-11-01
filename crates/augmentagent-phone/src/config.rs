@@ -160,6 +160,7 @@ impl Settings {
             &required("AUGMENTAGENT_PHONE_VERIFICATION_KEY")?,
             links,
         )?
+        .with_inbound(crate::inbound::InboundConfig::from_lookup(&get)?)?
         .with_voice(voice.clone())
         .with_debug_events(debug_events)
         .with_silence(silence)

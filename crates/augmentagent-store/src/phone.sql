@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS phone_origin_authority (
     revision INTEGER NOT NULL CHECK(revision > 0)
 );
 
+-- Inbound calls never receive an outbound dial permit. One PIN attempt per SID.
+CREATE TABLE IF NOT EXISTS phone_inbound_calls (
+    call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),
+    pin_attempted INTEGER NOT NULL DEFAULT 0 CHECK(pin_attempted IN (0,1))
+);
+
 -- Separate additive table so existing call rows and native sessions survive upgrade.
 CREATE TABLE IF NOT EXISTS phone_call_usage (
     call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),

@@ -173,6 +173,7 @@ pub async fn cleanup_without_runtime(
             links: Vec::new(),
             voice: crate::voice::VoiceConfig::default(),
             live: None,
+            inbound: None,
             owner_first_name: None,
             debug_events: false,
             barge_in: crate::relay::BargeIn::default(),
