@@ -748,7 +748,7 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
         let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),
-            resource_audit:std::sync::Mutex::new(None),native_launch:None,native_resource:std::sync::Mutex::new(None),_directory:directory};
+            resource_audit:std::sync::Mutex::new(None),native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
         std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -806,7 +806,7 @@ mod tests {
         let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:true,vm_preflight:false,
             resource_observed:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
-            resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
+            native_launch:None,native_resource:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
         assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
         group.admit_command("verification",None).await.unwrap();
         assert!(group.verified_quiescence().is_err(),"admitted is not completed");
