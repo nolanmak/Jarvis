@@ -257,6 +257,18 @@ mod tests {
         }
     }
     #[test]
+    fn native_launch_dispatch_refuses_held_and_terminal_checkpoints_with_a_live_lease() {
+        for (stage,allowed) in [(Stage::Held,false),(Stage::Merged,false),(Stage::Retired,false),(Stage::Build,true)] {
+            let root=tempfile::tempdir().unwrap();
+            let (mut store,lease,binding)=setup(&root.path().join("workflow.db"),"owner/repo/pr/7",false);
+            let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage=stage;store.checkpoint(&lease,&checkpoint,4).unwrap();
+            assert_eq!(store.validate_dispatch(&lease,&binding,5).is_ok(),allowed,"dispatch boundary accepted {stage:?}");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+        }
+    }
+
+    #[test]
     fn native_launch_bridge_refuses_missing_original_binding_and_stale_lease() {
         for bound in [false,true] {
             let root=tempfile::tempdir().unwrap();
