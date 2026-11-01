@@ -370,15 +370,16 @@ impl std::fmt::Debug for AuditLogger {
 
 impl AuditLogger {
     /// Healthy runtime ownership handoff, distinct from interrupted recovery.
-    pub fn handoff_evidence(&self,request_sha256:&str,destination:&crate::native_vm::RuntimeOwner)->anyhow::Result<serde_json::Value> {
+    pub fn handoff_evidence(&self,request_sha256:&str,destination:&crate::native_vm::RuntimeOwner,assert_current:&dyn Fn()->anyhow::Result<()>)->anyhow::Result<serde_json::Value> {
         anyhow::ensure!(request_sha256.len()==64 && request_sha256.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),"invalid handoff request digest");
         let source=self.native_runtime_owner()?.ok_or_else(||anyhow::anyhow!("handoff source authority missing"))?;
         anyhow::ensure!(source.workflow_id==destination.workflow_id && destination.lease_generation>source.lease_generation,"handoff requires a newer owner of the same workflow");
         let sink=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("handoff requires protected audit"))?;
         let context=serde_json::json!({"version":1,"request_sha256":request_sha256,
-            "source":source,"destination":destination,"source_audit_path":self.path});
+            "source":source,"destination":destination,"source_audit_path":sink.log_path()});
+        assert_current()?;
         sink.seal_for_handoff(&context,|rows| {
-            self.protected_writer_health()?;
+            assert_current()?;self.protected_writer_health()?;
             let generation=rows.iter().filter(|r|r["actor"]=="controller")
                 .filter_map(|r|r["generation"].as_i64()).max()
                 .ok_or_else(||anyhow::anyhow!("previous workflow lease evidence missing"))?;
@@ -405,10 +406,22 @@ impl AuditLogger {
                 }
             }
             let proofs=resources.values().map(|(identity,_,_)|crate::run_resources::verify_quiescent(identity)).collect::<anyhow::Result<Vec<_>>>()?;
+            assert_current()?;
             Ok(serde_json::json!({"previous_lease_generation":generation,"quiescent_resources":proofs}))
         })
     }
 
+    pub(crate) fn protected_log_path(&self)->Option<&Path> {self.anchored.as_ref().map(|sink|sink.log_path())}
+    pub(crate) fn handoff_destination_ready(&self,expected:&crate::native_vm::RuntimeOwner)->anyhow::Result<()> {
+        anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(expected),"destination native authority mismatch");
+        self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("protected destination required"))?.inspect_open(|rows| {
+            self.protected_writer_health()?;
+            anyhow::ensure!(rows.iter().any(|row|row["actor"]=="controller" && row["kind"]=="run_resources_required"),"destination resource policy missing");
+            anyhow::ensure!(rows.iter().filter(|row|row["actor"]=="controller").filter_map(|row|row["generation"].as_i64()).max()==Some(expected.lease_generation)
+                && rows.iter().all(|row|row.get("workflow").is_none() || row["workflow"]==expected.workflow_id),"destination audit authority mismatch");
+            Ok(())
+        })
+    }
     pub(crate) fn protected_anchor_path(&self)->Option<&Path> {self.anchored.as_ref().map(|sink|sink.anchor_path())}
     /// Seal a failed generation only after a new fenced workflow lease and
     /// independent kernel proof that no admitted worker remains alive.
@@ -1439,7 +1452,7 @@ mod tests {
         logger.record_controller(serde_json::json!({"actor":"controller","kind":"workflow_claimed","workflow":source.workflow_id,"generation":1})).unwrap();
         logger.require_run_resources().unwrap();
         let request="a".repeat(64);
-        let proof=logger.handoff_evidence(&request,&destination).expect("healthy runtime has no handoff seal path");
+        let proof=logger.handoff_evidence(&request,&destination,&||Ok(())).expect("healthy runtime has no handoff seal path");
         assert_eq!(proof["validation"]["handoff_context"]["request_sha256"],request);
         assert!(logger.record_controller(serde_json::json!({"actor":"controller","kind":"late"})).is_err());
         assert!(logger.protected_health().is_err()); // A late health append is also closed.
@@ -1447,12 +1460,12 @@ mod tests {
         let sealed_bytes=std::fs::read(&anchor).unwrap();
         let reopened=AuditLogger::protected(log.clone(),anchor.clone(),&[]).unwrap();
         reopened.set_native_runtime_owner(source).unwrap();
-        assert_eq!(reopened.handoff_evidence(&request,&destination).unwrap(),proof);
+        assert_eq!(reopened.handoff_evidence(&request,&destination,&||Ok(())).unwrap(),proof);
         assert_eq!(std::fs::read(&anchor).unwrap(),sealed_bytes,"replay rewrote the sealed anchor");
-        assert!(reopened.handoff_evidence(&"b".repeat(64),&destination).is_err());
-        assert!(reopened.handoff_evidence(&request,&crate::native_vm::RuntimeOwner {lease_generation:3,..destination.clone()}).is_err());
+        assert!(reopened.handoff_evidence(&"b".repeat(64),&destination,&||Ok(())).is_err());
+        assert!(reopened.handoff_evidence(&request,&crate::native_vm::RuntimeOwner {lease_generation:3,..destination.clone()},&||Ok(())).is_err());
         std::fs::write(log,b"changed committed audit").unwrap();
-        assert!(reopened.handoff_evidence(&request,&destination).is_err(),"replay accepted modified committed bytes");
+        assert!(reopened.handoff_evidence(&request,&destination,&||Ok(())).is_err(),"replay accepted modified committed bytes");
     }
 
     fn handoff_fixture()->(tempfile::TempDir,AuditLogger,crate::native_vm::RuntimeOwner,PathBuf) {
@@ -1477,7 +1490,7 @@ mod tests {
         let identity=completed_resource_identity();
         logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":"codex","observation":{"identity":identity}})).unwrap();
         logger.model_call_admitted_in_scope("codex",&identity).unwrap();
-        let proof=logger.handoff_evidence(&"a".repeat(64),&destination).unwrap();
+        let proof=logger.handoff_evidence(&"a".repeat(64),&destination,&||Ok(())).unwrap();
         let observations=proof["validation"]["observation"]["quiescent_resources"].as_array().unwrap();
         assert_eq!(observations.len(),1);
         assert_eq!(observations[0]["identity"],identity);
@@ -1503,7 +1516,7 @@ mod tests {
                 "foreign-workflow"=>logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture","workflow":"foreign"})).unwrap(),
                 _=>{},
             }
-            assert!(logger.handoff_evidence(&"a".repeat(64),&destination).is_err(),"accepted {case}");
+            assert!(logger.handoff_evidence(&"a".repeat(64),&destination,&||Ok(())).is_err(),"accepted {case}");
             let persisted:serde_json::Value=serde_json::from_slice(&std::fs::read(anchor).unwrap()).unwrap();
             assert!(persisted["sealed"].is_null(),"invalid evidence sealed the source: {case}");
             drop(ticket);

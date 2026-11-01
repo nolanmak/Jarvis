@@ -166,6 +166,11 @@ impl AnchoredAudit {
         anchor.sealed=Some(proof.clone());self.save(&anchor)?;Ok(proof)
     }
 
+    pub(crate) fn inspect_open<F>(&self,validate:F)->Result<()> where F:FnOnce(&[serde_json::Value])->Result<()> {
+        let (_lock,anchor,rows,clean)=self.locked_snapshot()?;
+        ensure!(clean && anchor.sealed.is_none(),"audit generation is not healthy and open");validate(&rows)
+    }
+    pub(crate) fn log_path(&self)->&Path {&self.log}
     pub(crate) fn anchor_path(&self)->&Path {&self.anchor}
 
     fn locked_snapshot(&self)->Result<(File,Anchor,Vec<serde_json::Value>,bool)> {
