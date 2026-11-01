@@ -17,6 +17,18 @@ def show(key):
 def escaped(value):
  if '\n' in value or '\r' in value: raise RuntimeError('newline in service configuration')
  return value.replace('\\','\\\\').replace('"','\\"').replace('%','%%')
+def environment_file(path,optional=False,literal=False):
+ # This directive consumes the whole path; embedded shell quotes become
+ # literal filename characters. Preserve inherited glob patterns below.
+ if not pathlib.Path(path).is_absolute() or any(c in path for c in '\n\r\0'):
+  raise RuntimeError('environment file must be an absolute single-line path')
+ if path.endswith('\\'):
+  raise RuntimeError('environment file path cannot end in a line continuation')
+ if literal:
+  # EnvironmentFile uses libc glob patterns. Inherited daemon directives keep
+  # their patterns; our shared selection names one exact file instead.
+  path=''.join('\\'+c if c in '\\*?[]' else c for c in path)
+ return 'EnvironmentFile='+('-' if optional else '')+path.replace('%','%%')
 plan={}
 def write(path,text):
  path.parent.mkdir(parents=True,exist_ok=True)
@@ -38,6 +50,7 @@ def setting(name,override,fallback):
  if not re.fullmatch(r'(?:[0-9]+[KMGTPE]?|infinity)',value):
   raise RuntimeError('invalid resource setting '+name)
  return value
+
 env=shlex.split(show('Environment'))
 extra=['Environment="'+escaped(value)+'"' for value in env]
 # systemctl expands EnvironmentFile specifiers; preserve the resolved paths,
@@ -47,7 +60,7 @@ while raw:
  match=re.match(r'(.*?) \(ignore_errors=(yes|no)\)(?:\s+|$)',raw,re.S)
  if not match:raise RuntimeError('cannot preserve daemon EnvironmentFiles')
  name,optional=match.groups()
- extra.append('EnvironmentFile='+('-' if optional=='yes' else '')+'"'+escaped(name)+'"')
+ extra.append(environment_file(name,optional=='yes'))
  raw=raw[match.end():]
 # Selection is explicit; merely staging a profile never activates it. Keep a
 # shared final EnvironmentFile so both units use the same choice on rollout.
@@ -69,7 +82,7 @@ if selected:
  # EnvironmentFile does not expand systemd specifiers or shell variables.
  value=selected.replace('\\','\\\\').replace('"','\\"')
  selection_text='# Managed by ensure-autopr-worker.sh\nAUGMENTAGENT_NATIVE_VM_POLICY="'+value+'"\n'
-shared_environment='EnvironmentFile=-"'+escaped(str(selection))+'"'
+shared_environment=environment_file(str(selection),True,literal=True)
 extra.append(shared_environment)
 dry=os.environ.get('AUGMENTAGENT_AUTOSTART_DRY_RUN')
 if dry is None:
@@ -126,6 +139,7 @@ Slice=augmentagent-runtime.slice
 # Validate every destination before changing any managed file. Selection is
 # committed last; manager failures restore the prior units and selection.
 if selection_text is not None:write(selection,selection_text)
+subprocess.run(['python3',str(repo/'scripts/secure-release-executables.py'),str(repo/'target/release')],check=True)
 log_dir.mkdir(parents=True,exist_ok=True)
 previous={path:(path.read_bytes(),stat.S_IMODE(path.stat().st_mode)) if path.exists() else None for path in plan}
 written=[]

@@ -98,6 +98,7 @@ mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
 mod imessage_send;
+mod imessage_owner;
 mod imessage_compose;
 mod owner_alerts;
 mod autopr_eval;
@@ -1619,6 +1620,11 @@ enum PersonOp {
 
 #[derive(Subcommand)]
 enum ImessageOp {
+    /// Private owner conversation and native approval-event transport.
+    Owner {
+        #[command(subcommand)]
+        op: imessage_owner::Op,
+    },
     /// Proactive owner alerts, separate from approved replies to contacts.
     Alerts {
         #[command(subcommand)]
@@ -3615,6 +3621,7 @@ async fn main() -> Result<()> {
                 card_surfaces.clone(),
                 interrupted_discord_turns,
                 Some(discord_phone_pending.clone()),
+                true,
             )
             .await
             {
@@ -5132,6 +5139,7 @@ async fn main() -> Result<()> {
         },
         Cmd::Imessage { ref op } => match op {
             ImessageOp::Alerts { op } => owner_alerts::run(&store, op).await,
+            ImessageOp::Owner { op } => imessage_owner::run(&store, op),
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;
                 Ok(())
@@ -11386,6 +11394,7 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
 /// `FallbackReasoner` + `ask_opts`. Lives in the CLI to avoid a circular
 /// dep between the discord crate and the channel-email crate.
 struct WikiQuerier {
+    running_text_turns: dashmap::DashMap<String, Arc<imessage_owner::RunningTurn>>,
     reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
@@ -11418,6 +11427,7 @@ fn wiki_querier(
         voice_enabled,
         phone_tools: std::sync::OnceLock::new(),
         voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     }
 }
@@ -11560,6 +11570,12 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    fn turn_cancellation(&self,session:&str)->Option<CancellationToken> {
+        self.running_text_turns.get(session).map(|r|r.cancel.clone())
+    }
+    async fn owner_command(&self,ctx:&augmentagent_approval_discord::AuditCtx,text:&str)->Option<String> {
+        imessage_owner::owner_command(self,ctx,text).await
+    }
     fn autoship_bound(&self, context: &augmentagent_approval_discord::autoship::Context) -> anyhow::Result<bool> {
         autoship_discord_command::gateway_bound(&autoship_workflow::default_path(), context)
     }
@@ -11625,6 +11641,9 @@ impl QueryHandler for WikiQuerier {
             let bin=self.repo_root.join("target/release/augmentagent");
             for prefix in ["augmentagent".to_string(),bin.display().to_string()] {
                 opts.allowed_tools.push(format!("Bash({prefix} approvals history*)"));
+                if self.conversation_store.as_ref().is_some_and(|store|augmentagent_approval_discord::imessage_owner::OwnerSurface::new(store.clone()).active()) {
+                    opts.allowed_tools.push(format!("Bash({prefix} imessage owner history*)"));
+                }
             }
         }
 
@@ -11748,6 +11767,17 @@ impl QueryHandler for WikiQuerier {
         history: &str,
         current: &str,
     ) -> anyhow::Result<String> {
+        let (cancel,_running)=imessage_owner::begin_turn(self,ctx);
+        let mut combined_history=history.to_owned();
+        if ctx.owner_authorized && !augmentagent_approval_discord::imessage_owner::owner_chat_active() {
+            if let (Some(store),Some(channel))=(self.conversation_store.as_ref(),ctx.channel_id) {
+                if augmentagent_approval_discord::imessage_owner::OwnerSurface::new(store.clone()).active() {
+                combined_history.push_str("\n\n");
+                combined_history.push_str(&store.imessage_owner_chat_history(&channel.get().to_string())?);
+                }
+            }
+        }
+        let history=combined_history.as_str();
         let legacy_prompt = || {
             if history.is_empty() { current.to_string() }
             else { format!("{history}\n\nuser's current message:\n{current}") }
@@ -11769,10 +11799,12 @@ impl QueryHandler for WikiQuerier {
         let (Some(guild_id), Some(channel_id), Some(store)) =
             (ctx.guild_id, ctx.channel_id, self.conversation_store.as_ref())
         else {
-            return self.answer(ctx, &legacy_prompt()).await;
+            let prompt=legacy_prompt();
+            return tokio::select! { _=cancel.cancelled()=>Err(anyhow::anyhow!("Owner text stop requested; cleanup unconfirmed")), result=self.answer(ctx,&prompt)=>result };
         };
         if !self.voice_enabled || !ctx.owner_authorized {
-            return self.answer(ctx, &legacy_prompt()).await;
+            let prompt=legacy_prompt();
+            return tokio::select! { _=cancel.cancelled()=>Err(anyhow::anyhow!("Owner text stop requested; cleanup unconfirmed")), result=self.answer(ctx,&prompt)=>result };
         }
         let guild = guild_id.to_string();
         let channel = channel_id.get().to_string();
@@ -11810,7 +11842,7 @@ impl QueryHandler for WikiQuerier {
                         )
                         .selected(Some(&channel))
                     },
-                    None,
+                    Some(&cancel),
                     |prompt| async move { self.answer(ctx, &prompt).await },
                 )
                 .await?;
@@ -12068,7 +12100,7 @@ mod query_delivery_contract_tests {
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
             conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
             phone_tools: std::sync::OnceLock::new(),
-            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
+            voice_tools: std::sync::OnceLock::new(), running_text_turns: Default::default(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
             ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
@@ -12131,7 +12163,7 @@ mod query_delivery_contract_tests {
             repo_root: fixture.path().to_path_buf(), conversation_store: None,
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
             phone_tools: std::sync::OnceLock::new(),
-            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
+            voice_tools: std::sync::OnceLock::new(), running_text_turns: Default::default(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
         let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
@@ -16168,6 +16200,7 @@ async fn build_broker(
         // is then live: only `serve` closes interrupted turns (#1396).
         Vec::new(),
         None,
+        false,
     )
     .await
 }
@@ -16187,10 +16220,12 @@ async fn build_approval_surfaces(
     surfaces: augmentagent_approval_discord::CardSurfaces,
     interrupted_discord_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
     phone_pending: Option<discord_phone::PendingSlot>,
+    start_owner_worker: bool,
 ) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
         return Ok((Arc::new(NoopBroker), None));
     }
+    let owner_enabled=store.imessage_owner_binding()?.is_some_and(|b|b.enabled);
     let slack = slack.filter(|_| routing.slack);
     let token = if routing.discord {
         std::env::var("DISCORD_BOT_TOKEN").ok()
@@ -16201,7 +16236,7 @@ async fn build_approval_surfaces(
         );
         None
     };
-    if token.is_none() && slack.is_none() {
+    if token.is_none() && slack.is_none() && !owner_enabled {
         if routing.discord {
             warn!("DISCORD_BOT_TOKEN unset; approval broker disabled (replies will error)");
         } else {
@@ -16224,6 +16259,7 @@ async fn build_approval_surfaces(
             warn!("COMPOSIO_API_KEY unset: approvals of Gmail and calendar cards will fail until it is set");
             String::new()
         }
+        (Err(_), None) if owner_enabled => String::new(),
         (Err(_), None) => anyhow::bail!("COMPOSIO_API_KEY env var required"),
     };
     let calendar = Arc::new(
@@ -16245,6 +16281,12 @@ async fn build_approval_surfaces(
     // Keep handles for the broker before `store` is moved into the approver:
     // the #37 Revise-triple capture.
     let store_for_broker = Arc::clone(&store);
+    let owner_surface=Arc::new(augmentagent_approval_discord::imessage_owner::OwnerSurface::new(store.clone()));
+    let owner_card:Arc<dyn augmentagent_approval_discord::ApprovalCardSurface>=owner_surface.clone();
+    surfaces.register(&owner_card);
+    let shared_query=cli.wiki_dir.as_ref().map(|root|Arc::new(wiki_querier(
+        reasoner.clone(),root.clone(),repo_root.clone(),store.clone(),
+        std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref()==Ok("1"))));
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
@@ -16266,14 +16308,10 @@ async fn build_approval_surfaces(
     let mut brokers: Vec<(&'static str, Arc<dyn ApprovalBroker>)> = Vec::new();
     if let Some(token) = token {
         // With Slack beside it, Discord decisions redraw the Slack cards.
-        let handler: Arc<dyn ApprovalActionHandler> = match &slack {
-            Some(_) => Arc::new(augmentagent_approval_discord::SyncingActionHandler::new(
-                "discord",
-                Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
-                surfaces.clone(),
-            )),
-            None => Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
-        };
+        let handler: Arc<dyn ApprovalActionHandler> = Arc::new(
+            augmentagent_approval_discord::SyncingActionHandler::new(
+                "discord", Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>, surfaces.clone(),
+            ));
         match start_discord_broker(
             cli,
             store_for_broker,
@@ -16283,6 +16321,7 @@ async fn build_approval_surfaces(
             &repo_root,
             interrupted_discord_turns,
             phone_pending,
+            shared_query.clone(),
         )
         .await
         {
@@ -16295,7 +16334,7 @@ async fn build_approval_surfaces(
             }
             // #1287 / #1289 — a Discord failure must not take the Slack
             // approvals down with it.
-            Err(e) if slack.is_some() => {
+            Err(e) if slack.is_some() || owner_enabled => {
                 tracing::error!(
                     "discord approval broker disabled: {e:#}. Approvals continue on Slack; fix \
                      the Discord settings and restart the daemon."
@@ -16310,6 +16349,14 @@ async fn build_approval_surfaces(
         slack.set_handler(Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>);
         slack.register();
         brokers.push(("slack", slack as Arc<dyn ApprovalBroker>));
+    }
+    brokers.push(("imessage-owner",owner_surface.clone() as Arc<dyn ApprovalBroker>));
+    if start_owner_worker {
+        if let Some(query)=shared_query {
+            let handler:Arc<dyn ApprovalActionHandler>=Arc::new(augmentagent_approval_discord::SyncingActionHandler::new(
+                "imessage-owner",approver.clone(),surfaces.clone()));
+            imessage_owner::start_runtime(owner_surface,handler,query);
+        }
     }
     let names: Vec<&str> = brokers.iter().map(|(n, _)| *n).collect();
     info!(surfaces = %names.join(","), "approval cards go to these surfaces");
@@ -16359,9 +16406,10 @@ async fn start_discord_broker(
     token: String,
     handler: Arc<dyn ApprovalActionHandler>,
     reasoner: &Arc<FallbackReasoner>,
-    repo_root: &Path,
+    _repo_root: &Path,
     interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
     phone_pending: Option<discord_phone::PendingSlot>,
+    shared_query: Option<Arc<WikiQuerier>>,
 ) -> Result<DiscordApprovalBroker> {
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
         .context("DISCORD_CHANNEL_ID env var required")?
@@ -16382,15 +16430,7 @@ async fn start_discord_broker(
     let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
         std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
-    let query_handler: Option<Arc<WikiQuerier>> = cli.wiki_dir.as_ref().map(|root| {
-        Arc::new(wiki_querier(
-            Arc::clone(reasoner),
-            root.clone(),
-            repo_root.to_path_buf(),
-            Arc::clone(&store),
-            voice_enabled,
-        ))
-    });
+    let query_handler=shared_query;
     // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
     // exists (keyring/env); without it the command replies with the
     // not-configured notice and the daemon is otherwise unaffected.
@@ -16430,16 +16470,22 @@ async fn journal_ops_from_env(
     cli: &Cli,
     reasoner: &Arc<FallbackReasoner>,
 ) -> Option<Arc<dyn augmentagent_approval_discord::JournalOps>> {
+    journal_ops_for_wiki(cli.wiki_dir.clone(), reasoner).await
+}
+
+async fn journal_ops_for_wiki(
+    wiki_root: Option<PathBuf>,
+    reasoner: &Arc<FallbackReasoner>,
+) -> Option<Arc<dyn augmentagent_approval_discord::JournalOps>> {
     match augmentagent_channel_journal::JournalRuntime::from_env().await {
         Ok(Some(runtime)) => {
-            let wiki_schema = cli
-                .wiki_dir
+            let wiki_schema = wiki_root
                 .as_ref()
                 .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
             Some(Arc::new(CliJournalOps {
                 runtime,
                 reasoner: Arc::clone(reasoner),
-                wiki_root: cli.wiki_dir.clone(),
+                wiki_root: wiki_root.clone(),
                 wiki_schema,
             }))
         }

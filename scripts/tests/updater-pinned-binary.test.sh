@@ -41,6 +41,7 @@ make_case() {
   printf '#!/bin/sh\nexec ./target/release/augmentagent "$@"\n' > "$TMP/work/scripts/run-rs.sh"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
+  cp "$REPO_ROOT/scripts/secure-release-executables.py" "$TMP/work/scripts/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
@@ -54,6 +55,8 @@ make_case() {
   # The binary the updater "builds", and a frozen copy of the checkout a
   # rollout might pin (binary + a same-named wrapper).
   printf '#!/bin/sh\n' > "$TMP/work/target/release/augmentagent"
+  chmod +x "$TMP/work/target/release/augmentagent"
+  cp "$TMP/work/target/release/augmentagent" "$TMP/work/target/release/augmentagent-mcp-memory"
   mkdir -p "$TMP/frozen/scripts" "$TMP/frozen/target/release"
   printf '#!/bin/sh\n' > "$TMP/frozen/target/release/augmentagent"
   printf '#!/bin/sh\n' > "$TMP/frozen/scripts/run-rs.sh"
