@@ -1081,6 +1081,20 @@ mod tests {
         assert_eq!(super::super::owner_outcome::capture_owner_with_policy(None, &|| Ok(())), Err(TransferReason::RuntimeUnavailable));
     }
     #[test]
+    fn native_owner_binding_capture_refuses_lost_authority_without_recreating_it() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let database = f.root.join("runtime-retirement.sqlite");
+        {
+            let _lock = super::super::StateLock::acquire(&f.root).unwrap();
+            let connection = augmentagent_store::rusqlite::Connection::open(&database).unwrap();
+            connection.execute_batch("DROP TABLE native_transfer").unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())), Err(TransferReason::PendingUnknown));
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+    #[test]
     fn native_owner_binding_capture_rechecks_authority_after_store_verification() {
         let f = empty_binding_fixture();
         let path = policy(&f);
