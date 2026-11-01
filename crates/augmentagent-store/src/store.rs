@@ -5078,6 +5078,27 @@ impl Store {
                 },
             )
             .optional()?;
+        // #1764 — a WhatsApp archive group card goes to every member. Every
+        // repost (Revise, nudge, recompose) reloads this row, so restore the
+        // recipients stored at import; scoped so no other platform's `to`
+        // (which feeds Gmail reply routing) changes.
+        let mut row = row;
+        if let Some(r) = row.as_mut().filter(|r| {
+            r.email.platform == "whatsapp" && r.email.account_entity_id.as_deref() == Some("whatsapp-history")
+        }) {
+            let raw: Option<String> = guard
+                .query_row(
+                    "SELECT retryGuardContext FROM emails WHERE messageId = ?1",
+                    params![r.email.message_id],
+                    |q| q.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some((to, cc, _)) = raw.and_then(|raw| serde_json::from_str::<(String, String, Vec<String>)>(&raw).ok()) {
+                r.email.to = to;
+                r.email.cc = cc;
+            }
+        }
         Ok(row)
     }
 
@@ -6191,44 +6212,62 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// `(action id, approved text, approved at ms)` awaiting confirmation on a thread.
+    /// `(action id, approved text, approved at ms)` awaiting confirmation on a
+    /// thread — including ones already expired, so a paste whose archive
+    /// timestamp is inside the window still confirms when the archive was late.
     pub fn manual_sends_pending_for_thread(&self, thread_id: &str) -> StoreResult<Vec<(String, String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
             "SELECT id, COALESCE(draftBody, ''), updatedAt FROM actions \
-              WHERE threadId = ?1 AND status = 'approved' AND errorMessage = ?2 \
+              WHERE threadId = ?1 AND ((status = 'approved' AND errorMessage = ?2) \
+                                    OR (status = 'error' AND errorMessage = ?3)) \
               ORDER BY updatedAt",
         )?;
-        let rows = stmt.query_map(params![thread_id, MANUAL_SEND_PENDING], |r| {
+        let rows = stmt.query_map(params![thread_id, MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The owner's pasted message showed up in the archive: `approved → sent`.
+    /// The owner's pasted message showed up in the archive: `approved → sent`
+    /// (or a late archive: expired `error → sent`).
     pub fn confirm_manual_send(&self, action_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let n = guard.execute(
-            "UPDATE actions SET status = 'sent', errorMessage = NULL, updatedAt = ?3 \
-              WHERE id = ?1 AND status = 'approved' AND errorMessage = ?2",
-            params![action_id, MANUAL_SEND_PENDING, now_millis()],
+            "UPDATE actions SET status = 'sent', errorMessage = NULL, updatedAt = ?4 \
+              WHERE id = ?1 AND ((status = 'approved' AND errorMessage = ?2) \
+                              OR (status = 'error' AND errorMessage = ?3))",
+            params![action_id, MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED, now_millis()],
         )?;
         Ok(n == 1)
     }
 
     /// Unconfirmed manual sends approved before `before_ms` become `error`
-    /// (never resent). Returns the ids.
+    /// (never resent). Returns the ids. `updatedAt` keeps the approval time,
+    /// so a late archive can still confirm against the original window.
     pub fn expire_manual_sends(&self, before_ms: i64) -> StoreResult<Vec<String>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "UPDATE actions SET status = 'error', errorMessage = ?3, updatedAt = ?4 \
+            "UPDATE actions SET status = 'error', errorMessage = ?3 \
               WHERE status = 'approved' AND errorMessage = ?1 AND updatedAt < ?2 RETURNING id",
         )?;
         let rows = stmt.query_map(
-            params![MANUAL_SEND_PENDING, before_ms, MANUAL_SEND_UNCONFIRMED, now_millis()],
+            params![MANUAL_SEND_PENDING, before_ms, MANUAL_SEND_UNCONFIRMED],
             |r| r.get(0),
         )?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// `(awaiting paste, expired unconfirmed)` WhatsApp-style manual sends,
+    /// for the owner's status view (#1765).
+    pub fn manual_send_counts(&self) -> StoreResult<(i64, i64)> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT COALESCE(SUM(status = 'approved' AND errorMessage = ?1), 0), \
+                    COALESCE(SUM(status = 'error' AND errorMessage = ?2), 0) FROM actions",
+            params![MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     // --- tone profiles & examples (issue #73) ---

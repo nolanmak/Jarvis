@@ -184,7 +184,13 @@ WhatsApp. When the archive shows your message with that text within
 `AUGMENTAGENT_WHATSAPP_MANUAL_SEND_WINDOW_MINS` (default 120), the action
 becomes `sent`. If it never shows up, the action becomes `error` ("manual send
 not confirmed in the archive; nothing was sent automatically"). Nothing is
-ever resent. A different message you type in that chat counts as a manual
+ever resent. The window is measured from the message's own time, so a paste
+the archive delivers late (WhatsApp Desktop was closed) still confirms, even
+after the row was marked `error`. A reply too long to show inline arrives as
+an attached `whatsapp-reply.txt`. `deny-outbound <jid>` refuses Approve for
+that chat (the card stays pending); outbound defaults are not needed for
+archive cards. `augmentagent whatsapp-history status` counts replies awaiting
+your paste and those never confirmed. Revise and Skip work as on every card. A different message you type in that chat counts as a manual
 reply. Teammate coverage (#1700) applies to group cards: a rostered teammate
 answering the asker retires the card. Configure teammates by phone number; a
 teammate seen only as an unmapped `@lid` never matches.

@@ -14701,6 +14701,7 @@ impl ApprovalActionHandler for ReplyApprover {
                 | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
                 | ApprovalActionOutcome::DocumentSigned { already_existed: false, .. }
                 | ApprovalActionOutcome::Scheduled { .. }
+                | ApprovalActionOutcome::ManualSendReady { .. }
         ) {
             self.trigger_next_nudge().await;
         }
@@ -15329,7 +15330,9 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.skip_socialapi(action_id, action);
         }
-        if action.email.platform == imessage_send::PLATFORM {
+        if action.email.platform == imessage_send::PLATFORM
+            || augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email)
+        {
             return self.skip_imessage(action_id, action);
         }
         if is_linkedin_email(&action.email) {
@@ -15414,7 +15417,11 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.revise_socialapi(action_id, feedback, action).await;
         }
-        if action.email.platform == imessage_send::PLATFORM {
+        // #1765 — WhatsApp archive cards have no server draft either; never
+        // the Gmail tail below (Composio call against the monthly cap).
+        if action.email.platform == imessage_send::PLATFORM
+            || augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email)
+        {
             return self
                 .revise_without_server_draft(action_id, feedback, action)
                 .await;
