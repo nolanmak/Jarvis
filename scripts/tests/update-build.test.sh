@@ -48,4 +48,22 @@ export FAKE_OUTPUT=$'error: type mismatch\nsource: "build storage busy; retry ad
 check 1; grep -q 'RUST BUILD FAILED' "$LOG"
 export FAKE_MODE=none FAKE_CODE=0 FAKE_OUTPUT='bootstrap'
 check 0; grep -q '^build --release ' "$FAKE_CALLS"
-echo '8 update build outcome cases passed'
+# The producer must repair cached output before CLI admission, and new
+# Cargo output before any subsequent preflight/service launch.
+mkdir -p "$TMP/target/release"
+cat > "$TMP/target/release/augmentagent" <<'STUB'
+#!/usr/bin/env bash
+if (( (8#$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$0") & 8#022) != 0 )); then
+  echo unsafe-cli >> "$FAKE_CALLS"
+fi
+if [ "$*" = 'disk build --help' ]; then echo '--update'; exit 0; fi
+chmod 775 "$(dirname "$0")/augmentagent" "$(dirname "$0")/augmentagent-mcp-memory"
+STUB
+cp "$TMP/target/release/augmentagent" "$TMP/target/release/augmentagent-mcp-memory"
+chmod 775 "$TMP/target/release/"*
+: > "$FAKE_CALLS"
+run_update_build "$TMP/target/release/augmentagent" "$TMP/target"
+! grep -q unsafe-cli "$FAKE_CALLS"
+[ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$TMP/target/release/augmentagent")" = 755 ]
+[ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$TMP/target/release/augmentagent-mcp-memory")" = 755 ]
+echo '9 update build outcome and permission cases passed'

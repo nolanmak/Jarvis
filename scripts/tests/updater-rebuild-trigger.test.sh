@@ -44,6 +44,7 @@ make_case() {
   printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
+  cp "$REPO_ROOT/scripts/secure-release-executables.py" "$TMP/work/scripts/"
   echo "# base" > "$TMP/work/$path"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
@@ -129,6 +130,7 @@ fi
 exit 1
 STUB
 chmod +x "$TMP/work/target/release/augmentagent"
+cp "$TMP/work/target/release/augmentagent" "$TMP/work/target/release/augmentagent-mcp-memory"
 if updater_rebuilt && grep -q 'disk build --target-dir .*target -- cargo build --release' "$TMP/storage-calls"; then
   ok "release build participates in storage admission when supported"
 else
@@ -269,6 +271,7 @@ case "$1" in
 esac
 STUB
 chmod +x "$TMP/work/sidecars/browser/setup.sh" "$TMP/work/target/release/augmentagent" "$TMP/bin/launchctl"
+cp "$TMP/work/target/release/augmentagent" "$TMP/work/target/release/augmentagent-mcp-memory"
 updater_rebuilt || true
 if grep -q '^install browser-sidecar$' "$TMP/browser-install-calls" 2>/dev/null; then
   ok "refreshes installed macOS browser plists when the installer changes"

@@ -23,11 +23,19 @@ bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 make_case() {
   TMP=$(mktemp -d); export TMP
   mkdir -p "$TMP/repo/scripts/lib" "$TMP/repo/target/release" "$TMP/bin" "$TMP/home"
-  cp "$REPO_ROOT/scripts/install-autostart.sh" "$REPO_ROOT/scripts/configure-run-resources.sh" "$REPO_ROOT/scripts/install-tenant.sh" "$TMP/repo/scripts/"
+  cp "$REPO_ROOT/scripts/install-autostart.sh" "$REPO_ROOT/scripts/secure-release-executables.py" "$REPO_ROOT/scripts/configure-run-resources.sh" "$REPO_ROOT/scripts/install-tenant.sh" "$TMP/repo/scripts/"
   cp "$REPO_ROOT/scripts/lib/launchd-install.sh" "$TMP/repo/scripts/lib/"
   printf '# PDF installation is tested separately.\n' > "$TMP/repo/scripts/pdf-runtime.py"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/scripts/run-rs.sh"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/repo/target/release/augmentagent"
+  cat > "$TMP/repo/target/release/augmentagent" <<'STUB'
+#!/usr/bin/env bash
+if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o022 else 1)' "$0"; then
+  touch "$TMP/unsafe-cli"
+fi
+exit 0
+STUB
+  cp "$TMP/repo/target/release/augmentagent" "$TMP/repo/target/release/augmentagent-mcp-memory"
+  chmod +x "$TMP/repo/target/release/augmentagent-mcp-memory"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/bin/systemctl"
   # The unit cases render the Linux branch on any host (#1079: CI runs macOS too).
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname"
@@ -59,8 +67,11 @@ echo "install-autostart.sh unit resource limits (#902):"
 
 # --- defaults -------------------------------------------------------------
 make_case
+chmod 775 "$TMP/repo/target/release/augmentagent" "$TMP/repo/target/release/augmentagent-mcp-memory"
 if run_installer install-autostart.sh; then ok "installer runs against a throwaway HOME"
 else bad "installer runs against a throwaway HOME" "$(tail -3 "$TMP/install.out")"; fi
+if [ ! -e "$TMP/unsafe-cli" ]; then ok "installer secures cached executables before its CLI preflight"
+else bad "installer secures cached executables before its CLI preflight"; fi
 [ -s "$UNIT" ] && ok "renders the unit" || bad "renders the unit" "no file at $UNIT"
 expect_directives "$UNIT" "daemon unit"
 for d in "CPUQuota=400%"; do
