@@ -103,19 +103,23 @@ fn cleanup_receipt_complete(bytes:&[u8])->bool {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if !self.receipt.exists() {
+        // Creation precedes the supervisor's write/chmod/fsync. A visible
+        // pathname is not yet a complete proof; give publication the same
+        // bounded wait as a missing receipt, without accepting partial bytes.
+        let complete=|| private_read(&self.receipt).is_ok_and(|bytes|cleanup_receipt_complete(&bytes));
+        if !complete() {
             // Signal the supervisor, which retains ownership of detached
             // grandchildren and acknowledges only after reaping every child.
             unsafe { libc::kill(self.id, libc::SIGTERM); }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !self.receipt.exists() && std::time::Instant::now() < deadline {
+            while !complete() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         if let Ok(audit)=self.resource_audit.lock() {
             if let Some((provider,logger))=audit.as_ref() { let _=self.resource_outcome(provider,Some(logger)); }
         }
-        let mut processes_settled = std::fs::read(&self.receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
+        let mut processes_settled = complete();
         if !processes_settled {
             unsafe { libc::kill(self.id,libc::SIGKILL); }
             if self.resource_required {
@@ -631,6 +635,32 @@ mod tests {
     use serde_json::{json, Value};
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[test]
+    fn cleanup_waits_for_complete_receipt_after_path_is_created() {
+        for prefix in [b"".as_slice(),b"all-descendants-".as_slice()] {
+            let directory=tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            let receipt=directory.path().join("cleanup-complete");
+            let mut output=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+            output.write_all(prefix).unwrap();output.sync_all().unwrap();
+            let mut child=std::process::Command::new("sleep").arg("5").spawn().unwrap();
+            let id=child.id() as libc::pid_t;
+            let prefix_length=prefix.len();
+            let writer=std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _=child.kill();child.wait().unwrap();
+                // Publish completion only after the fixture's actual child is reaped.
+                output.write_all(&b"all-descendants-reaped\n"[prefix_length..]).unwrap();output.sync_all().unwrap();
+            });
+            let clean=Arc::new(AtomicBool::new(false));
+            let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
+                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
+                resource_audit:std::sync::Mutex::new(None),_directory:directory};
+            drop(group);writer.join().unwrap();
+            assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
+        }
+    }
 
     #[test]
     fn setup_diagnostics_do_not_masquerade_as_capacity_or_echo_untrusted_detail() {
