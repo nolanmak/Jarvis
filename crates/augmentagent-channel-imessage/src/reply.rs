@@ -32,10 +32,24 @@ pub const COMPOSE_KIND: &str = "compose";
 
 /// Appended to the trusted part of the triage prompt for a group card
 /// (#1738). The group's title and members ride in the card's Subject/To.
-pub const GROUP_TRIAGE_POLICY: &str = "\n\nThis message is from a GROUP chat (members in To; the owner's own entries are marked `me`). The bar for \"reply\" is higher than in a 1:1: choose \"reply\" only when the newest message addresses the owner (by name, a direct question to them, or an answer to something they said) or asks something that is clearly the owner's to answer. General chatter, reactions, logistics between other members and questions addressed to someone else are \"skip\", not \"flag\". Choose \"flag\" only for something important the owner must see today.";
+pub const GROUP_TRIAGE_POLICY: &str = "\n\nThis message is from an iMessage GROUP chat (members in To; the owner's own entries are marked `me`). The bar for \"reply\" is higher than in a 1:1: choose \"reply\" only when the newest message addresses the owner (by name, a direct question to them, or an answer to something they said) or asks something that is clearly the owner's to answer. General chatter, reactions, logistics between other members and questions addressed to someone else are \"skip\", not \"flag\". Choose \"flag\" only for something important the owner must see today.";
+
+/// The group triage policy and draft note for `platform` (`email.platform`).
+/// iMessage keeps the exact #1739 wording (#448: triage prompt changes are
+/// measured, never incidental); other platforms swap in their own name.
+pub fn group_notes(platform: &str) -> (String, String) {
+    let name = match platform {
+        "whatsapp" => "WhatsApp",
+        _ => return (GROUP_TRIAGE_POLICY.into(), GROUP_DRAFT_NOTE.into()),
+    };
+    (
+        GROUP_TRIAGE_POLICY.replace("an iMessage GROUP", &format!("a {name} GROUP")),
+        GROUP_DRAFT_NOTE.replace("iMessage group", &format!("{name} group")),
+    )
+}
 
 /// Appended to the draft prompt for a group card (#1738).
-pub const GROUP_DRAFT_NOTE: &str = "\n\nThis reply goes to the whole group (members in To). Write one short message to the group; name the person you are answering when it would otherwise be unclear.";
+pub const GROUP_DRAFT_NOTE: &str = "\n\nThis reply goes to the whole iMessage group (members in To). Write one short message to the group; name the person you are answering when it would otherwise be unclear.";
 
 #[derive(Debug, Clone)]
 pub struct ImessageReplyConfig {
@@ -317,8 +331,9 @@ impl CardDrafter<'_> {
                 self.store, &email, self.config.wiki_root.as_deref(),
             )?.prompt()
         } else { String::new() };
+        let (group_policy, group_note) = group_notes(&email.platform);
         if group {
-            baseline.push_str(GROUP_TRIAGE_POLICY);
+            baseline.push_str(&group_policy);
         }
         let triage = triage_opts(self.config.wiki_root.clone());
         let raw = self
@@ -356,7 +371,7 @@ impl CardDrafter<'_> {
         let draft_opts = draft_opts(skill, self.config.wiki_root.clone());
         let mut evidence = context.prompt();
         if group {
-            evidence.push_str(GROUP_DRAFT_NOTE);
+            evidence.push_str(&group_note);
         }
         let drafted = self
             .reasoner
@@ -1055,6 +1070,15 @@ mod tests {
             crate::resolve_target("imessage:chat900", &[group(None)]),
             Err(crate::TargetError::GroupUnsupported)
         );
+    }
+
+    #[test]
+    fn imessage_keeps_its_exact_group_wording_and_whatsapp_gets_its_own() {
+        assert!(GROUP_TRIAGE_POLICY.starts_with("\n\nThis message is from an iMessage GROUP chat"));
+        assert_eq!(group_notes("imessage"), (GROUP_TRIAGE_POLICY.to_string(), GROUP_DRAFT_NOTE.to_string()));
+        let (policy, note) = group_notes("whatsapp");
+        assert!(policy.contains("from a WhatsApp GROUP chat") && !policy.contains("iMessage"), "{policy}");
+        assert!(note.contains("whole WhatsApp group") && !note.contains("iMessage"), "{note}");
     }
 
     #[test]

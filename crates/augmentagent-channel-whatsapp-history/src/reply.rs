@@ -174,17 +174,6 @@ impl WhatsappReplier {
 
     pub async fn handle_deltas_at(&self, deltas: &[Delta], now_ms: i64) -> ReplyStats {
         let mut stats = ReplyStats::default();
-        let cutoff = now_ms - self.manual_send_window.as_millis() as i64;
-        match self.store.expire_manual_sends(cutoff) {
-            Ok(ids) if !ids.is_empty() => {
-                warn!(count = ids.len(), "whatsapp manual sends never showed up in the archive; marked error, nothing resent")
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("whatsapp manual-send expiry failed: {e:#}");
-                stats.errors += 1;
-            }
-        }
         for delta in deltas {
             if delta.first_run {
                 continue;
@@ -247,6 +236,19 @@ impl WhatsappReplier {
                 }
             }
         }
+        // Only after this poll's archive entries had their chance to confirm:
+        // expiring first would mark a paste the archive just delivered as never sent.
+        let cutoff = now_ms - self.manual_send_window.as_millis() as i64;
+        match self.store.expire_manual_sends(cutoff) {
+            Ok(ids) if !ids.is_empty() => {
+                warn!(count = ids.len(), "whatsapp manual sends never showed up in the archive; marked error, nothing resent")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("whatsapp manual-send expiry failed: {e:#}");
+                stats.errors += 1;
+            }
+        }
         stats
     }
 }
@@ -270,7 +272,7 @@ mod tests {
     use super::*;
     use augmentagent_approval_discord::ApprovalError;
     use augmentagent_channel_core::reasoner::ReasonerOpts;
-    use augmentagent_channel_imessage::{Conversation, GROUP_DRAFT_NOTE, GROUP_TRIAGE_POLICY};
+    use augmentagent_channel_imessage::{group_notes, Conversation};
     use augmentagent_store::ActionStatus;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -435,8 +437,9 @@ mod tests {
         let stats = run(&f, r.clone(), d).await;
         assert_eq!(stats.cards, 1);
         let prompts = r.prompts();
-        assert!(prompts[0].contains(GROUP_TRIAGE_POLICY));
-        assert!(prompts[1].contains(GROUP_DRAFT_NOTE));
+        let (policy, note) = group_notes("whatsapp");
+        assert!(prompts[0].contains(&policy));
+        assert!(prompts[1].contains(&note));
         let card = &f.broker.cards.lock().unwrap()[0].1;
         assert_eq!(card.subject, "WhatsApp group: Ski Trip");
         assert_eq!(card.to, "Jo <+14155550999>, Ana <+14155550777>"); // pii-ok synthetic
@@ -581,6 +584,36 @@ mod tests {
         assert_eq!(status(&f.store, &id), ("error".into(), Some(augmentagent_store::MANUAL_SEND_UNCONFIRMED.into())));
         assert_eq!(status(&f.store, &fresh).0, "approved");
         assert!(f.broker.cards.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paste_arriving_in_the_poll_that_crosses_the_window_still_confirms() {
+        // Approved 125 min ago, pasted at +100 min; the archive only delivers it now.
+        let f = fx();
+        let id = approved_card(&f, "On my way!", 125);
+        let stats = run(&f, Scripted::new(&[]), delta(dm(), vec![entry("me", "On my way!", 25)], false)).await;
+        assert_eq!((stats.own_sends, stats.manual_replies), (1, 0));
+        assert_eq!(status(&f.store, &id), ("sent".into(), None));
+    }
+
+    #[tokio::test]
+    async fn late_archive_confirms_an_already_expired_row_within_its_original_window() {
+        let f = fx();
+        let id = approved_card(&f, "On my way!", 200);
+        replier(&f, Scripted::new(&[])).handle_deltas_at(&[], now_ms()).await;
+        assert_eq!(status(&f.store, &id).0, "error");
+        // Pasted 100 min after approval, but WhatsApp Desktop was closed until now.
+        let stats = run(&f, Scripted::new(&[]), delta(dm(), vec![entry("me", "On my way!", 100)], false)).await;
+        assert_eq!(stats.own_sends, 1);
+        assert_eq!(status(&f.store, &id), ("sent".into(), None));
+        // Outside the original window never confirms.
+        let late = approved_card(&f, "Later", 300);
+        replier(&f, Scripted::new(&[])).handle_deltas_at(&[], now_ms()).await;
+        let mut d = delta(dm(), vec![entry("me", "Later", 10)], false);
+        d.entries[0].0 = 30;
+        assert_eq!(run(&f, Scripted::new(&[]), d).await.own_sends, 0);
+        assert_eq!(status(&f.store, &late).0, "error");
+        assert_eq!(f.store.manual_send_counts().unwrap(), (0, 1));
     }
 
     #[test]

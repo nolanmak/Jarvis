@@ -28,10 +28,14 @@ pub enum Op {
     DenyInbound { jid: String },
     /// Allow approved replies for a chat, lifting any denial.
     AllowOutbound { jid: String },
-    /// Refuse approved replies for a chat, even while defaults are on.
+    /// Refuse approved replies for a chat (archive cards and the live
+    /// channel), even while defaults are on.
     DenyOutbound { jid: String },
     /// Print defaults, explicit entries and denials for both directions.
     Allowlist,
+    /// Approved replies still awaiting your paste, and ones never seen in the
+    /// archive (marked error, never resent).
+    Status,
 }
 
 /// #1765 — Approve on a WhatsApp archive card. Nothing is sent: the action
@@ -46,9 +50,24 @@ pub fn approve(
     let Some(draft) = action.action.draft_body.as_deref() else {
         return Outcome::Failed { message: "no draft body on action; nothing to send".into() };
     };
-    let text = augmentagent_approval_discord::strip_assumes_for_send(draft);
+    // What is shown is exactly what is stored and matched later: a code
+    // fence inside the draft would break the paste block, so neutralise it
+    // here rather than only in the rendering (#1765).
+    let text = augmentagent_approval_discord::strip_assumes_for_send(draft).replace("```", "'''");
     if text.trim().is_empty() {
         return Outcome::Failed { message: "draft is empty after removing card markers".into() };
+    }
+    // `deny-outbound <jid>` refuses replies to that chat; the card stays
+    // pending (Skip it, or `allow-outbound` to lift the denial).
+    let jid = action.email.thread_id.as_deref().and_then(|t| t.strip_prefix(history::THREAD_PREFIX));
+    match (jid, store.list_whatsapp_policy(true)) {
+        (Some(jid), Ok((_, denied))) if denied.iter().any(|d| d == jid) => {
+            return Outcome::Failed {
+                message: format!("replies to this chat are denied; run `augmentagent whatsapp-history allow-outbound {jid}` to lift it"),
+            }
+        }
+        (_, Err(e)) => return Outcome::Failed { message: format!("checking the outbound policy failed: {e}") },
+        _ => {}
     }
     match store.mark_manual_send_pending(action_id) {
         Ok(true) => {}
@@ -95,9 +114,24 @@ pub fn policy_command(store: &Store, op: &Op) -> Result<()> {
         Op::AllowOutbound { jid } => store.allow_whatsapp_outbound(&checked(jid)?)?,
         Op::DenyOutbound { jid } => store.deny_whatsapp_outbound(&checked(jid)?)?,
         Op::Allowlist => {}
+        Op::Status => {
+            print!("{}", render_status(store)?);
+            return Ok(());
+        }
     }
     print!("{}", render_policy(store)?);
     Ok(())
+}
+
+pub fn render_status(store: &Store) -> Result<String> {
+    let (awaiting, unconfirmed) = store.manual_send_counts()?;
+    let mut out = format!(
+        "manual sends awaiting paste\t{awaiting}\nmanual sends not confirmed in the archive\t{unconfirmed}\n"
+    );
+    if unconfirmed > 0 {
+        out.push_str("Check WhatsApp for those chats: nothing was sent automatically, and nothing will be resent.\n");
+    }
+    Ok(out)
 }
 
 pub fn render_policy(store: &Store) -> Result<String> {
@@ -301,6 +335,80 @@ mod approve_tests {
         assert_eq!(link, None);
         let row = store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(row.action.draft_body.as_deref().map(str::trim), Some("See you all there."), "stored text is what gets matched");
+    }
+
+    struct Redraft;
+
+    #[async_trait::async_trait]
+    impl augmentagent_channel_core::Reasoner for Redraft {
+        async fn call(&self, o: &augmentagent_channel_core::reasoner::ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+            if o.system_prompt.contains("You select evidence") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
+            Ok("a warmer reply".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn revise_and_skip_route_to_the_history_paths_never_gmail() {
+        let (store, mut approver, dir) = fixture();
+        approver.reasoner = Arc::new(augmentagent_channel_core::fallback::FallbackReasoner::for_tests(
+            vec![(augmentagent_channel_core::ProviderKind::Claude, Arc::new(Redraft) as Arc<dyn augmentagent_channel_core::Reasoner>)],
+            augmentagent_channel_core::cooldown::CooldownLatch::at(dir.path().join("latch.json")),
+        ));
+        let id = seed(&store, DM, "yes");
+        // The Gmail tail would fail here (no Google route, fake Composio key).
+        match approver.run_revise(&id, "warmer").await {
+            ApprovalActionOutcome::Revised { draft, .. } => assert_eq!(draft, "a warmer reply"),
+            other => panic!("expected Revised, got {other:?}"),
+        }
+        let row = store.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!((row.action.status.as_str(), row.draft_id.as_deref()), ("pending", None));
+        assert_eq!(row.action.draft_body.as_deref(), Some("a warmer reply"));
+        assert!(matches!(approver.run_skip(&id).await, ApprovalActionOutcome::Skipped));
+        assert_eq!(store.get_action_with_email(&id).unwrap().unwrap().action.status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn shown_and_stored_text_are_identical_even_with_code_fences() {
+        let (store, approver, _d) = fixture();
+        let id = seed(&store, DM, "run ```ls``` first");
+        let ApprovalActionOutcome::ManualSendReady { text, link } = approver.run_approve(&id).await else { panic!() };
+        assert_eq!(text, "run QQQlsQQQ first".replace("QQQ", "'''"));
+        let stored = store.get_action_with_email(&id).unwrap().unwrap().action.draft_body.unwrap();
+        assert_eq!(stored, text, "confirmation compares against exactly what was shown");
+        let shown = augmentagent_approval_discord::outcome::describe(&ApprovalActionOutcome::ManualSendReady { text: text.clone(), link });
+        assert!(shown.contains(&format!("```\n{text}\n```")), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn deny_outbound_refuses_an_archive_card_and_leaves_it_pending() {
+        let (store, approver, _d) = fixture();
+        store.deny_whatsapp_outbound(GROUP).unwrap();
+        let id = seed(&store, GROUP, "see you all");
+        let ApprovalActionOutcome::Failed { message } = approver.run_approve(&id).await else { panic!() };
+        assert!(message.contains(&format!("allow-outbound {GROUP}")), "{message}");
+        assert_eq!(store.get_action_with_email(&id).unwrap().unwrap().action.status, "pending");
+        store.allow_whatsapp_outbound(GROUP).unwrap();
+        assert!(matches!(approver.run_approve(&id).await, ApprovalActionOutcome::ManualSendReady { .. }));
+        // Outbound defaults stay off: only a denial refuses, never the absence of an entry.
+        let other = seed(&store, DM, "hi");
+        assert!(!store.is_whatsapp_outbound_allowed(DM).unwrap());
+        assert!(matches!(approver.run_approve(&other).await, ApprovalActionOutcome::ManualSendReady { .. }));
+    }
+
+    #[test]
+    fn status_reports_awaiting_and_unconfirmed_manual_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("d.db")).unwrap();
+        let a = seed(&store, DM, "one");
+        let b = seed(&store, GROUP, "two");
+        assert!(store.mark_manual_send_pending(&a).unwrap() && store.mark_manual_send_pending(&b).unwrap());
+        store.with_conn(|c| c.execute("UPDATE actions SET updatedAt = 0 WHERE id = ?1", [&b])).unwrap();
+        assert_eq!(store.expire_manual_sends(1).unwrap(), vec![b]);
+        let text = render_status(&store).unwrap();
+        assert!(text.contains("awaiting paste\t1") && text.contains("not confirmed in the archive\t1"), "{text}");
+        assert!(text.contains("nothing will be resent"), "{text}");
     }
 
     #[tokio::test]
