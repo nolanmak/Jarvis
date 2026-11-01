@@ -694,6 +694,10 @@ mod tests {
             let row=rows.iter().find(|row|row["kind"]=="native_launch_intent")
                 .expect("native command escaped preparation without a durable controller launch intent");
             assert_eq!(logger.read_append_receipt(&prepared.controller_receipt).unwrap(),*row);
+            assert_eq!(row["version"],2,"launch evidence needs an explicit original-binding format");
+            let original=logger.native_store_binding().unwrap().unwrap();
+            let original_hash=format!("{:x}",Sha256::digest(ownership::canonical_bytes(&serde_json::to_value(original).unwrap()).unwrap()));
+            assert_eq!(row["original_store_binding_sha256"],original_hash,"controller receipt omitted the original store binding");
             assert_eq!(row["actor"],"controller");assert_eq!(row["source_owner"],serde_json::to_value(&owner).unwrap());
             assert_eq!(row["source_audit_path"],logger.path().to_str().unwrap());
             assert_eq!(row["provider"],provider);assert_eq!(row["native_session_id"],serde_json::to_value(id).unwrap());
