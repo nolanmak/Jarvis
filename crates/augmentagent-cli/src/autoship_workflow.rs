@@ -23,6 +23,8 @@ mod conversations;
 mod owner_revision;
 #[path = "autoship_owner_turn.rs"]
 pub(crate) mod owner_turn;
+#[path = "autoship_native_owner_binding.rs"]
+mod native_owner_binding;
 #[path = "autoship_owner_inbox.rs"]
 pub(crate) mod owner_inbox;
 #[path = "autoship_discord_controls.rs"]
@@ -373,6 +375,11 @@ impl WorkflowStore {
                 workflow TEXT NOT NULL REFERENCES workflow(id), lease_generation INTEGER NOT NULL,
                 audit_path TEXT NOT NULL, retirement_reason TEXT, retired_at INTEGER,
                 attempted_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_owner_binding (
+                workflow TEXT NOT NULL, lease_generation INTEGER NOT NULL,
+                binding TEXT NOT NULL, registered_at INTEGER NOT NULL,
+                PRIMARY KEY(workflow,lease_generation),
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);

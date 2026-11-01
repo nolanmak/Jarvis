@@ -134,10 +134,45 @@ pub fn capture_owner_binding(
     capture_owner_with_policy(path.as_deref().map(Path::new), current)
 }
 pub(super) fn capture_owner_with_policy(
-    _policy: Option<&Path>,
-    _current: &dyn Fn() -> Result<(), TransferFenceError>,
+    policy_path: Option<&Path>,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> Result<TransferBinding, TransferReason> {
-    Err(TransferReason::InvalidRequest)
+    let selected = (|| -> anyhow::Result<_> {
+        current().map_err(anyhow::Error::new)?;
+        let path = policy_path.context(TransferReason::RuntimeUnavailable)?;
+        let bytes = super::private(path).context(TransferReason::RuntimeUnavailable)?;
+        let policy: super::Policy =
+            serde_json::from_slice(&bytes).context(TransferReason::MetadataInvalid)?;
+        anyhow::ensure!(valid_policy(&policy), TransferReason::MetadataInvalid);
+        let root = policy.state_root.canonicalize()?;
+        anyhow::ensure!(root.to_str().is_some(), TransferReason::MetadataInvalid);
+        Ok((sha(&bytes), root))
+    })()
+    .map_err(|error| classify(&error).0)?;
+    capture_store_binding(policy_path, &selected.0, &selected.1, current).map_err(|error| {
+        let (reason, _) = classify(&error);
+        if error.is::<TransferFenceError>()
+            || matches!(
+                reason,
+                TransferReason::AuthorityConflict
+                    | TransferReason::PersistRetry
+                    | TransferReason::LockBusy
+                    | TransferReason::StateCapacity
+                    | TransferReason::HistoryCapacity
+            )
+        {
+            reason
+        } else {
+            // No binding can be registered from uncertain store authority.
+            TransferReason::PendingUnknown
+        }
+    })
+}
+fn valid_policy(policy: &super::Policy) -> bool {
+    policy.version == 1
+        && (512..=4096).contains(&policy.memory_mb)
+        && policy.max_state_bytes >= super::SESSION_BYTES
+        && policy.max_sessions > 0
 }
 pub fn capture_transfer_binding(
     request: &TransferRequest,
@@ -153,6 +188,15 @@ pub fn capture_transfer_binding(
     )
 }
 impl TransferBinding {
+    /// Validate the private wire shape only; dispatch still requires the bound
+    /// store, selected policy and current controller authority to be verified.
+    pub fn validate(&self) -> Result<(), TransferReason> {
+        if self.valid() {
+            Ok(())
+        } else {
+            Err(TransferReason::InvalidRequest)
+        }
+    }
     fn valid(&self) -> bool {
         self.version == 1
             && digest(&self.policy_sha256)
@@ -207,19 +251,7 @@ pub(super) fn capture_with_policy(
         .policy_sha256
         .as_deref()
         .expect("loaded policy digest");
-    let result = (|| -> anyhow::Result<TransferBinding> {
-        let lock = super::StateLock::acquire(&selected.root)?;
-        selected_fence(policy, expected, &selected.root, current)?;
-        let ledger = super::owner_ledger::Ledger::open(&selected.root, &lock)?;
-        let store = ledger.store_identity()?;
-        selected_fence(policy, expected, &selected.root, current)?;
-        Ok(TransferBinding {
-            version: 1,
-            policy_sha256: expected.into(),
-            canonical_state_root: selected.root.clone(),
-            store,
-        })
-    })();
+    let result = capture_store_binding(policy, expected, &selected.root, current);
     result.map_err(|error| {
         let (reason, category) = classify(&error);
         if error.is::<TransferFenceError>()
@@ -232,6 +264,24 @@ pub(super) fn capture_with_policy(
         } else {
             unknown(request)
         }
+    })
+}
+fn capture_store_binding(
+    policy: Option<&Path>,
+    expected: &str,
+    root: &Path,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> anyhow::Result<TransferBinding> {
+    let lock = super::StateLock::acquire(root)?;
+    selected_fence(policy, expected, root, current)?;
+    let ledger = super::owner_ledger::Ledger::open(root, &lock)?;
+    let store = ledger.store_identity()?;
+    selected_fence(policy, expected, root, current)?;
+    Ok(TransferBinding {
+        version: 1,
+        policy_sha256: expected.into(),
+        canonical_state_root: root.to_path_buf(),
+        store,
     })
 }
 fn historical_context<'a>(
@@ -391,11 +441,7 @@ fn load_selection<'a>(
         Ok(policy) => policy,
         Err(_) => return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none")),
     };
-    if policy.version != 1
-        || !(512..=4096).contains(&policy.memory_mb)
-        || policy.max_state_bytes < super::SESSION_BYTES
-        || policy.max_sessions == 0
-    {
+    if !valid_policy(&policy) {
         return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none"));
     }
     let root = match policy.state_root.canonicalize() {
