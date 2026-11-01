@@ -35,6 +35,8 @@ pub(crate) mod owner_inbox;
 pub(crate) mod discord_controls;
 #[path = "autoship_owner_control.rs"]
 pub(crate) mod owner_control;
+#[path = "autoship_verification_retry.rs"]
+mod verification_retry;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};

@@ -6841,6 +6841,15 @@ async fn resume_draft_pr(
         if let Err(gate_err) = gate_result {
             if workflow.audit_logger().resource_capacity_seen() { return Err(gate_err); }
             if let Some(report)=capacity_accounting.report()? {return Ok(report);}
+            // Infrastructure is not a code repair task. Persist retry eligibility
+            // before any baseline probe or model repair, then release only after
+            // the verifier's supervised work has finished.
+            if let Some(eligible)=workflow.defer_verification_infrastructure(&gate_err).await? {
+                let report=capacity_accounting.retry_report(format!(
+                    "PR #{pr}: verification infrastructure deferred until {eligible}; candidate and evidence preserved"))?;
+                workflow.finish()?;
+                return Ok(report);
+            }
             // #931 — a failure `main` already has is not this draft's; do
             // not spend a repair round on it or count an attempt. The
             // ledger mark at the top of this fn already moves the picker on.
