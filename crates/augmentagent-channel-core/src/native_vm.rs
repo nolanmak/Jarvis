@@ -147,6 +147,21 @@ fn digest(value: &str) -> String {
 const SESSION_BYTES: u64 = 1024 * 1024 * 1024;
 struct StateLock(std::fs::File);
 impl StateLock {
+    /// Existing authority only: never initialize, chmod, or wait behind a
+    /// transfer while validating a saved binding at a dispatch boundary.
+    fn existing(root:&Path)->Result<Self> {
+        let directory=root.symlink_metadata()?;
+        ensure!(directory.is_dir() && !directory.file_type().is_symlink()
+            && directory.uid()==unsafe{libc::geteuid()} && directory.mode() & 0o077==0,"native state root is not private");
+        let file=std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(root.join("state.lock"))?;
+        let info=file.metadata()?;
+        ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native state lock");
+        if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self(file))
+    }
     fn acquire(root:&Path) -> Result<Self> {
         let directory=root.symlink_metadata()?;
         ensure!(directory.is_dir() && !directory.file_type().is_symlink() && directory.uid()==unsafe{libc::geteuid()} && directory.mode() & 0o077==0,"native state root is not private");
@@ -386,9 +401,12 @@ impl Launch {
         if let Some(expected)=crate::native_session::current_builder_owner() {
             ensure!(audit_owner==expected,"native builder scope owner mismatch");
         }
+        let original_binding=owner_logger.native_store_binding()?.context("original native store binding missing")?;
+        owner_logger.validate_native_store_binding()?;
         let policy_path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY")
             .context("required native VM policy unavailable")?;
-        let policy: Policy = serde_json::from_slice(&private(Path::new(&policy_path))?)?;
+        let policy_bytes=private(Path::new(&policy_path))?;
+        let policy: Policy = serde_json::from_slice(&policy_bytes)?;
         ensure!(policy.version == 1 && (512..=4096).contains(&policy.memory_mb), "invalid native VM policy");
         let resource_policy=match build_memory(bridge).and_then(|build_mb|
             crate::run_resources::composed_native_policy(u64::from(policy.memory_mb),build_mb)) {
@@ -397,6 +415,7 @@ impl Launch {
         };
         let profile = policy.providers.get(provider).context("required native provider profile unavailable")?;
         let root = policy.state_root.canonicalize()?;
+        original_binding.verify_launch_policy(&policy_bytes,&root)?;
         let metadata = root.metadata()?;
         ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
             "native VM state root is not private");
@@ -409,8 +428,8 @@ impl Launch {
             ensure!(profile.auth_file.as_ref() == Some(&expected),
                 "OAuth refresh requires an explicitly imported controller credential");
         }
-        let state_lock=StateLock::acquire(&root)?;
-        let ledger=owner_ledger::Ledger::open(&root,&state_lock)?;
+        let state_lock=StateLock::existing(&root)?;
+        let ledger=original_binding.launch_ledger(&root,&state_lock)?;
         ensure_native_admission(&ledger,&audit_owner,owner_logger)?;
         let audit_log=owner_logger.protected_log_path().context("native protected audit log missing")?.to_path_buf();
         let reserved=ledger.reserved_bytes()?;
@@ -520,6 +539,8 @@ impl Launch {
             .env("PATH","/usr/bin:/bin");
         let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, audit_log, _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
+        owner_logger.validate_native_store_binding()?;
+        owner_logger.dispatch_allowed()?;
         Ok(result)
     }
     pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
@@ -615,7 +636,11 @@ mod tests {
             logger.set_native_runtime_owner(owner.clone()).unwrap();
             if mode!="unbound" {
                 let binding=ownership::capture_owner_binding(&||Ok(())).unwrap();
-                logger.set_native_store_binding(binding).unwrap();
+                logger.set_native_store_binding(binding.clone()).unwrap();
+                logger.clone().set_native_store_binding(binding.clone()).unwrap();
+                let mut changed=serde_json::to_value(&binding).unwrap();changed["policy_sha256"]="f".repeat(64).into();
+                assert!(logger.clone().set_native_store_binding(serde_json::from_value(changed).unwrap()).is_err());
+                assert_eq!(logger.native_store_binding().unwrap(),Some(binding));
             }
             if mode=="reselect" {
                 let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(&policy).unwrap()).unwrap();

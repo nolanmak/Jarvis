@@ -102,6 +102,8 @@ impl WorkflowStore {
             && prepared.intent.source_audit_path==audit.path(),"native launch controller identity mismatch");
         let (original_audit,_)=original_context(&self.conn,&lease.workflow,lease.generation,true)?;
         ensure!(Path::new(&original_audit)==audit.path(),"native launch original audit mismatch");
+        ensure!(audit.native_store_binding()?==self.native_owner_binding(&lease.workflow,lease.generation)?,
+            "native launch original store binding mismatch");
         let mut actual=audit.read_append_receipt(&prepared.controller_receipt)?;
         actual.as_object_mut().context("native launch audit record is not an object")?.remove("audit_chain");
         let mut expected=serde_json::to_value(&prepared.intent)?;
@@ -216,6 +218,9 @@ mod tests {
         let (store,lease,binding)=setup_at_audit(&root.join("workflow.db"),"owner/repo/pr/7",bound,audit.path().to_str().unwrap());
         let source_owner=RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation};
         audit.set_native_runtime_owner(source_owner.clone()).unwrap();
+        if let Some(original)=store.native_owner_binding(&lease.workflow,lease.generation).unwrap() {
+            audit.set_native_store_binding(original).unwrap();
+        }
         let intent=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:1,
             intent_id:uuid::Uuid::new_v4().to_string(),source_owner,source_audit_path:audit.path().into(),
             provider:"codex".into(),runtime_relative_path:"codex/session-first".into(),native_session_id:None,

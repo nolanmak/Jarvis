@@ -776,6 +776,9 @@ impl WorkflowGuard {
             store.validate_dispatch(&dispatch_lease,&binding,millis())
         }))?;
         if self.audit.native_runtime_owner()?.is_some() {
+            let original=self.store.lock().map_err(|_|anyhow::anyhow!("native original binding store poisoned"))?
+                .native_owner_binding(&self.lease.workflow,self.lease.generation)?;
+            if let Some(original)=original {self.audit.set_native_store_binding(original)?;}
             let journal_store=self.store.clone();let journal_lease=self.lease.clone();
             // The logger owns its callback; a weak reference avoids retaining
             // the logger/store after the guarded owner has gone away.

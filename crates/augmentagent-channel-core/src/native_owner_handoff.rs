@@ -1095,6 +1095,16 @@ mod tests {
         }
     }
     #[test]
+    fn native_owner_binding_validation_rechecks_selection_after_store_read() {
+        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
+        let original=std::fs::read(&path).unwrap();let database=f.root.join("runtime-retirement.sqlite");
+        let before=std::fs::read(&database).unwrap();let calls=std::cell::Cell::new(0);
+        let current=||{calls.set(calls.get()+1);if calls.get()==2 {
+            let mut changed=original.clone();changed.push(b' ');std::fs::write(&path,changed).unwrap();}Ok(())};
+        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&current),Err(TransferReason::AuthorityConflict));
+        assert_eq!(calls.get(),2);assert_eq!(std::fs::read(database).unwrap(),before);
+    }
+    #[test]
     fn native_owner_binding_validation_refuses_busy_store_instead_of_waiting() {
         let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
         let _writer=super::super::StateLock::acquire(&f.root).unwrap();

@@ -75,6 +75,11 @@ impl ProcessGroup {
             resource_identity=Some(observation["identity"].clone());
         }
         if let Some(logger)=logger {logger.dispatch_allowed()?;}
+        if model && self.vm_preflight {
+            logger.ok_or_else(||anyhow::anyhow!("native VM model admission requires protected original binding"))?
+                .validate_native_store_binding()?;
+            logger.unwrap().dispatch_allowed()?;
+        }
         if model { if let Some(logger)=logger {
             match &resource_identity {
                 Some(identity)=>logger.model_call_admitted_in_scope(provider,identity)?,
@@ -645,10 +650,37 @@ mod tests {
 
     #[tokio::test]
     async fn native_store_binding_is_checked_before_model_admission_and_release_marker() {
+        native_store_release_fixture(false).await;
+    }
+    #[tokio::test]
+    async fn native_store_binding_reselection_after_setup_refuses_model_release() {
+        const CHILD:&str="JARVIS_TEST_NATIVE_BINDING_RELEASE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","process_tree::tests::native_store_binding_reselection_after_setup_refuses_model_release","--test-threads=1"])
+                .env(CHILD,"1").output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+        }
+        native_store_release_fixture(true).await;
+    }
+    async fn native_store_release_fixture(reselect:bool) {
         let root=tempfile::tempdir().unwrap();
         for name in ["logs","anchors"] {std::fs::create_dir(root.path().join(name)).unwrap();}
         let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("logs/model.jsonl"),root.path().join("anchors/model.json"),&[]).unwrap());
         logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}).unwrap();
+        if reselect {
+            let state=root.path().join("native");std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::native_vm::initialize_native_test_store(&state);
+            let path=root.path().join("policy.json");
+            let mut policy=json!({"version":1,"state_root":state,"memory_mb":512,"max_state_bytes":8589934592u64,
+                "max_sessions":8,"runtime_config":"/fixture/runtime","guest_runtime":"/fixture/guest","providers":{}});
+            std::fs::write(&path,serde_json::to_vec(&policy).unwrap()).unwrap();
+            std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&path);
+            logger.set_native_store_binding(crate::native_vm::ownership::capture_owner_binding(&||Ok(())).unwrap()).unwrap();
+            policy["memory_mb"]=1024.into();std::fs::write(&path,serde_json::to_vec(&policy).unwrap()).unwrap();
+        }
         let admitted=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=admitted.clone();
         logger.set_model_call_observer(Arc::new(move |_|{count.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
         // A real idle child makes cleanup truthful. This fixture tests only the
@@ -661,7 +693,8 @@ mod tests {
             resource_audit:std::sync::Mutex::new(None),_directory:directory};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
-        assert!(outcome.is_err(),"VM release ignored the missing original store binding");
+        std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(outcome.is_err(),"VM release ignored the original store binding (reselected={reselect})");
         assert_eq!(admitted.load(Ordering::SeqCst),0);assert!(!receipt.with_file_name("launch-continue").exists());
     }
 

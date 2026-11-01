@@ -305,6 +305,7 @@ pub struct AuditLogger {
     dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
+    native_store_binding: Arc<std::sync::Mutex<Option<crate::native_vm::ownership::TransferBinding>>>,
     native_launch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&crate::native_vm::PreparedLaunchRecord) -> anyhow::Result<()> + Send + Sync>>>>,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
     resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
@@ -580,9 +581,22 @@ impl AuditLogger {
         Ok(record)
     }
 
-    pub fn set_native_store_binding(&self,_binding:crate::native_vm::ownership::TransferBinding)->anyhow::Result<()> {Ok(())}
-    pub fn native_store_binding(&self)->anyhow::Result<Option<crate::native_vm::ownership::TransferBinding>> {Ok(None)}
-    pub fn validate_native_store_binding(&self)->anyhow::Result<()> {Ok(())}
+    /// Install a protected original registration, never capture current policy
+    /// here. Dispatch separately verifies selection and the existing store.
+    pub fn set_native_store_binding(&self,binding:crate::native_vm::ownership::TransferBinding)->anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && self.native_runtime_owner()?.is_some(),"native store binding requires protected owner");
+        binding.validate()?;
+        let mut original=self.native_store_binding.lock().map_err(|_|anyhow::anyhow!("native store binding lock poisoned"))?;
+        anyhow::ensure!(original.as_ref().is_none_or(|value|value==&binding),"original native store binding cannot change");
+        *original=Some(binding);Ok(())
+    }
+    pub fn native_store_binding(&self)->anyhow::Result<Option<crate::native_vm::ownership::TransferBinding>> {
+        Ok(self.native_store_binding.lock().map_err(|_|anyhow::anyhow!("native store binding lock poisoned"))?.clone())
+    }
+    pub fn validate_native_store_binding(&self)->anyhow::Result<()> {
+        let binding=self.native_store_binding()?.ok_or_else(||anyhow::anyhow!("original native store binding missing"))?;
+        crate::native_vm::ownership::validate_owner_binding(&binding,&||Ok(()))?;Ok(())
+    }
 
     pub fn native_runtime_owner(&self)->anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
         Ok(self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?.clone())
@@ -597,6 +611,7 @@ impl AuditLogger {
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
+            native_store_binding: Arc::new(std::sync::Mutex::new(None)),
             native_launch_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,
             failure_path: None,

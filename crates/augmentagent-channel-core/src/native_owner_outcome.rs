@@ -168,12 +168,30 @@ pub(super) fn capture_owner_with_policy(
         }
     })
 }
+/// Verify only the originally saved store and current policy selection.
+/// This is read-only, bounded by a nonblocking lock, and grants no owner authority.
 pub fn validate_owner_binding(binding:&TransferBinding,current:&dyn Fn()->Result<(),TransferFenceError>)->Result<(),TransferReason> {
     let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
     validate_owner_with_policy(path.as_deref().map(Path::new),binding,current)
 }
-pub(super) fn validate_owner_with_policy(_policy:Option<&Path>,_binding:&TransferBinding,
-    _current:&dyn Fn()->Result<(),TransferFenceError>)->Result<(),TransferReason> {Ok(())}
+pub(super) fn validate_owner_with_policy(policy:Option<&Path>,binding:&TransferBinding,
+    current:&dyn Fn()->Result<(),TransferFenceError>)->Result<(),TransferReason> {
+    binding.validate()?;
+    let result=(||->anyhow::Result<()> {
+        selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,current)?;
+        super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
+        let lock=super::StateLock::existing(&binding.canonical_state_root)?;
+        let _ledger=super::owner_ledger::Ledger::open_bound(&binding.canonical_state_root,&lock,&binding.store,true)?;
+        selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,current)?;
+        super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
+        Ok(())
+    })();
+    result.map_err(|error|match classify(&error).0 {
+        reason @ (TransferReason::AuthorityConflict|TransferReason::PersistRetry|TransferReason::LockBusy
+            |TransferReason::StateCapacity|TransferReason::HistoryCapacity)=>reason,
+        _=>TransferReason::PendingUnknown,
+    })
+}
 fn valid_policy(policy: &super::Policy) -> bool {
     policy.version == 1
         && (512..=4096).contains(&policy.memory_mb)
@@ -194,6 +212,15 @@ pub fn capture_transfer_binding(
     )
 }
 impl TransferBinding {
+    pub(super) fn verify_launch_policy(&self,bytes:&[u8],root:&Path)->Result<(),TransferReason> {
+        self.validate()?;
+        if sha(bytes)==self.policy_sha256 && root==self.canonical_state_root {Ok(())}
+        else {Err(TransferReason::AuthorityConflict)}
+    }
+    pub(super) fn launch_ledger<'a>(&self,root:&'a Path,lock:&'a super::StateLock)->anyhow::Result<super::owner_ledger::Ledger<'a>> {
+        anyhow::ensure!(root==self.canonical_state_root,TransferReason::AuthorityConflict);
+        super::owner_ledger::Ledger::open_bound(root,lock,&self.store,false)
+    }
     /// Validate the private wire shape only; dispatch still requires the bound
     /// store, selected policy and current controller authority to be verified.
     pub fn validate(&self) -> Result<(), TransferReason> {
