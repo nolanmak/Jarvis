@@ -1906,6 +1906,9 @@ async fn followup_with_recovery(
     }
 }
 
+/// Longest manual-send message shown inline with the card title prefix.
+const MANUAL_SEND_INLINE_MAX: usize = 1700;
+
 fn approval_followup(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
@@ -1960,7 +1963,17 @@ async fn deliver_approval_outcome(
     let mut followup = approval_followup(outcome, action_id);
     // #1507 — name the card the click acted on, so a reply can't be mistaken
     // for another card's (the owner approved a DM thinking it was a signature).
-    if let Some(title) = card_title(&comp.message) {
+    // #1765 — paste-ready text must never be cut: what the owner pastes is
+    // matched against the stored text. Too long for one message → attach it.
+    let manual_text = match outcome {
+        ApprovalActionOutcome::ManualSendReady { text, .. } => Some(text.as_str()),
+        _ => None,
+    };
+    if let Some(text) = manual_text.filter(|_| describe(outcome).chars().count() > MANUAL_SEND_INLINE_MAX) {
+        followup = followup
+            .content("Approved — not sent automatically. The reply is too long to show inline; paste the attached text into WhatsApp. The card closes as sent once the archive shows your message.")
+            .add_file(serenity::all::CreateAttachment::bytes(text.as_bytes().to_vec(), "whatsapp-reply.txt"));
+    } else if let Some(title) = card_title(&comp.message) {
         // Embed titles are capped at 256 by Discord; keep well inside the
         // 2000-char message limit so naming the card can't fail the reply.
         let title: String = title.chars().take(200).collect();

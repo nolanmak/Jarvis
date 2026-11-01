@@ -143,6 +143,11 @@ pub fn email(conv: &Conversation, idx: usize, entry: &MessageEntry) -> Email {
     email.platform = "whatsapp".into();
     email.account_entity_id = Some(ACCOUNT.into());
     email.from = display_sender(conv, &entry.sender);
+    if is_group(conv) {
+        // Stored with the row so every repost of a card names the group's
+        // members, not only the first post (#1764).
+        email.to = conv.participants.iter().map(|p| display_sender(conv, p)).collect::<Vec<_>>().join(", ");
+    }
     email.kind = if is_group(conv) {
         "group"
     } else {

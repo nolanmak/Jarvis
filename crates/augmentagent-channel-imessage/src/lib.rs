@@ -28,6 +28,6 @@ pub use sync::{
 };
 pub use target::{conversation_identifier, resolve_target, ImessageTarget, TargetError};
 pub use reply::{
-    context_body, only_own_sends, reply_email, CardDrafter, Handled, ImessageReplier,
+    context_body, group_notes, only_own_sends, reply_email, CardDrafter, Handled, ImessageReplier,
     ImessageReplyConfig, ReplyStats, GROUP_DRAFT_NOTE, GROUP_TRIAGE_POLICY,
 };
