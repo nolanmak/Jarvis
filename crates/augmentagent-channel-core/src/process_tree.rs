@@ -633,6 +633,32 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[test]
+    fn cleanup_waits_for_complete_receipt_after_path_is_created() {
+        for prefix in [b"".as_slice(),b"all-descendants-".as_slice()] {
+            let directory=tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            let receipt=directory.path().join("cleanup-complete");
+            let mut output=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+            output.write_all(prefix).unwrap();output.sync_all().unwrap();
+            let mut child=std::process::Command::new("sleep").arg("5").spawn().unwrap();
+            let id=child.id() as libc::pid_t;
+            let prefix_length=prefix.len();
+            let writer=std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _=child.kill();child.wait().unwrap();
+                // Publish completion only after the fixture's actual child is reaped.
+                output.write_all(&b"all-descendants-reaped\n"[prefix_length..]).unwrap();output.sync_all().unwrap();
+            });
+            let clean=Arc::new(AtomicBool::new(false));
+            let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
+                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
+                resource_audit:std::sync::Mutex::new(None),_directory:directory};
+            drop(group);writer.join().unwrap();
+            assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
+        }
+    }
+
+    #[test]
     fn setup_diagnostics_do_not_masquerade_as_capacity_or_echo_untrusted_detail() {
         assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"FileNotFoundError","message":"private path"})),Some("FileNotFoundError"));
         assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"private credentials"})),Some("BoundaryFailure"));
