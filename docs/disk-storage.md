@@ -18,7 +18,17 @@ Set `AUGMENTAGENT_BUILD_PARENT` to place that
 parent on a build volume, `CARGO_TARGET_DIR` for a specific cache, or
 `AUGMENTAGENT_STORAGE_BIN` for a supporting binary during bootstrap.
 Do not start an external `CARGO_TARGET_DIR=... cargo ...` build outside this
-wrapper. The wrapper contains test temporary files under the target's `tmp/` on the
+wrapper (#1754). `disk build` refuses a `--target-dir` inside its child command,
+because Cargo would write to that directory instead of the leased one. In Claude
+Code, the project hook `scripts/cargo-target-guard.py` blocks bare `cargo` with
+`CARGO_TARGET_DIR=`/`CARGO_BUILD_TARGET_DIR=` or `--target-dir`; prefix
+`AUGMENTAGENT_ALLOW_UNMANAGED_TARGET=1` only to bootstrap the storage commands.
+Whatever slips past (other clients, `bash -c`, exported variables) is listed by
+`augmentagent disk status`: Cargo caches directly inside a volume that holds a
+managed build parent, owned by no registration, marker, or housekeeping root.
+`disk status --unmanaged [--json]` prints only that list, with size, idle days,
+and an `augmentagent disk register --root DIR --abandoned` suggestion; `disk prune`
+prints the count. Nothing adopts or deletes them automatically. The wrapper contains test temporary files under the target's `tmp/` on the
 measured filesystem and reclaims scratch before its next admission. It defaults
 dev/test debuginfo to zero and strips provider secrets
 from build subprocesses using the gate policy. It also finds the deployed

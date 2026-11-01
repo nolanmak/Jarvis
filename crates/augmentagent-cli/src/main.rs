@@ -1088,6 +1088,11 @@ enum DiskOp {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Only list Cargo caches beside a managed build parent that nothing
+        /// registers (#1754), with size and idle days. With `--json`, an array
+        /// of `{path, bytes, idle_days}`.
+        #[arg(long, default_value_t = false)]
+        unmanaged: bool,
     },
 }
 #[derive(Subcommand)]
@@ -3248,6 +3253,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             DiskOp::Build { target_dir, command, update } => {
+                if let Some(flag) = build_storage::child_target_override(command) {
+                    eprintln!("refusing `{flag}` in the build command: `disk build` already gives cargo its leased target \
+                        (--target-dir {}) and the flag would write to an unregistered directory instead. \
+                        Pass the directory as `--target-dir` to `disk build` (or `CARGO_TARGET_DIR=` before scripts/cargo-managed.sh). #1754",
+                        target_dir.display());
+                    std::process::exit(2);
+                }
                 let result = async {
                     let admitted: Result<Option<build_storage::Lease>> = async {
                         if build_storage::inherited_mode(target_dir, *update)? { Ok(None) }
@@ -3289,8 +3301,8 @@ async fn main() -> Result<()> {
                 },
                 &mut std::io::stdout().lock(),
             ),
-            DiskOp::Status { json } => {
-                disk::run_status(&repo_root, *json, &mut std::io::stdout().lock())
+            DiskOp::Status { json, unmanaged } => {
+                disk::run_status(&repo_root, *json, *unmanaged, &mut std::io::stdout().lock())
             }
         };
     }
