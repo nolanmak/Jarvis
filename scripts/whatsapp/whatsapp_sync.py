@@ -20,6 +20,10 @@ HEADER_PREFIX = "### ["
 
 # ZSESSIONTYPE: 0 = DM, 1 = group; >= 2 = broadcast/status noise.
 _SYNCED_SESSION_TYPES = (0, 1)
+# ZMESSAGETYPE 6 = group event, 10 = system notice, 14 = deletion pointer
+# (its media item's title is the removed message's id). ZTEXT on these holds
+# a JID, never anything a person wrote.
+SYSTEM_MESSAGE_TYPES = (6, 10, 14)
 
 # A source app that stops running freezes its database, and an exporter with
 # nothing to export looks identical to a healthy one. Report the age so a cold
@@ -86,6 +90,16 @@ def clean_title(name):
     if not name:
         return ""
     return _TITLE_JUNK.sub("", name).replace(" ", " ").strip()
+
+
+# Desktop keeps an encoded '+<base64>' token in ZWAGROUPMEMBER.ZFIRSTNAME
+# for some members; it is never a name a person would recognise.
+_ENCODED_NAME = re.compile(r"\+(?=[A-Za-z0-9+/]*[A-Za-z])[A-Za-z0-9+/]+={0,2}")
+
+
+def member_name(name):
+    name = clean_title(name)
+    return "" if _ENCODED_NAME.fullmatch(name) else name
 
 
 def escape_body(text):
@@ -265,7 +279,7 @@ def _group_members(cur):
         f"SELECT ZCHATSESSION, ZMEMBERJID, ZCONTACTNAME, {first}, {active}"
         " FROM ZWAGROUPMEMBER WHERE ZMEMBERJID IS NOT NULL"
     ):
-        name = clean_title(contact) or clean_title(given) or clean_title(push.get(jid))
+        name = member_name(contact) or member_name(given) or member_name(push.get(jid))
         out.setdefault(session, []).append((jid_handle(jid), name or None, bool(is_active)))
     return out
 
@@ -356,9 +370,10 @@ def sync(db_path, out_dir, state_path):
         cur = con.cursor()
         sessions = _sessions(cur)
 
+        kind = "ZMESSAGETYPE" if "ZMESSAGETYPE" in _columns(cur, "ZWAMESSAGE") else "0"
         rows = cur.execute(
             "SELECT Z_PK, ZCHATSESSION, ZTEXT, ZMESSAGEDATE, ZISFROMME,"
-            " ZFROMJID, ZGROUPMEMBER, ZMEDIAITEM"
+            f" ZFROMJID, ZGROUPMEMBER, ZMEDIAITEM, {kind}"
             " FROM ZWAMESSAGE WHERE Z_PK > ? ORDER BY ZMESSAGEDATE, Z_PK",
             (state["last_pk"],),
         ).fetchall()
@@ -368,10 +383,10 @@ def sync(db_path, out_dir, state_path):
         last_pk = state["last_pk"]
 
         for (pk, session_pk, text, date, from_me, from_jid, member_pk,
-             media_pk) in rows:
+             media_pk, message_type) in rows:
             last_pk = max(last_pk, pk)
             sess = sessions.get(session_pk)
-            if sess is None:
+            if sess is None or message_type in SYSTEM_MESSAGE_TYPES:
                 continue
 
             parts = []

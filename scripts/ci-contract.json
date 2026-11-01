@@ -322,7 +322,7 @@
       "shell": "bash"
     },
     "platform/platform/33": {
-      "body": "python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test scripts.tests.sync_source_watchdog_test -v",
+      "body": "python3 -m unittest scripts.tests.launchd_installers_test scripts.tests.scheduled_sync_installers_test scripts.tests.sync_source_watchdog_test scripts.tests.secure_release_executables_test -v",
       "shell": "bash"
     },
     "platform/platform/35": {
