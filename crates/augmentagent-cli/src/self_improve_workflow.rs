@@ -108,6 +108,12 @@ pub(super) struct CapacityAccounting {
     resumed: bool,
 }
 impl CapacityAccounting {
+    pub(super) fn retry_report(&self,message:String)->Result<RunReport> {
+        let calls=self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
+            .snapshot(&self.workflow)?.context("retry workflow missing")?.model_calls;
+        let paid=calls.checked_sub(self.calls_before).context("durable admissions decreased")?;
+        Ok(RunReport{message,billed:paid>0,held:paid==0,resumed:self.resumed})
+    }
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
         let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
         let paused=store.owner_control(&self.workflow)?.is_some_and(|c|c.paused);
@@ -1362,6 +1368,20 @@ impl WorkflowGuard {
             .filter(|r| r.reviewer.starts_with(prefix))
             .last()
             .map(|r| r.evidence))
+    }
+
+    pub(super) async fn defer_verification_infrastructure(&mut self,error:&anyhow::Error)->Result<Option<i64>> {
+        let message=format!("{error:#}");
+        let Some(code)=infra_failure_reason(&message) else {return Ok(None);};
+        self.validate_before_side_effect()?;
+        self.audit_health().await?;
+        let dependency=format!("{:x}",Sha256::digest(self.environment.as_bytes()));
+        let eligible=self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
+            .defer_verification_infrastructure(&self.lease,&self.binding,code,&dependency,millis())?;
+        self.audit_event("verification_infrastructure_retry",serde_json::json!({
+            "failure_code":code,"dependency_sha256":dependency,"eligible_at_ms":eligible,
+            "failure_sha256":format!("{:x}",Sha256::digest(message.as_bytes()))}))?;
+        Ok(Some(eligible))
     }
 
     /// Transition stage while retaining the receipt set that reviewers saw.
@@ -2712,6 +2732,34 @@ mod tests {
         }
         assert!(guard.bounded_native_calls("component".into(),2,async {guard.audit_logger().model_call_admitted("codex")}).await.is_err());
         assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,2);
+    }
+
+    #[tokio::test]
+    async fn verification_infrastructure_defers_without_repair_calls_or_permanent_hold() {
+        let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+        let mut guard=WorkflowGuard::acquire_at(&path,Start{repo_root:dir.path(),worktree:dir.path(),
+            repository:"owner/repo",source_issue:Some(77),pr:Some(88),branch:"fixture",contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+        guard.checkpoint(Stage::Verify,"verification_started","run_verifier",0,&["receipt".into()]).await.unwrap();
+        let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        let accounting=guard.capacity_accounting(true).unwrap();
+        let code_error=anyhow::anyhow!("error[E0308]: mismatched types");
+        assert!(guard.defer_verification_infrastructure(&code_error).await.unwrap().is_none());
+        let now=millis();
+        let infra=anyhow::anyhow!("ort-sys failed to download prebuilt binaries: Temporary failure in name resolution");
+        let eligible=guard.defer_verification_infrastructure(&infra).await.unwrap().unwrap();
+        let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+        assert_eq!(after.checkpoint.stage,Stage::Verify,"retryable infrastructure became a permanent hold");
+        assert_eq!(after.checkpoint.next.reason,"verification_infrastructure_retry");
+        assert!(eligible>=now+300_000 && eligible<=millis()+300_000);
+        assert_eq!(after.checkpoint.next.eligible_at_ms,eligible);
+        assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+        assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+        assert_eq!(after.model_calls,before.model_calls);
+        assert_eq!(after.progress_at_ms,before.progress_at_ms,"a retry is not productive progress");
+        let report=accounting.retry_report("retry".into()).unwrap();
+        assert!(!report.billed && report.is_idle() && report.resumed);
+        guard.finish().unwrap();
+        assert!(WorkflowStore::open(&path).unwrap().claim_productive(&before.workflow,"other",eligible-1,60_000).unwrap().is_none());
     }
 
     #[tokio::test]
