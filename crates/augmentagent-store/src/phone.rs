@@ -6,6 +6,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::Serialize;
 use thiserror::Error;
 
+#[path = "phone_inbound.rs"]
+mod inbound;
+pub use inbound::ReserveInboundCall;
+
 pub(crate) fn migrate(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(include_str!("phone.sql"))?;
     // #1555 speculation fields, added in place to existing metrics tables.
@@ -647,6 +651,13 @@ impl Store {
     pub fn phone_accept(&self, id: &str, sid: &str, now_ms: i64) -> PhoneResult<bool> {
         transaction(self, |tx| {
             let call = call_by_id(tx, id)?;
+            let inbound: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM phone_inbound_calls WHERE call_id=?1)",
+                [id], |r| r.get(0),
+            )?;
+            if inbound {
+                return Err(PhoneError::Conflict);
+            }
             if call.provider_sid.as_deref() != Some(sid) || call.stop_requested || call.verification
             {
                 return Err(PhoneError::Conflict);

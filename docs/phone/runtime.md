@@ -67,6 +67,9 @@ limits and duplicate-call protections still apply. Private DM entry is optional.
 | `TWILIO_ACCOUNT_SID` | Twilio account SID. |
 | `TWILIO_AUTH_TOKEN` | Twilio API authentication and callback-signature secret. |
 | `TWILIO_PHONE_NUMBER` | Operator's voice-capable Twilio caller number, in E.164 format. This is **not** the owner's destination. |
+| `AUGMENTAGENT_PHONE_INBOUND_PIN` | Optional secret of 4–12 decimal digits. Setting it enables incoming calls to `TWILIO_PHONE_NUMBER`; unset keeps incoming calls disabled. Never put it in chat, history or repository files. |
+| `AUGMENTAGENT_PHONE_INBOUND_PLATFORM` | Required with an inbound PIN: platform of an existing owner link, e.g. `discord`. Incoming calls continue in that account's bound control conversation. |
+| `AUGMENTAGENT_PHONE_INBOUND_ACCOUNT` | Required with an inbound PIN: exact account ID from that owner link, e.g. `dm:<bot-user-id>`. No chat is inferred from recent calls or display names. |
 | `AUGMENTAGENT_PHONE_PUBLIC_URL` | Stable public HTTPS origin, e.g. `https://phone.example.test`; no path, query, credentials or nonstandard port. |
 | `AUGMENTAGENT_PHONE_BIND` | Local proxy upstream, default `127.0.0.1:8878`; must be a loopback IP with a nonzero port. |
 | `AUGMENTAGENT_PHONE_VERIFICATION_KEY` | Separate secret of at least 32 bytes, used for keyed verification-code hashes. Keep stable across restarts; rotation invalidates outstanding challenges. |
@@ -106,6 +109,55 @@ Discord sender must match `DISCORD_ALLOWED_USER_ID`. Stored owner/control-chat
 bindings must match the mapping; the daemon does not infer or overwrite them.
 Restart after changing configured identity links or adding a new account.
 
+## Calling Jarvis directly
+
+The same Twilio number supports incoming and outgoing calls. Set the three
+`AUGMENTAGENT_PHONE_INBOUND_*` settings above through `augmentagent env set KEY VALUE`
+or the private service environment. CLI values take precedence for these three
+settings; CLI listings and write receipts mask the PIN. Restart to apply them.
+Select an existing owner link with a bound control conversation. Incoming calls
+prefer its private DM; otherwise they use its already-authorized control channel.
+Save your own caller number through that authenticated chat's existing number
+setup. Deploy the updated daemon before changing the Twilio number's routing.
+
+In Twilio Console → Phone Numbers → the number matching `TWILIO_PHONE_NUMBER` →
+Voice configuration, set **A call comes in** to a webhook using **HTTP POST**:
+
+```text
+https://<your-phone-origin>/phone/incoming
+```
+
+Set the number's **Call status changes** callback to **HTTP POST**:
+
+```text
+https://<your-phone-origin>/phone/incoming/status
+```
+
+These are number-level settings for incoming calls; outgoing calls retain their
+per-call callbacks. Forward the new paths through the TLS proxy as listed below.
+Twilio documents these settings in its
+[Voice webhooks](https://www.twilio.com/docs/usage/webhooks/voice-webhooks) and
+[TwiML request flow](https://www.twilio.com/docs/voice/twiml) documentation.
+
+Call Jarvis's number from your saved phone number and enter your PIN on the
+keypad when prompted. Jarvis then answers through the configured voice backend
+and uses the selected control chat's native session, tools and transcript
+delivery. Caller ID routes the call; the PIN authenticates it. Unknown, withheld
+or ambiguous caller numbers are rejected. Incoming calls never enroll a number
+or create owner/chat bindings.
+
+Each provider call gets one PIN attempt within the existing 15-second acceptance
+window; a wrong PIN or timeout hangs up. Callback retries preserve the original
+window and reservation. Incoming and outgoing calls share the one-active-call,
+three-attempts-per-ten-minutes and daily usage limits, maximum duration, shutdown
+cleanup and usage reconciliation. Number-level status callbacks without an event
+timestamp close the call immediately; the existing provider reconciliation
+worker retrieves authoritative final duration and end time.
+
+Qualification: run the offline inbound tests, then place a real call and verify
+PIN entry, two spoken turns, transcript delivery to the chosen chat, hangup and
+final usage. Offline tests do not establish live audio or public TLS readiness.
+
 ## Listener and proxy contract
 
 Terminate TLS at a stable reverse proxy/tunnel on the same host as the loopback
@@ -115,6 +167,10 @@ listener. Forward HTTP POST callbacks and WebSocket upgrades only for:
 - `/phone/accept/{call_id}`
 - `/phone/status/{call_id}`
 - `/phone/relay/{call_id}`
+- `/phone/relay-ended/{call_id}`
+- `/phone/incoming`
+- `/phone/incoming/{call_id}`
+- `/phone/incoming/status`
 
 Preserve the path, form fields and `X-Twilio-Signature`; support long-lived WSS
 connections. Signature verification uses the configured public origin, never

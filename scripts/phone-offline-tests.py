@@ -30,6 +30,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "live_playback", 5),
     ("augmentagent-phone", "--test", "relay", 24),
     ("augmentagent-phone", "--test", "service", 52),
+    ("augmentagent-phone", "--test", "inbound", 10),
     ("augmentagent-phone", "--test", "speech", 14),
     ("augmentagent-phone", "--test", "fast", 30),
     ("augmentagent-phone", "--test", "metrics", 4),

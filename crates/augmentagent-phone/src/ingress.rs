@@ -403,6 +403,9 @@ pub fn router(
     agent: Arc<dyn ConversationAgent>,
 ) -> Router {
     Router::new()
+        .route("/phone/incoming", post(incoming))
+        .route("/phone/incoming/status", post(incoming_status))
+        .route("/phone/incoming/{id}", post(incoming_pin))
         .route("/phone/status/{id}", post(status))
         .route("/phone/start/{id}", post(start))
         .route("/phone/accept/{id}", post(accept))
@@ -451,6 +454,53 @@ fn failure(error: Error) -> Response {
 fn twiml(result: Result<String, Error>) -> Response {
     match result {
         Ok(xml) => ([("content-type", "application/xml")], xml).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn incoming(
+    State(state): State<Ingress>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (fields, sig) = match form(&headers, &uri, &body) {
+        Ok(v) => v,
+        Err(r) => return r.into_response(),
+    };
+    twiml(state.service.incoming_callback(&state.auth, &fields, &sig))
+}
+async fn incoming_pin(
+    State(state): State<Ingress>,
+    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (fields, sig) = match form(&headers, &uri, &body) {
+        Ok(v) => v,
+        Err(r) => return r.into_response(),
+    };
+    twiml(
+        state
+            .service
+            .incoming_pin_callback(&state.auth, &id, &fields, &sig),
+    )
+}
+async fn incoming_status(
+    State(state): State<Ingress>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (fields, sig) = match form(&headers, &uri, &body) {
+        Ok(v) => v,
+        Err(r) => return r.into_response(),
+    };
+    match state
+        .service
+        .incoming_status_callback(&state.auth, &fields, &sig)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => failure(e),
     }
 }

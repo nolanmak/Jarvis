@@ -13,6 +13,27 @@ fn values() -> HashMap<&'static str, String> {
 ].into_iter().map(|(k,v)|(k,v.to_owned())).collect()
 }
 #[test]
+fn inbound_requires_valid_pin_and_explicit_chat_account() {
+    let mut env = values();
+    env.insert("AUGMENTAGENT_PHONE_INBOUND_PIN", "4831".into());
+    assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_err());
+    env.insert("AUGMENTAGENT_PHONE_INBOUND_PLATFORM", "discord".into());
+    assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_err());
+    env.insert("AUGMENTAGENT_PHONE_INBOUND_ACCOUNT", "guild-fixture".into());
+    assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_ok());
+    env.insert("AUGMENTAGENT_PHONE_INBOUND_ACCOUNT", "unlinked-account".into());
+    assert!(Settings::from_lookup(|k| env.get(k).cloned()).is_err());
+    env.insert("AUGMENTAGENT_PHONE_INBOUND_ACCOUNT", "guild-fixture".into());
+    for bad in ["", "123", "1234567890123", "12x456", " 123456"] {
+        env.insert("AUGMENTAGENT_PHONE_INBOUND_PIN", bad.into());
+        let error = Settings::from_lookup(|k| env.get(k).cloned())
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), "not_configured");
+        assert!(!format!("{error}").contains(bad) || bad.is_empty());
+    }
+}
+#[test]
 fn ac01_configuration_defaults_off_and_requires_complete_explicit_setup() {
     assert!(Settings::from_lookup(|_| None).unwrap().is_none());
     let mut env = values();
