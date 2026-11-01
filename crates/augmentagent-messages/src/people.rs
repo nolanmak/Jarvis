@@ -688,12 +688,7 @@ mod tests {
         );
         page(w.path(), "alex-rivera", &front, "");
         page(w.path(), "sam-doe", "identities:\n  discord: \"610\"\n", "");
-        page(
-            w.path(),
-            "sam-park",
-            "identities:\n  discord: \"620\"\n",
-            "",
-        );
+        page(w.path(), "sam-park", "identities:\n  discord: \"620\"\n", "");
         w
     }
 
@@ -826,28 +821,17 @@ mod tests {
 
     #[test]
     fn bare_first_name_keyed_page_does_not_swallow_longer_named_people() {
-        // #1668: `jordan.md` (key `jordan`, no phone) sat next to
-        // `jordan-blake.md`, which held the iMessage handle. `with:jordan`
-        // matched the bare key exactly, returned it alone, and the thread
-        // vanished with an empty ambiguity list.
+        // #1668: `jordan.md` (key `jordan`, no identities) sat next to
+        // `jordan-blake.md`, which holds the thread's number. `with:jordan`
+        // matched the bare key exactly, bound to a page with no handles, and
+        // search answered zero hits behind an empty ambiguity list.
         let (_d, s) = store();
         let w = tempfile::tempdir().unwrap();
-        page(
-            w.path(),
-            "jordan",
-            "identities:\n  linkedin: jordanblake\n",
-            "",
-        );
+        page(w.path(), "jordan", "", "");
         page(
             w.path(),
             "jordan-blake",
             "identities:\n  phone: [\"+14155550177\"]\n",
-            "",
-        );
-        page(
-            w.path(),
-            "jordan-acme",
-            "identities:\n  email: [jordan@acme.example]\n",
             "",
         );
         resolve_people(&s, w.path()).unwrap();
@@ -859,19 +843,18 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [
                     ("jordan", MatchKind::Exact),
-                    ("jordan-acme", MatchKind::Partial),
                     ("jordan-blake", MatchKind::Partial),
                 ],
                 "the bare-key page is a candidate, never the silent winner"
             );
-            // Spelling out the full name still settles it.
-            let full = resolve_person(c, "Jordan Blake")?;
-            assert_eq!(full.len(), 1);
-            assert_eq!(full[0].key, "jordan-blake");
-            // The hyphenated key still resolves on its own.
-            let by_key = resolve_person(c, "jordan-blake")?;
-            assert_eq!(by_key.len(), 1);
-            assert_eq!(by_key[0].key, "jordan-blake");
+            assert_eq!(handles_for(c, "jordan")?, ["jordan"], "nothing to search");
+            assert_eq!(handles_for(c, "jordan-blake")?, ["phone:+14155550177"]);
+            // Either full spelling still settles the reference.
+            for q in ["Jordan Blake", "jordan-blake"] {
+                let settled = resolve_person(c, q)?;
+                assert_eq!(settled.len(), 1, "{q}");
+                assert_eq!(settled[0].key, "jordan-blake");
+            }
             Ok(())
         })
         .unwrap();
