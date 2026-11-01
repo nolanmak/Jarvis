@@ -972,6 +972,7 @@ impl WorkflowGuard {
 
     pub(super) fn fresh_native_builder_sessions(&self) -> Result<Arc<augmentagent_channel_core::native_session::FreshBuilderSessions>> {
         self.validate_before_side_effect()?;
+        self.audit.validate_native_store_binding()?;
         let owner=self.audit.native_runtime_owner()?.context("workflow native owner missing")?;
         anyhow::ensure!(owner.workflow_id==self.lease.workflow && owner.lease_generation==self.lease.generation,"workflow native owner changed");
         augmentagent_channel_core::native_session::FreshBuilderSessions::for_workflow(owner)
@@ -2882,6 +2883,7 @@ mod tests {
         let mut guard=result.unwrap().unwrap();
         if matches!(mode.as_str(),"unconfigured"|"configuration-recovery") {
             assert!(guard.audit_logger().native_store_binding().unwrap().is_none());
+            assert!(guard.fresh_native_builder_sessions().is_err(),"builder scope accepted a missing original native store binding");
             assert!(guard.store.lock().unwrap().initial_native_owner_available(guard.id()).unwrap(),"missing configuration created an unbound native owner");
             guard.finish().unwrap();
             if mode=="unconfigured" {println!("native registration guard case passed: {mode}");return;}
@@ -2894,6 +2896,7 @@ mod tests {
         assert_eq!(guard.audit_logger().native_store_binding().unwrap(),saved);
         assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
         guard.audit_logger().validate_native_store_binding().unwrap();
+        assert!(guard.fresh_native_builder_sessions().is_ok(),"bound builder scope was refused");
         if mode=="fresh" {
             let audit=guard.audit_logger();
             let original=saved.clone().unwrap();
