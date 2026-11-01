@@ -47,6 +47,7 @@ tokio::task_local! { pub static FRESH_REVIEW: bool; }
 pub struct FreshBuilderSessions {
     sessions: Mutex<Vec<Arc<NativeSession>>>,
     retain_runtime: bool,
+    workflow_owner: Option<crate::native_vm::RuntimeOwner>,
 }
 #[derive(Debug, Clone)]
 pub struct ObservedConversation {
@@ -57,6 +58,12 @@ pub struct ObservedConversation {
 tokio::task_local! { static FRESH_BUILDERS: Arc<FreshBuilderSessions>; }
 impl FreshBuilderSessions {
     pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
+    /// The durable workflow registration, rather than this controller scope,
+    /// owns retirement of these builder conversations.
+    pub fn for_workflow(owner: crate::native_vm::RuntimeOwner) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(!owner.workflow_id.is_empty() && owner.lease_generation > 0, "invalid workflow builder owner");
+        Ok(Self::new())
+    }
     pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
         FRESH_BUILDERS.scope(Arc::clone(self), call).await
     }
@@ -70,7 +77,7 @@ impl FreshBuilderSessions {
             anyhow::ensure!(!restored.iter().any(|s|s.provider()==observation.provider),"duplicate builder provider conversation");
             restored.push(NativeSession::from_id(observation.provider,Some(observation.id.clone()))?);
         }
-        Ok(Arc::new(Self {sessions:Mutex::new(restored),retain_runtime:true}))
+        Ok(Arc::new(Self {sessions:Mutex::new(restored),retain_runtime:true,workflow_owner:None}))
     }
     pub fn observed(&self) -> Vec<ObservedConversation> {
         self.sessions.lock().expect("builder sessions mutex poisoned").iter().filter_map(|session| {
@@ -117,6 +124,11 @@ pub async fn fresh_review_scope<T>(
 
 pub fn is_fresh_review() -> bool {
     FRESH_REVIEW.try_with(|fresh| *fresh).unwrap_or(false)
+}
+
+pub(crate) fn current_builder_owner() -> Option<crate::native_vm::RuntimeOwner> {
+    if is_fresh_review() { return None; }
+    FRESH_BUILDERS.try_with(|builders| builders.workflow_owner.clone()).ok().flatten()
 }
 
 
@@ -451,6 +463,60 @@ mod builder_restore_tests {
                 assert_eq!(resumed,id);drop(restored);
                 assert!(!runtime.join("retired.json").exists());
             }
+        }
+    }
+    #[tokio::test]
+    async fn first_workflow_builder_keeps_runtime_after_controller_exit() {
+        for provider in [ProviderKind::Codex, ProviderKind::Claude] {
+            let root=tempfile::tempdir().unwrap();
+            let runtime=runtime_fixture(root.path(),"session-first-workflow-builder");
+            let sessions=FreshBuilderSessions::for_workflow(crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}).unwrap();
+            let id=sessions.scope(async {finish_native_turn(provider,&runtime)}).await;
+            let observed=sessions.observed();
+            assert_eq!(observed.len(),1);
+            drop(sessions);
+            assert!(!runtime.join("retired.json").exists(),"first builder conversation retired before workflow handoff: {provider:?}");
+            let restored=FreshBuilderSessions::from_observed(&observed).unwrap();
+            restored.scope(async {
+                let session=current_for(provider).unwrap().unwrap();
+                assert_eq!(session.begin(provider).unwrap().launch(),Launch::Resume {id});
+            }).await;
+            drop(restored);
+            assert!(!runtime.join("retired.json").exists());
+        }
+    }
+    #[tokio::test]
+    async fn first_workflow_builder_does_not_retain_an_independent_reviewer() {
+        let root=tempfile::tempdir().unwrap();
+        let runtime=runtime_fixture(root.path(),"session-workflow-reviewer");
+        let sessions=FreshBuilderSessions::for_workflow(crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}).unwrap();
+        sessions.scope(async {
+            fresh_review_scope(ProviderKind::Claude,async {
+                finish_native_turn(ProviderKind::Claude,&runtime);Ok(())
+            }).await.unwrap();
+        }).await;
+        drop(sessions);
+        assert!(runtime.join("retired.json").exists());
+    }
+    #[tokio::test]
+    async fn workflow_builder_owner_context_is_separate_from_fresh_review() {
+        let owner=crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1};
+        let sessions=FreshBuilderSessions::for_workflow(owner.clone()).unwrap();
+        sessions.scope(async {
+            assert_eq!(current_builder_owner(),Some(owner.clone()));
+            fresh_review_scope(ProviderKind::Codex,async {
+                assert_eq!(current_builder_owner(),None);
+                let session=current_for(ProviderKind::Codex)?.unwrap();
+                let mut lease=session.begin(ProviderKind::Codex)?;
+                lease.observe("independent-review")?;lease.finish()?;Ok(())
+            }).await.unwrap();
+            assert_eq!(current_builder_owner(),Some(owner));
+        }).await;
+    }
+    #[test]
+    fn workflow_builder_owner_must_be_a_real_workflow_generation() {
+        for (workflow,generation) in [("",1),("fixture",0),("fixture",-1)] {
+            assert!(FreshBuilderSessions::for_workflow(crate::native_vm::RuntimeOwner {workflow_id:workflow.into(),lease_generation:generation}).is_err());
         }
     }
     #[tokio::test]
