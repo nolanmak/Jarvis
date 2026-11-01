@@ -311,6 +311,11 @@ const HELPERS: &[(&str, &[u8])] = &[
             ("build-dependency-proxy.py", include_bytes!("../../../scripts/build-dependency-proxy.py")),
     ];
 
+fn ensure_native_admission(ledger:&owner_ledger::Ledger<'_>,owner:&RuntimeOwner,logger:&crate::tool_audit::AuditLogger)->Result<()> {
+    ensure!(!ledger.is_closed(owner)? && !ledger.held_by_abort(owner)?,"native-transfer-authority-conflict");
+    ensure!(!ledger.claimed(owner,"")? && !ledger.claimed_audit(logger.path().to_str().context("non-UTF8 native audit path")?)?
+        && !ledger.claimed_anchor(logger.protected_anchor_path().context("native protected audit anchor missing")?)?,"native-transfer-lock-busy");Ok(())
+}
 pub(crate) struct Launch {
     pub command: Command,
     pub resource_policy: serde_json::Value,
@@ -350,9 +355,7 @@ impl Launch {
         }
         let state_lock=StateLock::acquire(&root)?;
         let ledger=owner_ledger::Ledger::open(&root,&state_lock)?;
-        ensure!(!ledger.is_closed(&audit_owner)? && !ledger.held_by_abort(&audit_owner)?
-            && !ledger.claimed(&audit_owner,"")? && !ledger.claimed_audit(owner_logger.path().to_str().context("non-UTF8 native audit path")?)?
-            && !ledger.claimed_anchor(owner_logger.protected_anchor_path().context("native protected audit anchor missing")?)?,"native runtime owner is retired or held");
+        ensure_native_admission(&ledger,&audit_owner,owner_logger)?;
         let reserved=ledger.reserved_bytes()?;
         ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
         let count=prune_and_count(&root)?;
