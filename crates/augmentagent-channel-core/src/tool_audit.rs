@@ -637,6 +637,12 @@ impl AuditLogger {
         result
     }
 
+    /// Read one historical record through this logger's original anchor. This
+    /// does not attest current writer health, ownership, or model admission.
+    pub fn read_append_receipt(&self, _receipt: &crate::audit_chain::AppendReceipt) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("protected receipt lookup is not implemented")
+    }
+
     async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
         let sink = self
             .anchored
@@ -1453,6 +1459,37 @@ mod tests {
         let anchor = dir.path().join("anchors/workflow.json");
         let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
         (dir, logger, log, anchor)
+    }
+
+    #[test]
+    fn receipt_reader_rejects_bad_references_without_poisoning_the_writer() {
+        let (_directory, logger, log, anchor) = protected_fixture();
+        let receipt = logger.record_controller_receipted(
+            serde_json::json!({"actor":"controller","kind":"native_launch_fixture"})).unwrap();
+        let before_log = std::fs::read(&log).unwrap();
+        let before_anchor = std::fs::read(&anchor).unwrap();
+        let pending = || std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().count();
+        let before_pending = pending();
+        let mut wrong = receipt.clone(); wrong.record_sha256 = "0".repeat(64);
+        assert!(logger.read_append_receipt(&wrong).is_err());
+        logger.protected_health().unwrap();
+        let row = logger.read_append_receipt(&receipt).unwrap();
+        assert_eq!(row["kind"], "native_launch_fixture");
+        assert_eq!(std::fs::read(&log).unwrap(), before_log);
+        assert_eq!(std::fs::read(&anchor).unwrap(), before_anchor);
+        assert_eq!(pending(), before_pending, "lookup must not register a writer");
+    }
+
+    #[test]
+    fn receipt_reader_requires_a_protected_logger_without_creating_a_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("absent.log");
+        let logger = AuditLogger::new(path.clone());
+        let receipt = crate::audit_chain::AppendReceipt {version:1,sequence:1,
+            record_sha256:"a".repeat(64),committed_audit_sha256:"b".repeat(64)};
+        let error = logger.read_append_receipt(&receipt).unwrap_err();
+        assert!(error.to_string().contains("protected audit required"));
+        assert!(!path.exists());
     }
 
     #[test]
