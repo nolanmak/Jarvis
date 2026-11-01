@@ -756,6 +756,65 @@ mod tests {
         assert!(!native_auth_at(&path,"codex",|_|None).unwrap());
     }
 
+    // Physical native-store fixtures with no provider dispatch. A replacement
+    // deliberately has the same path/owned bytes but a different authority epoch.
+    fn lifecycle_fixture()->(tempfile::TempDir,PathBuf,Retirement,Launch) {
+        let base=tempfile::tempdir().unwrap();let root=base.path().join("native");
+        std::fs::create_dir(&root).unwrap();let root=root.canonicalize().unwrap();
+        let runtime=session(&root,"session-captured","/audit/original",false);
+        let aliases=root.join("codex/aliases");std::fs::create_dir(&aliases).unwrap();
+        std::fs::set_permissions(&aliases,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let expected=ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/original".into()};
+        let retirement=Retirement {session:runtime.clone(),expected:expected.clone()};
+        let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),aliases,
+            session:runtime,ephemeral:false,authority:expected,audit_log:"/audit/original".into(),_directory:tempfile::tempdir().unwrap()};
+        (base,root,retirement,launch)
+    }
+    fn replace_lifecycle_root(base:&Path,root:&Path)->PathBuf {
+        std::fs::rename(root,base.join("retained-native")).unwrap();std::fs::create_dir(root).unwrap();
+        let runtime=session(root,"session-captured","/audit/original",false);
+        let aliases=root.join("codex/aliases");std::fs::create_dir(&aliases).unwrap();
+        std::fs::set_permissions(aliases,std::fs::Permissions::from_mode(0o700)).unwrap();runtime
+    }
+    #[test]
+    fn native_lifecycle_retirement_does_not_act_on_a_replacement_store() {
+        let (base,root,retirement,_launch)=lifecycle_fixture();
+        let replacement=replace_lifecycle_root(base.path(),&root);retire(&retirement);
+        assert!(!replacement.join("retired.json").exists(),"delayed cleanup retired a replacement runtime");
+        assert!(!base.path().join("retained-native/codex/session-captured/retired.json").exists());
+    }
+    #[test]
+    fn native_lifecycle_alias_does_not_act_on_a_replacement_store() {
+        let (base,root,_retirement,launch)=lifecycle_fixture();replace_lifecycle_root(base.path(),&root);
+        assert!(launch.observe_session("late-reply").is_err(),"delayed callback published into a replacement store");
+        assert_eq!(std::fs::read_dir(root.join("codex/aliases")).unwrap().count(),0);
+    }
+    #[test]
+    fn native_lifecycle_lost_authority_is_not_recreated_by_scope_callbacks() {
+        let (_base,root,retirement,launch)=lifecycle_fixture();
+        for name in ["state.lock","runtime-retirement.sqlite","authority-epoch.json"] {std::fs::remove_file(root.join(name)).unwrap();}
+        let names=||std::fs::read_dir(&root).unwrap().map(|entry|entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+        let before=names();assert!(launch.observe_session("late-reply").is_err());retire(&retirement);
+        assert_eq!(names(),before,"scope callback recreated missing authority files");
+        assert!(!retirement.session.join("retired.json").exists());
+    }
+    #[test]
+    fn native_lifecycle_busy_store_retains_scope_without_blocking() {
+        for action in ["retire","alias"] {
+            let (_base,root,retirement,launch)=lifecycle_fixture();let lock=StateLock::acquire(&root).unwrap();
+            let (tx,rx)=std::sync::mpsc::channel();
+            let worker=std::thread::spawn(move || {
+                if action=="retire" {retire(&retirement);} else {assert!(launch.observe_session("late-busy-reply").is_err());}
+                let _=tx.send(());
+            });
+            let completed=rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            drop(lock);let joined=worker.join();
+            assert!(completed,"{action} blocked behind a native transfer/store writer");joined.unwrap();
+            assert!(!root.join("codex/session-captured/retired.json").exists());
+            assert_eq!(std::fs::read_dir(root.join("codex/aliases")).unwrap().count(),0);
+        }
+    }
+
     #[test]
     fn retirement_preserves_active_and_resumable_sessions_then_reclaims_released_owner() {
         let temp=tempfile::tempdir().unwrap();
