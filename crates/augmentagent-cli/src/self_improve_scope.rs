@@ -15,7 +15,16 @@ struct Selection {
     requests: Vec<ReadRequest>,
 }
 fn source_allowed(path:&str)->bool {
-    !path.split('/').any(|part|part==".env" || (part.starts_with(".env.") && part!=".env.example") || part==".credentials.json")
+    !path.split('/').any(|component| {
+        if component==".env.example" {return false;}
+        let part=component.to_ascii_lowercase();
+        part==".env" || part.starts_with(".env.")
+            || matches!(part.as_str(),".credentials.json"|".npmrc"|".netrc"|".git-credentials"|"id_rsa"|"id_dsa"|"id_ecdsa"|"id_ed25519")
+            || part.ends_with(".pem") || part.ends_with(".key")
+    })
+}
+fn source_entry_allowed(metadata:&str,path:&str)->bool {
+    metadata.split_whitespace().nth(1)==Some("blob") && source_allowed(path)
 }
 fn indexed_selection(raw:&str,files:&[(&str,&str)])->Result<Selection> {
     #[derive(Deserialize)]
@@ -30,8 +39,8 @@ fn indexed_selection(raw:&str,files:&[(&str,&str)])->Result<Selection> {
     ensure!(!selected.requests.is_empty() && selected.requests.len()<=16,"scoper must select 1-16 excerpts");
     let mut requests=Vec::new();
     for request in selected.requests {
-        let (_,path)=files.get(request.file_index).context("source file_index is outside the controller's tracked-file table")?;
-        ensure!(source_allowed(path),"scoper requested credential file");
+        let (metadata,path)=files.get(request.file_index).context("source file_index is outside the controller's tracked-file table")?;
+        ensure!(source_entry_allowed(metadata,path),"scoper selected a credential path or non-blob entry");
         let request=ReadRequest {path:(*path).into(),start_line:request.start_line,end_line:request.end_line,needle:request.needle};
         excerpt("",&request)?; // Validate bounds before any Git content is fetched.
         requests.push(request);
@@ -188,7 +197,7 @@ async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,
         tracked.len() <= 1024 * 1024,
         "scoper file index needs partitioning"
     );
-    let entries=tree_entries(&tracked)?.into_iter().filter(|(_,path)|source_allowed(path)).collect::<Vec<_>>();
+    let entries=tree_entries(&tracked)?.into_iter().filter(|(metadata,path)|source_entry_allowed(metadata,path)).collect::<Vec<_>>();
     // The model needs names and stable ordinals, not every blob SHA/mode.
     let tracked=serde_json::to_string(&entries.iter().enumerate().map(|(file_index,(_,path))|serde_json::json!([file_index,path])).collect::<Vec<_>>())?;
     let providers = reviewer_pool()
@@ -304,6 +313,25 @@ where R:Fn(bool,u32)->Result<Option<String>>,W:Fn(bool,u32,&str)->Result<()>,G:F
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_source_table_excludes_credentials_without_excluding_ordinary_configs() {
+        for path in [".npmrc","nested/.netrc",".git-credentials","keys/id_rsa","keys/id_dsa","keys/id_ecdsa","keys/id_ed25519","keys/deployment.pem","keys/deployment.key",".NPMRC","keys/DEPLOYMENT.PEM"] {
+            assert!(!source_entry_allowed("100644 blob a 12",path),"credential path offered to model: {path}");
+            let files=[("100644 blob a 12",path)];
+            assert!(indexed_selection(r#"{"requests":[{"file_index":0,"start_line":1,"end_line":2}]}"#,&files).is_err(),"credential path accepted on lookup: {path}");
+        }
+        for path in ["config/.env.example","Cargo.toml","src/key.rs","fixtures/id_rsa.pub","config/schema.json"] {
+            assert!(source_entry_allowed("100644 blob a 12",path),"ordinary source excluded: {path}");
+        }
+    }
+    #[test]
+    fn indexed_source_table_excludes_gitlinks_and_other_non_blob_entries() {
+        for metadata in ["160000 commit abc -","040000 tree abc -"] {
+            assert!(!source_entry_allowed(metadata,"dependency"));
+            assert!(indexed_selection(r#"{"requests":[{"file_index":0,"start_line":1,"end_line":2}]}"#,&[(metadata,"dependency")]).is_err());
+        }
+        assert!(source_entry_allowed("100644 blob abc 12","source.rs"));
+    }
     #[test]
     fn indexed_sources_resolve_only_controller_supplied_paths() {
         let files=[("100644 blob a 12","source/quoted\"name\nand\ttab.rs"),("100644 blob b 14","real.py")];
