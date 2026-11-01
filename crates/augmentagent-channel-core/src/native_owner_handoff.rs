@@ -943,6 +943,89 @@ mod tests {
             before
         );
     }
+    #[test]
+    fn native_handoff_binding_policy_change_during_sealing_preserves_exact_prepared_request() {
+        let f = fixture(true);
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let original = std::fs::read(&path).unwrap();
+        let changed = std::cell::Cell::new(false);
+        let current = || {
+            let value: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(f.sources[0].protected_anchor_path().unwrap()).unwrap(),
+            )
+            .unwrap();
+            if !value["sealed"].is_null() && !changed.replace(true) {
+                let mut bytes = original.clone();
+                bytes.push(b' ');
+                std::fs::write(&path, bytes).unwrap();
+            }
+            Ok(())
+        };
+        let result = super::super::owner_outcome::transfer_bound_with_policy(
+            Some(&path),
+            &binding,
+            &f.request,
+            &observation(),
+            &f.sources,
+            &f.destination,
+            &current,
+        );
+        assert!(
+            matches!(
+                &result,
+                TransferOutcome::Held {
+                    reason: TransferReason::AuthorityConflict,
+                    ..
+                }
+            ),
+            "changed policy did not fence seal/commit: {result:?}"
+        );
+        assert!(changed.get());
+        assert_eq!(
+            super::super::ownership::transfer_receipt(
+                &binding,
+                &f.request,
+                &observation(),
+                &|| Ok(())
+            ),
+            Ok(None)
+        );
+        std::fs::write(&path, &original).unwrap();
+        assert!(matches!(
+            run_bound(&f, &path, &binding),
+            TransferOutcome::Completed(_)
+        ));
+    }
+    #[test]
+    fn native_handoff_binding_capture_rechecks_current_authority_before_returning() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let calls = std::cell::Cell::new(0);
+        let result = super::super::owner_outcome::capture_with_policy(
+            Some(&path),
+            &f.request,
+            &observation(),
+            &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() > 1 {
+                    Err(TransferFenceError::NotCurrent)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(TransferOutcome::Held {
+                    reason: TransferReason::AuthorityConflict,
+                    ..
+                })
+            ),
+            "capture returned after its lease became stale: {result:?}"
+        );
+    }
     struct Fixture {
         _temporary: tempfile::TempDir,
         root: PathBuf,
