@@ -3,7 +3,41 @@
 use super::*;
 use augmentagent_channel_core::native_vm::ownership::TransferBinding;
 
+fn initial_registration_origin(conn:&Connection,workflow:&str)->Result<bool> {
+    let marker:Option<(i64,i64)>=conn.query_row(
+        "SELECT version,registration_sequence FROM workflow_native_registration_origin WHERE workflow=?1",
+        [workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    let Some((version,sequence))=marker else {return Ok(false);};
+    ensure!(version==1 && sequence>0,"invalid native registration creation origin");
+    let event:Option<(String,i64,String)>=conn.query_row(
+        "SELECT workflow,generation,kind FROM workflow_event WHERE seq=?1",
+        [sequence],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+    ensure!(event==Some((workflow.into(),0,"registered".into())),"native registration creation origin changed");
+    Ok(true)
+}
+fn initial_registration_history(conn:&Connection,workflow:&str)->Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 UNION ALL SELECT 1 FROM workflow_builder_conversation WHERE workflow=?1 UNION ALL SELECT 1 FROM workflow_native_session_owner WHERE workflow=?1 UNION ALL SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind IN ('builder_conversation_observed','native_runtime_owner_registered','native_launch_intent_recorded') UNION ALL SELECT 1 FROM workflow WHERE id=?1 AND model_calls>0 UNION ALL SELECT 1 FROM resource_charge WHERE workflow=?1 AND model_calls>0)",
+        [workflow],|row|row.get(0))?)
+}
+
 impl WorkflowStore {
+    /// A selection hint only: registration rechecks history in its transaction.
+    pub fn initial_native_owner_available(&self,workflow:&str)->Result<bool> {
+        Ok(initial_registration_origin(&self.conn,workflow)? && !initial_registration_history(&self.conn,workflow)?)
+    }
+    /// Read failures remain distinct from an expired/superseded candidate.
+    /// This is a metadata fence; native dispatch retains its additional gates.
+    pub fn native_registration_current(&self,lease:&Lease,binding:&Binding,now:i64)->Result<bool> {
+        binding.validate()?;
+        let raw:Option<String>=self.conn.query_row(
+            "SELECT checkpoint FROM workflow WHERE id=?1 AND owner=?2 AND generation=?3 AND lease_until>?4 AND NOT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1 AND lease_generation=?3 AND (retirement_reason IS NOT NULL OR retired_at IS NOT NULL))",
+            params![lease.workflow,lease.owner,lease.generation,now],|row|row.get(0)).optional()?;
+        raw.map(|raw|->Result<bool> {
+            let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+            Ok(checkpoint.binding==*binding && !matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired))
+        }).transpose().map(|value|value.unwrap_or(false))
+    }
     /// Only the first owner of a fresh workflow can use this entry. Subsequent
     /// owners need receipt-backed handoff settlement. Never backfill a legacy
     /// registration from the currently selected policy.
@@ -46,6 +80,10 @@ impl WorkflowStore {
                 "original native owner binding is missing or changed"
             );
         } else {
+            ensure!(initial_registration_origin(&tx,&lease.workflow)?,"legacy workflow creation requires verified native reconciliation");
+            let checkpoint_raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|row|row.get(0))?;
+            let checkpoint:Checkpoint=serde_json::from_str(&checkpoint_raw)?;
+            ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"workflow checkpoint blocks native registration");
             let previous: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workflow_native_owner WHERE workflow=?1)",
                 [&lease.workflow],
@@ -55,9 +93,7 @@ impl WorkflowStore {
                 !previous,
                 "retained native owners require handoff settlement"
             );
-            let legacy_native:bool=tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_builder_conversation WHERE workflow=?1 UNION ALL SELECT 1 FROM workflow_native_session_owner WHERE workflow=?1 UNION ALL SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='builder_conversation_observed' UNION ALL SELECT 1 FROM workflow WHERE id=?1 AND model_calls>0 UNION ALL SELECT 1 FROM resource_charge WHERE workflow=?1 AND model_calls>0)",
-                [&lease.workflow],|row|row.get(0))?;
+            let legacy_native=initial_registration_history(&tx,&lease.workflow)?;
             ensure!(!legacy_native,"legacy native or unattributed model-call history requires verified reconciliation");
             tx.execute("INSERT INTO workflow_native_owner(workflow,lease_generation,audit_path) VALUES(?1,?2,?3)", params![lease.workflow,lease.generation,audit_path])?;
             tx.execute(
@@ -162,6 +198,60 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, lease, binding)
+    }
+    #[test]
+    fn native_initial_owner_requires_creation_origin_without_backfill() {
+        let temporary=tempfile::tempdir().unwrap();let mut store=WorkflowStore::open(&temporary.path().join("workflow.sqlite")).unwrap();
+        let workflow="owner/repo/pr/7";let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+        let checkpoint=Checkpoint {stage:Stage::Intake,binding:binding.clone(),evidence:vec![],next:NextAction {reason:"legacy".into(),action:"scope".into(),eligible_at_ms:0}};
+        // A pre-feature workflow can have no owner, native ID or model charge.
+        // Its generic registered event is not a new-format creation receipt.
+        store.conn.execute("INSERT INTO workflow(id,branch,checkpoint,heartbeat_at,progress_at) VALUES(?1,'candidate',?2,1,1)",params![workflow,serde_json::to_string(&checkpoint).unwrap()]).unwrap();
+        store.conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,0,'registered','candidate',1)",[workflow]).unwrap();
+        assert!(!store.register(workflow,"candidate",binding.clone(),2).unwrap());
+        let lease=store.claim(workflow,"controller",3,100).unwrap().unwrap();
+        assert!(store.register_initial_native_owner(&lease,&binding,"/private/new-audit",&native_binding('d'),4).is_err(),
+            "an old empty workflow was silently declared fresh");
+        assert!(!store.initial_native_owner_available(workflow).unwrap());
+        assert!(store.native_owner_binding(workflow,lease.generation).unwrap().is_none());
+    }
+    #[test]
+    fn native_creation_origin_is_atomic_immutable_and_bound_to_its_registered_event() {
+        let temporary=tempfile::tempdir().unwrap();let path=temporary.path().join("workflow.sqlite");
+        let (mut store,lease,binding)=setup(&path);
+        let original:i64=store.conn.query_row("SELECT registration_sequence FROM workflow_native_registration_origin WHERE workflow=?1",[&lease.workflow],|row|row.get(0)).unwrap();
+        assert!(!store.register(&lease.workflow,"different-branch",binding.clone(),4).unwrap());
+        assert_eq!(store.conn.query_row("SELECT registration_sequence FROM workflow_native_registration_origin WHERE workflow=?1",[&lease.workflow],|row|row.get::<_,i64>(0)).unwrap(),original);
+        drop(store);let mut store=WorkflowStore::open(&path).unwrap();
+        assert!(store.initial_native_owner_available(&lease.workflow).unwrap());
+        store.conn.execute_batch("CREATE TRIGGER deny_native_origin BEFORE INSERT ON workflow_native_registration_origin BEGIN SELECT RAISE(ABORT,'synthetic origin failure'); END;").unwrap();
+        assert!(store.register("owner/repo/pr/8","candidate",binding.clone(),5).is_err());
+        assert!(store.snapshot("owner/repo/pr/8").unwrap().is_none());
+        assert!(store.events("owner/repo/pr/8").unwrap().is_empty());
+        store.conn.execute_batch("DROP TRIGGER deny_native_origin").unwrap();
+        store.register("owner/repo/pr/8","candidate",binding.clone(),6).unwrap();
+        store.conn.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES('owner/repo/pr/8',0,'registered','other',7)",[]).unwrap();
+        let foreign=store.conn.last_insert_rowid();
+        store.conn.execute("UPDATE workflow_native_registration_origin SET registration_sequence=?2 WHERE workflow=?1",params![lease.workflow,foreign]).unwrap();
+        assert!(store.initial_native_owner_available(&lease.workflow).is_err(),"a foreign creation event supplied freshness authority");
+        assert!(store.register_initial_native_owner(&lease,&binding,"/private/new-audit",&native_binding('d'),8).is_err());
+        assert!(store.native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
+    }
+    #[test]
+    fn native_registration_fence_distinguishes_stale_authority_and_unreadable_checkpoint() {
+        let temporary=tempfile::tempdir().unwrap();let (mut store,lease,workflow)=setup(&temporary.path().join("workflow.sqlite"));
+        assert!(store.native_registration_current(&lease,&workflow,3).unwrap());
+        let mut wrong=lease.clone();wrong.owner="another-controller".into();
+        assert!(!store.native_registration_current(&wrong,&workflow,3).unwrap());
+        let mut changed=workflow.clone();changed.evidence_hash="changed".into();
+        assert!(!store.native_registration_current(&lease,&changed,3).unwrap());
+        assert!(!store.native_registration_current(&lease,&workflow,103).unwrap());
+        store.register_initial_native_owner(&lease,&workflow,"/private/original-audit",&native_binding('d'),3).unwrap();
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Held;
+        store.checkpoint(&lease,&checkpoint,4).unwrap();
+        assert!(!store.native_registration_current(&lease,&workflow,5).unwrap());
+        store.conn.execute("UPDATE workflow SET checkpoint='not-json'",[]).unwrap();
+        assert!(store.native_registration_current(&lease,&workflow,5).is_err(),"unreadable authority was reported as merely stale");
     }
     #[test]
     fn native_initial_owner_rejects_legacy_conversations_without_owner_metadata() {

@@ -381,6 +381,10 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS scope_stage_response(workflow TEXT NOT NULL REFERENCES workflow(id),key TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(workflow,key));
             CREATE TABLE IF NOT EXISTS pr_readiness_dependencies(workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_hash TEXT NOT NULL,base TEXT NOT NULL,evidence TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
+            CREATE TABLE IF NOT EXISTS workflow_native_registration_origin (
+                workflow TEXT PRIMARY KEY REFERENCES workflow(id),
+                version INTEGER NOT NULL CHECK(version=1),
+                registration_sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq));
             CREATE TABLE IF NOT EXISTS workflow_native_owner (
                 workflow TEXT NOT NULL REFERENCES workflow(id), lease_generation INTEGER NOT NULL,
                 audit_path TEXT NOT NULL, retirement_reason TEXT, retired_at INTEGER,
@@ -675,6 +679,9 @@ impl WorkflowStore {
         )? == 1;
         if inserted {
             event(&tx, workflow, 0, "registered", branch, now_ms)?;
+            let sequence:i64=tx.query_row("SELECT seq FROM workflow_event WHERE workflow=?1 AND generation=0 AND kind='registered' ORDER BY seq DESC LIMIT 1",
+                [workflow],|row|row.get(0))?;
+            tx.execute("INSERT INTO workflow_native_registration_origin VALUES(?1,1,?2)",params![workflow,sequence])?;
         }
         tx.commit()?;
         Ok(inserted)
