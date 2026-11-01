@@ -1059,6 +1059,49 @@ mod tests {
         ));
     }
     #[test]
+    fn native_owner_binding_validation_is_read_only_and_checks_current_fence() {
+        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
+        let database=f.root.join("runtime-retirement.sqlite");let before=std::fs::read(&database).unwrap();
+        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Ok(()));
+        for (error,reason) in [(TransferFenceError::NotCurrent,TransferReason::AuthorityConflict),
+            (TransferFenceError::Unavailable,TransferReason::PersistRetry)] {
+            assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Err(error)),Err(reason));
+        }
+        assert_eq!(std::fs::read(database).unwrap(),before);
+    }
+    #[test]
+    fn native_owner_binding_validation_rejects_reselection_without_initializing_replacement() {
+        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
+        let replacement=f._temporary.path().join("replacement-state");std::fs::create_dir(&replacement).unwrap();
+        std::fs::set_permissions(&replacement,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["state_root"]=replacement.to_str().unwrap().into();std::fs::write(&path,serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Err(TransferReason::AuthorityConflict));
+        assert_eq!(std::fs::read_dir(&replacement).unwrap().count(),0);
+    }
+    #[test]
+    fn native_owner_binding_validation_does_not_recreate_lost_authority() {
+        for lost in ["runtime-retirement.sqlite","state.lock","authority-epoch.json","schema"] {
+            let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
+            if lost=="schema" {
+                let db=augmentagent_store::rusqlite::Connection::open(f.root.join("runtime-retirement.sqlite")).unwrap();
+                db.execute_batch("DROP TABLE native_transfer").unwrap();
+            } else {std::fs::remove_file(f.root.join(lost)).unwrap();}
+            let snapshot=||std::fs::read_dir(&f.root).unwrap().map(|entry|{let entry=entry.unwrap();
+                (entry.file_name(),std::fs::read(entry.path()).unwrap())}).collect::<std::collections::BTreeMap<_,_>>();
+            let before=snapshot();
+            assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Err(TransferReason::PendingUnknown),"accepted {lost}");
+            assert_eq!(snapshot(),before,"validation rewrote lost authority ({lost})");
+        }
+    }
+    #[test]
+    fn native_owner_binding_validation_refuses_busy_store_instead_of_waiting() {
+        let f=empty_binding_fixture();let path=policy(&f);let binding=binding_for(&f,&path);
+        let _writer=super::super::StateLock::acquire(&f.root).unwrap();
+        assert_eq!(super::super::owner_outcome::validate_owner_with_policy(Some(&path),&binding,&||Ok(())),Err(TransferReason::LockBusy));
+    }
+
+    #[test]
     fn native_owner_binding_capture_needs_no_transfer_and_preserves_empty_history() {
         let f = empty_binding_fixture();
         let path = policy(&f);

@@ -1,7 +1,7 @@
 //! Controller-owned runtime handoff; creation receipts remain immutable.
 use anyhow::{Result,ensure};
 use serde_json::Value;
-pub use super::owner_outcome::{capture_owner_binding, capture_transfer_binding, transfer, transfer_receipt, TransferBinding, TransferFenceError, TransferObservation, TransferOutcome, TransferReason};
+pub use super::owner_outcome::{capture_owner_binding, validate_owner_binding, capture_transfer_binding, transfer, transfer_receipt, TransferBinding, TransferFenceError, TransferObservation, TransferOutcome, TransferReason};
 
 pub fn canonical_bytes(value:&Value)->Result<Vec<u8>> {
     fn append(value:&Value,bytes:&mut Vec<u8>)->Result<()> {

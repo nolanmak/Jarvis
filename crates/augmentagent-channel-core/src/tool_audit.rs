@@ -580,6 +580,10 @@ impl AuditLogger {
         Ok(record)
     }
 
+    pub fn set_native_store_binding(&self,_binding:crate::native_vm::ownership::TransferBinding)->anyhow::Result<()> {Ok(())}
+    pub fn native_store_binding(&self)->anyhow::Result<Option<crate::native_vm::ownership::TransferBinding>> {Ok(None)}
+    pub fn validate_native_store_binding(&self)->anyhow::Result<()> {Ok(())}
+
     pub fn native_runtime_owner(&self)->anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
         Ok(self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?.clone())
     }

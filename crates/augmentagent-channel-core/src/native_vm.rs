@@ -564,20 +564,27 @@ mod tests {
     }
     #[test]
     fn native_preparation_durably_records_exact_launch_before_returning() {
-        launch_intent_child(false,false);
+        launch_intent_child("ready");
     }
     #[test]
     fn native_preparation_refuses_when_launch_intent_cannot_be_committed() {
-        launch_intent_child(true,false);
+        launch_intent_child("seal");
     }
     #[test]
     fn native_preparation_propagates_workflow_journal_refusal() {
-        launch_intent_child(false,true);
+        launch_intent_child("refuse");
     }
-    fn launch_intent_child(seal: bool, refuse: bool) {
+    #[test]
+    fn native_preparation_requires_original_store_binding() {launch_intent_child("unbound");}
+    #[test]
+    fn native_preparation_rejects_changed_original_policy_before_allocating_runtime() {launch_intent_child("reselect");}
+    fn launch_intent_child(mode: &str) {
+        let seal=mode=="seal";let refuse=mode=="refuse";
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let test = if refuse {"native_preparation_propagates_workflow_journal_refusal"}
+            let test = if mode=="unbound" {"native_preparation_requires_original_store_binding"}
+                else if mode=="reselect" {"native_preparation_rejects_changed_original_policy_before_allocating_runtime"}
+                else if refuse {"native_preparation_propagates_workflow_journal_refusal"}
                 else if seal {"native_preparation_refuses_when_launch_intent_cannot_be_committed"}
                 else {"native_preparation_durably_records_exact_launch_before_returning"};
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -606,6 +613,15 @@ mod tests {
             let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("model.jsonl"),anchors.join("model.json"),&[]).unwrap());
             let owner=RuntimeOwner {workflow_id:"owner/repo/pr/7".into(),lease_generation:1};
             logger.set_native_runtime_owner(owner.clone()).unwrap();
+            if mode!="unbound" {
+                let binding=ownership::capture_owner_binding(&||Ok(())).unwrap();
+                logger.set_native_store_binding(binding).unwrap();
+            }
+            if mode=="reselect" {
+                let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(&policy).unwrap()).unwrap();
+                value["memory_mb"]=(value["memory_mb"].as_u64().unwrap()+512).into();
+                std::fs::write(&policy,serde_json::to_vec(&value).unwrap()).unwrap();
+            }
             let observed=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let count=observed.clone();
             let saved=std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -626,6 +642,11 @@ mod tests {
             let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
             let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
             let launch=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native));
+            if matches!(mode,"unbound"|"reselect") {
+                assert!(launch.is_err(),"native preparation ignored the original store binding ({mode})");
+                assert!(!state.join(provider).exists(),"refused preparation allocated runtime state");
+                assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),0);continue;
+            }
             if seal {
                 assert!(launch.is_err(),"native preparation returned a dispatchable command without durable launch evidence");
                 continue;

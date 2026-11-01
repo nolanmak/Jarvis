@@ -643,6 +643,28 @@ mod tests {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    #[tokio::test]
+    async fn native_store_binding_is_checked_before_model_admission_and_release_marker() {
+        let root=tempfile::tempdir().unwrap();
+        for name in ["logs","anchors"] {std::fs::create_dir(root.path().join(name)).unwrap();}
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("logs/model.jsonl"),root.path().join("anchors/model.json"),&[]).unwrap());
+        logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}).unwrap();
+        let admitted=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=admitted.clone();
+        logger.set_model_call_observer(Arc::new(move |_|{count.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        // A real idle child makes cleanup truthful. This fixture tests only the
+        // controller release boundary; it does not pretend to launch a VM.
+        let mut child=std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let directory=tempfile::tempdir_in(root.path()).unwrap();let receipt=directory.path().join("cleanup-complete");
+        std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
+        let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
+            active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),
+            resource_audit:std::sync::Mutex::new(None),_directory:directory};
+        let outcome=group.admit_model("codex",Some(&logger)).await;
+        let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
+        assert!(outcome.is_err(),"VM release ignored the missing original store binding");
+        assert_eq!(admitted.load(Ordering::SeqCst),0);assert!(!receipt.with_file_name("launch-continue").exists());
+    }
+
     #[test]
     fn cleanup_waits_for_complete_receipt_after_path_is_created() {
         for prefix in [b"".as_slice(),b"all-descendants-".as_slice()] {

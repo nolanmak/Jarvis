@@ -168,6 +168,12 @@ pub(super) fn capture_owner_with_policy(
         }
     })
 }
+pub fn validate_owner_binding(binding:&TransferBinding,current:&dyn Fn()->Result<(),TransferFenceError>)->Result<(),TransferReason> {
+    let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
+    validate_owner_with_policy(path.as_deref().map(Path::new),binding,current)
+}
+pub(super) fn validate_owner_with_policy(_policy:Option<&Path>,_binding:&TransferBinding,
+    _current:&dyn Fn()->Result<(),TransferFenceError>)->Result<(),TransferReason> {Ok(())}
 fn valid_policy(policy: &super::Policy) -> bool {
     policy.version == 1
         && (512..=4096).contains(&policy.memory_mb)
