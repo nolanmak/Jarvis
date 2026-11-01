@@ -873,9 +873,22 @@ async fn proposal_with_retry(
             let prompt = format!("Supply the independent executable acceptance contract for {source}. Previous scoper output lacked a valid executable contract ({error}). Use only the supplied original source; do not edit it.\n{CONTRACT_PROMPT}\nScoper requirements:\n{scope}\nPreserve EACH original criterion verbatim as a contract requirement: {}", serde_json::to_string(required_criteria)?);
             // Reuse the audited, controller-mediated original-source selector.
             // Directory-only or prose requests must not become empty evidence.
-            let epoch = amendment::digest(&serde_json::to_vec(&(
-                source, actual_head(candidate).await?, scope, required_criteria, CONTRACT_PROMPT,
-            ))?);
+            let original_head=actual_head(candidate).await?;
+            let epoch_for=|criteria:&[String]|->Result<String> {Ok(amendment::digest(&serde_json::to_vec(&(
+                source,&original_head,scope,criteria,CONTRACT_PROMPT,
+            ))?))};
+            let epoch=epoch_for(required_criteria)?;
+            // Old resume parsing clipped each criterion to 200 characters and
+            // dropped entries after eight. Reuse a completed reply only when
+            // it passes the unchanged strict parser and ALL full requirements
+            // for this exact source, base, scope and workflow contract.
+            let mut legacy_criteria=required_criteria.to_vec();super::cap_criteria(&mut legacy_criteria);
+            if legacy_criteria!=required_criteria {
+                if let Some(proposal)=scope_authority::cached_persistent(workflow,"initial_acceptance_proposal",&epoch_for(&legacy_criteria)?,
+                    |raw|parse_proposal_for(raw,source).and_then(&validate))? {
+                    return Ok(proposal);
+                }
+            }
             scope_authority::persistent(
                 candidate, workflow, "initial_acceptance_proposal", &epoch, &prompt, true,
                 |raw| parse_proposal_for(raw, source).and_then(&validate),
