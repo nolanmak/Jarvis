@@ -2730,13 +2730,13 @@ mod tests {
         // Metadata fixture only: call the same protected preparation boundary
         // as NativeVM, without inventing a real runtime or submitting a prompt.
         let audit=guard.audit_logger();
-        let prepared=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:1,
+        let prepared=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:2,original_store_binding_sha256:"a".repeat(64),
             intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {
                 workflow_id:guard.id().into(),lease_generation:guard.lease.generation},
             source_audit_path:audit.path().into(),provider:"codex".into(),runtime_relative_path:"codex/session-fixture".into(),
             native_session_id:None,launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64)};
         let error=audit.native_launch_prepared(&prepared).unwrap_err();
-        assert!(error.to_string().contains("original owner binding"),"{error:#}");
+        assert!(error.to_string().contains("original") && error.to_string().contains("binding"),"{error:#}");
         let mut store=guard.store.lock().unwrap();
         assert!(store.native_launch_intents(guard.id()).unwrap().is_empty());
         assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,0);

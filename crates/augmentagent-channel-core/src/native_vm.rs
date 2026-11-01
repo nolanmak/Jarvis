@@ -29,6 +29,7 @@ pub struct PreparedLaunchIntent {
     pub native_session_id: Option<String>,
     pub launch_sha256: String,
     pub creation_receipt_sha256: String,
+    pub original_store_binding_sha256: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedLaunchRecord {
@@ -38,7 +39,7 @@ pub struct PreparedLaunchRecord {
 impl PreparedLaunchIntent {
     pub(crate) fn validate(&self) -> Result<()> {
         let id=uuid::Uuid::parse_str(&self.intent_id)?;
-        ensure!(self.version==1 && !id.is_nil() && id.to_string()==self.intent_id,"invalid native launch intent identity");
+        ensure!(self.version==2 && !id.is_nil() && id.to_string()==self.intent_id,"invalid native launch intent identity");
         ensure!(matches!(self.provider.as_str(),"codex"|"claude"|"qwen"|"glm"),"invalid native launch provider");
         let parts:Vec<_>=self.runtime_relative_path.split('/').collect();
         ensure!(parts.len()==2 && parts[0]==self.provider && parts[1].starts_with("session-") && parts[1].len()>8
@@ -48,7 +49,7 @@ impl PreparedLaunchIntent {
             && self.source_audit_path.is_absolute(),"invalid native launch source owner");
         ensure!(self.native_session_id.as_ref().is_none_or(|id|!id.is_empty() && id.len()<=256
             && id.bytes().all(|byte|byte.is_ascii_graphic())),"invalid native launch session ID");
-        ensure!([&self.launch_sha256,&self.creation_receipt_sha256].into_iter().all(|hash|hash.len()==64
+        ensure!([&self.launch_sha256,&self.creation_receipt_sha256,&self.original_store_binding_sha256].into_iter().all(|hash|hash.len()==64
             && hash.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f'))),"invalid native launch digest");
         Ok(())
     }
@@ -527,7 +528,8 @@ impl Launch {
             Some(crate::native_session::Launch::Resume {id})=>Some(id.clone()),
             None=>None,
         };
-        let intent=PreparedLaunchIntent {version:1,intent_id:uuid::Uuid::new_v4().to_string(),
+        let original_store_binding_sha256=format!("{:x}",Sha256::digest(ownership::canonical_bytes(&serde_json::to_value(&original_binding)?)?));
+        let intent=PreparedLaunchIntent {version:2,intent_id:uuid::Uuid::new_v4().to_string(),original_store_binding_sha256,
             source_owner:audit_owner,source_audit_path:owner_logger.path().into(),provider:provider.into(),
             runtime_relative_path,native_session_id,creation_receipt_sha256,
             launch_sha256:format!("{:x}",Sha256::digest(&spec_bytes))};

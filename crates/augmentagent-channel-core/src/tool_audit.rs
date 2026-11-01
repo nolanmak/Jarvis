@@ -568,6 +568,10 @@ impl AuditLogger {
     /// command can escape to a provider. This does not prove native submission.
     pub fn native_launch_prepared(&self,intent:&crate::native_vm::PreparedLaunchIntent)->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
         intent.validate()?;
+        let original=self.native_store_binding()?.ok_or_else(||anyhow::anyhow!("original native store binding missing"))?;
+        use sha2::Digest;
+        let original_hash=format!("{:x}",sha2::Sha256::digest(crate::native_vm::ownership::canonical_bytes(&serde_json::to_value(original)?)?));
+        anyhow::ensure!(intent.original_store_binding_sha256==original_hash,"native launch original store digest mismatch");
         anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&intent.source_owner)
             && intent.source_audit_path==self.path,"native launch source audit mismatch");
         self.dispatch_allowed()?;

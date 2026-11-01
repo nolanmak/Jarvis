@@ -97,11 +97,12 @@ impl WorkflowStore {
         now:i64)->Result<NativeLaunchRecord> {
         self.validate_dispatch(lease,binding,now)?;
         let source=RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation};
-        ensure!(prepared.intent.version==1 && prepared.intent.source_owner==source
+        ensure!(prepared.intent.version==2 && prepared.intent.source_owner==source
             && audit.native_runtime_owner()?.as_ref()==Some(&source)
             && prepared.intent.source_audit_path==audit.path(),"native launch controller identity mismatch");
-        let (original_audit,_)=original_context(&self.conn,&lease.workflow,lease.generation,true)?;
+        let (original_audit,original_store_sha256)=original_context(&self.conn,&lease.workflow,lease.generation,true)?;
         ensure!(Path::new(&original_audit)==audit.path(),"native launch original audit mismatch");
+        ensure!(prepared.intent.original_store_binding_sha256==original_store_sha256,"native launch original store digest mismatch");
         ensure!(audit.native_store_binding()?==self.native_owner_binding(&lease.workflow,lease.generation)?,
             "native launch original store binding mismatch");
         let mut actual=audit.read_append_receipt(&prepared.controller_receipt)?;
@@ -221,7 +222,9 @@ mod tests {
         if let Some(original)=store.native_owner_binding(&lease.workflow,lease.generation).unwrap() {
             audit.set_native_store_binding(original).unwrap();
         }
-        let intent=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:1,
+        let original_store_binding_sha256=audit.native_store_binding().unwrap().map(|binding|
+            format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(binding).unwrap()).unwrap()))).unwrap_or_else(||"0".repeat(64));
+        let intent=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:2,original_store_binding_sha256,
             intent_id:uuid::Uuid::new_v4().to_string(),source_owner,source_audit_path:audit.path().into(),
             provider:"codex".into(),runtime_relative_path:"codex/session-first".into(),native_session_id:None,
             launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64)};
@@ -243,7 +246,7 @@ mod tests {
     }
     #[test]
     fn native_launch_bridge_rejects_receipts_for_changed_launch_owner_or_candidate() {
-        for mode in ["intent","owner","audit","provider","version","hash","receipt","candidate"] {
+        for mode in ["intent","owner","audit","provider","version","hash","receipt","candidate","binding-digest"] {
             let root=tempfile::tempdir().unwrap();
             let (mut store,lease,mut binding,audit,mut prepared)=protected_launch(root.path(),true);
             match mode {
@@ -251,8 +254,9 @@ mod tests {
                 "owner"=>prepared.intent.source_owner.lease_generation+=1,
                 "audit"=>prepared.intent.source_audit_path=root.path().join("foreign-audit"),
                 "provider"=>prepared.intent.provider="claude".into(),
-                "version"=>prepared.intent.version=2,
+                "version"=>prepared.intent.version=1,
                 "hash"=>prepared.intent.launch_sha256="c".repeat(64),
+                "binding-digest"=>prepared.intent.original_store_binding_sha256="c".repeat(64),
                 "receipt"=>prepared.controller_receipt.record_sha256="c".repeat(64),
                 "candidate"=>binding.head="changed".into(),
                 _=>unreachable!(),
@@ -271,6 +275,18 @@ mod tests {
             assert_eq!(store.validate_dispatch(&lease,&binding,5).is_ok(),allowed,"dispatch boundary accepted {stage:?}");
             assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
         }
+    }
+
+    #[test]
+    fn native_launch_bridge_does_not_upgrade_legacy_controller_intents_to_bound_evidence() {
+        let root=tempfile::tempdir().unwrap();
+        let (mut store,lease,binding,audit,mut prepared)=protected_launch(root.path(),true);
+        let mut legacy=serde_json::to_value(&prepared.intent).unwrap();legacy["version"]=1.into();
+        legacy.as_object_mut().unwrap().remove("original_store_binding_sha256");
+        legacy["actor"]="controller".into();legacy["kind"]="native_launch_intent".into();
+        prepared.controller_receipt=audit.record_controller_receipted(legacy).unwrap();
+        assert!(store.record_verified_native_launch(&lease,&binding,&audit,&prepared,4).is_err());
+        assert!(store.native_launch_intents(&lease.workflow).unwrap().is_empty());
     }
 
     #[test]
