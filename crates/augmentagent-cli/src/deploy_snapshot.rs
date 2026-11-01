@@ -165,8 +165,24 @@ pub fn snapshot(
 
 /// A forensic page image preserves damaged source bytes under normal ownership
 /// and retention. It is evidence, never a deployable rollback database.
-fn forensic_snapshot_budgeted(_db:&Path,_root:&Path,_label:&str,_now:chrono::DateTime<chrono::Utc>,
-    _limits:SnapshotLimits)->Result<PathBuf> {bail!("forensic snapshot not implemented")}
+pub fn snapshot_forensic(db:&Path,root:&Path,label:&str,now:chrono::DateTime<chrono::Utc>)->Result<PathBuf> {
+    forensic_snapshot_budgeted(db,root,label,now,SnapshotLimits {
+        budget_bytes:budget_bytes(),reserve_gb:crate::disk::gate_min_free_gb(),
+    })
+}
+fn forensic_snapshot_budgeted(db:&Path,root:&Path,label:&str,now:chrono::DateTime<chrono::Utc>,
+    limits:SnapshotLimits)->Result<PathBuf> {
+    snapshot_budgeted_mode(db,None,root,label,None,now,limits,true,None)
+}
+
+/// Capture through the maintenance connection so its exclusive database lock
+/// remains held from the preflight through the durable evidence capture.
+pub(crate) fn snapshot_forensic_connection(db: &Path, connection: &rusqlite::Connection,
+    root: &Path, label: &str) -> Result<PathBuf> {
+    snapshot_budgeted_mode(db,None,root,label,None,chrono::Utc::now(),SnapshotLimits {
+        budget_bytes:budget_bytes(),reserve_gb:crate::disk::gate_min_free_gb(),
+    },true,Some(connection))
+}
 
 struct SnapshotLimits {
     budget_bytes: u64,
@@ -175,6 +191,11 @@ struct SnapshotLimits {
 
 fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     git_sha: Option<&str>, now: chrono::DateTime<chrono::Utc>, limits: SnapshotLimits) -> Result<PathBuf> {
+    snapshot_budgeted_mode(db,binary,root,label,git_sha,now,limits,false,None)
+}
+fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
+    git_sha:Option<&str>,now:chrono::DateTime<chrono::Utc>,limits:SnapshotLimits,forensic:bool,
+    source:Option<&rusqlite::Connection>)->Result<PathBuf> {
     let SnapshotLimits { budget_bytes: budget, reserve_gb } = limits;
     if !db.is_file() {
         bail!("no database at {}", db.display());
@@ -218,23 +239,49 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     let result = (|| -> Result<u64> {
         let plain = dir.join("data.db.tmp");
         {
-            let conn = rusqlite::Connection::open_with_flags(
+            let opened;
+            let conn = if let Some(source)=source {source} else {
+                opened = rusqlite::Connection::open_with_flags(
                 db,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .with_context(|| format!("open {}", db.display()))?;
+                &opened
+            };
             conn.busy_timeout(Duration::from_secs(60))?;
-            conn.execute("VACUUM INTO ?1", [plain.to_string_lossy().as_ref()])
-                .context("VACUUM INTO (consistent copy)")?;
+            if forensic {
+                // Backup reads committed pages, including WAL, without walking
+                // damaged btrees or resurrecting deleted rows through recovery.
+                let mut destination=rusqlite::Connection::open(&plain)?;
+                let backup=rusqlite::backup::Backup::new(conn,&mut destination)?;
+                let deadline=std::time::Instant::now()+Duration::from_secs(60);
+                loop {
+                    use rusqlite::backup::StepResult;
+                    match backup.step(128)? {
+                        StepResult::Done=>break,
+                        StepResult::More=>(),
+                        StepResult::Busy|StepResult::Locked=>std::thread::sleep(Duration::from_millis(10)),
+                        _=>bail!("unknown forensic page-copy outcome"),
+                    }
+                    if std::time::Instant::now()>=deadline {bail!("forensic page copy remained busy or changing; retry capture");}
+                }
+            } else {
+                conn.execute("VACUUM INTO ?1", [plain.to_string_lossy().as_ref()])
+                    .context("VACUUM INTO (consistent copy)")?;
+            }
         }
-        let gz_path = dir.join(DB_NAME);
-        {
+        let gz_path = dir.join(if forensic {FORENSIC_DB_NAME}else{DB_NAME});
+        let image_sha256={
+            use std::io::Read;
+            use sha2::{Digest,Sha256};
             let mut input = std::fs::File::open(&plain)?;
             let out = std::fs::File::create(&gz_path)?;
             let mut enc = flate2::write::GzEncoder::new(out, flate2::Compression::fast());
-            std::io::copy(&mut input, &mut enc)?;
+            let mut digest=Sha256::new();let mut buffer=[0u8;65536];
+            loop {let count=input.read(&mut buffer)?;if count==0 {break;}digest.update(&buffer[..count]);enc.write_all(&buffer[..count])?;}
             enc.finish()?.sync_all()?;
-        }
+            format!("{:x}",digest.finalize())
+        };
         std::fs::remove_file(&plain)?;
         if let Some(bin) = binary.filter(|b| b.is_file()) {
             std::fs::copy(bin, dir.join(BINARY_NAME))
@@ -246,6 +293,9 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
         }
         let manifest = serde_json::json!({
             "owner": "augmentagent-snapshot-v1",
+            "kind": if forensic {"forensic-page-image"} else {"rollback"},
+            "restorable": !forensic,
+            "image_sha256": image_sha256,
             "created_at": now.to_rfc3339(),
             "label": sanitize_label(label),
             "git_sha": git_sha,
@@ -253,7 +303,14 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
             "db_gz_bytes": gz_bytes,
             "has_binary": dir.join(BINARY_NAME).is_file(),
         });
+        if forensic {
+            std::fs::write(dir.join(".pin"),"Forensic recovery evidence: verify repair before unpinning; never restore as a rollback")?;
+            std::fs::File::open(dir.join(".pin"))?.sync_all()?;
+        }
         std::fs::write(dir.join(MANIFEST_NAME), serde_json::to_vec_pretty(&manifest)?)?;
+        std::fs::File::open(dir.join(MANIFEST_NAME))?.sync_all()?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        std::fs::File::open(root)?.sync_all()?;
         Ok(gz_bytes)
     })();
     if let Err(e) = result {
@@ -290,6 +347,11 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Decompress a snapshot's database to `to`. Never overwrites without `force`.
 pub fn restore_db(snapshot_dir: &Path, to: &Path, force: bool) -> Result<()> {
+    if std::fs::read(snapshot_dir.join(MANIFEST_NAME)).ok().and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|metadata|metadata.get("kind").and_then(|v|v.as_str())==Some("forensic-page-image")
+            || metadata.get("restorable").and_then(|v|v.as_bool())==Some(false)) {
+        bail!("forensic evidence cannot be restored as a rollback database");
+    }
     let gz_path = snapshot_dir.join(DB_NAME);
     if !gz_path.is_file() {
         bail!("{} holds no {DB_NAME}", snapshot_dir.display());
@@ -402,7 +464,9 @@ fn manifest(path: &Path) -> Option<serde_json::Value> {
     // The original helper's manifest is also recognized; arbitrary dirs are not.
     (value.get("created_at").and_then(|v| v.as_str()).is_some()
         && value.get("db_bytes").and_then(|v| v.as_u64()).is_some()
-        && (path.join(DB_NAME).is_file() || value.get("external_path").is_some())).then_some(value)
+        && (path.join(DB_NAME).is_file() || value.get("external_path").is_some()
+            || (value.get("kind").and_then(|v|v.as_str())==Some("forensic-page-image")
+                && value.get("restorable").and_then(|v|v.as_bool())==Some(false) && path.join(FORENSIC_DB_NAME).is_file()))).then_some(value)
 }
 
 fn external_path(path: &Path) -> Option<PathBuf> {
@@ -451,7 +515,13 @@ fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opt
             out.push(Removal { kind, path: path.display().to_string(), bytes, removed, reason });
         }
     };
-    expire("snapshot", root, snapshot_items(root, now), MIN_AGE_HOURS, true);
+    let (forensic,rollbacks): (Vec<_>,Vec<_>)=snapshot_items(root,now).into_iter().partition(|item|
+        manifest(&root.join(&item.name)).and_then(|value|value.get("kind").and_then(|v|v.as_str()).map(str::to_owned))
+            .as_deref()==Some("forensic-page-image"));
+    // Evidence has its own retention slots and is pinned on capture. It must
+    // never evict one of the requested healthy rollback generations.
+    expire("snapshot", root, rollbacks, MIN_AGE_HOURS, true);
+    expire("forensic snapshot",root,forensic,MIN_AGE_HOURS,true);
     if let Some(dir) = release_dir {
         expire("rollback binary", dir, items_in(dir, now, &|name, is_dir| !is_dir && is_rollback_binary(name)), MIN_AGE_HOURS, true);
     }
