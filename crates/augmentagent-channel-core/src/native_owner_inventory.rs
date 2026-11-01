@@ -242,18 +242,38 @@ mod tests {
     }
     #[test]
     fn native_export_legacy_directory_modes_remain_private_beneath_private_generation_root() {
-        for mode in [0o755,0o775,0o777] {
-            let root=fixture();let nested=root.path().join("legacy");std::fs::create_dir(&nested).unwrap();std::fs::set_permissions(&nested,std::fs::Permissions::from_mode(mode)).unwrap();file(&nested.join("context"),b"saved native context");
-            let manifest=export_manifest(root.path()).expect("private ancestor should preserve eligibility of unchanged legacy directories");assert_eq!(manifest["entries"].as_array().unwrap().len(),2);
-            assert_eq!(nested.metadata().unwrap().permissions().mode()&0o777,mode);assert_eq!(std::fs::read(nested.join("context")).unwrap(),b"saved native context");
-            std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o775)).unwrap();assert!(export_manifest(root.path()).is_err(),"public generation root was accepted");
+        for mode in [0o755, 0o775, 0o777] {
+            let root = fixture();
+            let nested = root.path().join("legacy");
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(mode)).unwrap();
+            file(&nested.join("context"), b"saved native context");
+            let manifest = export_manifest(root.path()).expect(
+                "private ancestor should preserve eligibility of unchanged legacy directories",
+            );
+            assert_eq!(manifest["entries"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                nested.metadata().unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert_eq!(
+                std::fs::read(nested.join("context")).unwrap(),
+                b"saved native context"
+            );
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+            assert!(
+                export_manifest(root.path()).is_err(),
+                "public generation root was accepted"
+            );
         }
     }
     #[test]
     fn native_export_producer_parents_are_private_under_real_service_umasks() {
-        let script=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/native-provider-vm.py");
-        for mask in [0o002,0o022] {
-            let root=fixture();let output=std::process::Command::new("/usr/bin/python3").args(["-I","-c",r#"import importlib.util,json,os,pathlib,sys
+        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/native-provider-vm.py");
+        for mask in [0o002, 0o022] {
+            let root = fixture();
+            let output=std::process::Command::new("/usr/bin/python3").args(["-I","-c",r#"import importlib.util,json,os,pathlib,sys
 spec=importlib.util.spec_from_file_location('producer',sys.argv[1]);producer=importlib.util.module_from_spec(spec);spec.loader.exec_module(producer)
 os.umask(int(sys.argv[3]));root=pathlib.Path(sys.argv[2]);target=producer.export_target(root,'.codex/sessions/date/context')
 target.write_bytes(b'saved native context');target.chmod(0o600);modes=[];path=target.parent
@@ -261,9 +281,23 @@ while path!=root:
  modes.append(path.stat().st_mode & 0o777);path=path.parent
 print(json.dumps(modes))
 "#]).arg(&script).arg(root.path()).arg(mask.to_string()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();
-            assert!(output.status.success(),"producer failed: {}",String::from_utf8_lossy(&output.stderr));let modes:Vec<u32>=serde_json::from_slice(&output.stdout).unwrap();assert!(modes.iter().all(|mode|*mode==0o700),"umask {mask:o} produced nonprivate parents: {modes:?}");
-            assert_eq!(export_manifest(root.path()).unwrap()["entries"].as_array().unwrap().len(),4);
+            assert!(
+                output.status.success(),
+                "producer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let modes: Vec<u32> = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(
+                modes.iter().all(|mode| *mode == 0o700),
+                "umask {mask:o} produced nonprivate parents: {modes:?}"
+            );
+            assert_eq!(
+                export_manifest(root.path()).unwrap()["entries"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                4
+            );
         }
     }
-
 }

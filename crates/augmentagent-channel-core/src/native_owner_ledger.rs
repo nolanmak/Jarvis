@@ -1422,6 +1422,54 @@ mod tests {
         assert_eq!(std::fs::read_dir(&aliases).unwrap().count(), 2);
     }
     #[test]
+    fn native_ledger_late_alias_writer_obeys_captured_actual_log_claim_after_alias_rebind() {
+        use std::os::unix::fs::symlink;
+        let root = fixture();
+        let audit = fixture();
+        let actual = audit.path().join("actual.log");
+        let rebound = audit.path().join("rebound.log");
+        super::super::write(&actual, b"original").unwrap();
+        super::super::write(&rebound, b"replacement").unwrap();
+        let alias = audit.path().join("alias.log");
+        symlink(&actual, &alias).unwrap();
+        let mut other = request("other");
+        other.source_owners[0].audit_path = alias.to_str().unwrap().into();
+        other.inventory[0].creation_audit_path = alias.to_str().unwrap().into();
+        other.inventory[0].effective_audit_path = alias.to_str().unwrap().into();
+        let runtime = physical_runtime(root.path(), &mut other);
+        let aliases = root.path().join("codex/aliases");
+        std::fs::create_dir(&aliases).unwrap();
+        std::fs::set_permissions(&aliases, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            command: tokio::process::Command::new("unused-fixture"),
+            resource_policy: json!({}),
+            aliases: aliases.clone(),
+            session: runtime,
+            ephemeral: false,
+            authority: other.source_owners[0].clone(),
+            _directory: tempfile::tempdir().unwrap(),
+        };
+        launch.observe_session("before-pending").unwrap();
+        let mut pending = request("pending");
+        pending.inventory.clear();
+        let mut bindings = endpoints(&pending);
+        bindings[0].actual_audit_path = actual.to_str().unwrap().into();
+        {
+            let lock = StateLock::acquire(root.path()).unwrap();
+            Ledger::open(root.path(), &lock)
+                .unwrap()
+                .prepare(&pending, &bindings, u64::MAX)
+                .unwrap();
+        }
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&rebound, &alias).unwrap();
+        assert!(
+            launch.observe_session("after-pending").is_err(),
+            "late observer bypassed its captured log namespace claim"
+        );
+        assert_eq!(std::fs::read_dir(&aliases).unwrap().count(), 1);
+    }
+    #[test]
     fn native_ledger_real_audit_file_claims_cover_distinct_aliases_and_anchor_names() {
         let root = fixture();
         let lock = StateLock::acquire(root.path()).unwrap();
