@@ -508,6 +508,70 @@ mod tests {
         path
     }
     #[test]
+    fn native_preparation_durably_records_exact_launch_before_returning() {
+        launch_intent_child(false);
+    }
+    #[test]
+    fn native_preparation_refuses_when_launch_intent_cannot_be_committed() {
+        launch_intent_child(true);
+    }
+    fn launch_intent_child(seal: bool) {
+        const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let test = if seal {"native_preparation_refuses_when_launch_intent_cannot_be_committed"}
+                else {"native_preparation_durably_records_exact_launch_before_returning"};
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("native_vm::tests::{test}"), "--test-threads=1"])
+                .env(CHILD,"1").env("AUGMENTAGENT_RUN_RESOURCES","1")
+                .env_remove("AUGMENTAGENT_RUN_MEMORY_BYTES").env_remove("AUGMENTAGENT_RUN_HOST_OVERHEAD_BYTES").output().unwrap();
+            assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use sha2::{Digest,Sha256};
+        let root=tempfile::tempdir().unwrap();
+        let state=root.path().join("state"); std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
+        initialize_native_test_store(&state);
+        let policy=root.path().join("policy.json");
+        write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,
+            "runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":state,
+            "memory_mb":512,"max_state_bytes":8589934592u64,"max_sessions":8,
+            "providers":{"codex":{"gateway":{},"auth_file":null,"auth_relative":".codex/auth.json"},
+                "claude":{"gateway":{},"auth_file":null,"auth_relative":".claude.json"}}})).unwrap()).unwrap();
+        // Isolated subprocess: never mutate another Rust test's policy selection.
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);
+        for (provider,id) in [("codex",Some("requested-codex-id")),("claude",None)] {
+            let logs=root.path().join(format!("logs-{provider}")); let anchors=root.path().join(format!("anchors-{provider}"));
+            std::fs::create_dir(&logs).unwrap(); std::fs::create_dir(&anchors).unwrap();
+            let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("model.jsonl"),anchors.join("model.json"),&[]).unwrap());
+            let owner=RuntimeOwner {workflow_id:"owner/repo/pr/7".into(),lease_generation:1};
+            logger.set_native_runtime_owner(owner.clone()).unwrap();
+            if seal {logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
+                crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap()
+                .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();}
+            let mut opts=crate::reasoner::triage_opts(None);opts.audit_logger=Some(logger.clone());
+            let native=crate::native_session::Launch::Create {requested_id:id.map(str::to_owned)};
+            let launch=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,Some(&native));
+            if seal {
+                assert!(launch.is_err(),"native preparation returned a dispatchable command without durable launch evidence");
+                continue;
+            }
+            let launch=launch.unwrap();
+            let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines()
+                .map(|row|serde_json::from_str(row).unwrap()).collect();
+            let row=rows.iter().find(|row|row["kind"]=="native_launch_intent")
+                .expect("native command escaped preparation without a durable controller launch intent");
+            assert_eq!(row["actor"],"controller");assert_eq!(row["source_owner"],serde_json::to_value(&owner).unwrap());
+            assert_eq!(row["source_audit_path"],logger.path().to_str().unwrap());
+            assert_eq!(row["provider"],provider);assert_eq!(row["native_session_id"],serde_json::to_value(id).unwrap());
+            assert_eq!(row["runtime_relative_path"],relative_runtime(&state,&launch.session).unwrap());
+            assert_eq!(row["launch_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch._directory.path().join("launch.json")).unwrap())));
+            assert_eq!(row["creation_receipt_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch.session.join("owned.json")).unwrap())));
+            assert!(uuid::Uuid::parse_str(row["intent_id"].as_str().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
     fn embedded_inventory_imports_without_checkout_siblings() {
         let temp=tempfile::tempdir().unwrap();
         for (name,contents) in HELPERS {write(&temp.path().join(name),contents).unwrap();}
