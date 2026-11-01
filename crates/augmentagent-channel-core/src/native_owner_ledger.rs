@@ -373,6 +373,35 @@ pub(super) fn history_bytes(root: &Path) -> Result<u64> {
     }
     Ok(bytes)
 }
+fn validate_all_history(db: &rusqlite::Connection) -> Result<()> {
+    let mut query = db.prepare("SELECT id FROM native_transfer ORDER BY id")?;
+    let ids = query
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut creations = BTreeMap::new();
+    for id in ids {
+        let record = load(db, &id)?.context(R::PreparedCorrupt)?;
+        if !matches!(record.state, State::Completed(_)) {
+            ensure!(!db.query_row("SELECT EXISTS(SELECT 1 FROM native_transfer_link WHERE transfer_id=?1 UNION ALL SELECT 1 FROM native_transfer_close WHERE transfer_id=?1)",[&id],|row|row.get::<_,bool>(0))?,R::PreparedCorrupt);
+        }
+        for row in record.request.inventory {
+            let creation = (
+                Authority {
+                    owner: row.creation_owner,
+                    audit_path: row.creation_audit_path,
+                },
+                row.creation_receipt_sha256,
+            );
+            if let Some(previous) = creations.insert(row.runtime_relative_path, creation.clone()) {
+                ensure!(previous == creation, R::PreparedCorrupt);
+            }
+        }
+    }
+    for (runtime, (authority, hash)) in creations {
+        resolve(db, &runtime, &authority, &hash).context(R::PreparedCorrupt)?;
+    }
+    Ok(())
+}
 impl<'a> Ledger<'a> {
     pub fn open(root: &'a Path, lock: &'a StateLock) -> Result<Self> {
         let held = lock.0.metadata()?;
@@ -406,6 +435,10 @@ impl<'a> Ledger<'a> {
             ensure!(rows.next()?.is_none(), R::PreparedCorrupt);
         }
         growth(&db)?;
+        if super::owner_store::initializing(&db)? {
+            super::owner_store::verify_migration(&db)?;
+            validate_all_history(&db)?;
+        }
         super::owner_store::activate(root, lock, &db)?;
         std::fs::File::open(root)?.sync_all()?;
         Ok(Self {
@@ -928,6 +961,50 @@ mod tests {
     #[test]
     fn native_store_identity_missing_epoch_constraints_refuse() {
         epoch_schema_refused(false);
+    }
+    #[test]
+    fn native_store_identity_migration_preserves_valid_terminal_history_and_chains() {
+        let root = fixture();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let mut ledger = Ledger::open(root.path(), &lock).unwrap();
+        let completed = request("completed");
+        ledger
+            .prepare(&completed, &endpoints(&completed), u64::MAX)
+            .unwrap();
+        let receipt = ledger.commit(&completed, seals(&completed)).unwrap();
+        let aborted = request("aborted");
+        ledger
+            .prepare(&aborted, &endpoints(&aborted), u64::MAX)
+            .unwrap();
+        ledger
+            .abort_and_retire(
+                &aborted.source_owners[0].audit_path,
+                &aborted.source_owners[0].owner,
+            )
+            .unwrap();
+        ledger
+            .db
+            .execute_batch("DROP TABLE native_authority_epoch")
+            .unwrap();
+        std::fs::remove_file(root.path().join("authority-epoch.json")).unwrap();
+        drop(ledger);
+        let migrated = Ledger::open(root.path(), &lock).unwrap();
+        assert_eq!(
+            migrated.state_for(&completed).unwrap(),
+            Some(State::Completed(receipt))
+        );
+        assert_eq!(migrated.state_for(&aborted).unwrap(), Some(State::Aborted));
+        assert_eq!(
+            migrated
+                .resolve(
+                    &completed.inventory[0].runtime_relative_path,
+                    &completed.source_owners[0],
+                    &completed.inventory[0].creation_receipt_sha256
+                )
+                .unwrap(),
+            completed.destination
+        );
+        assert_eq!(migrated.reserved_bytes().unwrap(), 0);
     }
     fn request(workflow: &str) -> TransferRequest {
         let source = RuntimeOwner {

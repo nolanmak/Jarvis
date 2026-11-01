@@ -12,6 +12,7 @@ use std::{
 const DATABASE: &str = "runtime-retirement.sqlite";
 const MARKER: &str = "authority-epoch.json";
 const BOOTSTRAP: &str = "authority-bootstrap.json";
+const EPOCH_SCHEMA: &str = "CREATE TABLE native_authority_epoch(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,epoch TEXT NOT NULL,root_identity_sha256 TEXT NOT NULL,ledger_identity_sha256 TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('initializing','active')),origin TEXT NOT NULL CHECK(origin IN ('fresh','legacy')))";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +161,15 @@ fn epoch_row(db: &rusqlite::Connection) -> Result<Option<(StoreIdentity, String,
     if !table_exists(db, "native_authority_epoch")? {
         return Ok(None);
     }
+    let schema: String = db.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='native_authority_epoch'",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        schema.trim_end_matches(';').trim() == EPOCH_SCHEMA,
+        R::PreparedCorrupt
+    );
     ensure!(
         db.query_row("SELECT count(*) FROM native_authority_epoch", [], |row| row
             .get::<_, u64>(0))?
@@ -283,7 +293,7 @@ pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection
             ledger_identity_sha256: ledger_hash,
         };
         let tx = db.unchecked_transaction()?;
-        tx.execute_batch("CREATE TABLE native_authority_epoch(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,epoch TEXT NOT NULL,root_identity_sha256 TEXT NOT NULL,ledger_identity_sha256 TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('initializing','active')),origin TEXT NOT NULL CHECK(origin IN ('fresh','legacy')));")?;
+        tx.execute_batch(EPOCH_SCHEMA)?;
         tx.execute(
             "INSERT INTO native_authority_epoch VALUES(1,?1,?2,?3,?4,'initializing',?5)",
             rusqlite::params![
@@ -303,6 +313,12 @@ pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection
     }
     crash_point("published");
     Ok(db)
+}
+pub(super) fn initializing(db: &rusqlite::Connection) -> Result<bool> {
+    Ok(epoch_row(db)?.context(R::PreparedCorrupt)?.1 == "initializing")
+}
+pub(super) fn verify_migration(db: &rusqlite::Connection) -> Result<()> {
+    validate_legacy(db)
 }
 pub(super) fn activate(root: &Path, lock: &StateLock, db: &rusqlite::Connection) -> Result<()> {
     lock_matches(root, lock)?;
@@ -441,5 +457,30 @@ mod tests {
         assert!(super::super::owner_ledger::Ledger::open(root.path(), &lock).is_err());
         assert!(!root.path().join(MARKER).exists());
         assert_eq!(std::fs::read(root.path().join(DATABASE)).unwrap(), before);
+    }
+    #[test]
+    fn native_store_identity_consumes_actual_python_provisioning_intent() {
+        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/provision-native-vm-probe.py");
+        for mask in [0o002, 0o022] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let child=std::process::Command::new("/usr/bin/python3").args(["-I","-c",r#"import importlib.util,os,pathlib,sys
+spec=importlib.util.spec_from_file_location('provision',sys.argv[1]);p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
+os.umask(int(sys.argv[3]));p.record_fresh_store(pathlib.Path(sys.argv[2]))
+"#]).arg(&script).arg(root.path()).arg(mask.to_string()).env_clear().env("PATH","/usr/bin:/bin").output().unwrap();
+            assert!(
+                child.status.success(),
+                "actual provisioner failed: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            let bootstrap: Bootstrap = optional(root.path(), BOOTSTRAP).unwrap().unwrap();
+            let lock = StateLock::acquire(root.path()).unwrap();
+            super::super::owner_ledger::Ledger::open(root.path(), &lock).unwrap();
+            let epoch: StoreIdentity = optional(root.path(), MARKER).unwrap().unwrap();
+            assert_eq!(epoch.epoch, bootstrap.epoch);
+            assert_eq!(epoch.root_identity_sha256, bootstrap.root_identity_sha256);
+            assert!(!root.path().join(BOOTSTRAP).exists());
+        }
     }
 }
