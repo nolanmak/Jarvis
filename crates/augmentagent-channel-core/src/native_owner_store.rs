@@ -459,6 +459,33 @@ mod tests {
         assert_eq!(std::fs::read(root.path().join(DATABASE)).unwrap(), before);
     }
     #[test]
+    fn native_store_identity_missing_state_lock_is_not_recreated_while_original_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::initialize_native_test_store(root.path());
+        let _original = StateLock::acquire(root.path()).unwrap();
+        std::fs::remove_file(root.path().join("state.lock")).unwrap();
+        assert!(
+            StateLock::acquire(root.path()).is_err(),
+            "missing durable lock was silently replaced"
+        );
+        assert!(!root.path().join("state.lock").exists());
+    }
+    #[test]
+    fn native_store_identity_replaced_state_lock_never_grants_a_second_writer() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::initialize_native_test_store(root.path());
+        let _original = StateLock::acquire(root.path()).unwrap();
+        std::fs::remove_file(root.path().join("state.lock")).unwrap();
+        super::super::write(&root.path().join("state.lock"), b"").unwrap();
+        let replacement = StateLock::acquire(root.path()).unwrap();
+        assert!(
+            super::super::owner_ledger::Ledger::open(root.path(), &replacement).is_err(),
+            "a replacement lock permitted a second authority writer"
+        );
+    }
+    #[test]
     fn native_store_identity_consumes_actual_python_provisioning_intent() {
         let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/provision-native-vm-probe.py");
