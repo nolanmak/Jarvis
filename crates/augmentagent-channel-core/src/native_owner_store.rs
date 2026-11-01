@@ -350,3 +350,96 @@ pub(crate) fn provision_fixture(root: &Path) {
     )
     .unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn native_store_identity_crash_publication_replays_one_epoch() {
+        const ROOT: &str = "JARVIS_TEST_STORE_CRASH_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let lock = StateLock::acquire(&root).unwrap();
+            super::super::owner_ledger::Ledger::open(&root, &lock).unwrap();
+            panic!("store initializer did not reach its crash point");
+        }
+        for origin in ["fresh", "legacy"] {
+            for phase in ["initialized", "published", "active", "consumed"] {
+                let root = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                if origin == "fresh" {
+                    provision_fixture(root.path());
+                } else {
+                    super::super::retirement_db(root.path())
+                        .unwrap()
+                        .execute(
+                            "INSERT INTO retired_owner VALUES('/audit/legacy','workflow',1)",
+                            [],
+                        )
+                        .unwrap();
+                }
+                let child=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","native_vm::owner_store::tests::native_store_identity_crash_publication_replays_one_epoch","--test-threads=1"])
+                .env(ROOT,root.path()).env("JARVIS_TEST_STORE_CRASH_PHASE",phase).output().unwrap();
+                assert_eq!(
+                    child.status.code(),
+                    Some(86),
+                    "{origin}/{phase}: {} {}",
+                    String::from_utf8_lossy(&child.stdout),
+                    String::from_utf8_lossy(&child.stderr)
+                );
+                let before = rusqlite::Connection::open_with_flags(
+                    root.path().join(DATABASE),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let (expected, state, _) = epoch_row(&before).unwrap().unwrap();
+                assert_eq!(
+                    state,
+                    if matches!(phase, "active" | "consumed") {
+                        "active"
+                    } else {
+                        "initializing"
+                    }
+                );
+                drop(before);
+                let lock = StateLock::acquire(root.path()).unwrap();
+                let ledger = super::super::owner_ledger::Ledger::open(root.path(), &lock).unwrap();
+                let marker: StoreIdentity = optional(root.path(), MARKER).unwrap().unwrap();
+                assert_eq!(marker, expected);
+                assert!(!root.path().join(BOOTSTRAP).exists());
+                assert_eq!(
+                    ledger
+                        .is_closed(&super::super::RuntimeOwner {
+                            workflow_id: "workflow".into(),
+                            lease_generation: 1
+                        })
+                        .unwrap(),
+                    origin == "legacy"
+                );
+                drop(ledger);
+                super::super::owner_ledger::Ledger::open(root.path(), &lock).unwrap();
+                assert_eq!(
+                    optional::<StoreIdentity>(root.path(), MARKER)
+                        .unwrap()
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn native_store_identity_active_marker_loss_never_republishes_it() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::initialize_native_test_store(root.path());
+        std::fs::remove_file(root.path().join(MARKER)).unwrap();
+        let before = std::fs::read(root.path().join(DATABASE)).unwrap();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        assert!(super::super::owner_ledger::Ledger::open(root.path(), &lock).is_err());
+        assert!(!root.path().join(MARKER).exists());
+        assert_eq!(std::fs::read(root.path().join(DATABASE)).unwrap(), before);
+    }
+}

@@ -840,6 +840,95 @@ mod tests {
             epoch
         );
     }
+    fn migration_refuses_terminal_corruption(completed: bool) {
+        let root = fixture();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let request = request("workflow");
+        let mut ledger = Ledger::open(root.path(), &lock).unwrap();
+        ledger
+            .prepare(&request, &endpoints(&request), u64::MAX)
+            .unwrap();
+        if completed {
+            ledger.commit(&request, seals(&request)).unwrap();
+            ledger
+                .db
+                .execute(
+                    "UPDATE native_transfer SET receipt_json=?1 WHERE id=?2",
+                    params![b"{}".to_vec(), request.transfer_id],
+                )
+                .unwrap();
+        } else {
+            ledger
+                .abort_and_retire(
+                    &request.source_owners[0].audit_path,
+                    &request.source_owners[0].owner,
+                )
+                .unwrap();
+            ledger
+                .db
+                .execute(
+                    "UPDATE native_transfer SET request_sha256='changed' WHERE id=?1",
+                    [&request.transfer_id],
+                )
+                .unwrap();
+        }
+        ledger
+            .db
+            .execute_batch("DROP TABLE native_authority_epoch")
+            .unwrap();
+        std::fs::remove_file(root.path().join("authority-epoch.json")).unwrap();
+        drop(ledger);
+        assert!(
+            Ledger::open(root.path(), &lock).is_err(),
+            "corrupt terminal history became active authority"
+        );
+        let db = rusqlite::Connection::open(root.path().join("runtime-retirement.sqlite")).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT state FROM native_authority_epoch WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "initializing"
+        );
+    }
+    #[test]
+    fn native_store_identity_migration_validates_completed_history_before_activation() {
+        migration_refuses_terminal_corruption(true);
+    }
+    #[test]
+    fn native_store_identity_migration_validates_aborted_history_before_activation() {
+        migration_refuses_terminal_corruption(false);
+    }
+    fn epoch_schema_refused(extra: bool) {
+        let root = fixture();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let ledger = Ledger::open(root.path(), &lock).unwrap();
+        if extra {
+            ledger
+                .db
+                .execute_batch("ALTER TABLE native_authority_epoch ADD COLUMN extra TEXT")
+                .unwrap();
+        } else {
+            ledger.db.execute_batch("ALTER TABLE native_authority_epoch RENAME TO previous_epoch;
+            CREATE TABLE native_authority_epoch(id INTEGER PRIMARY KEY,version INTEGER NOT NULL,epoch TEXT NOT NULL,root_identity_sha256 TEXT NOT NULL,ledger_identity_sha256 TEXT NOT NULL,state TEXT NOT NULL,origin TEXT NOT NULL);
+            INSERT INTO native_authority_epoch SELECT * FROM previous_epoch; DROP TABLE previous_epoch;").unwrap();
+        }
+        drop(ledger);
+        assert!(
+            Ledger::open(root.path(), &lock).is_err(),
+            "altered authority schema was accepted"
+        );
+    }
+    #[test]
+    fn native_store_identity_extra_epoch_columns_refuse() {
+        epoch_schema_refused(true);
+    }
+    #[test]
+    fn native_store_identity_missing_epoch_constraints_refuse() {
+        epoch_schema_refused(false);
+    }
     fn request(workflow: &str) -> TransferRequest {
         let source = RuntimeOwner {
             workflow_id: workflow.into(),
