@@ -619,12 +619,17 @@ impl AuditLogger {
 
     /// Controller receipts have their own actor kind, never a fictional model.
     pub fn record_controller(&self, value: serde_json::Value) -> anyhow::Result<()> {
+        self.record_controller_receipted(value).map(|_| ())
+    }
+
+    /// Capture the reference while the record's append lock is still held.
+    pub fn record_controller_receipted(&self, value: serde_json::Value) -> anyhow::Result<crate::audit_chain::AppendReceipt> {
         let sink = self
             .anchored
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("protected audit required"))?;
         let ticket = self.begin_write()?;
-        let result = sink.append(value);
+        let result = sink.append_receipted(value);
         if result.is_err() {
             self.mark_failed();
         }

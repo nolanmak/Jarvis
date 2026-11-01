@@ -129,6 +129,9 @@ impl AnchoredAudit {
     /// Appends under a cross-process lock; a durable pending intent permits
     /// replay after a daemon crash without accepting loss of committed rows.
     pub fn append(&self, record: serde_json::Value) -> Result<()> {
+        self.append_receipted(record).map(|_| ())
+    }
+    pub fn append_receipted(&self, record: serde_json::Value) -> Result<AppendReceipt> {
         let lock_path = self.anchor.with_extension("lock");
         ensure!(
             lock_path != self.anchor && lock_path != self.log,
@@ -141,9 +144,6 @@ impl AnchoredAudit {
             "audit lock failed"
         );
         self.append_locked(record)
-    }
-    pub fn append_receipted(&self, _record: serde_json::Value) -> Result<AppendReceipt> {
-        bail!("audit append receipt is not implemented")
     }
     /// Validate without replaying uncertain records, then atomically prevent all
     /// future appends. The caller validates kernel quiescence while holding the
@@ -204,6 +204,7 @@ impl AnchoredAudit {
         let committed = &bytes[..anchor.bytes];
         let actual = if committed.is_empty() { String::new() } else { digest(committed) };
         ensure!(actual == anchor.hash, "committed audit modified");
+        ensure!(anchor.sequence == committed.split(|byte| *byte==b'\n').filter(|row| !row.is_empty()).count() as u64, "committed audit sequence mismatch");
         let tail = &bytes[anchor.bytes..];
         ensure!(match &anchor.pending { Some(p) => p.as_bytes().starts_with(tail), None => tail.is_empty() }, "unrecognized audit tail");
         let rows = committed.split(|b| *b == b'\n').filter(|r| !r.is_empty())
@@ -211,7 +212,7 @@ impl AnchoredAudit {
         let clean=anchor.pending.is_none() && tail.is_empty();
         Ok((lock,anchor,rows,clean))
     }
-    fn append_locked(&self, mut record: serde_json::Value) -> Result<()> {
+    fn append_locked(&self, mut record: serde_json::Value) -> Result<AppendReceipt> {
         let mut anchor = if self.anchor.exists() {
             let file = private_open(&self.anchor, false)?;
             ensure!(
@@ -245,7 +246,11 @@ impl AnchoredAudit {
             digest(committed)
         };
         ensure!(actual == anchor.hash, "committed audit was modified");
+        ensure!(anchor.sequence == committed.split(|byte| *byte==b'\n').filter(|row| !row.is_empty()).count() as u64, "committed audit sequence mismatch");
         if let Some(pending) = anchor.pending.take() {
+            ensure!(pending.ends_with('\n') && !pending[..pending.len()-1].contains('\n'), "pending audit record framing is invalid");
+            ensure!(serde_json::from_str::<serde_json::Value>(&pending)?.is_object(), "pending audit record must be an object");
+            ensure!(anchor.bytes.checked_add(pending.len()).is_some_and(|bytes| bytes<=LIMIT as usize), "pending audit exceeds workflow budget");
             let suffix = &bytes[anchor.bytes..];
             ensure!(
                 pending.as_bytes().starts_with(suffix),
@@ -278,6 +283,7 @@ impl AnchoredAudit {
             }),
         );
         let mut line = serde_json::to_string(&record)?;
+        let record_sha256 = digest(line.as_bytes());
         line.push('\n');
         if bytes.len() + line.len() > LIMIT as usize {
             bail!("audit exceeds workflow budget");
@@ -291,7 +297,8 @@ impl AnchoredAudit {
         anchor.hash = digest(&bytes);
         anchor.sequence += 1;
         anchor.pending = None;
-        self.save(&anchor)
+        self.save(&anchor)?;
+        Ok(AppendReceipt { version:1, sequence:anchor.sequence, record_sha256, committed_audit_sha256:anchor.hash })
     }
 }
 
@@ -353,11 +360,15 @@ mod tests {
     }
     #[test]
     fn append_receipt_refuses_sealed_or_corrupt_authority_without_rewriting_it() {
-        for seal in [false, true] {
+        for mode in ["corrupt", "sealed", "counter"] {
             let (_directory, sink) = setup();
             sink.append(serde_json::json!({"kind":"first"})).unwrap();
-            if seal {
+            if mode == "sealed" {
                 sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).unwrap();
+            } else if mode == "counter" {
+                let mut anchor: Anchor = serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+                anchor.sequence += 1;
+                sink.save(&anchor).unwrap();
             } else {
                 let mut bytes = fs::read(&sink.log).unwrap();
                 bytes[2] ^= 1;
@@ -365,6 +376,19 @@ mod tests {
             }
             let before = fs::read(&sink.log).unwrap();
             assert!(sink.append_receipted(serde_json::json!({"kind":"late"})).is_err());
+            assert_eq!(fs::read(&sink.log).unwrap(), before);
+        }
+    }
+    #[test]
+    fn append_receipt_refuses_malformed_pending_records_before_recovering_bytes() {
+        for pending in ["\n", "[]\n", "{}\n{}\n"] {
+            let (_directory, sink) = setup();
+            sink.append(serde_json::json!({"kind":"first"})).unwrap();
+            let mut anchor: Anchor = serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+            anchor.pending = Some(pending.into());
+            sink.save(&anchor).unwrap();
+            let before = fs::read(&sink.log).unwrap();
+            assert!(sink.append_receipted(serde_json::json!({"kind":"new"})).is_err());
             assert_eq!(fs::read(&sink.log).unwrap(), before);
         }
     }
