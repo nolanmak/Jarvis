@@ -45,6 +45,8 @@ pub mod readiness;
 pub mod ownership;
 #[path = "native_owner_ledger.rs"]
 mod owner_ledger;
+#[path = "native_owner_inventory.rs"]
+mod owner_inventory;
 
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
@@ -347,7 +349,8 @@ impl Launch {
         let state_lock=StateLock::acquire(&root)?;
         let ledger=owner_ledger::Ledger::open(&root,&state_lock)?;
         ensure!(!ledger.is_closed(&audit_owner)? && !ledger.held_by_abort(&audit_owner)?
-            && !ledger.claimed(&audit_owner,"")? && !ledger.claimed_audit(owner_logger.path().to_str().context("non-UTF8 native audit path")?)?,"native runtime owner is retired or held");
+            && !ledger.claimed(&audit_owner,"")? && !ledger.claimed_audit(owner_logger.path().to_str().context("non-UTF8 native audit path")?)?
+            && !ledger.claimed_anchor(owner_logger.protected_anchor_path().context("native protected audit anchor missing")?)?,"native runtime owner is retired or held");
         let reserved=ledger.reserved_bytes()?;
         ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
         let count=prune_and_count(&root)?;
