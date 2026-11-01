@@ -20,6 +20,7 @@ pub(super) enum State {
 }
 pub(super) struct Endpoint {
     pub audit_path: String,
+    pub actual_audit_path: String,
     pub anchor_path: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -762,6 +763,7 @@ mod tests {
             .chain(std::iter::once(&request.destination))
             .map(|owner| Endpoint {
                 audit_path: owner.audit_path.clone(),
+                actual_audit_path:owner.audit_path.clone(),
                 anchor_path: format!("{}.anchor", owner.audit_path),
             })
             .collect()
@@ -1382,4 +1384,16 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_dir(&aliases).unwrap().count(), 2);
     }
+    #[test]
+    fn native_ledger_real_audit_file_claims_cover_distinct_aliases_and_anchor_names() {
+        let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let first=request("first");let second=request("second");
+        let mut first_endpoints=endpoints(&first);first_endpoints[0].actual_audit_path="/actual/shared/audit".into();
+        let mut second_endpoints=endpoints(&second);second_endpoints[0].actual_audit_path="/actual/shared/audit".into();
+        let mut ledger=Ledger::open(root.path(),&lock).unwrap();ledger.prepare(&first,&first_endpoints,u64::MAX).unwrap();
+        assert_eq!(ledger.prepare(&second,&second_endpoints,u64::MAX).unwrap_err().to_string(),"native-transfer-lock-busy");
+        assert!(ledger.state(&second.transfer_id).unwrap().is_none());
+        let mut changed=endpoints(&first);changed[0].actual_audit_path="/actual/rebound/audit".into();
+        assert!(ledger.prepare(&first,&changed,u64::MAX).is_err(),"same request accepted rebound audit namespace");
+    }
+
 }
