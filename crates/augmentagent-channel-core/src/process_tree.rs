@@ -59,6 +59,7 @@ impl ProcessGroup {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        let mut resource_identity=None;
         if self.resource_required {
             let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
                 .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -71,9 +72,15 @@ impl ProcessGroup {
             if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
             }
+            resource_identity=Some(observation["identity"].clone());
         }
         if let Some(logger)=logger {logger.dispatch_allowed()?;}
-        if model { if let Some(logger)=logger { logger.model_call_admitted(provider)?; } }
+        if model { if let Some(logger)=logger {
+            match &resource_identity {
+                Some(identity)=>logger.model_call_admitted_in_scope(provider,identity)?,
+                None=>logger.model_call_admitted(provider)?,
+            }
+        } }
         let mut proceed=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.receipt.with_file_name("launch-continue"))?;
         proceed.write_all(b"admitted\n")?;
         proceed.sync_all()?;
@@ -866,6 +873,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");
         // Idle to the sweep, yet still unsettled, so recovery can act on it.
         assert!(request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap());
+    }
+
+    #[tokio::test]
+    async fn model_admission_binds_the_exact_supervisor_resource_identity() {
+        let directory=tempfile::tempdir_in("/tmp").unwrap();
+        for name in ["logs","anchors"] {std::fs::create_dir(directory.path().join(name)).unwrap();}
+        let log=directory.path().join("logs/audit.jsonl");
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
+        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let command=Command::new("/usr/bin/true");
+        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        // Exercise the real supervisor admission boundary with a disposable
+        // controller receipt. This tests correlation, not kernel quiescence.
+        let identity=serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot",
+            "path":"/sys/fs/cgroup/synthetic-run","inode":42,"limits":{"memory_max_bytes":1024}});
+        write_private(&group.receipt.with_file_name("resource-accounting.json"),
+            serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}).to_string().as_bytes());
+        group.resource_required=true;
+        group.admit_model("codex",Some(&logger)).await.unwrap();
+        assert!(child.wait().await.unwrap().success());drop(group);
+        let rows:Vec<serde_json::Value>=std::fs::read_to_string(log).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        let resource=rows.iter().find(|r|r["kind"]=="run_resource_admitted").unwrap();
+        let model=rows.iter().find(|r|r["kind"]=="model_call_admitted").unwrap();
+        assert_eq!(model["resource_identity"],resource["observation"]["identity"],
+            "model admission has no binding to the resource scope whose quiescence will be verified");
+        assert_eq!(model["admission_schema_version"],2);
+        assert_eq!(model["actual_provider"],resource["provider"]);
+        assert_eq!(count.load(Ordering::SeqCst),1);
     }
 
     #[tokio::test]

@@ -16,6 +16,12 @@ use std::{
 };
 
 const LIMIT: u64 = 64 * 1024 * 1024;
+#[derive(Debug)]
+pub(crate) struct GenerationSealed;
+impl std::fmt::Display for GenerationSealed {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"audit generation is sealed")}
+}
+impl std::error::Error for GenerationSealed {}
 #[derive(Clone, Debug)]
 pub struct AnchoredAudit {
     log: PathBuf,
@@ -65,6 +71,23 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 impl AnchoredAudit {
+    /// Writer registration and sealing share this cross-process ingress gate.
+    /// The callback must persist its ticket before releasing the anchor lock.
+    pub(crate) fn with_open_generation<T>(&self,register:impl FnOnce()->Result<T>)->Result<T> {
+        let lock_path=self.anchor.with_extension("lock");
+        ensure!(lock_path!=self.anchor && lock_path!=self.log,"audit lock path collision");
+        let lock=private_open(&lock_path,false)?;
+        #[cfg(unix)]
+        ensure!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_EX)}==0,"audit lock failed");
+        if self.anchor.exists() {
+            let file=private_open(&self.anchor,false)?;
+            ensure!(file.metadata()?.len()<=LIMIT,"anchor exceeds budget");
+            let anchor:Anchor=serde_json::from_reader(file)?;
+            ensure!(anchor.version==1,"unsupported anchor");
+            if anchor.sealed.is_some(){return Err(GenerationSealed.into());}
+        }
+        register()
+    }
     /// Parents must already exist and be daemon-owned. Pass the complete set
     /// of admitted worker write roots, including runtime and build caches.
     pub fn new(log: PathBuf, anchor: PathBuf, writable_roots: &[PathBuf]) -> Result<Self> {
