@@ -475,6 +475,7 @@ mod tests {
         for case in ["stale", "unavailable", "uncertain", "invalid"] {
             let mut f = fixture(false);
             let before = audit_bytes(&f);
+            let native_before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
             let mut observed = observation();
             if case == "uncertain" {
                 observed.certain = false;
@@ -519,7 +520,10 @@ mod tests {
                 (_, other) => panic!("wrong {case} outcome: {other:?}"),
             }
             assert_eq!(audit_bytes(&f), before);
-            assert!(!f.root.join("runtime-retirement.sqlite").exists());
+            assert_eq!(
+                std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+                native_before
+            );
         }
     }
     #[test]
@@ -769,6 +773,7 @@ mod tests {
         let base = temporary.path().canonicalize().unwrap();
         let root = base.join("native");
         directory(&root);
+        super::super::initialize_native_test_store(&root);
         let audit = base.join("audit");
         directory(&audit.join("logs"));
         directory(&audit.join("anchors"));

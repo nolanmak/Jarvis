@@ -415,6 +415,7 @@ mod builder_restore_tests {
     fn runtime_fixture(root:&std::path::Path,name:&str)->std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::native_vm::initialize_native_test_store(root);
         let path=root.join("codex").join(name);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("owned.json"),r#"{"version":1,"owner":{"workflow_id":"fixture","lease_generation":1},"audit_path":"/audit/fixture"}"#).unwrap();

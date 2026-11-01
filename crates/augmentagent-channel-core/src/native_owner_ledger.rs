@@ -381,7 +381,7 @@ impl<'a> Ledger<'a> {
             held.dev() == current.dev() && held.ino() == current.ino(),
             R::LockBusy
         );
-        let db = super::retirement_db(root)?;
+        let db = super::owner_store::open(root, lock)?;
         db.pragma_update(None, "foreign_keys", "ON")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS native_transfer_meta(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
             INSERT OR IGNORE INTO native_transfer_meta VALUES(1,1);
@@ -406,6 +406,7 @@ impl<'a> Ledger<'a> {
             ensure!(rows.next()?.is_none(), R::PreparedCorrupt);
         }
         growth(&db)?;
+        super::owner_store::activate(root, lock, &db)?;
         std::fs::File::open(root)?.sync_all()?;
         Ok(Self {
             root,
@@ -882,7 +883,7 @@ mod tests {
     }
     #[test]
     fn native_ledger_preparation_survives_reopen_and_rejects_rebinding() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let lock = StateLock::acquire(root.path()).unwrap();
         let request = request("workflow");
@@ -914,7 +915,7 @@ mod tests {
     }
     #[test]
     fn native_ledger_completed_replay_never_downgrades_a_later_transfer() {
-        let root = tempfile::tempdir().unwrap();
+        let root = fixture();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let lock = StateLock::acquire(root.path()).unwrap();
         let first = request("workflow");
@@ -960,6 +961,7 @@ mod tests {
     fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::initialize_native_test_store(root.path());
         root
     }
     #[test]

@@ -190,6 +190,9 @@ def provision(args):
         root = root.resolve()
         state = root / 'state'
         state.mkdir(mode=0o700)
+        state_info = state.stat()
+        root_identity = hashlib.sha256(json.dumps({'device': state_info.st_dev, 'inode': state_info.st_ino}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        runtime_helper.atomic(state / 'authority-bootstrap.json', json.dumps({'version': 1, 'epoch': str(uuid.uuid4()), 'root_identity_sha256': root_identity}, sort_keys=True, separators=(',', ':')).encode())
         policy_path = root / 'policy.json'
         policy = {'version': 1, 'runtime_config': str(args.runtime_config.resolve()),
                   'state_root': str(state), 'memory_mb': args.memory_mb if args.memory_mb is not None else 1024,

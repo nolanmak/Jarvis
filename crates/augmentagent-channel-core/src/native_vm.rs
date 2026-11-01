@@ -51,6 +51,8 @@ mod owner_inventory;
 mod owner_handoff;
 #[path = "native_owner_outcome.rs"]
 mod owner_outcome;
+#[path = "native_owner_store.rs"]
+mod owner_store;
 
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
@@ -220,6 +222,7 @@ pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<us
     let lock=StateLock::acquire(&root)?;
     retire_owned_at(&root,&lock,audit_path,owner)
 }
+#[cfg(test)]
 fn retirement_db(root:&Path)->Result<rusqlite::Connection> {
     let path=root.join("runtime-retirement.sqlite");
     let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)?;
@@ -476,10 +479,18 @@ impl Launch {
 impl Drop for Launch { fn drop(&mut self) { if self.ephemeral {retire(&Retirement{session:self.session.clone(),expected:self.authority.clone()});} } }
 
 #[cfg(test)]
+pub(crate) fn initialize_native_test_store(root:&Path) {
+    owner_store::provision_fixture(root);
+    let lock=StateLock::acquire(root).unwrap();
+    owner_ledger::Ledger::open(root,&lock).unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn session(root:&Path,name:&str,owner:&str,complete:bool)->PathBuf {
         std::fs::set_permissions(root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !root.join("runtime-retirement.sqlite").exists() {initialize_native_test_store(root);}
         let path=root.join("codex").join(name);
         std::fs::create_dir_all(&path).unwrap();std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
         write(&path.join("owned.json"),&serde_json::to_vec(&serde_json::json!({"version":1,"audit_path":owner,"owner":{"workflow_id":"workflow","lease_generation":1}})).unwrap()).unwrap();
