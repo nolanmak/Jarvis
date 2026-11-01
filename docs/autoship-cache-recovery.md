@@ -4,7 +4,9 @@
 It does not reset workflow attempts, merge allowance, merge evidence, owner
 pauses, messages, or adoption event history. Healthy databases are a no-op.
 
-Inspect first; inspection opens the existing workflow database read-only:
+Inspect first; inspection opens the existing workflow database read-only.
+SQLite may maintain WAL shared-memory coordination files; inspection does not
+change committed database or WAL contents:
 
 ```sh
 augmentagent autopr recover-adoption-cache --workflow-db /path/to/autopr-workflow.sqlite3 --json
@@ -52,7 +54,8 @@ require investigation rather than a forced replay.
 After repair, normal adoption must rediscover and revalidate PRs against
 authenticated GitHub observations. An empty cache does not grant provenance,
 permission to merge, or a new allowance. Verify the real workflow's progress
-through `autopr status` and a normal admitted `autopr work` attempt.
+through `autopr status --workflow <workflow-id>` and a normal admitted
+`autopr work` attempt.
 
 For forensic capture alone:
 

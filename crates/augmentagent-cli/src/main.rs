@@ -3126,9 +3126,11 @@ async fn main() -> Result<()> {
         return model_tool::serve(channel, readiness);
     }
     if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
-        let _storage=if apply {Some(build_storage::acquire().await?)}else{None};
-        let root=deploy_snapshot::snapshot_root().context("no snapshot retention root")?;
-        let result=autoship_cache_recovery::recover(workflow_db,&root,apply,evidence.as_deref());
+        let result=async {
+            let _storage=if apply {Some(build_storage::acquire().await?)}else{None};
+            let root=deploy_snapshot::snapshot_root().context("no snapshot retention root")?;
+            autoship_cache_recovery::recover(workflow_db,&root,apply,evidence.as_deref())
+        }.await;
         let (code,value)=match result {
             Ok(value)=>(0,value),
             Err(error)=>(4,serde_json::json!({"schema_version":1,"state":"recovery-refused","error":format!("{error:#}")})),

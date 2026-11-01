@@ -470,8 +470,7 @@ mod tests {
         let path = temp.path().join("workflow.db");
         drop(crate::autoship_workflow::WorkflowStore::open(&path).unwrap());
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("PRAGMA journal_mode=DELETE;
-            CREATE TABLE authority_fixture(id INTEGER PRIMARY KEY, paused INTEGER, confirmed INTEGER, payload BLOB, ratio REAL);
+        db.execute_batch("CREATE TABLE authority_fixture(id INTEGER PRIMARY KEY, paused INTEGER, confirmed INTEGER, payload BLOB, ratio REAL);
             INSERT INTO authority_fixture VALUES(7,1,3,x'00ff01',1.25);
             INSERT INTO adoption_event(repository,pr,head,at_ms) VALUES('owner/repo',4,'head',1);
             INSERT INTO adopted_pr VALUES('owner/repo',4,'head','{}',1,1);").unwrap();
@@ -489,6 +488,8 @@ mod tests {
             )
             .unwrap();
         let size: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         drop(db);
         let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.seek(SeekFrom::Start(((page - 1) * size) as u64))
@@ -754,5 +755,47 @@ mod tests {
             "incident"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn adoption_recovery_inspection_preserves_committed_wal_and_repair_defers_for_its_reader() {
+        let (temp, path) = fixture();
+        damage(&path, "adopted_pr");
+        let root = temp.path().join("snapshots");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute("UPDATE authority_fixture SET confirmed=4", [])
+            .unwrap();
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let before = std::fs::read(&wal).unwrap();
+        assert!(!before.is_empty());
+        let inspected = recover(&path, &root, false, None).unwrap();
+        assert_eq!(inspected["state"], "repairable-cache-corruption");
+        assert_eq!(
+            std::fs::read(&wal).unwrap(),
+            before,
+            "inspection modified committed WAL frames"
+        );
+        let error = recover(&path, &root, true, None).unwrap_err().to_string();
+        assert!(error.contains("database busy"), "{error}");
+        assert!(
+            !root.exists(),
+            "a reader-blocked repair allocated evidence or changed state"
+        );
+        drop(writer);
+        let repaired = recover(&path, &root, true, None).unwrap();
+        assert_eq!(repaired["state"], "repaired");
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row("SELECT confirmed FROM authority_fixture", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
     }
 }

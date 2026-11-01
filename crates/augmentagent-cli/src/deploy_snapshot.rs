@@ -193,6 +193,23 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     git_sha: Option<&str>, now: chrono::DateTime<chrono::Utc>, limits: SnapshotLimits) -> Result<PathBuf> {
     snapshot_budgeted_mode(db,binary,root,label,git_sha,now,limits,false,None)
 }
+fn create_root_durable(root: &Path) -> Result<()> {
+    let absolute=if root.is_absolute() {root.to_path_buf()}else{std::env::current_dir()?.join(root)};
+    let mut missing=Vec::new();let mut cursor=absolute.as_path();
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor=cursor.parent().context("snapshot root has no existing ancestor")?;
+    }
+    std::fs::create_dir_all(&absolute)?;
+    // Persist every new directory entry before a forensic image can become
+    // durable evidence for a live repair, including multi-level new roots.
+    for directory in missing.iter().rev() {
+        restrict(directory);
+        std::fs::File::open(directory)?.sync_all()?;
+        std::fs::File::open(directory.parent().context("new snapshot directory has no parent")?)?.sync_all()?;
+    }
+    Ok(())
+}
 fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
     git_sha:Option<&str>,now:chrono::DateTime<chrono::Utc>,limits:SnapshotLimits,forensic:bool,
     source:Option<&rusqlite::Connection>)->Result<PathBuf> {
@@ -202,7 +219,7 @@ fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
     }
     let wal = PathBuf::from(format!("{}-wal", db.to_string_lossy()));
     let db_bytes = std::fs::metadata(db)?.len().saturating_add(std::fs::metadata(wal).map_or(0, |m| m.len()));
-    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    create_root_durable(root).with_context(|| format!("create {}", root.display()))?;
     let _lease = retention_lease(root)?.context("snapshot retention/creation busy; retry")?;
     let refs = crate::snapshot_refs::collect();
     prune_locked(root, None, &[], &PruneOptions { keep: keep_from_env(), ..Default::default() }, SystemTime::now(), &refs);
@@ -211,7 +228,7 @@ fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
     if retained.saturating_add(db_bytes).saturating_add(binary_bytes) > budget {
         bail!("{}", budget_refusal(&refs));
     }
-    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    create_root_durable(root).with_context(|| format!("create {}", root.display()))?;
     // Plain and gzip copies coexist during compression. Include the binary,
     // compression overhead, and final free-space reserve before allocating.
     let _space = {
