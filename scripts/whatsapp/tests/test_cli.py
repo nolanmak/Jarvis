@@ -35,6 +35,19 @@ class CliTests(unittest.TestCase):
         mask = os.umask(0o022)
         self.addCleanup(os.umask, mask)
 
+    def test_cold_source_database_warns_in_the_job_log(self):
+        old = 1_000_000_000
+        os.utime(self.db, (old, old))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(self.args), 0)
+        self.assertIn("WhatsApp Desktop store has not been written", err.getvalue())
+        fresh = io.StringIO()
+        os.utime(self.db, None)
+        with contextlib.redirect_stderr(fresh), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(self.args), 0)
+        self.assertNotIn("not been written", fresh.getvalue())
+
     def test_export_is_private_incremental_and_read_only(self):
         original = self.db.read_bytes()
         self.assertEqual(cli.main(self.args), 0)

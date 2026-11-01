@@ -249,9 +249,11 @@ fn a_resolved_turn_is_never_rerun_but_unblocks_the_next_turn() {
         .is_err());
 }
 
-// Discord keeps its own uncertain-turn semantics (#1220): its turns cannot
-// be resolved through the surface API, so a Discord conversation with an
-// uncertain turn stays blocked until inspected.
+// Discord keeps its own uncertain-turn semantics (#1220): a turn a live
+// process finished as uncertain cannot be resolved through the surface API
+// and blocks the conversation until inspected, and Discord turns are never
+// cancelled. The one exception (#1774) is a host signal stopping the
+// provider of a still-pending turn: closed as interrupted, like #1396.
 #[test]
 fn discord_turns_cannot_be_resolved_through_the_surface_api() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,9 +262,39 @@ fn discord_turns_cannot_be_resolved_through_the_surface_api() {
     let turn = SurfaceTurnRef::new(discord.clone(), "2:1").unwrap();
     store.claim_surface_turn(&turn).unwrap();
     assert!(store
-        .resolve_surface_turn(&turn, SurfaceTurnResolution::Interrupted)
+        .resolve_surface_turn(&turn, SurfaceTurnResolution::Cancelled)
         .is_err());
+    store.finish_surface_turn(&turn, false).unwrap();
+    assert!(store
+        .resolve_surface_turn(&turn, SurfaceTurnResolution::Interrupted)
+        .is_err(), "an uncertain turn from a live process keeps inspect-first");
     assert!(store
         .claim_surface_turn(&SurfaceTurnRef::new(discord, "2:2").unwrap())
         .is_err());
+}
+
+// #1774 — a deploy restart SIGTERMs the provider of a pending Discord turn:
+// the live process closes it as interrupted, the channel stays usable, and
+// the turn itself is never re-run.
+#[test]
+fn discord_pending_turn_stopped_by_a_host_signal_resolves_as_interrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("data.db")).unwrap();
+    let discord = chat("discord", "1", "2");
+    let turn = SurfaceTurnRef::new(discord.clone(), "2:1").unwrap();
+    store.claim_surface_turn(&turn).unwrap();
+    store
+        .resolve_surface_turn(&turn, SurfaceTurnResolution::Interrupted)
+        .unwrap();
+    let state = store.surface_turn_state(&turn).unwrap().unwrap();
+    assert_eq!(state.status, SurfaceTurnStatus::Uncertain);
+    assert_eq!(state.resolution, Some(SurfaceTurnResolution::Interrupted));
+    store
+        .claim_surface_turn(&SurfaceTurnRef::new(discord.clone(), "2:2").unwrap())
+        .expect("next turn proceeds");
+    assert!(store.claim_surface_turn(&turn).is_err(), "never re-run");
+    assert!(store.interrupt_pending_discord_turns().unwrap().iter().all(|t| t.turn_id != "2:1"),
+        "the startup pass does not see it again");
+    assert!(store.interrupt_discord_turn("1", "2", "2:1").is_err(), "not pending any more");
+    assert!(store.interrupt_discord_turn("1", "2", "unknown").is_err());
 }

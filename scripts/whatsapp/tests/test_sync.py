@@ -194,6 +194,23 @@ class TestSync(unittest.TestCase):
         state = json.loads(self.state.read_text())
         self.assertEqual(state["last_pk"], 1)
 
+    def test_group_event_jid_text_is_not_exported_as_a_message(self):
+        # Join/leave events (types 6 and 10) carry the member's JID in ZTEXT.
+        add_message(self.con, 1, 2, "222222222222222@lid", cd(1787745600), 0, message_type=6)
+        add_message(self.con, 2, 2, "14155550999@s.whatsapp.net", cd(1787745601), 0, message_type=10)
+        r = sync(self.db, self.out, self.state)
+        self.assertEqual(r["messages"], 0)
+        self.assertEqual(json.loads(self.state.read_text())["last_pk"], 2)
+
+    def test_deletion_pointer_is_not_exported_as_an_attachment(self):
+        self.con.execute(
+            "INSERT INTO ZWAMEDIAITEM (Z_PK, ZMEDIALOCALPATH, ZTITLE)"
+            " VALUES (5, NULL, 'AC2D2B3B5C12F0B76554E538717EF0CD')"
+        )
+        add_message(self.con, 1, 2, None, cd(1787745600), 0, message_type=14, media_item=5)
+        r = sync(self.db, self.out, self.state)
+        self.assertEqual(r["messages"], 0)
+
     def test_formatted_phone_partner_name_uses_e164_dir(self):
         # unsaved contacts have ZPARTNERNAME like '‪+1 (555) 207‑2258‬' —
         # the directory must be the clean handle, not slugified punctuation
@@ -317,6 +334,17 @@ class TestIdentity(unittest.TestCase):
         sync(self.db, self.out, self.state)
         names = self.index()[GROUP]["participant_names"]
         self.assertEqual(names, {"+14155550999": "Jane", LID_A: "Ana Lima", LID_B: "bee"})
+
+    def test_encoded_first_name_blob_yields_to_push_name(self):
+        # Desktop stores an encoded '+<base64>' token in ZFIRSTNAME for
+        # some members; it is never a display name.
+        self.con.execute("UPDATE ZWAGROUPMEMBER SET ZFIRSTNAME = '+CgAQuP2Z0wY=' WHERE Z_PK = 9")
+        self.con.execute("UPDATE ZWAGROUPMEMBER SET ZCONTACTNAME = NULL, ZFIRSTNAME = '+ChVHUCBhdCBEYXJpbmc' WHERE Z_PK = 7")
+        self.con.commit()
+        add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)
+        sync(self.db, self.out, self.state)
+        names = self.index()[GROUP]["participant_names"]
+        self.assertEqual(names, {LID_A: "Ana Lima", LID_B: "bee"})
 
     def test_lid_sender_maps_to_phone_when_known_and_is_left_raw_otherwise(self):
         add_message(self.con, 1, 2, "ski?", cd(1787745600), 0, group_member=8)

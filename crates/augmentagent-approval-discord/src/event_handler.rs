@@ -303,6 +303,18 @@ pub const INTERRUPTED_TURN_NOTICE: &str = "Jarvis restarted while working on thi
      part-way and was not run again (it may already have done some of the work). Send it again \
      if you still need it.";
 
+/// #1774 — the owner-facing text for a failed query turn. When a host signal
+/// (deploy restart) stopped the provider, the turn runner has already closed
+/// the turn as interrupted in the store; the owner gets the #1396 restart
+/// notice, not a "provider unavailable" error — the provider said nothing.
+pub fn failed_turn_reply(error: &impl std::fmt::Display, interrupted: bool) -> String {
+    if interrupted {
+        INTERRUPTED_TURN_NOTICE.to_string()
+    } else {
+        format!("wiki query failed: {error}")
+    }
+}
+
 /// Where to post the notice for an interrupted turn: its channel, and the
 /// message to reply to when the turn is a text turn (`<channel>:<message>`).
 /// Any other turn ID (speech) gets a channel-level notice. `None` only when
@@ -708,6 +720,7 @@ impl EventHandler for Handler {
         let allowed_user_id = self.state.allowed_user_id;
         let wiki_root = self.state.wiki_root.clone();
         let voice_bridge = self.state.voice_bridge.clone();
+        let store = self.state.store.clone();
 
         info!(%channel_id, %msg_id, "discord query received");
         tokio::spawn(async move {
@@ -831,7 +844,15 @@ impl EventHandler for Handler {
                     // the daemon log too so a failed turn can be diagnosed
                     // without correlating Discord and the store by hand.
                     warn!(%channel_id, %msg_id, error = %e, "discord query failed");
-                    let mut err_msg = format!("wiki query failed: {e}");
+                    let interrupted = store.as_deref().is_some_and(|store| {
+                        store
+                            .discord_turn_interrupted(&channel_id.to_string(), &audit_ctx.session_id)
+                            .unwrap_or_else(|error| {
+                                warn!("could not read interrupted-turn state: {error}");
+                                false
+                            })
+                    });
+                    let mut err_msg = failed_turn_reply(&e, interrupted);
                     if let Some(f) = &footer {
                         err_msg.push_str("\n\n");
                         err_msg.push_str(f);
@@ -1885,6 +1906,9 @@ async fn followup_with_recovery(
     }
 }
 
+/// Longest manual-send message shown inline with the card title prefix.
+const MANUAL_SEND_INLINE_MAX: usize = 1700;
+
 fn approval_followup(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
@@ -1939,7 +1963,17 @@ async fn deliver_approval_outcome(
     let mut followup = approval_followup(outcome, action_id);
     // #1507 — name the card the click acted on, so a reply can't be mistaken
     // for another card's (the owner approved a DM thinking it was a signature).
-    if let Some(title) = card_title(&comp.message) {
+    // #1765 — paste-ready text must never be cut: what the owner pastes is
+    // matched against the stored text. Too long for one message → attach it.
+    let manual_text = match outcome {
+        ApprovalActionOutcome::ManualSendReady { text, .. } => Some(text.as_str()),
+        _ => None,
+    };
+    if let Some(text) = manual_text.filter(|_| describe(outcome).chars().count() > MANUAL_SEND_INLINE_MAX) {
+        followup = followup
+            .content("Approved — not sent automatically. The reply is too long to show inline; paste the attached text into WhatsApp. The card closes as sent once the archive shows your message.")
+            .add_file(serenity::all::CreateAttachment::bytes(text.as_bytes().to_vec(), "whatsapp-reply.txt"));
+    } else if let Some(title) = card_title(&comp.message) {
         // Embed titles are capped at 256 by Discord; keep well inside the
         // 2000-char message limit so naming the card can't fail the reply.
         let title: String = title.chars().take(200).collect();
@@ -3194,6 +3228,18 @@ mod tests {
             );
         }
         assert_eq!(interrupted_turn_target(&interrupted("not-a-channel", "x")), None);
+    }
+
+    // #1774 — a turn a host signal stopped gets the restart notice, not a
+    // "provider unavailable" error; any other failure keeps the error text.
+    #[test]
+    fn a_failed_turn_closed_as_interrupted_gets_the_restart_notice() {
+        let error = anyhow::anyhow!("reasoner chain exhausted for FullAgentic: claude: attempted");
+        assert_eq!(failed_turn_reply(&error, true), INTERRUPTED_TURN_NOTICE);
+        assert_eq!(
+            failed_turn_reply(&error, false),
+            "wiki query failed: reasoner chain exhausted for FullAgentic: claude: attempted"
+        );
     }
     use augmentagent_docs::doc_command_for;
 

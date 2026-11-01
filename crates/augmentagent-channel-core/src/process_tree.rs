@@ -86,9 +86,14 @@ impl ProcessGroup {
                 None=>logger.model_call_admitted(provider)?,
             }
         } }
-        let mut proceed=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.receipt.with_file_name("launch-continue"))?;
+        // Publish only complete, synced admission bytes. Both the supervisor
+        // and native VM can observe this path immediately after creation.
+        let mut proceed=tempfile::NamedTempFile::new_in(self.receipt.parent().ok_or_else(||std::io::Error::other("admission directory missing"))?)?;
         proceed.write_all(b"admitted\n")?;
-        proceed.sync_all()?;
+        proceed.as_file().sync_all()?;
+        proceed.persist_noclobber(self.receipt.with_file_name("launch-continue"))
+            .map_err(|error|error.error)?;
+        std::fs::File::open(self.receipt.parent().unwrap())?.sync_all()?;
         Ok(())
     }
     pub(crate) fn resource_outcome(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {

@@ -366,9 +366,21 @@ impl Store {
     ) -> StoreResult<()> {
         let chat = turn.conversation();
         if chat.account().platform().as_str() == "discord" {
-            return Err(StoreError::InvalidInput(
-                "Discord native turns are not resolved through the surface API".into(),
-            ));
+            // #1774 — a host signal stopping the provider is the one
+            // resolution Discord takes from a live process (same record as
+            // the #1396 startup pass). Anything else keeps inspect-first.
+            if !matches!(resolution, SurfaceTurnResolution::Interrupted) {
+                return Err(StoreError::InvalidInput(
+                    "Discord native turns are not resolved through the surface API".into(),
+                ));
+            }
+            if chat.thread_id().is_none() {
+                return self.interrupt_discord_turn(
+                    chat.account().account_id(),
+                    chat.conversation_id(),
+                    turn.turn_id(),
+                );
+            }
         }
         let cols = params![
             chat.account().platform().as_str(),
@@ -502,22 +514,46 @@ impl Store {
         };
         let now = now_millis();
         for turn in &turns {
-            tx.execute(
-                "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
-                 WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
-                params![turn.guild_id, turn.channel_id, turn.turn_id, now],
-            )?;
-            tx.execute(
-                "INSERT INTO surface_turn_resolutions \
-                 (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
-                 VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
-                 ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
-                params![turn.guild_id, turn.channel_id, turn.turn_id,
-                    SurfaceTurnResolution::Interrupted.as_str(), now],
-            )?;
+            close_discord_turn_interrupted(&tx, &turn.guild_id, &turn.channel_id, &turn.turn_id, now)?;
         }
         tx.commit()?;
         Ok(turns)
+    }
+
+    /// #1774 — close one `pending` Discord turn as interrupted, from the live
+    /// process that claimed it, when a host signal stopped its provider. Same
+    /// record as the #1396 startup pass: `uncertain` plus an `interrupted`
+    /// resolution, so the turn stays consumed but no longer blocks the
+    /// channel. Refused for a turn that is not pending.
+    pub fn interrupt_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+    ) -> StoreResult<()> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !close_discord_turn_interrupted(&tx, guild_id, channel_id, turn_id, now_millis())? {
+            return Err(StoreError::InvalidInput("Discord native turn is not pending".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// #1774 — whether this Discord channel turn was closed as interrupted
+    /// (a host signal stopped its provider, or the #1396 startup pass).
+    pub fn discord_turn_interrupted(&self, channel_id: &str, turn_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM surface_turn_resolutions WHERE platform = 'discord' \
+                 AND conversation_id = ?1 AND thread_id = '' AND turn_id = ?2 \
+                 AND resolution = ?3 LIMIT 1",
+                params![channel_id, turn_id, SurfaceTurnResolution::Interrupted.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Only the native runner that claimed a pending turn can resolve it.
@@ -5042,6 +5078,27 @@ impl Store {
                 },
             )
             .optional()?;
+        // #1764 — a WhatsApp archive group card goes to every member. Every
+        // repost (Revise, nudge, recompose) reloads this row, so restore the
+        // recipients stored at import; scoped so no other platform's `to`
+        // (which feeds Gmail reply routing) changes.
+        let mut row = row;
+        if let Some(r) = row.as_mut().filter(|r| {
+            r.email.platform == "whatsapp" && r.email.account_entity_id.as_deref() == Some("whatsapp-history")
+        }) {
+            let raw: Option<String> = guard
+                .query_row(
+                    "SELECT retryGuardContext FROM emails WHERE messageId = ?1",
+                    params![r.email.message_id],
+                    |q| q.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some((to, cc, _)) = raw.and_then(|raw| serde_json::from_str::<(String, String, Vec<String>)>(&raw).ok()) {
+                r.email.to = to;
+                r.email.cc = cc;
+            }
+        }
         Ok(row)
     }
 
@@ -6155,44 +6212,62 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// `(action id, approved text, approved at ms)` awaiting confirmation on a thread.
+    /// `(action id, approved text, approved at ms)` awaiting confirmation on a
+    /// thread — including ones already expired, so a paste whose archive
+    /// timestamp is inside the window still confirms when the archive was late.
     pub fn manual_sends_pending_for_thread(&self, thread_id: &str) -> StoreResult<Vec<(String, String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
             "SELECT id, COALESCE(draftBody, ''), updatedAt FROM actions \
-              WHERE threadId = ?1 AND status = 'approved' AND errorMessage = ?2 \
+              WHERE threadId = ?1 AND ((status = 'approved' AND errorMessage = ?2) \
+                                    OR (status = 'error' AND errorMessage = ?3)) \
               ORDER BY updatedAt",
         )?;
-        let rows = stmt.query_map(params![thread_id, MANUAL_SEND_PENDING], |r| {
+        let rows = stmt.query_map(params![thread_id, MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The owner's pasted message showed up in the archive: `approved → sent`.
+    /// The owner's pasted message showed up in the archive: `approved → sent`
+    /// (or a late archive: expired `error → sent`).
     pub fn confirm_manual_send(&self, action_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let n = guard.execute(
-            "UPDATE actions SET status = 'sent', errorMessage = NULL, updatedAt = ?3 \
-              WHERE id = ?1 AND status = 'approved' AND errorMessage = ?2",
-            params![action_id, MANUAL_SEND_PENDING, now_millis()],
+            "UPDATE actions SET status = 'sent', errorMessage = NULL, updatedAt = ?4 \
+              WHERE id = ?1 AND ((status = 'approved' AND errorMessage = ?2) \
+                              OR (status = 'error' AND errorMessage = ?3))",
+            params![action_id, MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED, now_millis()],
         )?;
         Ok(n == 1)
     }
 
     /// Unconfirmed manual sends approved before `before_ms` become `error`
-    /// (never resent). Returns the ids.
+    /// (never resent). Returns the ids. `updatedAt` keeps the approval time,
+    /// so a late archive can still confirm against the original window.
     pub fn expire_manual_sends(&self, before_ms: i64) -> StoreResult<Vec<String>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "UPDATE actions SET status = 'error', errorMessage = ?3, updatedAt = ?4 \
+            "UPDATE actions SET status = 'error', errorMessage = ?3 \
               WHERE status = 'approved' AND errorMessage = ?1 AND updatedAt < ?2 RETURNING id",
         )?;
         let rows = stmt.query_map(
-            params![MANUAL_SEND_PENDING, before_ms, MANUAL_SEND_UNCONFIRMED, now_millis()],
+            params![MANUAL_SEND_PENDING, before_ms, MANUAL_SEND_UNCONFIRMED],
             |r| r.get(0),
         )?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// `(awaiting paste, expired unconfirmed)` WhatsApp-style manual sends,
+    /// for the owner's status view (#1765).
+    pub fn manual_send_counts(&self) -> StoreResult<(i64, i64)> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(guard.query_row(
+            "SELECT COALESCE(SUM(status = 'approved' AND errorMessage = ?1), 0), \
+                    COALESCE(SUM(status = 'error' AND errorMessage = ?2), 0) FROM actions",
+            params![MANUAL_SEND_PENDING, MANUAL_SEND_UNCONFIRMED],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     // --- tone profiles & examples (issue #73) ---
@@ -13086,3 +13161,32 @@ pub fn whatsapp_default_coverable(chat_jid: &str) -> bool {
 pub const MANUAL_SEND_PENDING: &str = "manual send pending";
 /// Set when the archive never showed the pasted reply within the window.
 pub const MANUAL_SEND_UNCONFIRMED: &str = "manual send not confirmed in the archive; nothing was sent automatically";
+
+/// #1396/#1774 — the one write that closes a `pending` Discord turn as
+/// interrupted: `uncertain` (its tools may have run) plus an `interrupted`
+/// resolution, so it stays consumed but no longer blocks the channel.
+/// Returns whether a pending turn was closed.
+fn close_discord_turn_interrupted(
+    tx: &rusqlite::Transaction<'_>,
+    guild_id: &str,
+    channel_id: &str,
+    turn_id: &str,
+    now: i64,
+) -> StoreResult<bool> {
+    let changed = tx.execute(
+        "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
+         WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+        params![guild_id, channel_id, turn_id, now],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO surface_turn_resolutions \
+         (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
+         VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
+         ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+        params![guild_id, channel_id, turn_id, SurfaceTurnResolution::Interrupted.as_str(), now],
+    )?;
+    Ok(true)
+}
