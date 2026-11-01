@@ -314,7 +314,8 @@ const HELPERS: &[(&str, &[u8])] = &[
 fn ensure_native_admission(ledger:&owner_ledger::Ledger<'_>,owner:&RuntimeOwner,logger:&crate::tool_audit::AuditLogger)->Result<()> {
     ensure!(!ledger.is_closed(owner)? && !ledger.held_by_abort(owner)?,"native-transfer-authority-conflict");
     ensure!(!ledger.claimed(owner,"")? && !ledger.claimed_audit(logger.path().to_str().context("non-UTF8 native audit path")?)?
-        && !ledger.claimed_anchor(logger.protected_anchor_path().context("native protected audit anchor missing")?)?,"native-transfer-lock-busy");Ok(())
+        && !ledger.claimed_anchor(logger.protected_anchor_path().context("native protected audit anchor missing")?)?
+        && !ledger.claimed_log(logger.protected_log_path().context("native protected audit log missing")?)?,"native-transfer-lock-busy");Ok(())
 }
 pub(crate) struct Launch {
     pub command: Command,

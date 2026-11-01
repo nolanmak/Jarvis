@@ -214,8 +214,7 @@ fn load(db: &rusqlite::Connection, id: &str) -> Result<Option<Record>> {
     );
     let claims: Vec<Claim> = serde_json::from_slice(&claim_bytes)?;
     ensure!(
-        claim_bytes.len() <= SEALS_LIMIT
-            && sha(&claim_bytes) == claim_sha
+        sha(&claim_bytes) == claim_sha
             && encoded(&claims)? == claim_bytes
             && claims.windows(2).all(|pair| pair[0] < pair[1]),
         "native-transfer-prepared-corrupt"
@@ -459,6 +458,13 @@ impl<'a> Ledger<'a> {
             |row| row.get(0),
         )?)
     }
+    pub fn claimed_log(&self, log: &Path) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_transfer_claim WHERE kind='audit-file' AND key=?1)",
+            [log.to_str().context("non-UTF8 native audit log")?],
+            |row| row.get(0),
+        )?)
+    }
     pub fn claimed_anchor(&self, anchor: &Path) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM native_transfer_claim WHERE kind='anchor' AND key=?1)",
@@ -477,10 +483,6 @@ impl<'a> Ledger<'a> {
             .context("native-transfer-invalid-request")?;
         let claims = claim_set(request, endpoints)?;
         let request_bytes = encoded(request)?;
-        ensure!(
-            encoded(&claims)?.len() <= SEALS_LIMIT,
-            "native-transfer-invalid-request"
-        );
         if let Some(prior) = load(&self.db, &request.transfer_id)? {
             ensure!(
                 prior.request == *request && prior.claims == claims,
@@ -686,9 +688,18 @@ impl<'a> Ledger<'a> {
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         growth(&transaction)?; // Corrupt pending state never grants retirement authority.
-        let mut query=transaction.prepare("SELECT DISTINCT transfer_id FROM native_transfer_claim WHERE (kind='owner' AND key=?1) OR (kind='audit' AND key=?2)")?;
+        let actual = match Path::new(audit_path).canonicalize() {
+            Ok(path) => Some(
+                path.to_str()
+                    .context("non-UTF8 native audit log")?
+                    .to_string(),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut query=transaction.prepare("SELECT DISTINCT transfer_id FROM native_transfer_claim WHERE (kind='owner' AND key=?1) OR (kind='audit' AND key=?2) OR (kind='audit-file' AND key=?3)")?;
         let ids = query
-            .query_map(params![owner_key(owner)?, audit_path], |row| {
+            .query_map(params![owner_key(owner)?, audit_path, actual], |row| {
                 row.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1489,37 +1500,127 @@ mod tests {
         );
     }
     #[test]
-    fn native_ledger_native_preparation_cannot_bypass_actual_log_claim_with_alias_and_alternate_anchor() {
+    fn native_ledger_native_preparation_cannot_bypass_actual_log_claim_with_alias_and_alternate_anchor(
+    ) {
         use std::os::unix::fs::symlink;
-        let root=fixture();let audit=fixture();let logs=audit.path().join("logs");let anchors=audit.path().join("anchors");std::fs::create_dir(&logs).unwrap();std::fs::create_dir(&anchors).unwrap();
-        let actual=logs.join("shared.jsonl");let source=crate::tool_audit::AuditLogger::protected(actual.clone(),anchors.join("source.json"),&[]).unwrap();
-        source.record_controller(json!({"actor":"controller","kind":"source"})).unwrap();
-        let alias=audit.path().join("alias");symlink(&logs,&alias).unwrap();let other=crate::tool_audit::AuditLogger::protected(alias.join("shared.jsonl"),anchors.join("other.json"),&[]).unwrap();
-        let owner=RuntimeOwner{workflow_id:"other".into(),lease_generation:9};other.set_native_runtime_owner(owner.clone()).unwrap();
-        let mut request=request("first");request.source_owners[0].audit_path=actual.to_str().unwrap().into();request.inventory.clear();let mut endpoints=endpoints(&request);
-        endpoints[0].anchor_path=source.protected_anchor_path().unwrap().to_str().unwrap().into();
-        let lock=StateLock::acquire(root.path()).unwrap();let mut ledger=Ledger::open(root.path(),&lock).unwrap();ledger.prepare(&request,&endpoints,u64::MAX).unwrap();
-        assert_eq!(super::super::ensure_native_admission(&ledger,&owner,&other).unwrap_err().to_string(),"native-transfer-lock-busy");
+        let root = fixture();
+        let audit = fixture();
+        let logs = audit.path().join("logs");
+        let anchors = audit.path().join("anchors");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::create_dir(&anchors).unwrap();
+        let actual = logs.join("shared.jsonl");
+        let source = crate::tool_audit::AuditLogger::protected(
+            actual.clone(),
+            anchors.join("source.json"),
+            &[],
+        )
+        .unwrap();
+        source
+            .record_controller(json!({"actor":"controller","kind":"source"}))
+            .unwrap();
+        let alias = audit.path().join("alias");
+        symlink(&logs, &alias).unwrap();
+        let other = crate::tool_audit::AuditLogger::protected(
+            alias.join("shared.jsonl"),
+            anchors.join("other.json"),
+            &[],
+        )
+        .unwrap();
+        let owner = RuntimeOwner {
+            workflow_id: "other".into(),
+            lease_generation: 9,
+        };
+        other.set_native_runtime_owner(owner.clone()).unwrap();
+        let mut request = request("first");
+        request.source_owners[0].audit_path = actual.to_str().unwrap().into();
+        request.inventory.clear();
+        let mut endpoints = endpoints(&request);
+        endpoints[0].anchor_path = source
+            .protected_anchor_path()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let mut ledger = Ledger::open(root.path(), &lock).unwrap();
+        ledger.prepare(&request, &endpoints, u64::MAX).unwrap();
+        assert_eq!(
+            super::super::ensure_native_admission(&ledger, &owner, &other)
+                .unwrap_err()
+                .to_string(),
+            "native-transfer-lock-busy"
+        );
     }
     #[test]
     fn native_ledger_fenced_retirement_intersects_canonical_actual_audit_alias() {
         use std::os::unix::fs::symlink;
-        let root=fixture();let audit=fixture();let actual=audit.path().join("source.log");super::super::write(&actual,b"private fixture").unwrap();let alias=audit.path().join("alias.log");symlink(&actual,&alias).unwrap();
-        let mut request=request("first");request.source_owners[0].audit_path=actual.to_str().unwrap().into();request.inventory.clear();
-        let lock=StateLock::acquire(root.path()).unwrap();let mut ledger=Ledger::open(root.path(),&lock).unwrap();ledger.prepare(&request,&endpoints(&request),u64::MAX).unwrap();
-        let other=RuntimeOwner{workflow_id:"other".into(),lease_generation:9};ledger.abort_and_retire(alias.to_str().unwrap(),&other).unwrap();
-        assert_eq!(ledger.state(&request.transfer_id).unwrap(),Some(State::Aborted));assert_eq!(ledger.reserved_bytes().unwrap(),0);
-        assert!(ledger.is_closed(&other).unwrap());assert!(!ledger.is_closed(&request.source_owners[0].owner).unwrap());
+        let root = fixture();
+        let audit = fixture();
+        let actual = audit.path().join("source.log");
+        super::super::write(&actual, b"private fixture").unwrap();
+        let alias = audit.path().join("alias.log");
+        symlink(&actual, &alias).unwrap();
+        let mut request = request("first");
+        request.source_owners[0].audit_path = actual.to_str().unwrap().into();
+        request.inventory.clear();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let mut ledger = Ledger::open(root.path(), &lock).unwrap();
+        ledger
+            .prepare(&request, &endpoints(&request), u64::MAX)
+            .unwrap();
+        let other = RuntimeOwner {
+            workflow_id: "other".into(),
+            lease_generation: 9,
+        };
+        ledger
+            .abort_and_retire(alias.to_str().unwrap(), &other)
+            .unwrap();
+        assert_eq!(
+            ledger.state(&request.transfer_id).unwrap(),
+            Some(State::Aborted)
+        );
+        assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+        assert!(ledger.is_closed(&other).unwrap());
+        assert!(!ledger.is_closed(&request.source_owners[0].owner).unwrap());
     }
     #[test]
     fn native_ledger_large_claim_bindings_use_exact_reserved_growth_instead_of_reference_limit() {
-        let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let mut request=request("workflow");request.inventory.clear();
-        request.source_owners=(0..64).map(|lease_generation|Authority{owner:RuntimeOwner{workflow_id:"workflow".into(),lease_generation},audit_path:format!("/declared/{lease_generation}")}).collect();request.destination.owner.lease_generation=64;
-        let mut endpoints=endpoints(&request);
-        for (index,endpoint) in endpoints.iter_mut().enumerate() {endpoint.actual_audit_path=format!("/actual/{index}/{}log","segment/".repeat(500));endpoint.anchor_path=format!("/anchor/{index}/{}anchor","segment/".repeat(500));}
-        let claims=encoded(&claim_set(&request,&endpoints).unwrap()).unwrap();assert!(claims.len()>SEALS_LIMIT);
-        {let mut ledger=Ledger::open(root.path(),&lock).unwrap();assert_eq!(ledger.prepare(&request,&endpoints,u64::MAX).unwrap(),State::Prepared);assert!(ledger.reserved_bytes().unwrap()>2*claims.len() as u64);}
-        assert_eq!(Ledger::open(root.path(),&lock).unwrap().state(&request.transfer_id).unwrap(),Some(State::Prepared));
+        let root = fixture();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let mut request = request("workflow");
+        request.inventory.clear();
+        request.source_owners = (0..64)
+            .map(|lease_generation| Authority {
+                owner: RuntimeOwner {
+                    workflow_id: "workflow".into(),
+                    lease_generation,
+                },
+                audit_path: format!("/declared/{lease_generation}"),
+            })
+            .collect();
+        request.destination.owner.lease_generation = 64;
+        let mut endpoints = endpoints(&request);
+        for (index, endpoint) in endpoints.iter_mut().enumerate() {
+            endpoint.actual_audit_path = format!("/actual/{index}/{}log", "segment/".repeat(500));
+            endpoint.anchor_path = format!("/anchor/{index}/{}anchor", "segment/".repeat(500));
+        }
+        let claims = encoded(&claim_set(&request, &endpoints).unwrap()).unwrap();
+        assert!(claims.len() > SEALS_LIMIT);
+        {
+            let mut ledger = Ledger::open(root.path(), &lock).unwrap();
+            assert_eq!(
+                ledger.prepare(&request, &endpoints, u64::MAX).unwrap(),
+                State::Prepared
+            );
+            assert!(ledger.reserved_bytes().unwrap() > 2 * claims.len() as u64);
+        }
+        assert_eq!(
+            Ledger::open(root.path(), &lock)
+                .unwrap()
+                .state(&request.transfer_id)
+                .unwrap(),
+            Some(State::Prepared)
+        );
     }
-
 }
