@@ -46,6 +46,23 @@ With the opt-out set it warns that builds run on the host.
 
 ### Build scratch, persistence and timeout (#1036)
 
+Rust dependencies can use native artifacts outside Cargo's registry. In
+particular, `ort-sys` downloads ONNX Runtime during its build script. The build
+guest has no external network interface, so the operator must provision this
+dependency before the build. An optional `ort_cache` field in the private runtime
+JSON names an absolute, literal directory containing the `ort-sys` cache layout:
+`dfbin/<target>/<distribution-sha256>/libonnxruntime.a`. Provision the distribution
+required by the locked `ort-sys` version using its normal integrity-checked
+download on the operator side. This is an explicit dependency export, never a
+discovery or export of the operator's whole home/cache directory.
+
+The guest mounts only that directory read-only at `/ort-cache` and sets
+`ORT_CACHE_DIR=/ort-cache`. Tasks cannot supply this environment variable. The
+selected distribution must already exist; a missing distribution still fails
+the build. This does not disable linking, substitute a stub, add a network
+device, or extend the package gateway's permitted origins. Existing runtime
+declarations without `ort_cache` retain their behavior.
+
 Every VM build file lives under the scratch root, never the root disk:
 `AUGMENTAGENT_BUILD_SCRATCH_DIR` in the daemon environment, default
 `/mnt/build/codex-vm`. Codex runs with a cleared environment, so the daemon

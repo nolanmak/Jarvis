@@ -96,11 +96,46 @@ class BuildScratchPlacementTests(unittest.TestCase):
 
     def runtime(self, root):
         artifact = root / 'artifact'; artifact.write_bytes(b'synthetic')
+        artifact.chmod(0o600)
         runtime = vm.Runtime()
         runtime.config = {name: str(artifact) for name in ('qemu', 'kernel', 'busybox', 'firmware',
                           'data_dir', 'library_dir', 'module_dir')}
         runtime.config.update(modules=[str(artifact)], memory_mb=512)
         return runtime
+
+    def test_explicit_ort_cache_is_read_only_and_pinned_in_guest_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()
+            cache = root / 'ort'; cache.mkdir()
+            runtime = self.runtime(root); runtime.config['ort_cache'] = str(cache)
+            seen = {}
+            def capture(entries):
+                seen.update({entry[0]: entry[2] for entry in entries})
+                raise self.Stop()
+            def certificate(command, **kwargs):
+                Path(command[command.index('-keyout')+1]).write_bytes(b'fixture key')
+                Path(command[command.index('-out')+1]).write_bytes(b'fixture certificate')
+            with patch.object(vm.subprocess, 'run', side_effect=certificate), patch.object(vm, 'initrd', side_effect=capture):
+                with self.assertRaisesRegex(vm.Unavailable, 'unexpected VM environment'):
+                    vm.run(runtime, workspace, ['true'], {'ORT_CACHE_DIR': '/workspace/forged'})
+                with self.assertRaises(self.Stop):
+                    vm.run(runtime, workspace, ['true'], {})
+            self.assertIn(b'ro,nosuid,nodev ort_cache /ort-cache', seen['init'])
+            self.assertTrue(json.loads(seen['job.json'])['ort_cache'])
+
+    def test_ort_cache_requires_an_explicit_literal_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); cache=root/'ort'; cache.mkdir()
+            runtime=self.runtime(root); config=root/'runtime.json'
+            alias=root/'alias'; alias.symlink_to(cache, target_is_directory=True)
+            for path, accepted in [(str(cache), True), (str(alias), False), ('relative', False), (None, False)]:
+                with self.subTest(path=path):
+                    runtime.config['ort_cache']=path
+                    config.write_text(json.dumps(runtime.config)); config.chmod(0o600)
+                    if accepted:
+                        self.assertEqual(vm.Runtime.load(config).config['ort_cache'], str(cache))
+                    else:
+                        with self.assertRaises(vm.Unavailable): vm.Runtime.load(config)
 
     def test_private_directory_is_created_under_the_scratch_dir(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -150,6 +185,30 @@ class QemuCommandTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires a provisioned private KVM runtime')
 class BuildVmTests(unittest.TestCase):
+    def test_explicit_ort_cache_is_visible_but_not_writable_or_a_home_export(self):
+        runtime = vm.Runtime.load(Path(os.environ['JARVIS_TEST_VM_CONFIG']))
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); workspace=root/'workspace'; workspace.mkdir()
+            cache=root/'ort'; cache.mkdir(); (cache/'fixture.a').write_bytes(b'synthetic native dependency')
+            secret=root/'private'; secret.write_bytes(b'SYNTHETIC_PRIVATE')
+            runtime.config['ort_cache']=str(cache)
+            program='''import json,os
+from pathlib import Path
+cache=Path(os.environ['ORT_CACHE_DIR'])
+result={'value':(cache/'fixture.a').read_text(),'home':os.environ['HOME'],
+        'interfaces':sorted(p.name for p in Path('/sys/class/net').iterdir()),
+        'sibling_visible':(cache.parent/'private').exists()}
+try:
+ (cache/'fixture.a').write_text('forged'); result['writable']=True
+except OSError: result['writable']=False
+print(json.dumps(result))
+'''
+            result=vm.run(runtime,workspace,['/usr/bin/python3','-c',program],{},timeout=30)
+            self.assertEqual(result['exit_code'],0,result)
+            self.assertEqual(json.loads(result['stdout']),{'value':'synthetic native dependency',
+                'home':'/home/worker','interfaces':['lo'],'sibling_visible':False,'writable':False})
+            self.assertEqual((cache/'fixture.a').read_bytes(),b'synthetic native dependency')
+
     def test_output_limit_stops_a_running_command_before_its_deadline(self):
         runtime = vm.Runtime.load(Path(os.environ['JARVIS_TEST_VM_CONFIG']))
         with tempfile.TemporaryDirectory() as temporary:
