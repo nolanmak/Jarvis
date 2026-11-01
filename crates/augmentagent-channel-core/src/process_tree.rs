@@ -18,7 +18,8 @@ pub(crate) struct ProcessGroup {
     vm_preflight: bool,
     resource_observed: AtomicBool,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
-    _directory: tempfile::TempDir,
+    resource_admission: std::sync::Mutex<Option<serde_json::Value>>,
+    _directory: Option<tempfile::TempDir>,
 }
 
 impl ProcessGroup {
@@ -32,7 +33,15 @@ impl ProcessGroup {
     pub(crate) async fn admit_command(&self, label: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         self.admit(label,logger,false).await
     }
+    pub(crate) async fn admit_command_observed(&self,provider:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,
+        observer:&mut (dyn FnMut(&serde_json::Value)->anyhow::Result<()> + Send)) -> anyhow::Result<()> {
+        self.admit_observed(provider,logger,false,Some(observer)).await
+    }
     async fn admit(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>, model:bool) -> anyhow::Result<()> {
+        self.admit_observed(provider,logger,model,None).await
+    }
+    async fn admit_observed(&self, provider:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,model:bool,
+        observer:Option<&mut (dyn FnMut(&serde_json::Value)->anyhow::Result<()> + Send)>) -> anyhow::Result<()> {
         self.bind_resource_audit(provider,logger)?;
         let ready=self.receipt.with_file_name("launch-ready");
         // Admission may wait for capacity (reclaiming cache, then a sibling run
@@ -74,6 +83,17 @@ impl ProcessGroup {
             }
             resource_identity=Some(observation["identity"].clone());
         }
+        if let Some(identity)=&resource_identity {
+            let parent=self.receipt.parent().ok_or_else(||anyhow::anyhow!("resource admission directory missing"))?;
+            let mut original=tempfile::NamedTempFile::new_in(parent)?;
+            original.write_all(&serde_json::to_vec(identity)?)?;original.as_file().sync_all()?;
+            original.persist_noclobber(parent.join("resource-admitted.json")).map_err(|error|error.error)?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        *self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?=resource_identity.clone();
+        if let Some(observer)=observer {
+            observer(resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("observed command requires a correlated resource scope"))?)?;
+        }
         if let Some(logger)=logger {logger.dispatch_allowed()?;}
         if model { if let Some(logger)=logger {
             match &resource_identity {
@@ -90,6 +110,14 @@ impl ProcessGroup {
             .map_err(|error|error.error)?;
         std::fs::File::open(self.receipt.parent().unwrap())?.sync_all()?;
         Ok(())
+    }
+    pub(crate) fn verified_quiescence(&self) -> anyhow::Result<serde_json::Value> {
+        let admitted=self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?
+            .clone().ok_or_else(||anyhow::anyhow!("command has no verified resource admission"))?;
+        let completed:serde_json::Value=serde_json::from_slice(&private_read(&self.receipt.with_file_name("resource-accounting.json"))?)?;
+        anyhow::ensure!(completed["phase"]=="completed" && completed.get("identity")==Some(&admitted),
+            "command completion lacks its exact admitted resource identity");
+        crate::run_resources::verify_quiescent(&admitted)
     }
     pub(crate) fn resource_outcome(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         if self.resource_observed.swap(true,Ordering::SeqCst) { return Ok(()); }
@@ -153,7 +181,12 @@ impl Drop for ProcessGroup {
         let mut clean=processes_settled;
         if clean { if let Some(marker)=&self.active_request { clean=retire_request(marker,&self.receipt).is_ok(); } }
         self.clean.store(clean,Ordering::SeqCst);
-        if !clean { tracing::error!("provider descendant cleanup is unverified; failover blocked"); }
+        if !clean {
+            // Retain private correlation evidence for restart recovery. A log
+            // line or a finished supervisor PID cannot prove subtree teardown.
+            if let Some(directory)=self._directory.take() {let _=directory.keep();}
+            tracing::error!("provider descendant cleanup is unverified; failover blocked");
+        }
 
     }
 }
@@ -538,31 +571,37 @@ const ADMISSION_WAIT_SECS: u64 = 120;
 /// policy explicitly; Command does not expose whether env_clear was selected.
 pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[])
+    spawn_supervised_inner(command,clear_env,clean,journal,false,false,false,None,&[],None)
 }
 pub(crate) fn spawn_admitted(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[])
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,None,&[],None)
 }
 /// #1627 — admitted spawn under the caller's resource tier. `None` keeps the
 /// supervisor's own declaration lookup (the builder tier).
 pub(crate) fn spawn_admitted_with_policy(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, required_resources:bool, policy:Option<&serde_json::Value>)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[])
+    spawn_supervised_inner(command,clear_env,clean,journal,true,required_resources,false,policy,&[],None)
 }
 /// Controller-only VM startup capability. Native code cannot run before admission.
 pub(crate) fn spawn_admitted_vm(command: &Command, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, policy:&serde_json::Value)
     -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[])
+    spawn_supervised_inner(command,true,clean,journal,true,true,true,Some(policy),&[],None)
 }
 pub(crate) fn spawn_admitted_storage(command: &Command, clean: Arc<AtomicBool>, required_resources: bool,
     storage_files: &[std::fs::File], policy: &serde_json::Value) -> std::io::Result<(Child, ProcessGroup)> {
     if storage_files.is_empty() || storage_files.len() > 64 {
         return Err(std::io::Error::other("invalid inherited storage descriptor set"));
     }
-    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files)
+    spawn_supervised_inner(command, true, clean, None, true, required_resources, false, Some(policy), storage_files,None)
 }
-fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File])
+pub(crate) fn spawn_admitted_storage_at(command:&Command,clean:Arc<AtomicBool>,required_resources:bool,
+    storage_files:&[std::fs::File],policy:&serde_json::Value,directory:&std::path::Path)
+    -> std::io::Result<(Child,ProcessGroup)> {
+    if storage_files.is_empty() || storage_files.len()>64 {return Err(std::io::Error::other("invalid inherited storage descriptor set"));}
+    spawn_supervised_inner(command,true,clean,None,true,required_resources,false,Some(policy),storage_files,Some(directory))
+}
+fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>, admission:bool, required_resources:bool, vm_preflight:bool, composed:Option<&serde_json::Value>, storage_files:&[std::fs::File], directory_override:Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
@@ -582,15 +621,17 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "provider binary is not executable"));
     }
-    let directory = tempfile::tempdir()?;
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
-    let helper = directory.path().join("supervisor.py");
-    let receipt = directory.path().join("cleanup-complete");
+    let owned_directory=if directory_override.is_none() {Some(tempfile::tempdir()?)} else {None};
+    let directory=directory_override.unwrap_or_else(||owned_directory.as_ref().unwrap().path());
+    if owned_directory.is_some() {std::fs::set_permissions(directory,std::fs::Permissions::from_mode(0o700))?;}
+    private_directory(directory)?;
+    let helper = directory.join("supervisor.py");
+    let receipt = directory.join("cleanup-complete");
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&helper)?;
     file.write_all(include_bytes!("../../../scripts/provider-supervisor.py"))?;
     let resource_policy=match composed {Some(policy)=>Some(policy.clone()),None=>crate::run_resources::declared_policy().map_err(std::io::Error::other)?};
     if required_resources && resource_policy.is_none() { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"required run resource declaration unavailable")); }
-    if resource_policy.is_some() { crate::run_resources::install_helper(directory.path()).map_err(std::io::Error::other)?; }
+    if resource_policy.is_some() { crate::run_resources::install_helper(directory).map_err(std::io::Error::other)?; }
     let mut supervised = Command::new("python3");
     supervised.args([std::ffi::OsStr::new("-I"), helper.as_os_str(), receipt.as_os_str(), executable.as_os_str()])
         .args(original.get_args()).current_dir(cwd)
@@ -638,7 +679,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), _directory: directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), resource_admission:std::sync::Mutex::new(None), _directory: owned_directory }))
 }
 
 #[cfg(test)]
@@ -668,10 +709,89 @@ mod tests {
             let clean=Arc::new(AtomicBool::new(false));
             let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
                 resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
-                resource_audit:std::sync::Mutex::new(None),_directory:directory};
+                resource_audit:std::sync::Mutex::new(None),resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
         }
+    }
+
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn command_quiescence_requires_the_exact_admitted_scope_and_completed_receipt() {
+        use sha2::{Digest,Sha256};
+        let directory=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let receipt=directory.path().join("cleanup-complete");
+        std::fs::write(&receipt,b"all-descendants-reaped\n").unwrap();
+        std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let resource=directory.path().join("resource-accounting.json");
+        let identity=serde_json::json!({
+            "host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
+            "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+            "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),
+            "inode":1,"limits":{"memory.max":67108864}});
+        let write=|value:&serde_json::Value| {
+            std::fs::write(&resource,serde_json::to_vec(value).unwrap()).unwrap();
+            std::fs::set_permissions(&resource,std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(&serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}));
+        std::fs::write(directory.path().join("launch-ready"),b"ready").unwrap();
+        let group=ProcessGroup {id:i32::MAX,receipt,clean:Arc::new(AtomicBool::new(false)),
+            active_request:None,resource_required:true,vm_preflight:false,
+            resource_observed:AtomicBool::new(false),resource_audit:std::sync::Mutex::new(None),
+            resource_admission:std::sync::Mutex::new(None),_directory:Some(directory)};
+        assert!(group.verified_quiescence().is_err(),"a file without admission is not authority");
+        group.admit_command("verification",None).await.unwrap();
+        assert!(group.verified_quiescence().is_err(),"admitted is not completed");
+        let completed=serde_json::json!({"phase":"completed","exhausted":false,"identity":identity});
+        write(&completed);
+        let proof=group.verified_quiescence().expect("exact completed scope must be verified against the kernel");
+        assert_eq!(proof["identity"],identity);
+        assert_eq!(proof["verified_state"],"removed_empty_subtree");
+        let mut foreign=completed.clone();foreign["identity"]["path"]=format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()).into();
+        write(&foreign);assert!(group.verified_quiescence().is_err(),"a different empty scope cannot replace the admitted one");
+        let mut malformed=completed.clone();malformed["phase"]="admitted".into();
+        write(&malformed);assert!(group.verified_quiescence().is_err());
+        write(&completed);
+    }
+
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    #[ignore = "requires an isolated delegated systemd service; real kernel scope, no VM or model"]
+    async fn observed_command_boundary_proves_live_then_quiescent_kernel_scope() {
+        use tokio::io::AsyncWriteExt;
+        let root=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory=root.path().join("supervisor");std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lease=std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
+            .open(root.path().join("storage-lease")).unwrap();
+        assert_eq!(unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let mut command=Command::new("/usr/bin/python3");
+        command.args(["-I","-c","import sys; print('ready',flush=True); sys.stdin.readline()"])
+            .env_clear().env("PATH","/usr/bin:/bin");
+        let policy=serde_json::json!({"memory_bytes":67108864,"pids":32,"cpu_percent":20});
+        let (mut child,group)=spawn_admitted_storage_at(&command,Arc::new(AtomicBool::new(true)),
+            true,&[lease],&policy,&directory).unwrap();
+        let mut admitted=None;
+        group.admit_command_observed("verification",None,&mut |identity| {
+            assert!(!directory.join("launch-continue").exists(),"callback ran after release");
+            admitted=Some(identity.clone());Ok(())
+        }).await.unwrap();
+        let mut output=BufReader::new(child.stdout.take().unwrap());let mut line=String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10),output.read_line(&mut line)).await.unwrap().unwrap();
+        assert_eq!(line.trim(),"ready");
+        let admitted=admitted.expect("actual admission callback missing");
+        assert!(crate::run_resources::verify_quiescent(&admitted).is_err(),"a live descendant was treated as quiescent");
+        assert!(group.verified_quiescence().is_err());
+        child.stdin.take().unwrap().write_all(b"finish\n").await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(10),child.wait()).await.unwrap().unwrap().success());
+        group.resource_outcome("verification",None).unwrap();
+        let proof=group.verified_quiescence().unwrap();
+        assert_eq!(proof["identity"],admitted);
+        assert!(matches!(proof["verified_state"].as_str(),Some("removed_empty_subtree"|"kernel_empty_subtree_removed")));
+        drop(group);
+        assert!(directory.join("resource-accounting.json").exists(),"caller-owned recovery receipts were deleted");
     }
 
     #[test]
