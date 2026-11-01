@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1713,
+  "scope": "Controller runtime retention for restored native builder conversations; no Discord consumer or live native continuation claim.",
+  "test_first_commit": "f91b551d",
+  "implementation_commit": "cc590f3a",
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "e9b405b5e32e5608fbccf3ba5f0ff31a55d8bcd80b596d9e214007dbd2015951"
+    }
+  ],
+  "red": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib builder_restore_tests -- --test-threads=1",
+    "passed": 4,
+    "failed": 1,
+    "expected_failure": "restored_owner_builders_keep_runtime_after_controller_exit_and_resume_again: saved native conversation was retired when its controller exited",
+    "log_sha256": "a93526573f749596d0ddac39aa8e3071843aac0419428c176bfa4b43d352dd91"
+  },
+  "green": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib native_ -- --test-threads=1",
+    "passed": 43,
+    "failed": 0,
+    "ignored": 2,
+    "log_sha256": "b48f76967cde53eee1f974135a6e93fca37eb49c3eecfffee4cbd9973bc150fe"
+  },
+  "preserved_invariants": [
+    "ordinary scoped builder runtimes retire",
+    "fresh independent reviewers retire even inside restored builder scopes",
+    "uncertain, duplicate and invalid restored sessions refuse",
+    "existing native workflow/audit ownership and retired-owner fences remain enforced"
+  ],
+  "remaining_acceptance": [
+    "quiescent fenced owner-turn handoff",
+    "owner-turn completion preserving explicit owner pause",
+    "worker/gateway consumer",
+    "actual Codex and Claude guarded continuation across restart",
+    "live Discord initiation, follow-up and gated merge"
+  ]
+}
