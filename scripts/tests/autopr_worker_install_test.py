@@ -17,10 +17,16 @@ class InstallTests(unittest.TestCase):
             base = Path(temporary)
             repo = base / 'repo fixture'
             (repo / 'scripts/systemd').mkdir(parents=True)
-            for name in ('ensure-autopr-worker.sh', 'systemd/augmentagent-autopr.service'):
+            for name in ('ensure-autopr-worker.sh','secure-release-executables.py', 'systemd/augmentagent-autopr.service'):
                 shutil.copy(ROOT / 'scripts' / name, repo / 'scripts' / name)
             runner=repo/'scripts/run-rs.sh'
             runner.write_text('#!/bin/sh\nexit 0\n');runner.chmod(0o700)
+            release=repo/'target/release';release.mkdir(parents=True)
+            artifacts=[release/name for name in ('augmentagent','augmentagent-mcp-memory')]
+            for artifact in artifacts:
+                artifact.write_text('#!/bin/sh\nexit 0\n');artifact.chmod(0o775)
+            # Cargo's public artifact and deps entry share the executable inode.
+            os.link(artifacts[0],release/'cargo-deps-link')
             binary = base / 'bin'; binary.mkdir()
             stub = binary / 'systemctl'
             stub.write_text('''#!/usr/bin/env python3
@@ -30,7 +36,7 @@ with open(os.environ['CALLS'],'a') as f:f.write(' '.join(sys.argv[1:])+'\\n')
 if 'show' in sys.argv:
  key=sys.argv[sys.argv.index('-p')+1]
  print({'Environment':'PATH=/usr/bin RUST_LOG=warn SYNTHETIC=fixture',
- 'EnvironmentFiles':'/fixture/config (ignore_errors=yes)',
+ 'EnvironmentFiles':os.environ.get('FIXTURE_ENVIRONMENT_FILES','/fixture/config (ignore_errors=yes) /fixture/required config% (ignore_errors=no) /fixture/pattern*.env (ignore_errors=yes)'),
  'ExecStart':'{ argv[]=/fixture/bin serve --dry-run false ; }',
  'MemoryHigh':'8589934592','MemoryMax':'10737418240',
  'TasksMax':'2048','LimitNOFILE':'4096','CPUQuotaPerSecUSec':'4s',
@@ -38,15 +44,22 @@ if 'show' in sys.argv:
 ''')
             stub.chmod(0o700)
             env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ['PATH'],
-                       XDG_CONFIG_HOME=str(base/'config'), XDG_STATE_HOME=str(base/'state'),
+                       XDG_CONFIG_HOME=str(base/'config fixture%[prod]*?\\folder'), XDG_STATE_HOME=str(base/'state'),
                        CALLS=str(base/'calls'))
             command = ['bash', str(repo/'scripts/ensure-autopr-worker.sh')]
             subprocess.run(command, env=env, check=True)
-            units = base/'config/systemd/user'
+            self.assertEqual([p.stat().st_mode & 0o777 for p in artifacts],[0o755,0o755],
+                'normal worker installation must make cached Cargo executables pass deployment trust checks')
+            self.assertEqual((release/'cargo-deps-link').stat().st_mode & 0o777,0o755)
+            units = base/'config fixture%[prod]*?\\folder/systemd/user'
             worker = (units/'augmentagent-autopr.service').read_text()
             self.assertIn('--dry-run false', worker)
             self.assertIn('Environment="SYNTHETIC=fixture"', worker)
-            self.assertIn('EnvironmentFile=-"/fixture/config"', worker)
+            self.assertIn('EnvironmentFile=-/fixture/config', worker)
+            self.assertIn('EnvironmentFile=/fixture/required config%%',worker)
+            self.assertIn('EnvironmentFile=-/fixture/pattern*.env',worker)
+            self.assertLess(worker.index('EnvironmentFile=-/fixture/config'),
+                            worker.index('EnvironmentFile=/fixture/required config%%'))
             self.assertIn('After=network-online.target augmentagent.service', worker)
             self.assertNotIn('PartOf=', worker)
             self.assertNotIn('BindsTo=', worker)
@@ -72,6 +85,8 @@ if 'show' in sys.argv:
                 verify=subprocess.run(['systemd-analyze','--user','verify',str(units/'augmentagent-autopr.service')],
                     env=dict(env,SYSTEMD_UNIT_PATH=str(units)+':'),capture_output=True,text=True)
                 self.assertEqual(verify.returncode,0,verify.stderr)
+                self.assertNotIn('EnvironmentFile= path is not absolute',verify.stderr,
+                    'systemd must accept every generated environment file path')
             # Explicit install dry-run wins; configuration cannot silently
             # enable write actions when reinstalling a dry-run daemon.
             subprocess.run(command, env=dict(env,AUGMENTAGENT_AUTOSTART_DRY_RUN='true'),check=True)
@@ -83,13 +98,39 @@ if 'show' in sys.argv:
             policy.chmod(0o600)
             original=hashlib.sha256(policy.read_bytes()).hexdigest()
             subprocess.run(command,env=dict(env,AUGMENTAGENT_NATIVE_VM_POLICY=str(policy)),check=True)
-            selection=base/'config/augmentagent/autoship-native.env'
+            selection=base/'config fixture%[prod]*?\\folder/augmentagent/autoship-native.env'
             self.assertTrue(selection.exists(),'explicit native profile selection must persist')
             self.assertEqual(shlex.split(selection.read_text().splitlines()[-1]),['AUGMENTAGENT_NATIVE_VM_POLICY='+str(policy)])
             self.assertEqual(selection.stat().st_mode & 0o777,0o600)
-            shared='EnvironmentFile=-"'+str(selection)+'"'
-            self.assertIn(shared,(units/'augmentagent-autopr.service').read_text())
+            import ctypes
+            pattern=next(line.removeprefix('EnvironmentFile=-') for line in (units/'augmentagent-autopr.service').read_text().splitlines() if line.startswith('EnvironmentFile=-') and 'autoship-native.env' in line).replace('%%','%')
+            fnmatch=ctypes.CDLL(None).fnmatch
+            fnmatch.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_int]
+            self.assertEqual(fnmatch(os.fsencode(pattern),os.fsencode(selection),0),0,
+                             'shared policy path must glob-match its literal filename')
+            self.assertNotEqual(fnmatch(os.fsencode(pattern),
+                os.fsencode(str(selection).replace('*?','ANYTHINGz')),0),0,
+                'literal policy path must not glob-match a neighboring filename')
+            shared='EnvironmentFile=-'+pattern.replace('%','%%')
             self.assertIn(shared,dropin.read_text())
+            # Validate both artifacts before changing either mode or units.
+            before_units={p:p.read_bytes() for p in [units/'augmentagent-autopr.service',dropin,selection]}
+            memory_bytes=artifacts[1].read_bytes()
+            foreign=base/'foreign-executable';foreign.write_bytes(memory_bytes);foreign.chmod(0o775)
+            for kind in ['symlink','fifo','non-executable']:
+                artifacts[0].chmod(0o775);artifacts[1].unlink()
+                if kind=='symlink':artifacts[1].symlink_to(foreign)
+                elif kind=='fifo':os.mkfifo(artifacts[1])
+                else:artifacts[1].write_bytes(memory_bytes);artifacts[1].chmod(0o600)
+                rejected=subprocess.run(command,env=env,capture_output=True,text=True,timeout=5)
+                self.assertNotEqual(rejected.returncode,0,kind)
+                self.assertEqual(artifacts[0].stat().st_mode & 0o777,0o775,'partial executable permission change')
+                self.assertEqual(foreign.stat().st_mode & 0o777,0o775,'followed a foreign symlink')
+                self.assertEqual(before_units,{p:p.read_bytes() for p in before_units})
+            artifacts[1].unlink();artifacts[1].write_bytes(memory_bytes);artifacts[1].chmod(0o755)
+            artifacts[0].chmod(0o700)
+            subprocess.run(command,env=env,check=True)
+            self.assertEqual(artifacts[0].stat().st_mode & 0o777,0o700,'installer widened existing read access')
             prior=selection.read_bytes()
             alternate=base/'alternate.json'
             alternate.write_bytes(policy.read_bytes());alternate.chmod(0o600)
@@ -97,7 +138,8 @@ if 'show' in sys.argv:
             before_failed={p:p.read_bytes() for p in watched}
             for failure in ({'AUGMENTAGENT_AUTOSTART_DRY_RUN':'invalid'},
                             {'AUGMENTAGENT_UNIT_MEMORY_MAX':'invalid'},
-                            {'FAIL_MANAGER':'daemon-reload'},{'FAIL_MANAGER':'enable'}):
+                            {'FAIL_MANAGER':'daemon-reload'},{'FAIL_MANAGER':'enable'},
+                            {'FIXTURE_ENVIRONMENT_FILES':'/fixture/trailing'+chr(92)+' (ignore_errors=yes)'}):
                 rejected=subprocess.run(command,env=dict(env,AUGMENTAGENT_NATIVE_VM_POLICY=str(alternate),**failure),capture_output=True,text=True)
                 self.assertNotEqual(rejected.returncode,0)
                 self.assertEqual(before_failed,{p:p.read_bytes() for p in watched},'failed install must restore every managed file')

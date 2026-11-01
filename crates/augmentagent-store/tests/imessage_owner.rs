@@ -1,5 +1,128 @@
 use augmentagent_store::{imessage_owner::OwnerEvent, Store};
 
+#[test]
+fn independent_capture_and_dispatch_connections_serialize_writes() {
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("owner.db");
+    let store = Store::open(&path).unwrap();
+    let binding = store
+        .bind_imessage_owner(
+            "iMessage;-;owner@example.invalid",
+            "owner@example.invalid",
+            true,
+            0,
+        )
+        .unwrap();
+    let stores = (0..5)
+        .map(|_| Store::open(&path).unwrap())
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(5));
+    let workers = stores
+        .into_iter()
+        .enumerate()
+        .map(|(worker, s)| {
+            let barrier = barrier.clone();
+            let revision = binding.revision;
+            std::thread::spawn(move || {
+                let mut errors = Vec::new();
+                for row in 1..=25 {
+                    barrier.wait();
+                    let result = if worker == 0 {
+                        let mut e = event(revision, row);
+                        e.from_me = true;
+                        e.body = format!("owner question {row}");
+                        s.accept_imessage_owner_events(revision, row, &[e], row)
+                    } else {
+                        s.reconcile_imessage_owner_echoes(row)
+                    };
+                    if let Err(error) = result {
+                        errors.push(error.to_string());
+                    }
+                }
+                errors
+            })
+        })
+        .collect::<Vec<_>>();
+    let errors = workers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        errors.is_empty(),
+        "concurrent owner writes failed: {errors:?}"
+    );
+    store.reconcile_imessage_owner_echoes(30).unwrap();
+    for e in store.ready_imessage_owner_events().unwrap() {
+        store.classify_imessage_owner_event(&e, false).unwrap();
+    }
+    let stores = (0..5)
+        .map(|_| Store::open(&path).unwrap())
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(5));
+    let workers = stores
+        .into_iter()
+        .map(|s| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut claimed = Vec::new();
+                let mut errors = Vec::new();
+                for now in 31..=55 {
+                    barrier.wait();
+                    match s.claim_imessage_owner_event(now) {
+                        Ok(Some(e)) => {
+                            claimed.push(e.guid.clone());
+                            if let Err(error) = s.finish_imessage_owner_event(&e, now) {
+                                errors.push(error.to_string());
+                            }
+                            if let Err(error) = s.enqueue_imessage_owner_output(
+                                e.binding_revision,
+                                &format!("answer:{}", e.guid),
+                                "answer",
+                                None,
+                                now,
+                            ) {
+                                errors.push(error.to_string());
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => errors.push(error.to_string()),
+                    }
+                }
+                (claimed, errors)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut claimed = Vec::new();
+    for worker in workers {
+        let (guids, errors) = worker.join().unwrap();
+        assert!(
+            errors.is_empty(),
+            "concurrent owner claims failed: {errors:?}"
+        );
+        claimed.extend(guids);
+    }
+    assert_eq!(claimed.len(), 25);
+    claimed.sort();
+    claimed.dedup();
+    assert_eq!(claimed.len(), 25, "a native input was claimed twice");
+    assert_eq!(store.imessage_owner_binding().unwrap().unwrap().cursor, 25);
+    assert_eq!(
+        store.imessage_owner_status(60).unwrap()["events"]["completed"],
+        25
+    );
+    assert_eq!(
+        store
+            .with_conn(
+                |c| c.query_row("SELECT COUNT(*) FROM imessage_owner_deliveries", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+            )
+            .unwrap(),
+        25
+    );
+}
+
 fn event(rev: i64, row: i64) -> OwnerEvent {
     OwnerEvent {
         binding_revision: rev,
