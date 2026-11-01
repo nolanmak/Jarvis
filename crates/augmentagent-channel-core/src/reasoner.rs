@@ -404,12 +404,19 @@ pub(crate) fn reasoner_timeout_for_class(
 /// a fixed interval, so a wording change can never break failover, only its
 /// precision.
 pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_reset_hint_in(message, chrono::Utc::now(), &chrono::Local)
+}
+fn parse_reset_hint_in<Tz: chrono::TimeZone>(
+    message: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    local: &Tz,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let lower = message.to_ascii_lowercase();
     if let Some(idx) = lower.find("resets ") {
-        return parse_claude_reset(message[idx + "resets ".len()..].trim());
+        return parse_claude_reset(message[idx + "resets ".len()..].trim(), now);
     }
     if let Some(idx) = lower.find("try again at ") {
-        return parse_codex_reset(message[idx + "try again at ".len()..].trim());
+        return parse_codex_reset(message[idx + "try again at ".len()..].trim(), now, local);
     }
     None
 }
@@ -417,13 +424,19 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 /// `9:30am`, `10am`, `4:18 AM` (one token, or time and meridiem split) →
 /// `(hour24, minute, tokens consumed)`.
 fn parse_clock(tokens: &[&str]) -> Option<(u32, u32, usize)> {
-    let first = tokens.first()?.trim_end_matches(['.', ',']).to_ascii_lowercase();
+    let first = tokens
+        .first()?
+        .trim_end_matches(['.', ','])
+        .to_ascii_lowercase();
     let (num, meridiem, used) = if let Some(t) = first.strip_suffix("pm") {
         (t.to_string(), true, 1)
     } else if let Some(t) = first.strip_suffix("am") {
         (t.to_string(), false, 1)
     } else {
-        let second = tokens.get(1)?.trim_end_matches(['.', ',']).to_ascii_lowercase();
+        let second = tokens
+            .get(1)?
+            .trim_end_matches(['.', ','])
+            .to_ascii_lowercase();
         match second.as_str() {
             "pm" => (first, true, 2),
             "am" => (first, false, 2),
@@ -447,8 +460,10 @@ fn parse_clock(tokens: &[&str]) -> Option<(u32, u32, usize)> {
 }
 
 /// The Claude wording: next `<clock>` in the named zone, capped at 6 h.
-fn parse_claude_reset(rest: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
+fn parse_claude_reset(
+    rest: &str,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     let (hour24, m, _) = parse_clock(&tokens)?;
     // Timezone suffix: "(America/New_York)". Absent → UTC is assumed, which
@@ -461,35 +476,31 @@ fn parse_claude_reset(rest: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             rest[open + 1..close].trim().parse().ok()
         })
         .unwrap_or(chrono_tz::UTC);
-    let now = chrono::Utc::now().with_timezone(&tz);
+    let now = now_utc.with_timezone(&tz);
     let today = now.date_naive().and_hms_opt(hour24, m, 0)?;
-    let candidate = tz.from_local_datetime(&today).earliest()?;
-    let candidate = if candidate <= now {
-        tz.from_local_datetime(&(today + chrono::Duration::days(1)))
-            .earliest()?
-    } else {
-        candidate
-    };
+    let candidate_utc = reset_clock_candidate(&tz, today, now_utc, true)?;
     // Plausibility cap (#655 review): Claude session windows are 5-hourly,
     // so a genuine reset is never more than ~5h out. Anything further means
     // we parsed quoted/stale text, hit the day-rollover on a just-expired
     // window, or mis-assumed the timezone — returning None makes the latch
     // fall back to its short default cooldown, which self-heals, instead of
     // latching the provider for up to a day.
-    let candidate_utc = candidate.with_timezone(&chrono::Utc);
-    if candidate_utc - chrono::Utc::now() > chrono::Duration::hours(6) {
+    if candidate_utc - now_utc > chrono::Duration::hours(6) {
         return None;
     }
     Some(candidate_utc)
 }
 
 /// The Codex wording, in the machine's local zone: `3:00 PM` (next such
-/// instant, so within 24 h) or `Sep 24th, 2026 4:18 AM` (that instant, at
+/// instant, today or the next local day) or `Sep 24th, 2026 4:18 AM` (that instant, at
 /// most 8 days out).
-fn parse_codex_reset(rest: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
+fn parse_codex_reset<Tz: chrono::TimeZone>(
+    rest: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    local: &Tz,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
-    let now_local = chrono::Local::now();
+    let now_local = now.with_timezone(local);
     let (date, clock_tokens) = match month_number(tokens.first()?) {
         Some(month) => {
             let day: u32 = tokens
@@ -499,25 +510,53 @@ fn parse_codex_reset(rest: &str) -> Option<chrono::DateTime<chrono::Utc>> {
                 .parse()
                 .ok()?;
             let year: i32 = tokens.get(2)?.trim_end_matches(',').parse().ok()?;
-            (chrono::NaiveDate::from_ymd_opt(year, month, day)?, &tokens[3..])
+            (
+                chrono::NaiveDate::from_ymd_opt(year, month, day)?,
+                &tokens[3..],
+            )
         }
         None => (now_local.date_naive(), &tokens[..]),
     };
     let (hour24, m, _) = parse_clock(clock_tokens)?;
     let naive = date.and_hms_opt(hour24, m, 0)?;
-    let mut candidate = chrono::Local.from_local_datetime(&naive).earliest()?;
     let dated = clock_tokens.len() != tokens.len();
-    if !dated && candidate <= now_local {
-        candidate = chrono::Local
-            .from_local_datetime(&(naive + chrono::Duration::days(1)))
-            .earliest()?;
-    }
-    let candidate_utc = candidate.with_timezone(&chrono::Utc);
-    let horizon = chrono::Utc::now() + chrono::Duration::days(8);
-    if candidate_utc <= chrono::Utc::now() || candidate_utc > horizon {
+    let candidate_utc = reset_clock_candidate(local, naive, now, !dated)?;
+    let horizon = now + chrono::Duration::days(8);
+    if candidate_utc <= now || candidate_utc > horizon {
         return None;
     }
     Some(candidate_utc)
+}
+
+/// A repeated clock has two instants. Compare them in UTC rather than relying
+/// on the timezone implementation's ordering, and use the second occurrence
+/// when the first has passed. A nonexistent clock retains the normal fallback.
+fn reset_clock_candidate<Tz: chrono::TimeZone>(
+    zone: &Tz,
+    naive: chrono::NaiveDateTime,
+    now: chrono::DateTime<chrono::Utc>,
+    allow_next_day: bool,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    for days in 0..=if allow_next_day { 1 } else { 0 } {
+        let clock = naive.checked_add_signed(chrono::Duration::days(days))?;
+        let candidates = match zone.from_local_datetime(&clock) {
+            chrono::LocalResult::Single(at) => [Some(at.with_timezone(&chrono::Utc)), None],
+            chrono::LocalResult::Ambiguous(first, second) => [
+                Some(first.with_timezone(&chrono::Utc)),
+                Some(second.with_timezone(&chrono::Utc)),
+            ],
+            chrono::LocalResult::None => return None,
+        };
+        if let Some(at) = candidates
+            .into_iter()
+            .flatten()
+            .filter(|at| *at > now)
+            .min()
+        {
+            return Some(at);
+        }
+    }
+    None
 }
 
 fn month_number(token: &str) -> Option<u32> {
@@ -4920,10 +4959,14 @@ mod failover_error_tests {
     #[test]
     fn parse_reset_hint_reads_time_and_caps_horizon() {
         use chrono::Timelike;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-21T14:15:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let parse = |message: &str| parse_reset_hint_in(message, now, &chrono_tz::UTC);
 
         // A genuinely-near reset (2h ahead, UTC) parses to the right minute.
         // Built dynamically so the test is independent of wall-clock time.
-        let near = chrono::Utc::now() + chrono::Duration::hours(2);
+        let near = now + chrono::Duration::hours(2);
         let (h12, ampm) = match near.hour() {
             0 => (12, "am"),
             h @ 1..=11 => (h, "am"),
@@ -4934,18 +4977,15 @@ mod failover_error_tests {
             "You've hit your session limit · resets {h12}:{:02}{ampm} (UTC)",
             near.minute()
         );
-        let at = parse_reset_hint(&msg).expect("near reset must parse");
-        assert!(at > chrono::Utc::now(), "reset must be in the future");
-        assert!(
-            at <= chrono::Utc::now() + chrono::Duration::hours(6),
-            "cap holds"
-        );
+        let at = parse(&msg).expect("near reset must parse");
+        assert!(at > now, "reset must be in the future");
+        assert!(at <= now + chrono::Duration::hours(6), "cap holds");
         assert_eq!((at.hour(), at.minute()), (near.hour(), near.minute()));
 
         // Plausibility cap (#655 review): a reset >6h out can only come from
         // quoted/stale text or a day-rollover on a just-expired window —
         // it must be rejected (None ⇒ short default cooldown, self-healing).
-        let far = chrono::Utc::now() + chrono::Duration::hours(12);
+        let far = now + chrono::Duration::hours(12);
         let (fh12, fampm) = match far.hour() {
             0 => (12, "am"),
             h @ 1..=11 => (h, "am"),
@@ -4954,14 +4994,14 @@ mod failover_error_tests {
         };
         let far_msg = format!("resets {fh12}:{:02}{fampm} (UTC)", far.minute());
         assert!(
-            parse_reset_hint(&far_msg).is_none(),
+            parse(&far_msg).is_none(),
             "distant reset must be capped to None: {far_msg}"
         );
 
         // Garbage shapes degrade to None, never panic.
-        assert!(parse_reset_hint("no reset here").is_none());
-        assert!(parse_reset_hint("resets whenever").is_none());
-        assert!(parse_reset_hint("resets 13:00pm (Mars/Olympus)").is_none());
+        assert!(parse("no reset here").is_none());
+        assert!(parse("resets whenever").is_none());
+        assert!(parse("resets 13:00pm (Mars/Olympus)").is_none());
     }
 
     /// The Codex CLI's wall wording, in local time, with a date when the
@@ -4970,7 +5010,12 @@ mod failover_error_tests {
     #[test]
     fn parse_reset_hint_reads_the_codex_wording_in_local_time() {
         use chrono::{Datelike, Timelike};
-        let fmt = |at: chrono::DateTime<chrono::Local>| {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-21T14:15:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let zone = chrono_tz::America::New_York;
+        let parse = |message: &str| parse_reset_hint_in(message, now, &zone);
+        let fmt = |at: chrono::DateTime<chrono_tz::Tz>| {
             let (h12, ampm) = match at.hour() {
                 0 => (12, "AM"),
                 h @ 1..=11 => (h, "AM"),
@@ -4981,10 +5026,11 @@ mod failover_error_tests {
         };
 
         // Dated form, three days out: exact instant, well past the Claude cap.
-        let far = chrono::Local::now() + chrono::Duration::days(3);
+        let far = now.with_timezone(&zone) + chrono::Duration::days(3);
         let (h12, min, ampm) = fmt(far);
-        let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            [far.month0() as usize];
+        let month = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ][far.month0() as usize];
         let suffix = match far.day() {
             1 | 21 | 31 => "st",
             2 | 22 => "nd",
@@ -4997,37 +5043,131 @@ mod failover_error_tests {
             far.day(),
             far.year()
         );
-        let at = parse_reset_hint(&msg).unwrap_or_else(|| panic!("dated codex reset must parse: {msg}"));
+        let at = parse(&msg).unwrap_or_else(|| panic!("dated codex reset must parse: {msg}"));
         let expected = far.with_timezone(&chrono::Utc);
         assert_eq!(
             (at.year(), at.month(), at.day(), at.hour(), at.minute()),
-            (expected.year(), expected.month(), expected.day(), expected.hour(), expected.minute()),
+            (
+                expected.year(),
+                expected.month(),
+                expected.day(),
+                expected.hour(),
+                expected.minute()
+            ),
             "{msg}"
         );
 
         // Time-only form, two hours out: the next such local instant.
-        let near = chrono::Local::now() + chrono::Duration::hours(2);
+        let near = now.with_timezone(&zone) + chrono::Duration::hours(2);
         let (h12, min, ampm) = fmt(near);
         let msg = format!(
             "You've hit your usage limit for gpt-5.5-codex. Switch to another model now, or try again at {h12}:{min:02} {ampm}."
         );
-        let at = parse_reset_hint(&msg).unwrap_or_else(|| panic!("time-only codex reset must parse: {msg}"));
+        let at = parse(&msg).unwrap_or_else(|| panic!("time-only codex reset must parse: {msg}"));
         let expected = near.with_timezone(&chrono::Utc);
-        assert_eq!((at.hour(), at.minute()), (expected.hour(), expected.minute()), "{msg}");
-        assert!(at > chrono::Utc::now());
+        assert_eq!(
+            (at.hour(), at.minute()),
+            (expected.hour(), expected.minute()),
+            "{msg}"
+        );
+        assert!(at > now);
 
         // Time-only, already past today: tomorrow, not None.
-        let past = chrono::Local::now() - chrono::Duration::hours(2);
+        let past = now.with_timezone(&zone) - chrono::Duration::hours(2);
         let (h12, min, ampm) = fmt(past);
-        let at = parse_reset_hint(&format!("try again at {h12}:{min:02} {ampm}."))
+        let at = parse(&format!("try again at {h12}:{min:02} {ampm}."))
             .expect("a past clock time means tomorrow");
-        assert!(at > chrono::Utc::now() + chrono::Duration::hours(21));
+        assert!(at > now + chrono::Duration::hours(21));
 
         // A dated reset in the past, or absurdly far out, is stale text.
-        assert!(parse_reset_hint("try again at Jan 1st, 2020 4:18 AM.").is_none());
-        assert!(parse_reset_hint("try again at Jan 1st, 2099 4:18 AM.").is_none());
-        assert!(parse_reset_hint("try again at whenever").is_none());
-        assert!(parse_reset_hint("try again at Sep 24th, 2026").is_none());
+        assert!(parse("try again at Jan 1st, 2020 4:18 AM.").is_none());
+        assert!(parse("try again at Jan 1st, 2099 4:18 AM.").is_none());
+        assert!(parse("try again at whenever").is_none());
+        assert!(parse("try again at Sep 24th, 2026").is_none());
+    }
+
+    #[test]
+    fn quota_reset_local_dst_uses_earliest_future_instant() {
+        const CHILD: &str = "JARVIS_TEST_QUOTA_DST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let child=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","reasoner::failover_error_tests::quota_reset_local_dst_uses_earliest_future_instant","--test-threads=1"])
+                .env(CHILD,"1").env("TZ","America/New_York").output().unwrap();
+            assert!(
+                child.status.success(),
+                "real local-zone parsing failed: {} {}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T03:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-11-01T05:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            parse_reset_hint_in("try again at Nov 1st, 2026 1:30 AM.", now, &chrono::Local),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_reset_hint_in("try again at 1:30 AM.", now, &chrono::Local),
+            Some(expected)
+        );
+    }
+    #[test]
+    fn quota_reset_repeated_clock_uses_later_occurrence_before_next_day() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T05:45:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-11-01T06:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let zone = chrono_tz::America::New_York;
+        for text in [
+            "try again at 1:30 AM.",
+            "try again at Nov 1st, 2026 1:30 AM.",
+            "resets 1:30am (America/New_York)",
+        ] {
+            assert_eq!(
+                parse_reset_hint_in(text, now, &zone),
+                Some(expected),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_reset_rejects_nonexistent_clocks_and_keeps_dated_resets_on_their_date() {
+        let utc = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let zone = chrono_tz::America::New_York;
+        let before_gap = utc("2026-03-08T05:00:00Z");
+        for text in [
+            "try again at 2:30 AM.",
+            "try again at Mar 8th, 2026 2:30 AM.",
+            "resets 2:30am (America/New_York)",
+        ] {
+            assert_eq!(parse_reset_hint_in(text, before_gap, &zone), None, "{text}");
+        }
+        let after_fold = utc("2026-11-01T06:45:00Z");
+        assert_eq!(
+            parse_reset_hint_in("try again at Nov 1st, 2026 1:30 AM.", after_fold, &zone),
+            None
+        );
+        assert_eq!(
+            parse_reset_hint_in("try again at 1:30 AM.", after_fold, &zone),
+            Some(utc("2026-11-02T06:30:00Z"))
+        );
+        // A local day spanning the backward transition is 25 hours long.
+        assert_eq!(
+            parse_reset_hint_in("try again at 12:00 AM.", utc("2026-11-01T04:15:00Z"), &zone),
+            Some(utc("2026-11-02T05:00:00Z"))
+        );
     }
 
     /// Write an executable stub script the reasoner spawns instead of the
