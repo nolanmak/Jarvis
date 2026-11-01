@@ -502,6 +502,23 @@ mod tests {
         task.join().unwrap();
         assert_eq!(sink.read_receipt(&receipt).unwrap()["audit_chain"]["sequence"],1);
     }
+    #[cfg(unix)]
+    #[test]
+    fn receipt_lookup_busy_writer_is_retryable_without_waiting_for_it() {
+        let (_directory, sink) = setup();
+        let receipt = sink.append_receipted(serde_json::json!({"kind":"launch"})).unwrap();
+        let lock = private_existing(&sink.anchor.with_extension("lock")).unwrap();
+        assert_eq!(unsafe {libc::flock(lock.as_raw_fd(),libc::LOCK_EX)},0);
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = sink.clone(); let request = receipt.clone();
+        let task = std::thread::spawn(move || {send.send(reader.read_receipt(&request)).unwrap();});
+        let result = receive.recv_timeout(std::time::Duration::from_millis(200));
+        // Release even on failure so this regression never hangs the suite.
+        drop(lock); task.join().unwrap();
+        let error = result.expect("lookup waited for a held writer lock").unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(),std::io::ErrorKind::WouldBlock);
+        assert_eq!(sink.read_receipt(&receipt).unwrap()["kind"],"launch");
+    }
     fn setup() -> (tempfile::TempDir, AnchoredAudit) {
         let dir = tempfile::tempdir().unwrap();
         for name in ["logs", "anchors", "work"] {
