@@ -2,6 +2,72 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Observe the exact Rust build check that fails in the deployed main gate.
+/// Persist bounded private output even on failure; no production verdict is set.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_rust_build_diagnostic() -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let root=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&root),"evidence must be outside candidate");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    ensure!(evidence.canonicalize()?==evidence,"evidence path must be literal");
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-rust-build-diagnostic",Some(&root))?;
+    audit.require_run_resources()?;
+    augmentagent_channel_core::run_resources::check_requirement("shared_ci_vm",Some(&audit))?;
+    let before=binding(&root).await?;let target=crate::build_storage::effective_target(&root);
+    // Run the already-built opt-in binary after the managed build exits.
+    // This admission owns the actual storage lease throughout the guest step.
+    let storage=crate::build_storage::admit_ci(&root,&target).await?;
+    let session=vm::Session::prepare(&root,&target)?;
+    let source=snapshot(&root,&before,&target).await?;
+    let discovered=session.run("plan",source.path(),&root,&before,None,&["Cargo.toml".into()],&[],&[],None,
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    ensure!(discovered.status=="planned","guest planning unavailable");
+    let plan:Plan=serde_json::from_value(discovered.plan.context("guest plan missing")?)?;plan.validate(&before)?;
+    let check=plan.checks.iter().find(|check|check.id==r#"platform/platform/3 @{"os":"ubuntu-latest"}"#).context("normal Rust CLI build check missing")?;
+    ensure!(check.status=="ready","normal Rust CLI build check is not ready: {}",check.reason);
+    let mut onnx_cache_probe=None;
+    if std::env::var("AUTOSHIP_CI_ACCEPTANCE_ORT_CACHE_PROBE").as_deref()==Ok("1") {
+        let command=r#"python3 -c 'import json,os; from pathlib import Path
+cache=Path(os.environ["ORT_CACHE_DIR"])
+library=next(cache.glob("dfbin/*/*/libonnxruntime.a"))
+writable=False
+try:
+ fd=os.open(library,os.O_WRONLY); os.close(fd); writable=True
+except OSError: pass
+print(json.dumps({"cache":str(cache),"library_bytes":library.stat().st_size,"writable":writable,"interfaces":sorted(p.name for p in Path("/sys/class/net").iterdir()),"home":os.environ["HOME"]}))'"#;
+        let probe=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some(command),
+            &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+        ensure!(probe.status=="passed","ONNX cache guest probe failed");
+        let observed:serde_json::Value=serde_json::from_str(probe.stdout.trim())?;
+        ensure!(observed["cache"]=="/ort-cache" && observed["writable"]==false
+            && observed["interfaces"]==serde_json::json!(["lo"]) && observed["home"]=="/home/worker"
+            && observed["library_bytes"].as_u64().is_some_and(|bytes|bytes>0),"ONNX cache exposure mismatch");
+        onnx_cache_probe=Some(observed);
+    }
+    drop(source);let source=snapshot(&root,&before,&target).await?;
+    let observed=session.run("step",source.path(),&root,&before,Some(check),&[],&[],&[],None,
+        &storage,&target,&audit,check.remaining(std::time::Duration::ZERO)?).await;
+    let (status,stdout,stderr,error)=match observed {
+        Ok(outcome)=>(outcome.status,outcome.stdout,outcome.stderr,None),
+        Err(error)=>("unavailable".into(),String::new(),String::new(),Some(format!("{error:#}"))),
+    };
+    let receipt=serde_json::json!({"version":1,"kind":"real-shared-ci-rust-build-diagnostic","binding":before,
+        "adapter_authority":session.authority_sha256,"check":check.id,"status":status,
+        "stdout":stdout,"stderr":stderr,"error":error,"additional_model_calls":0,"onnx_cache_probe":onnx_cache_probe,
+        "diagnostic_selection_only":true,"full_ci_pass":false,"shipping_authority":false});
+    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW).open(evidence.join("receipt.json"))?;
+    file.write_all(&serde_json::to_vec_pretty(&receipt)?)?;file.sync_all()?;
+    audit.record_controller(serde_json::json!({"version":1,"kind":"shared_ci_rust_diagnostic_observed","check":check.id,
+        "status":status,"stdout_sha256":digest(stdout.as_bytes()),"stderr_sha256":digest(stderr.as_bytes()),"shipping_authority":false}))?;
+    audit.protected_health()?;ensure!(binding(&root).await?==before,"source changed during diagnostic");
+    ensure!(status=="passed","isolated Rust build failed; inspect the private diagnostic receipt");Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
 async fn live_shared_ci_internal_links() -> Result<()> {
