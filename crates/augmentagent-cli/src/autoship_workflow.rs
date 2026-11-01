@@ -1483,6 +1483,9 @@ impl WorkflowStore {
     pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
+        let raw:String=tx.query_row("SELECT checkpoint FROM workflow WHERE id=?1",[&lease.workflow],|row|row.get(0))?;
+        let checkpoint:Checkpoint=serde_json::from_str(&raw)?;
+        ensure!(!matches!(checkpoint.stage,Stage::Held|Stage::Merged|Stage::Retired),"workflow checkpoint blocks native dispatch");
         owner_turn::require_native_dispatch(&tx,lease,now)?;
         tx.commit()?;Ok(())
     }
