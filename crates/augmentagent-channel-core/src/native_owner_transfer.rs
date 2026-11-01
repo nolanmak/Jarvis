@@ -75,7 +75,52 @@ impl TransferRequest {
         let request:Self=serde_json::from_slice(bytes)?;
         request.validate()?;Ok(request)
     }
-    pub fn validate(&self)->Result<()> {Ok(())}
+    /// Checks the wire contract only. Filesystem inventory, anchored audits,
+    /// controller fencing and current ownership still require the transfer ledger.
+    pub fn validate(&self)->Result<()> {
+        use std::collections::HashSet;
+        ensure!(self.version==1,"unsupported native transfer request version");
+        ensure!(uuid::Uuid::parse_str(&self.transfer_id)?.to_string()==self.transfer_id,"noncanonical native transfer UUID");
+        ensure!(!self.workflow_id.is_empty(),"empty native transfer workflow");
+        ensure!(!self.source_owners.is_empty() && self.source_owners.len()<=64 && self.inventory.len()<=64,"native transfer inventory bound");
+        let authority=|owner:&super::RuntimeOwner,path:&str|->Result<()> {
+            ensure!(owner.workflow_id==self.workflow_id && owner.lease_generation>=0,"native transfer workflow mismatch");
+            ensure!(std::path::Path::new(path).is_absolute() && !path.contains('\0'),"invalid native audit path");Ok(())
+        };
+        authority(&self.destination.owner,&self.destination.audit_path)?;
+        let mut generations=HashSet::new();
+        for source in &self.source_owners {
+            authority(&source.owner,&source.audit_path)?;
+            ensure!(source.owner.lease_generation<self.destination.owner.lease_generation,"native transfer destination is not newer");
+            ensure!(source.audit_path!=self.destination.audit_path,"native transfer audit namespace reused");
+            ensure!(generations.insert(source.owner.lease_generation),"duplicate native source owner");
+        }
+        ensure!(self.source_owners.windows(2).all(|pair|
+            (pair[0].owner.lease_generation,pair[0].audit_path.as_bytes()) <
+            (pair[1].owner.lease_generation,pair[1].audit_path.as_bytes())),"native source owners are not ordered");
+        let mut runtimes=HashSet::new();let mut sessions=HashSet::new();
+        for row in &self.inventory {
+            ensure!(matches!(row.provider.as_str(),"codex"|"claude"),"invalid native transfer provider");
+            ensure!(!row.native_session_id.is_empty() && row.native_session_id.len()<=256 &&
+                row.native_session_id.bytes().all(|byte|(33..=126).contains(&byte)),"invalid observed native session ID");
+            let parts:Vec<_>=row.runtime_relative_path.split('/').collect();
+            ensure!(parts.len()==2 && parts[0]==row.provider && parts[1].starts_with("session-") && parts[1].len()>8 &&
+                !parts.iter().any(|part|part.is_empty() || *part=="." || *part==".." || part.contains('\0')),
+                "invalid native runtime relative path");
+            ensure!(runtimes.insert(row.runtime_relative_path.as_str()) && sessions.insert((row.provider.as_str(),row.native_session_id.as_str())),"duplicate native runtime or session");
+            authority(&row.creation_owner,&row.creation_audit_path)?;authority(&row.effective_owner,&row.effective_audit_path)?;
+            ensure!(row.creation_owner.lease_generation<=row.effective_owner.lease_generation,"native creation provenance is newer than effective owner");
+            ensure!(row.creation_owner!=row.effective_owner || row.creation_audit_path==row.effective_audit_path,"native creation authority has conflicting audit paths");
+            ensure!(self.source_owners.iter().any(|source|source.owner==row.effective_owner && source.audit_path==row.effective_audit_path),"native runtime is disconnected from source authority");
+            for hash in [&row.creation_receipt_sha256,&row.completion_sha256,&row.alias_sha256,&row.export_manifest_sha256] {
+                ensure!(hash.len()==64 && hash.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),"invalid native transfer digest");
+            }
+        }
+        ensure!(self.inventory.windows(2).all(|pair|
+            (pair[0].provider.as_bytes(),pair[0].runtime_relative_path.as_bytes()) <
+            (pair[1].provider.as_bytes(),pair[1].runtime_relative_path.as_bytes())),"native transfer inventory is not ordered");
+        Ok(())
+    }
     pub fn request_digest(&self)->Result<String> {
         self.validate()?;hash_value(&serde_json::to_value(self)?)
     }
@@ -117,7 +162,8 @@ mod tests {
     #[test]
     fn native_transfer_request_binds_every_inventory_field() {
         let value=request_fixture();let request=TransferRequest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(request.request_digest().unwrap(),hash_value(&value).unwrap());
+        assert_eq!(request.request_digest().unwrap(),"0cac6f42ffc523bc060bf1bc1994586411fda451143d5cb6fe3154bf3998f90b");
+        assert_eq!(request.inventory_digest().unwrap(),"b242f588d275bbda74741f459d95b729efe429e2c5a0e1c90c57979ade2e2a5f");
         let mut changed=value.clone();changed["inventory"][0]["native_session_id"]=serde_json::json!("another-session");
         let changed=TransferRequest::parse(&serde_json::to_vec(&changed).unwrap()).unwrap();
         assert_ne!(request.request_digest().unwrap(),changed.request_digest().unwrap());
@@ -158,6 +204,37 @@ mod tests {
             let mut value=request_fixture();value.pointer_mut(pointer).unwrap().as_object_mut().unwrap().insert("unknown".into(),Value::Null);
             assert!(TransferRequest::parse(&serde_json::to_vec(&value).unwrap()).is_err(),"accepted unknown field at {pointer}");
         }
+    }
+
+    #[test]
+    fn native_transfer_multi_provider_and_multi_owner_inventory_has_one_order() {
+        let mut value=request_fixture();
+        let second=serde_json::json!({"owner":{"workflow_id":"workflow","lease_generation":2},"audit_path":"/audit/second.jsonl"});
+        value["source_owners"].as_array_mut().unwrap().push(second.clone());
+        value["destination"]["owner"]["lease_generation"]=serde_json::json!(3);
+        let mut claude=value["inventory"][0].clone();claude["provider"]=serde_json::json!("claude");
+        claude["runtime_relative_path"]=serde_json::json!("claude/session-two");
+        claude["effective_owner"]=second["owner"].clone();claude["effective_audit_path"]=second["audit_path"].clone();
+        value["inventory"].as_array_mut().unwrap().insert(0,claude);
+        TransferRequest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        for field in ["inventory","source_owners"] {
+            let mut reversed=value.clone();reversed[field].as_array_mut().unwrap().reverse();
+            assert!(TransferRequest::parse(&serde_json::to_vec(&reversed).unwrap()).is_err(),"accepted reversed {field}");
+        }
+    }
+    #[test]
+    fn native_transfer_source_limit_refuses_overflow_without_truncating() {
+        let mut value=request_fixture();value["inventory"]=serde_json::json!([]);
+        value["destination"]["owner"]["lease_generation"]=serde_json::json!(65);
+        value["source_owners"]=Value::Array((0..64).map(|generation|serde_json::json!({
+            "owner":{"workflow_id":"workflow","lease_generation":generation},
+            "audit_path":format!("/audit/source-{generation}.jsonl")})).collect());
+        let mut request=TransferRequest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(request.source_owners.len(),64);
+        request.source_owners.push(Authority{owner:super::super::RuntimeOwner{workflow_id:"workflow".into(),lease_generation:64},audit_path:"/audit/source-64.jsonl".into()});
+        assert!(request.request_digest().is_err());
+        assert!(TransferRequest::parse(&serde_json::to_vec(&request).unwrap()).is_err());
+        assert_eq!(request.source_owners.len(),65);
     }
 
 }

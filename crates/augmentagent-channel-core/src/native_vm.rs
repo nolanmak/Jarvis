@@ -9,6 +9,7 @@ use std::os::fd::AsRawFd;
 
 /// Controller-fenced owner; unrelated claims may reuse the same audit file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeOwner {
     pub workflow_id: String,
     pub lease_generation: i64,
