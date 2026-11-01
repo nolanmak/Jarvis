@@ -92,12 +92,6 @@ pub fn card_email(delta: &Delta, now_ms: i64, max_age: Duration) -> Option<Email
     card.body = context_body(&shown);
     if is_group(conv) {
         card.subject = format!("WhatsApp group: {}", conv.title);
-        card.to = conv
-            .participants
-            .iter()
-            .map(|p| display_sender(conv, p))
-            .collect::<Vec<_>>()
-            .join(", ");
     } else {
         card.subject = format!("WhatsApp: {}", conv.title);
     }

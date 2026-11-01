@@ -362,6 +362,34 @@ mod approve_tests {
             ApprovalActionOutcome::Revised { draft, .. } => assert_eq!(draft, "a warmer reply"),
             other => panic!("expected Revised, got {other:?}"),
         }
+        // A group card reposted after Revise keeps its subject and every member.
+        let mut conv = augmentagent_channel_imessage::Conversation {
+            identifier: GROUP.into(),
+            title: "Ski Trip".into(),
+            participants: vec!["+14155550999".into(), "111@lid".into()], // pii-ok synthetic
+            service: "WhatsApp".into(),
+            ..Default::default()
+        };
+        conv.participant_names.insert("111@lid".into(), "Ana".into());
+        let entry = augmentagent_channel_imessage::MessageEntry {
+            timestamp: "2026-11-01T12:00:00-04:00".into(),
+            sender: "111@lid".into(),
+            body: "Sam, can you drive?".into(),
+            attachments: vec![],
+        };
+        let stored = history::email(&conv, 4, &entry);
+        store.upsert_email(&stored).unwrap();
+        let gid = store
+            .log_action(&stored.message_id, stored.thread_id.as_deref(), &stored.from, "WhatsApp group: Ski Trip",
+                        Some(&stored.body), Some("yes"), ActionStatus::Pending)
+            .unwrap();
+        match approver.run_revise(&gid, "shorter").await {
+            ApprovalActionOutcome::Revised { email, .. } => {
+                assert_eq!(email.subject, "WhatsApp group: Ski Trip");
+                assert_eq!(email.to, "+14155550999, Ana <111@lid>"); // pii-ok synthetic
+            }
+            other => panic!("expected Revised, got {other:?}"),
+        }
         let row = store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!((row.action.status.as_str(), row.draft_id.as_deref()), ("pending", None));
         assert_eq!(row.action.draft_body.as_deref(), Some("a warmer reply"));

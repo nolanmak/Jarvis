@@ -5078,6 +5078,27 @@ impl Store {
                 },
             )
             .optional()?;
+        // #1764 — a WhatsApp archive group card goes to every member. Every
+        // repost (Revise, nudge, recompose) reloads this row, so restore the
+        // recipients stored at import; scoped so no other platform's `to`
+        // (which feeds Gmail reply routing) changes.
+        let mut row = row;
+        if let Some(r) = row.as_mut().filter(|r| {
+            r.email.platform == "whatsapp" && r.email.account_entity_id.as_deref() == Some("whatsapp-history")
+        }) {
+            let raw: Option<String> = guard
+                .query_row(
+                    "SELECT retryGuardContext FROM emails WHERE messageId = ?1",
+                    params![r.email.message_id],
+                    |q| q.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some((to, cc, _)) = raw.and_then(|raw| serde_json::from_str::<(String, String, Vec<String>)>(&raw).ok()) {
+                r.email.to = to;
+                r.email.cc = cc;
+            }
+        }
         Ok(row)
     }
 
