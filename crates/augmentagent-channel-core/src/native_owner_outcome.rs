@@ -139,7 +139,6 @@ pub(super) fn transfer_with_policy(
     destination: &Arc<AuditLogger>,
     current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> TransferOutcome {
-    use super::owner_ledger::{Ledger, State};
     use TransferReason as R;
     let mut context = FingerprintContext::new(request, observation);
     let preflight_hold =
@@ -225,6 +224,17 @@ pub(super) fn transfer_with_policy(
         Ok(receipt) => return TransferOutcome::Completed(receipt),
         Err(error) => error,
     };
+    reconcile_failure(&root, request, &mut context, &error)
+}
+
+pub(super) fn reconcile_failure(
+    root: &Path,
+    request: &TransferRequest,
+    context: &mut FingerprintContext<'_>,
+    error: &anyhow::Error,
+) -> TransferOutcome {
+    use super::owner_ledger::{Ledger, State};
+    use TransferReason as R;
     // The error may follow a durable commit. Inspect exactly this UUID under
     // the same state lock before classifying; never invent a replacement ID.
     let known = (|| -> anyhow::Result<Option<State>> {
@@ -272,7 +282,7 @@ fn digest(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-struct FingerprintContext<'a> {
+pub(super) struct FingerprintContext<'a> {
     request_sha256: String,
     observation: &'a TransferObservation,
     policy_sha256: Option<String>,
@@ -282,7 +292,7 @@ struct FingerprintContext<'a> {
     history_class: Option<u64>,
 }
 impl<'a> FingerprintContext<'a> {
-    fn new(request: &TransferRequest, observation: &'a TransferObservation) -> Self {
+    pub(super) fn new(request: &TransferRequest, observation: &'a TransferObservation) -> Self {
         // The request contains only strings, arrays and integers. Keep even an
         // invalid request's bounded projection distinct without exposing it.
         let request_sha256 = sha(
@@ -396,21 +406,8 @@ fn classify(error: &anyhow::Error) -> (TransferReason, &'static str) {
     {
         return (*reason, "none");
     }
-    if let Some(error) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<augmentagent_store::rusqlite::Error>())
-    {
-        use augmentagent_store::rusqlite::ErrorCode;
-        return match error.sqlite_error_code() {
-            Some(ErrorCode::DiskFull) => (R::StateCapacity, "space"),
-            Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked) => {
-                (R::LockBusy, "busy")
-            }
-            Some(ErrorCode::SystemIoFailure) | Some(ErrorCode::CannotOpen) => {
-                (R::PersistRetry, "sqlite-io")
-            }
-            _ => (R::PreparedCorrupt, "none"),
-        };
+    if sqlite.is_some() {
+        return (R::PreparedCorrupt, "none");
     }
     if io.is_some() {
         (R::InventoryMissing, "missing")

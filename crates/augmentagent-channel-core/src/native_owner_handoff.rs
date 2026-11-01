@@ -638,6 +638,106 @@ mod tests {
             }
         ));
     }
+    #[test]
+    fn native_handoff_outcome_committed_receipt_wins_response_error_and_changed_uuid_inputs_conflict(
+    ) {
+        let mut f = fixture(false);
+        let receipt = handoff_at(
+            &f.root,
+            u64::MAX,
+            &f.request,
+            &f.sources,
+            &f.destination,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let observed = observation();
+        let mut context =
+            super::super::owner_outcome::FingerprintContext::new(&f.request, &observed);
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "private fixture response lost",
+        ));
+        assert_eq!(
+            super::super::owner_outcome::reconcile_failure(
+                &f.root,
+                &f.request,
+                &mut context,
+                &error
+            ),
+            TransferOutcome::Completed(receipt.clone())
+        );
+        let original = f.request.clone();
+        f.request.inventory[0].completion_sha256 = "1".repeat(64);
+        let result = outcome(&f, &observed, &|| Ok(()));
+        assert!(
+            matches!(
+                &result,
+                TransferOutcome::Held {
+                    reason: TransferReason::AuthorityConflict,
+                    ..
+                }
+            ),
+            "valid stored receipt mislabeled after UUID input mismatch: {result:?}"
+        );
+        f.request = original;
+        assert_eq!(
+            outcome(&f, &observed, &|| Ok(())),
+            TransferOutcome::Completed(receipt)
+        );
+    }
+    #[test]
+    fn native_handoff_outcome_aborted_request_holds_without_reviving_runtime_authority() {
+        let f = fixture(false);
+        let current = || {
+            let db = f.root.join("runtime-retirement.sqlite");
+            if db.exists() {
+                let connection = augmentagent_store::rusqlite::Connection::open(db).unwrap();
+                let prepared: bool = connection
+                    .query_row("SELECT EXISTS(SELECT 1 FROM native_transfer)", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                if prepared {
+                    return Err(TransferFenceError::NotCurrent);
+                }
+            }
+            Ok(())
+        };
+        assert!(matches!(
+            outcome(&f, &observation(), &current),
+            TransferOutcome::Held {
+                reason: TransferReason::AuthorityConflict,
+                ..
+            }
+        ));
+        {
+            let lock = super::super::StateLock::acquire(&f.root).unwrap();
+            Ledger::open(&f.root, &lock)
+                .unwrap()
+                .abort_and_retire(
+                    &f.request.source_owners[0].audit_path,
+                    &f.request.source_owners[0].owner,
+                )
+                .unwrap();
+        }
+        let before = audit_bytes(&f);
+        assert!(matches!(
+            outcome(&f, &observation(), &|| Ok(())),
+            TransferOutcome::Held {
+                reason: TransferReason::AuthorityConflict,
+                ..
+            }
+        ));
+        assert_eq!(audit_bytes(&f), before);
+        let lock = super::super::StateLock::acquire(&f.root).unwrap();
+        let ledger = Ledger::open(&f.root, &lock).unwrap();
+        assert_eq!(
+            ledger.state(&f.request.transfer_id).unwrap(),
+            Some(State::Aborted)
+        );
+        assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+    }
     struct Fixture {
         _temporary: tempfile::TempDir,
         root: PathBuf,
