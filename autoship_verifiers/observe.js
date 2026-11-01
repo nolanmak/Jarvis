@@ -1,0 +1,10 @@
+const fs = require('fs');
+const source = fs.readFileSync('crates/augmentagent-channel-slack/tests/conversation_harness.rs', 'utf8');
+const blocks = source.split(/#\[(?:tokio::test[^\]]*|test)\]/);
+const named = (word) => blocks.some((block) => new RegExp(`async fn [\\w_]*${word}[\\w_]*`, 'i').test(block));
+const interrupted = blocks.filter((block) => /async fn [\w_]*interrupt[\w_]*/i.test(block));
+const interruptedCoverage = interrupted.some((block) => /interrupted_error\s*\(/.test(block) && /INTERRUPTED_REPLY/.test(block) && /calls\s*\(\s*\)\s*\.\s*is_empty\s*\(\s*\)/.test(block));
+const replyReturned = interrupted.some((block) => /answers\s*\(/.test(block) && /INTERRUPTED_REPLY/.test(block));
+const existingCategories = named('cancel') && named('uncertain') && blocks.some((block) => /answers\s*\(/.test(block) && /session_of\s*\(/.test(block)) && named('replay');
+const enumeratedCategories = existingCategories && interruptedCoverage;
+console.log(JSON.stringify([interruptedCoverage, replyReturned, existingCategories, enumeratedCategories]));
