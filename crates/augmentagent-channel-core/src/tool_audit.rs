@@ -585,6 +585,31 @@ impl AuditLogger {
         Ok(record)
     }
 
+    /// Actual provider ID observation, bound to this exact prepared launch.
+    /// This records no completion, export validity or transferable certainty.
+    pub(crate) fn native_session_observed(&self,prepared:&crate::native_vm::PreparedLaunchRecord,id:&str)->anyhow::Result<crate::audit_chain::AppendReceipt> {
+        anyhow::ensure!(!id.is_empty() && id.len()<=256 && id.bytes().all(|byte|byte.is_ascii_graphic()),"invalid observed native session");
+        prepared.intent.validate()?;
+        anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner)
+            && prepared.intent.source_audit_path==self.path,"native observation source owner mismatch");
+        let original=self.native_store_binding()?.ok_or_else(||anyhow::anyhow!("original native store binding missing"))?;
+        use sha2::Digest;
+        let original_hash=format!("{:x}",sha2::Sha256::digest(crate::native_vm::ownership::canonical_bytes(&serde_json::to_value(original)?)?));
+        anyhow::ensure!(prepared.intent.original_store_binding_sha256==original_hash,"native observation original store digest mismatch");
+        self.dispatch_allowed()?;
+        let mut actual=self.read_append_receipt(&prepared.controller_receipt)?;
+        actual.as_object_mut().ok_or_else(||anyhow::anyhow!("native launch record is not an object"))?.remove("audit_chain");
+        let mut expected=serde_json::to_value(&prepared.intent)?;
+        expected["actor"]="controller".into();expected["kind"]="native_launch_intent".into();
+        anyhow::ensure!(actual==expected,"native observation references another prepared launch");
+        self.dispatch_allowed()?;
+        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_session_observed","launch_intent":prepared.intent,"launch_receipt":prepared.controller_receipt,
+            "native_session_id":id,"observed_at_ms":chrono::Utc::now().timestamp_millis()}))?;
+        self.dispatch_allowed()?;
+        Ok(receipt)
+    }
+
     /// Install a protected original registration, never capture current policy
     /// here. Dispatch separately verifies selection and the existing store.
     pub fn set_native_store_binding(&self,binding:crate::native_vm::ownership::TransferBinding)->anyhow::Result<()> {

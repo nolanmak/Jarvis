@@ -1660,9 +1660,10 @@ mod tests {
             ephemeral: false,
             authority: request.source_owners[0].clone(),
             audit_log: request.source_owners[0].audit_path.clone().into(),
+            observation: None,
             _directory: tempfile::tempdir().unwrap(),
         };
-        launch.observe_session("observed-before").unwrap();
+        launch.register_alias("observed-before").unwrap();
         {
             let lock = StateLock::acquire(root.path()).unwrap();
             Ledger::open(root.path(), &lock)
@@ -1670,7 +1671,7 @@ mod tests {
                 .prepare(&request, &endpoints(&request), u64::MAX)
                 .unwrap();
         }
-        assert!(launch.observe_session("late-pending").is_err());
+        assert!(launch.register_alias("late-pending").is_err());
         assert_eq!(std::fs::read_dir(&aliases).unwrap().count(), 1);
         {
             let lock = StateLock::acquire(root.path()).unwrap();
@@ -1679,7 +1680,7 @@ mod tests {
                 .commit(&request, seals(&request))
                 .unwrap();
         }
-        assert!(launch.observe_session("late-completed").is_err());
+        assert!(launch.register_alias("late-completed").is_err());
         assert_eq!(std::fs::read_dir(&aliases).unwrap().count(), 1);
         let destination = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
@@ -1690,10 +1691,11 @@ mod tests {
             ephemeral: false,
             authority: request.destination.clone(),
             audit_log: request.destination.audit_path.clone().into(),
+            observation: None,
             _directory: tempfile::tempdir().unwrap(),
         };
         destination
-            .observe_session("destination-observation")
+            .register_alias("destination-observation")
             .unwrap();
         assert_eq!(std::fs::read_dir(&aliases).unwrap().count(), 2);
     }
@@ -1725,9 +1727,10 @@ mod tests {
             ephemeral: false,
             authority: other.source_owners[0].clone(),
             audit_log: actual.clone(),
+            observation: None,
             _directory: tempfile::tempdir().unwrap(),
         };
-        launch.observe_session("before-pending").unwrap();
+        launch.register_alias("before-pending").unwrap();
         let mut pending = request("pending");
         pending.inventory.clear();
         let mut bindings = endpoints(&pending);
@@ -1742,7 +1745,7 @@ mod tests {
         std::fs::remove_file(&alias).unwrap();
         symlink(&rebound, &alias).unwrap();
         assert!(
-            launch.observe_session("after-pending").is_err(),
+            launch.register_alias("after-pending").is_err(),
             "late observer bypassed its captured log namespace claim"
         );
         assert_eq!(std::fs::read_dir(&aliases).unwrap().count(), 1);

@@ -403,6 +403,10 @@ fn ensure_native_admission(ledger:&owner_ledger::Ledger<'_>,owner:&RuntimeOwner,
         && !ledger.claimed_anchor(logger.protected_anchor_path().context("native protected audit anchor missing")?)?
         && !ledger.claimed_log(logger.protected_log_path().context("native protected audit log missing")?)?,"native-transfer-lock-busy");Ok(())
 }
+struct LaunchObservation {
+    prepared:PreparedLaunchRecord,
+    logger:std::sync::Weak<crate::tool_audit::AuditLogger>,
+}
 pub(crate) struct Launch {
     pub command: Command,
     pub resource_policy: serde_json::Value,
@@ -412,6 +416,7 @@ pub(crate) struct Launch {
     authority:ownership::Authority,
     store:owner_store::StoreIdentity,
     audit_log:PathBuf,
+    observation:Option<LaunchObservation>,
     _directory: tempfile::TempDir,
 }
 impl Launch {
@@ -556,12 +561,14 @@ impl Launch {
             launch_sha256:format!("{:x}",Sha256::digest(&spec_bytes))};
         // The protected append and optional workflow journal callback complete
         // before any command can escape preparation or receive prompt bytes.
-        owner_logger.native_launch_prepared(&intent)?;
+        let prepared=owner_logger.native_launch_prepared(&intent)?;
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, audit_log, _directory:directory };
-        if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
+        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, audit_log,
+            observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger)}),_directory:directory };
+        // A requested alias permits later lookup but is not a provider ID event.
+        if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
         owner_logger.validate_native_store_binding()?;
         owner_logger.dispatch_allowed()?;
         Ok(result)
@@ -570,6 +577,12 @@ impl Launch {
         lease.register_vm_retirement(Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone()});
     }
     pub fn observe_session(&self, id: &str) -> Result<()> {
+        let observed=self.observation.as_ref().context("native observation lacks prepared controller context")?;
+        let logger=observed.logger.upgrade().context("native observation controller expired")?;
+        self.register_alias_with(id,||logger.native_session_observed(&observed.prepared,id).map(|_|()))
+    }
+    fn register_alias(&self,id:&str)->Result<()> {self.register_alias_with(id,||Ok(()))}
+    fn register_alias_with(&self,id:&str,publish:impl FnOnce()->Result<()>)->Result<()> {
         ensure!(!id.is_empty() && id.len() <= 256 && id.bytes().all(|byte|(33..=126).contains(&byte)), "invalid observed native session");
         let root=self.session.parent().and_then(Path::parent).context("native state root missing")?;
         owner_store::validate_bound_metadata(root,&self.store)?;
@@ -581,8 +594,12 @@ impl Launch {
         let alias = self.aliases.join(digest(id));
         let name = self.session.file_name().context("missing session directory")?.to_string_lossy();
         let value = serde_json::to_vec(name.as_ref())?;
-        if alias.exists() { ensure!(private(&alias)? == value, "native session alias collision"); }
-        else { write(&alias,&value)?; }
+        let exists=alias.exists();
+        if exists { ensure!(private(&alias)? == value, "native session alias collision"); }
+        // Keep the original native authority lock through the controller append
+        // and alias write; a transfer cannot race this callback into another owner.
+        publish()?;
+        if !exists { write(&alias,&value)?; }
         Ok(())
     }
 }
@@ -636,11 +653,26 @@ mod tests {
     fn native_preparation_requires_original_store_binding() {launch_intent_child("unbound");}
     #[test]
     fn native_preparation_rejects_changed_original_policy_before_allocating_runtime() {launch_intent_child("reselect");}
+    #[test]
+    fn native_observation_records_actual_id_with_exact_launch_receipt() {launch_intent_child("observe");}
+    #[test]
+    fn native_observation_refuses_sealed_audit_before_alias_publication() {launch_intent_child("observe-sealed");}
+    #[test]
+    fn native_observation_rechecks_workflow_fence_before_alias_publication() {launch_intent_child("observe-fenced");}
+    #[test]
+    fn native_observation_rejects_mismatched_preparation_receipt() {launch_intent_child("observe-mismatch");}
+    #[test]
+    fn native_observation_refuses_expired_controller_before_alias_publication() {launch_intent_child("observe-expired");}
     fn launch_intent_child(mode: &str) {
         let seal=mode=="seal";let refuse=mode=="refuse";
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let test = if mode=="unbound" {"native_preparation_requires_original_store_binding"}
+                else if mode=="observe" {"native_observation_records_actual_id_with_exact_launch_receipt"}
+                else if mode=="observe-sealed" {"native_observation_refuses_sealed_audit_before_alias_publication"}
+                else if mode=="observe-fenced" {"native_observation_rechecks_workflow_fence_before_alias_publication"}
+                else if mode=="observe-mismatch" {"native_observation_rejects_mismatched_preparation_receipt"}
+                else if mode=="observe-expired" {"native_observation_refuses_expired_controller_before_alias_publication"}
                 else if mode=="reselect" {"native_preparation_rejects_changed_original_policy_before_allocating_runtime"}
                 else if refuse {"native_preparation_propagates_workflow_journal_refusal"}
                 else if seal {"native_preparation_refuses_when_launch_intent_cannot_be_committed"}
@@ -745,7 +777,60 @@ mod tests {
             assert_eq!(row["launch_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch._directory.path().join("launch.json")).unwrap())));
             assert_eq!(row["creation_receipt_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch.session.join("owned.json")).unwrap())));
             assert!(uuid::Uuid::parse_str(row["intent_id"].as_str().unwrap()).is_ok());
+            if mode.starts_with("observe") {
+                assert!(!rows.iter().any(|row|row["kind"]=="native_session_observed"),
+                    "requested native ID was misreported as a provider observation");
+                let actual_id=format!("actual-{provider}-session");
+                if mode=="observe-mismatch" {
+                    let unrelated=logger.record_controller_receipted(serde_json::json!({"actor":"controller","kind":"unrelated"})).unwrap();
+                    let before=std::fs::read(logger.path()).unwrap();
+                    for field in ["sequence","record","launch","requested-id","owner","store"] {
+                        let mut changed=prepared.clone();
+                        match field {
+                            "sequence"=>changed.controller_receipt.sequence+=100,
+                            "record"=>changed.controller_receipt=unrelated.clone(),
+                            "launch"=>changed.intent.launch_sha256="e".repeat(64),
+                            "requested-id"=>changed.intent.native_session_id=Some("another-requested-id".into()),
+                            "owner"=>changed.intent.source_owner.lease_generation+=1,
+                            "store"=>changed.intent.original_store_binding_sha256="f".repeat(64),
+                            _=>unreachable!(),
+                        }
+                        assert!(logger.native_session_observed(&changed,&actual_id).is_err(),"accepted altered {field}");
+                        assert_eq!(std::fs::read(logger.path()).unwrap(),before,"invalid launch reference appended an ID");
+                    }
+                }
+                if mode=="observe-expired" {
+                    drop(opts);drop(logger);
+                    assert!(launch.observe_session(&actual_id).is_err(),"expired controller still published an ID");
+                    assert!(!launch.aliases.join(digest(&actual_id)).exists());continue;
+                }
+                if mode=="observe-sealed" {
+                    sink_for_observation(&logger,&anchors).seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed-after-prepare"}))).unwrap();
+                } else if mode=="observe-fenced" {
+                    logger.set_dispatch_observer(std::sync::Arc::new(||anyhow::bail!("fixture owner paused"))).unwrap();
+                }
+                if !matches!(mode,"observe"|"observe-mismatch") {
+                    assert!(launch.observe_session(&actual_id).is_err(),"late ID ignored controller evidence/fence");
+                    assert!(!launch.aliases.join(digest(&actual_id)).exists(),"refused observation still published its alias");
+                    continue;
+                }
+                launch.observe_session(&actual_id).unwrap();launch.observe_session(&actual_id).unwrap();
+                let latest:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines()
+                    .map(|row|serde_json::from_str(row).unwrap()).filter(|row:&serde_json::Value|row["kind"]=="native_session_observed").collect();
+                assert_eq!(latest.len(),2,"actual ID callbacks were not durably observed");
+                for observed in latest {
+                    assert_eq!(observed["actor"],"controller");assert_eq!(observed["version"],1);
+                    assert_eq!(observed["native_session_id"],actual_id);
+                    assert_eq!(observed["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
+                    assert_eq!(observed["launch_receipt"],serde_json::to_value(&prepared.controller_receipt).unwrap());
+                    assert!(observed["observed_at_ms"].as_i64().unwrap()>0);
+                    assert!(observed.get("certainty").is_none(),"ID alone granted completion certainty");
+                }
+            }
         }
+    }
+    fn sink_for_observation(logger:&crate::tool_audit::AuditLogger,anchors:&Path)->crate::audit_chain::AnchoredAudit {
+        crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap()
     }
 
     #[test]
@@ -802,7 +887,7 @@ mod tests {
         let expected=ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/original".into()};
         let retirement=Retirement {session:runtime.clone(),expected:expected.clone(),store:test_store_identity(&root)};
         let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),aliases,
-            session:runtime,ephemeral:false,authority:expected,store:test_store_identity(&root),audit_log:"/audit/original".into(),_directory:tempfile::tempdir().unwrap()};
+            session:runtime,ephemeral:false,authority:expected,store:test_store_identity(&root),audit_log:"/audit/original".into(),observation:None,_directory:tempfile::tempdir().unwrap()};
         (base,root,retirement,launch)
     }
     fn replace_lifecycle_root(base:&Path,root:&Path)->PathBuf {
@@ -884,7 +969,7 @@ mod tests {
     #[test]
     fn native_lifecycle_alias_does_not_act_on_a_replacement_store() {
         let (base,root,_retirement,launch)=lifecycle_fixture();replace_lifecycle_root(base.path(),&root);
-        assert!(launch.observe_session("late-reply").is_err(),"delayed callback published into a replacement store");
+        assert!(launch.register_alias("late-reply").is_err(),"delayed callback published into a replacement store");
         assert_eq!(std::fs::read_dir(root.join("codex/aliases")).unwrap().count(),0);
     }
     #[test]
@@ -892,7 +977,7 @@ mod tests {
         let (_base,root,retirement,launch)=lifecycle_fixture();
         for name in ["state.lock","runtime-retirement.sqlite","authority-epoch.json"] {std::fs::remove_file(root.join(name)).unwrap();}
         let names=||std::fs::read_dir(&root).unwrap().map(|entry|entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
-        let before=names();assert!(launch.observe_session("late-reply").is_err());retire(&retirement);
+        let before=names();assert!(launch.register_alias("late-reply").is_err());retire(&retirement);
         assert_eq!(names(),before,"scope callback recreated missing authority files");
         assert!(!retirement.session.join("retired.json").exists());
     }
@@ -902,7 +987,7 @@ mod tests {
             let (_base,root,retirement,launch)=lifecycle_fixture();let lock=StateLock::acquire(&root).unwrap();
             let (tx,rx)=std::sync::mpsc::channel();
             let worker=std::thread::spawn(move || {
-                if action=="retire" {retire(&retirement);} else {assert!(launch.observe_session("late-busy-reply").is_err());}
+                if action=="retire" {retire(&retirement);} else {assert!(launch.register_alias("late-busy-reply").is_err());}
                 let _=tx.send(());
             });
             let completed=rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
