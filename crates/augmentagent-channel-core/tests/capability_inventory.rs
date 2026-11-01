@@ -958,6 +958,18 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
 }
 
 #[test]
+fn whatsapp_contact_defaults_are_not_reasoner_reachable() {
+    use augmentagent_channel_core::reasoner::*;
+    let dir=tempfile::tempdir().unwrap();let wiki=dir.path().to_path_buf();
+    let presets=[ask_opts(wiki.clone(),wiki.clone()),triage_opts(Some(wiki.clone())),
+        draft_opts("Synthetic instructions".into(),Some(wiki.clone())),digest_opts(Some(wiki.clone())),
+        resume_opts(wiki.clone()),tone_summarize_opts(),loop_parse_opts()];
+    for opts in presets {
+        assert!(!opts.allowed_tools.iter().any(|t|t.contains("whatsapp-history")), "{:?}", opts.allowed_tools);
+    }
+}
+
+#[test]
 fn imessage_compose_matches_social_card_scope_and_forbids_send_controls() {
     use augmentagent_channel_core::reasoner::*;
     let dir=tempfile::tempdir().unwrap();let wiki=dir.path().to_path_buf();

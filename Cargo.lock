@@ -972,6 +972,8 @@ name = "augmentagent-channel-whatsapp-history"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
  "augmentagent-channel-core",
  "augmentagent-channel-imessage",
  "augmentagent-mcp-memory",

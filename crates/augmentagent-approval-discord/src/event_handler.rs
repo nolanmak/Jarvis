@@ -1889,9 +1889,12 @@ fn approval_followup(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) -> CreateInteractionResponseFollowup {
+    // #1765 — the paste-ready text must outlive the click (owner copies it
+    // later, often from a phone), so it is a normal message, not ephemeral.
+    let persistent = matches!(outcome, ApprovalActionOutcome::ManualSendReady { .. });
     let mut fu = CreateInteractionResponseFollowup::new()
         .content(describe(outcome))
-        .ephemeral(true)
+        .ephemeral(!persistent)
         .allowed_mentions(serenity::all::CreateAllowedMentions::new());
     if let ApprovalActionOutcome::AlreadyResolved { status, detail } = outcome {
         if offers_recompose(status, detail.as_deref()) {
@@ -2176,6 +2179,7 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
             | ApprovalActionOutcome::CalendarCreated { .. }
             | ApprovalActionOutcome::CalendarResponded { .. }
             | ApprovalActionOutcome::DocumentSigned { .. }
+            | ApprovalActionOutcome::ManualSendReady { .. }
             | ApprovalActionOutcome::Skipped
             | ApprovalActionOutcome::Revised { .. }
             | ApprovalActionOutcome::AlreadyResolved { .. }
