@@ -240,7 +240,7 @@ pub(super) fn reconcile_failure(
     let known = (|| -> anyhow::Result<Option<State>> {
         let lock = super::StateLock::acquire(&root)?;
         let ledger = Ledger::open(&root, &lock)?;
-        let state = ledger.state(&request.transfer_id)?;
+        let state = ledger.state_for(request)?;
         context.free_class = super::available_bytes(&root)
             .ok()
             .map(|bytes| bytes / super::SESSION_BYTES);
@@ -265,6 +265,9 @@ pub(super) fn reconcile_failure(
         Ok(_) => {
             let (reason, category) = classify(&error);
             context.failure(reason, category)
+        }
+        Err(error) if error.downcast_ref::<R>() == Some(&R::AuthorityConflict) => {
+            context.failure(R::AuthorityConflict, "none")
         }
         Err(_) => TransferOutcome::Unknown {
             reason: R::PendingUnknown,

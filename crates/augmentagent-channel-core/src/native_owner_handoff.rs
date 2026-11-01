@@ -337,7 +337,7 @@ pub(super) fn handoff_at(
     request.validate()?;
     let lock = super::StateLock::acquire(root)?;
     let mut ledger = Ledger::open(root, &lock)?;
-    match ledger.state(&request.transfer_id)? {
+    match ledger.state_for(request)? {
         Some(State::Completed(receipt)) => {
             receipt.verify(request)?;
             return Ok(receipt);

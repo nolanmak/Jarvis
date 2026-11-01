@@ -416,6 +416,13 @@ impl<'a> Ledger<'a> {
     pub fn state(&self, id: &str) -> Result<Option<State>> {
         Ok(load(&self.db, id)?.map(|record| record.state))
     }
+    pub fn state_for(&self, request: &TransferRequest) -> Result<Option<State>> {
+        let Some(prior) = load(&self.db, &request.transfer_id)? else {
+            return Ok(None);
+        };
+        ensure!(prior.request == *request, R::AuthorityConflict);
+        Ok(Some(prior.state))
+    }
     pub fn reserved_bytes(&self) -> Result<u64> {
         growth(&self.db)
     }
