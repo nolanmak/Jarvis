@@ -46,6 +46,7 @@ class LaunchdInstallerTests(unittest.TestCase):
         for name in INSTALLERS:
             shutil.copy2(SOURCE / "scripts" / f"install-{name}.sh", self.repo / "scripts")
         shutil.copy2(SOURCE / "scripts/uninstall-autostart.sh", self.repo / "scripts")
+        shutil.copy2(SOURCE / "scripts/secure-release-executables.py", self.repo / "scripts")
         for name in ("run-rs.sh", "run-dashboard.sh", "check-for-updates.sh", "calendar-poll.sh",
                      "daily-digest.sh", "daily-research.sh", "wix-events-sync.mjs"):
             (self.repo / "scripts" / name).write_text("#!/bin/sh\nexit 0\n")
@@ -54,6 +55,7 @@ class LaunchdInstallerTests(unittest.TestCase):
         (self.repo / "scripts/pdf-runtime.py").write_text("raise SystemExit(0)\n")
         (self.repo / "target/release/augmentagent").write_text("#!/bin/sh\nexit 0\n")
         (self.repo / "target/release/augmentagent").chmod(0o755)
+        shutil.copy2(self.repo / "target/release/augmentagent", self.repo / "target/release/augmentagent-mcp-memory")
         (self.repo / "dist/dashboard-server.js").write_text("")
         self.bin = self.root / "bin"
         self.bin.mkdir()

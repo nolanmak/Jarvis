@@ -25,6 +25,7 @@ make_case() {
   printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
+  cp "$REPO_ROOT/scripts/secure-release-executables.py" "$TMP/work/scripts/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base
@@ -80,6 +81,7 @@ elif [ "${1:-} ${2:-}" = 'disk build' ] && [ -n "${STORAGE_CODE:-}" ]; then
 fi
 STUB
   chmod +x "$TMP/work/target/release/augmentagent"
+cp "$TMP/work/target/release/augmentagent" "$TMP/work/target/release/augmentagent-mcp-memory"
   # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
   printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
   SYSTEMCTL_STUB_DIR="$TMP"; export SYSTEMCTL_STUB_DIR

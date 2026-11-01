@@ -17,7 +17,7 @@ class InstallTests(unittest.TestCase):
             base = Path(temporary)
             repo = base / 'repo fixture'
             (repo / 'scripts/systemd').mkdir(parents=True)
-            for name in ('ensure-autopr-worker.sh', 'systemd/augmentagent-autopr.service'):
+            for name in ('ensure-autopr-worker.sh','secure-release-executables.py', 'systemd/augmentagent-autopr.service'):
                 shutil.copy(ROOT / 'scripts' / name, repo / 'scripts' / name)
             runner=repo/'scripts/run-rs.sh'
             runner.write_text('#!/bin/sh\nexit 0\n');runner.chmod(0o700)

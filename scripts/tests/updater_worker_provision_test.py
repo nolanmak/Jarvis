@@ -24,7 +24,7 @@ class WorkerProvisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             for name in ['check-for-updates.sh','lib/service-restart.sh','lib/update-build.sh',
-                         'ensure-autopr-worker.sh','systemd/augmentagent-autopr.service']:
+                         'ensure-autopr-worker.sh','secure-release-executables.py','systemd/augmentagent-autopr.service']:
                 target=root/'scripts'/name;target.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copy(ROOT/'scripts'/name,target)
             tools=root/'bin';tools.mkdir();release=root/'target/release';release.mkdir(parents=True)
@@ -55,7 +55,7 @@ if 'show' in sys.argv:
  print({'ExecStart':'{ argv[]=/fixture/serve --dry-run false ; }'}.get(key,''))
 ''');manager.chmod(0o700)
             cargo=tools/'cargo';cargo.write_text('#!/bin/sh\necho forbidden-cargo >> "$CALLS"\nexit 99\n');cargo.chmod(0o700)
-            calls=root/'calls'
+            calls=root/'calls';calls.touch()
             env={'HOME':str(root),'XDG_STATE_HOME':str(root/'state'),'XDG_CONFIG_HOME':str(root/'config'),
                  'PATH':str(tools)+':/usr/bin:/bin','CALLS':str(calls)}
             stamp=root/'state/augmentagent/built-commit';stamp.parent.mkdir(parents=True)
@@ -67,7 +67,7 @@ if 'show' in sys.argv:
                 self.assertNotEqual(result.returncode,0)
                 self.assertEqual(stamp.read_text().strip(),'a'*40)
                 self.assertEqual(cli.stat().st_mode & 0o777,0o775)
-                self.assertNotIn('enable augmentagent-autopr.service',calls.read_text())
+                self.assertEqual(calls.read_text(),'','invalid artifacts must fail before any CLI or service call')
                 self.assertNotIn('restart augmentagent.service',calls.read_text())
                 return
             pending=stamp.parent/'autopr-provision-pending'

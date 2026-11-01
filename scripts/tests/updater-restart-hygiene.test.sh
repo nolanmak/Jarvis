@@ -26,6 +26,7 @@ make_case() {
   printf 'import os, sys; sys.exit(int(os.environ.get("PDF_INSTALL_FAIL", "0")))\n' > "$TMP/work/scripts/pdf-runtime.py"
   cp "$REPO_ROOT/scripts/lib/service-restart.sh" "$TMP/work/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/update-build.sh" "$TMP/work/scripts/lib/"
+  cp "$REPO_ROOT/scripts/secure-release-executables.py" "$TMP/work/scripts/"
   echo base > "$TMP/work/crates/x.rs"
   git -C "$TMP/work" add -A
   git -C "$TMP/work" -c user.email=t@e -c user.name=t commit -qm base

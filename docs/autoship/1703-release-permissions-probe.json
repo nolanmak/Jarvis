@@ -5,19 +5,39 @@
   "source_sha256": [
     {
       "path": "scripts/ensure-autopr-worker.sh",
-      "sha256": "86327e559d6a82b769c14b5fd3252b1dfed27dfb5ec561677a8654955aea3267"
+      "sha256": "dd870acb177f678ddd8fc50d1d1c317abd37f9f8e5f14c1fe7309a1ebab40e73"
     },
     {
       "path": "scripts/check-for-updates.sh",
-      "sha256": "3070a5aad6c6a176cff258562e01c8e0049fd7e6000a836dfe0ffe8c92d1dd1e"
+      "sha256": "7c9000ee2447422301012702dd6898683ba43ea5be2a9e2fdbf3237394d0608d"
     },
     {
       "path": "scripts/tests/autopr_worker_install_test.py",
-      "sha256": "7bf13143f8f16ba9af40df9849a98f2f7d2984a702ddfa428fa5883c49605299"
+      "sha256": "cd9044cf6b2bcc83373b0e931ac547d46a0ef6e6dceb83c308f6b1c410fb7283"
     },
     {
       "path": "scripts/tests/updater_worker_provision_test.py",
-      "sha256": "24e061e172d973498a4c38252c08d0c8d5d81f1431beb91ad1ed65c60038869c"
+      "sha256": "c398ca6cd268fd65d9b626de919ffc2e5702b5dfb2977cc7f30ac24006565c7f"
+    },
+    {
+      "path": "scripts/secure-release-executables.py",
+      "sha256": "21c26ce590e96ac2ea3dcfe5fbd63625bd2ec4d6e9b17bf8d76e88e4d54a9aad"
+    },
+    {
+      "path": "scripts/lib/update-build.sh",
+      "sha256": "441ed9d70b49d814038ddbdf171956eb8daacc48a3f74dadf7b77685d88ffa61"
+    },
+    {
+      "path": "scripts/install-autostart.sh",
+      "sha256": "12822fb6e2e0ffd0ff0107530a6a6c70c1443cb7ce835628da142d1cb5997e80"
+    },
+    {
+      "path": "scripts/tests/update-build.test.sh",
+      "sha256": "6e77b83153413ec311baf19f85e9b6b789f0939036114b74409785445831ed22"
+    },
+    {
+      "path": "scripts/tests/install-autostart.test.sh",
+      "sha256": "f5736c8bb2c9489e3dd5cbf99397ad0b243a3cc6b10299d3ac72487bd6ed5c44"
     }
   ],
   "observed_production_failure": "Both Cargo release executables were mode 0775 with two hard links; deployment trust checks reject group-write access. Policy selection made this previously hidden check reachable.",
@@ -33,28 +53,50 @@
       "command": "python3 scripts/tests/updater_worker_provision_test.py",
       "failure": "script-only pull skips worker provisioning and leaves modes 0775",
       "log_sha256": "b563438df0970d1f88fe37fe3de5b0370f873c4ab06463283b8409b001875b31"
+    },
+    {
+      "commit": "0dace86a",
+      "command": "python3 -m unittest discover -s scripts/tests -p updater_worker_provision_test.py",
+      "failure": "CLI preflight runs mode 0775; provisioning failure leaves stale stamp before next tick",
+      "log_sha256": "d82780c63b73df967cd69eaae2a914c334623bf94156586f0a32e72df38b899c"
     }
   ],
   "green": {
     "installer_tests": 1,
-    "whole_updater_tests": 2,
-    "build_wrapper_outcome_cases": 8,
+    "whole_updater_tests": 3,
+    "build_wrapper_outcome_cases": 9,
     "installer_log_sha256": "2d29252106404abedc07d5628b4ebe7fb597fc4b260975732e851312cbf0dc8c",
-    "updater_log_sha256": "544fe7f9ee5d4aa36f7d738d22a83e3d62047ddc3038f99c604f7d8099f85ec7"
+    "updater_log_sha256": "544fe7f9ee5d4aa36f7d738d22a83e3d62047ddc3038f99c604f7d8099f85ec7",
+    "retry_ordering_log_sha256": "1090daedd4f2400c8d7736ba93bccd10ed46d42e8502b905129b945c4f81a9f4",
+    "autostart_assertions": 61,
+    "launchd_installer_tests": 6,
+    "existing_updater_assertions": {
+      "stamp": 28,
+      "pinned_binary": 42,
+      "restart_hygiene": 21,
+      "sync_scripts": 10,
+      "rebuild_trigger": 76
+    }
   },
   "preserved": [
     "existing Cargo inode/hard links and file bytes",
     "existing owner-private read permissions",
     "no symlink/FIFO/non-executable normalization",
     "both files validate before either mode changes",
-    "failure withholds deployment stamp and service restart",
     "worker provisioning never forces an active worker restart",
-    "deployment executable trust policy and restart budget unchanged"
+    "deployment executable trust policy and restart budget unchanged",
+    "invalid cached artifacts refuse before any CLI or service call",
+    "failed provisioning retains independent retry state while completed build/deployment stamp stays accurate",
+    "unverified required restart still withholds build stamp"
   ],
   "not_proved": [
     "Both production processes have loaded the selected native policy",
     "Full native issue or PR merge acceptance",
     "Discord coding consumer",
     "Soak and daily shipping throughput"
-  ]
+  ],
+  "review_corrections": {
+    "preflight": "Shared artifact-only helper runs before updater CLI helpers, build admission, and autostart preflight; successful builds repair new Cargo output too.",
+    "retry": "Private provisioning pending marker is independent of build stamp. Failed provisioning does not undo completed script-only deployment. Unchanged-head ticks retry provisioning until successful without Cargo or daemon restart."
+  }
 }
