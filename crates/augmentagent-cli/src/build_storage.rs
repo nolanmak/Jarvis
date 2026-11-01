@@ -10,6 +10,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "build_storage_ci_holds.rs"]
+pub(crate) mod ci_holds;
+
 const MARKER: &str = ".augmentagent-target.json";
 const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n";
 pub const PARENT_LEASE_ENV: &str = "AUGMENTAGENT_BUILD_PARENT_LEASE";
