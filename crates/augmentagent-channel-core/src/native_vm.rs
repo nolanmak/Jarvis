@@ -197,12 +197,17 @@ fn tree_bytes(root:&Path) -> Result<u64> {
     Ok(total)
 }
 #[derive(Debug,Clone,PartialEq,Eq)]
-pub(crate) struct Retirement {pub(crate) session:PathBuf,pub(crate) expected:ownership::Authority}
+pub(crate) struct Retirement {
+    pub(crate) session:PathBuf,
+    pub(crate) expected:ownership::Authority,
+    store:owner_store::StoreIdentity,
+}
 pub(crate) fn retire(retirement:&Retirement) {
     let session=&retirement.session;
     let Some(root)=session.parent().and_then(Path::parent) else{return};
-    let Ok(lock)=StateLock::acquire(root) else{return};
-    let Ok(ledger)=owner_ledger::Ledger::open(root,&lock) else{return};
+    if owner_store::validate_bound_metadata(root,&retirement.store).is_err() {return;}
+    let Ok(lock)=StateLock::existing(root) else{return};
+    let Ok(ledger)=owner_ledger::Ledger::open_bound(root,&lock,&retirement.store,true) else{return};
     let result=(||->Result<()> {
         let current=runtime_authority(root,&ledger,session)?;
         ensure!(current==retirement.expected && !ledger.is_closed(&current.owner)?
@@ -391,6 +396,7 @@ pub(crate) struct Launch {
     session: PathBuf,
     ephemeral: bool,
     authority:ownership::Authority,
+    store:owner_store::StoreIdentity,
     audit_log:PathBuf,
     _directory: tempfile::TempDir,
 }
@@ -466,6 +472,7 @@ impl Launch {
             }
         };
         let authority=runtime_authority(&root,&ledger,&session)?;
+        let store=ledger.store_identity()?;
         let runtime_relative_path=relative_runtime(&root,&session)?.to_owned();
         use sha2::{Digest,Sha256};
         let creation_receipt_sha256=format!("{:x}",Sha256::digest(private(&session.join("owned.json"))?));
@@ -539,19 +546,21 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, audit_log, _directory:directory };
+        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, audit_log, _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
         owner_logger.validate_native_store_binding()?;
         owner_logger.dispatch_allowed()?;
         Ok(result)
     }
     pub fn register_retirement(&self, lease:&crate::native_session::Lease) {
-        lease.register_vm_retirement(Retirement{session:self.session.clone(),expected:self.authority.clone()});
+        lease.register_vm_retirement(Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone()});
     }
     pub fn observe_session(&self, id: &str) -> Result<()> {
         ensure!(!id.is_empty() && id.len() <= 256 && id.bytes().all(|byte|(33..=126).contains(&byte)), "invalid observed native session");
         let root=self.session.parent().and_then(Path::parent).context("native state root missing")?;
-        let lock=StateLock::acquire(root)?;let ledger=owner_ledger::Ledger::open(root,&lock)?;
+        owner_store::validate_bound_metadata(root,&self.store)?;
+        let lock=StateLock::existing(root)?;
+        let ledger=owner_ledger::Ledger::open_bound(root,&lock,&self.store,true)?;
         let current=runtime_authority(root,&ledger,&self.session)?;ensure_unretired(&self.session)?;
         ensure!(current==self.authority && !ledger.is_closed(&current.owner)? && !ledger.held_by_abort(&current.owner)?
             && !ledger.claimed(&current.owner,relative_runtime(root,&self.session)?)? && !ledger.claimed_audit(&current.audit_path)? && !ledger.claimed_log(&self.audit_log)?,"native alias authority changed or held");
@@ -564,13 +573,25 @@ impl Launch {
     }
 }
 
-impl Drop for Launch { fn drop(&mut self) { if self.ephemeral {retire(&Retirement{session:self.session.clone(),expected:self.authority.clone()});} } }
+impl Drop for Launch { fn drop(&mut self) { if self.ephemeral {retire(&Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone()});} } }
 
 #[cfg(test)]
 pub(crate) fn initialize_native_test_store(root:&Path) {
     owner_store::provision_fixture(root);
     let lock=StateLock::acquire(root).unwrap();
     owner_ledger::Ledger::open(root,&lock).unwrap();
+}
+
+#[cfg(test)]
+fn test_store_identity(root:&Path)->owner_store::StoreIdentity {
+    let lock=StateLock::acquire(root).unwrap();
+    owner_ledger::Ledger::open(root,&lock).unwrap().store_identity().unwrap()
+}
+#[cfg(test)]
+pub(crate) fn test_retirement(session:PathBuf,expected:ownership::Authority)->Retirement {
+    let root=session.parent().and_then(Path::parent).unwrap();
+    let store=test_store_identity(root);
+    Retirement {session,expected,store}
 }
 
 #[cfg(test)]
@@ -765,9 +786,9 @@ mod tests {
         let aliases=root.join("codex/aliases");std::fs::create_dir(&aliases).unwrap();
         std::fs::set_permissions(&aliases,std::fs::Permissions::from_mode(0o700)).unwrap();
         let expected=ownership::Authority {owner:RuntimeOwner {workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/original".into()};
-        let retirement=Retirement {session:runtime.clone(),expected:expected.clone()};
+        let retirement=Retirement {session:runtime.clone(),expected:expected.clone(),store:test_store_identity(&root)};
         let launch=Launch {command:Command::new("unused-fixture"),resource_policy:serde_json::json!({}),aliases,
-            session:runtime,ephemeral:false,authority:expected,audit_log:"/audit/original".into(),_directory:tempfile::tempdir().unwrap()};
+            session:runtime,ephemeral:false,authority:expected,store:test_store_identity(&root),audit_log:"/audit/original".into(),_directory:tempfile::tempdir().unwrap()};
         (base,root,retirement,launch)
     }
     fn replace_lifecycle_root(base:&Path,root:&Path)->PathBuf {
@@ -858,7 +879,7 @@ mod tests {
     fn scope_retirement_does_not_guess_interrupted_session_safe() {
         let temp=tempfile::tempdir().unwrap();
         let interrupted=session(temp.path(),"session-interrupted","/audit/one",false);
-        retire(&Retirement{session:interrupted.clone(),expected:ownership::Authority{owner:RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/one".into()}});
+        retire(&test_retirement(interrupted.clone(),ownership::Authority{owner:RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1},audit_path:"/audit/one".into()}));
         let state_lock=StateLock::acquire(temp.path()).unwrap();
         assert_eq!(prune_and_count(temp.path()).unwrap(),1);
         assert!(interrupted.exists());

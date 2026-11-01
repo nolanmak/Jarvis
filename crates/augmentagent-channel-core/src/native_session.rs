@@ -437,7 +437,7 @@ mod builder_restore_tests {
     fn finish_native_turn(provider:ProviderKind,runtime:&std::path::Path)->String {
         let session=current_for(provider).unwrap().unwrap();
         let mut lease=session.begin(provider).unwrap();
-        lease.register_vm_retirement(crate::native_vm::Retirement{session:runtime.to_owned(),expected:crate::native_vm::ownership::Authority{owner:crate::native_vm::RuntimeOwner{workflow_id:"fixture".into(),lease_generation:1},audit_path:"/audit/fixture".into()}});
+        lease.register_vm_retirement(crate::native_vm::test_retirement(runtime.to_owned(),crate::native_vm::ownership::Authority{owner:crate::native_vm::RuntimeOwner{workflow_id:"fixture".into(),lease_generation:1},audit_path:"/audit/fixture".into()}));
         let id=match lease.launch() {
             Launch::Resume {id}|Launch::Create {requested_id:Some(id)}=>id,
             Launch::Create {requested_id:None}=>"observed-native-codex".into(),

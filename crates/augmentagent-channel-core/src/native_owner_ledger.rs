@@ -1549,6 +1549,7 @@ mod tests {
             super::super::retire(&super::super::Retirement {
                 session: runtime.clone(),
                 expected: request.source_owners[0].clone(),
+                store:super::super::test_store_identity(root.path()),
             });
             assert!(
                 !runtime.join("retired.json").exists(),
@@ -1653,6 +1654,7 @@ mod tests {
         let launch = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            store:super::super::test_store_identity(root.path()),
             aliases: aliases.clone(),
             session: runtime.clone(),
             ephemeral: false,
@@ -1682,6 +1684,7 @@ mod tests {
         let destination = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            store:super::super::test_store_identity(root.path()),
             aliases: aliases.clone(),
             session: runtime,
             ephemeral: false,
@@ -1716,6 +1719,7 @@ mod tests {
         let launch = super::super::Launch {
             command: tokio::process::Command::new("unused-fixture"),
             resource_policy: json!({}),
+            store:super::super::test_store_identity(root.path()),
             aliases: aliases.clone(),
             session: runtime,
             ephemeral: false,
