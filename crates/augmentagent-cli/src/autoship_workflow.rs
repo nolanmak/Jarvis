@@ -382,6 +382,14 @@ impl WorkflowStore {
                 binding TEXT NOT NULL, registered_at INTEGER NOT NULL,
                 PRIMARY KEY(workflow,lease_generation),
                 FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_launch (
+                intent_id TEXT PRIMARY KEY, workflow TEXT NOT NULL REFERENCES workflow(id),
+                sequence INTEGER NOT NULL UNIQUE REFERENCES workflow_event(seq),
+                lease_generation INTEGER NOT NULL, provider TEXT NOT NULL,
+                runtime_relative_path TEXT NOT NULL, native_session TEXT, record TEXT NOT NULL,
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner_binding(workflow,lease_generation));
+            CREATE INDEX IF NOT EXISTS workflow_native_launch_history ON workflow_native_launch(workflow,sequence);
+            CREATE INDEX IF NOT EXISTS workflow_native_launch_session ON workflow_native_launch(provider,native_session);
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (
                 workflow TEXT PRIMARY KEY REFERENCES workflow(id), generation INTEGER NOT NULL,
                 lease_generation INTEGER NOT NULL, recovery TEXT NOT NULL);
