@@ -67,6 +67,27 @@ fn private_open(path: &Path, append: bool) -> Result<File> {
     );
     Ok(file)
 }
+fn verify_existing_identity(path: &Path, file: &File) -> Result<()> {
+    let held = file.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+    ensure!(held.is_file() && current.is_file() && !current.file_type().is_symlink(), "audit evidence is not a regular file");
+    #[cfg(unix)]
+    ensure!(
+        held.uid() == unsafe { libc::geteuid() } && held.mode() & 0o077 == 0
+            && held.nlink() == 1 && held.dev() == current.dev() && held.ino() == current.ino(),
+        "audit evidence is not private or its identity changed"
+    );
+    Ok(())
+}
+fn private_existing(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    verify_existing_identity(path, &file)?;
+    Ok(file)
+}
 fn canonical_destination(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
@@ -84,8 +105,70 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
 impl AnchoredAudit {
     /// Verify a historical append reference against this existing audit only.
     /// This lookup grants no current runtime or transfer authority.
-    pub fn read_receipt(&self, _receipt: &AppendReceipt) -> Result<serde_json::Value> {
-        bail!("exact audit receipt lookup is not implemented")
+    pub fn read_receipt(&self, receipt: &AppendReceipt) -> Result<serde_json::Value> {
+        let hash = |value: &str| value.len() == 64
+            && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        ensure!(receipt.version == 1 && receipt.sequence > 0
+            && hash(&receipt.record_sha256) && hash(&receipt.committed_audit_sha256),
+            "invalid audit append receipt");
+        let lock_path = self.anchor.with_extension("lock");
+        ensure!(lock_path != self.anchor && lock_path != self.log, "audit lock path collision");
+        // Open original evidence only. In particular, never recreate a missing
+        // lock inode and accidentally coordinate with a different generation.
+        let lock = private_existing(&lock_path)?;
+        #[cfg(unix)]
+        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "audit lock failed");
+        verify_existing_identity(&lock_path, &lock)?;
+        let anchor_file = private_existing(&self.anchor)?;
+        let log_file = private_existing(&self.log)?;
+        ensure!(anchor_file.metadata()?.len() <= LIMIT && log_file.metadata()?.len() <= LIMIT,
+            "audit evidence exceeds budget");
+        let mut anchor_bytes = Vec::new();
+        (&anchor_file).take(LIMIT + 1).read_to_end(&mut anchor_bytes)?;
+        ensure!(anchor_bytes.len() as u64 <= LIMIT, "anchor exceeds budget");
+        let anchor: Anchor = serde_json::from_slice(&anchor_bytes)?;
+        ensure!(anchor.version == 1 && anchor.pending.is_none(), "audit has unsupported or uncertain authority");
+        let mut bytes = Vec::new();
+        (&log_file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 <= LIMIT && bytes.len() == anchor.bytes,
+            "audit has truncated or unanchored bytes");
+        let committed_hash = if bytes.is_empty() { String::new() } else { digest(&bytes) };
+        ensure!(committed_hash == anchor.hash, "committed audit modified");
+        let mut offset = 0;
+        let mut sequence = 0;
+        let mut found = None;
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            ensure!(line.ends_with(b"\n"), "committed audit record is incomplete");
+            let end = offset + line.len();
+            let raw = &line[..line.len()-1];
+            if !raw.is_empty() {
+                sequence += 1;
+                let row: serde_json::Value = serde_json::from_slice(raw)?;
+                ensure!(row.is_object(), "committed audit record is not an object");
+                if sequence == receipt.sequence {
+                    ensure!(digest(raw) == receipt.record_sha256
+                        && digest(&bytes[..end]) == receipt.committed_audit_sha256,
+                        "audit receipt does not match its committed record");
+                    let mut payload = row.clone();
+                    let chain = payload.as_object_mut().unwrap().remove("audit_chain")
+                        .context("referenced record lacks append metadata")?;
+                    let previous = if offset == 0 { String::new() } else { digest(&bytes[..offset]) };
+                    ensure!(chain.as_object().is_some_and(|object| object.len() == 4)
+                        && chain["version"].as_u64() == Some(1)
+                        && chain["sequence"].as_u64() == Some(sequence)
+                        && chain["previous"].as_str() == Some(previous.as_str())
+                        && chain["payload_sha256"].as_str() == Some(digest(&serde_json::to_vec(&payload)?).as_str()),
+                        "referenced record has invalid append metadata");
+                    found = Some(row);
+                }
+            }
+            offset = end;
+        }
+        ensure!(sequence == anchor.sequence, "committed audit sequence mismatch");
+        verify_existing_identity(&lock_path, &lock)?;
+        verify_existing_identity(&self.anchor, &anchor_file)?;
+        verify_existing_identity(&self.log, &log_file)?;
+        found.context("audit receipt record is missing")
     }
     /// Writer registration and sealing share this cross-process ingress gate.
     /// The callback must persist its ticket before releasing the anchor lock.
@@ -380,6 +463,44 @@ mod tests {
             assert!(sink.read_receipt(&receipt).is_err(), "{mode}");
             assert_eq!(fs::read(&sink.log).unwrap(),log); assert_eq!(fs::read(&sink.anchor).unwrap(),anchor);
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn receipt_lookup_refuses_links_and_nonprivate_evidence() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for name in ["log", "anchor", "lock"] {
+            for mode in ["symlink", "hardlink", "public"] {
+                let (directory, sink) = setup();
+                let receipt = sink.append_receipted(serde_json::json!({"kind":"launch"})).unwrap();
+                let path = match name { "log"=>sink.log.clone(), "anchor"=>sink.anchor.clone(), _=>sink.anchor.with_extension("lock") };
+                let before = fs::read(&path).unwrap();
+                let alias = directory.path().join("alias");
+                match mode {
+                    "symlink" => { fs::rename(&path,&alias).unwrap(); symlink(&alias,&path).unwrap(); },
+                    "hardlink" => fs::hard_link(&path,&alias).unwrap(),
+                    "public" => fs::set_permissions(&path,fs::Permissions::from_mode(0o644)).unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(sink.read_receipt(&receipt).is_err(), "{name}/{mode}");
+                assert_eq!(fs::read(&path).unwrap(),before);
+                if mode=="symlink" {assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());}
+            }
+        }
+    }
+    #[test]
+    fn receipt_lookup_serializes_with_concurrent_appends() {
+        let (_directory, sink) = setup();
+        let receipt = sink.append_receipted(serde_json::json!({"kind":"launch","request":"first"})).unwrap();
+        let writer = sink.clone();
+        let task = std::thread::spawn(move || {
+            for index in 0..12 {writer.append(serde_json::json!({"kind":"other","index":index})).unwrap();}
+        });
+        for _ in 0..12 {
+            let row = sink.read_receipt(&receipt).unwrap();
+            assert_eq!(row["kind"],"launch"); assert_eq!(row["request"],"first");
+        }
+        task.join().unwrap();
+        assert_eq!(sink.read_receipt(&receipt).unwrap()["audit_chain"]["sequence"],1);
     }
     fn setup() -> (tempfile::TempDir, AnchoredAudit) {
         let dir = tempfile::tempdir().unwrap();
