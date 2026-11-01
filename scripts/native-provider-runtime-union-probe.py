@@ -55,6 +55,7 @@ def main():
     profile = root / 'profile'
     profile.mkdir(mode=0o700)
     (profile / 'state').mkdir(mode=0o700)
+    provision.record_fresh_store(profile / 'state')
     copied = dict(baseline, state_root=str(profile / 'state'))
     policy_path = profile / 'policy.json'
     write(policy_path, copied)

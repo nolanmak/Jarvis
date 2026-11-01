@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1713,
+  "tested_commit": "38540ad548d948876e78f1fe3037a20aa3fcbf7c",
+  "scope": "Per-store native authority identity and durable initialization/migration. Original policy/store binding in pending workflow requests and native-owner registrations is not implemented by this evidence.",
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_store.rs",
+      "sha256": "654fd58f46967ec7b1fa995947a29c332b1af628d334d4b6c4367b868c9381cf"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "8090b91c97532a7164701c0175136bf45e8028a9a14cf9ea18c9a40ecc9186ca"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "3236ebcb722c8a2c429a84d59e60e996bd69604ac6b27de5bcc38616cd62d724"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "681a3adf84ee1686f8d41fb24967fdb02d16d1259dce5c8378f4fd9b21e7b56c"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "bda07e2d9566d1c011345591b6051d744a16616ef6ae107399c40a8623f7722c"
+    },
+    {
+      "path": "scripts/provision-native-vm-probe.py",
+      "sha256": "3d1cda0b97080291584fc92cae54aff570bde83764aa0709e567582df294a6f5"
+    },
+    {
+      "path": "scripts/test-provision-native-vm.py",
+      "sha256": "f18b63144d01c50667deec2542d774a78157d16f85a3c536acd617cd08c6ac14"
+    },
+    {
+      "path": "scripts/native-provider-runtime-union-probe.py",
+      "sha256": "c2a66a220de5b897f899121f2d04dd7af113bd1adde0ab2f6201be8f38af5751"
+    }
+  ],
+  "red_commits": {
+    "identity": "d856ae7e",
+    "activation": "4640d8b6",
+    "state_lock": "70c98e44"
+  },
+  "verification": [
+    {
+      "name": "identity_red",
+      "exit_code": 1,
+      "passed": 0,
+      "failed": 4,
+      "log_sha256": "b540a8efa2837e6f1beae1e3d96707aefbc8d42af7f7e96d04567eb1844c285d"
+    },
+    {
+      "name": "activation_red",
+      "exit_code": 1,
+      "passed": 6,
+      "failed": 4,
+      "log_sha256": "85ccc845800099cec8c85ee6afc8d530493fb4de0a8973662e7c58f5691e6eba"
+    },
+    {
+      "name": "lock_identity_red",
+      "exit_code": 1,
+      "passed": 12,
+      "failed": 2,
+      "log_sha256": "551aaf2c07574f9fbb396d67b73feeb6ed2d300082c77f3b477585cb72c2b7dc"
+    },
+    {
+      "name": "initial_native_green",
+      "exit_code": 0,
+      "passed": 91,
+      "failed": 0,
+      "log_sha256": "b19dec221bbb2e9f48a2dce610d44ca214db0a4f8de9f8656113b19b4aa4b12e"
+    },
+    {
+      "name": "intermediate_core_green",
+      "exit_code": 0,
+      "passed": 738,
+      "failed": 0,
+      "log_sha256": "c2c54cf4742eac8bca0d1b1415f7318db670656125420573aeed738bcd8003bb"
+    },
+    {
+      "name": "final_core_green",
+      "exit_code": 0,
+      "passed": 740,
+      "failed": 0,
+      "log_sha256": "b9c119f59a087eb7d31f13297035f2ee8f4fe833b4d2400829bf394e6ed4904c"
+    },
+    {
+      "name": "cli_integration_green",
+      "exit_code": 0,
+      "passed": 44,
+      "failed": 0,
+      "log_sha256": "611dacd4c76327ae9f282a0837c2de52dfc5abbfcea1e5eea9cf4dee3cf0d395"
+    },
+    {
+      "name": "provisioning_green",
+      "exit_code": 0,
+      "passed": 10,
+      "failed": 0,
+      "log_sha256": "3ccb1a794699d72e8bc57af8ff80c22c6824baf62cec130f785d26b36bf76a1c"
+    },
+    {
+      "name": "transport_python_green",
+      "exit_code": 0,
+      "passed": 18,
+      "failed": 0,
+      "log_sha256": "1fddbf768e9b149f732e7b61eb5b9cad7a9669a6342eaec3cd4af8b498f64e0a"
+    }
+  ],
+  "provisioning_red": {
+    "exit_code": 1,
+    "passed": 9,
+    "errors": 1,
+    "log_sha256": "53e18e9b858a12e59dbd8b28d99636cce60b60e6a4b75bb95a093548d5265df0",
+    "behavior": "new provisioning omitted a durable explicit fresh-root intent"
+  },
+  "initial_native_ignored": 2,
+  "full_core_ignored": 14,
+  "cli_suites": {
+    "autoship_commands_cli": 15,
+    "autoship_resolution_cli": 10,
+    "autoship_submit_cli": 19
+  },
+  "wrapper": "scripts/cargo-managed.sh",
+  "verified": [
+    "missing or replaced established ledger never recreates authority or initializes the replacement",
+    "bare empty root cannot bootstrap without supported explicit intent",
+    "fresh Python provisioner intent consumed by Rust under real umasks0002/0022",
+    "verified legacy migration preserves closures and valid completed/aborted history",
+    "exact managed epoch schema and all existing transfer states/chains validated before activation",
+    "subprocess exits at initializing commit, marker publication, active commit and bootstrap consumption replay the same epoch for both fresh and legacy roots",
+    "active marker loss refuses without republishing it",
+    "missing/replaced persistent state lock cannot grant a second writer while original flock remains held"
+  ],
+  "focused_reviews": {
+    "initialization_order": "holds for named crash boundaries",
+    "activation_history_and_schema": "verified findings resolved and focused recheck holds",
+    "persistent_lock_binding": "revision17 focused recheck holds"
+  },
+  "not_verified": [
+    "durable original policy/store binding and read-only original-store historical lookup",
+    "native-owner registration and dispatch binding gate",
+    "corrupt prepared-state liveness recovery O4",
+    "workflow observation, preparation, receipt settlement, backoff and actual owner turns",
+    "live VM/CLI/Discord merge and delivery acceptance",
+    "72-hour fault soak and24-hour unattended live soak",
+    "five confirmed autonomous ships/day"
+  ],
+  "production_mutated": false
+}

@@ -214,13 +214,23 @@ pub(super) fn reconcile_runtime_retirements()->Result<usize> {
     reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
-    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){return Ok(0);}
     let rows=store.pending_native_retirements(now,16)?;
     let mut completed=0;
     for (workflow,generation,audit_path) in rows {
         let owner=augmentagent_channel_core::native_vm::RuntimeOwner{workflow_id:workflow.clone(),lease_generation:generation};
-        match augmentagent_channel_core::native_vm::retire_owned_runtimes(Path::new(&audit_path),&owner) {
-            Ok(_)=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+        let binding=match store.native_owner_binding(&workflow,generation) {
+            Ok(Some(binding))=>binding,
+            Ok(None)=>{warn!("native runtime retirement retained: original binding is missing");continue;},
+            Err(error)=>{warn!("native runtime retirement retained: original binding is unreadable: {error:#}");continue;},
+        };
+        let current=|| {
+            use augmentagent_channel_core::native_vm::ownership::TransferFenceError;
+            match store.native_retirement_is_current(&workflow,generation,&audit_path,&binding) {
+                Ok(true)=>Ok(()),Ok(false)=>Err(TransferFenceError::NotCurrent),Err(_)=>Err(TransferFenceError::Unavailable),
+            }
+        };
+        match augmentagent_channel_core::native_vm::retire_owned_runtimes(&binding,Path::new(&audit_path),&owner,&current) {
+            Ok(_)=>{store.complete_bound_native_retirement(&workflow,generation,&audit_path,&binding,now)?; completed+=1;}
             Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
         }
     }
@@ -698,8 +708,7 @@ impl WorkflowGuard {
         audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
-        store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
-        let guard = Self {
+        let mut guard = Self {
             audit,
             store: Arc::new(Mutex::new(store)),
             lease,
@@ -715,8 +724,14 @@ impl WorkflowGuard {
             capacity_exhausted: Arc::new(AtomicBool::new(false)),
             released: false,
         };
-        guard.install_model_accounting()?;
-        guard.audit_event("workflow_claimed", serde_json::json!({}))?;
+        let setup=guard.register_native_context()
+            .and_then(|_|guard.install_model_accounting())
+            .and_then(|_|guard.validate_before_side_effect())
+            .and_then(|_|guard.audit_event("workflow_claimed",serde_json::json!({})));
+        if let Err(error)=setup {
+            guard.release_unstarted_native_registration()?;
+            return Err(error);
+        }
         guard.spawn_renewal();
         let _ = start.repo_root; // Kept explicit: caller owns repository/worktree provenance validation.
         Ok(Some(guard))
@@ -773,6 +788,46 @@ impl WorkflowGuard {
     pub(super) fn audit_logger(&self) -> Arc<augmentagent_channel_core::AuditLogger> {
         self.audit.clone()
     }
+    /// No native transport can escape acquisition before this registration.
+    /// Missing selection leaves no unbound owner to strand later setup recovery.
+    fn register_native_context(&self)->Result<()> {
+        use augmentagent_channel_core::native_vm::ownership::{self,TransferFenceError,TransferReason};
+        if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none() {return Ok(());}
+        let current=|| {
+            if self.healthy_lease().is_err() || self.audit.protected_health().is_err() {
+                return Err(TransferFenceError::Unavailable);
+            }
+            let store=self.store.lock().map_err(|_|TransferFenceError::Unavailable)?;
+            match store.native_registration_current(&self.lease,&self.binding,millis()) {
+                Ok(true)=>Ok(()),Ok(false)=>Err(TransferFenceError::NotCurrent),Err(_)=>Err(TransferFenceError::Unavailable),
+            }
+        };
+        let (original,available)={
+            let store=self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?;
+            (store.native_owner_binding(self.id(),self.lease.generation)?,store.initial_native_owner_available(self.id())?)
+        };
+        let original=if let Some(original)=original {
+            ownership::validate_owner_binding(&original,&current)?;original
+        } else {
+            anyhow::ensure!(available,TransferReason::InventoryMissing);
+            ownership::with_initial_owner_binding(self.id(),&current,&mut |original| {
+                self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?
+                    .register_initial_native_owner(&self.lease,&self.binding,
+                        self.audit.path().to_str().context("native audit path is not UTF-8")?,original,millis())
+            })?
+        };
+        self.audit.set_native_store_binding(original)?;
+        current().map_err(anyhow::Error::new)
+    }
+
+    /// Acquisition has not returned and no provider/observer can have executed.
+    /// This narrowly releases a refused setup, never a running turn.
+    fn release_unstarted_native_registration(&mut self)->Result<()> {
+        let mut store=self.store.lock().map_err(|_|anyhow::anyhow!("native registration store poisoned"))?;
+        let now=millis();charge_elapsed(&mut store,&self.lease,self.started,&self.accounted_ms,now)?;
+        store.release(&self.lease,now)?;self.released=true;Ok(())
+    }
+
     fn install_model_accounting(&self) -> Result<()> {
         self.audit.require_run_resources()?;
         let dispatch_store=self.store.clone();let dispatch_lease=self.lease.clone();
@@ -781,6 +836,34 @@ impl WorkflowGuard {
             let binding=store.snapshot(&dispatch_lease.workflow)?.context("workflow missing")?.checkpoint.binding;
             store.validate_dispatch(&dispatch_lease,&binding,millis())
         }))?;
+        if self.audit.native_runtime_owner()?.is_some() {
+            let original=self.store.lock().map_err(|_|anyhow::anyhow!("native original binding store poisoned"))?
+                .native_owner_binding(&self.lease.workflow,self.lease.generation)?;
+            if let Some(original)=original {self.audit.set_native_store_binding(original)?;}
+            let journal_store=self.store.clone();let journal_lease=self.lease.clone();
+            // The logger owns its callback; a weak reference avoids retaining
+            // the logger/store after the guarded owner has gone away.
+            let journal_audit=Arc::downgrade(&self.audit);
+            self.audit.set_native_launch_observer(Arc::new(move |prepared| {
+                let audit=journal_audit.upgrade().context("native launch audit owner is gone")?;
+                let mut store=journal_store.lock().map_err(|_|anyhow::anyhow!("native launch journal lock poisoned"))?;
+                let binding=if let Ok(call)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
+                    anyhow::ensure!(call.workflow==journal_lease.workflow,"native launch used another workflow scope");call.binding
+                } else {store.snapshot(&journal_lease.workflow)?.context("native launch workflow missing")?.checkpoint.binding};
+                store.record_verified_native_launch(&journal_lease,&binding,&audit,prepared,millis())?;
+                Ok(())
+            }))?;
+            let observation_store=self.store.clone();let observation_lease=self.lease.clone();
+            let observation_audit=Arc::downgrade(&self.audit);
+            self.audit.set_native_observation_observer(Arc::new(move |fact| {
+                let audit=observation_audit.upgrade().context("native observation controller is gone")?;
+                let mut store=observation_store.lock().map_err(|_|anyhow::anyhow!("native observation store poisoned"))?;
+                let binding=if let Ok(call)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
+                    anyhow::ensure!(call.workflow==observation_lease.workflow,"native observation crossed workflow scope");call.binding
+                } else {store.snapshot(&observation_lease.workflow)?.context("native observation workflow missing")?.checkpoint.binding};
+                store.record_verified_native_observation(&observation_lease,&binding,&audit,fact,millis())?;Ok(())
+            }))?;
+        }
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
         let capacity_flag = self.capacity_exhausted.clone();
@@ -864,11 +947,16 @@ impl WorkflowGuard {
         audit.set_native_runtime_owner(augmentagent_channel_core::native_vm::RuntimeOwner {
             workflow_id: lease.workflow.clone(), lease_generation: lease.generation,
         })?;
-        store.register_native_owner(&lease,audit.path().to_str().context("native audit path is not UTF-8")?,now)?;
-        let guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
+        let mut guard = Self { audit,store:Arc::new(Mutex::new(store)),lease,repository:id.clone(),worktree:PathBuf::new(),contract:"observation-v1".into(),environment:"diagnostic".into(),binding,
             heartbeat:tokio_util::sync::CancellationToken::new(),lease_failure:Arc::new(Mutex::new(None)),started:std::time::Instant::now(),accounted_ms:Arc::new(AtomicU64::new(0)),capacity_exhausted:Arc::new(AtomicBool::new(false)),released:false };
-        guard.install_model_accounting()?;
-        guard.audit_event("observation_claimed",serde_json::json!({"key":key}))?;
+        let setup=guard.register_native_context()
+            .and_then(|_|guard.install_model_accounting())
+            .and_then(|_|guard.validate_before_side_effect())
+            .and_then(|_|guard.audit_event("observation_claimed",serde_json::json!({"key":key})));
+        if let Err(error)=setup {
+            guard.release_unstarted_native_registration()?;
+            return Err(error);
+        }
         guard.spawn_renewal();
         Ok(Some(guard))
     }
@@ -880,6 +968,14 @@ impl WorkflowGuard {
             "actor": "controller", "workflow": self.lease.workflow, "generation": self.lease.generation,
             "kind": kind, "binding": self.binding, "details": details, "at_ms": millis(),
         }))
+    }
+
+    pub(super) fn fresh_native_builder_sessions(&self) -> Result<Arc<augmentagent_channel_core::native_session::FreshBuilderSessions>> {
+        self.validate_before_side_effect()?;
+        self.audit.validate_native_store_binding()?;
+        let owner=self.audit.native_runtime_owner()?.context("workflow native owner missing")?;
+        anyhow::ensure!(owner.workflow_id==self.lease.workflow && owner.lease_generation==self.lease.generation,"workflow native owner changed");
+        augmentagent_channel_core::native_session::FreshBuilderSessions::for_workflow(owner)
     }
 
     pub(super) fn record_episode_sessions(
@@ -2711,6 +2807,142 @@ mod tests {
         assert_eq!(after.model_calls, before.model_calls);
         assert!(guard.validate_before_side_effect().is_err());
         std::fs::write(PathBuf::from(std::env::var_os(CHILD).unwrap()).join("executed"), "ok").unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_guard_initial_native_owner_registers_before_returning() {
+        const CHILD:&str="AUTOSHIP_INITIAL_GUARD_CHILD";
+        const MODE:&str="AUTOSHIP_INITIAL_GUARD_MODE";
+        if std::env::var_os(CHILD).is_none() {
+            for mode in ["fresh","missing-policy","unconfigured","legacy-owner","legacy-call","legacy-workflow","physical-prior-state","configuration-recovery"] {
+                let control=control_dir();let mut child=std::process::Command::new(std::env::current_exe().unwrap());
+                child.args(["--exact","self_improve::workflow::tests::workflow_guard_initial_native_owner_registers_before_returning","--nocapture","--test-threads=1"])
+                    .env(CHILD,control.path()).env(MODE,mode);
+                if matches!(mode,"unconfigured"|"configuration-recovery") {child.env_remove("AUGMENTAGENT_NATIVE_VM_POLICY");}
+                else {child.env("AUGMENTAGENT_NATIVE_VM_POLICY",control.path().join("policy.json"));}
+                assert!(child.status().unwrap().success(),"native registration guard fixture failed: {mode}");
+            }
+            return;
+        }
+        use std::os::unix::fs::{MetadataExt,PermissionsExt};
+        let control=PathBuf::from(std::env::var_os(CHILD).unwrap());let native=control.join("native");
+        std::fs::create_dir(&native).unwrap();std::fs::set_permissions(&native,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let info=native.metadata().unwrap();
+        let root_identity=format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(
+            &serde_json::json!({"device":info.dev(),"inode":info.ino()})).unwrap()));
+        // Explicit fresh-root provisioning intent; no provider, credentials or VM.
+        let bootstrap=native.join("authority-bootstrap.json");
+        std::fs::write(&bootstrap,serde_json::to_vec(&serde_json::json!({"version":1,"epoch":uuid::Uuid::new_v4().to_string(),"root_identity_sha256":root_identity})).unwrap()).unwrap();
+        std::fs::set_permissions(&bootstrap,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let policy=control.join("policy.json");
+        std::fs::write(&policy,serde_json::to_vec(&serde_json::json!({"version":1,"runtime_config":"/unused-runtime","guest_runtime":"/unused-guest",
+            "state_root":native,"memory_mb":1024,"max_state_bytes":8589934592u64,"max_sessions":16,"providers":{}})).unwrap()).unwrap();
+        std::fs::set_permissions(&policy,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let dir=repo();let state=control.join("workflow.db");let mode=std::env::var(MODE).unwrap();
+        let id=durable::workflow_id("owner/repo",77).unwrap();
+        if mode=="legacy-workflow" {
+            let binding=git_binding(dir.path(),"C1","test",&[]).await.unwrap();
+            // No live WorkflowStore connection exists while this fixture
+            // recreates a pre-feature row and generic registered event.
+            drop(WorkflowStore::open(&state).unwrap());
+            let db=augmentagent_store::rusqlite::Connection::open(&state).unwrap();
+            let checkpoint=Checkpoint {stage:Stage::Intake,binding,evidence:vec![],next:NextAction {reason:"legacy".into(),action:"scope".into(),eligible_at_ms:0}};
+            db.execute("INSERT INTO workflow(id,branch,checkpoint,heartbeat_at,progress_at) VALUES(?1,'fixture',?2,1,1)",augmentagent_store::rusqlite::params![id,serde_json::to_string(&checkpoint).unwrap()]).unwrap();
+            db.execute("INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,0,'registered','fixture',1)",[&id]).unwrap();
+        }
+        if matches!(mode.as_str(),"legacy-owner"|"legacy-call") {
+            let binding=git_binding(dir.path(),"C1","test",&[]).await.unwrap();let now=millis();
+            let mut store=WorkflowStore::open(&state).unwrap();store.register(&id,"fixture",binding,now).unwrap();
+            let lease=store.claim(&id,"legacy",now,LEASE_MS).unwrap().unwrap();
+            if mode=="legacy-owner" {store.register_native_owner(&lease,"/private/legacy-audit",now).unwrap();}
+            else {store.charge(&lease,"legacy-call",ResourceCharge {model_calls:1,..Default::default()},now).unwrap();}
+            store.release(&lease,millis()).unwrap();
+        }
+        if mode=="missing-policy" {std::fs::remove_file(&policy).unwrap();}
+        if mode=="physical-prior-state" {
+            let provider=native.join("codex");std::fs::create_dir(&provider).unwrap();
+            std::fs::set_permissions(&provider,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let session=provider.join("session-prior");std::fs::create_dir(&session).unwrap();
+            std::fs::set_permissions(&session,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let owned=session.join("owned.json");std::fs::write(&owned,serde_json::to_vec(&serde_json::json!({
+                "version":1,"audit_path":"/private/prior-audit","owner":{"workflow_id":id,"lease_generation":1}})).unwrap()).unwrap();
+            std::fs::set_permissions(&owned,std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let start=||Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
+            source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"};
+        let result=WorkflowGuard::acquire_at(&state,start(),millis()).await;
+        if matches!(mode.as_str(),"missing-policy"|"legacy-owner"|"legacy-call"|"legacy-workflow"|"physical-prior-state") {
+            assert!(result.is_err(),"registration should have refused: {mode}");
+            let mut store=WorkflowStore::open(&state).unwrap();let snapshot=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(snapshot.lease_until_ms,0,"unstarted admission retained its lease: {mode}");
+            assert_eq!(snapshot.model_calls,if mode=="legacy-call" {1} else {0});
+            assert!(store.native_owner_binding(&id,snapshot.generation).unwrap().is_none());
+            assert!(store.pending_native_retirements(millis(),16).unwrap().is_empty(),"refusal retired an older owner");
+            println!("native registration guard case passed: {mode}");return;
+        }
+        let mut guard=result.unwrap().unwrap();
+        if matches!(mode.as_str(),"unconfigured"|"configuration-recovery") {
+            assert!(guard.audit_logger().native_store_binding().unwrap().is_none());
+            assert!(guard.fresh_native_builder_sessions().is_err(),"builder scope accepted a missing original native store binding");
+            assert!(guard.store.lock().unwrap().initial_native_owner_available(guard.id()).unwrap(),"missing configuration created an unbound native owner");
+            guard.finish().unwrap();
+            if mode=="unconfigured" {println!("native registration guard case passed: {mode}");return;}
+            // This subprocess runs one test only; no process-global env race.
+            unsafe {std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY",&policy);}
+            guard=WorkflowGuard::acquire_at(&state,start(),millis()).await.unwrap().unwrap();
+        }
+        let saved=guard.store.lock().unwrap().native_owner_binding(guard.id(),guard.lease.generation).unwrap();
+        assert!(saved.is_some(),"fresh guard returned without its original native store binding");
+        assert_eq!(guard.audit_logger().native_store_binding().unwrap(),saved);
+        assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        guard.audit_logger().validate_native_store_binding().unwrap();
+        assert!(guard.fresh_native_builder_sessions().is_ok(),"bound builder scope was refused");
+        if mode=="fresh" {
+            let audit=guard.audit_logger();
+            let original=saved.clone().unwrap();
+            let intent=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:2,
+                original_store_binding_sha256:format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(original).unwrap()).unwrap())),
+                intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {
+                    workflow_id:guard.id().into(),lease_generation:guard.lease.generation},source_audit_path:audit.path().into(),
+                provider:"codex".into(),runtime_relative_path:"codex/session-unsubmitted".into(),
+                native_session_id:Some("requested-only".into()),launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64)};
+            let prepared=audit.native_launch_prepared(&intent).unwrap();
+            let fact=augmentagent_channel_core::native_vm::ownership::observe_native_uncertainty(&audit,&prepared,None).unwrap();
+            let rows=guard.store.lock().unwrap().native_observation_history(guard.id()).unwrap();
+            assert_eq!(rows.len(),1,"the actual guard did not consume native outcome observations");
+            assert!(rows[0].native_session_id.is_none(),"a requested ID became an actual provider observation");
+            assert_eq!(rows[0].certainty,crate::autoship_workflow::native_observation::Certainty::Uncertain);
+            assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
+            assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        }
+        guard.finish().unwrap();println!("native registration guard case passed: {mode}");
+    }
+    #[tokio::test]
+    async fn workflow_guard_installs_native_launch_journal_before_provider_binding() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
+            source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"},millis()).await.unwrap().unwrap();
+        assert!(guard.audit_logger().set_native_launch_observer(Arc::new(|_|Ok(()))).is_err(),
+            "guard returned without installing its native launch journal");
+        assert!(guard.store.lock().unwrap().native_owner_binding(guard.id(),guard.lease.generation).unwrap().is_none(),
+            "legacy owner must not be backfilled from current policy");
+        // Metadata fixture only: call the same protected preparation boundary
+        // as NativeVM, without inventing a real runtime or submitting a prompt.
+        let audit=guard.audit_logger();
+        let prepared=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:2,original_store_binding_sha256:"a".repeat(64),
+            intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {
+                workflow_id:guard.id().into(),lease_generation:guard.lease.generation},
+            source_audit_path:audit.path().into(),provider:"codex".into(),runtime_relative_path:"codex/session-fixture".into(),
+            native_session_id:None,launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64)};
+        let error=audit.native_launch_prepared(&prepared).unwrap_err();
+        assert!(error.to_string().contains("original") && error.to_string().contains("binding"),"{error:#}");
+        let mut store=guard.store.lock().unwrap();
+        assert!(store.native_launch_intents(guard.id()).unwrap().is_empty());
+        assert_eq!(store.snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        drop(store);
+        guard.validate_before_side_effect().unwrap();
+        let weak=Arc::downgrade(&audit);drop(audit);guard.finish().unwrap();
+        assert!(weak.upgrade().is_none(),"native launch callback retained the logger after the guard finished");
     }
 
     #[tokio::test]

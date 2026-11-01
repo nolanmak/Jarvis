@@ -362,7 +362,7 @@ impl CodexCliReasoner {
         // #1627 — a text turn reserves the text tier, not a builder's 4 GiB.
         let run_policy = crate::run_resources::declared_policy_for(crate::run_resources::run_kind_for(opts))?;
         let spawned = match &native_vm {
-            Some(vm) => crate::process_tree::spawn_admitted_vm(&vm.command, clean, opts.handoff_path.as_deref(), &vm.resource_policy),
+            Some(vm) => crate::process_tree::spawn_admitted_vm(vm, clean, opts.handoff_path.as_deref()),
             None => crate::process_tree::spawn_admitted_with_policy(&cmd, true, clean, opts.handoff_path.as_deref(), false, run_policy.as_ref()),
         };
         let (mut child, process_group) = spawned.map_err(|e| {
@@ -504,6 +504,7 @@ impl CodexCliReasoner {
         let status = child.wait().await?;
         let logger=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         let resources=process_group.resource_outcome(provider, logger.as_ref());
+        let native_resource=process_group.native_resource_receipt()?;
         drop(process_group);
         resources?;
         let stderr_buf = match stderr_task {
@@ -523,9 +524,11 @@ impl CodexCliReasoner {
             if crate::reasoner::is_rate_limited(&final_text) {
                 return Err(turn_error(provider, FailureClass::Quota, capability, final_text));
             }
+            if let Some(vm)=&native_vm {vm.record_completion(native_resource.as_ref())?;}
             if let Some(lease) = native_lease {
                 lease.finish()?;
             }
+            if let Some(vm)=&native_vm {vm.acknowledge_completion()?;}
             return Ok(final_text);
         }
 

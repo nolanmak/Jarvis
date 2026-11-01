@@ -120,6 +120,22 @@ def safe_relative(raw):
     return path
 
 
+def export_target(staging, raw):
+    relative = safe_relative(raw)
+    # mkdir(parents=True) applies mode only to the final directory. Create
+    # every component separately so service umasks cannot expose new parents.
+    parent = staging
+    for component in (None, *relative.parts[:-1]):
+        if component is not None:
+            parent = parent / component
+            parent.mkdir(mode=0o700, exist_ok=True)
+        info = parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077):
+            raise ValueError('invalid native export directory')
+    return staging / relative
+
+
 @contextlib.contextmanager
 def short_channel_endpoint():
     """Socket only: AF_UNIX names cannot inherit arbitrarily long state roots.
@@ -741,11 +757,10 @@ def main(spec_path):
                     if exported > MAX_HOME or str(relative) in received or len(received) >= 4096:
                         raise ValueError('native runtime export exceeds budget or duplicates file')
                     received.add(str(relative))
-                    target = staging / relative
                     export_directories.update(str(parent) for parent in relative.parents if str(parent) != '.')
                     if len(export_directories) > 2048:
                         raise ValueError('native runtime directory budget exceeded')
-                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    target = export_target(staging, str(relative))
                     stream = open(target, 'xb')
                     os.fchmod(stream.fileno(), 0o600)
                     active_export = [stream, size, 0]

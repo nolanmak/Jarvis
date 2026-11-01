@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1713,
+  "scope": "Private FULL-synchronous native handoff ledger and runtime-authority integration. No public transfer orchestration or workflow/Discord consumer is enabled.",
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "3bf67dea9daf345e4f3e4470a2d04c3fab83a33093b1a13db4a17a459f49a5d7"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "f21968232167b01ef808249a03a16c3f8e15aabe68ea9d55ad2434142a13ed46"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "41b970570b7fefe1fd83b6731d0460e118d766fe509920fd3706eb78548d6797"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "c9dffbb70f06b527a402375742fb63f786938fd1debf3d12bbc5180f0dbec565"
+    }
+  ],
+  "red": [
+    {
+      "commit": "1a5ce8a2",
+      "passed": 0,
+      "failed": 2,
+      "behaviors": [
+        "prepared request absent after connection reopen",
+        "completed transfer leaves original effective owner"
+      ],
+      "log_sha256": "418ff155f59d573242dd08ec98146f9e16b72a2732156055f6ec247de2f1771f"
+    },
+    {
+      "commit": "4a3f4fbc",
+      "passed": 8,
+      "failed": 3,
+      "behaviors": [
+        "normal fenced retirement leaves transfer prepared",
+        "new destination cannot resume transferred session",
+        "delayed source scope writes retirement marker during pending transfer"
+      ],
+      "log_sha256": "d6b09821d3138cae96d4a7492fced83e392347b6614bde2318f1987239208d40"
+    }
+  ],
+  "green": {
+    "native_suite_passed": 63,
+    "native_suite_ignored": 2,
+    "native_log_sha256": "da8a6908e2a748396337ed8f8f6c7d3982740f369483dd6176622ce04bf3b079",
+    "full_core_passed": 702,
+    "full_core_failed": 0,
+    "full_core_ignored": 14,
+    "full_core_log_sha256": "2b659eaf740fef0ab6cefbbfc9a0aff37555024056b2307b987d0898cb0b56f3",
+    "wrapper": "scripts/cargo-managed.sh",
+    "native_subset_scope": "Subset passed before final fail-closed marker error handling and formatting; full-core run covers the exact final source hashes."
+  },
+  "verified": [
+    "immutable request binding and typed historical receipt verification",
+    "exclusive durable owner/audit/anchor/runtime claims; disjoint workflow admission",
+    "prepared and committed records survive separate-process _exit without Rust or SQLite destructor",
+    "completed replay stays historical after a later transfer and cannot downgrade ownership",
+    "one SQLite transaction commits links, source closure, receipt and claim/reservation release",
+    "injected final write failure rolls back all ownership changes and preserves pending claims",
+    "128 MiB history budget accounts for all unresolved growth reservations, including after reopen",
+    "authorized retirement atomically aborts intersecting pending transfers and closes only requested owner",
+    "corrupt pending records refuse retirement before writing owner closure",
+    "remaining aborted source peers stay held for authorized reconciliation",
+    "resume and terminal retirement resolve immutable creation provenance through current ledger chain",
+    "scope retirement captures launch authority and preserves pending/transferred/aborted peers",
+    "late alias observation refuses during preparation and after ownership changes"
+  ],
+  "not_proved": [
+    "complete filesystem-scanned inventory/export manifest validation",
+    "current lease callback plus real protected-audit sealing orchestrated under all runtime locks",
+    "subprocess crash after each individual audit seal",
+    "typed S outcome projection and public transfer entry point",
+    "workflow preparation/settlement, observation history, owner-turn completion and Discord consumer",
+    "live current-build continuation, CLI/GitHub/Discord acceptance, soak or shipping throughput"
+  ],
+  "implemented_not_independently_exercised": [
+    "normal native allocation deducts pending growth while retaining existing free-space guard"
+  ]
+}

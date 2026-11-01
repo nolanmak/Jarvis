@@ -23,6 +23,26 @@ spec.loader.exec_module(vm)
 
 
 class NativeVmTests(unittest.TestCase):
+    def test_export_target_rejects_existing_public_or_symlink_parents(self):
+        for case in ('public-root', 'public-parent', 'symlink-parent'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                staging = root / 'generation'
+                staging.mkdir(mode=0o700)
+                if case == 'public-root':
+                    staging.chmod(0o775)
+                elif case == 'public-parent':
+                    (staging / 'nested').mkdir(mode=0o700)
+                    (staging / 'nested').chmod(0o775)
+                else:
+                    outside = root / 'outside'
+                    outside.mkdir(mode=0o700)
+                    (staging / 'nested').symlink_to(outside, target_is_directory=True)
+                before = {path: path.lstat().st_mode for path in root.rglob('*')}
+                with self.assertRaises(ValueError):
+                    vm.export_target(staging, 'nested/file')
+                self.assertEqual(before, {path: path.lstat().st_mode for path in root.rglob('*')})
+
     def wait_file(self, path, process):
         deadline = time.monotonic() + 5
         while not path.exists():

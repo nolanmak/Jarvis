@@ -558,7 +558,7 @@ async fn execute(
                 previous = None;
                 if native_sessions.is_none() {
                     native_sessions = Some(
-                        augmentagent_channel_core::native_session::FreshBuilderSessions::new(),
+                        guard.fresh_native_builder_sessions()?,
                     );
                 }
                 Some(session)
