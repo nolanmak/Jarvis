@@ -237,18 +237,9 @@ fn proof(record: &Record) -> Result<serde_json::Value> {
         "CI cleanup host identity changed"
     );
     record.supervisor.unchanged()?;
-    let observed = receipt(&record.supervisor, "resource-accounting.json")
+    let original = receipt(&record.supervisor, "resource-admitted.json")
         .and_then(|bytes| Ok(serde_json::from_slice::<serde_json::Value>(&bytes)?));
-    if record.resource.is_none()
-        && observed
-            .as_ref()
-            .ok()
-            .and_then(|value| value.get("identity"))
-            .is_none()
-    {
-        // No CI adapter can run before launch-continue. A private complete
-        // supervisor receipt plus the absent immutable release token proves
-        // that a refused resource admission never used source or build data.
+    if record.resource.is_none() && original.is_err() {
         let released = record.supervisor.path.join("launch-continue");
         anyhow::ensure!(
             matches!(std::fs::symlink_metadata(&released),Err(ref e) if e.kind()==std::io::ErrorKind::NotFound),
@@ -264,19 +255,27 @@ fn proof(record: &Record) -> Result<serde_json::Value> {
             serde_json::json!({"verified_state":"never_admitted_supervisor_reaped","shipping_authority":false}),
         );
     }
-    let observation = observed?;
-    let identity = match &record.resource {
-        Some(identity) => {
-            anyhow::ensure!(
-                observation.get("identity") == Some(identity),
-                "CI completion substituted another resource scope"
-            );
-            identity
+    let original = original?;
+    if let Some(saved) = &record.resource {
+        anyhow::ensure!(
+            *saved == original,
+            "CI original admission and storage ownership disagree"
+        );
+    }
+    // Completion determines CI success elsewhere. Its absence or torn tail
+    // cannot erase independently persisted admission plus live kernel proof.
+    // A well-formed contradictory identity still requires named recovery.
+    if let Ok(bytes) = receipt(&record.supervisor, "resource-accounting.json") {
+        if let Ok(completed) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(identity) = completed.get("identity") {
+                anyhow::ensure!(
+                    *identity == original,
+                    "CI completion substituted another resource scope"
+                );
+            }
         }
-        None => observation
-            .get("identity")
-            .context("CI resource identity unavailable; retain cleanup hold")?,
-    };
+    }
+    let identity = &original;
     anyhow::ensure!(
         identity.is_object(),
         "CI cleanup resource identity unavailable"
@@ -417,9 +416,22 @@ impl Hold {
     }
     #[cfg(test)]
     pub(crate) fn bind_fixture_identity(&mut self, identity: &serde_json::Value) -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.supervisor().join("resource-admitted.json"))?;
+        file.write_all(&serde_json::to_vec(identity)?)?;
+        file.sync_all()?;
         self.bind_identity(identity)
     }
     fn bind_identity(&mut self, identity: &serde_json::Value) -> Result<()> {
+        let original: serde_json::Value =
+            serde_json::from_slice(&receipt(&self.record.supervisor, "resource-admitted.json")?)?;
+        anyhow::ensure!(
+            original == *identity,
+            "CI admission capability belongs to another supervisor"
+        );
         anyhow::ensure!(
             self.active
                 && self.record.phase == Phase::Prepared
@@ -541,7 +553,7 @@ mod tests {
                 let current = Owner::current().unwrap();
                 let identity = serde_json::json!({"host_sha256":current.host,"boot_id":current.boot,
                     "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
-                hold.bind_identity(&identity).unwrap();
+                hold.bind_fixture_identity(&identity).unwrap();
                 private_receipt(
                     &hold.supervisor().join("resource-accounting.json"),
                     &serde_json::json!({"phase":"completed","identity":identity}),
@@ -606,7 +618,7 @@ mod tests {
             let current = Owner::current().unwrap();
             let identity = serde_json::json!({"host_sha256":current.host,"boot_id":current.boot,
                 "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
-            hold.bind_identity(&identity).unwrap();
+            hold.bind_fixture_identity(&identity).unwrap();
             let receipt_path = hold.supervisor().join("resource-accounting.json");
             private_receipt(
                 &receipt_path,
@@ -627,13 +639,35 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     #[test]
+    fn lost_completion_uses_original_admission_and_kernel_for_cleanup_only() {
+        for tail in [None, Some(b"{torn".as_slice())] {
+            fixture(|root, _| {
+                let mut hold = Hold::begin(root, root, root, root, &"a".repeat(64)).unwrap();
+                let current = Owner::current().unwrap();
+                let identity = serde_json::json!({"host_sha256":current.host,"boot_id":current.boot,
+                    "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
+                hold.bind_fixture_identity(&identity).unwrap();
+                if let Some(tail) = tail {
+                    let path = hold.supervisor().join("resource-accounting.json");
+                    std::fs::write(&path, tail).unwrap();
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                assert_eq!(
+                    hold.settle().unwrap()["verified_state"],
+                    "removed_empty_subtree"
+                );
+                assert!(may_cleanup(root).unwrap());
+            });
+        }
+    }
+    #[test]
     fn contradictory_owner_boot_cannot_synthesize_reboot_proof() {
         fixture(|root, _| {
             let mut hold = Hold::begin(root, root, root, root, &"a".repeat(64)).unwrap();
             let current = Owner::current().unwrap();
             let identity = serde_json::json!({"host_sha256":current.host,"boot_id":current.boot,
                 "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
-            hold.bind_identity(&identity).unwrap();
+            hold.bind_fixture_identity(&identity).unwrap();
             private_receipt(
                 &hold.supervisor().join("resource-accounting.json"),
                 &serde_json::json!({"phase":"completed","identity":identity}),
@@ -667,7 +701,7 @@ mod tests {
             let current = Owner::current().unwrap();
             let identity = serde_json::json!({"host_sha256":current.host,"boot_id":current.boot,
                 "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
-            hold.bind_identity(&identity).unwrap();
+            hold.bind_fixture_identity(&identity).unwrap();
             let mut substituted = identity.clone();
             substituted["path"] =
                 format!("/sys/fs/cgroup/run-{}", uuid::Uuid::new_v4().simple()).into();

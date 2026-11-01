@@ -83,6 +83,13 @@ impl ProcessGroup {
             }
             resource_identity=Some(observation["identity"].clone());
         }
+        if let Some(identity)=&resource_identity {
+            let parent=self.receipt.parent().ok_or_else(||anyhow::anyhow!("resource admission directory missing"))?;
+            let mut original=tempfile::NamedTempFile::new_in(parent)?;
+            original.write_all(&serde_json::to_vec(identity)?)?;original.as_file().sync_all()?;
+            original.persist_noclobber(parent.join("resource-admitted.json")).map_err(|error|error.error)?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         *self.resource_admission.lock().map_err(|_|anyhow::anyhow!("resource admission lock poisoned"))?=resource_identity.clone();
         if let Some(observer)=observer {
             observer(resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("observed command requires a correlated resource scope"))?)?;
