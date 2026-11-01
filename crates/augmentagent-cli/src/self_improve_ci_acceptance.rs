@@ -30,6 +30,7 @@ async fn live_shared_ci_rust_build_diagnostic() -> Result<()> {
     let check=plan.checks.iter().find(|check|check.id==r#"platform/platform/3 @{"os":"ubuntu-latest"}"#).context("normal Rust CLI build check missing")?;
     ensure!(check.status=="ready","normal Rust CLI build check is not ready: {}",check.reason);
     let mut onnx_cache_probe=None;
+    let mut onnx_probe_error=None;
     if std::env::var("AUTOSHIP_CI_ACCEPTANCE_ORT_CACHE_PROBE").as_deref()==Ok("1") {
         let command=r#"python3 -c 'import json,os; from pathlib import Path
 cache=Path(os.environ["ORT_CACHE_DIR"])
@@ -40,24 +41,42 @@ try:
 except OSError: pass
 print(json.dumps({"cache":str(cache),"library_bytes":library.stat().st_size,"writable":writable,"interfaces":sorted(p.name for p in Path("/sys/class/net").iterdir()),"home":os.environ["HOME"]}))'"#;
         let probe=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some(command),
-            &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
-        ensure!(probe.status=="passed","ONNX cache guest probe failed");
-        let observed:serde_json::Value=serde_json::from_str(probe.stdout.trim())?;
-        ensure!(observed["cache"]=="/ort-cache" && observed["writable"]==false
-            && observed["interfaces"]==serde_json::json!(["lo"]) && observed["home"]=="/home/worker"
-            && observed["library_bytes"].as_u64().is_some_and(|bytes|bytes>0),"ONNX cache exposure mismatch");
-        onnx_cache_probe=Some(observed);
+            &storage,&target,&audit,std::time::Duration::from_secs(180)).await;
+        let mut diagnostic=match &probe {
+            Ok(outcome)=>serde_json::json!({"status":outcome.status,"stdout":outcome.stdout,"stderr":outcome.stderr}),
+            Err(error)=>serde_json::json!({"status":"unavailable","error":format!("{error:#}")}),
+        };
+        let evaluated:Result<serde_json::Value>=(|| {
+            let probe=probe?;ensure!(probe.status=="passed","ONNX cache guest probe failed");
+            let observed:serde_json::Value=serde_json::from_str(probe.stdout.trim())?;
+            ensure!(observed["cache"]=="/ort-cache" && observed["writable"]==false
+                && observed["interfaces"]==serde_json::json!(["lo"]) && observed["home"]=="/home/worker"
+                && observed["library_bytes"].as_u64().is_some_and(|bytes|bytes>0),"ONNX cache exposure mismatch");
+            Ok(observed)
+        })();
+        match evaluated {
+            Ok(observed)=>onnx_cache_probe=Some(observed),
+            Err(error)=>{
+                diagnostic["error"]=format!("{error:#}").into();
+                onnx_cache_probe=Some(diagnostic);onnx_probe_error=Some(error);
+            },
+        }
     }
-    drop(source);let source=snapshot(&root,&before,&target).await?;
-    let observed=session.run("step",source.path(),&root,&before,Some(check),&[],&[],&[],None,
-        &storage,&target,&audit,check.remaining(std::time::Duration::ZERO)?).await;
+    // An optional probe failure still reaches the private receipt writer. Do
+    // not start a Rust build after failed confinement/dependency observation.
+    let rust_build_attempted=onnx_probe_error.is_none();
+    let observed=if let Some(error)=onnx_probe_error {Err(error)} else {async {
+        drop(source);let source=snapshot(&root,&before,&target).await?;
+        session.run("step",source.path(),&root,&before,Some(check),&[],&[],&[],None,
+            &storage,&target,&audit,check.remaining(std::time::Duration::ZERO)?).await
+    }.await};
     let (status,stdout,stderr,error)=match observed {
         Ok(outcome)=>(outcome.status,outcome.stdout,outcome.stderr,None),
         Err(error)=>("unavailable".into(),String::new(),String::new(),Some(format!("{error:#}"))),
     };
     let receipt=serde_json::json!({"version":1,"kind":"real-shared-ci-rust-build-diagnostic","binding":before,
         "adapter_authority":session.authority_sha256,"check":check.id,"status":status,
-        "stdout":stdout,"stderr":stderr,"error":error,"additional_model_calls":0,"onnx_cache_probe":onnx_cache_probe,
+        "stdout":stdout,"stderr":stderr,"error":error,"additional_model_calls":0,"onnx_cache_probe":onnx_cache_probe,"rust_build_attempted":rust_build_attempted,
         "diagnostic_selection_only":true,"full_ci_pass":false,"shipping_authority":false});
     let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
         .custom_flags(libc::O_NOFOLLOW).open(evidence.join("receipt.json"))?;
