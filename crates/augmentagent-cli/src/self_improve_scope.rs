@@ -250,15 +250,34 @@ async fn run_inner(root:&Path,repository:&str,workflow:&workflow::WorkflowGuard,
 pub(super) struct CompletedInvalid(pub String);
 impl std::fmt::Display for CompletedInvalid {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"independent scope exhausted bounded completed-response retries: {}",self.0)}}
 impl std::error::Error for CompletedInvalid {}
+fn cached_completed_generation<T>(read:impl Fn(bool,u32)->Result<Option<String>>,validate:impl Fn(&str)->Result<T>)->Result<Option<T>> {
+    for correction in [false,true] {
+        for attempt in 0..2 {
+            if let Some(raw)=read(correction,attempt)? {
+                if let Ok(valid)=validate(&raw) {return Ok(Some(valid));}
+            }
+        }
+    }
+    Ok(None)
+}
+fn response_key(purpose:&str,epoch:&str,contract:&str,correction:bool,attempt:u32)->String {
+    let original=serde_json::to_string(&(purpose,epoch,contract,attempt)).unwrap();
+    if correction {amendment::digest(serde_json::to_string(&("completed-contract-correction-v1",original)).unwrap().as_bytes())}
+    else {amendment::digest(original.as_bytes())}
+}
+/// Read completed historical replies only, through the current workflow fence.
+/// The caller must validate them against the full current requirements. This
+/// cannot generate another response or rewrite any previous response slot.
+pub(super) fn cached_persistent<T>(workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,validate:impl Fn(&str)->Result<T>)->Result<Option<T>> {
+    cached_completed_generation(|correction,attempt|workflow.scope_stage_response(&response_key(purpose,epoch,&workflow.binding().contract,correction,attempt)),validate)
+}
 /// Persist completed model output before parsing/side effects. Provider or
 /// infrastructure errors do not consume the bounded *completed-response*
 /// strategy slots; actual model admissions remain fully charged by the audit
 /// observer. A crash after response persistence resumes without another call.
 pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,prompt:&str,contract:bool,validate:impl Fn(&str)->Result<T>)->Result<T> {
     let key=|correction,attempt| {
-        let original=serde_json::to_string(&(purpose,epoch,&workflow.binding().contract,attempt)).unwrap();
-        if correction {amendment::digest(serde_json::to_string(&("completed-contract-correction-v1",original)).unwrap().as_bytes())}
-        else {amendment::digest(original.as_bytes())}
+        response_key(purpose,epoch,&workflow.binding().contract,correction,attempt)
     };
     let generate=|request:String|async move {workflow.check_resource_policy()?;let raw=run_inner(root,workflow.repository(),workflow,&request,contract).await?;workflow.audit_health().await?;Ok(raw)};
     if contract {
@@ -313,6 +332,23 @@ where R:Fn(bool,u32)->Result<Option<String>>,W:Fn(bool,u32,&str)->Result<()>,G:F
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_completed_contract_revalidates_all_slots_without_generation() {
+        let visited=std::sync::Mutex::new(Vec::new());
+        let found=cached_completed_generation(|correction,attempt| {
+            visited.lock().unwrap().push((correction,attempt));
+            Ok(Some(if correction && attempt==0 {"full original requirement"}else{"invalid or clipped requirement"}.to_owned()))
+        },|raw| {ensure!(raw=="full original requirement","owner requirement mismatch");Ok(raw.to_owned())}).unwrap();
+        assert_eq!(found.as_deref(),Some("full original requirement"));
+        assert_eq!(*visited.lock().unwrap(),vec![(false,0),(false,1),(true,0)]);
+    }
+    #[test]
+    fn cached_completed_contract_propagates_missing_authority_and_never_accepts_invalid_data() {
+        let absent=cached_completed_generation(|_,_|Ok(Some("invalid".to_owned())),|_|->Result<()> {anyhow::bail!("full criteria missing")}).unwrap();
+        assert_eq!(absent,None);
+        let failed=cached_completed_generation(|_,_|anyhow::bail!("protected cache unavailable"),|_|->Result<()> {panic!("unreadable cache cannot authorize a contract")});
+        assert!(failed.is_err());
+    }
     #[test]
     fn indexed_source_table_excludes_credentials_without_excluding_ordinary_configs() {
         for path in [".npmrc","nested/.netrc",".git-credentials","keys/id_rsa","keys/id_dsa","keys/id_ecdsa","keys/id_ed25519","keys/deployment.pem","keys/deployment.key",".NPMRC","keys/DEPLOYMENT.PEM"] {
