@@ -344,6 +344,9 @@ impl Launch {
         bridge: Option<&crate::codex_tools::BridgeLaunch>, native: Option<&crate::native_session::Launch>) -> Result<Self> {
         let owner_logger=opts.audit_logger.as_ref().context("native runtime owner audit unavailable")?;
         let audit_owner=owner_logger.native_runtime_owner()?.context("native runtime fenced owner unavailable")?;
+        if let Some(expected)=crate::native_session::current_builder_owner() {
+            ensure!(audit_owner==expected,"native builder scope owner mismatch");
+        }
         let policy_path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY")
             .context("required native VM policy unavailable")?;
         let policy: Policy = serde_json::from_slice(&private(Path::new(&policy_path))?)?;

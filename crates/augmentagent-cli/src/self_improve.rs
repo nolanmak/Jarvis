@@ -7262,7 +7262,7 @@ async fn resume_draft_pr(
             kind,
             "resume: revising against findings"
         );
-        if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+        if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(workflow.fresh_native_builder_sessions()?); }
         let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
         let (repair_opts,repair_prompt) = match episode_session {
             Some(session) => (session.opts,session.prompt),
@@ -8579,7 +8579,7 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             };
             info!(issue = issue.number, round, max_rounds, ?source, "revising against the findings");
             let snapshot = snapshot_tree(&worktree).await?;
-            if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(augmentagent_channel_core::native_session::FreshBuilderSessions::new()); }
+            if episode_session.is_some() && episode_native_sessions.is_none() { episode_native_sessions = Some(workflow_guard.fresh_native_builder_sessions()?); }
             let episode_dispatch = episode_session.as_ref().map(|s|(s.epoch.clone(),s.action.clone()));
             let (repair_opts,repair_prompt) = match episode_session {
                 Some(session) => (session.opts,session.prompt),

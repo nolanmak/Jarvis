@@ -876,6 +876,13 @@ impl WorkflowGuard {
         }))
     }
 
+    pub(super) fn fresh_native_builder_sessions(&self) -> Result<Arc<augmentagent_channel_core::native_session::FreshBuilderSessions>> {
+        self.validate_before_side_effect()?;
+        let owner=self.audit.native_runtime_owner()?.context("workflow native owner missing")?;
+        anyhow::ensure!(owner.workflow_id==self.lease.workflow && owner.lease_generation==self.lease.generation,"workflow native owner changed");
+        augmentagent_channel_core::native_session::FreshBuilderSessions::for_workflow(owner)
+    }
+
     pub(super) fn record_episode_sessions(
         &self,
         sessions: &augmentagent_channel_core::native_session::FreshBuilderSessions,

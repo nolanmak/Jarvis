@@ -62,7 +62,7 @@ impl FreshBuilderSessions {
     /// owns retirement of these builder conversations.
     pub fn for_workflow(owner: crate::native_vm::RuntimeOwner) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(!owner.workflow_id.is_empty() && owner.lease_generation > 0, "invalid workflow builder owner");
-        Ok(Self::new())
+        Ok(Arc::new(Self { sessions:Mutex::new(Vec::new()), retain_runtime:true, workflow_owner:Some(owner) }))
     }
     pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
         FRESH_BUILDERS.scope(Arc::clone(self), call).await
@@ -518,6 +518,29 @@ mod builder_restore_tests {
         for (workflow,generation) in [("",1),("fixture",0),("fixture",-1)] {
             assert!(FreshBuilderSessions::for_workflow(crate::native_vm::RuntimeOwner {workflow_id:workflow.into(),lease_generation:generation}).is_err());
         }
+    }
+    #[tokio::test]
+    async fn workflow_builder_cannot_prepare_a_foreign_audit_owner() {
+        const CHILD:&str="JARVIS_TEST_BUILDER_OWNER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let child=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","native_session::builder_restore_tests::workflow_builder_cannot_prepare_a_foreign_audit_owner","--test-threads=1"])
+                .env(CHILD,"1").env_remove("AUGMENTAGENT_NATIVE_VM_POLICY").output().unwrap();
+            assert!(child.status.success(),"owner mismatch was not fenced before policy selection: {} {}",String::from_utf8_lossy(&child.stdout),String::from_utf8_lossy(&child.stderr));
+            return;
+        }
+        let root=tempfile::tempdir().unwrap();
+        for name in ["logs","anchors"] {std::fs::create_dir(root.path().join(name)).unwrap();}
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(root.path().join("logs/model.jsonl"),root.path().join("anchors/model.json"),&[]).unwrap());
+        logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"other-workflow".into(),lease_generation:1}).unwrap();
+        let mut opts=crate::reasoner::triage_opts(None);
+        opts.audit_logger=Some(logger);
+        let sessions=FreshBuilderSessions::for_workflow(crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}).unwrap();
+        sessions.scope(async {
+            let command=tokio::process::Command::new("/usr/bin/false");
+            let error=crate::native_vm::Launch::prepare("codex",&opts,&command,None,None).err().expect("foreign audit owner was accepted");
+            assert!(error.to_string().contains("native builder scope owner mismatch"),"wrong owner reached native preparation: {error:#}");
+        }).await;
     }
     #[tokio::test]
     async fn scoped_builders_still_retire_their_completed_runtime() {
