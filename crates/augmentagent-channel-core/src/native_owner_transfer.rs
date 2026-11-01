@@ -133,6 +133,66 @@ fn hash_value(value:&Value)->Result<String> {
     Ok(format!("{:x}",Sha256::digest(canonical_bytes(value)?)))
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceClosure {
+    pub owner:super::RuntimeOwner,
+    pub audit_path:String,
+    pub closed:bool,
+}
+#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealReference {pub audit_path:String,pub seal_sha256:String}
+#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMapping {
+    pub provider:String,
+    pub native_session_sha256:String,
+    pub runtime_relative_path:String,
+    pub creation_receipt_sha256:String,
+    pub completion_sha256:String,
+    pub export_manifest_sha256:String,
+    pub effective_owner:super::RuntimeOwner,
+    pub effective_audit_path:String,
+    pub transfer_id:String,
+}
+#[derive(Debug,Clone,PartialEq,Eq,serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferReceipt {
+    pub version:u32,
+    pub transfer_id:String,
+    pub request_sha256:String,
+    pub source_inventory_sha256:String,
+    pub source_closures:Vec<SourceClosure>,
+    pub source_seals:Vec<SealReference>,
+    pub destination:Authority,
+    pub mappings:Vec<RuntimeMapping>,
+    pub receipt_sha256:String,
+}
+impl TransferReceipt {
+    pub(crate) fn for_request(request:&TransferRequest,seals:Vec<SealReference>)->Result<Self> {
+        use sha2::{Digest,Sha256};
+        request.validate()?;
+        let mut paths:Vec<_>=request.source_owners.iter().map(|source|source.audit_path.clone()).collect();
+        paths.sort_by(|a,b|a.as_bytes().cmp(b.as_bytes()));paths.dedup();
+        ensure!(seals.iter().map(|seal|&seal.audit_path).eq(paths.iter()),"native-transfer-audit-corrupt");
+        ensure!(seals.iter().all(|seal|seal.seal_sha256.len()==64 && seal.seal_sha256.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),"native-transfer-audit-corrupt");
+        let mut receipt=Self{version:1,transfer_id:request.transfer_id.clone(),request_sha256:request.request_digest()?,
+            source_inventory_sha256:request.inventory_digest()?,destination:request.destination.clone(),
+            source_closures:request.source_owners.iter().map(|source|SourceClosure{owner:source.owner.clone(),audit_path:source.audit_path.clone(),closed:true}).collect(),
+            source_seals:seals,mappings:request.inventory.iter().map(|row|RuntimeMapping{provider:row.provider.clone(),
+                native_session_sha256:format!("{:x}",Sha256::digest(row.native_session_id.as_bytes())),runtime_relative_path:row.runtime_relative_path.clone(),
+                creation_receipt_sha256:row.creation_receipt_sha256.clone(),completion_sha256:row.completion_sha256.clone(),export_manifest_sha256:row.export_manifest_sha256.clone(),
+                effective_owner:request.destination.owner.clone(),effective_audit_path:request.destination.audit_path.clone(),transfer_id:request.transfer_id.clone()}).collect(),receipt_sha256:String::new()};
+        let mut value=serde_json::to_value(&receipt)?;value.as_object_mut().expect("receipt object").remove("receipt_sha256");
+        receipt.receipt_sha256=hash_value(&value)?;Ok(receipt)
+    }
+    /// Historical receipt binding only; dispatch additionally needs current ledger authority.
+    pub fn verify(&self,request:&TransferRequest)->Result<()> {
+        ensure!(*self==Self::for_request(request,self.source_seals.clone())?,"native-transfer-prepared-corrupt");Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
