@@ -67,9 +67,11 @@ impl FreshBuilderSessions {
     pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
         FRESH_BUILDERS.scope(Arc::clone(self), call).await
     }
-    /// Restored workflow conversations outlive this controller scope. Their
-    /// native owner/audit fences still apply, and workflow retirement owns GC.
-    pub fn from_observed(observed:&[ObservedConversation])->anyhow::Result<Arc<Self>> {
+    /// Restored workflow conversations retain their durable workflow owner,
+    /// including when no provider conversation has been observed yet. Native
+    /// preparation still checks that owner against the current audit fence.
+    pub fn from_observed(owner:crate::native_vm::RuntimeOwner,observed:&[ObservedConversation])->anyhow::Result<Arc<Self>> {
+        let builders=Self::for_workflow(owner)?;
         let mut restored:Vec<Arc<NativeSession>>=Vec::new();
         for observation in observed {
             anyhow::ensure!(!observation.uncertain,"uncertain builder conversation requires reconciliation");
@@ -77,7 +79,8 @@ impl FreshBuilderSessions {
             anyhow::ensure!(!restored.iter().any(|s|s.provider()==observation.provider),"duplicate builder provider conversation");
             restored.push(NativeSession::from_id(observation.provider,Some(observation.id.clone()))?);
         }
-        Ok(Arc::new(Self {sessions:Mutex::new(restored),retain_runtime:true,workflow_owner:None}))
+        *builders.sessions.lock().expect("builder sessions mutex poisoned")=restored;
+        Ok(builders)
     }
     pub fn observed(&self) -> Vec<ObservedConversation> {
         self.sessions.lock().expect("builder sessions mutex poisoned").iter().filter_map(|session| {
@@ -424,6 +427,9 @@ mod lease_drop_tests {
 #[cfg(test)]
 mod builder_restore_tests {
     use super::*;
+    fn fixture_owner()->crate::native_vm::RuntimeOwner {
+        crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}
+    }
     fn runtime_fixture(root:&std::path::Path,name:&str)->std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(root,std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -450,11 +456,11 @@ mod builder_restore_tests {
             for existing in [false,true] {
                 let root=tempfile::tempdir().unwrap();let runtime=runtime_fixture(root.path(),"session-owner");
                 let recorded=if existing {vec![ObservedConversation {provider,id:"previous-native-session".into(),uncertain:false}]} else {vec![]};
-                let sessions=FreshBuilderSessions::from_observed(&recorded).unwrap();
+                let sessions=FreshBuilderSessions::from_observed(fixture_owner(),&recorded).unwrap();
                 let id=sessions.scope(async {finish_native_turn(provider,&runtime)}).await;
                 let observed=sessions.observed();assert_eq!(observed.len(),1);drop(sessions);
                 assert!(!runtime.join("retired.json").exists(),"saved native conversation was retired when its controller exited: {provider:?}, existing={existing}");
-                let restored=FreshBuilderSessions::from_observed(&observed).unwrap();
+                let restored=FreshBuilderSessions::from_observed(fixture_owner(),&observed).unwrap();
                 let resumed=restored.scope(async {
                     let session=current_for(provider).unwrap().unwrap();
                     assert_eq!(session.begin(provider).unwrap().launch(),Launch::Resume {id:id.clone()});
@@ -476,7 +482,7 @@ mod builder_restore_tests {
             assert_eq!(observed.len(),1);
             drop(sessions);
             assert!(!runtime.join("retired.json").exists(),"first builder conversation retired before workflow handoff: {provider:?}");
-            let restored=FreshBuilderSessions::from_observed(&observed).unwrap();
+            let restored=FreshBuilderSessions::from_observed(fixture_owner(),&observed).unwrap();
             restored.scope(async {
                 let session=current_for(provider).unwrap().unwrap();
                 assert_eq!(session.begin(provider).unwrap().launch(),Launch::Resume {id});
@@ -516,7 +522,9 @@ mod builder_restore_tests {
     #[test]
     fn workflow_builder_owner_must_be_a_real_workflow_generation() {
         for (workflow,generation) in [("",1),("fixture",0),("fixture",-1)] {
-            assert!(FreshBuilderSessions::for_workflow(crate::native_vm::RuntimeOwner {workflow_id:workflow.into(),lease_generation:generation}).is_err());
+            let owner=crate::native_vm::RuntimeOwner {workflow_id:workflow.into(),lease_generation:generation};
+            assert!(FreshBuilderSessions::for_workflow(owner.clone()).is_err());
+            assert!(FreshBuilderSessions::from_observed(owner,&[]).is_err());
         }
     }
     #[tokio::test]
@@ -535,12 +543,14 @@ mod builder_restore_tests {
         logger.set_native_runtime_owner(crate::native_vm::RuntimeOwner {workflow_id:"other-workflow".into(),lease_generation:1}).unwrap();
         let mut opts=crate::reasoner::triage_opts(None);
         opts.audit_logger=Some(logger);
-        let sessions=FreshBuilderSessions::for_workflow(crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1}).unwrap();
-        sessions.scope(async {
-            let command=tokio::process::Command::new("/usr/bin/false");
-            let error=crate::native_vm::Launch::prepare("codex",&opts,&command,None,None).err().expect("foreign audit owner was accepted");
-            assert!(error.to_string().contains("native builder scope owner mismatch"),"wrong owner reached native preparation: {error:#}");
-        }).await;
+        let owner=crate::native_vm::RuntimeOwner {workflow_id:"fixture".into(),lease_generation:1};
+        for sessions in [FreshBuilderSessions::for_workflow(owner).unwrap(),FreshBuilderSessions::from_observed(fixture_owner(),&[]).unwrap()] {
+            sessions.scope(async {
+                let command=tokio::process::Command::new("/usr/bin/false");
+                let error=crate::native_vm::Launch::prepare("codex",&opts,&command,None,None).err().expect("foreign audit owner was accepted");
+                assert!(error.to_string().contains("native builder scope owner mismatch"),"wrong owner reached native preparation: {error:#}");
+            }).await;
+        }
     }
     #[tokio::test]
     async fn scoped_builders_still_retire_their_completed_runtime() {
@@ -552,7 +562,7 @@ mod builder_restore_tests {
     #[tokio::test]
     async fn independent_reviews_retire_even_inside_a_restored_builder() {
         let root=tempfile::tempdir().unwrap();let runtime=runtime_fixture(root.path(),"session-reviewer");
-        let sessions=FreshBuilderSessions::from_observed(&[]).unwrap();
+        let sessions=FreshBuilderSessions::from_observed(fixture_owner(),&[]).unwrap();
         sessions.scope(async {
             fresh_review_scope(ProviderKind::Claude,async {
                 finish_native_turn(ProviderKind::Claude,&runtime);Ok(())
@@ -564,7 +574,7 @@ mod builder_restore_tests {
     async fn restored_builder_sessions_resume_their_provider_and_independent_review_stays_fresh() {
         for provider in [ProviderKind::Codex,ProviderKind::Claude] {
             let recorded=ObservedConversation {provider,id:format!("recorded-{}",provider.name()),uncertain:false};
-            let sessions=FreshBuilderSessions::from_observed(&[recorded.clone()]).expect("persisted native conversations cannot be restored");
+            let sessions=FreshBuilderSessions::from_observed(fixture_owner(),&[recorded.clone()]).expect("persisted native conversations cannot be restored");
             sessions.scope(async {
                 let session=current_for(provider).unwrap().unwrap();let mut lease=session.begin(provider).unwrap();
                 assert_eq!(lease.launch(),Launch::Resume {id:recorded.id.clone()});lease.observe(&recorded.id).unwrap();lease.finish().unwrap();
@@ -578,9 +588,9 @@ mod builder_restore_tests {
     #[test]
     fn uncertain_duplicate_and_invalid_restorations_are_refused() {
         let mut observation=ObservedConversation {provider:ProviderKind::Codex,id:"native-one".into(),uncertain:true};
-        assert!(FreshBuilderSessions::from_observed(&[observation.clone()]).is_err());observation.uncertain=false;
-        assert!(FreshBuilderSessions::from_observed(&[observation.clone(),observation.clone()]).is_err());
-        observation.id="native id with whitespace".into();assert!(FreshBuilderSessions::from_observed(&[observation]).is_err());
+        assert!(FreshBuilderSessions::from_observed(fixture_owner(),&[observation.clone()]).is_err());observation.uncertain=false;
+        assert!(FreshBuilderSessions::from_observed(fixture_owner(),&[observation.clone(),observation.clone()]).is_err());
+        observation.id="native id with whitespace".into();assert!(FreshBuilderSessions::from_observed(fixture_owner(),&[observation]).is_err());
     }
 
 }
