@@ -1123,6 +1123,79 @@ mod tests {
         assert_eq!(super::super::ownership::transfer_receipt(&binding, &f.request, &observation(), &|| Ok(())), Ok(None));
     }
     #[test]
+    fn native_initial_owner_registration_holds_original_state_lock_through_callback() {
+        let f=empty_binding_fixture();let path=policy(&f);let expected=binding_for(&f,&path);let mut called=false;
+        let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"fresh-workflow",&||Ok(()),&mut |binding| {
+            called=true;assert_eq!(*binding,expected);
+            assert!(super::super::StateLock::existing(&f.root).is_err(),"registration escaped the census lock");Ok(())
+        });
+        assert!(result.is_ok(),"{result:?}");assert!(called);
+    }
+    #[test]
+    fn native_initial_owner_registration_refuses_prior_runtime_without_invoking_callback() {
+        let f=fixture(false);let path=policy(&f);let mut called=false;
+        let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"workflow",&||Ok(()),&mut |_| {called=true;Ok(())});
+        assert_eq!(result,Err(TransferReason::AuthorityConflict));assert!(!called);
+    }
+    #[test]
+    fn native_initial_owner_registration_preserves_other_workflows_and_refuses_unknown_state() {
+        let f=fixture(false);let path=policy(&f);let mut called=0;
+        assert!(super::super::owner_outcome::initial_owner_with_policy(Some(&path),"new-workflow",&||Ok(()),&mut |_| {called+=1;Ok(())}).is_ok());
+        assert_eq!(called,1);
+        directory(&f.root.join("codex/session-unknown"));
+        let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"new-workflow",&||Ok(()),&mut |_| {called+=1;Ok(())});
+        assert!(result.is_err(),"unowned legacy state was treated as absent");assert_eq!(called,1);
+    }
+    #[test]
+    fn native_initial_owner_registration_refuses_retired_history_with_zero_runtimes() {
+        let f=empty_binding_fixture();let path=policy(&f);
+        {
+            let lock=super::super::StateLock::existing(&f.root).unwrap();let mut ledger=Ledger::open(&f.root,&lock).unwrap();
+            ledger.abort_and_retire(&f.request.source_owners[0].audit_path,&f.request.source_owners[0].owner).unwrap();
+        }
+        let mut called=false;
+        assert_eq!(super::super::owner_outcome::initial_owner_with_policy(Some(&path),"workflow",&||Ok(()),&mut |_| {called=true;Ok(())}),Err(TransferReason::AuthorityConflict));
+        assert!(!called);
+    }
+    #[test]
+    fn native_initial_owner_registration_rechecks_selection_after_callback_and_preserves_failures() {
+        for change_policy in [false,true] {
+            let f=empty_binding_fixture();let path=policy(&f);let before=std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+            let mut called=false;
+            let result=super::super::owner_outcome::initial_owner_with_policy(Some(&path),"fresh-workflow",&||Ok(()),&mut |_| {
+                called=true;
+                if change_policy {let mut bytes=std::fs::read(&path)?;bytes.push(b' ');std::fs::write(&path,bytes)?;Ok(())}
+                else {anyhow::bail!("synthetic registration transaction failure")}
+            });
+            assert_eq!(result,Err(if change_policy {TransferReason::AuthorityConflict} else {TransferReason::PersistRetry}));
+            assert!(called);assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),before);
+            assert!(super::super::StateLock::existing(&f.root).is_ok());
+        }
+    }
+    #[test]
+    fn native_initial_owner_registration_checks_alias_and_retained_launch_provenance() {
+        for scenario in ["orphan-alias","partial-launch","foreign-launch","escaped-launch","symlink-runtime"] {
+            let f=fixture(false);let policy=policy(&f);let provider=f.root.join("codex");
+            match scenario {
+                "orphan-alias"=>super::super::write(&provider.join("aliases/orphan"),br#""session-missing""#).unwrap(),
+                "symlink-runtime"=>std::os::unix::fs::symlink(provider.join("session-missing"),provider.join("session-alias")).unwrap(),
+                _=>{
+                    let launch=provider.join("launch-retained");directory(&launch);
+                    if scenario!="partial-launch" {
+                        let session=if scenario=="escaped-launch" {f.root.join("claude/session-escaped")} else {
+                            f.root.join(&f.request.inventory.iter().find(|runtime|runtime.provider=="codex").unwrap().runtime_relative_path)
+                        };
+                        super::super::write(&launch.join("launch.json"),&serde_json::to_vec(&json!({"version":1,"provider":"codex","session_directory":session})).unwrap()).unwrap();
+                    }
+                },
+            }
+            let mut called=false;
+            let result=super::super::owner_outcome::initial_owner_with_policy(Some(&policy),"fresh-workflow",&||Ok(()),&mut |_| {called=true;Ok(())});
+            assert_eq!(result.is_ok(),scenario=="foreign-launch","{scenario}: {result:?}");
+            assert_eq!(called,scenario=="foreign-launch","{scenario}");
+        }
+    }
+    #[test]
     fn native_owner_binding_capture_fences_before_touching_authority() {
         let f = empty_binding_fixture();
         let path = policy(&f);

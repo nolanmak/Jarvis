@@ -504,6 +504,14 @@ impl<'a> Ledger<'a> {
     pub fn reserved_bytes(&self) -> Result<u64> {
         growth(&self.db)
     }
+    pub fn has_workflow_history(&self, workflow: &str) -> Result<bool> {
+        ensure!(history_bytes(self.root)? <= HISTORY_LIMIT, R::HistoryCapacity);
+        // The source index is authoritative only after checking it against
+        // every retained canonical transfer, including aborted/completed rows.
+        validate_all_history(&self.db)?;
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM retired_owner WHERE workflow=?1 UNION ALL SELECT 1 FROM native_transfer_source WHERE workflow=?1)",
+            [workflow], |row| row.get(0))?)
+    }
     pub fn is_closed(&self, owner: &RuntimeOwner) -> Result<bool> {
         closed(&self.db, owner)
     }

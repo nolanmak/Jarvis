@@ -168,6 +168,39 @@ pub(super) fn capture_owner_with_policy(
         }
     })
 }
+/// Register only after proving a workflow has no prior native state.
+/// The callback runs while the original store's StateLock is held. It must
+/// atomically fence/register workflow metadata; it grants no provider dispatch.
+pub fn with_initial_owner_binding(
+    workflow:&str,current:&dyn Fn()->Result<(),TransferFenceError>,
+    register:&mut dyn FnMut(&TransferBinding)->anyhow::Result<()>,
+) -> Result<TransferBinding,TransferReason> {
+    let path=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
+    initial_owner_with_policy(path.as_deref().map(Path::new),workflow,current,register)
+}
+pub(super) fn initial_owner_with_policy(
+    policy:Option<&Path>,workflow:&str,current:&dyn Fn()->Result<(),TransferFenceError>,
+    register:&mut dyn FnMut(&TransferBinding)->anyhow::Result<()>,
+) -> Result<TransferBinding,TransferReason> {
+    if workflow.is_empty() || workflow.len()>4096 || workflow.contains('\0') {return Err(TransferReason::InvalidRequest);}
+    let binding=capture_owner_with_policy(policy,current)?;
+    let result=(||->anyhow::Result<()> {
+        selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,current)?;
+        super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
+        let lock=super::StateLock::existing(&binding.canonical_state_root)?;
+        let ledger=super::owner_ledger::Ledger::open_bound(&binding.canonical_state_root,&lock,&binding.store,true)?;
+        super::owner_initial::prove_no_prior_state(&binding.canonical_state_root,&ledger,workflow)?;
+        selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,current)?;
+        super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
+        register(&binding).context(TransferReason::PersistRetry)?;
+        selected_fence(policy,&binding.policy_sha256,&binding.canonical_state_root,current)?;
+        super::owner_store::validate_bound_metadata(&binding.canonical_state_root,&binding.store)?;
+        Ok(())
+    })();
+    result.map_err(|error|classify(&error).0)?;
+    Ok(binding)
+}
+
 /// Verify only the originally saved store and current policy selection.
 /// This is read-only, bounded by a nonblocking lock, and grants no owner authority.
 pub fn validate_owner_binding(binding:&TransferBinding,current:&dyn Fn()->Result<(),TransferFenceError>)->Result<(),TransferReason> {

@@ -55,6 +55,10 @@ impl WorkflowStore {
                 !previous,
                 "retained native owners require handoff settlement"
             );
+            let legacy_native:bool=tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_builder_conversation WHERE workflow=?1 UNION ALL SELECT 1 FROM workflow_native_session_owner WHERE workflow=?1 UNION ALL SELECT 1 FROM workflow_event WHERE workflow=?1 AND kind='builder_conversation_observed' UNION ALL SELECT 1 FROM workflow WHERE id=?1 AND model_calls>0 UNION ALL SELECT 1 FROM resource_charge WHERE workflow=?1 AND model_calls>0)",
+                [&lease.workflow],|row|row.get(0))?;
+            ensure!(!legacy_native,"legacy native or unattributed model-call history requires verified reconciliation");
             tx.execute("INSERT INTO workflow_native_owner(workflow,lease_generation,audit_path) VALUES(?1,?2,?3)", params![lease.workflow,lease.generation,audit_path])?;
             tx.execute(
                 "INSERT INTO workflow_native_owner_binding VALUES(?1,?2,?3,?4)",
@@ -158,6 +162,40 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, lease, binding)
+    }
+    #[test]
+    fn native_initial_owner_rejects_legacy_conversations_without_owner_metadata() {
+        use augmentagent_channel_core::{native_session::ObservedConversation,ProviderKind};
+        for deleted_projection in ["none","conversation","all-current-projections"] {
+            let temporary=tempfile::tempdir().unwrap();let (mut store,lease,workflow)=setup(&temporary.path().join("workflow.sqlite"));
+            store.record_builder_conversations(&lease,&workflow,&[ObservedConversation {
+                provider:ProviderKind::Codex,id:"legacy-native-session".into(),uncertain:true,
+            }],3).unwrap();
+            if deleted_projection!="none" {store.conn.execute("DELETE FROM workflow_builder_conversation",[]).unwrap();}
+            if deleted_projection=="all-current-projections" {store.conn.execute("DELETE FROM workflow_native_session_owner",[]).unwrap();}
+            assert!(store.register_initial_native_owner(&lease,&workflow,"/private/new-audit",&native_binding('d'),4).is_err(),
+                "legacy native history was backfilled from today's selected store");
+            assert!(store.native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn native_initial_owner_rejects_unattributed_prior_model_calls() {
+        let temporary=tempfile::tempdir().unwrap();let (mut store,lease,workflow)=setup(&temporary.path().join("workflow.sqlite"));
+        store.charge(&lease,"legacy-paid-call",ResourceCharge {model_calls:1,..Default::default()},3).unwrap();
+        assert!(store.register_initial_native_owner(&lease,&workflow,"/private/new-audit",&native_binding('d'),4).is_err(),
+            "a missing native ID was treated as proof that a prior model call acquired no native state");
+        assert!(store.native_owner_binding(&lease.workflow,lease.generation).unwrap().is_none());
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
+    }
+    #[test]
+    fn native_initial_owner_replay_preserves_a_binding_saved_before_model_accounting() {
+        let temporary=tempfile::tempdir().unwrap();let (mut store,lease,workflow)=setup(&temporary.path().join("workflow.sqlite"));
+        let native=native_binding('d');let audit="/private/original-audit";
+        store.register_initial_native_owner(&lease,&workflow,audit,&native,3).unwrap();
+        store.charge(&lease,"subsequent-paid-call",ResourceCharge {model_calls:1,..Default::default()},4).unwrap();
+        store.register_initial_native_owner(&lease,&workflow,audit,&native,5).unwrap();
+        assert_eq!(store.native_owner_binding(&lease.workflow,lease.generation).unwrap(),Some(native));
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,1);
     }
     #[test]
     fn native_retirement_requires_exact_durable_intent_and_original_binding() {
