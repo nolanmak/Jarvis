@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1713,
+  "tested_commit": "a19c0031bf6f5bbfee95ae894f71d39b2f5ca656",
+  "scope": "Guarded native handoff orchestration and regression repairs. Real temporary native files and protected logs, subprocess process-crash replay. No actual VM/provider/GitHub/Discord continuation acceptance.",
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_handoff.rs",
+      "sha256": "f89d93e41ed496fe3da80ff90828c8b3c35d4072ac3f74f73bd1fb7835d0053a"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_inventory.rs",
+      "sha256": "7311f528306f8461b5d38cba5157de97c521af0dfa2e9b830223ccb4601f0598"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_ledger.rs",
+      "sha256": "fec1b82d436ffc72f2dd36909ee0a8ddbeebd7f8776eb8ce74e8893a381eb643"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_owner_transfer.rs",
+      "sha256": "f21968232167b01ef808249a03a16c3f8e15aabe68ea9d55ad2434142a13ed46"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "197ee200b9be99e4e4ab9e7176ac7c11b6b494f1f87591546ef56aeafd23b050"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "0e6af8d9f90ccd2db3001040eeee1f74b53573105ef3bcb55817baf26936b296"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
+      "sha256": "db54a3f73d7b2f4293a6b07c82b846ceddf6c71ea7fce795ca37c210b850a87a"
+    },
+    {
+      "path": "scripts/native-provider-vm.py",
+      "sha256": "6ce2135a1bae0584cc80974367ddfd4460438d46c98131306573b3272f0c0ee4"
+    },
+    {
+      "path": "scripts/test-native-provider-vm.py",
+      "sha256": "9e8cd83ef184b7eb2e7be89a436bf5072e31604253286cff4af85e57258c51c3"
+    }
+  ],
+  "verification": [
+    {
+      "name": "export_umask_red",
+      "log_sha256": "600efb07699ad00d88d10bf0e80e8b58303bab77e8bfb6f106cfb83e7beeb2e2",
+      "exit_code": 1,
+      "passed": 3,
+      "failed": 2
+    },
+    {
+      "name": "late_alias_red",
+      "log_sha256": "86ddcd1b7253dc6155ee7135611ccb52ebe18a91cfa095e0e37d4392be1c15f3",
+      "exit_code": 1,
+      "passed": 0,
+      "failed": 1
+    },
+    {
+      "name": "exports_green",
+      "log_sha256": "32c9037f165b7d8c30020d6a206049c8c2f0e8b8b734f0f8884c50189dea0b42",
+      "exit_code": 0,
+      "passed": 5,
+      "failed": 0
+    },
+    {
+      "name": "full_core_green",
+      "log_sha256": "55da769abd3d76f8654da544325a57cbfdc9129c94e5e6c5493eb39188dccf62",
+      "exit_code": 0,
+      "passed": 719,
+      "failed": 0
+    },
+    {
+      "name": "python_green",
+      "log_sha256": "f24345cf6417e247962bf8f96fba9d7666e3fe40fa40fc5f8a8e7adec682753a",
+      "exit_code": 0,
+      "passed": 18,
+      "failed": 0
+    }
+  ],
+  "full_core_ignored": 14,
+  "red_commits": {
+    "export_umasks": "5f1c6e42",
+    "late_alias": "ef2d96ba"
+  },
+  "build_wrapper": "scripts/cargo-managed.sh",
+  "verified_behaviors": [
+    "new producer parent directories remain0700 under umasks0002 and0022",
+    "unchanged same-UID legacy directories qualify only beneath private generation root",
+    "public generation roots and public/symlink producer parents reject",
+    "delayed alias publication consumes captured actual-log claims despite raw alias rebinding",
+    "complete locked inventory, exact metadata hashes, protected source seals and atomic receipt mapping",
+    "same request replay after subprocess exits after preparation, individual seals and committed response loss",
+    "original creation receipts and export bytes preserved; historical replay after runtime reclamation"
+  ],
+  "spec_review": {
+    "S25_S62": "Holds at revision11/777352a6; read-only producer-to-consumer publication lifetime trace",
+    "S34": "Holds at revision12/current source; captured actual-log claim under StateLock"
+  },
+  "not_verified": [
+    "public typed outcome API",
+    "workflow handoff preparation/settlement/reconciliation",
+    "actual Codex/Claude native continuation",
+    "production CLI issue/PR merge acceptance",
+    "Discord coding and durable delivery acceptance",
+    "72-hour fault soak",
+    "24-hour unattended live acceptance",
+    "five confirmed autonomous merges/day"
+  ]
+}
