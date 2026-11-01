@@ -1240,6 +1240,51 @@ mod tests {
         ));
     }
     #[test]
+    fn native_handoff_binding_changed_policy_to_missing_root_is_authority_conflict() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let original = std::fs::read(&path).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let absent = f._temporary.path().join("never-provisioned");
+        changed["state_root"] = json!(&absent);
+        std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(matches!(
+            run_bound(&f, &path, &binding),
+            TransferOutcome::Held { reason: TransferReason::AuthorityConflict, .. }
+        ));
+        assert!(!absent.exists());
+        assert_eq!(super::super::ownership::transfer_receipt(&binding, &f.request, &observation(), &|| Ok(())), Ok(None));
+        std::fs::write(&path, original).unwrap();
+        assert!(matches!(run_bound(&f, &path, &binding), TransferOutcome::Completed(_)));
+    }
+    #[test]
+    fn native_handoff_binding_capture_rejects_root_alias_changed_after_identity_read() {
+        use std::os::unix::fs::symlink;
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let alias = f._temporary.path().join("selected-native-root");
+        symlink(&f.root, &alias).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["state_root"] = json!(&alias);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        directory(other.path());
+        super::super::initialize_native_test_store(other.path());
+        let calls = std::cell::Cell::new(0);
+        let current = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(other.path(), &alias).unwrap();
+            }
+            Ok(())
+        };
+        let result = super::super::owner_outcome::capture_with_policy(Some(&path), &f.request, &observation(), &current);
+        assert!(matches!(result, Err(TransferOutcome::Held { reason: TransferReason::AuthorityConflict, .. })), "capture accepted a changed root alias: {result:?}");
+        assert_eq!(calls.get(), 3);
+    }
+    #[test]
     fn native_handoff_binding_root_alias_rebound_during_sealing_is_fenced() {
         use std::os::unix::fs::symlink;
         let f = fixture(true);
