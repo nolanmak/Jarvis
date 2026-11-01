@@ -19,6 +19,7 @@ pub(crate) struct ProcessGroup {
     resource_observed: AtomicBool,
     resource_audit: std::sync::Mutex<Option<(String,Arc<crate::tool_audit::AuditLogger>)>>,
     native_launch:Option<crate::native_vm::PreparedLaunchRecord>,
+    native_resource:std::sync::Mutex<Option<crate::audit_chain::AppendReceipt>>,
     _directory: tempfile::TempDir,
 }
 
@@ -82,7 +83,8 @@ impl ProcessGroup {
             logger.unwrap().dispatch_allowed()?;
             let prepared=self.native_launch.as_ref().ok_or_else(||anyhow::anyhow!("native VM model admission requires prepared controller receipt"))?;
             let identity=resource_identity.as_ref().ok_or_else(||anyhow::anyhow!("native VM model admission requires exact resource identity"))?;
-            logger.unwrap().native_launch_resource_binding(prepared,provider,identity)?;
+            let receipt=logger.unwrap().native_launch_resource_binding(prepared,provider,identity)?;
+            *self.native_resource.lock().map_err(|_|anyhow::anyhow!("native resource receipt lock poisoned"))?=Some(receipt);
         }
         if model { if let Some(logger)=logger {
             match &resource_identity {
@@ -99,6 +101,9 @@ impl ProcessGroup {
             .map_err(|error|error.error)?;
         std::fs::File::open(self.receipt.parent().unwrap())?.sync_all()?;
         Ok(())
+    }
+    pub(crate) fn native_resource_receipt(&self)->anyhow::Result<Option<crate::audit_chain::AppendReceipt>> {
+        Ok(self.native_resource.lock().map_err(|_|anyhow::anyhow!("native resource receipt lock poisoned"))?.clone())
     }
     pub(crate) fn resource_outcome(&self, provider: &str, logger: Option<&Arc<crate::tool_audit::AuditLogger>>) -> anyhow::Result<()> {
         if self.resource_observed.swap(true,Ordering::SeqCst) { return Ok(()); }
@@ -650,7 +655,7 @@ fn spawn_supervised_inner(command: &Command, clear_env: bool, clean: Arc<AtomicB
     };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_launch:None,_directory: directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, vm_preflight, resource_required:resource_policy.is_some(), resource_observed:AtomicBool::new(false), resource_audit:std::sync::Mutex::new(None), native_launch:None,native_resource:std::sync::Mutex::new(None),_directory: directory }))
 }
 
 #[cfg(test)]
@@ -702,7 +707,7 @@ mod tests {
         std::fs::write(directory.path().join("launch-ready"),"ready\n").unwrap();
         let group=ProcessGroup {id:child.id() as libc::pid_t,receipt:receipt.clone(),clean:Arc::new(AtomicBool::new(false)),
             active_request:None,resource_required:false,vm_preflight:true,resource_observed:AtomicBool::new(false),
-            resource_audit:std::sync::Mutex::new(None),native_launch:None,_directory:directory};
+            resource_audit:std::sync::Mutex::new(None),native_launch:None,native_resource:std::sync::Mutex::new(None),_directory:directory};
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let _=child.kill();child.wait().unwrap();std::fs::write(&receipt,"all-descendants-reaped\n").unwrap();
         std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -730,7 +735,7 @@ mod tests {
             let clean=Arc::new(AtomicBool::new(false));
             let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
                 resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
-                resource_audit:std::sync::Mutex::new(None),native_launch:None,_directory:directory};
+                resource_audit:std::sync::Mutex::new(None),native_launch:None,native_resource:std::sync::Mutex::new(None),_directory:directory};
             drop(group);writer.join().unwrap();
             assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
         }
@@ -1038,12 +1043,15 @@ mod tests {
         group.resource_required=mode!="resource";group.vm_preflight=true;
         let outcome=group.admit_model("codex",Some(&logger)).await;
         let proceeded=group.receipt.with_file_name("launch-continue").exists();
+        let retained_resource=group.native_resource_receipt().unwrap();
         drop(group);let _=child.wait().await;
         let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
         let binding=rows.iter().find(|row|row["kind"]=="native_launch_resource_binding");
         if mode=="bound" {
             outcome.unwrap();assert!(proceeded);assert_eq!(count.load(Ordering::SeqCst),1);
             let binding=binding.expect("released native model has no exact launch/resource correlation");
+            assert_eq!(logger.read_append_receipt(&retained_resource.unwrap()).unwrap(),*binding,
+                "completion did not retain the exact protected supervisor receipt");
             let prepared=prepared.unwrap();
             assert_eq!(binding["launch_intent"],serde_json::to_value(prepared.intent).unwrap());
             assert_eq!(binding["launch_receipt"],serde_json::to_value(prepared.controller_receipt).unwrap());

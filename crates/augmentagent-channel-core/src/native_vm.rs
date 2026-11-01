@@ -95,6 +95,8 @@ mod owner_outcome;
 mod owner_store;
 #[path = "native_owner_initial.rs"]
 mod owner_initial;
+#[path = "native_owner_completion.rs"]
+pub(crate) mod owner_completion;
 
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
@@ -408,6 +410,9 @@ fn ensure_native_admission(ledger:&owner_ledger::Ledger<'_>,owner:&RuntimeOwner,
 struct LaunchObservation {
     prepared:PreparedLaunchRecord,
     logger:std::sync::Weak<crate::tool_audit::AuditLogger>,
+    actual_session:std::sync::Mutex<Option<(String,crate::audit_chain::AppendReceipt)>>,
+    completion_verified:std::sync::atomic::AtomicBool,
+    completed:std::sync::atomic::AtomicBool,
 }
 pub(crate) struct Launch {
     pub command: Command,
@@ -573,7 +578,7 @@ impl Launch {
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
         let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, store, audit_log,
-            observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger)}),_directory:directory };
+            observation:Some(LaunchObservation {prepared,logger:std::sync::Arc::downgrade(owner_logger),actual_session:std::sync::Mutex::new(None),completion_verified:std::sync::atomic::AtomicBool::new(false),completed:std::sync::atomic::AtomicBool::new(false)}),_directory:directory };
         // A requested alias permits later lookup but is not a provider ID event.
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.register_alias(id)?; }
         owner_logger.validate_native_store_binding()?;
@@ -586,7 +591,29 @@ impl Launch {
     pub fn observe_session(&self, id: &str) -> Result<()> {
         let observed=self.observation.as_ref().context("native observation lacks prepared controller context")?;
         let logger=observed.logger.upgrade().context("native observation controller expired")?;
-        self.register_alias_with(id,||logger.native_session_observed(&observed.prepared,id).map(|_|()))
+        let mut actual=observed.actual_session.lock().map_err(|_|anyhow::anyhow!("native ID receipt lock poisoned"))?;
+        ensure!(actual.as_ref().is_none_or(|(existing,_)|existing==id),"native launch returned conflicting session IDs");
+        self.register_alias_with(id,||{
+            let receipt=logger.native_session_observed(&observed.prepared,id)?;
+            *actual=Some((id.to_string(),receipt));Ok(())
+        })
+    }
+    /// Called after supervisor cleanup, before a successful turn can finish its
+    /// native lease. The requested ID can never supply this actual-ID receipt.
+    pub(crate) fn record_completion(&self,resource:Option<&crate::audit_chain::AppendReceipt>)->Result<()> {
+        let observed=self.observation.as_ref().context("native completion lacks prepared context")?;
+        let logger=observed.logger.upgrade().context("native completion controller expired")?;
+        let actual=observed.actual_session.lock().map_err(|_|anyhow::anyhow!("native ID receipt lock poisoned"))?.clone()
+            .context("native completion actual session ID unavailable")?;
+        logger.native_launch_completion(&observed.prepared,&actual.1,
+            resource.context("native completion resource binding unavailable")?)?;
+        observed.completion_verified.store(true,std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    pub(crate) fn acknowledge_completion(&self)->Result<()> {
+        let observed=self.observation.as_ref().context("native completion lacks prepared context")?;
+        ensure!(observed.completion_verified.load(std::sync::atomic::Ordering::SeqCst),"native completion has not been verified");
+        observed.completed.store(true,std::sync::atomic::Ordering::SeqCst);Ok(())
     }
     fn register_alias(&self,id:&str)->Result<()> {self.register_alias_with(id,||Ok(()))}
     fn register_alias_with(&self,id:&str,publish:impl FnOnce()->Result<()>)->Result<()> {
@@ -611,7 +638,7 @@ impl Launch {
     }
 }
 
-impl Drop for Launch { fn drop(&mut self) { if self.ephemeral {retire(&Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone()});} } }
+
 
 #[cfg(test)]
 pub(crate) fn initialize_native_test_store(root:&Path) {
@@ -630,6 +657,20 @@ pub(crate) fn test_retirement(session:PathBuf,expected:ownership::Authority)->Re
     let root=session.parent().and_then(Path::parent).unwrap();
     let store=test_store_identity(root);
     Retirement {session,expected,store}
+}
+
+impl Drop for Launch {
+    fn drop(&mut self) {
+        if let Some(observed)=&self.observation {
+            if !observed.completed.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(logger)=observed.logger.upgrade() {
+                    let actual=observed.actual_session.lock().ok().and_then(|value|value.clone());
+                    let _=logger.native_launch_uncertain(&observed.prepared,actual.as_ref().map(|(_,receipt)|receipt));
+                }
+            }
+        }
+        if self.ephemeral {retire(&Retirement{session:self.session.clone(),expected:self.authority.clone(),store:self.store.clone()});}
+    }
 }
 
 #[cfg(test)]
@@ -670,11 +711,15 @@ mod tests {
     fn native_observation_rejects_mismatched_preparation_receipt() {launch_intent_child("observe-mismatch");}
     #[test]
     fn native_observation_refuses_expired_controller_before_alias_publication() {launch_intent_child("observe-expired");}
+    #[cfg(target_os="linux")]
+    #[test]
+    fn native_completion_requires_exact_launch_and_kernel_quiescence() {launch_intent_child("completion");}
     fn launch_intent_child(mode: &str) {
         let seal=mode=="seal";let refuse=mode=="refuse";
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let test = if mode=="unbound" {"native_preparation_requires_original_store_binding"}
+                else if mode=="completion" {"native_completion_requires_exact_launch_and_kernel_quiescence"}
                 else if mode=="observe" {"native_observation_records_actual_id_with_exact_launch_receipt"}
                 else if mode=="observe-sealed" {"native_observation_refuses_sealed_audit_before_alias_publication"}
                 else if mode=="observe-fenced" {"native_observation_rechecks_workflow_fence_before_alias_publication"}
@@ -784,6 +829,79 @@ mod tests {
             assert_eq!(row["launch_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch._directory.path().join("launch.json")).unwrap())));
             assert_eq!(row["creation_receipt_sha256"],format!("{:x}",Sha256::digest(std::fs::read(launch.session.join("owned.json")).unwrap())));
             assert!(uuid::Uuid::parse_str(row["intent_id"].as_str().unwrap()).is_ok());
+            #[cfg(target_os="linux")]
+            if mode=="completion" {
+                let actual_id=format!("actual-{provider}-session");
+                let identity=serde_json::json!({
+                    "host_sha256":format!("{:x}",Sha256::digest(std::fs::read("/etc/machine-id").unwrap())),
+                    "boot_id":std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),
+                    "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
+                let resource=logger.native_launch_resource_binding(&prepared,provider,&identity).unwrap();
+                assert!(launch.record_completion(Some(&resource)).is_err(),"requested ID supplied actual completion");
+                launch.observe_session(&actual_id).unwrap();
+                let session=logger.native_session_observed(&prepared,&actual_id).unwrap();
+                let generation=launch.session.join("generation-completion");
+                std::fs::create_dir(&generation).unwrap();
+                std::fs::set_permissions(&generation,std::fs::Permissions::from_mode(0o700)).unwrap();
+                write(&generation.join("context"),b"complete synthetic conversation").unwrap();
+                let completion=serde_json::to_vec(&serde_json::json!({"version":1,"exit_code":0,
+                    "generation":"generation-completion","launch_sha256":prepared.intent.launch_sha256,
+                    "worker_quiescence":{"remaining_workers":0,"quiet_scans":2}})).unwrap();
+                write(&launch.session.join("complete.json"),&completion).unwrap();
+                let receipt=logger.native_launch_completion(&prepared,&session,&resource).unwrap();
+                let proof=logger.read_append_receipt(&receipt).unwrap();
+                assert_eq!(proof["kind"],"native_launch_completion_verified");
+                assert_eq!(proof["inventory"]["native_session_id"],actual_id);
+                assert_eq!(proof["launch_intent"],serde_json::to_value(&prepared.intent).unwrap());
+                assert_eq!(proof["quiescent_resource"]["identity"],identity);
+                assert!(proof.get("certainty").is_none(),"completion bypassed unresolved observation history");
+                for fault in ["older-launch","failed-exit","diagnostic","workers-live","missing-id","wrong-resource","alias","export","foreign-host","missing-completion"] {
+                    let mut changed:serde_json::Value=serde_json::from_slice(&completion).unwrap();
+                    match fault {
+                        "older-launch"=>changed["launch_sha256"]="e".repeat(64).into(),
+                        "failed-exit"=>changed["exit_code"]=1.into(),
+                        "diagnostic"=>changed["diagnostic_only"]=true.into(),
+                        "workers-live"=>changed["worker_quiescence"]["remaining_workers"]=1.into(),
+                        "alias"=>{std::fs::write(launch.aliases.join(digest(&actual_id)),b"\"session-other\"").unwrap();},
+                        "export"=>{std::os::unix::fs::symlink("/etc/passwd",generation.join("unsafe")).unwrap();},
+                        _=>(),
+                    }
+                    std::fs::write(launch.session.join("complete.json"),serde_json::to_vec(&changed).unwrap()).unwrap();
+                    let mut resource_for_check=resource.clone();let mut session_for_check=session.clone();
+                    if fault=="foreign-host" {
+                        let mut foreign=identity.clone();foreign["host_sha256"]="f".repeat(64).into();
+                        resource_for_check=logger.native_launch_resource_binding(&prepared,provider,&foreign).unwrap();
+                        session_for_check=logger.native_session_observed(&prepared,&actual_id).unwrap();
+                    }
+                    if fault=="missing-completion" {std::fs::remove_file(launch.session.join("complete.json")).unwrap();}
+                    let before=std::fs::read(logger.path()).unwrap();
+                    let result=logger.native_launch_completion(&prepared,
+                        if fault=="missing-id" {&prepared.controller_receipt} else {&session_for_check},
+                        if fault=="wrong-resource" {&session} else {&resource_for_check});
+                    assert!(result.is_err(),"accepted completion fault {fault}");
+                    assert_eq!(std::fs::read(logger.path()).unwrap(),before,"refused proof appended completion");
+                    std::fs::write(launch.session.join("complete.json"),&completion).unwrap();
+                    std::fs::set_permissions(launch.session.join("complete.json"),std::fs::Permissions::from_mode(0o600)).unwrap();
+                    if fault=="alias" {std::fs::write(launch.aliases.join(digest(&actual_id)),serde_json::to_vec(launch.session.file_name().unwrap().to_str().unwrap()).unwrap()).unwrap();}
+                    if fault=="export" {std::fs::remove_file(generation.join("unsafe")).unwrap();}
+                }
+                assert!(launch.record_completion(None).is_err(),"missing resource receipt was accepted");
+                assert!(launch.acknowledge_completion().is_err(),"unverified launch acknowledged completion");
+                launch.record_completion(Some(&resource)).unwrap();
+                launch.acknowledge_completion().unwrap();
+                assert!(launch.observation.as_ref().unwrap().completed.load(std::sync::atomic::Ordering::SeqCst));
+                let unfinished=Launch::prepare(provider,&opts,&Command::new("/usr/bin/false"),None,
+                    Some(&crate::native_session::Launch::Create{requested_id:None})).unwrap();
+                let unfinished_id=unfinished.prepared_record().unwrap().intent.intent_id;
+                drop(unfinished);
+                let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines()
+                    .map(|line|serde_json::from_str(line).unwrap()).collect();
+                let uncertain=rows.iter().find(|row|row["kind"]=="native_launch_uncertain"
+                    && row["launch_intent"]["intent_id"]==unfinished_id).unwrap();
+                assert!(uncertain["session_observation_receipt"].is_null());
+                assert!(uncertain.get("certainty").is_none());
+                continue;
+            }
             if mode.starts_with("observe") {
                 assert!(!rows.iter().any(|row|row["kind"]=="native_session_observed"),
                     "requested native ID was misreported as a provider observation");

@@ -238,23 +238,27 @@ fn inventory_paths(
     ensure!(paths == declared_sorted, R::InventoryMissing);
     Ok(paths)
 }
-fn exact_inventory_row(
+pub(super) fn completed_inventory_row(
     root: &Path,
     ledger: &Ledger<'_>,
-    declared: &RuntimeInventoryRow,
-) -> Result<()> {
-    let session = root.join(&declared.runtime_relative_path);
+    provider: &str,
+    runtime_relative_path: &str,
+    native_session_id: &str,
+) -> Result<(RuntimeInventoryRow, String)> {
+    private_directory(&root.join(provider))?;
+    let session = root.join(runtime_relative_path);
     private_directory(&session)?;
     ensure!(!retired(&session)?, R::AuthorityConflict);
     let owned = super::private(&session.join("owned.json"))?;
     let creation: serde_json::Value = serde_json::from_slice(&owned)?;
+    ensure!(creation["version"] == 1, R::MetadataInvalid);
     let creation_owner: super::RuntimeOwner = serde_json::from_value(creation["owner"].clone())?;
     let creation_audit_path = creation["audit_path"]
         .as_str()
         .context(R::MetadataInvalid)?
         .to_string();
     let effective = ledger.resolve(
-        &declared.runtime_relative_path,
+        runtime_relative_path,
         &Authority {
             owner: creation_owner.clone(),
             audit_path: creation_audit_path.clone(),
@@ -296,9 +300,9 @@ fn exact_inventory_row(
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
         R::MetadataInvalid
     );
-    let aliases = root.join(&declared.provider).join("aliases");
+    let aliases = root.join(provider).join("aliases");
     private_directory(&aliases)?;
-    let alias = super::private(&aliases.join(sha(declared.native_session_id.as_bytes())))?;
+    let alias = super::private(&aliases.join(sha(native_session_id.as_bytes())))?;
     let target: String = serde_json::from_slice(&alias)?;
     ensure!(
         target.starts_with("session-")
@@ -310,9 +314,9 @@ fn exact_inventory_row(
     );
     let manifest = super::owner_inventory::export_manifest(&session.join(generation))?;
     let actual = RuntimeInventoryRow {
-        provider: declared.provider.clone(),
-        native_session_id: declared.native_session_id.clone(),
-        runtime_relative_path: declared.runtime_relative_path.clone(),
+        provider: provider.to_string(),
+        native_session_id: native_session_id.to_string(),
+        runtime_relative_path: runtime_relative_path.to_string(),
         creation_owner,
         creation_audit_path,
         effective_owner: effective.owner,
@@ -322,6 +326,11 @@ fn exact_inventory_row(
         alias_sha256: sha(&alias),
         export_manifest_sha256: value_hash(&manifest)?,
     };
+    Ok((actual, launch.to_string()))
+}
+fn exact_inventory_row(root: &Path, ledger: &Ledger<'_>, declared: &RuntimeInventoryRow) -> Result<()> {
+    let (actual, _) = completed_inventory_row(root, ledger, &declared.provider,
+        &declared.runtime_relative_path, &declared.native_session_id)?;
     ensure!(actual == *declared, R::MetadataInvalid);
     Ok(())
 }

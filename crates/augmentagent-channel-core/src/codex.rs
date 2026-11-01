@@ -504,6 +504,7 @@ impl CodexCliReasoner {
         let status = child.wait().await?;
         let logger=opts.audit_logger.clone().or_else(crate::reasoner::default_audit_logger);
         let resources=process_group.resource_outcome(provider, logger.as_ref());
+        let native_resource=process_group.native_resource_receipt()?;
         drop(process_group);
         resources?;
         let stderr_buf = match stderr_task {
@@ -523,9 +524,11 @@ impl CodexCliReasoner {
             if crate::reasoner::is_rate_limited(&final_text) {
                 return Err(turn_error(provider, FailureClass::Quota, capability, final_text));
             }
+            if let Some(vm)=&native_vm {vm.record_completion(native_resource.as_ref())?;}
             if let Some(lease) = native_lease {
                 lease.finish()?;
             }
+            if let Some(vm)=&native_vm {vm.acknowledge_completion()?;}
             return Ok(final_text);
         }
 

@@ -607,7 +607,20 @@ impl AuditLogger {
             "resource_identity":identity,"recorded_at_ms":chrono::Utc::now().timestamp_millis()}))?;
         self.dispatch_allowed()?;Ok(receipt)
     }
-    fn verify_native_launch_reference(&self,prepared:&crate::native_vm::PreparedLaunchRecord)->anyhow::Result<()> {
+    pub(crate) fn native_launch_uncertain(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
+        session:Option<&crate::audit_chain::AppendReceipt>)->anyhow::Result<()> {
+        self.verify_native_launch_reference(prepared)?;
+        self.record_controller(serde_json::json!({"version":1,"actor":"controller",
+            "kind":"native_launch_uncertain","launch_intent":prepared.intent,
+            "launch_receipt":prepared.controller_receipt,"session_observation_receipt":session,
+            "reason":"completion-not-verified","observed_at_ms":chrono::Utc::now().timestamp_millis()}))
+    }
+    pub(crate) fn native_launch_completion(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
+        session:&crate::audit_chain::AppendReceipt,resource:&crate::audit_chain::AppendReceipt)
+        ->anyhow::Result<crate::audit_chain::AppendReceipt> {
+        crate::native_vm::owner_completion::record(self,prepared,session,resource)
+    }
+    pub(crate) fn verify_native_launch_reference(&self,prepared:&crate::native_vm::PreparedLaunchRecord)->anyhow::Result<()> {
         prepared.intent.validate()?;
         anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&prepared.intent.source_owner)
             && prepared.intent.source_audit_path==self.path,"native observation source owner mismatch");

@@ -1457,15 +1457,13 @@ impl ClaudeCliReasoner {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Some(lease) = native_lease.as_mut() {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if (value["type"] == "system" && value["subtype"] == "init")
-                        || value["type"] == "result"
-                    {
-                        if let Some(id) = value["session_id"].as_str() {
-                            if let Some(vm) = &native_vm { vm.observe_session(id)?; }
-                            lease.observe(id)?;
-                        }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if (value["type"] == "system" && value["subtype"] == "init")
+                    || value["type"] == "result"
+                {
+                    if let Some(id) = value["session_id"].as_str() {
+                        if let Some(vm) = &native_vm { vm.observe_session(id)?; }
+                        if let Some(lease) = native_lease.as_mut() {lease.observe(id)?;}
                     }
                 }
             }
@@ -1526,6 +1524,7 @@ impl ClaudeCliReasoner {
 
         let status = child.wait().await?;
         let resources = process_group.resource_outcome("claude", audit_logger.as_ref());
+        let native_resource = process_group.native_resource_receipt()?;
         drop(process_group);
         resources?;
         // Unmatched tool uses represent uncertain side effects. Dropping their
@@ -1608,9 +1607,11 @@ impl ClaudeCliReasoner {
                 message: final_text.trim().to_string(),
             });
         }
+        if let Some(vm)=&native_vm {vm.record_completion(native_resource.as_ref())?;}
         if let Some(lease) = native_lease {
             lease.finish()?;
         }
+        if let Some(vm)=&native_vm {vm.acknowledge_completion()?;}
         crate::triage_capture::finish(&audit_session);
         Ok(final_text)
     }
