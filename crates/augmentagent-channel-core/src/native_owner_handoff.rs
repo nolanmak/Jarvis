@@ -1,5 +1,6 @@
 //! Guarded handoff orchestration. No provider is launched by this module.
 use super::owner_ledger::{Endpoint, Ledger, State};
+use super::ownership::TransferReason as R;
 use super::ownership::{
     canonical_bytes, Authority, RuntimeInventoryRow, SealReference, TransferReceipt,
     TransferRequest,
@@ -27,7 +28,7 @@ fn private_directory(path: &Path) -> Result<()> {
             && !info.file_type().is_symlink()
             && info.uid() == unsafe { libc::geteuid() }
             && info.mode() & 0o077 == 0,
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     Ok(())
 }
@@ -38,7 +39,7 @@ fn actual_audit(path: &Path) -> Result<PathBuf> {
             && info.uid() == unsafe { libc::geteuid() }
             && info.mode() & 0o077 == 0
             && info.nlink() == 1,
-        "native-transfer-audit-corrupt"
+        R::AuditCorrupt
     );
     Ok(path.canonicalize()?)
 }
@@ -64,41 +65,30 @@ fn audit_plan<'a>(
     }
     let mut supplied = BTreeMap::new();
     for logger in sources {
-        let log = logger
-            .protected_log_path()
-            .context("native-transfer-audit-corrupt")?;
+        let log = logger.protected_log_path().context(R::AuditCorrupt)?;
         ensure!(
             actual_audit(logger.path())? == log
                 && supplied.insert(log.to_path_buf(), logger).is_none(),
-            "native-transfer-audit-corrupt"
+            R::AuditCorrupt
         );
     }
-    ensure!(
-        supplied.keys().eq(expected.keys()),
-        "native-transfer-audit-corrupt"
-    );
+    ensure!(supplied.keys().eq(expected.keys()), R::AuditCorrupt);
     let destination_log = actual_audit(Path::new(&request.destination.audit_path))?;
     ensure!(
         Some(destination_log.as_path()) == destination.protected_log_path()
             && actual_audit(destination.path())? == destination_log
             && !expected.contains_key(&destination_log),
-        "native-transfer-authority-conflict"
+        R::AuthorityConflict
     );
     let destination_anchor = actual_audit(
         destination
             .protected_anchor_path()
-            .context("native-transfer-audit-corrupt")?,
+            .context(R::AuditCorrupt)?,
     )?;
     let mut endpoints = vec![Endpoint {
         audit_path: request.destination.audit_path.clone(),
-        actual_audit_path: destination_log
-            .to_str()
-            .context("native-transfer-audit-corrupt")?
-            .into(),
-        anchor_path: destination_anchor
-            .to_str()
-            .context("native-transfer-audit-corrupt")?
-            .into(),
+        actual_audit_path: destination_log.to_str().context(R::AuditCorrupt)?.into(),
+        anchor_path: destination_anchor.to_str().context(R::AuditCorrupt)?.into(),
     }];
     let mut planned = Vec::new();
     for (path, owners) in expected {
@@ -109,29 +99,16 @@ fn audit_plan<'a>(
             .unwrap();
         ensure!(
             logger.native_runtime_owner()?.as_ref() == Some(&highest.owner),
-            "native-transfer-authority-conflict"
+            R::AuthorityConflict
         );
-        let anchor = actual_audit(
-            logger
-                .protected_anchor_path()
-                .context("native-transfer-audit-corrupt")?,
-        )?;
-        ensure!(
-            anchor != destination_anchor,
-            "native-transfer-authority-conflict"
-        );
+        let anchor = actual_audit(logger.protected_anchor_path().context(R::AuditCorrupt)?)?;
+        ensure!(anchor != destination_anchor, R::AuthorityConflict);
         let mut references = Vec::new();
         for owner in owners {
             endpoints.push(Endpoint {
                 audit_path: owner.audit_path.clone(),
-                actual_audit_path: path
-                    .to_str()
-                    .context("native-transfer-audit-corrupt")?
-                    .into(),
-                anchor_path: anchor
-                    .to_str()
-                    .context("native-transfer-audit-corrupt")?
-                    .into(),
+                actual_audit_path: path.to_str().context(R::AuditCorrupt)?.into(),
+                anchor_path: anchor.to_str().context(R::AuditCorrupt)?.into(),
             });
             references.push(owner.audit_path.clone());
         }
@@ -162,10 +139,10 @@ fn session_lock(path: &Path) -> Result<SessionLock> {
             && info.uid() == unsafe { libc::geteuid() }
             && info.mode() & 0o077 == 0
             && info.nlink() == 1,
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        anyhow::bail!("native-transfer-lock-busy")
+        anyhow::bail!(R::LockBusy)
     }
     Ok(SessionLock(file))
 }
@@ -176,7 +153,7 @@ fn retired(session: &Path) -> Result<bool> {
             Ok(_) => {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&super::private(&session.join(name))?)?;
-                ensure!(marker["version"] == 1, "native-transfer-metadata-invalid");
+                ensure!(marker["version"] == 1, R::MetadataInvalid);
                 retired = true;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -202,7 +179,7 @@ fn inventory_paths(
             let path = entry?.path();
             if !path
                 .file_name()
-                .context("native-transfer-metadata-invalid")?
+                .context(R::MetadataInvalid)?
                 .to_string_lossy()
                 .starts_with("session-")
             {
@@ -211,11 +188,11 @@ fn inventory_paths(
             private_directory(&path)?;
             let bytes = super::private(&path.join("owned.json"))?;
             let owned: serde_json::Value = serde_json::from_slice(&bytes)?;
-            ensure!(owned["version"] == 1, "native-transfer-metadata-invalid");
+            ensure!(owned["version"] == 1, R::MetadataInvalid);
             let creation: super::RuntimeOwner = serde_json::from_value(owned["owner"].clone())?;
             ensure!(
                 !creation.workflow_id.is_empty() && creation.lease_generation > 0,
-                "native-transfer-metadata-invalid"
+                R::MetadataInvalid
             );
             if creation.workflow_id != request.workflow_id {
                 continue;
@@ -225,11 +202,11 @@ fn inventory_paths(
             }
             ensure!(
                 matches!(provider, "codex" | "claude"),
-                "native-transfer-runtime-unavailable"
+                R::RuntimeUnavailable
             );
             let audit_path = owned["audit_path"]
                 .as_str()
-                .context("native-transfer-metadata-invalid")?
+                .context(R::MetadataInvalid)?
                 .into();
             let effective = ledger.resolve(
                 super::relative_runtime(root, &path)?,
@@ -241,11 +218,11 @@ fn inventory_paths(
             )?;
             ensure!(
                 !ledger.is_closed(&effective.owner)? && !ledger.held_by_abort(&effective.owner)?,
-                "native-transfer-authority-conflict"
+                R::AuthorityConflict
             );
             ensure!(
                 request.source_owners.contains(&effective),
-                "native-transfer-inventory-missing"
+                R::InventoryMissing
             );
             paths.push(path);
         }
@@ -258,10 +235,7 @@ fn inventory_paths(
         .collect::<Vec<_>>();
     let mut declared_sorted = declared.clone();
     declared_sorted.sort();
-    ensure!(
-        paths == declared_sorted,
-        "native-transfer-inventory-missing"
-    );
+    ensure!(paths == declared_sorted, R::InventoryMissing);
     Ok(paths)
 }
 fn exact_inventory_row(
@@ -271,13 +245,13 @@ fn exact_inventory_row(
 ) -> Result<()> {
     let session = root.join(&declared.runtime_relative_path);
     private_directory(&session)?;
-    ensure!(!retired(&session)?, "native-transfer-authority-conflict");
+    ensure!(!retired(&session)?, R::AuthorityConflict);
     let owned = super::private(&session.join("owned.json"))?;
     let creation: serde_json::Value = serde_json::from_slice(&owned)?;
     let creation_owner: super::RuntimeOwner = serde_json::from_value(creation["owner"].clone())?;
     let creation_audit_path = creation["audit_path"]
         .as_str()
-        .context("native-transfer-metadata-invalid")?
+        .context(R::MetadataInvalid)?
         .to_string();
     let effective = ledger.resolve(
         &declared.runtime_relative_path,
@@ -287,8 +261,7 @@ fn exact_inventory_row(
         },
         &sha(&owned),
     )?;
-    let complete = super::private(&session.join("complete.json"))
-        .context("native-transfer-runtime-unavailable")?;
+    let complete = super::private(&session.join("complete.json")).context(R::RuntimeUnavailable)?;
     let completion: serde_json::Value = serde_json::from_slice(&complete)?;
     ensure!(
         completion["version"] == 1
@@ -300,28 +273,28 @@ fn exact_inventory_row(
             && completion["worker_quiescence"]["quiet_scans"]
                 .as_u64()
                 .is_some_and(|count| count >= 2),
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     let launch = completion["launch_sha256"]
         .as_str()
-        .context("native-transfer-metadata-invalid")?;
+        .context(R::MetadataInvalid)?;
     ensure!(
         launch.len() == 64
             && launch
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     let generation = completion["generation"]
         .as_str()
-        .context("native-transfer-metadata-invalid")?;
+        .context(R::MetadataInvalid)?;
     ensure!(
         generation.starts_with("generation-")
             && generation.len() > 11
             && generation
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     let aliases = root.join(&declared.provider).join("aliases");
     private_directory(&aliases)?;
@@ -333,7 +306,7 @@ fn exact_inventory_row(
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             && session.file_name().and_then(|name| name.to_str()) == Some(&target),
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     let manifest = super::owner_inventory::export_manifest(&session.join(generation))?;
     let actual = RuntimeInventoryRow {
@@ -349,10 +322,10 @@ fn exact_inventory_row(
         alias_sha256: sha(&alias),
         export_manifest_sha256: value_hash(&manifest)?,
     };
-    ensure!(actual == *declared, "native-transfer-metadata-invalid");
+    ensure!(actual == *declared, R::MetadataInvalid);
     Ok(())
 }
-fn handoff_at(
+pub(super) fn handoff_at(
     root: &Path,
     max_state_bytes: u64,
     request: &TransferRequest,
@@ -369,10 +342,10 @@ fn handoff_at(
             receipt.verify(request)?;
             return Ok(receipt);
         }
-        Some(State::Aborted) => anyhow::bail!("native-transfer-authority-conflict"),
+        Some(State::Aborted) => anyhow::bail!(R::AuthorityConflict),
         _ => {}
     }
-    let plan = audit_plan(request, sources, destination)?;
+    let plan = audit_plan(request, sources, destination).context(R::AuditCorrupt)?;
     let paths = inventory_paths(root, &ledger, request)?;
     let _sessions = paths
         .iter()
@@ -384,13 +357,15 @@ fn handoff_at(
     current()?;
     // Read-only destination validation does not append, so overlap/busy/invalid
     // requests leave both source and destination audit bytes unchanged.
-    destination.handoff_destination_ready(&request.destination.owner)?;
+    destination
+        .handoff_destination_ready(&request.destination.owner)
+        .context(R::AuditCorrupt)?;
     ensure!(
         matches!(
             ledger.prepare(request, &plan.endpoints, max_state_bytes)?,
             State::Prepared
         ),
-        "native-transfer-authority-conflict"
+        R::AuthorityConflict
     );
     let digest = request.request_digest()?;
     let mut seals = Vec::new();
@@ -398,7 +373,8 @@ fn handoff_at(
         current()?;
         let proof = source
             .logger
-            .handoff_evidence(&digest, &request.destination.owner, current)?;
+            .handoff_evidence(&digest, &request.destination.owner, current)
+            .context(R::AuditCorrupt)?;
         let seal_sha256 = value_hash(&proof)?;
         for audit_path in source.references {
             seals.push(SealReference {
@@ -429,7 +405,8 @@ mod tests {
     fn policy(f: &Fixture) -> PathBuf {
         let path = f._temporary.path().join("policy.json");
         let value = json!({"version":1,"runtime_config":"/unused-runtime","guest_runtime":"/unused-guest","state_root":f.root,"memory_mb":512,"max_state_bytes":u64::MAX,"max_sessions":8,"providers":{}});
-        super::super::write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
     fn outcome(
@@ -577,7 +554,7 @@ mod tests {
         let mut selected: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
         selected["max_sessions"] = json!(9);
-        super::super::write(&policy_path, &serde_json::to_vec(&selected).unwrap()).unwrap();
+        std::fs::write(&policy_path, &serde_json::to_vec(&selected).unwrap()).unwrap();
         assert_ne!(run(&f, &observed), first);
         policy(&f);
         f.request.inventory[0].completion_sha256 = "c".repeat(64);
@@ -595,13 +572,17 @@ mod tests {
     fn native_handoff_outcome_corrupt_audit_holds_and_unreadable_pending_state_is_unknown() {
         let f = fixture(false);
         std::fs::write(f.sources[0].path(), b"broken private audit fixture").unwrap();
-        assert!(matches!(
-            outcome(&f, &observation(), &|| Ok(())),
-            TransferOutcome::Held {
-                reason: TransferReason::AuditCorrupt,
-                ..
-            }
-        ));
+        let result = outcome(&f, &observation(), &|| Ok(()));
+        assert!(
+            matches!(
+                &result,
+                TransferOutcome::Held {
+                    reason: TransferReason::AuditCorrupt,
+                    ..
+                }
+            ),
+            "wrong corrupt-audit outcome: {result:?}"
+        );
         let f = fixture(false);
         let corrupted = std::cell::Cell::new(false);
         let current = || {
@@ -633,14 +614,29 @@ mod tests {
     }
     #[test]
     fn native_handoff_outcome_live_writer_defers_then_replays_but_interrupted_writer_holds() {
-        let f=fixture(false);
-        let writer=f.sources[0].begin_write().unwrap();
-        assert!(matches!(outcome(&f,&observation(),&||Ok(())),TransferOutcome::Deferred {reason:TransferReason::LockBusy,..}));
+        let f = fixture(false);
+        let writer = f.sources[0].begin_write().unwrap();
+        assert!(matches!(
+            outcome(&f, &observation(), &|| Ok(())),
+            TransferOutcome::Deferred {
+                reason: TransferReason::LockBusy,
+                ..
+            }
+        ));
         writer.complete();
-        assert!(matches!(outcome(&f,&observation(),&||Ok(())),TransferOutcome::Completed(_)));
-        let f=fixture(false);
+        assert!(matches!(
+            outcome(&f, &observation(), &|| Ok(())),
+            TransferOutcome::Completed(_)
+        ));
+        let f = fixture(false);
         drop(f.sources[0].begin_write().unwrap());
-        assert!(matches!(outcome(&f,&observation(),&||Ok(())),TransferOutcome::Held {reason:TransferReason::AuditCorrupt,..}));
+        assert!(matches!(
+            outcome(&f, &observation(), &|| Ok(())),
+            TransferOutcome::Held {
+                reason: TransferReason::AuditCorrupt,
+                ..
+            }
+        ));
     }
     struct Fixture {
         _temporary: tempfile::TempDir,

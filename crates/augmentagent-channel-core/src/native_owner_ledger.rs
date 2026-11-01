@@ -1,5 +1,6 @@
 //! Private transactional authority. Callers still validate filesystem inventory,
 //! audit seals and current workflow fencing before committing through this layer.
+use super::ownership::TransferReason as R;
 use super::ownership::{
     canonical_bytes, Authority, SealReference, TransferReceipt, TransferRequest,
 };
@@ -57,7 +58,7 @@ fn reservation(request: &[u8], claims: &[u8]) -> Result<u64> {
         .and_then(|bytes| bytes.checked_add((SEALS_LIMIT + RECEIPT_LIMIT) as u64))
         .and_then(|bytes| bytes.checked_mul(2))
         .and_then(|bytes| bytes.checked_add(1024 * 1024))
-        .context("native-transfer-history-capacity")
+        .context(R::HistoryCapacity)
 }
 fn required_claims(request: &TransferRequest) -> Result<Vec<Claim>> {
     let mut claims = Vec::new();
@@ -94,32 +95,26 @@ fn claim_set(request: &TransferRequest, endpoints: &[Endpoint]) -> Result<Vec<Cl
             [&endpoint.actual_audit_path, &endpoint.anchor_path]
                 .iter()
                 .all(|path| Path::new(path).is_absolute() && !path.contains('\0')),
-            "native-transfer-invalid-request"
+            R::InvalidRequest
         );
         let identity = (
             endpoint.actual_audit_path.clone(),
             endpoint.anchor_path.clone(),
         );
         if let Some(previous) = declarations.insert(endpoint.audit_path.clone(), identity.clone()) {
-            ensure!(previous == identity, "native-transfer-invalid-request");
+            ensure!(previous == identity, R::InvalidRequest);
         }
         if let Some(previous) = actual_files.insert(
             endpoint.actual_audit_path.clone(),
             endpoint.anchor_path.clone(),
         ) {
-            ensure!(
-                previous == endpoint.anchor_path,
-                "native-transfer-invalid-request"
-            );
+            ensure!(previous == endpoint.anchor_path, R::InvalidRequest);
         }
         if let Some(previous) = anchors.insert(
             endpoint.anchor_path.clone(),
             endpoint.actual_audit_path.clone(),
         ) {
-            ensure!(
-                previous == endpoint.actual_audit_path,
-                "native-transfer-invalid-request"
-            );
+            ensure!(previous == endpoint.actual_audit_path, R::InvalidRequest);
         }
     }
     let mut expected: Vec<_> = request
@@ -130,10 +125,7 @@ fn claim_set(request: &TransferRequest, endpoints: &[Endpoint]) -> Result<Vec<Cl
         .collect();
     expected.sort();
     expected.dedup();
-    ensure!(
-        declarations.keys().eq(expected.iter()),
-        "native-transfer-invalid-request"
-    );
+    ensure!(declarations.keys().eq(expected.iter()), R::InvalidRequest);
     let mut claims = required_claims(request)?;
     for (audit_path, (actual_audit_path, anchor_path)) in declarations {
         let binding = Endpoint {
@@ -204,20 +196,20 @@ fn load(db: &rusqlite::Connection, id: &str) -> Result<Option<Record>> {
     let Some((bytes, digest, claim_bytes, claim_sha, reserved, state, receipt, seals)) = raw else {
         return Ok(None);
     };
-    let request = TransferRequest::parse(&bytes).context("native-transfer-prepared-corrupt")?;
+    let request = TransferRequest::parse(&bytes).context(R::PreparedCorrupt)?;
     ensure!(
         request.transfer_id == id
             && request.request_digest()? == digest
             && encoded(&request)? == bytes
             && reserved == reservation(&bytes, &claim_bytes)?,
-        "native-transfer-prepared-corrupt"
+        R::PreparedCorrupt
     );
     let claims: Vec<Claim> = serde_json::from_slice(&claim_bytes)?;
     ensure!(
         sha(&claim_bytes) == claim_sha
             && encoded(&claims)? == claim_bytes
             && claims.windows(2).all(|pair| pair[0] < pair[1]),
-        "native-transfer-prepared-corrupt"
+        R::PreparedCorrupt
     );
     let bindings = claims
         .iter()
@@ -226,41 +218,38 @@ fn load(db: &rusqlite::Connection, id: &str) -> Result<Option<Record>> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     ensure!(
         claims == claim_set(&request, &bindings)?,
-        "native-transfer-prepared-corrupt"
+        R::PreparedCorrupt
     );
     ensure!(
         sources(db, id)? == request.source_owners,
-        "native-transfer-prepared-corrupt"
+        R::PreparedCorrupt
     );
     let active = actual_claims(db, id)?;
     let state = match state.as_str() {
         "prepared" => {
             ensure!(
                 active == claims && receipt.is_none() && seals.is_none(),
-                "native-transfer-prepared-corrupt"
+                R::PreparedCorrupt
             );
             State::Prepared
         }
         "aborted" => {
             ensure!(
                 active.is_empty() && receipt.is_none() && seals.is_none(),
-                "native-transfer-prepared-corrupt"
+                R::PreparedCorrupt
             );
             State::Aborted
         }
         "completed" => {
-            ensure!(active.is_empty(), "native-transfer-prepared-corrupt");
-            let bytes = receipt.context("native-transfer-prepared-corrupt")?;
-            ensure!(
-                bytes.len() <= RECEIPT_LIMIT,
-                "native-transfer-prepared-corrupt"
-            );
+            ensure!(active.is_empty(), R::PreparedCorrupt);
+            let bytes = receipt.context(R::PreparedCorrupt)?;
+            ensure!(bytes.len() <= RECEIPT_LIMIT, R::PreparedCorrupt);
             let receipt: TransferReceipt = serde_json::from_slice(&bytes)?;
             receipt.verify(&request)?;
-            let seals = seals.context("native-transfer-prepared-corrupt")?;
+            let seals = seals.context(R::PreparedCorrupt)?;
             ensure!(
                 seals.len() <= SEALS_LIMIT && seals == encoded(&receipt.source_seals)?,
-                "native-transfer-prepared-corrupt"
+                R::PreparedCorrupt
             );
             let mut query=db.prepare("SELECT ordinal,runtime FROM native_transfer_link WHERE transfer_id=?1 ORDER BY ordinal")?;
             let links = query
@@ -276,7 +265,7 @@ fn load(db: &rusqlite::Connection, id: &str) -> Result<Option<Record>> {
                         .enumerate()
                         .map(|(index, row)| (index, row.runtime_relative_path.clone()))
                         .collect::<Vec<_>>(),
-                "native-transfer-prepared-corrupt"
+                R::PreparedCorrupt
             );
             let mut query=db.prepare("SELECT workflow,generation,audit_path FROM native_transfer_close WHERE transfer_id=?1 ORDER BY generation,audit_path")?;
             let closed = query
@@ -290,13 +279,10 @@ fn load(db: &rusqlite::Connection, id: &str) -> Result<Option<Record>> {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(
-                closed == request.source_owners,
-                "native-transfer-prepared-corrupt"
-            );
+            ensure!(closed == request.source_owners, R::PreparedCorrupt);
             State::Completed(receipt)
         }
-        _ => anyhow::bail!("native-transfer-prepared-corrupt"),
+        _ => anyhow::bail!(R::PreparedCorrupt),
     };
     Ok(Some(Record {
         request,
@@ -316,12 +302,10 @@ fn transfer_closed(db: &rusqlite::Connection, owner: &RuntimeOwner) -> Result<bo
     if let Some(id) = id {
         ensure!(
             matches!(
-                load(db, &id)?
-                    .context("native-transfer-prepared-corrupt")?
-                    .state,
+                load(db, &id)?.context(R::PreparedCorrupt)?.state,
                 State::Completed(_)
             ),
-            "native-transfer-prepared-corrupt"
+            R::PreparedCorrupt
         );
         return Ok(true);
     }
@@ -345,12 +329,10 @@ fn conflict(db: &rusqlite::Connection, owner: &RuntimeOwner) -> Result<bool> {
     for id in &ids {
         ensure!(
             matches!(
-                load(db, id)?
-                    .context("native-transfer-prepared-corrupt")?
-                    .state,
+                load(db, id)?.context(R::PreparedCorrupt)?.state,
                 State::Aborted
             ),
-            "native-transfer-prepared-corrupt"
+            R::PreparedCorrupt
         );
     }
     Ok(!ids.is_empty())
@@ -362,18 +344,15 @@ fn growth(db: &rusqlite::Connection) -> Result<u64> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut total = 0u64;
     for id in ids {
-        let record = load(db, &id)?.context("native-transfer-prepared-corrupt")?;
-        ensure!(
-            matches!(record.state, State::Prepared),
-            "native-transfer-prepared-corrupt"
-        );
+        let record = load(db, &id)?.context(R::PreparedCorrupt)?;
+        ensure!(matches!(record.state, State::Prepared), R::PreparedCorrupt);
         total = total
             .checked_add(record.reserved)
-            .context("native-transfer-history-capacity")?;
+            .context(R::HistoryCapacity)?;
     }
     Ok(total)
 }
-fn history_bytes(root: &Path) -> Result<u64> {
+pub(super) fn history_bytes(root: &Path) -> Result<u64> {
     let mut bytes = 0u64;
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let path = root.join(format!("runtime-retirement.sqlite{suffix}"));
@@ -384,11 +363,9 @@ fn history_bytes(root: &Path) -> Result<u64> {
                         && info.uid() == unsafe { libc::geteuid() }
                         && info.mode() & 0o077 == 0
                         && info.nlink() == 1,
-                    "native-transfer-prepared-corrupt"
+                    R::PreparedCorrupt
                 );
-                bytes = bytes
-                    .checked_add(info.len())
-                    .context("native-transfer-history-capacity")?;
+                bytes = bytes.checked_add(info.len()).context(R::HistoryCapacity)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -402,7 +379,7 @@ impl<'a> Ledger<'a> {
         let current = root.join("state.lock").symlink_metadata()?;
         ensure!(
             held.dev() == current.dev() && held.ino() == current.ino(),
-            "native-transfer-lock-busy"
+            R::LockBusy
         );
         let db = super::retirement_db(root)?;
         db.pragma_update(None, "foreign_keys", "ON")?;
@@ -421,12 +398,12 @@ impl<'a> Ledger<'a> {
                 [],
                 |row| row.get::<_, i64>(0)
             )? == 1,
-            "native-transfer-prepared-corrupt"
+            R::PreparedCorrupt
         );
         {
             let mut check = db.prepare("PRAGMA foreign_key_check")?;
             let mut rows = check.query([])?;
-            ensure!(rows.next()?.is_none(), "native-transfer-prepared-corrupt");
+            ensure!(rows.next()?.is_none(), R::PreparedCorrupt);
         }
         growth(&db)?;
         std::fs::File::open(root)?.sync_all()?;
@@ -478,15 +455,13 @@ impl<'a> Ledger<'a> {
         endpoints: &[Endpoint],
         max_state_bytes: u64,
     ) -> Result<State> {
-        request
-            .validate()
-            .context("native-transfer-invalid-request")?;
+        request.validate().context(R::InvalidRequest)?;
         let claims = claim_set(request, endpoints)?;
         let request_bytes = encoded(request)?;
         if let Some(prior) = load(&self.db, &request.transfer_id)? {
             ensure!(
                 prior.request == *request && prior.claims == claims,
-                "native-transfer-authority-conflict"
+                R::AuthorityConflict
             );
             return Ok(prior.state);
         }
@@ -497,7 +472,7 @@ impl<'a> Ledger<'a> {
         {
             ensure!(
                 !closed(&self.db, &owner.owner)? && !conflict(&self.db, &owner.owner)?,
-                "native-transfer-authority-conflict"
+                R::AuthorityConflict
             );
         }
         for claim in &claims {
@@ -507,11 +482,11 @@ impl<'a> Ledger<'a> {
                     params![claim.kind, claim.key],
                     |row| row.get::<_, bool>(0)
                 )?,
-                "native-transfer-lock-busy"
+                R::LockBusy
             );
         }
         let reserved = reservation(&request_bytes, &encoded(&claims)?)?;
-        ensure!(reserved <= HISTORY_LIMIT, "native-transfer-invalid-request");
+        ensure!(reserved <= HISTORY_LIMIT, R::InvalidRequest);
         let outstanding = growth(&self.db)?;
         let mut paths: Vec<_> = request
             .source_owners
@@ -533,14 +508,14 @@ impl<'a> Ledger<'a> {
         ensure!(
             encoded(&preview)?.len() <= RECEIPT_LIMIT
                 && encoded(&preview.source_seals)?.len() <= SEALS_LIMIT,
-            "native-transfer-invalid-request"
+            R::InvalidRequest
         );
         ensure!(
             history_bytes(self.root)?
                 .checked_add(outstanding)
                 .and_then(|bytes| bytes.checked_add(reserved))
                 .is_some_and(|bytes| bytes <= HISTORY_LIMIT),
-            "native-transfer-history-capacity"
+            R::HistoryCapacity
         );
         ensure!(
             super::tree_bytes(self.root)?
@@ -551,7 +526,7 @@ impl<'a> Ledger<'a> {
                     >= super::SESSION_BYTES
                         .saturating_add(outstanding)
                         .saturating_add(reserved),
-            "native-transfer-state-capacity"
+            R::StateCapacity
         );
         let transaction = self
             .db
@@ -585,30 +560,23 @@ impl<'a> Ledger<'a> {
     ) -> Result<TransferReceipt> {
         let expected = TransferReceipt::for_request(request, seals)?;
         if let Some(record) = load(&self.db, &request.transfer_id)? {
-            ensure!(
-                record.request == *request,
-                "native-transfer-authority-conflict"
-            );
+            ensure!(record.request == *request, R::AuthorityConflict);
             if let State::Completed(receipt) = record.state {
-                ensure!(receipt == expected, "native-transfer-audit-corrupt");
+                ensure!(receipt == expected, R::AuditCorrupt);
                 return Ok(receipt);
             }
         }
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let record = load(&transaction, &request.transfer_id)?
-            .context("native-transfer-prepared-corrupt")?;
-        ensure!(
-            record.request == *request,
-            "native-transfer-authority-conflict"
-        );
+        let record = load(&transaction, &request.transfer_id)?.context(R::PreparedCorrupt)?;
+        ensure!(record.request == *request, R::AuthorityConflict);
         match record.state {
             State::Completed(receipt) => {
-                ensure!(receipt == expected, "native-transfer-audit-corrupt");
+                ensure!(receipt == expected, R::AuditCorrupt);
                 return Ok(receipt);
             }
-            State::Aborted => anyhow::bail!("native-transfer-authority-conflict"),
+            State::Aborted => anyhow::bail!(R::AuthorityConflict),
             State::Prepared => {}
         }
         for owner in request
@@ -618,7 +586,7 @@ impl<'a> Ledger<'a> {
         {
             ensure!(
                 !closed(&transaction, &owner.owner)? && !conflict(&transaction, &owner.owner)?,
-                "native-transfer-authority-conflict"
+                R::AuthorityConflict
             );
         }
         for row in &request.inventory {
@@ -634,14 +602,14 @@ impl<'a> Ledger<'a> {
             ensure!(
                 source.owner == row.effective_owner
                     && source.audit_path == row.effective_audit_path,
-                "native-transfer-authority-conflict"
+                R::AuthorityConflict
             );
         }
         let bytes = encoded(&expected)?;
         let seals = encoded(&expected.source_seals)?;
         ensure!(
             bytes.len() <= RECEIPT_LIMIT && seals.len() <= SEALS_LIMIT,
-            "native-transfer-history-capacity"
+            R::HistoryCapacity
         );
         for (index, row) in request.inventory.iter().enumerate() {
             transaction.execute(
@@ -682,7 +650,7 @@ impl<'a> Ledger<'a> {
             Path::new(audit_path).is_absolute()
                 && !owner.workflow_id.is_empty()
                 && owner.lease_generation >= 0,
-            "native-transfer-invalid-request"
+            R::InvalidRequest
         );
         let transaction = self
             .db
@@ -707,12 +675,10 @@ impl<'a> Ledger<'a> {
         for id in &ids {
             ensure!(
                 matches!(
-                    load(&transaction, id)?
-                        .context("native-transfer-prepared-corrupt")?
-                        .state,
+                    load(&transaction, id)?.context(R::PreparedCorrupt)?.state,
                     State::Prepared
                 ),
-                "native-transfer-prepared-corrupt"
+                R::PreparedCorrupt
             );
         }
         for id in ids {
@@ -749,15 +715,15 @@ fn resolve(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, index) in links {
-        let record = load(db, &id)?.context("native-transfer-prepared-corrupt")?;
+        let record = load(db, &id)?.context(R::PreparedCorrupt)?;
         let State::Completed(receipt) = record.state else {
-            anyhow::bail!("native-transfer-prepared-corrupt")
+            anyhow::bail!(R::PreparedCorrupt)
         };
         let row = record
             .request
             .inventory
             .get(index)
-            .context("native-transfer-prepared-corrupt")?;
+            .context(R::PreparedCorrupt)?;
         ensure!(
             row.runtime_relative_path == runtime
                 && row.creation_owner == creation.owner
@@ -765,14 +731,11 @@ fn resolve(
                 && row.creation_receipt_sha256 == creation_sha256
                 && row.effective_owner == authority.owner
                 && row.effective_audit_path == authority.audit_path,
-            "native-transfer-metadata-invalid"
+            R::MetadataInvalid
         );
         authority = receipt.destination;
     }
-    ensure!(
-        !transfer_closed(db, &authority.owner)?,
-        "native-transfer-prepared-corrupt"
-    );
+    ensure!(!transfer_closed(db, &authority.owner)?, R::PreparedCorrupt);
     Ok(authority)
 }
 #[cfg(test)]

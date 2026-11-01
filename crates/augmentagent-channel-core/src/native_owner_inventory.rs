@@ -1,4 +1,5 @@
 //! Derive an immutable manifest of the exact completed native export bytes.
+use super::ownership::TransferReason as R;
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -20,7 +21,7 @@ fn private_metadata(info: &Metadata, directory: bool) -> Result<()> {
             } else {
                 info.is_file() && info.nlink() == 1
             },
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     Ok(())
 }
@@ -36,14 +37,14 @@ fn unchanged(path: &Path, original: &Metadata, current: &Metadata) -> Result<()>
             && original.mtime_nsec() == current.mtime_nsec()
             && original.ctime() == current.ctime()
             && original.ctime_nsec() == current.ctime_nsec(),
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     let named = path.symlink_metadata()?;
     ensure!(
         named.dev() == current.dev()
             && named.ino() == current.ino()
             && !named.file_type().is_symlink(),
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     Ok(())
 }
@@ -58,7 +59,7 @@ fn directory(path: &Path, generation_root: bool) -> Result<(File, Metadata)> {
     // root prevents other users from reaching them; never rewrite saved exports.
     ensure!(
         !generation_root || info.mode() & 0o077 == 0,
-        "native-transfer-metadata-invalid"
+        R::MetadataInvalid
     );
     Ok((file, info))
 }
@@ -75,32 +76,26 @@ pub(super) fn export_manifest(root: &Path) -> Result<Value> {
             let relative = path
                 .strip_prefix(root)?
                 .to_str()
-                .context("native-transfer-metadata-invalid")?
+                .context(R::MetadataInvalid)?
                 .to_string();
             ensure!(
                 !relative.is_empty()
                     && relative
                         .split('/')
                         .all(|part| !part.is_empty() && part != "." && part != ".."),
-                "native-transfer-metadata-invalid"
+                R::MetadataInvalid
             );
             let info = path.symlink_metadata()?;
-            ensure!(
-                !info.file_type().is_symlink(),
-                "native-transfer-metadata-invalid"
-            );
+            ensure!(!info.file_type().is_symlink(), R::MetadataInvalid);
             if info.is_dir() {
                 private_metadata(&info, true)?;
                 directories += 1;
-                ensure!(
-                    directories <= MAX_DIRECTORIES,
-                    "native-transfer-state-capacity"
-                );
+                ensure!(directories <= MAX_DIRECTORIES, R::StateCapacity);
                 entries.push(json!({"kind":"directory","path":relative}));
                 stack.push(path);
             } else {
                 files += 1;
-                ensure!(files <= MAX_FILES, "native-transfer-state-capacity");
+                ensure!(files <= MAX_FILES, R::StateCapacity);
                 private_metadata(&info, false)?;
                 let mut file = OpenOptions::new()
                     .read(true)
@@ -111,8 +106,8 @@ pub(super) fn export_manifest(root: &Path) -> Result<Value> {
                 unchanged(&path, &info, &before)?;
                 total_bytes = total_bytes
                     .checked_add(before.len())
-                    .context("native-transfer-state-capacity")?;
-                ensure!(total_bytes <= MAX_BYTES, "native-transfer-state-capacity");
+                    .context(R::StateCapacity)?;
+                ensure!(total_bytes <= MAX_BYTES, R::StateCapacity);
                 let mut sha = Sha256::new();
                 let mut bytes = 0u64;
                 let mut buffer = [0u8; 65536];
@@ -121,13 +116,11 @@ pub(super) fn export_manifest(root: &Path) -> Result<Value> {
                     if count == 0 {
                         break;
                     }
-                    bytes = bytes
-                        .checked_add(count as u64)
-                        .context("native-transfer-state-capacity")?;
-                    ensure!(bytes <= before.len(), "native-transfer-metadata-invalid");
+                    bytes = bytes.checked_add(count as u64).context(R::StateCapacity)?;
+                    ensure!(bytes <= before.len(), R::MetadataInvalid);
                     sha.update(&buffer[..count]);
                 }
-                ensure!(bytes == before.len(), "native-transfer-metadata-invalid");
+                ensure!(bytes == before.len(), R::MetadataInvalid);
                 unchanged(&path, &before, &file.metadata()?)?;
                 entries.push(json!({"kind":"file","path":relative,"bytes":bytes,"sha256":format!("{:x}",sha.finalize())}));
             }

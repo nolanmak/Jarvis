@@ -368,6 +368,13 @@ impl std::fmt::Debug for AuditLogger {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct AuditWritersBusy;
+impl std::fmt::Display for AuditWritersBusy {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("workflow audit writers have not drained")}
+}
+impl std::error::Error for AuditWritersBusy {}
+
 impl AuditLogger {
     /// Healthy runtime ownership handoff, distinct from interrupted recovery.
     pub fn handoff_evidence(&self,request_sha256:&str,destination:&crate::native_vm::RuntimeOwner,assert_current:&dyn Fn()->anyhow::Result<()>)->anyhow::Result<serde_json::Value> {
@@ -761,7 +768,7 @@ impl AuditLogger {
             self.pending_writers
                 .load(std::sync::atomic::Ordering::Acquire)
                 == 0,
-            "workflow audit writers have not drained"
+            AuditWritersBusy
         );
         if let Some(dir) = &self.pending_dir {
             anyhow::ensure!(

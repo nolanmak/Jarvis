@@ -1,6 +1,8 @@
 //! Bounded controller results. Only `public_status` is suitable for transport.
 use super::ownership::{TransferReceipt, TransferRequest};
 use crate::tool_audit::AuditLogger;
+use sha2::{Digest, Sha256};
+use std::os::unix::fs::MetadataExt;
 use std::{path::Path, sync::Arc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,15 +132,289 @@ pub fn transfer(
 }
 
 pub(super) fn transfer_with_policy(
-    _policy: Option<&Path>,
+    policy_path: Option<&Path>,
     request: &TransferRequest,
-    _observation: &TransferObservation,
-    _sources: &[Arc<AuditLogger>],
-    _destination: &Arc<AuditLogger>,
-    _current: &dyn Fn() -> Result<(), TransferFenceError>,
+    observation: &TransferObservation,
+    sources: &[Arc<AuditLogger>],
+    destination: &Arc<AuditLogger>,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> TransferOutcome {
-    TransferOutcome::Unknown {
-        reason: TransferReason::PendingUnknown,
-        transfer_id: request.transfer_id.clone(),
+    use super::owner_ledger::{Ledger, State};
+    use TransferReason as R;
+    let mut context = FingerprintContext::new(request, observation);
+    let preflight_hold =
+        if request.validate().is_err() || observation.revision == 0 || !digest(&observation.sha256)
+        {
+            Some(R::InvalidRequest)
+        } else if !observation.certain {
+            Some(R::ConversationUncertain)
+        } else {
+            None
+        };
+    let Some(policy_path) = policy_path else {
+        return context.failure(
+            preflight_hold.unwrap_or(R::RuntimeUnavailable),
+            "missing-policy",
+        );
+    };
+    let bytes = match super::private(policy_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let (reason, category) = classify(&error);
+            return context.failure(
+                preflight_hold.unwrap_or(if reason == R::InventoryMissing {
+                    R::RuntimeUnavailable
+                } else {
+                    reason
+                }),
+                category,
+            );
+        }
+    };
+    context.policy_sha256 = Some(sha(&bytes));
+    let policy: super::Policy = match serde_json::from_slice(&bytes) {
+        Ok(policy) => policy,
+        Err(_) => return context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none"),
+    };
+    if policy.version != 1
+        || !(512..=4096).contains(&policy.memory_mb)
+        || policy.max_state_bytes < super::SESSION_BYTES
+        || policy.max_sessions == 0
+    {
+        return context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none");
+    }
+    let root = match policy.state_root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            let (reason, category) = classify(&error.into());
+            return context.failure(preflight_hold.unwrap_or(reason), category);
+        }
+    };
+    match root.metadata() {
+        Ok(info) => {
+            if !info.is_dir()
+                || info.uid() != unsafe { libc::geteuid() }
+                || info.mode() & 0o077 != 0
+            {
+                return context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none");
+            }
+            context.root_identity_sha256 =
+                Some(sha(format!("{}:{}", info.dev(), info.ino()).as_bytes()));
+        }
+        Err(error) => {
+            let (reason, category) = classify(&error.into());
+            return context.failure(preflight_hold.unwrap_or(reason), category);
+        }
+    }
+    if let Some(reason) = preflight_hold {
+        return context.failure(reason, "none");
+    }
+    if let Err(error) = current() {
+        let (reason, category) = classify(&error.into());
+        return context.failure(reason, category);
+    }
+    let fence = || current().map_err(anyhow::Error::new);
+    let error = match super::owner_handoff::handoff_at(
+        &root,
+        policy.max_state_bytes,
+        request,
+        sources,
+        destination,
+        &fence,
+    ) {
+        Ok(receipt) => return TransferOutcome::Completed(receipt),
+        Err(error) => error,
+    };
+    // The error may follow a durable commit. Inspect exactly this UUID under
+    // the same state lock before classifying; never invent a replacement ID.
+    let known = (|| -> anyhow::Result<Option<State>> {
+        let lock = super::StateLock::acquire(&root)?;
+        let ledger = Ledger::open(&root, &lock)?;
+        let state = ledger.state(&request.transfer_id)?;
+        context.free_class = super::available_bytes(&root)
+            .ok()
+            .map(|bytes| bytes / super::SESSION_BYTES);
+        context.reserved_class = ledger
+            .reserved_bytes()
+            .ok()
+            .map(|bytes| bytes / (1024 * 1024));
+        context.history_class = super::owner_ledger::history_bytes(&root)
+            .ok()
+            .map(|bytes| bytes / (1024 * 1024));
+        Ok(state)
+    })();
+    match known {
+        Ok(Some(State::Completed(receipt))) => {
+            if receipt.verify(request).is_ok() {
+                TransferOutcome::Completed(receipt)
+            } else {
+                context.failure(R::PreparedCorrupt, "none")
+            }
+        }
+        Ok(Some(State::Aborted)) => context.failure(R::AuthorityConflict, "none"),
+        Ok(_) => {
+            let (reason, category) = classify(&error);
+            context.failure(reason, category)
+        }
+        Err(_) => TransferOutcome::Unknown {
+            reason: R::PendingUnknown,
+            transfer_id: request.transfer_id.clone(),
+        },
+    }
+}
+
+fn sha(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+struct FingerprintContext<'a> {
+    request_sha256: String,
+    observation: &'a TransferObservation,
+    policy_sha256: Option<String>,
+    root_identity_sha256: Option<String>,
+    free_class: Option<u64>,
+    reserved_class: Option<u64>,
+    history_class: Option<u64>,
+}
+impl<'a> FingerprintContext<'a> {
+    fn new(request: &TransferRequest, observation: &'a TransferObservation) -> Self {
+        // The request contains only strings, arrays and integers. Keep even an
+        // invalid request's bounded projection distinct without exposing it.
+        let request_sha256 = sha(
+            &super::ownership::canonical_bytes(&serde_json::json!(request)).unwrap_or_default(),
+        );
+        Self {
+            request_sha256,
+            observation,
+            policy_sha256: None,
+            root_identity_sha256: None,
+            free_class: None,
+            reserved_class: None,
+            history_class: None,
+        }
+    }
+    fn failure(&self, reason: TransferReason, io_category: &str) -> TransferOutcome {
+        use TransferReason as R;
+        let mut value = serde_json::json!({"version":1,"reason":reason.code(),"request_sha256":self.request_sha256,
+            "policy_sha256":self.policy_sha256,"root_identity_sha256":self.root_identity_sha256,
+            "observation_revision":self.observation.revision,"observation_sha256":self.observation.sha256,"certain":self.observation.certain});
+        if matches!(reason, R::LockBusy | R::StateCapacity | R::HistoryCapacity) {
+            value["capacity"] = serde_json::json!({"free_gib":self.free_class,"reserved_mib":self.reserved_class,"history_mib":self.history_class});
+        }
+        if reason == R::PersistRetry {
+            value["io_category"] = serde_json::json!(io_category);
+        }
+        let fingerprint = sha(&super::ownership::canonical_bytes(&value).unwrap_or_default());
+        if matches!(
+            reason,
+            R::LockBusy
+                | R::StateCapacity
+                | R::HistoryCapacity
+                | R::InventoryMissing
+                | R::RuntimeUnavailable
+                | R::PersistRetry
+        ) {
+            TransferOutcome::Deferred {
+                reason,
+                fingerprint,
+            }
+        } else {
+            TransferOutcome::Held {
+                reason,
+                fingerprint,
+            }
+        }
+    }
+}
+fn classify(error: &anyhow::Error) -> (TransferReason, &'static str) {
+    use TransferReason as R;
+    for cause in error.chain() {
+        if let Some(fence) = cause.downcast_ref::<TransferFenceError>() {
+            return match fence {
+                TransferFenceError::NotCurrent => (R::AuthorityConflict, "none"),
+                TransferFenceError::Unavailable => (R::PersistRetry, "fence-unavailable"),
+            };
+        }
+        if cause.is::<crate::tool_audit::AuditWritersBusy>()
+            || cause.is::<crate::run_resources::ResourceNotQuiescent>()
+        {
+            return (R::LockBusy, "none");
+        }
+    }
+    let io = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    if let Some(error) = io {
+        match error.raw_os_error() {
+            Some(libc::ENOSPC) | Some(libc::EDQUOT) => return (R::StateCapacity, "space"),
+            Some(libc::ELOOP) | Some(libc::ENOTDIR) => return (R::MetadataInvalid, "none"),
+            Some(libc::EBUSY) | Some(libc::ENOTEMPTY) | Some(libc::EAGAIN) => {
+                return (R::LockBusy, "busy")
+            }
+            _ => (),
+        }
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return (
+                R::PersistRetry,
+                match error.kind() {
+                    std::io::ErrorKind::PermissionDenied => "permission",
+                    std::io::ErrorKind::Interrupted => "interrupted",
+                    std::io::ErrorKind::TimedOut => "timeout",
+                    _ => "io",
+                },
+            );
+        }
+    }
+    let sqlite = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<augmentagent_store::rusqlite::Error>());
+    if let Some(error) = sqlite {
+        use augmentagent_store::rusqlite::ErrorCode;
+        match error.sqlite_error_code() {
+            Some(ErrorCode::DiskFull) => return (R::StateCapacity, "space"),
+            Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked) => {
+                return (R::LockBusy, "busy")
+            }
+            Some(ErrorCode::SystemIoFailure) | Some(ErrorCode::CannotOpen) => {
+                return (R::PersistRetry, "sqlite-io")
+            }
+            _ => (),
+        }
+    }
+    // Anyhow's typed contexts require its own downcast. Prefer a specific
+    // underlying typed reason, then fall back to the outer typed context.
+    if let Some(reason) = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<R>())
+        .last()
+        .or_else(|| error.downcast_ref::<R>())
+    {
+        return (*reason, "none");
+    }
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<augmentagent_store::rusqlite::Error>())
+    {
+        use augmentagent_store::rusqlite::ErrorCode;
+        return match error.sqlite_error_code() {
+            Some(ErrorCode::DiskFull) => (R::StateCapacity, "space"),
+            Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked) => {
+                (R::LockBusy, "busy")
+            }
+            Some(ErrorCode::SystemIoFailure) | Some(ErrorCode::CannotOpen) => {
+                (R::PersistRetry, "sqlite-io")
+            }
+            _ => (R::PreparedCorrupt, "none"),
+        };
+    }
+    if io.is_some() {
+        (R::InventoryMissing, "missing")
+    } else {
+        (R::MetadataInvalid, "none")
     }
 }
