@@ -383,8 +383,8 @@ fn approval_embed_and_rows(
         .title(if composed && email.platform == "imessage" { "New message · iMessage".to_string() } else { truncate(&email.subject, 256) })
         .description(description)
         .field(if composed { "To" } else { "From" }, truncate(&email.from, 256), true);
-    // #1738 — an iMessage group reply goes to every member; say so.
-    if !composed && email.platform == "imessage" && !email.to.trim().is_empty() {
+    // #1738/#1764 — a group reply goes to every member; say so.
+    if !composed && matches!(email.platform.as_str(), "imessage" | "whatsapp") && !email.to.trim().is_empty() {
         embed = embed.field("To (group)", truncate(&email.to, 256), true);
     }
     let mut embed = embed.field("MessageId", truncate(&email.message_id, 256), true);
@@ -1821,6 +1821,11 @@ mod tests {
         assert!(names.iter().any(|n| n.starts_with("From=")), "{names:?}");
         e.to.clear();
         assert!(!field_names(&e).iter().any(|n| n.starts_with("To")), "1:1 cards unchanged");
+        // #1764 — WhatsApp archive group cards render the same field.
+        e.platform = "whatsapp".into();
+        e.subject = "WhatsApp group: Ski Trip".into();
+        e.to = "Jo <+15555550100>, Ana <+15555550111>".into(); // pii-ok synthetic
+        assert!(field_names(&e).contains(&"To (group)=Jo <+15555550100>, Ana <+15555550111>".to_string())); // pii-ok synthetic
     }
 
     /// #1635 — a composed message (Slack/iMessage `kind = compose`) has no

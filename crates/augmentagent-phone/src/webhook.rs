@@ -40,7 +40,7 @@ impl WebhookAuth {
         Ok(())
     }
 }
-fn field<'a>(fields: &'a [(String, String)], name: &str) -> Result<&'a str, Error> {
+pub(crate) fn field<'a>(fields: &'a [(String, String)], name: &str) -> Result<&'a str, Error> {
     let mut matches = fields.iter().filter(|(k, _)| k == name);
     let (_, value) = matches.next().ok_or(Error::InvalidArguments)?;
     if matches.next().is_some() {
@@ -137,6 +137,15 @@ impl PhoneService {
         signature: &str,
     ) -> Result<(), Error> {
         let (_, sid) = self.callback_call(auth, "status", id, fields, signature)?;
+        self.apply_status(id, &sid, fields, false)
+    }
+    pub(crate) fn apply_status(
+        &self,
+        id: &str,
+        sid: &str,
+        fields: &[(String, String)],
+        inbound: bool,
+    ) -> Result<(), Error> {
         let state = match field(fields, "CallStatus")? {
             "queued" | "initiated" => CallState::Queued,
             "ringing" => CallState::Ringing,
@@ -148,7 +157,7 @@ impl PhoneService {
             "failed" => CallState::Failed,
             _ => return Err(Error::InvalidArguments),
         };
-        let usage = if fields.iter().any(|(name, _)| name == "CallDuration") {
+        let duration = if fields.iter().any(|(name, _)| name == "CallDuration") {
             let seconds = field(fields, "CallDuration")?;
             if !state.terminal()
                 || seconds.is_empty()
@@ -156,9 +165,15 @@ impl PhoneService {
             {
                 return Err(Error::InvalidArguments);
             }
-            let duration_seconds = seconds
-                .parse::<i64>()
-                .map_err(|_| Error::InvalidArguments)?;
+            Some(seconds.parse::<i64>().map_err(|_| Error::InvalidArguments)?)
+        } else {
+            None
+        };
+        // Number-level inbound callbacks may omit event Timestamp. Recover
+        // authoritative final duration/end time through the existing worker.
+        let usage = if let Some(duration_seconds) = duration
+            .filter(|_| !inbound || fields.iter().any(|(name, _)| name == "Timestamp"))
+        {
             // Callback receipt time is not the call end time: delivery can be
             // late or cross midnight. Configured progress callbacks carry the
             // signed RFC 2822 event Timestamp alongside CallDuration (seconds).
@@ -173,11 +188,12 @@ impl PhoneService {
             None
         };
         self.store
-            .phone_provider_event_with_usage(id, &sid, state, self.clock.now_ms(), usage)?;
+            .phone_provider_event_with_usage(id, sid, state, self.clock.now_ms(), usage)?;
         if state.terminal() {
             // #1552: also covers a relay-ended callback that never arrived.
             // Calls that never reached the relay are not enqueued.
-            self.store.phone_enqueue_call_summary(id, self.clock.now_ms())?;
+            self.store
+                .phone_enqueue_call_summary(id, self.clock.now_ms())?;
         }
         Ok(())
     }
@@ -190,6 +206,7 @@ impl PhoneService {
     ) -> Result<String, Error> {
         let (call, sid) = self.callback_call(auth, "start", id, fields, signature)?;
         if call.verification || call.stop_requested || call.state.terminal() || !self.config.enabled
+            || self.store.phone_is_inbound(id)?
         {
             return Ok(HANGUP.into());
         }
@@ -229,6 +246,7 @@ impl PhoneService {
     ) -> Result<String, Error> {
         let (call, sid) = self.callback_call(auth, "accept", id, fields, signature)?;
         if call.verification || call.stop_requested || call.state.terminal() || !self.config.enabled
+            || self.store.phone_is_inbound(id)?
         {
             return Ok(HANGUP.into());
         }
@@ -247,7 +265,7 @@ impl PhoneService {
         }
         self.connection_twiml(id)
     }
-    fn connection_twiml(&self, id: &str) -> Result<String, Error> {
+    pub(crate) fn connection_twiml(&self, id: &str) -> Result<String, Error> {
         if self.store.phone_voice_backend(id)? == "openai_live" {
             if self.config.live.is_none() { return Err(Error::NotConfigured); }
             let ws = self.config.public_base.replacen("https://", "wss://", 1);

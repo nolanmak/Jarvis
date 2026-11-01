@@ -32,10 +32,10 @@ pub const COMPOSE_KIND: &str = "compose";
 
 /// Appended to the trusted part of the triage prompt for a group card
 /// (#1738). The group's title and members ride in the card's Subject/To.
-pub const GROUP_TRIAGE_POLICY: &str = "\n\nThis message is from an iMessage GROUP chat (members in To; the owner's own entries are marked `me`). The bar for \"reply\" is higher than in a 1:1: choose \"reply\" only when the newest message addresses the owner (by name, a direct question to them, or an answer to something they said) or asks something that is clearly the owner's to answer. General chatter, reactions, logistics between other members and questions addressed to someone else are \"skip\", not \"flag\". Choose \"flag\" only for something important the owner must see today.";
+pub const GROUP_TRIAGE_POLICY: &str = "\n\nThis message is from a GROUP chat (members in To; the owner's own entries are marked `me`). The bar for \"reply\" is higher than in a 1:1: choose \"reply\" only when the newest message addresses the owner (by name, a direct question to them, or an answer to something they said) or asks something that is clearly the owner's to answer. General chatter, reactions, logistics between other members and questions addressed to someone else are \"skip\", not \"flag\". Choose \"flag\" only for something important the owner must see today.";
 
 /// Appended to the draft prompt for a group card (#1738).
-pub const GROUP_DRAFT_NOTE: &str = "\n\nThis reply goes to the whole iMessage group (members in To). Write one short message to the group; name the person you are answering when it would otherwise be unclear.";
+pub const GROUP_DRAFT_NOTE: &str = "\n\nThis reply goes to the whole group (members in To). Write one short message to the group; name the person you are answering when it would otherwise be unclear.";
 
 #[derive(Debug, Clone)]
 pub struct ImessageReplyConfig {
@@ -83,8 +83,19 @@ pub fn reply_email(delta: &PollDelta) -> Option<Email> {
         return None;
     }
     let mut email = synthetic_imessage_email(conv, *idx, newest);
-    let start = delta.new_entries.len().saturating_sub(CONTEXT_ENTRIES);
-    email.body = delta.new_entries[start..]
+    email.body = context_body(&delta.new_entries);
+    if conv.is_group() {
+        email.subject = format!("iMessage group: {}", conv.title);
+        email.to = conv.participants.join(", ");
+    }
+    Some(email)
+}
+
+/// The last [`CONTEXT_ENTRIES`] entries as a card body, newest last. Shared
+/// by every bundle-backed replier (iMessage, WhatsApp #1764).
+pub fn context_body(entries: &[(usize, crate::bundle::MessageEntry)]) -> String {
+    let start = entries.len().saturating_sub(CONTEXT_ENTRIES);
+    entries[start..]
         .iter()
         .map(|(_, e)| {
             let mut s = format!("### [{}] {}\n{}", e.timestamp, e.sender, e.body);
@@ -95,18 +106,25 @@ pub fn reply_email(delta: &PollDelta) -> Option<Email> {
             s
         })
         .collect::<Vec<_>>()
-        .join("\n\n");
-    if conv.is_group() {
-        email.subject = format!("iMessage group: {}", conv.title);
-        email.to = conv.participants.join(", ");
-    }
-    Some(email)
+        .join("\n\n")
 }
 
-enum Handled {
+/// What [`draft_card`] did with one card email.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handled {
     Card { superseded: usize },
     Skipped,
     Flagged,
+}
+
+/// The platform-neutral half of a bundle reply: triage, then draft, then one
+/// approval card that supersedes the thread's older card. Platforms keep
+/// their own gating (allowlists, own-send echoes) and call this (#1764).
+pub struct CardDrafter<'a> {
+    pub store: &'a Store,
+    pub reasoner: &'a dyn Reasoner,
+    pub approvals: &'a dyn ApprovalBroker,
+    pub config: &'a ImessageReplyConfig,
 }
 
 /// True when every new entry is the agent's own send coming back, so the
@@ -267,6 +285,19 @@ impl ImessageReplier {
         stats
     }
 
+    async fn handle_one(&self, email: Email, group: bool) -> anyhow::Result<Handled> {
+        CardDrafter {
+            store: &self.store,
+            reasoner: self.reasoner.as_ref(),
+            approvals: self.approvals.as_ref(),
+            config: &self.config,
+        }
+        .draft(email, group, "superseded by a newer iMessage")
+        .await
+    }
+}
+
+impl CardDrafter<'_> {
     fn log(&self, email: &Email, draft: Option<&str>, status: ActionStatus) -> anyhow::Result<String> {
         Ok(self.store.log_action(
             &email.message_id,
@@ -279,10 +310,11 @@ impl ImessageReplier {
         )?)
     }
 
-    async fn handle_one(&self, email: Email, group: bool) -> anyhow::Result<Handled> {
+    /// `supersede_reason` names the platform in the older card's status.
+    pub async fn draft(&self, email: Email, group: bool, supersede_reason: &str) -> anyhow::Result<Handled> {
         let mut baseline = if augmentagent_channel_core::draft_workflow::enabled_for(&email.platform) {
             augmentagent_channel_core::draft_context::load_seed(
-                &self.store, &email, self.config.wiki_root.as_deref(),
+                self.store, &email, self.config.wiki_root.as_deref(),
             )?.prompt()
         } else { String::new() };
         if group {
@@ -317,7 +349,7 @@ impl ImessageReplier {
         let skill = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
             .unwrap_or_default();
         let context = augmentagent_channel_core::draft_workflow::prepare(
-            &self.store, self.reasoner.as_ref(), &email,
+            self.store, self.reasoner, &email,
             "Draft a response to the latest incoming message using relevant conversation and cross-platform evidence.",
             self.config.wiki_root.as_deref(),
         ).await?;
@@ -343,12 +375,12 @@ impl ImessageReplier {
             .store
             .mark_pending_drafts_superseded_by_thread_except_kind(
                 &thread,
-                "superseded by a newer iMessage",
+                supersede_reason,
                 COMPOSE_KIND,
             )?
             .len();
         let action_id = self.log(&email, Some(&drafted), ActionStatus::Pending)?;
-        anyhow::ensure!(context.attach(&self.store, &action_id)?, "draft evidence receipt could not be attached");
+        anyhow::ensure!(context.attach(self.store, &action_id)?, "draft evidence receipt could not be attached");
         if let Err(e) = self.approvals.post_approval(&action_id, &email, &drafted).await {
             self.store.update_action_status(
                 &action_id,
@@ -448,6 +480,7 @@ mod tests {
             service: service.into(),
             chat_guid: None,
             newest_entry: None,
+            ..Default::default()
         }
     }
 

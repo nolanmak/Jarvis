@@ -21,6 +21,25 @@ HEADER_PREFIX = "### ["
 # ZSESSIONTYPE: 0 = DM, 1 = group; >= 2 = broadcast/status noise.
 _SYNCED_SESSION_TYPES = (0, 1)
 
+# A source app that stops running freezes its database, and an exporter with
+# nothing to export looks identical to a healthy one. Report the age so a cold
+# source is visible in the job's own log instead of being silent for weeks.
+SOURCE_STALE_AFTER_S = 6 * 3600
+
+
+def source_staleness(db_path, now=None, threshold=SOURCE_STALE_AFTER_S):
+    """Seconds since `db_path` was written when that exceeds `threshold`.
+
+    None when the source is fresh or unreadable — the caller reports staleness,
+    it does not diagnose a missing file.
+    """
+    import time
+    try:
+        age = (now if now is not None else time.time()) - os.path.getmtime(db_path)
+    except OSError:
+        return None
+    return age if age > threshold else None
+
 
 def core_data_time_to_iso(raw):
     """ZMESSAGEDATE is seconds since 2001-01-01 UTC."""
@@ -189,6 +208,112 @@ def _sessions(cur):
     return out
 
 
+def _columns(cur, table):
+    return {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}
+
+
+def _readonly(path):
+    return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def load_identities(container):
+    """`<id>@lid` -> E.164 handle, from the stores WhatsApp Desktop keeps
+    next to ChatStorage.sqlite (#1762). Missing or unexpected stores yield
+    nothing: an unmapped `@lid` stays raw, it is never guessed."""
+    container = Path(container)
+    out = {}
+    sources = [
+        ("LID.sqlite", "ZWAZACCOUNT", "ZIDENTIFIER", "ZPHONENUMBER"),
+        ("ContactsV2.sqlite", "ZWAADDRESSBOOKCONTACT", "ZLID", "ZWHATSAPPID"),
+    ]
+    for name, table, lid_col, phone_col in sources:
+        path = container / name
+        if not path.exists():
+            continue
+        try:
+            con = _readonly(path)
+            try:
+                rows = con.execute(
+                    f"SELECT {lid_col}, {phone_col} FROM {table}"
+                ).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        for lid, phone in rows:
+            if not lid or not str(lid).endswith("@lid") or not phone:
+                continue
+            digits = str(phone).split("@", 1)[0].lstrip("+")
+            if digits.isdigit() and 7 <= len(digits) <= 15:
+                out.setdefault(lid, f"+{digits}")
+    return out
+
+
+def _group_members(cur):
+    """{group session pk: [(handle, display name or None, active)]}.
+    Empty when the database predates the session link."""
+    cols = _columns(cur, "ZWAGROUPMEMBER")
+    if "ZCHATSESSION" not in cols:
+        return {}
+    first = "ZFIRSTNAME" if "ZFIRSTNAME" in cols else "NULL"
+    active = "COALESCE(ZISACTIVE, 1) = 1" if "ZISACTIVE" in cols else "1"
+    push = {}
+    if "ZJID" in _columns(cur, "ZWAPROFILEPUSHNAME"):
+        push = dict(cur.execute("SELECT ZJID, ZPUSHNAME FROM ZWAPROFILEPUSHNAME"))
+    out = {}
+    for session, jid, contact, given, is_active in cur.execute(
+        f"SELECT ZCHATSESSION, ZMEMBERJID, ZCONTACTNAME, {first}, {active}"
+        " FROM ZWAGROUPMEMBER WHERE ZMEMBERJID IS NOT NULL"
+    ):
+        name = clean_title(contact) or clean_title(given) or clean_title(push.get(jid))
+        out.setdefault(session, []).append((jid_handle(jid), name or None, bool(is_active)))
+    return out
+
+
+def _newest_header_time(md_path):
+    """Latest entry timestamp already written to a conversation file."""
+    newest = None
+    try:
+        with open(md_path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(HEADER_PREFIX) and "] " in line:
+                    newest = newer_iso(newest, line[len(HEADER_PREFIX):line.index("] ")])
+    except OSError:
+        return None
+    return newest
+
+
+def _refresh_metadata(out_dir, index, sessions, members, identities):
+    """Group members, their names, and the `@lid` → phone map, recomputed on
+    every run so existing entries gain them without new messages."""
+    by_jid = {s["jid"]: pk for pk, s in sessions.items()}
+    for ident, entry in index.items():
+        if not entry.get("newest_entry"):
+            newest = _newest_header_time(out_dir / entry["path"])
+            if newest:
+                entry["newest_entry"] = newest
+        pk = by_jid.get(ident)
+        if ident.endswith("@g.us") and pk in members:
+            people = [m for m in members[pk] if m[2]]
+            # Every member inactive: the owner left. Keep who was there, and
+            # say so, so replies are never drafted into a group they left.
+            if people:
+                entry.pop("active", None)
+            else:
+                people = members[pk]
+                entry["active"] = False
+            entry["participants"] = sorted({h for h, _, _ in people})
+            names = {h: n for h, n, _ in people if n}
+            if names:
+                entry["participant_names"] = dict(sorted(names.items()))
+        lids = {p for p in entry.get("participants", []) if p.endswith("@lid")}
+        if ident.endswith("@lid"):
+            lids.add(ident)
+        identity = {l: identities[l] for l in sorted(lids) if l in identities}
+        if identity:
+            entry["identity"] = identity
+
+
 def _group_member_handle(cur, member_pk):
     row = cur.execute(
         "SELECT ZMEMBERJID FROM ZWAGROUPMEMBER WHERE Z_PK = ?", (member_pk,)
@@ -215,7 +340,10 @@ def sync(db_path, out_dir, state_path):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state = _load_json(state_path, {"last_pk": 0})
+    loaded_pk = state.get("last_pk")
     index = _load_json(out_dir / "conversations" / "index.json", {})
+    loaded_index = json.dumps(index, sort_keys=True)
+    identities = load_identities(Path(db_path).resolve().parent)
 
     with tempfile.TemporaryDirectory() as td:
         snap = Path(td) / "ChatStorage.sqlite"
@@ -311,13 +439,19 @@ def sync(db_path, out_dir, state_path):
             written += 1
             touched.add(ident)
 
+        _refresh_metadata(out_dir, index, sessions, _group_members(cur), identities)
         con.close()
 
-    if written or not (out_dir / "index.md").exists():
+    changed = json.dumps(index, sort_keys=True) != loaded_index
+    if written or changed or not (out_dir / "index.md").exists():
         _write_indexes(out_dir, index)
 
-    state["last_pk"] = last_pk
-    state["synced_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-    Path(state_path).parent.mkdir(parents=True, exist_ok=True)
-    _atomic_text(state_path,json.dumps(state, indent=2) + "\n")
+    # Only touch the state file when the cursor advanced. A Git-backed bundle
+    # (`sync.py --commit` runs `git add -A`) would otherwise commit a synced_at
+    # bump on every scheduled run, which makes a dead source look healthy.
+    if loaded_pk != last_pk or not Path(state_path).exists():
+        state["last_pk"] = last_pk
+        state["synced_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+        _atomic_text(state_path, json.dumps(state, indent=2) + "\n")
     return {"messages": written, "conversations": len(touched)}
