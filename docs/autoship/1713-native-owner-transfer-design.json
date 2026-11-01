@@ -286,6 +286,19 @@
     "normal_producer": "Only the fenced workflow controller observing the real native bridge completion may append a normal certain observation. It binds the launch intent captured before submission, observed provider ID, owned runtime and complete/export/alias bytes. Failure, missing ID, missing durable evidence or interrupted submission appends uncertainty. Normal writes cannot overwrite an unresolved uncertain row with certain merely because the same ID reappears.",
     "certainty_restoration": "Only a named verified-reconciliation operation under a current reconciliation lease can append certainty after uncertainty. Its proof must identify the exact uncertain sequence and exact submitted launch; verify same workflow/provider/native ID/runtime and creation/effective authority; verify protected controller observation and correlated kernel-quiescent resource evidence; and verify successful nondiagnostic completion for that same launch plus unchanged original alias/export bindings. Completion from an older launch, a healthy login/PID, time, operator prose or a bare boolean is insufficient. Missing historical launch/controller proof stays held; it is never synthesized or imported from provider text. Independently authorized terminal/namespace retirement can end retention but does not relabel that conversation certain.",
     "aggregate": "TransferObservation.revision is the maximum selected observation sequence. sha256 is SHA-256 of canonical_bytes({version:1,workflow_id,observations:[complete row projections sorted by provider/runtime_relative_path UTF-8 bytes]}), including proof, missing evidence and uncertainty; certain is true only if every required latest row has verified certainty. Separate registration-derived source_owners still includes owners with zero runtimes.",
-    "implementation_gate": "Persist launch/controller proof references and immutable history before enabling any productive consumer. Add exact-launch versus older-completion, missing-ID, certain-to-uncertain refusal, insufficient-recovery-proof and verified append-only restoration tests. No legacy backfill may invent missing proof."
+    "implementation_gate": "Persist launch/controller proof references and immutable history before enabling any productive consumer. Add exact-launch versus older-completion, missing-ID, certain-to-uncertain refusal, insufficient-recovery-proof and verified append-only restoration tests. No legacy backfill may invent missing proof.",
+    "reconciliation_proof_projection": [
+      "version:1",
+      "workflow_id",
+      "reconciliation_lease_generation",
+      "reconciles_sequence:exact uncertain predecessor",
+      "submitted_launch_sha256",
+      "source_observation:{audit_path,sequence,record_sha256,committed_audit_sha256}",
+      "resource_proofs:complete controller-read run_resources::verify_quiescent return objects sorted by canonical identity bytes",
+      "native_binding:{provider,native_session_sha256,runtime_relative_path,creation_owner,creation_audit_path,effective_owner,effective_audit_path,creation_receipt_sha256,completion_sha256,alias_sha256,export_manifest_sha256}",
+      "verified_at_ms:controller UTC milliseconds",
+      "proof_sha256:SHA-256 canonical complete proof omitting only this field"
+    ],
+    "proof_producer": "The native storage verifier reads exact runtime/launch/completion/alias/export metadata under StateLock then session lock and reads the protected source audit under its anchor gate; it verifies controller launch/ID observations and resource correlation as in D3. It returns the complete strict proof projection to the current workflow reconciliation lease for an append-only observation transaction. This operation cannot seal an audit, transfer ownership, write a retirement marker or dispatch a provider. Historical source evidence must already exist; missing launch/ID provenance refuses. The workflow transaction rechecks lease, binding, exact uncertain predecessor and proof digest before appending; its commit is the only producer of restored workflow certainty."
   }
 }
