@@ -18,6 +18,8 @@ pub(super) enum State {
     Completed(TransferReceipt),
     Aborted,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Endpoint {
     pub audit_path: String,
     pub actual_audit_path: String,
@@ -49,9 +51,10 @@ fn encoded<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
 fn owner_key(owner: &RuntimeOwner) -> Result<String> {
     Ok(sha(&encoded(owner)?))
 }
-fn reservation(request: &[u8]) -> Result<u64> {
+fn reservation(request: &[u8], claims: &[u8]) -> Result<u64> {
     (request.len() as u64)
-        .checked_add((SEALS_LIMIT + RECEIPT_LIMIT) as u64)
+        .checked_add(claims.len() as u64)
+        .and_then(|bytes| bytes.checked_add((SEALS_LIMIT + RECEIPT_LIMIT) as u64))
         .and_then(|bytes| bytes.checked_mul(2))
         .and_then(|bytes| bytes.checked_add(1024 * 1024))
         .context("native-transfer-history-capacity")
@@ -84,16 +87,37 @@ fn required_claims(request: &TransferRequest) -> Result<Vec<Claim>> {
 }
 fn claim_set(request: &TransferRequest, endpoints: &[Endpoint]) -> Result<Vec<Claim>> {
     let mut declarations = BTreeMap::new();
+    let mut actual_files = BTreeMap::new();
+    let mut anchors = BTreeMap::new();
     for endpoint in endpoints {
         ensure!(
-            Path::new(&endpoint.anchor_path).is_absolute() && !endpoint.anchor_path.contains('\0'),
+            [&endpoint.actual_audit_path, &endpoint.anchor_path]
+                .iter()
+                .all(|path| Path::new(path).is_absolute() && !path.contains('\0')),
             "native-transfer-invalid-request"
         );
-        if let Some(previous) =
-            declarations.insert(endpoint.audit_path.clone(), endpoint.anchor_path.clone())
-        {
+        let identity = (
+            endpoint.actual_audit_path.clone(),
+            endpoint.anchor_path.clone(),
+        );
+        if let Some(previous) = declarations.insert(endpoint.audit_path.clone(), identity.clone()) {
+            ensure!(previous == identity, "native-transfer-invalid-request");
+        }
+        if let Some(previous) = actual_files.insert(
+            endpoint.actual_audit_path.clone(),
+            endpoint.anchor_path.clone(),
+        ) {
             ensure!(
                 previous == endpoint.anchor_path,
+                "native-transfer-invalid-request"
+            );
+        }
+        if let Some(previous) = anchors.insert(
+            endpoint.anchor_path.clone(),
+            endpoint.actual_audit_path.clone(),
+        ) {
+            ensure!(
+                previous == endpoint.actual_audit_path,
                 "native-transfer-invalid-request"
             );
         }
@@ -110,21 +134,31 @@ fn claim_set(request: &TransferRequest, endpoints: &[Endpoint]) -> Result<Vec<Cl
         declarations.keys().eq(expected.iter()),
         "native-transfer-invalid-request"
     );
-    let mut anchors: Vec<_> = declarations.into_values().collect();
-    anchors.sort();
-    anchors.dedup();
-    ensure!(
-        anchors.len() == expected.len(),
-        "native-transfer-invalid-request"
-    );
     let mut claims = required_claims(request)?;
-    claims.extend(anchors.into_iter().map(|key| Claim {
+    for (audit_path, (actual_audit_path, anchor_path)) in declarations {
+        let binding = Endpoint {
+            audit_path,
+            actual_audit_path,
+            anchor_path,
+        };
+        claims.push(Claim {
+            kind: "audit-binding".into(),
+            key: String::from_utf8(encoded(&binding)?)?,
+        });
+    }
+    claims.extend(actual_files.into_keys().map(|key| Claim {
+        kind: "audit-file".into(),
+        key,
+    }));
+    claims.extend(anchors.into_keys().map(|key| Claim {
         kind: "anchor".into(),
         key,
     }));
     claims.sort();
+    claims.dedup();
     Ok(claims)
 }
+
 fn sources(db: &rusqlite::Connection, id: &str) -> Result<Vec<Authority>> {
     let mut query=db.prepare("SELECT workflow,generation,audit_path FROM native_transfer_source WHERE transfer_id=?1 ORDER BY generation,audit_path")?;
     let rows = query
@@ -175,7 +209,7 @@ fn load(db: &rusqlite::Connection, id: &str) -> Result<Option<Record>> {
         request.transfer_id == id
             && request.request_digest()? == digest
             && encoded(&request)? == bytes
-            && reserved == reservation(&bytes)?,
+            && reserved == reservation(&bytes, &claim_bytes)?,
         "native-transfer-prepared-corrupt"
     );
     let claims: Vec<Claim> = serde_json::from_slice(&claim_bytes)?;
@@ -186,29 +220,13 @@ fn load(db: &rusqlite::Connection, id: &str) -> Result<Option<Record>> {
             && claims.windows(2).all(|pair| pair[0] < pair[1]),
         "native-transfer-prepared-corrupt"
     );
-    ensure!(
-        claims
-            .iter()
-            .filter(|claim| claim.kind != "anchor")
-            .cloned()
-            .collect::<Vec<_>>()
-            == required_claims(&request)?,
-        "native-transfer-prepared-corrupt"
-    );
-    let mut audit_paths: Vec<_> = request
-        .source_owners
+    let bindings = claims
         .iter()
-        .chain(std::iter::once(&request.destination))
-        .map(|owner| &owner.audit_path)
-        .collect();
-    audit_paths.sort();
-    audit_paths.dedup();
+        .filter(|claim| claim.kind == "audit-binding")
+        .map(|claim| serde_json::from_str::<Endpoint>(&claim.key))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     ensure!(
-        claims.iter().filter(|claim| claim.kind == "anchor").count() == audit_paths.len()
-            && claims
-                .iter()
-                .filter(|claim| claim.kind == "anchor")
-                .all(|claim| Path::new(&claim.key).is_absolute() && !claim.key.contains('\0')),
+        claims == claim_set(&request, &bindings)?,
         "native-transfer-prepared-corrupt"
     );
     ensure!(
@@ -441,6 +459,13 @@ impl<'a> Ledger<'a> {
             |row| row.get(0),
         )?)
     }
+    pub fn claimed_anchor(&self, anchor: &Path) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_transfer_claim WHERE kind='anchor' AND key=?1)",
+            [anchor.to_str().context("non-UTF8 native audit anchor")?],
+            |row| row.get(0),
+        )?)
+    }
     pub fn prepare(
         &mut self,
         request: &TransferRequest,
@@ -483,7 +508,7 @@ impl<'a> Ledger<'a> {
                 "native-transfer-lock-busy"
             );
         }
-        let reserved = reservation(&request_bytes)?;
+        let reserved = reservation(&request_bytes, &encoded(&claims)?)?;
         let outstanding = growth(&self.db)?;
         let mut paths: Vec<_> = request
             .source_owners
@@ -763,7 +788,7 @@ mod tests {
             .chain(std::iter::once(&request.destination))
             .map(|owner| Endpoint {
                 audit_path: owner.audit_path.clone(),
-                actual_audit_path:owner.audit_path.clone(),
+                actual_audit_path: owner.audit_path.clone(),
                 anchor_path: format!("{}.anchor", owner.audit_path),
             })
             .collect()
@@ -1386,14 +1411,29 @@ mod tests {
     }
     #[test]
     fn native_ledger_real_audit_file_claims_cover_distinct_aliases_and_anchor_names() {
-        let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let first=request("first");let second=request("second");
-        let mut first_endpoints=endpoints(&first);first_endpoints[0].actual_audit_path="/actual/shared/audit".into();
-        let mut second_endpoints=endpoints(&second);second_endpoints[0].actual_audit_path="/actual/shared/audit".into();
-        let mut ledger=Ledger::open(root.path(),&lock).unwrap();ledger.prepare(&first,&first_endpoints,u64::MAX).unwrap();
-        assert_eq!(ledger.prepare(&second,&second_endpoints,u64::MAX).unwrap_err().to_string(),"native-transfer-lock-busy");
+        let root = fixture();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let first = request("first");
+        let second = request("second");
+        let mut first_endpoints = endpoints(&first);
+        first_endpoints[0].actual_audit_path = "/actual/shared/audit".into();
+        let mut second_endpoints = endpoints(&second);
+        second_endpoints[0].actual_audit_path = "/actual/shared/audit".into();
+        let mut ledger = Ledger::open(root.path(), &lock).unwrap();
+        ledger.prepare(&first, &first_endpoints, u64::MAX).unwrap();
+        assert_eq!(
+            ledger
+                .prepare(&second, &second_endpoints, u64::MAX)
+                .unwrap_err()
+                .to_string(),
+            "native-transfer-lock-busy"
+        );
         assert!(ledger.state(&second.transfer_id).unwrap().is_none());
-        let mut changed=endpoints(&first);changed[0].actual_audit_path="/actual/rebound/audit".into();
-        assert!(ledger.prepare(&first,&changed,u64::MAX).is_err(),"same request accepted rebound audit namespace");
+        let mut changed = endpoints(&first);
+        changed[0].actual_audit_path = "/actual/rebound/audit".into();
+        assert!(
+            ledger.prepare(&first, &changed, u64::MAX).is_err(),
+            "same request accepted rebound audit namespace"
+        );
     }
-
 }
