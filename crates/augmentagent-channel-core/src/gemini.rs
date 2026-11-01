@@ -262,6 +262,10 @@ impl GeminiCliReasoner {
             return Ok(response);
         }
 
+        // #1774 — a host kill is not a gemini failure.
+        if let Some(signal) = crate::reasoner::interrupted_by_signal(&status) {
+            return Err(crate::reasoner::interrupted_error("gemini", signal));
+        }
         let code = error_obj
             .as_ref()
             .and_then(|e| e.get("code"))
