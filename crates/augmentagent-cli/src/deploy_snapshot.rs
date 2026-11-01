@@ -182,7 +182,7 @@ fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     let binary_bytes = binary.and_then(|b| std::fs::metadata(b).ok()).map_or(0, |m| m.len());
     let retained = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>();
     if retained.saturating_add(db_bytes).saturating_add(binary_bytes) > budget {
-        bail!("snapshot storage budget exhausted (including protected snapshots); prune, unpin obsolete rollbacks, or increase AUGMENTAGENT_DEPLOY_MAX_GB");
+        bail!("{}", budget_refusal(&refs));
     }
     std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     // Plain and gzip copies coexist during compression. Include the binary,
@@ -349,6 +349,18 @@ pub fn prune(
     opts: &PruneOptions,
     now: SystemTime,
 ) -> Vec<Removal> {
+    prune_with_refs(root, release_dir, strays, opts, now, &crate::snapshot_refs::collect())
+}
+
+/// [`prune`] with the reference evidence supplied by the caller (tests).
+pub fn prune_with_refs(
+    root: &Path,
+    release_dir: Option<&Path>,
+    strays: &[PathBuf],
+    opts: &PruneOptions,
+    now: SystemTime,
+    refs: &crate::snapshot_refs::References,
+) -> Vec<Removal> {
     if !root.exists() && !opts.dry_run {
         if let Err(error) = std::fs::create_dir_all(root) {
             return vec![Removal { kind: "retention", path: root.display().to_string(), bytes: 0,
@@ -360,7 +372,17 @@ pub fn prune(
         return vec![Removal { kind: "retention", path: root.display().to_string(), bytes: 0,
             removed: false, reason: "deferred: retention/creation busy or lock unavailable".into() }];
     };
-    prune_locked(root, release_dir, strays, opts, now, &crate::snapshot_refs::collect())
+    prune_locked(root, release_dir, strays, opts, now, refs)
+}
+
+/// The refusal when retained snapshots leave no room. When missing evidence
+/// is what kept them, say which, so the freeze is diagnosable from the error.
+fn budget_refusal(refs: &crate::snapshot_refs::References) -> String {
+    let mut msg = "snapshot storage budget exhausted (including protected snapshots); prune, unpin obsolete rollbacks, or increase AUGMENTAGENT_DEPLOY_MAX_GB".to_string();
+    if !refs.reliable {
+        msg.push_str(&format!("; retention blocked: reference probe unavailable ({})", refs.unavailable_summary()));
+    }
+    msg
 }
 
 fn budget_bytes() -> u64 {
@@ -412,14 +434,15 @@ fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opt
             let path = dir.join(&name);
             let external = external_path(&path);
             let bytes = items.iter().find(|i| i.name == name).map_or(0, |i| i.bytes);
-            let blocked = refs.protects(&path) || external.as_deref().is_some_and(|p| refs.protects(p));
-            let removed = !blocked && act && !opts.dry_run
+            let kept = refs.retention_reason(&path)
+                .or_else(|| external.as_deref().and_then(|p| refs.retention_reason(p)));
+            let removed = kept.is_none() && act && !opts.dry_run
                 && external.as_deref().is_none_or(remove) && remove(&path);
-            let reason = if blocked { "kept: pinned, referenced, or reference probe unavailable" }
-                else if !act || opts.dry_run { "would remove: past count and minimum age" }
-                else if removed { "removed: past count and minimum age" }
-                else { "failed to remove; no recovery claimed" };
-            out.push(Removal { kind, path: path.display().to_string(), bytes, removed, reason: reason.into() });
+            let reason = if let Some(why) = &kept { format!("kept: {why}") }
+                else if !act || opts.dry_run { "would remove: past count and minimum age".into() }
+                else if removed { "removed: past count and minimum age".into() }
+                else { "failed to remove; no recovery claimed".into() };
+            out.push(Removal { kind, path: path.display().to_string(), bytes, removed, reason });
         }
     };
     expire("snapshot", root, snapshot_items(root, now), MIN_AGE_HOURS, true);
@@ -498,11 +521,23 @@ pub fn run_prune(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
+    run_prune_with_refs(root, release_dir, opts, json, out, &crate::snapshot_refs::collect())
+}
+
+/// [`run_prune`] with the reference evidence supplied by the caller (tests).
+pub fn run_prune_with_refs(
+    root: &Path,
+    release_dir: Option<&Path>,
+    opts: &PruneOptions,
+    json: bool,
+    out: &mut dyn Write,
+    refs: &crate::snapshot_refs::References,
+) -> Result<()> {
     let strays = stray_dirs(
         data_dir().as_deref(),
         augmentagent_channel_core::state_dir::state_dir().as_deref(),
     );
-    let removals = prune(root, release_dir, &strays, opts, SystemTime::now());
+    let removals = prune_with_refs(root, release_dir, &strays, opts, SystemTime::now(), refs);
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(&removals)?)?;
         return Ok(());
@@ -900,7 +935,8 @@ mod tests {
         // Keep it eligible by mtime too, so this regression isolates reporting.
         aged(&t.path().join("old"), 200.0);
         let mut output = Vec::new();
-        run_prune(t.path(), None, &PruneOptions { keep: 1, dry_run: true, ..Default::default() }, false, &mut output).unwrap();
+        let refs = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        run_prune_with_refs(t.path(), None, &PruneOptions { keep: 1, dry_run: true, ..Default::default() }, false, &mut output, &refs).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("kept: pinned"), "{text}");
         assert!(text.contains("freed 0 MB; 0 MB more would be freed"), "{text}");
@@ -932,4 +968,63 @@ mod tests {
         assert!(t.path().join("new").exists());
     }
 
+    // #1753: the kept reason names what the operator can act on.
+    fn expired_pair(root: &Path) {
+        for (name, age) in [("old", 200.0), ("new", 1.0)] {
+            let p = root.join(name);
+            std::fs::create_dir(&p).unwrap();
+            std::fs::write(p.join(DB_NAME), vec![0; 1024]).unwrap();
+            std::fs::write(p.join(MANIFEST_NAME), br#"{"created_at":"2026-01-01T00:00:00Z","db_bytes":1}"#).unwrap();
+            aged(&p, age);
+        }
+    }
+
+    fn prune_text(root: &Path, refs: &crate::snapshot_refs::References) -> String {
+        let mut output = Vec::new();
+        run_prune_with_refs(root, None, &PruneOptions { keep: 1, dry_run: true, ..Default::default() }, false, &mut output, refs).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn prune_reports_referenced_distinctly_from_pinned() {
+        let t = tempfile::tempdir().unwrap();
+        expired_pair(t.path());
+        let refs = crate::snapshot_refs::References { reliable: true,
+            config: format!("sqlite3 {}/data.db.gz", t.path().join("old").display()), ..Default::default() };
+        let text = prune_text(t.path(), &refs);
+        assert!(text.contains("kept: referenced: snapshot"), "{text}");
+        assert!(!text.contains("pinned"), "{text}");
+    }
+
+    #[test]
+    fn prune_names_the_blocking_evidence_when_the_probe_is_unavailable() {
+        let t = tempfile::tempdir().unwrap();
+        expired_pair(t.path());
+        let refs = crate::snapshot_refs::References { reliable: false,
+            unavailable: Some("pid 7 agent: exe Other".into()), unavailable_more: 2, ..Default::default() };
+        let text = prune_text(t.path(), &refs);
+        assert!(text.contains("kept: reference probe unavailable (pid 7 agent: exe Other; +2 more): snapshot"), "{text}");
+    }
+
+    #[test]
+    fn a_pin_is_reported_even_when_the_probe_is_unavailable() {
+        let t = tempfile::tempdir().unwrap();
+        expired_pair(t.path());
+        set_pin(t.path(), "old", Some("rollback")).unwrap();
+        aged(&t.path().join("old"), 200.0);
+        let refs = crate::snapshot_refs::References { reliable: false, ..Default::default() };
+        let text = prune_text(t.path(), &refs);
+        assert!(text.contains("kept: pinned: snapshot"), "{text}");
+    }
+
+    #[test]
+    fn budget_refusal_says_why_retention_was_blocked() {
+        let reliable = crate::snapshot_refs::References { reliable: true, ..Default::default() };
+        assert!(!budget_refusal(&reliable).contains("retention blocked"));
+        let blocked = crate::snapshot_refs::References { reliable: false,
+            unavailable: Some("systemctl --user cat augmentagent.service failed".into()), ..Default::default() };
+        let msg = budget_refusal(&blocked);
+        assert!(msg.starts_with("snapshot storage budget exhausted"), "{msg}");
+        assert!(msg.contains("retention blocked: reference probe unavailable (systemctl --user cat augmentagent.service failed)"), "{msg}");
+    }
 }

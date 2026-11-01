@@ -135,11 +135,10 @@ resume, and per-PR run locks, requires HEAD to be reachable from `origin/main`,
 and requires a clean tracked, untracked, and ignored-file inventory. Git locks,
 process references (including working directories), and unavailable evidence
 keep the checkout. Compiler inventory and readable process status/command lines
-are mandatory. For these reproducible resources only, permission-denied
-ptrace handles (`exe`, `cwd`, `fd`) from non-dumpable login/key agents are
-optional; otherwise normal SSH sessions would freeze all cleanup. Visible
-references still protect resources, and rollback snapshot retention retains
-its stricter all-reference policy. Removal uses `git worktree remove` without force and retains
+are mandatory. Permission-denied ptrace handles (`exe`, `cwd`, `fd`) from
+non-dumpable login/key agents are optional; otherwise normal SSH sessions
+would freeze all cleanup. Visible references still protect resources, and
+rollback snapshot retention applies the same reference policy (#1753). Removal uses `git worktree remove` without force and retains
 branches. External or unrecognized worktrees, unmerged commits (including
 squash-merged heads without ancestry proof), dirty work, and ignored private
 files are preserved; a deleted remote branch alone is not proof of safety.
@@ -194,7 +193,13 @@ augmentagent deploy prune --dry-run --json
 ```
 
 Pins, running executables, open files, command arguments, and service references
-prevent expiry. Unreadable reference evidence keeps candidates. Unknown folders
+prevent expiry. Unreadable reference evidence keeps candidates; the one
+exception is the permission wall the kernel puts around non-dumpable login/key
+agents (`sshd`, `ssh-agent`, `(sd-pam)`), whose `exe`/`cwd`/`fd` are denied even
+to their own user while their status and command line stay readable (#1753).
+Each kept snapshot says why: `kept: pinned`, `kept: referenced`, or
+`kept: reference probe unavailable (<first blocker>; +N more)`. A pin is
+reported ahead of the others. A budget refusal names the same blocker. Unknown folders
 under the snapshot root are preserved. Stray backup deletion still requires
 `--strays --yes`.
 
