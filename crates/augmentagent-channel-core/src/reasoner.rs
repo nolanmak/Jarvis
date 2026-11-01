@@ -537,7 +537,7 @@ fn reset_clock_candidate<Tz: chrono::TimeZone>(
     now: chrono::DateTime<chrono::Utc>,
     allow_next_day: bool,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    for days in 0..=i64::from(allow_next_day) {
+    for days in 0..=if allow_next_day { 1 } else { 0 } {
         let clock = naive.checked_add_signed(chrono::Duration::days(days))?;
         let candidates = match zone.from_local_datetime(&clock) {
             chrono::LocalResult::Single(at) => [Some(at.with_timezone(&chrono::Utc)), None],
