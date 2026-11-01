@@ -124,6 +124,21 @@ pub struct TransferBinding {
     canonical_state_root: PathBuf,
     store: super::owner_store::StoreIdentity,
 }
+/// Capture the selected store before registering a workflow's first native owner.
+/// This operation needs no invented conversation, observation or transfer request.
+/// A refusal grants neither owner registration nor provider dispatch.
+pub fn capture_owner_binding(
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> Result<TransferBinding, TransferReason> {
+    let path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
+    capture_owner_with_policy(path.as_deref().map(Path::new), current)
+}
+pub(super) fn capture_owner_with_policy(
+    _policy: Option<&Path>,
+    _current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> Result<TransferBinding, TransferReason> {
+    Err(TransferReason::InvalidRequest)
+}
 pub fn capture_transfer_binding(
     request: &TransferRequest,
     observation: &TransferObservation,

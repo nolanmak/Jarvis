@@ -1059,6 +1059,40 @@ mod tests {
         ));
     }
     #[test]
+    fn native_owner_binding_capture_needs_no_transfer_and_preserves_empty_history() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+        let binding = super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())).unwrap();
+        assert_eq!(binding, binding_for(&f, &path));
+        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Ok(())), Ok(binding.clone()));
+        assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(), before);
+        assert_eq!(super::super::ownership::transfer_receipt(&binding, &f.request, &observation(), &|| Ok(())), Ok(None));
+    }
+    #[test]
+    fn native_owner_binding_capture_fences_before_touching_authority() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+        for (fence, reason) in [(TransferFenceError::NotCurrent, TransferReason::AuthorityConflict), (TransferFenceError::Unavailable, TransferReason::PersistRetry)] {
+            assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &|| Err(fence)), Err(reason));
+        }
+        assert_eq!(std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(), before);
+        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(None, &|| Ok(())), Err(TransferReason::RuntimeUnavailable));
+    }
+    #[test]
+    fn native_owner_binding_capture_rechecks_authority_after_store_verification() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let calls = std::cell::Cell::new(0);
+        let current = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {Err(TransferFenceError::NotCurrent)} else {Ok(())}
+        };
+        assert_eq!(super::super::owner_outcome::capture_owner_with_policy(Some(&path), &current), Err(TransferReason::AuthorityConflict));
+        assert_eq!(calls.get(), 3);
+    }
+    #[test]
     fn native_handoff_binding_capture_rechecks_current_authority_before_returning() {
         let f = empty_binding_fixture();
         let path = policy(&f);
