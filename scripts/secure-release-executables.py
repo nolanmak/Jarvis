@@ -18,7 +18,7 @@ def secure_release_executables(directory):
    info=os.fstat(stream.fileno())
    if not stat.S_ISREG(info.st_mode) or info.st_uid not in (0,os.geteuid()) or not info.st_mode & 0o111 or not 0<info.st_size<=1024**3:
     raise RuntimeError('unsafe release executable')
-   current=path.stat(follow_symlinks=False)
+   current=path.lstat()
    if (current.st_dev,current.st_ino)!=(info.st_dev,info.st_ino):raise RuntimeError('release executable changed')
    files.append((stream,info))
   for stream,info in files:
