@@ -226,12 +226,10 @@ pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection
         file.sync_all()?;
         File::open(root)?.sync_all()?;
     }
-    let held = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)?;
-    let info = held.metadata()?;
+    // A raw descriptor closed alongside SQLite cancels the process's POSIX
+    // database locks. Keep identity validation on metadata and let SQLite's
+    // VFS coordinate descriptors, including no-follow path opening.
+    let info = path.symlink_metadata()?;
     regular(&info)?;
     let ledger_hash = identity(&info)?;
     if let Some(value) = &marker {
@@ -253,7 +251,7 @@ pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection
     }
     let db = rusqlite::Connection::open_with_flags(
         &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     db.pragma_update(None, "synchronous", "FULL")?;
     ensure!(
@@ -380,7 +378,7 @@ pub(super) fn open_bound(
     };
     let db = rusqlite::Connection::open_with_flags(
         root.join(DATABASE),
-        flags | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        flags | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     ensure!(
         current_identity(root, lock, &db)? == *expected,
@@ -444,6 +442,32 @@ pub(crate) fn provision_fixture(root: &Path) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn native_store_open_preserves_other_connections_sqlite_locks() {
+        const PROBE: &str="JARVIS_TEST_NATIVE_SQLITE_LOCK_PROBE";
+        if let Some(path)=std::env::var_os(PROBE) {
+            let db=rusqlite::Connection::open(path).unwrap();
+            db.busy_timeout(std::time::Duration::from_millis(50)).unwrap();
+            let result=db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; ROLLBACK;");
+            assert!(matches!(result,Err(rusqlite::Error::SqliteFailure(ref code,_)) if code.code==rusqlite::ErrorCode::DatabaseBusy || code.code==rusqlite::ErrorCode::DatabaseLocked),"another process acquired exclusive access during a live native-store read: {result:?}");
+            return;
+        }
+        let root=tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        provision_fixture(root.path());
+        let lock=StateLock::acquire(root.path()).unwrap();
+        drop(super::super::owner_ledger::Ledger::open(root.path(),&lock).unwrap());
+        let held=rusqlite::Connection::open(root.path().join(DATABASE)).unwrap();
+        held.execute_batch("BEGIN;").unwrap();held.query_row("SELECT count(*) FROM native_authority_epoch",[],|row|row.get::<_,i64>(0)).unwrap();
+        let probe=|| {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","native_vm::owner_store::tests::native_store_open_preserves_other_connections_sqlite_locks","--nocapture"])
+                .env(PROBE,root.path().join(DATABASE)).output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        };
+        probe();drop(super::open(root.path(),&lock).unwrap());probe();
+        held.execute_batch("ROLLBACK;").unwrap();
+    }
     #[test]
     fn native_store_identity_crash_publication_replays_one_epoch() {
         const ROOT: &str = "JARVIS_TEST_STORE_CRASH_ROOT";
