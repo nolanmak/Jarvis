@@ -165,12 +165,19 @@ impl TransferBinding {
 fn selected_fence(
     policy: Option<&Path>,
     expected: &str,
+    expected_root: &Path,
     current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> anyhow::Result<()> {
     current().map_err(anyhow::Error::new)?;
     let bytes = super::private(policy.context(TransferReason::PersistRetry)?)
         .context(TransferReason::PersistRetry)?;
     anyhow::ensure!(sha(&bytes) == expected, TransferReason::AuthorityConflict);
+    let selected: super::Policy =
+        serde_json::from_slice(&bytes).context(TransferReason::MetadataInvalid)?;
+    anyhow::ensure!(
+        selected.state_root.canonicalize()? == expected_root,
+        TransferReason::AuthorityConflict
+    );
     Ok(())
 }
 pub(super) fn capture_with_policy(
@@ -187,10 +194,10 @@ pub(super) fn capture_with_policy(
         .expect("loaded policy digest");
     let result = (|| -> anyhow::Result<TransferBinding> {
         let lock = super::StateLock::acquire(&selected.root)?;
-        selected_fence(policy, expected, current)?;
+        selected_fence(policy, expected, &selected.root, current)?;
         let ledger = super::owner_ledger::Ledger::open(&selected.root, &lock)?;
         let store = ledger.store_identity()?;
-        selected_fence(policy, expected, current)?;
+        selected_fence(policy, expected, &selected.root, current)?;
         Ok(TransferBinding {
             version: 1,
             policy_sha256: expected.into(),
@@ -360,6 +367,11 @@ fn load_selection<'a>(
         }
     };
     context.policy_sha256 = Some(sha(&bytes));
+    if binding
+        .is_some_and(|binding| context.policy_sha256.as_deref() != Some(&binding.policy_sha256))
+    {
+        return Err(context.failure(preflight_hold.unwrap_or(R::AuthorityConflict), "none"));
+    }
     let policy: super::Policy = match serde_json::from_slice(&bytes) {
         Ok(policy) => policy,
         Err(_) => return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none")),
@@ -374,10 +386,16 @@ fn load_selection<'a>(
     let root = match policy.state_root.canonicalize() {
         Ok(root) => root,
         Err(error) => {
+            if binding.is_some() && preflight_hold.is_none() {
+                return Err(unknown(request));
+            }
             let (reason, category) = classify(&error.into());
             return Err(context.failure(preflight_hold.unwrap_or(reason), category));
         }
     };
+    if binding.is_some_and(|binding| root != binding.canonical_state_root) {
+        return Err(context.failure(preflight_hold.unwrap_or(R::AuthorityConflict), "none"));
+    }
     if root.to_str().is_none() {
         return Err(context.failure(TransferReason::MetadataInvalid, "none"));
     }
@@ -387,6 +405,9 @@ fn load_selection<'a>(
                 || info.uid() != unsafe { libc::geteuid() }
                 || info.mode() & 0o077 != 0
             {
+                if binding.is_some() && preflight_hold.is_none() {
+                    return Err(unknown(request));
+                }
                 return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none"));
             }
             context.root_identity_sha256 = Some(match super::owner_store::identity(&info) {
@@ -395,6 +416,9 @@ fn load_selection<'a>(
             });
         }
         Err(error) => {
+            if binding.is_some() && preflight_hold.is_none() {
+                return Err(unknown(request));
+            }
             let (reason, category) = classify(&error.into());
             return Err(context.failure(preflight_hold.unwrap_or(reason), category));
         }
@@ -461,7 +485,12 @@ pub(super) fn transfer_bound_with_policy(
             .failure(TransferReason::AuthorityConflict, "none");
     }
     let fence = || {
-        selected_fence(policy_path, &binding.policy_sha256, current)?;
+        selected_fence(
+            policy_path,
+            &binding.policy_sha256,
+            &binding.canonical_state_root,
+            current,
+        )?;
         super::owner_store::validate_bound_metadata(&binding.canonical_state_root, &binding.store)
     };
     let error = match super::owner_handoff::handoff_bound_at(
