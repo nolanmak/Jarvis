@@ -1436,4 +1436,16 @@ mod tests {
             "same request accepted rebound audit namespace"
         );
     }
+    #[test]
+    fn native_ledger_oversized_immutable_receipt_is_invalid_before_preparation() {
+        let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let mut request=request("workflow");
+        let source_path=format!("/audit/{}source","segment/".repeat(250));let destination_path=format!("/audit/{}destination","another/".repeat(250));
+        request.source_owners=(0..64).map(|lease_generation|Authority{owner:RuntimeOwner{workflow_id:"workflow".into(),lease_generation},audit_path:source_path.clone()}).collect();
+        request.destination.owner.lease_generation=64;request.destination.audit_path=destination_path;
+        let row=request.inventory[0].clone();request.inventory=(0..64).map(|index|{let mut row=row.clone();row.native_session_id=format!("native-{index}");row.runtime_relative_path=format!("codex/session-{index:03}");row.creation_audit_path=source_path.clone();row.effective_audit_path=source_path.clone();row}).collect();request.validate().unwrap();
+        let mut ledger=Ledger::open(root.path(),&lock).unwrap();assert_eq!(ledger.prepare(&request,&endpoints(&request),u64::MAX).unwrap_err().to_string(),"native-transfer-invalid-request");
+        assert!(ledger.state(&request.transfer_id).unwrap().is_none());assert_eq!(ledger.reserved_bytes().unwrap(),0);
+        assert_eq!(ledger.db.query_row("SELECT count(*) FROM native_transfer_claim",[],|row|row.get::<_,u64>(0)).unwrap(),0);
+    }
+
 }
