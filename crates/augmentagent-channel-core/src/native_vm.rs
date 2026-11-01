@@ -77,7 +77,7 @@ pub(crate) fn required(logger: Option<&std::sync::Arc<crate::tool_audit::AuditLo
     logger.is_some_and(|logger| logger.run_resources_required())
 }
 fn private(path: &Path) -> Result<Vec<u8>> {
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;
     let metadata = file.metadata()?;
     ensure!(metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() }
         && metadata.mode() & 0o077 == 0 && metadata.nlink() == 1 && metadata.len() <= 2*1024*1024,
