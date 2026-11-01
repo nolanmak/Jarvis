@@ -276,4 +276,35 @@ mod tests {
         assert_eq!(resumed,"valid");assert_eq!(saved.lock().unwrap().len(),2);
     }
 
+    #[tokio::test]
+    async fn rejected_proposal_retries_include_field_path_and_exhaustion_survives_restart() {
+        let raw = serde_json::json!({
+            "contract":{"schema_version":1,"revision":1,"pull_request":841,
+                "criteria":[{"id":"sum","requirement":"Return the arithmetic sum","verifier_ids":["observe"]}],
+                "allowed_paths":[{"kind":"file","path":"arithmetic.py"}],
+                "verifiers":[{"id":"observe","command":{"kind":"black_box","invocation":{"kind":"python_script","file":"autoship_verifiers/observe.py","args":[]},
+                    "oracle":{"kind":"json","value":[5,3,0]}},"pinned_files":["autoship_verifiers/observe.py"],"failure_witness":{"stdout":"[\"TypeError\"]"}}]},
+            "files":{"autoship_verifiers/observe.py":"print(5)\n"}
+        });
+        let raw = format!("```autoship-contract\n{raw}\n```");
+        let saved = std::sync::Mutex::new(BTreeMap::<u32,String>::new());
+        let requests = std::sync::Mutex::new(Vec::new());
+        let read = |index| Ok(saved.lock().unwrap().get(&index).cloned());
+        let write = |index,raw:&str| { saved.lock().unwrap().insert(index,raw.into()); Ok(()) };
+        let validate = |raw:&str| parse_proposal_for(raw, AcceptanceSource::PullRequest(841));
+        let error = recoverable_generation("original requirements",read,write,|request| {
+            requests.lock().unwrap().push(request);
+            let raw = raw.clone();
+            async move { Ok(raw) }
+        },validate).await.unwrap_err();
+        assert!(error.downcast_ref::<CompletedInvalid>().is_some());
+        assert_eq!(requests.lock().unwrap().len(),2);
+        assert!(requests.lock().unwrap()[1].contains("contract.verifiers[0].failure_witness"));
+        assert_eq!(saved.lock().unwrap().len(),2);
+        let error = recoverable_generation("original requirements",read,write,
+            |_| async { panic!("restart must not redispatch exhausted completed responses") },validate)
+            .await.unwrap_err();
+        assert!(error.downcast_ref::<CompletedInvalid>().is_some());
+    }
+
 }

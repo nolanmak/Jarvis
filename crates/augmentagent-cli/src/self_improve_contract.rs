@@ -696,6 +696,32 @@ mod tests {
         assert_eq!(parsed.files["autoship_verifiers/observe.py"],script);
     }
     #[test]
+    fn contract_proposal_reports_the_rejected_field_without_coercing_it() {
+        let mut value = fence_proposal("print(5)\n");
+        // Exact field shape rejected by the production CLI on PR #1757.
+        value["contract"]["verifiers"][0]["failure_witness"] =
+            serde_json::json!({"stdout":"[\"TypeError\"]"});
+        let raw = format!("```autoship-contract\n{}\n```", value);
+        let error = parse_proposal_for(&raw, AcceptanceSource::PullRequest(841))
+            .unwrap_err().to_string();
+        assert!(error.contains("contract.verifiers[0].failure_witness"), "{error}");
+        assert!(error.contains("expected a string"), "{error}");
+        value["contract"]["verifiers"][0]["failure_witness"] = "observed arithmetic differs".into();
+        let raw = format!("```autoship-contract\n{}\n```", value);
+        assert!(parse_proposal_for(&raw, AcceptanceSource::PullRequest(841)).is_ok());
+    }
+    #[test]
+    fn contract_prompt_contains_a_complete_typed_proposal() {
+        let example = CONTRACT_PROMPT.split("Complete schema example:\n").nth(1)
+            .expect("scoper needs a complete typed example")
+            .split("\nEnd schema example.").next().unwrap();
+        let parsed = parse_proposal_for(
+            &format!("```autoship-contract\n{example}\n```"),
+            AcceptanceSource::PullRequest(841),
+        ).unwrap();
+        assert_eq!(parsed.contract.verifiers[0].failure_witness, "observed arithmetic differs");
+    }
+    #[test]
     fn contract_fence_rejects_ambiguous_or_unterminated_data_and_wrong_authority() {
         let raw=serde_json::to_string(&fence_proposal("print(5)\n")).unwrap();
         for trailing in ["{}"," trailing prose","\\n{}","\\nDO_THIS","\\u000a"] {
