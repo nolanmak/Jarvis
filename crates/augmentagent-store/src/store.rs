@@ -366,9 +366,21 @@ impl Store {
     ) -> StoreResult<()> {
         let chat = turn.conversation();
         if chat.account().platform().as_str() == "discord" {
-            return Err(StoreError::InvalidInput(
-                "Discord native turns are not resolved through the surface API".into(),
-            ));
+            // #1774 — a host signal stopping the provider is the one
+            // resolution Discord takes from a live process (same record as
+            // the #1396 startup pass). Anything else keeps inspect-first.
+            if !matches!(resolution, SurfaceTurnResolution::Interrupted) {
+                return Err(StoreError::InvalidInput(
+                    "Discord native turns are not resolved through the surface API".into(),
+                ));
+            }
+            if chat.thread_id().is_none() {
+                return self.interrupt_discord_turn(
+                    chat.account().account_id(),
+                    chat.conversation_id(),
+                    turn.turn_id(),
+                );
+            }
         }
         let cols = params![
             chat.account().platform().as_str(),
@@ -502,22 +514,46 @@ impl Store {
         };
         let now = now_millis();
         for turn in &turns {
-            tx.execute(
-                "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
-                 WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
-                params![turn.guild_id, turn.channel_id, turn.turn_id, now],
-            )?;
-            tx.execute(
-                "INSERT INTO surface_turn_resolutions \
-                 (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
-                 VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
-                 ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
-                params![turn.guild_id, turn.channel_id, turn.turn_id,
-                    SurfaceTurnResolution::Interrupted.as_str(), now],
-            )?;
+            close_discord_turn_interrupted(&tx, &turn.guild_id, &turn.channel_id, &turn.turn_id, now)?;
         }
         tx.commit()?;
         Ok(turns)
+    }
+
+    /// #1774 — close one `pending` Discord turn as interrupted, from the live
+    /// process that claimed it, when a host signal stopped its provider. Same
+    /// record as the #1396 startup pass: `uncertain` plus an `interrupted`
+    /// resolution, so the turn stays consumed but no longer blocks the
+    /// channel. Refused for a turn that is not pending.
+    pub fn interrupt_discord_turn(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        turn_id: &str,
+    ) -> StoreResult<()> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !close_discord_turn_interrupted(&tx, guild_id, channel_id, turn_id, now_millis())? {
+            return Err(StoreError::InvalidInput("Discord native turn is not pending".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// #1774 — whether this Discord channel turn was closed as interrupted
+    /// (a host signal stopped its provider, or the #1396 startup pass).
+    pub fn discord_turn_interrupted(&self, channel_id: &str, turn_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM surface_turn_resolutions WHERE platform = 'discord' \
+                 AND conversation_id = ?1 AND thread_id = '' AND turn_id = ?2 \
+                 AND resolution = ?3 LIMIT 1",
+                params![channel_id, turn_id, SurfaceTurnResolution::Interrupted.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Only the native runner that claimed a pending turn can resolve it.
@@ -13086,3 +13122,32 @@ pub fn whatsapp_default_coverable(chat_jid: &str) -> bool {
 pub const MANUAL_SEND_PENDING: &str = "manual send pending";
 /// Set when the archive never showed the pasted reply within the window.
 pub const MANUAL_SEND_UNCONFIRMED: &str = "manual send not confirmed in the archive; nothing was sent automatically";
+
+/// #1396/#1774 — the one write that closes a `pending` Discord turn as
+/// interrupted: `uncertain` (its tools may have run) plus an `interrupted`
+/// resolution, so it stays consumed but no longer blocks the channel.
+/// Returns whether a pending turn was closed.
+fn close_discord_turn_interrupted(
+    tx: &rusqlite::Transaction<'_>,
+    guild_id: &str,
+    channel_id: &str,
+    turn_id: &str,
+    now: i64,
+) -> StoreResult<bool> {
+    let changed = tx.execute(
+        "UPDATE discord_native_turns SET status = 'uncertain', finished_at_ms = ?4 \
+         WHERE guild_id = ?1 AND channel_id = ?2 AND turn_id = ?3 AND status = 'pending'",
+        params![guild_id, channel_id, turn_id, now],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO surface_turn_resolutions \
+         (platform, account_id, conversation_id, thread_id, turn_id, resolution, resolved_at_ms) \
+         VALUES ('discord', ?1, ?2, '', ?3, ?4, ?5) \
+         ON CONFLICT(platform, account_id, conversation_id, thread_id, turn_id) DO NOTHING",
+        params![guild_id, channel_id, turn_id, SurfaceTurnResolution::Interrupted.as_str(), now],
+    )?;
+    Ok(true)
+}

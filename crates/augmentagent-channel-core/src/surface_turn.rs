@@ -364,6 +364,29 @@ where
         store.resolve_surface_turn(turn, SurfaceTurnResolution::Cancelled)?;
         return Ok(SurfaceTurnOutcome::Cancelled);
     };
+    // #1774 — our host stopped the provider (a deploy restart SIGTERMs the
+    // whole unit). Close the turn the way the #1396 startup pass closes one a
+    // dead process left behind: consumed, never re-run, not blocking the
+    // conversation, and the binding kept usable. The caller tells the owner.
+    if let Err(error) = &answer {
+        if let Some(crate::reasoner::ReasonerError::Interrupted { provider: stopped, signal }) =
+            crate::reasoner::ReasonerError::find_in(error)
+        {
+            tracing::warn!(turn_id = %turn_id, provider = %stopped, signal,
+                "native turn interrupted by a host signal: closed, not re-run");
+            if let (Some(id), None) = (session.id(), &binding) {
+                store.bind_surface_conversation(&NativeConversation {
+                    conversation: chat.clone(),
+                    provider: provider.name().to_string(),
+                    native_session_id: id,
+                    cwd: request.cwd.to_string(),
+                    uncertain: false,
+                })?;
+            }
+            store.resolve_surface_turn(turn, SurfaceTurnResolution::Interrupted)?;
+            return answer.map(SurfaceTurnOutcome::Answered);
+        }
+    }
     if let Some(id) = session.id() {
         if binding.is_none() {
             store.bind_surface_conversation(&NativeConversation {

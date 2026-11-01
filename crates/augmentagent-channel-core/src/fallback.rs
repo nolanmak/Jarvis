@@ -2004,6 +2004,24 @@ mod tests {
         assert!(latch.latched_until("claude").is_none());
     }
 
+    /// #1774 — a deploy restart SIGTERMs the claude child: no latch (the
+    /// cooldown file is shared with the next daemon process) and no
+    /// failover into the dying cgroup; the typed error reaches the caller.
+    #[tokio::test]
+    async fn a_host_signal_neither_latches_nor_fails_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = latch_in(&dir);
+        let primary = Scripted::err(|| crate::reasoner::interrupted_error("claude", 15));
+        let fallback = Scripted::ok("must not run inside a dying unit");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary), (ProviderKind::Codex, fallback.clone()),
+        ], latch.clone());
+        let error = chain.call(&text_only_opts(), "synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Interrupted { signal: 15, .. })), "{error:#}");
+        assert_eq!(fallback.count(), 0);
+        assert!(latch.latched_until("claude").is_none());
+    }
+
     /// #1040 C1/C2 — the real codex adapter behind the chain, fed the
     /// fault-injection shapes. A turn that ended on its own content (no final
     /// message, context overflow) neither latches codex nor advances the
