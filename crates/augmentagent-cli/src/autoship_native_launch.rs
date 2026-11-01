@@ -54,7 +54,7 @@ impl NativeLaunchIntent {
         Ok(())
     }
 }
-fn original_context(conn: &Connection, workflow: &str, generation: i64, active: bool) -> Result<(String,String)> {
+pub(super) fn original_context(conn: &Connection, workflow: &str, generation: i64, active: bool) -> Result<(String,String)> {
     let (audit,raw,retirement,retired): (String,String,Option<String>,Option<i64>)=conn.query_row(
         "SELECT o.audit_path,b.binding,o.retirement_reason,o.retired_at FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2",
         params![workflow,generation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))
@@ -88,6 +88,12 @@ fn indexed(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedRecord> {
     Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))
 }
 const COLUMNS: &str="record,intent_id,workflow,sequence,lease_generation,provider,runtime_relative_path,native_session";
+
+pub(super) fn recorded_launch(conn:&Connection,intent_id:&str)->Result<NativeLaunchRecord> {
+    let row=conn.query_row(&format!("SELECT {COLUMNS} FROM workflow_native_launch WHERE intent_id=?1"),
+        [intent_id],indexed).optional()?.context("native observation has no original launch journal")?;
+    decode_record(conn,row)
+}
 
 impl WorkflowStore {
     /// Verify the original protected controller record before journaling it.

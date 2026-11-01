@@ -848,7 +848,14 @@ mod tests {
                     "generation":"generation-completion","launch_sha256":prepared.intent.launch_sha256,
                     "worker_quiescence":{"remaining_workers":0,"quiet_scans":2}})).unwrap();
                 write(&launch.session.join("complete.json"),&completion).unwrap();
+                let observations=std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let saved=observations.clone();
+                logger.set_native_observation_observer(std::sync::Arc::new(move |fact| {
+                    saved.lock().unwrap().push(fact.clone());Ok(())
+                })).unwrap();
+                assert!(logger.clone().set_native_observation_observer(std::sync::Arc::new(|_|Ok(()))).is_err());
                 let receipt=logger.native_launch_completion(&prepared,&session,&resource).unwrap();
+                assert_eq!(observations.lock().unwrap().len(),1,"verified completion never reached its durable journal consumer");
                 let proof=logger.read_append_receipt(&receipt).unwrap();
                 assert_eq!(proof["kind"],"native_launch_completion_verified");
                 assert_eq!(proof["inventory"]["native_session_id"],actual_id);

@@ -25,6 +25,8 @@ mod owner_revision;
 pub(crate) mod owner_turn;
 #[path = "autoship_native_owner_binding.rs"]
 mod native_owner_binding;
+#[path = "autoship_native_observation.rs"]
+pub(crate) mod native_observation;
 #[path = "autoship_native_launch.rs"]
 pub(crate) mod native_launch;
 #[path = "autoship_owner_inbox.rs"]
@@ -400,6 +402,15 @@ impl WorkflowStore {
                 lease_generation INTEGER NOT NULL, provider TEXT NOT NULL,
                 runtime_relative_path TEXT NOT NULL, native_session TEXT, record TEXT NOT NULL,
                 FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner_binding(workflow,lease_generation));
+            CREATE TABLE IF NOT EXISTS workflow_native_observation (
+                sequence INTEGER PRIMARY KEY REFERENCES workflow_event(seq), workflow TEXT NOT NULL REFERENCES workflow(id),
+                provider TEXT NOT NULL,runtime_relative_path TEXT NOT NULL,lease_generation INTEGER NOT NULL,
+                intent_id TEXT NOT NULL REFERENCES workflow_native_launch(intent_id),native_session TEXT,
+                source_audit_path TEXT NOT NULL,receipt_sequence INTEGER NOT NULL,record TEXT NOT NULL,
+                UNIQUE(source_audit_path,receipt_sequence),
+                FOREIGN KEY(workflow,lease_generation) REFERENCES workflow_native_owner_binding(workflow,lease_generation));
+            CREATE INDEX IF NOT EXISTS workflow_native_observation_runtime ON workflow_native_observation(workflow,provider,runtime_relative_path,sequence);
+            CREATE INDEX IF NOT EXISTS workflow_native_observation_session ON workflow_native_observation(provider,native_session);
             CREATE INDEX IF NOT EXISTS workflow_native_launch_history ON workflow_native_launch(workflow,sequence);
             CREATE INDEX IF NOT EXISTS workflow_native_launch_session ON workflow_native_launch(provider,native_session);
             CREATE TABLE IF NOT EXISTS workflow_audit_generation (

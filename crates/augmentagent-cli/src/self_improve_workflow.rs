@@ -847,6 +847,16 @@ impl WorkflowGuard {
                 store.record_verified_native_launch(&journal_lease,&binding,&audit,prepared,millis())?;
                 Ok(())
             }))?;
+            let observation_store=self.store.clone();let observation_lease=self.lease.clone();
+            let observation_audit=Arc::downgrade(&self.audit);
+            self.audit.set_native_observation_observer(Arc::new(move |fact| {
+                let audit=observation_audit.upgrade().context("native observation controller is gone")?;
+                let mut store=observation_store.lock().map_err(|_|anyhow::anyhow!("native observation store poisoned"))?;
+                let binding=if let Ok(call)=BOUNDED_NATIVE_CALL.try_with(Clone::clone) {
+                    anyhow::ensure!(call.workflow==observation_lease.workflow,"native observation crossed workflow scope");call.binding
+                } else {store.snapshot(&observation_lease.workflow)?.context("native observation workflow missing")?.checkpoint.binding};
+                store.record_verified_native_observation(&observation_lease,&binding,&audit,fact,millis())?;Ok(())
+            }))?;
         }
         let capacity_store = self.store.clone();
         let capacity_lease = self.lease.clone();
@@ -2864,6 +2874,24 @@ mod tests {
         assert_eq!(guard.audit_logger().native_store_binding().unwrap(),saved);
         assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
         guard.audit_logger().validate_native_store_binding().unwrap();
+        if mode=="fresh" {
+            let audit=guard.audit_logger();
+            let original=saved.clone().unwrap();
+            let intent=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:2,
+                original_store_binding_sha256:format!("{:x}",Sha256::digest(augmentagent_channel_core::native_vm::ownership::canonical_bytes(&serde_json::to_value(original).unwrap()).unwrap())),
+                intent_id:uuid::Uuid::new_v4().to_string(),source_owner:augmentagent_channel_core::native_vm::RuntimeOwner {
+                    workflow_id:guard.id().into(),lease_generation:guard.lease.generation},source_audit_path:audit.path().into(),
+                provider:"codex".into(),runtime_relative_path:"codex/session-unsubmitted".into(),
+                native_session_id:Some("requested-only".into()),launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64)};
+            let prepared=audit.native_launch_prepared(&intent).unwrap();
+            let fact=augmentagent_channel_core::native_vm::ownership::observe_native_uncertainty(&audit,&prepared,None).unwrap();
+            let rows=guard.store.lock().unwrap().native_observation_history(guard.id()).unwrap();
+            assert_eq!(rows.len(),1,"the actual guard did not consume native outcome observations");
+            assert!(rows[0].native_session_id.is_none(),"a requested ID became an actual provider observation");
+            assert_eq!(rows[0].certainty,crate::autoship_workflow::native_observation::Certainty::Uncertain);
+            assert_eq!(rows[0].protected_observation_reference.as_ref(),Some(fact.receipt()));
+            assert_eq!(guard.store.lock().unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        }
         guard.finish().unwrap();println!("native registration guard case passed: {mode}");
     }
     #[tokio::test]

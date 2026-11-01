@@ -6,6 +6,34 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Private controller capability: only the real completion/uncertainty
+/// producers can construct it. It is deliberately not deserializable.
+#[derive(Clone, Debug)]
+pub struct VerifiedNativeObservation {
+    pub(crate) prepared: PreparedLaunchRecord,
+    pub(crate) receipt: AppendReceipt,
+    pub(crate) native_session_id: Option<String>,
+    pub(crate) inventory: Option<RuntimeInventoryRow>,
+    pub(crate) observed_at_ms: i64,
+}
+impl VerifiedNativeObservation {
+    pub fn prepared(&self) -> &PreparedLaunchRecord {
+        &self.prepared
+    }
+    pub fn receipt(&self) -> &AppendReceipt {
+        &self.receipt
+    }
+    pub fn native_session_id(&self) -> Option<&str> {
+        self.native_session_id.as_deref()
+    }
+    pub fn inventory(&self) -> Option<&RuntimeInventoryRow> {
+        self.inventory.as_ref()
+    }
+    pub fn observed_at_ms(&self) -> i64 {
+        self.observed_at_ms
+    }
+}
+
 fn referenced_event(
     logger: &AuditLogger,
     prepared: &PreparedLaunchRecord,
@@ -37,22 +65,34 @@ fn selection(logger: &AuditLogger, binding: &super::ownership::TransferBinding) 
     Ok(())
 }
 
-pub(crate) fn record(
+pub fn observe_native_completion(
     logger: &AuditLogger,
     prepared: &PreparedLaunchRecord,
     session: &AppendReceipt,
     resource: &AppendReceipt,
-) -> Result<AppendReceipt> {
+) -> Result<VerifiedNativeObservation> {
     logger.verify_native_launch_reference(prepared)?;
     let observed = referenced_event(logger, prepared, session, "native_session_observed")?;
     let admitted = referenced_event(logger, prepared, resource, "native_launch_resource_binding")?;
-    ensure!(resource.sequence < session.sequence, "native ID predates resource admission");
-    let id = observed["native_session_id"].as_str().context("actual native ID missing")?;
-    ensure!(!id.is_empty() && id.len() <= 256 && id.bytes().all(|b| b.is_ascii_graphic()),
-        "invalid actual native ID");
+    ensure!(
+        resource.sequence < session.sequence,
+        "native ID predates resource admission"
+    );
+    let id = observed["native_session_id"]
+        .as_str()
+        .context("actual native ID missing")?;
+    ensure!(
+        !id.is_empty() && id.len() <= 256 && id.bytes().all(|b| b.is_ascii_graphic()),
+        "invalid actual native ID"
+    );
     let identity = &admitted["resource_identity"];
-    ensure!(identity.is_object(), "native completion resource identity missing");
-    let binding = logger.native_store_binding()?.context("original native binding missing")?;
+    ensure!(
+        identity.is_object(),
+        "native completion resource identity missing"
+    );
+    let binding = logger
+        .native_store_binding()?
+        .context("original native binding missing")?;
     selection(logger, &binding)?;
     let (root, store) = binding.retirement_store()?;
     let lock = super::StateLock::existing(root)?;
@@ -60,29 +100,56 @@ pub(crate) fn record(
     super::ensure_native_admission(&ledger, &prepared.intent.source_owner, logger)?;
     let inventory = || -> Result<RuntimeInventoryRow> {
         let (row, launch) = super::owner_handoff::completed_inventory_row(
-            root, &ledger, &prepared.intent.provider, &prepared.intent.runtime_relative_path, id,
+            root,
+            &ledger,
+            &prepared.intent.provider,
+            &prepared.intent.runtime_relative_path,
+            id,
         )?;
-        ensure!(launch == prepared.intent.launch_sha256
-            && row.creation_receipt_sha256 == prepared.intent.creation_receipt_sha256
-            && row.effective_owner == prepared.intent.source_owner
-            && Path::new(&row.effective_audit_path) == prepared.intent.source_audit_path,
-            "native completion describes another launch or owner");
+        ensure!(
+            launch == prepared.intent.launch_sha256
+                && row.creation_receipt_sha256 == prepared.intent.creation_receipt_sha256
+                && row.effective_owner == prepared.intent.source_owner
+                && Path::new(&row.effective_audit_path) == prepared.intent.source_audit_path,
+            "native completion describes another launch or owner"
+        );
         Ok(row)
     };
     let original = inventory()?;
     // Recheck the correlated kernel scope now. Guest completion, a stale PID,
     // and the supervisor's exit code cannot substitute for this operation.
     let quiescent = crate::run_resources::verify_quiescent(identity)?;
-    ensure!(inventory()? == original, "native completion bytes changed during verification");
+    ensure!(
+        inventory()? == original,
+        "native completion bytes changed during verification"
+    );
     selection(logger, &binding)?;
     logger.verify_native_launch_reference(prepared)?;
+    let observed_at_ms = chrono::Utc::now().timestamp_millis();
     let receipt = logger.record_controller_receipted(json!({
         "version":1,"actor":"controller","kind":"native_launch_completion_verified",
         "producer":"normal-completion","launch_intent":prepared.intent,
         "launch_receipt":prepared.controller_receipt,"session_observation_receipt":session,
         "resource_binding_receipt":resource,"inventory":original,
-        "quiescent_resource":quiescent,"observed_at_ms":chrono::Utc::now().timestamp_millis()
+        "quiescent_resource":quiescent,"observed_at_ms":observed_at_ms
     }))?;
     selection(logger, &binding)?;
-    Ok(receipt)
+    let fact = VerifiedNativeObservation {
+        prepared: prepared.clone(),
+        receipt,
+        native_session_id: Some(id.to_string()),
+        inventory: Some(original),
+        observed_at_ms,
+    };
+    logger.publish_native_observation(&fact)?;
+    selection(logger, &binding)?;
+    Ok(fact)
+}
+
+pub fn observe_native_uncertainty(
+    logger: &AuditLogger,
+    prepared: &PreparedLaunchRecord,
+    session: Option<&AppendReceipt>,
+) -> Result<VerifiedNativeObservation> {
+    logger.native_launch_uncertain(prepared, session)
 }

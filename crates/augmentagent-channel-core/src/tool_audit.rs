@@ -307,6 +307,7 @@ pub struct AuditLogger {
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     native_store_binding: Arc<std::sync::Mutex<Option<crate::native_vm::ownership::TransferBinding>>>,
     native_launch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&crate::native_vm::PreparedLaunchRecord) -> anyhow::Result<()> + Send + Sync>>>>,
+    native_observation_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&crate::native_vm::ownership::VerifiedNativeObservation)->anyhow::Result<()>+Send+Sync>>>>,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
     resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
@@ -564,6 +565,15 @@ impl AuditLogger {
         anyhow::ensure!(current.is_none(),"native launch observer already installed");
         *current=Some(observer);Ok(())
     }
+    pub fn set_native_observation_observer(&self,observer:Arc<dyn Fn(&crate::native_vm::ownership::VerifiedNativeObservation)->anyhow::Result<()>+Send+Sync>)->anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && self.native_runtime_owner()?.is_some(),"native observation journal requires protected owner");
+        let mut saved=self.native_observation_observer.lock().map_err(|_|anyhow::anyhow!("native observation journal poisoned"))?;
+        anyhow::ensure!(saved.is_none(),"native observation journal already installed");*saved=Some(observer);Ok(())
+    }
+    pub(crate) fn publish_native_observation(&self,observation:&crate::native_vm::ownership::VerifiedNativeObservation)->anyhow::Result<()> {
+        let observer=self.native_observation_observer.lock().map_err(|_|anyhow::anyhow!("native observation journal poisoned"))?.clone();
+        if let Some(observer)=observer {observer(observation)?;} Ok(())
+    }
     /// Commit controller-captured preparation and its exact receipt before the
     /// command can escape to a provider. This does not prove native submission.
     pub fn native_launch_prepared(&self,intent:&crate::native_vm::PreparedLaunchIntent)->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
@@ -608,17 +618,31 @@ impl AuditLogger {
         self.dispatch_allowed()?;Ok(receipt)
     }
     pub(crate) fn native_launch_uncertain(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
-        session:Option<&crate::audit_chain::AppendReceipt>)->anyhow::Result<()> {
+        session:Option<&crate::audit_chain::AppendReceipt>)->anyhow::Result<crate::native_vm::ownership::VerifiedNativeObservation> {
         self.verify_native_launch_reference(prepared)?;
-        self.record_controller(serde_json::json!({"version":1,"actor":"controller",
+        let native_session_id=if let Some(receipt)=session {
+            let row=self.read_append_receipt(receipt)?;
+            anyhow::ensure!(row["version"]==1 && row["actor"]=="controller" && row["kind"]=="native_session_observed"
+                && row["launch_intent"]==serde_json::to_value(&prepared.intent)?
+                && row["launch_receipt"]==serde_json::to_value(&prepared.controller_receipt)?
+                && receipt.sequence>prepared.controller_receipt.sequence,"uncertainty references another native observation");
+            let id=row["native_session_id"].as_str().ok_or_else(||anyhow::anyhow!("actual native ID unavailable"))?;
+            anyhow::ensure!(!id.is_empty() && id.len()<=256 && id.bytes().all(|b|b.is_ascii_graphic()),"invalid actual native ID");
+            Some(id.to_string())
+        } else {None};
+        let observed_at_ms=chrono::Utc::now().timestamp_millis();
+        let receipt=self.record_controller_receipted(serde_json::json!({"version":1,"actor":"controller",
             "kind":"native_launch_uncertain","launch_intent":prepared.intent,
             "launch_receipt":prepared.controller_receipt,"session_observation_receipt":session,
-            "reason":"completion-not-verified","observed_at_ms":chrono::Utc::now().timestamp_millis()}))
+            "native_session_id":native_session_id,"reason":"completion-not-verified","observed_at_ms":observed_at_ms}))?;
+        let fact=crate::native_vm::ownership::VerifiedNativeObservation{prepared:prepared.clone(),receipt,
+            native_session_id,inventory:None,observed_at_ms};
+        self.publish_native_observation(&fact)?;Ok(fact)
     }
     pub(crate) fn native_launch_completion(&self,prepared:&crate::native_vm::PreparedLaunchRecord,
         session:&crate::audit_chain::AppendReceipt,resource:&crate::audit_chain::AppendReceipt)
         ->anyhow::Result<crate::audit_chain::AppendReceipt> {
-        crate::native_vm::owner_completion::record(self,prepared,session,resource)
+        crate::native_vm::ownership::observe_native_completion(self,prepared,session,resource).map(|fact|fact.receipt().clone())
     }
     pub(crate) fn verify_native_launch_reference(&self,prepared:&crate::native_vm::PreparedLaunchRecord)->anyhow::Result<()> {
         prepared.intent.validate()?;
@@ -670,6 +694,7 @@ impl AuditLogger {
             native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
             native_store_binding: Arc::new(std::sync::Mutex::new(None)),
             native_launch_observer: Arc::new(std::sync::Mutex::new(None)),
+            native_observation_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,
             failure_path: None,
             pending_dir: None,
