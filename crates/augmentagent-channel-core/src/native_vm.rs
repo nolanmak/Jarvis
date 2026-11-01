@@ -324,6 +324,7 @@ pub(crate) struct Launch {
     session: PathBuf,
     ephemeral: bool,
     authority:ownership::Authority,
+    audit_log:PathBuf,
     _directory: tempfile::TempDir,
 }
 impl Launch {
@@ -357,6 +358,7 @@ impl Launch {
         let state_lock=StateLock::acquire(&root)?;
         let ledger=owner_ledger::Ledger::open(&root,&state_lock)?;
         ensure_native_admission(&ledger,&audit_owner,owner_logger)?;
+        let audit_log=owner_logger.protected_log_path().context("native protected audit log missing")?.to_path_buf();
         let reserved=ledger.reserved_bytes()?;
         ensure!(policy.max_state_bytes>=SESSION_BYTES && policy.max_sessions>0,"native state budget is not declared");
         let count=prune_and_count(&root)?;
@@ -446,7 +448,7 @@ impl Launch {
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
-        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, _directory:directory };
+        let result = Self { command, resource_policy, aliases, session, ephemeral:native.is_none(), authority, audit_log, _directory:directory };
         if let Some(crate::native_session::Launch::Create { requested_id:Some(id) }) = native { result.observe_session(id)?; }
         Ok(result)
     }
@@ -459,7 +461,7 @@ impl Launch {
         let lock=StateLock::acquire(root)?;let ledger=owner_ledger::Ledger::open(root,&lock)?;
         let current=runtime_authority(root,&ledger,&self.session)?;ensure_unretired(&self.session)?;
         ensure!(current==self.authority && !ledger.is_closed(&current.owner)? && !ledger.held_by_abort(&current.owner)?
-            && !ledger.claimed(&current.owner,relative_runtime(root,&self.session)?)? && !ledger.claimed_audit(&current.audit_path)?,"native alias authority changed or held");
+            && !ledger.claimed(&current.owner,relative_runtime(root,&self.session)?)? && !ledger.claimed_audit(&current.audit_path)? && !ledger.claimed_log(&self.audit_log)?,"native alias authority changed or held");
         let alias = self.aliases.join(digest(id));
         let name = self.session.file_name().context("missing session directory")?.to_string_lossy();
         let value = serde_json::to_vec(name.as_ref())?;

@@ -1386,6 +1386,7 @@ mod tests {
             session: runtime.clone(),
             ephemeral: false,
             authority: request.source_owners[0].clone(),
+            audit_log: request.source_owners[0].audit_path.clone().into(),
             _directory: tempfile::tempdir().unwrap(),
         };
         launch.observe_session("observed-before").unwrap();
@@ -1414,6 +1415,7 @@ mod tests {
             session: runtime,
             ephemeral: false,
             authority: request.destination.clone(),
+            audit_log: request.destination.audit_path.clone().into(),
             _directory: tempfile::tempdir().unwrap(),
         };
         destination
@@ -1447,6 +1449,7 @@ mod tests {
             session: runtime,
             ephemeral: false,
             authority: other.source_owners[0].clone(),
+            audit_log: actual.clone(),
             _directory: tempfile::tempdir().unwrap(),
         };
         launch.observe_session("before-pending").unwrap();
