@@ -170,7 +170,7 @@ impl Drop for Session {
             if crate::build_storage::ci_holds::may_cleanup(directory.path()).unwrap_or(false) {
                 drop(directory);
             } else {
-                directory.keep();
+                let _ = directory.keep();
                 tracing::error!("CI session preserved for verified cleanup recovery");
             }
         }

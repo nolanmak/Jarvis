@@ -75,7 +75,7 @@ pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &st
         "committed verifier source admission busy"
     );
     if path.try_exists()? {
-        ensure!(crate::build_storage::ci_holds::may_cleanup(&path)?,
+        ensure!(crate::build_storage::ci_holds::may_cleanup_after_reconcile(&path)?,
             "verifier source has an unresolved CI cleanup hold; preserved");
         let prior: serde_json::Value = private_json(&owner)?;
         ensure!(

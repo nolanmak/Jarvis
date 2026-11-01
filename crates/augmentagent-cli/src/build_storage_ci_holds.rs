@@ -191,7 +191,11 @@ fn records() -> Result<Vec<(PathBuf, Record)>> {
             "CI cleanup registry requires reconciliation"
         );
         let path = entry.path();
-        records.push((path.clone(), read(&path)?));
+        match read(&path) {
+            Ok(record) => records.push((path, record)),
+            Err(error) if is_not_found(&error) => continue,
+            Err(error) => return Err(error),
+        }
     }
     Ok(records)
 }
@@ -318,9 +322,30 @@ fn lifetime(path: &Path, create: bool) -> Result<std::fs::File> {
     );
     Ok(file)
 }
+#[cfg(test)]
+thread_local! {static BEFORE_RECONCILE:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const{std::cell::RefCell::new(None)};}
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
 pub(crate) fn reconcile_before_admission() -> Result<()> {
-    for (path, record) in records()? {
-        let live = lifetime(&path, false)?;
+    let snapshot = records()?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_RECONCILE.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    for (path, _) in snapshot {
+        let live = match lifetime(&path, false) {
+            Ok(live) => live,
+            Err(error) => match read(&path) {
+                Err(record_error) if is_not_found(&record_error) => continue,
+                // Settlement can unlink the lease before open or before its
+                // metadata is checked. Only an absent ownership record makes
+                // that benign; existing or unreadable records stay fenced.
+                _ => return Err(error),
+            },
+        };
         if unsafe { libc::flock(live.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -328,6 +353,14 @@ pub(crate) fn reconcile_before_admission() -> Result<()> {
             }
             return Err(error.into());
         }
+        // The owner may have settled or updated the record after inventory.
+        // It removes the record before releasing this lifetime lock, so only
+        // the record observed while holding the lock can require recovery.
+        let record = match read(&path) {
+            Ok(record) => record,
+            Err(error) if is_not_found(&error) => continue,
+            Err(error) => return Err(error),
+        };
         proof(&record).with_context(|| {
             format!(
                 "CI cleanup hold {} requires verified resource recovery",
@@ -350,6 +383,13 @@ pub(crate) fn may_cleanup(path: &Path) -> Result<bool> {
                 .iter()
                 .any(|directory| directory.protects(path))
     }))
+}
+
+/// Cleanup entry points reconcile abandoned owners themselves, before an old
+/// checkout can prevent the next storage admission from ever being reached.
+pub(crate) fn may_cleanup_after_reconcile(path: &Path) -> Result<bool> {
+    let _admission = crate::storage_reservations::Admission::lock()?;
+    may_cleanup(path)
 }
 
 pub(crate) struct Hold {
@@ -483,7 +523,7 @@ impl Drop for Hold {
                     tracing::error!("CI cleanup hold could not record uncertainty: {error:#}");
                 }
                 if let Some(directory) = self.supervisor.take() {
-                    directory.keep();
+                    let _ = directory.keep();
                 }
                 tracing::error!(hold=%self.record.id,"CI cleanup remains unverified; retaining source and storage recovery fence");
             }
@@ -637,6 +677,39 @@ mod tests {
     fn private_receipt(path: &Path, value: &serde_json::Value) {
         std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[test]
+    fn review_regression_concurrent_normal_settlement_is_not_false_busy() {
+        fixture(|root, _| {
+            let mut hold = Hold::begin(root, root, root, root, &"a".repeat(64)).unwrap();
+            let current = Owner::current().unwrap();
+            let identity = serde_json::json!({"host_sha256":current.host,"boot_id":current.boot,
+                "path":format!("/sys/fs/cgroup/run-{}",uuid::Uuid::new_v4().simple()),"inode":1});
+            hold.bind_fixture_identity(&identity).unwrap();
+            BEFORE_RECONCILE.with(|slot| *slot.borrow_mut() = Some(Box::new(move || drop(hold))));
+            assert!(
+                reconcile_before_admission().is_ok(),
+                "normal settlement racing the inventory is not unknown cleanup"
+            );
+            assert!(records().unwrap().is_empty());
+        });
+    }
+    #[test]
+    fn review_regression_cleanup_reconciles_a_proven_abandoned_hold_itself() {
+        fixture(|root, _| {
+            let hold = Hold::begin(root, root, root, root, &"a".repeat(64)).unwrap();
+            let supervisor = hold.supervisor().to_owned();
+            drop(hold);
+            assert!(!may_cleanup(root).unwrap());
+            let receipt = supervisor.join("cleanup-complete");
+            std::fs::write(&receipt, b"all-descendants-reaped\n").unwrap();
+            std::fs::set_permissions(receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                may_cleanup_after_reconcile(root).unwrap(),
+                "cleanup must not wait for an unrelated build to reconcile its hold"
+            );
+            assert!(records().unwrap().is_empty());
+        });
     }
     #[test]
     fn lost_completion_uses_original_admission_and_kernel_for_cleanup_only() {
