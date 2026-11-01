@@ -305,6 +305,7 @@ pub struct AuditLogger {
     dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
+    native_launch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&crate::native_vm::PreparedLaunchRecord) -> anyhow::Result<()> + Send + Sync>>>>,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
     resource_capacity_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<()> + Send + Sync>>>>,
     anchored: Option<crate::audit_chain::AnchoredAudit>,
@@ -554,6 +555,29 @@ impl AuditLogger {
         *current=Some(owner);
         Ok(())
     }
+    /// Install once, before native preparation. A controller's durable journal
+    /// may reject the launch; replacement cannot silently remove that fence.
+    pub fn set_native_launch_observer(&self,observer:Arc<dyn Fn(&crate::native_vm::PreparedLaunchRecord)->anyhow::Result<()>+Send+Sync>)->anyhow::Result<()> {
+        anyhow::ensure!(self.is_protected() && self.native_runtime_owner()?.is_some(),"native launch observer requires protected owner");
+        let mut current=self.native_launch_observer.lock().map_err(|_|anyhow::anyhow!("native launch observer lock poisoned"))?;
+        anyhow::ensure!(current.is_none(),"native launch observer already installed");
+        *current=Some(observer);Ok(())
+    }
+    pub(crate) fn native_launch_prepared(&self,intent:&crate::native_vm::PreparedLaunchIntent)->anyhow::Result<crate::native_vm::PreparedLaunchRecord> {
+        intent.validate()?;
+        anyhow::ensure!(self.native_runtime_owner()?.as_ref()==Some(&intent.source_owner)
+            && intent.source_audit_path==self.path,"native launch source audit mismatch");
+        self.dispatch_allowed()?;
+        let observer=self.native_launch_observer.lock().map_err(|_|anyhow::anyhow!("native launch observer lock poisoned"))?.clone();
+        let mut row=serde_json::to_value(intent)?;
+        row["actor"]="controller".into();row["kind"]="native_launch_intent".into();
+        let controller_receipt=self.record_controller_receipted(row)?;
+        let record=crate::native_vm::PreparedLaunchRecord {intent:intent.clone(),controller_receipt};
+        if let Some(observer)=observer {observer(&record)?;}
+        self.dispatch_allowed()?;
+        Ok(record)
+    }
+
     pub fn native_runtime_owner(&self)->anyhow::Result<Option<crate::native_vm::RuntimeOwner>> {
         Ok(self.native_runtime_owner.lock().map_err(|_|anyhow::anyhow!("native owner lock poisoned"))?.clone())
     }
@@ -567,6 +591,7 @@ impl AuditLogger {
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             native_runtime_owner: Arc::new(std::sync::Mutex::new(None)),
+            native_launch_observer: Arc::new(std::sync::Mutex::new(None)),
             anchored: None,
             failure_path: None,
             pending_dir: None,

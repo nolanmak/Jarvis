@@ -15,6 +15,45 @@ pub struct RuntimeOwner {
     pub lease_generation: i64,
 }
 
+/// Controller-captured preparation, never proof that a provider received or
+/// completed the turn. IDs on Create are requested IDs, not observed completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedLaunchIntent {
+    pub version: u32,
+    pub intent_id: String,
+    pub source_owner: RuntimeOwner,
+    pub source_audit_path: PathBuf,
+    pub provider: String,
+    pub runtime_relative_path: String,
+    pub native_session_id: Option<String>,
+    pub launch_sha256: String,
+    pub creation_receipt_sha256: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedLaunchRecord {
+    pub intent: PreparedLaunchIntent,
+    pub controller_receipt: crate::audit_chain::AppendReceipt,
+}
+impl PreparedLaunchIntent {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let id=uuid::Uuid::parse_str(&self.intent_id)?;
+        ensure!(self.version==1 && !id.is_nil() && id.to_string()==self.intent_id,"invalid native launch intent identity");
+        ensure!(matches!(self.provider.as_str(),"codex"|"claude"|"qwen"|"glm"),"invalid native launch provider");
+        let parts:Vec<_>=self.runtime_relative_path.split('/').collect();
+        ensure!(parts.len()==2 && parts[0]==self.provider && parts[1].starts_with("session-") && parts[1].len()>8
+            && self.runtime_relative_path.len()<=512
+            && parts[1].bytes().all(|byte|byte.is_ascii_alphanumeric() || byte==b'-'),"invalid native launch runtime path");
+        ensure!(self.source_owner.lease_generation>0 && !self.source_owner.workflow_id.is_empty()
+            && self.source_audit_path.is_absolute(),"invalid native launch source owner");
+        ensure!(self.native_session_id.as_ref().is_none_or(|id|!id.is_empty() && id.len()<=256
+            && id.bytes().all(|byte|byte.is_ascii_graphic())),"invalid native launch session ID");
+        ensure!([&self.launch_sha256,&self.creation_receipt_sha256].into_iter().all(|hash|hash.len()==64
+            && hash.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f'))),"invalid native launch digest");
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Policy {
@@ -407,6 +446,9 @@ impl Launch {
             }
         };
         let authority=runtime_authority(&root,&ledger,&session)?;
+        let runtime_relative_path=relative_runtime(&root,&session)?.to_owned();
+        use sha2::{Digest,Sha256};
+        let creation_receipt_sha256=format!("{:x}",Sha256::digest(private(&session.join("owned.json"))?));
         drop(ledger);drop(state_lock);
         let directory = tempfile::Builder::new().prefix("launch-").tempdir_in(&provider_root)?;
         for (name, contents) in HELPERS { write(&directory.path().join(name), contents)?; }
@@ -459,7 +501,20 @@ impl Launch {
             "environment":environment,"auth_file":profile.auth_file,"auth_relative":profile.auth_relative,
             "gateway":profile.gateway,"mcp_argv":mcp_argv,"assets":assets});
         let spec_path = directory.path().join("launch.json");
-        write(&spec_path,&serde_json::to_vec(&spec)?)?;
+        let spec_bytes=serde_json::to_vec(&spec)?;
+        write(&spec_path,&spec_bytes)?;
+        let native_session_id=match native {
+            Some(crate::native_session::Launch::Create {requested_id})=>requested_id.clone(),
+            Some(crate::native_session::Launch::Resume {id})=>Some(id.clone()),
+            None=>None,
+        };
+        let intent=PreparedLaunchIntent {version:1,intent_id:uuid::Uuid::new_v4().to_string(),
+            source_owner:audit_owner,source_audit_path:owner_logger.path().into(),provider:provider.into(),
+            runtime_relative_path,native_session_id,creation_receipt_sha256,
+            launch_sha256:format!("{:x}",Sha256::digest(&spec_bytes))};
+        // The protected append and optional workflow journal callback complete
+        // before any command can escape preparation or receive prompt bytes.
+        owner_logger.native_launch_prepared(&intent)?;
         let mut command = Command::new("/usr/bin/python3");
         command.arg("-I").arg(directory.path().join("native-provider-vm.py")).arg(spec_path).env_clear()
             .env("PATH","/usr/bin:/bin");
@@ -509,16 +564,21 @@ mod tests {
     }
     #[test]
     fn native_preparation_durably_records_exact_launch_before_returning() {
-        launch_intent_child(false);
+        launch_intent_child(false,false);
     }
     #[test]
     fn native_preparation_refuses_when_launch_intent_cannot_be_committed() {
-        launch_intent_child(true);
+        launch_intent_child(true,false);
     }
-    fn launch_intent_child(seal: bool) {
+    #[test]
+    fn native_preparation_propagates_workflow_journal_refusal() {
+        launch_intent_child(false,true);
+    }
+    fn launch_intent_child(seal: bool, refuse: bool) {
         const CHILD: &str = "JARVIS_TEST_NATIVE_LAUNCH_INTENT_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let test = if seal {"native_preparation_refuses_when_launch_intent_cannot_be_committed"}
+            let test = if refuse {"native_preparation_propagates_workflow_journal_refusal"}
+                else if seal {"native_preparation_refuses_when_launch_intent_cannot_be_committed"}
                 else {"native_preparation_durably_records_exact_launch_before_returning"};
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &format!("native_vm::tests::{test}"), "--test-threads=1"])
@@ -546,6 +606,20 @@ mod tests {
             let logger=std::sync::Arc::new(crate::tool_audit::AuditLogger::protected(logs.join("model.jsonl"),anchors.join("model.json"),&[]).unwrap());
             let owner=RuntimeOwner {workflow_id:"owner/repo/pr/7".into(),lease_generation:1};
             logger.set_native_runtime_owner(owner.clone()).unwrap();
+            let observed=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count=observed.clone();
+            let saved=std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured=saved.clone();
+            let sink=crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap();
+            logger.set_native_launch_observer(std::sync::Arc::new(move |prepared| {
+                let exact=sink.read_receipt(&prepared.controller_receipt)?;
+                ensure!(exact["intent_id"]==prepared.intent.intent_id,"callback did not receive the committed intent");
+                count.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                captured.lock().unwrap().push(prepared.clone());
+                ensure!(!refuse,"workflow journal refused launch");Ok(())
+            })).unwrap();
+            assert!(logger.clone().set_native_launch_observer(std::sync::Arc::new(|_|Ok(()))).is_err(),
+                "a logger clone replaced the workflow journal fence");
             if seal {logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
                 crate::audit_chain::AnchoredAudit::new(logger.path().into(),anchors.join("model.json"),&[]).unwrap()
                 .seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();}
@@ -556,11 +630,24 @@ mod tests {
                 assert!(launch.is_err(),"native preparation returned a dispatchable command without durable launch evidence");
                 continue;
             }
+            if refuse {
+                let error=launch.err().expect("workflow journal rejection returned a dispatchable command");
+                assert!(error.to_string().contains("workflow journal refused launch"),"{error:#}");
+                assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);continue;
+            }
             let launch=launch.unwrap();
+            assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
+            let before=std::fs::read(logger.path()).unwrap();
+            let prepared=saved.lock().unwrap()[0].clone();
+            let mut foreign=prepared.intent.clone();foreign.source_owner.lease_generation+=1;
+            assert!(logger.native_launch_prepared(&foreign).is_err());
+            assert_eq!(std::fs::read(logger.path()).unwrap(),before);
+            assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst),1);
             let rows:Vec<serde_json::Value>=std::fs::read_to_string(logger.path()).unwrap().lines()
                 .map(|row|serde_json::from_str(row).unwrap()).collect();
             let row=rows.iter().find(|row|row["kind"]=="native_launch_intent")
                 .expect("native command escaped preparation without a durable controller launch intent");
+            assert_eq!(logger.read_append_receipt(&prepared.controller_receipt).unwrap(),*row);
             assert_eq!(row["actor"],"controller");assert_eq!(row["source_owner"],serde_json::to_value(&owner).unwrap());
             assert_eq!(row["source_audit_path"],logger.path().to_str().unwrap());
             assert_eq!(row["provider"],provider);assert_eq!(row["native_session_id"],serde_json::to_value(id).unwrap());
