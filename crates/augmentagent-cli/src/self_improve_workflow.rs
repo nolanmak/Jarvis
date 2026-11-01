@@ -208,13 +208,23 @@ pub(super) fn reconcile_runtime_retirements()->Result<usize> {
     reconcile_runtime_retirements_in(&mut WorkflowStore::open(&state)?,millis())
 }
 fn reconcile_runtime_retirements_in(store:&mut WorkflowStore,now:i64)->Result<usize> {
-    if std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY").is_none(){return Ok(0);}
     let rows=store.pending_native_retirements(now,16)?;
     let mut completed=0;
     for (workflow,generation,audit_path) in rows {
         let owner=augmentagent_channel_core::native_vm::RuntimeOwner{workflow_id:workflow.clone(),lease_generation:generation};
-        match augmentagent_channel_core::native_vm::retire_owned_runtimes(Path::new(&audit_path),&owner) {
-            Ok(_)=>{store.complete_native_retirement(&workflow,generation,&audit_path,now)?; completed+=1;}
+        let binding=match store.native_owner_binding(&workflow,generation) {
+            Ok(Some(binding))=>binding,
+            Ok(None)=>{warn!("native runtime retirement retained: original binding is missing");continue;},
+            Err(error)=>{warn!("native runtime retirement retained: original binding is unreadable: {error:#}");continue;},
+        };
+        let current=|| {
+            use augmentagent_channel_core::native_vm::ownership::TransferFenceError;
+            match store.native_retirement_is_current(&workflow,generation,&audit_path,&binding) {
+                Ok(true)=>Ok(()),Ok(false)=>Err(TransferFenceError::NotCurrent),Err(_)=>Err(TransferFenceError::Unavailable),
+            }
+        };
+        match augmentagent_channel_core::native_vm::retire_owned_runtimes(&binding,Path::new(&audit_path),&owner,&current) {
+            Ok(_)=>{store.complete_bound_native_retirement(&workflow,generation,&audit_path,&binding,now)?; completed+=1;}
             Err(error)=>warn!("native runtime retirement retained for retry: {error:#}"),
         }
     }

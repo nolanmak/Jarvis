@@ -212,6 +212,10 @@ pub fn capture_transfer_binding(
     )
 }
 impl TransferBinding {
+    pub(super) fn retirement_store(&self)->Result<(&Path,&super::owner_store::StoreIdentity),TransferReason> {
+        self.validate()?;
+        Ok((&self.canonical_state_root,&self.store))
+    }
     pub(super) fn verify_launch_policy(&self,bytes:&[u8],root:&Path)->Result<(),TransferReason> {
         self.validate()?;
         if sha(bytes)==self.policy_sha256 && root==self.canonical_state_root {Ok(())}

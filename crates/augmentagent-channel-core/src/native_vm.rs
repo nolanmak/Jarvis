@@ -275,16 +275,26 @@ fn prune_and_count(root:&Path) -> Result<usize> {
     Ok(count)
 }
 
-/// Called by the workflow controller only after fenced recovery or completion.
+/// Called by the workflow controller only for an exact durable terminal or
+/// verified-recovery retirement intent. `current` revalidates that intent and
+/// its saved binding; acquiring the native lock does not create authority.
 /// It authorizes retirement of owned runtime data, including interrupted exports;
 /// active session locks still prevent reclamation. Approval/audit history is not
-/// stored here and is never removed by this operation.
-pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<usize> {
-    let Some(policy_path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(0)};
-    let policy:Policy=serde_json::from_slice(&private(Path::new(&policy_path))?)?;
-    let root=policy.state_root.canonicalize()?;
-    let lock=StateLock::acquire(&root)?;
-    retire_owned_at(&root,&lock,audit_path,owner)
+/// stored here and is never removed by this operation. Terminal cleanup uses
+/// only the original store, independently of today's productive policy choice.
+pub fn retire_owned_runtimes(binding:&ownership::TransferBinding,audit_path:&Path, owner:&RuntimeOwner,
+    current:&dyn Fn()->std::result::Result<(),ownership::TransferFenceError>) -> Result<usize> {
+    current().map_err(anyhow::Error::new)?;
+    let (root,store)=binding.retirement_store()?;
+    owner_store::validate_bound_metadata(root,store)?;
+    let lock=StateLock::existing(root)?;
+    let mut ledger=owner_ledger::Ledger::open_bound(root,&lock,store,false)?;
+    current().map_err(anyhow::Error::new)?;
+    owner_store::validate_bound_metadata(root,store)?;
+    let count=retire_owned_ledger(root,&mut ledger,audit_path,owner)?;
+    current().map_err(anyhow::Error::new)?;
+    owner_store::validate_bound_metadata(root,store)?;
+    Ok(count)
 }
 #[cfg(test)]
 fn retirement_db(root:&Path)->Result<rusqlite::Connection> {
@@ -304,8 +314,12 @@ fn owner_retired(root:&Path,lock:&StateLock,_audit_path:&Path,owner:&RuntimeOwne
     owner_ledger::Ledger::open(root,lock)?.is_closed(owner)
 }
 
+#[cfg(test)]
 fn retire_owned_at(root:&Path,lock:&StateLock,audit_path:&Path, expected_owner:&RuntimeOwner) -> Result<usize> {
     let mut ledger=owner_ledger::Ledger::open(root,lock)?;
+    retire_owned_ledger(root,&mut ledger,audit_path,expected_owner)
+}
+fn retire_owned_ledger(root:&Path,ledger:&mut owner_ledger::Ledger<'_>,audit_path:&Path,expected_owner:&RuntimeOwner)->Result<usize> {
     ledger.abort_and_retire(audit_path.to_str().context("non-UTF8 native audit path")?,expected_owner)?;
     std::fs::File::open(root)?.sync_all()?;
     let mut count=0;
@@ -319,7 +333,7 @@ fn retire_owned_at(root:&Path,lock:&StateLock,audit_path:&Path, expected_owner:&
             if !session.file_name().is_some_and(|name|name.to_string_lossy().starts_with("session-")){continue;}
             ensure!(session.is_dir() && !session.is_symlink(),"native owner session symlink");
             if !session.join("owned.json").exists(){continue;}
-            let current=runtime_authority(root,&ledger,&session)?;
+            let current=runtime_authority(root,ledger,&session)?;
             if current.audit_path!=audit_path.to_str().context("non-UTF8 native audit path")? || current.owner!=*expected_owner {continue;}
             let marker=session.join("retired-owner.json");
             if !marker.exists(){
@@ -796,6 +810,69 @@ mod tests {
         let runtime=session(root,"session-captured","/audit/original",false);
         let aliases=root.join("codex/aliases");std::fs::create_dir(&aliases).unwrap();
         std::fs::set_permissions(aliases,std::fs::Permissions::from_mode(0o700)).unwrap();runtime
+    }
+    fn lifecycle_binding(root:&Path,retirement:&Retirement)->ownership::TransferBinding {
+        serde_json::from_value(serde_json::json!({"version":1,"policy_sha256":"a".repeat(64),
+            "canonical_state_root":root,"store":retirement.store})).unwrap()
+    }
+    #[test]
+    fn native_terminal_retirement_uses_saved_store_without_selected_policy() {
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        let binding=lifecycle_binding(&root,&retirement);
+        assert_eq!(retire_owned_runtimes(&binding,Path::new(&retirement.expected.audit_path),
+            &retirement.expected.owner,&||Ok(())).unwrap(),1);
+        assert!(retirement.session.join("retired-owner.json").is_file());
+        assert_eq!(retire_owned_runtimes(&binding,Path::new(&retirement.expected.audit_path),
+            &retirement.expected.owner,&||Ok(())).unwrap(),0,"retirement replay must be idempotent");
+    }
+    #[test]
+    fn native_terminal_retirement_refuses_replaced_original_store() {
+        let (base,root,retirement,_launch)=lifecycle_fixture();
+        let binding=lifecycle_binding(&root,&retirement);
+        let replacement=replace_lifecycle_root(base.path(),&root);
+        assert!(retire_owned_runtimes(&binding,Path::new(&retirement.expected.audit_path),
+            &retirement.expected.owner,&||Ok(())).is_err());
+        assert!(!replacement.join("retired-owner.json").exists());
+        assert!(!base.path().join("retained-native/codex/session-captured/retired-owner.json").exists());
+    }
+    #[test]
+    fn native_terminal_retirement_never_recreates_missing_authority() {
+        for name in ["state.lock","runtime-retirement.sqlite","authority-epoch.json"] {
+            let (_base,root,retirement,_launch)=lifecycle_fixture();
+            let binding=lifecycle_binding(&root,&retirement);std::fs::remove_file(root.join(name)).unwrap();
+            assert!(retire_owned_runtimes(&binding,Path::new(&retirement.expected.audit_path),
+                &retirement.expected.owner,&||Ok(())).is_err(),"missing {name} accepted");
+            assert!(!root.join(name).exists(),"missing {name} recreated");
+            assert!(!retirement.session.join("retired-owner.json").exists());
+        }
+    }
+    #[test]
+    fn native_terminal_retirement_requires_current_intent_before_open_and_commit() {
+        for fail_at in [0,1] {
+            let (_base,root,retirement,_launch)=lifecycle_fixture();
+            let binding=lifecycle_binding(&root,&retirement);let calls=std::cell::Cell::new(0);
+            let current=|| {let call=calls.get();calls.set(call+1);
+                if call==fail_at {Err(ownership::TransferFenceError::NotCurrent)} else {Ok(())}};
+            assert!(retire_owned_runtimes(&binding,Path::new(&retirement.expected.audit_path),
+                &retirement.expected.owner,&current).is_err());
+            assert_eq!(calls.get(),fail_at+1);
+            assert!(!retirement.session.join("retired-owner.json").exists());
+            let lock=StateLock::existing(&root).unwrap();
+            let ledger=owner_ledger::Ledger::open_bound(&root,&lock,&retirement.store,true).unwrap();
+            assert!(!ledger.is_closed(&retirement.expected.owner).unwrap());
+        }
+    }
+    #[test]
+    fn native_terminal_retirement_busy_original_store_defers_without_blocking() {
+        let (_base,root,retirement,_launch)=lifecycle_fixture();
+        let binding=lifecycle_binding(&root,&retirement);let lock=StateLock::existing(&root).unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();let runtime=retirement.session.clone();
+        let worker=std::thread::spawn(move || {
+            let result=retire_owned_runtimes(&binding,Path::new(&retirement.expected.audit_path),
+                &retirement.expected.owner,&||Ok(()));let _=tx.send(result.is_err());
+        });
+        let refused=rx.recv_timeout(std::time::Duration::from_secs(1));drop(lock);worker.join().unwrap();
+        assert_eq!(refused.unwrap(),true);assert!(!runtime.join("retired-owner.json").exists());
     }
     #[test]
     fn native_lifecycle_retirement_does_not_act_on_a_replacement_store() {

@@ -100,6 +100,31 @@ impl WorkflowStore {
         })
         .transpose()
     }
+
+    /// A saved binding alone grants no cleanup. Only an exact durable terminal
+    /// or independently verified audit-recovery intent may close its owner.
+    pub fn native_retirement_is_current(&self,workflow:&str,generation:i64,audit_path:&str,binding:&TransferBinding)->Result<bool> {
+        native_retirement_matches(&self.conn,workflow,generation,audit_path,binding,true)
+    }
+    /// The filesystem may already have committed before a response was lost.
+    /// Revalidate the original intent and binding atomically with its ack/event.
+    pub fn complete_bound_native_retirement(&mut self,workflow:&str,generation:i64,audit_path:&str,binding:&TransferBinding,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(native_retirement_matches(&tx,workflow,generation,audit_path,binding,false)?,"native retirement intent or original binding changed");
+        let changed=tx.execute("UPDATE workflow_native_owner SET retired_at=?4 WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retired_at IS NULL",
+            params![workflow,generation,audit_path,now])?;
+        if changed>0 {event(&tx,workflow,generation,"native_runtime_owner_retired",audit_path,now)?;}
+        tx.commit()?;Ok(())
+    }
+}
+fn native_retirement_matches(conn:&Connection,workflow:&str,generation:i64,audit_path:&str,binding:&TransferBinding,pending_only:bool)->Result<bool> {
+    binding.validate()?;
+    let raw:Option<String>=conn.query_row(
+        "SELECT b.binding FROM workflow_native_owner o JOIN workflow_native_owner_binding b ON b.workflow=o.workflow AND b.lease_generation=o.lease_generation WHERE o.workflow=?1 AND o.lease_generation=?2 AND o.audit_path=?3 AND o.retirement_reason IN ('terminal_workflow','quiescent_audit_recovery') AND (?4=0 OR o.retired_at IS NULL)",
+        params![workflow,generation,audit_path,pending_only],|row|row.get(0)).optional()?;
+    raw.map(|raw|->Result<bool> {
+        let saved:TransferBinding=serde_json::from_str(&raw)?;saved.validate()?;Ok(saved==*binding)
+    }).transpose().map(|matched|matched.unwrap_or(false))
 }
 
 #[cfg(test)]
@@ -133,6 +158,54 @@ mod tests {
             .unwrap()
             .unwrap();
         (store, lease, binding)
+    }
+    #[test]
+    fn native_retirement_requires_exact_durable_intent_and_original_binding() {
+        let temporary=tempfile::tempdir().unwrap();let path=temporary.path().join("workflow.sqlite");
+        let (mut store,lease,workflow)=setup(&path);let native=native_binding('d');let audit="/private/source-audit";
+        store.register_initial_native_owner(&lease,&workflow,audit,&native,3).unwrap();
+        assert!(!store.native_retirement_is_current(&lease.workflow,lease.generation,audit,&native).unwrap(),"registration alone authorized retirement");
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;
+        store.checkpoint(&lease,&checkpoint,4).unwrap();drop(store);
+        let store=WorkflowStore::open(&path).unwrap();
+        assert!(store.native_retirement_is_current(&lease.workflow,lease.generation,audit,&native).unwrap());
+        assert!(!store.native_retirement_is_current(&lease.workflow,lease.generation,"/private/another-audit",&native).unwrap());
+        assert!(!store.native_retirement_is_current(&lease.workflow,lease.generation,audit,&native_binding('e')).unwrap());
+        assert!(!store.native_retirement_is_current(&lease.workflow,lease.generation+1,audit,&native).unwrap());
+        store.conn.execute("UPDATE workflow_native_owner SET retirement_reason='unknown_reason'",[]).unwrap();
+        assert!(!store.native_retirement_is_current(&lease.workflow,lease.generation,audit,&native).unwrap());
+    }
+    #[test]
+    fn native_retirement_ack_rejects_changed_binding_and_unbound_legacy() {
+        for legacy in [false,true] {
+            let temporary=tempfile::tempdir().unwrap();let (mut store,lease,workflow)=setup(&temporary.path().join("workflow.sqlite"));
+            let native=native_binding('d');let audit="/private/source-audit";
+            if legacy {store.register_native_owner(&lease,audit,3).unwrap();}
+            else {store.register_initial_native_owner(&lease,&workflow,audit,&native,3).unwrap();}
+            let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Retired;
+            store.checkpoint(&lease,&checkpoint,4).unwrap();
+            assert!(store.complete_bound_native_retirement(&lease.workflow,lease.generation,audit,&native_binding('e'),5).is_err(),"acknowledged unbound or changed authority");
+            assert_eq!(store.pending_native_retirements(6,16).unwrap().len(),1);
+            assert!(!store.events(&lease.workflow).unwrap().iter().any(|(_,kind,_,_)|kind=="native_runtime_owner_retired"));
+        }
+    }
+    #[test]
+    fn native_retirement_bound_ack_is_atomic_idempotent_and_restart_safe() {
+        let temporary=tempfile::tempdir().unwrap();let path=temporary.path().join("workflow.sqlite");
+        let (mut store,lease,workflow)=setup(&path);let native=native_binding('d');let audit="/private/source-audit";
+        store.register_initial_native_owner(&lease,&workflow,audit,&native,3).unwrap();
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;checkpoint.stage=Stage::Merged;
+        store.checkpoint(&lease,&checkpoint,4).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_retirement_event BEFORE INSERT ON workflow_event WHEN NEW.kind='native_runtime_owner_retired' BEGIN SELECT RAISE(ABORT,'fixture lost event'); END;").unwrap();
+        assert!(store.complete_bound_native_retirement(&lease.workflow,lease.generation,audit,&native,5).is_err());
+        assert!(store.native_retirement_is_current(&lease.workflow,lease.generation,audit,&native).unwrap());
+        store.conn.execute_batch("DROP TRIGGER fail_retirement_event").unwrap();
+        store.complete_bound_native_retirement(&lease.workflow,lease.generation,audit,&native,6).unwrap();drop(store);
+        let mut store=WorkflowStore::open(&path).unwrap();
+        store.complete_bound_native_retirement(&lease.workflow,lease.generation,audit,&native,7).unwrap();
+        assert!(!store.native_retirement_is_current(&lease.workflow,lease.generation,audit,&native).unwrap());
+        assert!(store.pending_native_retirements(8,16).unwrap().is_empty());
+        assert_eq!(store.events(&lease.workflow).unwrap().iter().filter(|(_,kind,_,_)|kind=="native_runtime_owner_retired").count(),1);
     }
     #[test]
     fn native_owner_binding_is_durable_idempotent_and_immutable() {

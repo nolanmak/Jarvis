@@ -1479,6 +1479,7 @@ impl WorkflowStore {
     }
 
     /// Acknowledgement is idempotent and only settles the exact authorized intent.
+    #[cfg(test)]
     pub fn complete_native_retirement(&mut self,workflow:&str,generation:i64,audit_path:&str,now:i64)->Result<()> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed=tx.execute("UPDATE workflow_native_owner SET retired_at=?4 WHERE workflow=?1 AND lease_generation=?2 AND audit_path=?3 AND retirement_reason IS NOT NULL AND retired_at IS NULL",
