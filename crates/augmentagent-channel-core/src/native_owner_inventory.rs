@@ -14,7 +14,7 @@ const MAX_DIRECTORIES: usize = 2048;
 fn private_metadata(info: &Metadata, directory: bool) -> Result<()> {
     ensure!(
         info.uid() == unsafe { libc::geteuid() }
-            && info.mode() & 0o077 == 0
+            && (directory || info.mode() & 0o077 == 0)
             && if directory {
                 info.is_dir()
             } else {
@@ -47,13 +47,19 @@ fn unchanged(path: &Path, original: &Metadata, current: &Metadata) -> Result<()>
     );
     Ok(())
 }
-fn directory(path: &Path) -> Result<(File, Metadata)> {
+fn directory(path: &Path, generation_root: bool) -> Result<(File, Metadata)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let info = file.metadata()?;
     private_metadata(&info, true)?;
+    // Legacy publisher parents inherit the service umask. A private generation
+    // root prevents other users from reaching them; never rewrite saved exports.
+    ensure!(
+        !generation_root || info.mode() & 0o077 == 0,
+        "native-transfer-metadata-invalid"
+    );
     Ok((file, info))
 }
 pub(super) fn export_manifest(root: &Path) -> Result<Value> {
@@ -63,7 +69,7 @@ pub(super) fn export_manifest(root: &Path) -> Result<Value> {
     let mut files = 0usize;
     let mut directories = 0usize;
     while let Some(path) = stack.pop() {
-        let (held, before) = directory(&path)?;
+        let (held, before) = directory(&path, path == root)?;
         for entry in std::fs::read_dir(&path)? {
             let path = entry?.path();
             let relative = path

@@ -121,9 +121,19 @@ def safe_relative(raw):
 
 
 def export_target(staging, raw):
-    target = staging / safe_relative(raw)
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return target
+    relative = safe_relative(raw)
+    # mkdir(parents=True) applies mode only to the final directory. Create
+    # every component separately so service umasks cannot expose new parents.
+    parent = staging
+    for component in (None, *relative.parts[:-1]):
+        if component is not None:
+            parent = parent / component
+            parent.mkdir(mode=0o700, exist_ok=True)
+        info = parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077):
+            raise ValueError('invalid native export directory')
+    return staging / relative
 
 
 @contextlib.contextmanager
