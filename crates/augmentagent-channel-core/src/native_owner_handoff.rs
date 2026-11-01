@@ -413,9 +413,235 @@ fn handoff_at(
 }
 #[cfg(test)]
 mod tests {
+    use super::super::ownership::{
+        TransferFenceError, TransferObservation, TransferOutcome, TransferReason,
+    };
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
+    fn observation() -> TransferObservation {
+        TransferObservation {
+            revision: 1,
+            sha256: "a".repeat(64),
+            certain: true,
+        }
+    }
+    fn policy(f: &Fixture) -> PathBuf {
+        let path = f._temporary.path().join("policy.json");
+        let value = json!({"version":1,"runtime_config":"/unused-runtime","guest_runtime":"/unused-guest","state_root":f.root,"memory_mb":512,"max_state_bytes":u64::MAX,"max_sessions":8,"providers":{}});
+        super::super::write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        path
+    }
+    fn outcome(
+        f: &Fixture,
+        observation: &TransferObservation,
+        current: &dyn Fn() -> std::result::Result<(), TransferFenceError>,
+    ) -> TransferOutcome {
+        super::super::owner_outcome::transfer_with_policy(
+            Some(&policy(f)),
+            &f.request,
+            observation,
+            &f.sources,
+            &f.destination,
+            current,
+        )
+    }
+    #[test]
+    fn native_handoff_outcome_public_entrypoint_uses_selected_policy_and_replays_private_receipt() {
+        const CHILD: &str = "JARVIS_TEST_TYPED_TRANSFER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "native_vm::owner_handoff::tests::native_handoff_outcome_public_entrypoint_uses_selected_policy_and_replays_private_receipt", "--test-threads=1"])
+                .env(CHILD,"1").env_remove("AUGMENTAGENT_NATIVE_VM_POLICY").output().unwrap();
+            assert!(
+                output.status.success(),
+                "public entrypoint child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let f = fixture(true);
+        std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY", policy(&f));
+        let result = super::super::ownership::transfer(
+            &f.request,
+            &observation(),
+            &f.sources,
+            &f.destination,
+            &|| Ok(()),
+        );
+        let TransferOutcome::Completed(receipt) = &result else {
+            panic!("valid selected-policy transfer did not complete: {result:?}")
+        };
+        receipt.verify(&f.request).unwrap();
+        let public = result.public_status();
+        assert_eq!(public.as_object().unwrap().len(), 3);
+        assert!(!public.to_string().contains(f.root.to_str().unwrap()));
+        assert!(!public.to_string().contains("native-codex"));
+        for source in &f.sources {
+            std::fs::remove_file(source.path()).unwrap();
+        }
+        assert_eq!(
+            super::super::ownership::transfer(
+                &f.request,
+                &observation(),
+                &f.sources,
+                &f.destination,
+                &|| Ok(())
+            ),
+            result
+        );
+    }
+    #[test]
+    fn native_handoff_outcome_preflight_distinguishes_stale_unavailable_and_uncertain_without_mutation(
+    ) {
+        for case in ["stale", "unavailable", "uncertain", "invalid"] {
+            let mut f = fixture(false);
+            let before = audit_bytes(&f);
+            let mut observed = observation();
+            if case == "uncertain" {
+                observed.certain = false;
+            }
+            if case == "invalid" {
+                f.request.version = 0;
+            }
+            let result = outcome(&f, &observed, &|| match case {
+                "stale" => Err(TransferFenceError::NotCurrent),
+                "unavailable" => Err(TransferFenceError::Unavailable),
+                _ => Ok(()),
+            });
+            match (case, result) {
+                (
+                    "stale",
+                    TransferOutcome::Held {
+                        reason: TransferReason::AuthorityConflict,
+                        ..
+                    },
+                )
+                | (
+                    "unavailable",
+                    TransferOutcome::Deferred {
+                        reason: TransferReason::PersistRetry,
+                        ..
+                    },
+                )
+                | (
+                    "uncertain",
+                    TransferOutcome::Held {
+                        reason: TransferReason::ConversationUncertain,
+                        ..
+                    },
+                )
+                | (
+                    "invalid",
+                    TransferOutcome::Held {
+                        reason: TransferReason::InvalidRequest,
+                        ..
+                    },
+                ) => (),
+                (_, other) => panic!("wrong {case} outcome: {other:?}"),
+            }
+            assert_eq!(audit_bytes(&f), before);
+            assert!(!f.root.join("runtime-retirement.sqlite").exists());
+        }
+    }
+    #[test]
+    fn native_handoff_outcome_busy_fingerprint_tracks_observation_policy_and_request() {
+        let mut f = fixture(false);
+        let before = audit_bytes(&f);
+        let _held =
+            session_lock(&f.root.join(&f.request.inventory[0].runtime_relative_path)).unwrap();
+        let policy_path = policy(&f);
+        let run = |f: &Fixture, observed: &TransferObservation| {
+            super::super::owner_outcome::transfer_with_policy(
+                Some(&policy_path),
+                &f.request,
+                observed,
+                &f.sources,
+                &f.destination,
+                &|| Ok(()),
+            )
+        };
+        let observed = observation();
+        let first = run(&f, &observed);
+        assert!(
+            matches!(&first, TransferOutcome::Deferred {reason:TransferReason::LockBusy, fingerprint} if fingerprint.len()==64)
+        );
+        assert_eq!(run(&f, &observed), first);
+        let mut newer = observed.clone();
+        newer.revision += 1;
+        assert_ne!(run(&f, &newer), first);
+        newer = observed.clone();
+        newer.sha256 = "b".repeat(64);
+        assert_ne!(run(&f, &newer), first);
+        let mut selected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
+        selected["max_sessions"] = json!(9);
+        super::super::write(&policy_path, &serde_json::to_vec(&selected).unwrap()).unwrap();
+        assert_ne!(run(&f, &observed), first);
+        policy(&f);
+        f.request.inventory[0].completion_sha256 = "c".repeat(64);
+        assert_ne!(run(&f, &observed), first);
+        f.request.inventory[0].completion_sha256 = "d".repeat(64);
+        f.request.inventory[0].alias_sha256 = "e".repeat(64);
+        assert_ne!(run(&f, &observed), first);
+        assert_eq!(audit_bytes(&f), before);
+        assert!(!first
+            .public_status()
+            .to_string()
+            .contains(f.root.to_str().unwrap()));
+    }
+    #[test]
+    fn native_handoff_outcome_corrupt_audit_holds_and_unreadable_pending_state_is_unknown() {
+        let f = fixture(false);
+        std::fs::write(f.sources[0].path(), b"broken private audit fixture").unwrap();
+        assert!(matches!(
+            outcome(&f, &observation(), &|| Ok(())),
+            TransferOutcome::Held {
+                reason: TransferReason::AuditCorrupt,
+                ..
+            }
+        ));
+        let f = fixture(false);
+        let corrupted = std::cell::Cell::new(false);
+        let current = || {
+            let db = f.root.join("runtime-retirement.sqlite");
+            if db.exists() && !corrupted.get() {
+                let connection = augmentagent_store::rusqlite::Connection::open(&db).unwrap();
+                let prepared: bool = connection
+                    .query_row("SELECT EXISTS(SELECT 1 FROM native_transfer)", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                drop(connection);
+                if prepared {
+                    std::fs::write(&db, b"broken private ledger fixture").unwrap();
+                    corrupted.set(true);
+                    return Err(TransferFenceError::Unavailable);
+                }
+            }
+            Ok(())
+        };
+        assert_eq!(
+            outcome(&f, &observation(), &current),
+            TransferOutcome::Unknown {
+                reason: TransferReason::PendingUnknown,
+                transfer_id: f.request.transfer_id.clone()
+            }
+        );
+        assert!(corrupted.get());
+    }
+    #[test]
+    fn native_handoff_outcome_live_writer_defers_then_replays_but_interrupted_writer_holds() {
+        let f=fixture(false);
+        let writer=f.sources[0].begin_write().unwrap();
+        assert!(matches!(outcome(&f,&observation(),&||Ok(())),TransferOutcome::Deferred {reason:TransferReason::LockBusy,..}));
+        writer.complete();
+        assert!(matches!(outcome(&f,&observation(),&||Ok(())),TransferOutcome::Completed(_)));
+        let f=fixture(false);
+        drop(f.sources[0].begin_write().unwrap());
+        assert!(matches!(outcome(&f,&observation(),&||Ok(())),TransferOutcome::Held {reason:TransferReason::AuditCorrupt,..}));
+    }
     struct Fixture {
         _temporary: tempfile::TempDir,
         root: PathBuf,

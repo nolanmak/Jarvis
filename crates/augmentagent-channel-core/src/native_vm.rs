@@ -49,6 +49,8 @@ mod owner_ledger;
 mod owner_inventory;
 #[path = "native_owner_handoff.rs"]
 mod owner_handoff;
+#[path = "native_owner_outcome.rs"]
+mod owner_outcome;
 
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
