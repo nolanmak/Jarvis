@@ -29,6 +29,7 @@ pub const MIN_AGE_HOURS: f64 = 48.0;
 pub const STRAY_DAYS: f64 = 7.0;
 
 const DB_NAME: &str = "data.db.gz";
+const FORENSIC_DB_NAME: &str = "forensic.db.gz";
 const BINARY_NAME: &str = "augmentagent";
 const MANIFEST_NAME: &str = "manifest.json";
 
@@ -161,6 +162,11 @@ pub fn snapshot(
         budget_bytes: budget_bytes(), reserve_gb: crate::disk::gate_min_free_gb(),
     })
 }
+
+/// A forensic page image preserves damaged source bytes under normal ownership
+/// and retention. It is evidence, never a deployable rollback database.
+fn forensic_snapshot_budgeted(_db:&Path,_root:&Path,_label:&str,_now:chrono::DateTime<chrono::Utc>,
+    _limits:SnapshotLimits)->Result<PathBuf> {bail!("forensic snapshot not implemented")}
 
 struct SnapshotLimits {
     budget_bytes: u64,
@@ -570,6 +576,75 @@ pub fn run_list(root: &Path, out: &mut dyn Write) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // Fresh fixture corruption only; production captures always use the
+    // supported deploy snapshot command and its managed retention directory.
+    fn forensic_source(path:&std::path::Path,corrupt:bool)->augmentagent_store::rusqlite::Connection {
+        let db=augmentagent_store::rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE authority(id INTEGER PRIMARY KEY, paused INTEGER, confirmed INTEGER); INSERT INTO authority VALUES(7,1,3); CREATE TABLE cached_observation(id INTEGER PRIMARY KEY, record TEXT); INSERT INTO cached_observation VALUES(1,'rebuildable');").unwrap();
+        if corrupt {
+            let page:i64=db.query_row("SELECT rootpage FROM sqlite_schema WHERE name='cached_observation'",[],|r|r.get(0)).unwrap();
+            let size:i64=db.query_row("PRAGMA page_size",[],|r|r.get(0)).unwrap();drop(db);
+            use std::os::unix::fs::FileExt;
+            let file=std::fs::OpenOptions::new().write(true).open(path).unwrap();file.write_all_at(&[0],((page-1)*size) as u64).unwrap();file.sync_all().unwrap();
+            augmentagent_store::rusqlite::Connection::open(path).unwrap()
+        } else {db}
+    }
+    fn forensic_limits()->SnapshotLimits {SnapshotLimits {budget_bytes:64*1024*1024,reserve_gb:0.0}}
+    #[test]
+    fn forensic_capture_preserves_corruption_and_authority_without_becoming_a_rollback() {
+        let temporary=tempfile::tempdir().unwrap();let source=temporary.path().join("source.db");
+        drop(forensic_source(&source,true));let root=temporary.path().join("snapshots");
+        assert!(snapshot_budgeted(&source,None,&root,"normal",None,chrono::Utc::now(),forensic_limits()).is_err());
+        let captured=forensic_snapshot_budgeted(&source,&root,"forensic",chrono::Utc::now(),forensic_limits()).unwrap();
+        assert!(captured.join(FORENSIC_DB_NAME).is_file());assert!(!captured.join(DB_NAME).exists());
+        assert!(captured.join(".pin").is_file());assert!(manifest(&captured).is_some());
+        let metadata:serde_json::Value=serde_json::from_slice(&std::fs::read(captured.join(MANIFEST_NAME)).unwrap()).unwrap();
+        assert_eq!(metadata["kind"],"forensic-page-image");assert_eq!(metadata["restorable"],false);
+        let image=temporary.path().join("fixture-image.db");
+        let mut input=flate2::read::GzDecoder::new(std::fs::File::open(captured.join(FORENSIC_DB_NAME)).unwrap());
+        std::io::copy(&mut input,&mut std::fs::File::create(&image).unwrap()).unwrap();
+        let db=augmentagent_store::rusqlite::Connection::open(&image).unwrap();
+        assert_eq!(db.query_row("SELECT paused,confirmed FROM authority WHERE id=7",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).unwrap(),(1,3));
+        let check=db.query_row("PRAGMA quick_check(1)",[],|r|r.get::<_,String>(0));
+        assert!(check.is_err() || check.unwrap()!="ok","forensic capture silently discarded the damaged cache");
+        let target=temporary.path().join("must-not-restore.db");assert!(restore_db(&captured,&target,true).is_err());
+        assert!(!target.exists());
+    }
+    #[test]
+    fn forensic_capture_includes_committed_live_wal() {
+        let temporary=tempfile::tempdir().unwrap();let source=temporary.path().join("source.db");
+        let db=forensic_source(&source,false);db.execute_batch("PRAGMA journal_mode=WAL; UPDATE authority SET confirmed=4 WHERE id=7;").unwrap();
+        let captured=forensic_snapshot_budgeted(&source,&temporary.path().join("snapshots"),"wal",chrono::Utc::now(),forensic_limits()).unwrap();
+        let image=temporary.path().join("fixture-image.db");
+        let mut input=flate2::read::GzDecoder::new(std::fs::File::open(captured.join(FORENSIC_DB_NAME)).unwrap());
+        std::io::copy(&mut input,&mut std::fs::File::create(&image).unwrap()).unwrap();
+        let image=augmentagent_store::rusqlite::Connection::open(image).unwrap();
+        assert_eq!(image.query_row("SELECT confirmed FROM authority WHERE id=7",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+    }
+    #[test]
+    fn forensic_capture_never_consumes_healthy_rollback_retention_slots() {
+        let temporary=tempfile::tempdir().unwrap();let root=temporary.path().join("snapshots");std::fs::create_dir(&root).unwrap();
+        let now=chrono::Utc::now();
+        for (name,hours,forensic) in [("healthy-old",90,false),("healthy-middle",80,false),("healthy-new",70,false),("evidence-new",60,true)] {
+            let dir=root.join(name);std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join(if forensic {FORENSIC_DB_NAME}else{DB_NAME}),b"fixture").unwrap();
+            std::fs::write(dir.join(MANIFEST_NAME),serde_json::to_vec(&serde_json::json!({"owner":"augmentagent-snapshot-v1","created_at":(now-chrono::Duration::hours(hours)).to_rfc3339(),"db_bytes":7,"kind":if forensic {"forensic-page-image"}else{"rollback"},"restorable":!forensic})).unwrap()).unwrap();
+            if forensic {std::fs::write(dir.join(".pin"),"recovery evidence").unwrap();assert!(manifest(&dir).is_some());}
+        }
+        let refs=crate::snapshot_refs::References {reliable:true,..Default::default()};
+        prune_locked(&root,None,&[],&PruneOptions {keep:2,..Default::default()},SystemTime::from(now),&refs);
+        assert!(!root.join("healthy-old").exists());assert!(root.join("healthy-middle").exists());
+        assert!(root.join("healthy-new").exists());assert!(root.join("evidence-new").exists());
+    }
+    #[test]
+    fn forensic_manifest_blocks_restore_before_creating_any_output() {
+        let temporary=tempfile::tempdir().unwrap();let snapshot=temporary.path().join("evidence");std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(snapshot.join(MANIFEST_NAME),br#"{"kind":"forensic-page-image","restorable":false}"#).unwrap();
+        std::fs::write(snapshot.join(DB_NAME),b"not-a-rollback").unwrap();let target=temporary.path().join("target.db");
+        assert!(restore_db(&snapshot,&target,true).is_err());assert!(!target.exists());
+        assert!(!target.with_extension("restore.tmp").exists(),"restore touched output before rejecting forensic evidence");
+    }
+
     use super::*;
 
     fn item(name: &str, age_hours: f64) -> Item {
