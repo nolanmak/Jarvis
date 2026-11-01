@@ -850,7 +850,16 @@ pub fn save_readings(now: &[FsReading], at: chrono::DateTime<chrono::Utc>) {
 }
 
 /// `augmentagent disk status`: what is watched and how much room it has.
-pub fn run_status(repo_root: &Path, json: bool, out: &mut dyn Write) -> Result<()> {
+pub fn run_status(repo_root: &Path, json: bool, unmanaged: bool, out: &mut dyn Write) -> Result<()> {
+    if unmanaged {
+        let caches = unmanaged_caches(repo_root, true);
+        if json {
+            writeln!(out, "{}", serde_json::to_string_pretty(&caches)?)?;
+        } else {
+            write_unmanaged(&caches, out)?;
+        }
+        return Ok(());
+    }
     let readings = read_filesystems(repo_root);
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(&readings)?)?;
@@ -860,6 +869,27 @@ pub fn run_status(repo_root: &Path, json: bool, out: &mut dyn Write) -> Result<(
     for r in &readings {
         let flag = if r.free_gb < floor { "  LOW" } else { "" };
         writeln!(out, "{:>8.1} GB free{flag}  {}", r.free_gb, r.label())?;
+    }
+    write_unmanaged(&unmanaged_caches(repo_root, true), out)
+}
+
+/// Cargo caches on a managed build volume that housekeeping cannot see (#1754).
+pub fn unmanaged_caches(repo_root: &Path, measure: bool) -> Vec<crate::build_storage::UnmanagedCache> {
+    let Ok(state) = crate::build_storage::state_dir() else { return vec![] };
+    let extra = extra_roots_from(&std::env::var("AUGMENTAGENT_PRUNE_TARGET_DIRS").unwrap_or_default());
+    let known: Vec<PathBuf> = discover_roots(repo_root, &extra).into_iter().map(|r| r.path).collect();
+    crate::build_storage::unmanaged_caches(&state, &known, measure, SystemTime::now())
+}
+
+fn write_unmanaged(caches: &[crate::build_storage::UnmanagedCache], out: &mut dyn Write) -> Result<()> {
+    if caches.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "\nunmanaged Cargo caches (never pruned; adopt or remove after checking nothing writes to them):")?;
+    for c in caches {
+        let idle = c.idle_days.map_or("idle ?".to_string(), |d| format!("idle {d:.0}d"));
+        writeln!(out, "{:>8.1} GB  {idle:>9}  {}", c.bytes as f64 / GIB, c.path.display())?;
+        writeln!(out, "{:>21}adopt: augmentagent disk register --root {} --abandoned", "", c.path.display())?;
     }
     Ok(())
 }
@@ -1297,6 +1327,13 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
         let total: u64 = reports.iter().map(|r| r.freed_bytes).sum();
         let verb = if opts.dry_run { "would free" } else { "freed" };
         writeln!(out, "{verb} {} across {} dirs", fmt_gb(total), reports.len())?;
+        // #1754: say when caches exist that this run cannot touch.
+        if opts.roots.is_empty() {
+            let strays = unmanaged_caches(repo_root, false).len();
+            if strays > 0 {
+                writeln!(out, "{strays} unmanaged Cargo caches not pruned (see `augmentagent disk status --unmanaged`)")?;
+            }
+        }
     }
     Ok(())
 }
