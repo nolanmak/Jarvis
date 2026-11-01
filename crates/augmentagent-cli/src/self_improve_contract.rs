@@ -237,6 +237,13 @@ async fn actual_head(root: &Path) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
+/// Fixed executable search roots; candidate paths and inherited PATH are absent.
+fn verifier_executable_path(program:&str,daemon_home:&Path)->Result<std::ffi::OsString> {
+    if program=="cargo" {
+        ensure!(daemon_home.is_absolute(),"operator compiler home must be absolute");
+        Ok(std::env::join_paths([daemon_home.join(".cargo/bin"),PathBuf::from("/usr/bin"),PathBuf::from("/bin")])?)
+    } else {Ok("/usr/bin:/bin".into())}
+}
 /// Runner policy fingerprint changes when enforcement or toolchain identity
 /// changes. Includes system interpreter binaries and rustup selection metadata.
 /// The orchestrator must also pin the admitted Rust toolchain image; this hash
@@ -269,7 +276,11 @@ fn environment_id_with_exporter(root: &Path, exporter: Option<&str>) -> Result<S
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        let settings = PathBuf::from(home).join(".rustup/settings.toml");
+        let home=PathBuf::from(home);
+        hash.update(serde_json::to_vec(&("verifier-executable-search-v1",
+            std::env::split_paths(&verifier_executable_path("cargo",&home)?).collect::<Vec<_>>(),
+            std::env::split_paths(&verifier_executable_path("python3",&home)?).collect::<Vec<_>>()))?);
+        let settings = home.join(".rustup/settings.toml");
         if settings.exists() {
             hash.update(std::fs::read(settings)?);
         }
@@ -613,7 +624,7 @@ async fn isolated_observation(
     }
     cmd.args(invocation.args)
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", verifier_executable_path(invocation.program,&daemon_home)?)
         .env("HOME", &home)
         .env("TMPDIR", &runtime)
         .env("CARGO_HOME", &cargo_home)
@@ -679,6 +690,101 @@ async fn isolated_observation(
 mod tests {
     use super::*;
     use anyhow::ensure;
+    fn verifier_toolchain_child(test:&str)->Option<PathBuf> {
+        const CHILD:&str="AUTOSHIP_VERIFIER_TOOLCHAIN_CHILD";
+        if let Some(root)=std::env::var_os(CHILD) {return Some(root.into());}
+        let root=tempfile::tempdir_in("/tmp").unwrap();let home=root.path().join("operator");std::fs::create_dir(&home).unwrap();
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact",&format!("self_improve::acceptance::tests::{test}"),"--nocapture","--test-threads=1"])
+            .env_clear().env("PATH","/usr/bin:/bin").env("HOME",home).env(CHILD,root.path())
+            // Synthetic executable lookup only: this fixture compiles no Rust
+            // and creates no Cargo build output or unmanaged build cache.
+            .env("AUGMENTAGENT_GATE_MIN_FREE_GB","1").env("AUGMENTAGENT_GATE_BUILD_GROWTH_GB","0")
+            .output().unwrap();
+        assert!(output.status.success(),"{} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));None
+    }
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    async fn isolated_cargo_finds_operator_compiler_and_preserves_confinement() {
+        let Some(root)=verifier_toolchain_child("isolated_cargo_finds_operator_compiler_and_preserves_confinement") else{return;};
+        use std::os::unix::fs::PermissionsExt;
+        let home=PathBuf::from(std::env::var_os("HOME").unwrap());let bin=home.join(".cargo/bin");
+        for p in [&bin,&home.join(".cargo/registry"),&home.join(".rustup/toolchains")] {std::fs::create_dir_all(p).unwrap();}
+        let source=root.join("source");let target=root.join("synthetic-output");let control=root.join("control");
+        for p in [&source,&target,&control] {std::fs::create_dir(p).unwrap();}
+        std::fs::write(source.join("Cargo.lock"),"version = 4\n").unwrap();
+        std::fs::write(source.join("protected.txt"),"original source").unwrap();
+        let private=home.join("credentials.json");std::fs::write(&private,"SYNTHETIC_PRIVATE").unwrap();
+        let compiler=format!("#!/usr/bin/python3\nimport json,socket\nfrom pathlib import Path\nr={{'compiler':'operator','private':'denied','write':'denied','network':'denied'}}\ntry:r['private']=Path({}).read_text()\nexcept PermissionError:pass\ntry:Path('protected.txt').write_text('changed');r['write']='allowed'\nexcept PermissionError:pass\ntry:socket.socket();r['network']='allowed'\nexcept PermissionError:pass\nprint(json.dumps(r))\n",serde_json::to_string(&private).unwrap());
+        for (path,bytes) in [(bin.join("cargo"),"#!/usr/bin/python3\nimport subprocess,sys\np=subprocess.run(['rustc','-vV'],capture_output=True,text=True)\nsys.stdout.write(p.stdout);sys.stderr.write(p.stderr);sys.exit(p.returncode)\n".to_owned()),(bin.join("rustc"),compiler),(source.join("rustc"),"#!/usr/bin/python3\nprint('candidate compiler must not run')\n".to_owned())] {
+            std::fs::write(&path,bytes).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let invocation=crate::autoship_contract::VerifierCommand::BlackBox {
+            invocation:crate::autoship_contract::BehaviorInvocation::CargoBinary {package:"fixture".into(),bin:"autoship_probe".into(),args:vec![]},
+            oracle:crate::autoship_contract::OutputOracle::Json {value:serde_json::json!(null)},
+        }.invocation().unwrap();
+        let observed=isolated_observation(&source,&target,invocation,&test_resource_audit(&control)).await.unwrap();
+        assert_eq!(observed.exit_code,Some(0),"{}",observed.stderr);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&observed.stdout).unwrap(),serde_json::json!({"compiler":"operator","private":"denied","write":"denied","network":"denied"}));
+        assert_eq!(std::fs::read_to_string(source.join("protected.txt")).unwrap(),"original source");
+    }
+    #[test]
+    fn verifier_environment_binds_operator_compiler_search_path() {
+        let Some(root)=verifier_toolchain_child("verifier_environment_binds_operator_compiler_search_path") else{return;};
+        let source=root.join("source");std::fs::create_dir(&source).unwrap();
+        let first=environment_id(&source).unwrap();
+        let other=root.join("other-operator");std::fs::create_dir(&other).unwrap();std::env::set_var("HOME",other);
+        assert_ne!(environment_id(&source).unwrap(),first,"compiler search policy changed without invalidating verifier evidence");
+    }
+    #[cfg(target_os="linux")]
+    #[tokio::test]
+    #[ignore = "requires delegated production resource policy and exclusive managed verifier storage"]
+    async fn live_isolated_cargo_reproduces_red_and_verifies_green() -> Result<()> {
+        use crate::autoship_contract::{BehaviorInvocation,Criterion,OutputOracle,PathScope,Verifier,VerifierCommand};
+        use std::os::unix::fs::PermissionsExt;
+        async fn git(root:&Path,args:&[&str])->Result<()> {
+            let out=Command::new("/usr/bin/git").args(args).current_dir(root).env_clear().env("PATH","/usr/bin:/bin").output().await?;
+            ensure!(out.status.success(),"fixture Git operation failed: {}",String::from_utf8_lossy(&out.stderr));Ok(())
+        }
+        async fn commit(root:&Path)->Result<()> {
+            git(root,&["add","."]).await?;
+            git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","Synthetic verifier behavior"]).await
+        }
+        let evidence=PathBuf::from(std::env::var("AUTOSHIP_CARGO_ACCEPTANCE_EVIDENCE")?);
+        ensure!(evidence.is_absolute(),"explicit private diagnostic evidence path required");
+        std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+        ensure!(evidence.canonicalize()?==evidence,"evidence path must be literal");
+        let root=evidence.join("candidate");std::fs::create_dir(&root)?;std::fs::create_dir(root.join("src"))?;
+        std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"autoship-live-fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n")?;
+        std::fs::write(root.join("Cargo.lock"),"version = 4\n\n[[package]]\nname = \"autoship-live-fixture\"\nversion = \"0.1.0\"\n")?;
+        std::fs::write(root.join("src/lib.rs"),"pub fn add(left:i32,right:i32)->i32 {left-right}\n")?;
+        git(&root,&["init","-q"]).await?;commit(&root).await?;
+        let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"real-cargo-verifier",Some(&root))?;
+        audit.require_run_resources()?;
+        augmentagent_channel_core::run_resources::check_requirement("acceptance_verifier",Some(&audit))?;
+        let adapter="src/bin/autoship_probe.rs";
+        let proposal=ContractProposal {contract:AcceptanceContract {schema_version:1,revision:1,issue:Some(1),pull_request:None,
+            criteria:vec![Criterion {id:"sum".into(),requirement:"Return the arithmetic sum".into(),verifier_ids:vec!["observe".into()]}],
+            allowed_paths:vec![PathScope::File("src/lib.rs".into()),PathScope::File(adapter.into())],
+            verifiers:vec![Verifier {id:"observe".into(),command:VerifierCommand::BlackBox {
+                invocation:BehaviorInvocation::CargoBinary {package:"autoship-live-fixture".into(),bin:"autoship_probe".into(),args:vec![]},
+                oracle:OutputOracle::Json {value:serde_json::json!(7)}},pinned_files:vec![adapter.into()],failure_witness:"observed sum differs".into()}]},
+            files:BTreeMap::from([(adapter.into(),"fn main(){println!(\"{}\",autoship_live_fixture::add(3,4));}\n".into())])};
+        // execute_registered owns managed storage itself; run this already-built
+        // opt-in test after cargo-managed exits, never inside its outer lease.
+        let baseline=register_and_reproduce(&root,proposal,&audit).await?;
+        ensure!(baseline.receipts.iter().all(|r|r.result==crate::autoship_contract::CheckResult::IntendedFailure),"baseline did not execute valid differing behavior");
+        std::fs::write(root.join("src/lib.rs"),"pub fn add(left:i32,right:i32)->i32 {left+right}\n")?;commit(&root).await?;
+        let candidate=verify_candidate(&root,&baseline,&audit).await?;
+        let binding=baseline.registration.binding(&actual_head(&root).await?)?;
+        ensure!(baseline.registration.candidate_passes(&baseline.receipts,&candidate,&binding)?,"actual Rust candidate was not verified green");
+        audit.protected_health()?;
+        let receipt=serde_json::json!({"version":1,"kind":"real_isolated_cargo_red_green","baseline":baseline.receipts,
+            "candidate":candidate,"binding":binding,"model_calls":0,"production_workflow_acceptance":false,"shipping_authority":false});
+        audit.record_controller(receipt.clone())?;audit.protected_health()?;
+        std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+        Ok(())
+    }
     fn fence_proposal(script:&str)->serde_json::Value {
         serde_json::json!({
             "contract":{"schema_version":1,"revision":1,"pull_request":841,

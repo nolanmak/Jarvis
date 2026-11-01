@@ -212,6 +212,31 @@ def qemu_command(config, image, shares, build_cache):
     return command
 
 
+def validate_snapshot_links(workspace):
+    # Native package builds may link their own artifacts inside the disposable
+    # snapshot. Account for every alias by inode; an unaccounted link may expose
+    # a host file and must refuse. Directory symlinks never expand the census.
+    groups = {}
+    for base, dirs, files in os.walk(workspace, followlinks=False):
+        for name in files:
+            path = Path(base) / name
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            key = (info.st_dev, info.st_ino)
+            expected, paths = groups.setdefault(key, (info.st_nlink, []))
+            if info.st_nlink != expected:
+                raise Unavailable('VM snapshot hard links changed during validation')
+            paths.append(path)
+    for identity, (expected, paths) in groups.items():
+        if len(paths) != expected:
+            raise Unavailable('VM snapshot must not contain host hard links')
+        for path in paths:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_nlink) != (*identity, expected):
+                raise Unavailable('VM snapshot hard links changed during validation')
+
+
 def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None,
         scratch_dir=None, build_cache=None, storage_lease=None, ci_context=None):
     """Execute argv in a disposable source snapshot; return after verified VM exit.
@@ -246,11 +271,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if (not cache.is_absolute() or info is None or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                 or info.st_uid != os.getuid() or info.st_mode & 0o077):
             raise Unavailable('invalid build cache image')
-    for base, dirs, files in os.walk(workspace, followlinks=False):
-        for name in files:
-            info = (Path(base) / name).lstat()
-            if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
-                raise Unavailable('VM snapshot must not contain host hard links')
+    validate_snapshot_links(workspace)
     node_mounts = list(node_workspaces)
     if node_modules is not None:
         node_mounts.append(('node_modules', node_modules))
