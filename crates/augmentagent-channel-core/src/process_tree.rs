@@ -103,19 +103,23 @@ fn cleanup_receipt_complete(bytes:&[u8])->bool {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if !self.receipt.exists() {
+        // Creation precedes the supervisor's write/chmod/fsync. A visible
+        // pathname is not yet a complete proof; give publication the same
+        // bounded wait as a missing receipt, without accepting partial bytes.
+        let complete=|| private_read(&self.receipt).is_ok_and(|bytes|cleanup_receipt_complete(&bytes));
+        if !complete() {
             // Signal the supervisor, which retains ownership of detached
             // grandchildren and acknowledges only after reaping every child.
             unsafe { libc::kill(self.id, libc::SIGTERM); }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !self.receipt.exists() && std::time::Instant::now() < deadline {
+            while !complete() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         if let Ok(audit)=self.resource_audit.lock() {
             if let Some((provider,logger))=audit.as_ref() { let _=self.resource_outcome(provider,Some(logger)); }
         }
-        let mut processes_settled = std::fs::read(&self.receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
+        let mut processes_settled = complete();
         if !processes_settled {
             unsafe { libc::kill(self.id,libc::SIGKILL); }
             if self.resource_required {
