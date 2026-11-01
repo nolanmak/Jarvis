@@ -50,6 +50,7 @@ def setting(name,override,fallback):
  if not re.fullmatch(r'(?:[0-9]+[KMGTPE]?|infinity)',value):
   raise RuntimeError('invalid resource setting '+name)
  return value
+
 env=shlex.split(show('Environment'))
 extra=['Environment="'+escaped(value)+'"' for value in env]
 # systemctl expands EnvironmentFile specifiers; preserve the resolved paths,
@@ -138,6 +139,7 @@ Slice=augmentagent-runtime.slice
 # Validate every destination before changing any managed file. Selection is
 # committed last; manager failures restore the prior units and selection.
 if selection_text is not None:write(selection,selection_text)
+subprocess.run(['python3',str(repo/'scripts/secure-release-executables.py'),str(repo/'target/release')],check=True)
 log_dir.mkdir(parents=True,exist_ok=True)
 previous={path:(path.read_bytes(),stat.S_IMODE(path.stat().st_mode)) if path.exists() else None for path in plan}
 written=[]

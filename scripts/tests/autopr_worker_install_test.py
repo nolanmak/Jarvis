@@ -17,10 +17,16 @@ class InstallTests(unittest.TestCase):
             base = Path(temporary)
             repo = base / 'repo fixture'
             (repo / 'scripts/systemd').mkdir(parents=True)
-            for name in ('ensure-autopr-worker.sh', 'systemd/augmentagent-autopr.service'):
+            for name in ('ensure-autopr-worker.sh','secure-release-executables.py', 'systemd/augmentagent-autopr.service'):
                 shutil.copy(ROOT / 'scripts' / name, repo / 'scripts' / name)
             runner=repo/'scripts/run-rs.sh'
             runner.write_text('#!/bin/sh\nexit 0\n');runner.chmod(0o700)
+            release=repo/'target/release';release.mkdir(parents=True)
+            artifacts=[release/name for name in ('augmentagent','augmentagent-mcp-memory')]
+            for artifact in artifacts:
+                artifact.write_text('#!/bin/sh\nexit 0\n');artifact.chmod(0o775)
+            # Cargo's public artifact and deps entry share the executable inode.
+            os.link(artifacts[0],release/'cargo-deps-link')
             binary = base / 'bin'; binary.mkdir()
             stub = binary / 'systemctl'
             stub.write_text('''#!/usr/bin/env python3
@@ -42,6 +48,9 @@ if 'show' in sys.argv:
                        CALLS=str(base/'calls'))
             command = ['bash', str(repo/'scripts/ensure-autopr-worker.sh')]
             subprocess.run(command, env=env, check=True)
+            self.assertEqual([p.stat().st_mode & 0o777 for p in artifacts],[0o755,0o755],
+                'normal worker installation must make cached Cargo executables pass deployment trust checks')
+            self.assertEqual((release/'cargo-deps-link').stat().st_mode & 0o777,0o755)
             units = base/'config fixture%[prod]*?\\folder/systemd/user'
             worker = (units/'augmentagent-autopr.service').read_text()
             self.assertIn('--dry-run false', worker)
@@ -104,6 +113,24 @@ if 'show' in sys.argv:
                 'literal policy path must not glob-match a neighboring filename')
             shared='EnvironmentFile=-'+pattern.replace('%','%%')
             self.assertIn(shared,dropin.read_text())
+            # Validate both artifacts before changing either mode or units.
+            before_units={p:p.read_bytes() for p in [units/'augmentagent-autopr.service',dropin,selection]}
+            memory_bytes=artifacts[1].read_bytes()
+            foreign=base/'foreign-executable';foreign.write_bytes(memory_bytes);foreign.chmod(0o775)
+            for kind in ['symlink','fifo','non-executable']:
+                artifacts[0].chmod(0o775);artifacts[1].unlink()
+                if kind=='symlink':artifacts[1].symlink_to(foreign)
+                elif kind=='fifo':os.mkfifo(artifacts[1])
+                else:artifacts[1].write_bytes(memory_bytes);artifacts[1].chmod(0o600)
+                rejected=subprocess.run(command,env=env,capture_output=True,text=True,timeout=5)
+                self.assertNotEqual(rejected.returncode,0,kind)
+                self.assertEqual(artifacts[0].stat().st_mode & 0o777,0o775,'partial executable permission change')
+                self.assertEqual(foreign.stat().st_mode & 0o777,0o775,'followed a foreign symlink')
+                self.assertEqual(before_units,{p:p.read_bytes() for p in before_units})
+            artifacts[1].unlink();artifacts[1].write_bytes(memory_bytes);artifacts[1].chmod(0o755)
+            artifacts[0].chmod(0o700)
+            subprocess.run(command,env=env,check=True)
+            self.assertEqual(artifacts[0].stat().st_mode & 0o777,0o700,'installer widened existing read access')
             prior=selection.read_bytes()
             alternate=base/'alternate.json'
             alternate.write_bytes(policy.read_bytes());alternate.chmod(0o600)
