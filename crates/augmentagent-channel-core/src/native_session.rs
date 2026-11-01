@@ -28,7 +28,7 @@ struct State {
 pub struct NativeSession {
     provider: ProviderKind,
     state: Mutex<State>,
-    retired_vm: Mutex<Vec<std::path::PathBuf>>,
+    retired_vm: Mutex<Vec<crate::native_vm::Retirement>>,
 }
 
 pub struct Lease {
@@ -186,7 +186,7 @@ impl Drop for NativeSession {
     }
 }
 impl Lease {
-    pub(crate) fn register_vm_retirement(&self, path:std::path::PathBuf) {
+    pub(crate) fn register_vm_retirement(&self, path:crate::native_vm::Retirement) {
         if is_fresh_review() || FRESH_BUILDERS.try_with(|builders|!builders.retain_runtime).unwrap_or(false) {
             let mut paths=self.session.retired_vm.lock().expect("native retirement mutex poisoned");
             if !paths.contains(&path) { paths.push(path); }
@@ -417,13 +417,14 @@ mod builder_restore_tests {
         std::fs::set_permissions(root,std::fs::Permissions::from_mode(0o700)).unwrap();
         let path=root.join("codex").join(name);
         std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("owned.json"),"{}").unwrap();
+        std::fs::write(path.join("owned.json"),r#"{"version":1,"owner":{"workflow_id":"fixture","lease_generation":1},"audit_path":"/audit/fixture"}"#).unwrap();
+        std::fs::set_permissions(path.join("owned.json"),std::fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
     fn finish_native_turn(provider:ProviderKind,runtime:&std::path::Path)->String {
         let session=current_for(provider).unwrap().unwrap();
         let mut lease=session.begin(provider).unwrap();
-        lease.register_vm_retirement(runtime.to_owned());
+        lease.register_vm_retirement(crate::native_vm::Retirement{session:runtime.to_owned(),expected:crate::native_vm::ownership::Authority{owner:crate::native_vm::RuntimeOwner{workflow_id:"fixture".into(),lease_generation:1},audit_path:"/audit/fixture".into()}});
         let id=match lease.launch() {
             Launch::Resume {id}|Launch::Create {requested_id:Some(id)}=>id,
             Launch::Create {requested_id:None}=>"observed-native-codex".into(),
