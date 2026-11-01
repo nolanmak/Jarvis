@@ -333,6 +333,12 @@ pub fn record_outcome(
 /// It never charges a model call. The caller owns output/time bounds and must
 /// record outcome before accepting verifier output.
 pub struct CommandGuard(crate::process_tree::ProcessGroup);
+/// Non-deserializable evidence from this command's actual admission callback.
+pub struct CommandAdmission {identity:serde_json::Value}
+impl CommandAdmission {pub fn identity(&self)->&serde_json::Value {&self.identity}}
+/// Kernel-verified evidence correlated with the same immutable admission.
+pub struct CommandQuiescence {evidence:serde_json::Value}
+impl CommandQuiescence {pub fn evidence(&self)->&serde_json::Value {&self.evidence}}
 impl CommandGuard {
     /// Confirm/audit readback and release the waiting command without billing
     /// a model call. Close child.stdin after this when no input is intended.
@@ -342,6 +348,14 @@ impl CommandGuard {
         logger: Option<&Arc<crate::tool_audit::AuditLogger>>,
     ) -> Result<()> {
         self.0.admit_command(label, logger).await
+    }
+    /// Publish durable correlation before the supervisor may release the command.
+    pub async fn admit_with_observer<F>(&self,label:&str,logger:Option<&Arc<crate::tool_audit::AuditLogger>>,
+        mut observer:F)->Result<()> where F:FnMut(&CommandAdmission)->Result<()>+Send {
+        self.0.admit_command_observed(label,logger,&mut |identity|observer(&CommandAdmission {identity:identity.clone()})).await
+    }
+    pub fn verified_quiescence(&self)->Result<CommandQuiescence> {
+        Ok(CommandQuiescence {evidence:self.0.verified_quiescence()?})
     }
     pub fn record_outcome(
         &self,
@@ -389,6 +403,19 @@ pub fn spawn_command_with_storage(command: &tokio::process::Command,
         logger.is_some_and(|logger| logger.run_resources_required()), files, &policy)?;
     guard.bind_resource_audit("verification", logger)?;
     Ok((child, CommandGuard(guard)))
+}
+
+/// CI owns this private directory across crashes; ProcessGroup never removes it.
+pub fn spawn_command_with_storage_at(command:&tokio::process::Command,
+    logger:Option<&Arc<crate::tool_audit::AuditLogger>>,files:&[std::fs::File],build_memory_mb:u64,
+    directory:&Path)->Result<(tokio::process::Child,CommandGuard)> {
+    check_requirement("verification",logger)?;
+    let policy=build_policy_or_defer(composed_native_policy(build_memory_mb,0),logger)?;
+    let (child,guard)=crate::process_tree::spawn_admitted_storage_at(command,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),logger.is_some_and(|l|l.run_resources_required()),
+        files,&policy,directory)?;
+    guard.bind_resource_audit("verification",logger)?;
+    Ok((child,CommandGuard(guard)))
 }
 
 #[cfg(test)]
