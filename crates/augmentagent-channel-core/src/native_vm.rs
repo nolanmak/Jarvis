@@ -622,6 +622,9 @@ mod tests {
         let state=root.path().join("state"); std::fs::create_dir(&state).unwrap();
         std::fs::set_permissions(&state,std::fs::Permissions::from_mode(0o700)).unwrap();
         initialize_native_test_store(&state);
+        // macOS temporary paths may traverse /var -> /private/var; compare
+        // runtime paths against the same canonical root used by preparation.
+        let state=state.canonicalize().unwrap();
         let policy=root.path().join("policy.json");
         write(&policy,&serde_json::to_vec(&serde_json::json!({"version":1,
             "runtime_config":"/declared/runtime.json","guest_runtime":"/declared/guest","state_root":state,
