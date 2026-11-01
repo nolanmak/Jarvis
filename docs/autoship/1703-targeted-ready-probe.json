@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1706,
+    1707,
+    1712
+  ],
+  "status": "selected-approved-pr-reconciliation-verified-not-deployed",
+  "parent_commit": "abab5b24a569bee3421281054640e4e56191193b",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_workflow.rs": "22b9826972be1109a8aca2b1bcbecb6034d6ce1ba0735618c18231afc93978b3",
+    "crates/augmentagent-cli/src/self_improve.rs": "b6f09b6ae6abb6d16c11a60b22d9ba01cfa832a0d79baeae50861b13546c6759",
+    "crates/augmentagent-cli/src/self_improve_adopted.rs": "f212e390f100bba755e56f5e6136b4e70a104455db273815670015a9629e7469",
+    "crates/augmentagent-cli/src/self_improve_progress_tests.rs": "43859a70503f0c2f2ea18e027f3ebfb1a573cccf60ca95cde6bd2004d85c16f6",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "2214f45a972ab75447a448baaa3abfc985dcaa110392c4177e75fb1ecd52e59f",
+    "crates/augmentagent-cli/src/self_improve_workflow.rs": "24d82b3cc6df779c4d2ffc9b9ae30a488ca9a377dbdbf2ec3e7c5c0574580163"
+  },
+  "tests": {
+    "targeted_red": {
+      "log": "/tmp/autoship-1703-red-targeted-ready.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Approved command remained AwaitChecks after required CI became green."
+    },
+    "claim_red": {
+      "log": "/tmp/autoship-1703-red-reconciliation-claim.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Generic reconciliation claim admitted a command hold."
+    },
+    "fixture_corrections": [
+      {
+        "log": "/tmp/autoship-1703-targeted-ready-fixture-correction.log",
+        "note": "Fixture now follows the actual durable PR alias instead of assuming an issue identity."
+      },
+      {
+        "log": "/tmp/autoship-1703-targeted-ready-main-fixture-correction.log",
+        "note": "Disposable bare remote now has its reviewed main ref, required by owned controller preparation."
+      }
+    ],
+    "targeted_green": {
+      "log": "/tmp/autoship-1703-green-targeted-ready.log",
+      "exit": 0,
+      "passed": 1,
+      "seconds": 59.19
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-targeted-ready-unit.log",
+      "exit": 0,
+      "passed": 1440,
+      "failed": 0,
+      "ignored": 25,
+      "seconds": 133.32
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-targeted-ready-cli.log",
+      "exit": 0,
+      "status_readiness_passed": 13,
+      "submission_work_passed": 11,
+      "resolution_passed": 10,
+      "failed": 0
+    }
+  },
+  "verified": [
+    "Work-once selects its bound AwaitChecks PR and runs the existing managed/adopted sweep engines without repository-wide PR discovery or unrelated reconciliation.",
+    "The selected path uses an owned sweep checkout and retains existing exact-head review, acceptance, CI, policy, lease and merge-accounting gates.",
+    "The real-Git/shared-service regression waits on pending CI, merges once on green CI, retains model-call counts and replays completed work without another mutation.",
+    "The owner checkout unsaved file, index bytes and HEAD remain unchanged during selected reconciliation.",
+    "Free merge lease admission atomically preserves command holds, PR-only ceilings and pending dispatches; productive claims remain excluded from approved waiting work.",
+    "Resumed/source-less CI waits are represented as AwaitChecks; genuine policy blocks remain Held."
+  ],
+  "limits": [
+    "The approved-to-merge regression calls the production shared service inside the test binary with scripted GitHub and review boundaries. It is not live native-model acceptance through the public CLI.",
+    "Ambiguous legacy Held states are preserved; owner-authorized recovery and automatic stale-input re-verification remain open.",
+    "Automatic queue consumption, wait/control commands, Discord sessions/updates, production rollout and required soaks remain open."
+  ]
+}

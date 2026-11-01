@@ -13,6 +13,7 @@ pub mod layout;
 pub mod locks;
 pub mod migrate;
 pub mod reader;
+pub mod search;
 pub mod slug;
 
 pub use crm::{merge_person_page, MergeResult, PersonPatch};

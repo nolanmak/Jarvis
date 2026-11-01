@@ -79,6 +79,7 @@ pub(crate) struct BrokerState {
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
+    pub(crate) autoship_delivery_started: std::sync::atomic::AtomicBool,
     /// #1396 — interrupted turns the owner has not been told about yet;
     /// drained by the first `Ready`.
     pub(crate) interrupted_turns: std::sync::Mutex<Vec<augmentagent_store::InterruptedDiscordTurn>>,
@@ -114,6 +115,7 @@ impl BrokerState {
             voice_bridge,
             voice_enabled,
             bot_user_id: std::sync::OnceLock::new(),
+            autoship_delivery_started: std::sync::atomic::AtomicBool::new(false),
             interrupted_turns: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -247,6 +249,10 @@ impl DiscordApprovalBroker {
 
 #[async_trait]
 impl ApprovalBroker for DiscordApprovalBroker {
+    async fn post_imessage_owner_health(&self,id:i64,status:&str)->Result<(),ApprovalError> {
+        self.channel_id.send_message(&*self.http,crate::imessage_owner::health_message(id,status)).await?;
+        Ok(())
+    }
     async fn post_owner_alert(&self, notice:&augmentagent_store::alert_schedule::AlertNotice)
         -> Result<String,ApprovalError> {
         let owner=self.owner_id.ok_or_else(||ApprovalError::Discord("DISCORD_ALLOWED_USER_ID is required for owner alerts".into()))?;

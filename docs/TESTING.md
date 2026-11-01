@@ -60,9 +60,9 @@ A failing test fails the job. `main` has no branch protection today, so the job
 blocks a merge only after the owner marks the **`bridge-suites`** check as
 required in the repository's branch protection or ruleset settings.
 
-## CI: `Code Mode`
+## CI: Code Mode
 
-`.github/workflows/code-mode.yml` runs on every PR and push to `main`. It pins
+The `agents` job in `.github/workflows/rust.yml` runs on every PR and push to `main`. It pins
 Deno 2.7.14 and Rust 1.94.1, installs the trusted host `packaging` parser, and
 runs the same deterministic entrypoint available locally:
 

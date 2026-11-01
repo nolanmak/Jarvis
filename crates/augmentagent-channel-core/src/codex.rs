@@ -529,6 +529,12 @@ impl CodexCliReasoner {
             return Ok(final_text);
         }
 
+        // #1774 — our host stopped the CLI (deploy restart): not a provider
+        // failure, so typed before the failure table can call it one.
+        if let Some(signal) = crate::reasoner::interrupted_by_signal(&status) {
+            warn!("{provider} exec stopped by signal {signal}");
+            return Err(crate::reasoner::interrupted_error(provider, signal));
+        }
         // #1040 — which failure this is decides latching and failover, so it
         // goes through one table (crate::turn_failure), not ad-hoc checks.
         let detail = match turn_failed {

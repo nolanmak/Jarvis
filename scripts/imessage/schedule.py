@@ -14,6 +14,7 @@ LABEL = "org.augmentagent.imessage-sync"
 JOBS = {
     "sync": (LABEL, "sync.py", "imessage-sync.log"),
     "send": ("org.augmentagent.imessage-send", "send.py", "imessage-send.log"),
+    "owner": ("org.augmentagent.imessage-owner", "owner_capture.py", "imessage-owner.log"),
 }
 
 
@@ -62,6 +63,10 @@ def main():
         from send import parser as send_parser
         parsed = send_parser().parse_args(sync_args)
         sync_args += ["--db", str(parsed.db), "--state-dir", str(parsed.state_dir)]
+    if not args.uninstall and args.job == "owner":
+        from owner_capture import parser as owner_parser
+        parsed = owner_parser().parse_args(sync_args)
+        sync_args += ["--db", str(parsed.db)]
     domain = f"gui/{os.getuid()}"
     service = f"{domain}/{label}"
     plist = Path.home() / f"Library/LaunchAgents/{label}.plist"
@@ -76,7 +81,7 @@ def main():
     plist.parent.mkdir(parents=True, exist_ok=True)
     log_dir = Path.home() / "Library/Logs/augmentagent"
     log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    interval_s = args.every_seconds if args.job == "send" else None
+    interval_s = args.every_seconds if args.job in ("send", "owner") else None
     plist.write_bytes(plistlib.dumps(
         make_plist(sync_args, args.interval, job=args.job, interval_s=interval_s)))
     subprocess.run(["launchctl", "enable", service], check=True)

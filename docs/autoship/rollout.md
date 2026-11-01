@@ -72,10 +72,19 @@ recovery acceptance. Do not describe read-only continuation as a refresh proof.
    profile/runtime/executable hashes and existing grants. Extension refuses
    conflicting runtime bytes; resolve through a separately validated runtime
    upgrade rather than overwriting active artifacts. Do not copy a host home.
-4. Add only the native-policy environment entry described in
-   [native-vm-launcher.md](native-vm-launcher.md) to a new private drop-in for the
-   configured daemon. Preserve all existing drop-ins and `ExecStart`. Stage it
-   before the normal updater restart; environment-only staging is not enrollment.
+4. Once the supported installer revision is in the canonical deployment checkout,
+   explicitly select the stable policy for both services:
+
+   ```sh
+   AUGMENTAGENT_NATIVE_VM_POLICY=STABLE_PRIVATE_ROOT/policy.json \
+     scripts/ensure-autopr-worker.sh
+   ```
+
+   Run this from the canonical deployment checkout, never a task worktree (the
+   installer binds the worker to its repository). It writes the private shared
+   `autoship-native.env` selection, preserves existing daemon environment files
+   and resource limits, and installs both service bindings without restarting
+   them. A staged selection is not evidence that running processes use it.
 
 ## Protection, normal update, and readback
 

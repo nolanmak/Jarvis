@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1713,
+    1712
+  ],
+  "status": "owner-turn-guard-native-admission-connected-public-consumer-not-connected",
+  "parent_commit": "d67879909c97b3f4b2a9316aef3d6e1a0c9d06bd",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-owner-dispatch.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Claimed owner turn cannot dispatch its native work because unconditional owner pause rejects it."
+    },
+    "full_cli_green": {
+      "log": "/tmp/autoship-1703-green-owner-dispatch.log",
+      "exit": 0,
+      "passed": 1488,
+      "failed": 0,
+      "ignored": 25,
+      "compiled_cli_passed": 43
+    }
+  },
+  "verified": [
+    "OwnerTurn guard acquisition uses the existing WorkflowGuard lifecycle, audit anchoring, resource accounting, runtime owner registration, heartbeat and final dispatch observer. It requires the existing candidate binding to match before claiming.",
+    "Native dispatch and new model-call accounting accept only the exact claimed owner lease, generation, candidate binding, pause revision and pending request. Ordinary paused workflows still reject native dispatch.",
+    "Newer owner intent, terminal/held state, expired lease or changed binding revoke turn admission. Replayed accounting receipts remain historical evidence, not a new launch authorization.",
+    "Publication operation intents and merge reservation/dispatch retain ordinary pause checks. Owner-turn native admission cannot grant push/merge authority or apply the inbox message.",
+    "Real temporary Git guard regression admits one model call, rejects Push and MergePr intents, then records a newer pause and rejects both dispatch observer and another model admission. It preserves the candidate file and pending message."
+  ],
+  "limits": [
+    "No public CLI/Discord consumer invokes the new owner guard entry yet. This does not prove real Codex/Claude execution, workspace provenance validation, an edit/test or completed owner turn.",
+    "Native readiness, provider pin, resources, tool scope and protected acceptance remain required separately. Native conversation continuation, owner scope/contract revision, dependent cache invalidation and fresh independent review still need the end-to-end consumer.",
+    "Completion/reset and native outcome/quiescence reconciliation remain open. A claimed interrupted turn is not automatically replayed.",
+    "No production rollout, live Discord/native acceptance, hosted CI acceptance or required soak completion. No child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_turn.rs",
+      "sha256": "32926de88a0ad0259ee838928dfddc8d589163c3fcd6b4dfd2bdbcc163162e01"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "a29cf8de1b227f82474fae28b9f37145aaf0a8d5bc30de1b8b4d4eecf452e181"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_workflow.rs",
+      "sha256": "12a1043b4b0807adf249a862ffd04615bda7bd38c762b2cb4c3e89adce7054a3"
+    }
+  ]
+}

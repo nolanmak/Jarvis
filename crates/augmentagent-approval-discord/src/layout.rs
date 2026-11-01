@@ -176,15 +176,16 @@ pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
 }
 
 /// Scrub every trace of the assumes marker from a body bound for a real
-/// recipient. Stricter than [`split_assumes`], which deliberately leaves a
+/// recipient. Also strips needs-input metadata now shared by all messaging
+/// adapters (#1690); context warnings belong on the card, never in a text.
+/// Stricter than [`split_assumes`], which deliberately leaves a
 /// malformed fence alone so the card never shows half-parsed markup: a Gmail
 /// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
 pub fn strip_assumes_for_send(body: &str) -> String {
     let (clean, _) = split_assumes(body);
-    match clean.rfind(ASSUMES_OPEN_PREFIX) {
-        Some(at) => clean[..at].trim_end().to_string(),
-        None => clean,
-    }
+    let cutoff = [ASSUMES_OPEN_PREFIX, "<!--aa:needs-input"].iter()
+        .filter_map(|marker|clean.find(marker)).min();
+    cutoff.map(|at|clean[..at].trim_end().to_string()).unwrap_or(clean)
 }
 
 /// Split a persisted draft into the human-facing draft and any needs-input
@@ -381,8 +382,12 @@ fn approval_embed_and_rows(
     let mut embed = CreateEmbed::new()
         .title(if composed && email.platform == "imessage" { "New message · iMessage".to_string() } else { truncate(&email.subject, 256) })
         .description(description)
-        .field(if composed { "To" } else { "From" }, truncate(&email.from, 256), true)
-        .field("MessageId", truncate(&email.message_id, 256), true);
+        .field(if composed { "To" } else { "From" }, truncate(&email.from, 256), true);
+    // #1738/#1764 — a group reply goes to every member; say so.
+    if !composed && matches!(email.platform.as_str(), "imessage" | "whatsapp") && !email.to.trim().is_empty() {
+        embed = embed.field("To (group)", truncate(&email.to, 256), true);
+    }
+    let mut embed = embed.field("MessageId", truncate(&email.message_id, 256), true);
     if !needs.is_empty() {
         embed = embed.field(
             "⚠️ Needs your input",
@@ -1248,6 +1253,15 @@ mod tests {
     }
 
     #[test]
+    fn send_scrubber_removes_context_warnings_even_if_incomplete() {
+        let needs=append_needs_input_marker("Hello.", &[("context".into(),"private source unavailable".into())]);
+        assert_eq!(strip_assumes_for_send(&needs),"Hello.");
+        assert_eq!(strip_assumes_for_send("Hello.\n\n<!--aa:needs-input\ncontext|private"),"Hello.");
+        let both=append_needs_input_marker(&append_assumes_marker("Hello.",&["private assumption".into()]),&[("context".into(),"private source".into())]);
+        assert_eq!(strip_assumes_for_send(&both),"Hello.");
+    }
+
+    #[test]
     fn fill_ask_modal_has_one_input_per_ask_keyed_by_kind() {
         let needs = vec![
             NeedsInput {
@@ -1785,6 +1799,33 @@ mod tests {
         assert_eq!(label_for("share_doc"), "Document link");
         assert_eq!(label_for("intro"), "Introduction");
         assert_eq!(label_for("???"), "Detail");
+    }
+
+    /// #1738 — a group reply card lists every member it will go to.
+    #[test]
+    fn imessage_group_card_shows_every_member_in_to() {
+        let field_names = |e: &Email| -> Vec<String> {
+            let v: serde_json::Value =
+                serde_json::from_str(&json(&approval_message("act-g1", e, "yes", 0))).unwrap();
+            v["embeds"][0]["fields"].as_array().unwrap().iter()
+                .map(|f| format!("{}={}", f["name"].as_str().unwrap(), f["value"].as_str().unwrap()))
+                .collect()
+        };
+        let mut e = email();
+        e.platform = "imessage".into();
+        e.from = "+15555550100".into(); // pii-ok synthetic
+        e.subject = "iMessage group: Ski Trip".into();
+        e.to = "+15555550100, +15555550111".into(); // pii-ok synthetic
+        let names = field_names(&e);
+        assert!(names.contains(&"To (group)=+15555550100, +15555550111".to_string()), "{names:?}"); // pii-ok synthetic
+        assert!(names.iter().any(|n| n.starts_with("From=")), "{names:?}");
+        e.to.clear();
+        assert!(!field_names(&e).iter().any(|n| n.starts_with("To")), "1:1 cards unchanged");
+        // #1764 — WhatsApp archive group cards render the same field.
+        e.platform = "whatsapp".into();
+        e.subject = "WhatsApp group: Ski Trip".into();
+        e.to = "Jo <+15555550100>, Ana <+15555550111>".into(); // pii-ok synthetic
+        assert!(field_names(&e).contains(&"To (group)=Jo <+15555550100>, Ana <+15555550111>".to_string())); // pii-ok synthetic
     }
 
     /// #1635 — a composed message (Slack/iMessage `kind = compose`) has no

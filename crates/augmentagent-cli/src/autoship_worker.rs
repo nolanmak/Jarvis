@@ -19,6 +19,15 @@ impl std::error::Error for UpgradeRequested {}
 pub struct UpgradeWatch {
     path: PathBuf,
     identity: (u64, u64),
+    configuration:Vec<(PathBuf,Option<ConfigurationStamp>)>,
+}
+type ConfigurationStamp=(u64,u64,u64,i64,i64,i64,i64);
+fn configuration_stamp(path:&Path)->Result<Option<ConfigurationStamp>> {
+    match std::fs::metadata(path) {
+        Ok(m)=>Ok(Some((m.dev(),m.ino(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()))),
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(None),
+        Err(error)=>Err(error.into()),
+    }
 }
 impl UpgradeWatch {
     pub fn current() -> Result<Self> {
@@ -28,12 +37,17 @@ impl UpgradeWatch {
         let metadata = std::fs::metadata("/proc/self/exe")?;
         #[cfg(not(target_os = "linux"))]
         let metadata = std::fs::metadata(&path)?;
-        Ok(Self {
-            path,
-            identity: (metadata.dev(), metadata.ino()),
-        })
+        let config=std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(||
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        let mut paths=vec![config.join("augmentagent/autoship-native.env")];
+        if let Some(policy)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") {paths.push(PathBuf::from(policy));}
+        let configuration=paths.into_iter().map(|path|Ok((path.clone(),configuration_stamp(&path)?))).collect::<Result<Vec<_>>>()?;
+        Ok(Self {path,identity: (metadata.dev(), metadata.ino()),configuration})
     }
     pub fn changed(&self) -> Result<bool> {
+        for (path,stamp) in &self.configuration {
+            if &configuration_stamp(path)?!=stamp {return Ok(true);}
+        }
         match std::fs::metadata(&self.path) {
             Ok(m) => Ok(m.is_file() && (m.dev(), m.ino()) != self.identity),
             // A failed build/removal is not a new executable to run.
@@ -47,6 +61,7 @@ impl UpgradeWatch {
         Self {
             path: path.into(),
             identity: (m.dev(), m.ino()),
+            configuration:Vec::new(),
         }
     }
 }
@@ -87,6 +102,9 @@ fn process_birth(stat: &Path) -> Result<String> {
 }
 
 pub async fn run(repo: PathBuf, dry_run: bool) -> Result<()> {
+    if let Err(error)=crate::autoship_deployment::record("worker", dry_run, true).await {
+        tracing::warn!("worker configuration receipt unavailable; productive preflight remains blocked: {error:#}");
+    }
     let Some(worker) = crate::self_improve::AutoPrLoop::from_env(repo, dry_run) else {
         tracing::info!("auto-ship worker disabled: AUGMENTAGENT_AUTOPR is not enabled");
         return Ok(());
@@ -126,6 +144,28 @@ pub async fn run(repo: PathBuf, dry_run: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn disabled_worker_exits_cleanly_even_when_receipt_storage_is_unavailable() {
+        const CHILD:&str="AUTOSHIP_DISABLED_RECEIPT_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root=tempfile::tempdir().unwrap();let blocked=root.path().join("file");std::fs::write(&blocked,"not a state directory").unwrap();
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","autoship_worker::tests::disabled_worker_exits_cleanly_even_when_receipt_storage_is_unavailable"])
+                .env_clear().env("PATH","/usr/bin:/bin").env("HOME",root.path()).env("XDG_STATE_HOME",&blocked).env(CHILD,"1")
+                .output().unwrap();
+            assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stdout));return;
+        }
+        assert!(run(std::env::current_dir().unwrap(),false).await.is_ok());
+    }
+    #[test]
+    fn policy_selection_and_in_place_updates_request_boundary_reload() {
+        let root=tempfile::tempdir().unwrap();let binary=root.path().join("binary");std::fs::write(&binary,"same executable").unwrap();
+        for name in ["selection.env","policy.json"] {
+            let path=root.path().join(name);std::fs::write(&path,"old").unwrap();
+            let mut watch=UpgradeWatch::at(&binary);watch.configuration.push((path.clone(),configuration_stamp(&path).unwrap()));
+            assert!(!watch.changed().unwrap());std::fs::write(&path,"new").unwrap();assert!(watch.changed().unwrap());
+        }
+    }
     #[test]
     fn replacing_binary_is_detected_without_treating_missing_file_as_an_upgrade() {
         let t = tempfile::tempdir().unwrap();

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1712,
+  "status": "targeted-execution-entry-internal-not-yet-cli-exposed",
+  "parent_commit": "0c523baf52e28997692d18fc811d89bee8024c7f",
+  "source_sha256": {
+    "crates/augmentagent-cli/src/autoship_submission.rs": "1a9a42688ead94da877798e663df10c7b5eb68b4c60310c4f5becb482a9c22d0",
+    "crates/augmentagent-cli/src/self_improve.rs": "75d4403501aa9003ea60aec0be19ca2804acca6f07e97c335e7676d710d23407",
+    "crates/augmentagent-cli/src/self_improve_targeted.rs": "37aac7e7e93bd125050be0b5cc0205cad6f3ed477993efe5a7e2b049cc2ed041",
+    "crates/augmentagent-cli/src/self_improve_provider_readiness.rs": "54045b641cbea8c4e6d5f86c1267a89bcfdfa6754725bcb36dbcc060c20037f0"
+  },
+  "changes": [
+    "Explicit issue/PR resolution verifies canonical repository, viewer write access, open state, target URL/number, trusted author and same-repository PR identity before execution.",
+    "Background run_once and targeted execution now share run_selected, rather than implementing a second simplified workflow.",
+    "Targeted issues bypass unrelated automatic selection; targeted PRs enter the existing managed/source-less resume engines. Existing issue workflow PR/source bindings are preserved.",
+    "Local execution requires an explicit resolved target and validates runtime, requested-builder roles and resources; it does not require equality with running deployed services. Background execution retains deployment equality checks.",
+    "A scoped command lane selects the existing combined/build lock and candidate namespace, then restores the surrounding lane without environment mutation.",
+    "Durable queued request lookup checks its target against the workflow/PR alias and supports pre-command stores read-only."
+  ],
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-targeted.log",
+      "failed": 1,
+      "cargo_exit": 101
+    },
+    "resolution_green": {
+      "log": "/tmp/autoship-1703-green-targeted.log",
+      "passed": 1,
+      "exit": 0,
+      "boundary": "real temporary Git repo; scripted GitHub reads; no model calls or workflow/worktree creation"
+    },
+    "final_cli_suite": {
+      "log": "/tmp/autoship-1703-green-targeted-cli.log",
+      "passed": 1434,
+      "failed": 0,
+      "ignored": 25,
+      "exit": 0,
+      "seconds": 129.41
+    }
+  },
+  "limits": [
+    "No public run/work-once command or automatic queue consumer is exposed by this change.",
+    "A complete native issue/PR run through the new targeted entry point remains unverified.",
+    "Queued approved work still needs targeted free reconciliation rather than repeating productive stages.",
+    "Wait/pause/cancel/resume/model commands, Discord sessions/updates, production rollout and live soak remain open."
+  ]
+}

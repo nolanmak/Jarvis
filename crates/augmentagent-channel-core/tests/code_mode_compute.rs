@@ -433,18 +433,24 @@ async fn orchestration_log_overflow_cancels_active_vm_rpc() {
     assert_eq!(receipt["cancelled"], true);
 }
 
+// pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires provisioned KVM and private build-volume scratch; kills only its fixture owner"]
 async fn killed_owner_recovery_removes_vm_and_task_lease() {
     crash_recovery(false).await;
 }
 
+// pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires provisioned KVM; kills only its fixture compute helper"]
 async fn killed_helper_recovery_removes_vm_and_task_lease() {
     crash_recovery(true).await;
 }
 
+// pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 async fn crash_recovery(kill_helper: bool) {
     let fixture_name = if kill_helper {
         "killed_helper_recovery_removes_vm_and_task_lease"
@@ -706,16 +712,22 @@ async fn real_call_timeout_returns_typed_result_and_preserves_remaining_task_bud
     assert_eq!(receipt["records"][0]["cleanupVerified"], true);
 }
 
+// pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn stalled_helper_cannot_get_a_second_cleanup_allowance() {
     stalled_helper_cleanup(false).await;
 }
 
+// pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn dropped_future_stalled_helper_cannot_survive_cleanup() {
     stalled_helper_cleanup(true).await;
 }
 
+// pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn dropped_startup_stalled_helper_is_killed_before_any_workload() {
     use augmentagent_channel_core::{build_scratch::{ProcFs, ProcessTable}, code_mode::compute::ComputeService};
@@ -756,6 +768,8 @@ async fn dropped_startup_stalled_helper_is_killed_before_any_workload() {
         !entry.unwrap().file_name().to_string_lossy().starts_with("compute-helper-")));
 }
 
+// pidfd and /proc process pinning are Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 async fn stalled_helper_cleanup(drop_call: bool) {
     use augmentagent_channel_core::code_mode::compute::ComputeService;
     let root = tempfile::tempdir().unwrap();

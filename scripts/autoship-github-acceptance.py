@@ -4,6 +4,7 @@ No execution without --execute. Requires an already built managed CLI test binar
 The repository is retained with its evidence; no production settings are touched.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,38 @@ import uuid
 
 MARKER = 'Synthetic autoship acceptance fixture; no production source or credentials.'
 TEST = 'self_improve::publication::live_probe::disposable_github_merge_boundary'
+
+
+def artifact_identity(stream):
+    stream.seek(0)
+    return {'sha256': hashlib.file_digest(stream, 'sha256').hexdigest(),
+            'bytes': os.fstat(stream.fileno()).st_size}
+
+
+def validate_checkpoint(checkpoint, artifact, root):
+    if checkpoint.get('version') != 2 or 'artifact' not in checkpoint:
+        raise ValueError('checkpoint-artifact-unbound: retain historical evidence; it cannot prove this build')
+    if checkpoint['artifact'] != artifact:
+        raise ValueError('checkpoint-artifact-mismatch: select the original artifact or a fresh fixture')
+    for stage in checkpoint.get('done', {}).values():
+        if (not isinstance(stage, dict) or stage.get('artifact') != artifact
+                or not isinstance(stage.get('log'), str)
+                or Path(stage['log']).name != stage['log']
+                or not isinstance(stage.get('log_sha256'), str)):
+            raise ValueError('checkpoint-stage-unbound: historical logs cannot be upgraded to current proof')
+        log = root / stage['log']
+        if not log.is_file() or hashlib.sha256(log.read_bytes()).hexdigest() != stage['log_sha256']:
+            raise ValueError('checkpoint-stage-log-mismatch')
+
+
+def run_probe(stream, artifact, env):
+    if artifact_identity(stream) != artifact:
+        raise ValueError('artifact-changed-before-dispatch')
+    return subprocess.run([f'/proc/self/fd/{stream.fileno()}', '--exact', TEST, '--ignored', '--nocapture'],
+                          pass_fds=(stream.fileno(),), env=env,
+                          text=True, capture_output=True, timeout=600)
+
+
 WORKFLOW = '''name: Synthetic boundary checks
 on: [push, pull_request]
 permissions:
@@ -38,6 +71,13 @@ def main():
     if not args.execute:
         parser.error('--execute is required; this command creates a synthetic PUBLIC repository')
     binary = args.test_binary.resolve(strict=True)
+    # Hold the exact executable inode across GitHub waits and every dispatch.
+    # A concurrent managed rebuild may replace the pathname; it must never
+    # change which binary runs under this checkpoint's evidence identity.
+    if not Path('/proc/self/fd').is_dir():
+        raise ValueError('artifact-pinning-requires-linux')
+    artifact_file = binary.open('rb')
+    artifact = artifact_identity(artifact_file)
     root = args.resume_root.resolve(strict=True) if args.resume_root else Path(tempfile.mkdtemp(prefix='autoship-github-acceptance-'))
     repo_root = root / 'repository'
     print(f'Fixture evidence: {root}', flush=True)
@@ -56,7 +96,12 @@ def main():
         return call('git', *cmd, cwd=repo_root)
 
     checkpoint_path = root / 'checkpoint.json'
-    checkpoint = json.loads(checkpoint_path.read_text()) if checkpoint_path.exists() else {'prs': {}, 'done': {}}
+    if args.resume_root and not checkpoint_path.exists():
+        raise ValueError('checkpoint-artifact-unbound: resume requires a bound checkpoint')
+    checkpoint = (json.loads(checkpoint_path.read_text()) if checkpoint_path.exists() else
+                  {'version': 2, 'artifact': artifact, 'prs': {}, 'done': {}})
+    # Refuse before even reading remote state, let alone creating or merging PRs.
+    validate_checkpoint(checkpoint, artifact, root)
 
     def save():
         temporary = root / 'checkpoint.tmp'
@@ -69,6 +114,8 @@ def main():
         os.fsync(descriptor)
         os.close(descriptor)
 
+    if not args.resume_root:
+        save()
     if args.resume_root:
         identity = json.loads((root / 'repository.json').read_text())
         repository = identity['repository']
@@ -164,17 +211,9 @@ def main():
 
     def probe(mode, pr, head, **extra):
         key = f'{pr}-{mode}'
-        log = root / f'{key}.log'
-        # Upgrade pre-checkpoint fixture only when the durable own mutation and
-        # successful test log agree. Never infer ownership from a merged PR alone.
-        if key not in checkpoint['done'] and mode == 'accepted' and log.exists() and '1 passed' in log.read_text():
-            import sqlite3
-            database = repo_root / f'probe-{pr}-{mode}.sqlite3'
-            with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as connection:
-                receipts = [json.loads(row[0]) for row in connection.execute('SELECT receipt FROM merge_mutation_receipt')]
-            assert any(r['expected_head'] == head and r['pr_number'] == int(pr) for r in receipts)
-            checkpoint['done'][key] = {'head': head, 'log': log.name}
-            save()
+        if artifact_identity(artifact_file) != artifact:
+            raise ValueError('artifact-changed-before-dispatch')
+        validate_checkpoint(checkpoint, artifact, root)
         if key in checkpoint['done']:
             assert checkpoint['done'][key]['head'] == head
             log = root / checkpoint['done'][key]['log']
@@ -186,15 +225,19 @@ def main():
                    AUTOSHIP_GITHUB_PROBE_ROOT=str(repo_root), AUTOSHIP_GITHUB_PROBE_MODE=mode,
                    AUTOSHIP_GITHUB_PROBE_PR=pr, AUTOSHIP_GITHUB_PROBE_HEAD=head, **extra)
         log = root / f'{key}-attempt-{uuid.uuid4().hex[:12]}.log'
-        result = subprocess.run([str(binary), '--exact', TEST, '--ignored', '--nocapture'],
-                                env=env, text=True, capture_output=True, timeout=600)
+        result = run_probe(artifact_file, artifact, env)
         output = result.stdout + '\n' + result.stderr
         log.write_text(output)
-        checkpoint.setdefault('attempts', []).append({'stage': key, 'head': head, 'log': log.name, 'exit': result.returncode})
+        actual = artifact_identity(artifact_file)
+        checkpoint.setdefault('attempts', []).append({'stage': key, 'head': head, 'log': log.name,
+            'exit': result.returncode, 'artifact': artifact, 'artifact_after': actual})
         save()
+        if actual != artifact:
+            raise ValueError('artifact-changed-during-dispatch: no successful stage recorded')
         if result.returncode or '1 passed' not in output:
             raise RuntimeError(f'probe {key} failed; retained exact error evidence at {log}')
-        checkpoint['done'][key] = {'head': head, 'log': log.name}
+        checkpoint['done'][key] = {'head': head, 'log': log.name, 'artifact': artifact,
+                                  'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest()}
         save()
 
     a, ah = create('candidate-a', seed)
@@ -256,7 +299,7 @@ def main():
     concurrent.update(pr=concurrent_pr, head=concurrent_head)
     save()
     probe('manual-race', concurrent_pr, concurrent_head)
-    (root / 'result.json').write_text(json.dumps({'repository': repository, 'passed': True,
+    (root / 'result.json').write_text(json.dumps({'version': 2, 'artifact': artifact, 'repository': repository, 'passed': True,
         'assertions': ['strict-base-rejection', 'head-race-rejection', 'own-receipt',
                        'lost-response-no-replay-no-attribution', 'external-merge-no-attribution',
                        'concurrent-external-merge-no-attribution']}))

@@ -66,12 +66,9 @@ impl ReplyApprover {
             Ok(t) => t,
             Err(e) => return failed(format!("cannot send: {e}")),
         };
-        let allowed = if target.kind == augmentagent_store::ImessageTargetKind::ChatGuid {
-            // Contact defaults never opt groups in.
-            self.store.list_imessage_allowlist(true).map(|ids| ids.contains(&target.conversation))
-        } else {
-            self.store.is_imessage_outbound_allowed(&target.conversation)
-        };
+        // Keyed on the chat identifier for groups too, so owner defaults and
+        // denials apply the same way (#1738); the guid is only the target.
+        let allowed = self.store.is_imessage_outbound_allowed(&target.conversation);
         match allowed {
             Ok(true) => {}
             Ok(false) => {
@@ -416,7 +413,7 @@ pub(crate) fn set_allowlist(
 
 pub(crate) fn print_allowlists(store: &Store) -> anyhow::Result<()> {
     for (label, outbound) in [("outbound", true), ("inbound", false)] {
-        println!("{label} defaults\t{}", if store.imessage_contact_default(outbound)? { "all one-to-one iMessage contacts (approval required for sends)" } else { "explicit allowlist only" });
+        println!("{label} defaults\t{}", if store.imessage_contact_default(outbound)? { "all iMessage conversations, groups included (approval required for sends)" } else { "explicit allowlist only" });
         for id in store.list_imessage_denials(outbound)? {
             println!("{label} denied\t{id}");
         }
@@ -463,11 +460,10 @@ pub(crate) async fn run_cli_resolve(
         broker: std::sync::OnceLock::new(),
         imessage: ImessageSendConfig::from_env(),
     };
-    let outcome = if approve {
-        approver.run_approve(action_id).await
-    } else {
-        approver.run_skip(action_id).await
-    };
+    let outcome = augmentagent_approval_discord::deciding("cli",async {
+        use augmentagent_approval_discord::ApprovalActionHandler;
+        if approve {approver.approve(action_id).await} else {approver.skip(action_id).await}
+    }).await;
     match outcome {
         ApprovalActionOutcome::Approved => {
             println!("approved: queued for the Mac sender");
@@ -502,6 +498,15 @@ pub(crate) async fn notify_outbox_failures(
         posted += 1;
     }
     for row in store.unnotified_imessage_outbox_failures()? {
+        if row.action_id.starts_with("owner-surface:") {
+            if matches!(row.error_detail.as_deref(),Some("owner surface disabled"|"owner binding changed")) {
+                store.mark_imessage_outbox_notified(row.id)?;continue;
+            }
+            if !store.claim_owner_text_failure_notice(now,600_000)? {continue;}
+            broker.post_imessage_owner_health(row.id,row.status.as_str()).await?;
+            store.mark_imessage_outbox_notified(row.id)?;posted+=1;continue;
+        }
+
         let Some(action) = store.get_action_with_email(&row.action_id)? else {
             if let Some(alert) = store.owner_alert_for_outbox(row.id)? {
                 let status = store.owner_alert_text_status(&alert.id)?.unwrap_or_default();
@@ -553,7 +558,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Reasoner for Redraft {
-        async fn call(&self, _o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+        async fn call(&self, opts: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+            if opts.system_prompt.contains("You select evidence") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             Ok("a better reply".into())
         }
     }
@@ -662,6 +670,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approve_imessage_never_sends_private_context_warnings() {
+        let f = fixture(true);
+        f.store.allow_imessage_outbound(PHONE).unwrap();
+        let draft = augmentagent_approval_discord::append_needs_input_marker(
+            "Can you resend the email?", &[("context".into(), "PRIVATE_CONTEXT_WARNING".into())],
+        );
+        let id=seed(&f.store, PHONE, &draft);
+        assert!(matches!(f.approver.run_approve(&id).await, ApprovalActionOutcome::Approved));
+        let rows=f.store.list_imessage_outbox(10).unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].body,"Can you resend the email?");
+    }
+
+    #[tokio::test]
     async fn approve_imessage_enqueues_once_and_never_reaches_gmail() {
         let f = fixture(true);
         f.store.allow_imessage_outbound(PHONE).unwrap();
@@ -745,6 +767,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_defaults_let_a_group_send_by_guid_unless_denied() {
+        let f = fixture(true);
+        f.store.set_imessage_contact_defaults(true, true).unwrap();
+        f.store.deny_imessage_outbound("chat901").unwrap();
+        let id = seed(&f.store, "chat901", "see you all there");
+        let msg = failed_message(f.approver.run_approve(&id).await);
+        assert!(msg.contains("allow-outbound chat901"), "{msg}");
+        assert_eq!(outbox_len(&f.store), 0);
+        f.store.allow_imessage_outbound("chat901").unwrap(); // lifts the denial
+        f.store.deny_imessage_outbound(PHONE).unwrap();
+        assert!(matches!(f.approver.run_approve(&id).await, ApprovalActionOutcome::Approved));
+        let row = f.store.list_imessage_outbox(1).unwrap().remove(0);
+        assert_eq!((row.target.as_str(), row.target_kind), ("any;+;chat901", ImessageTargetKind::ChatGuid));
+    }
+
+    #[tokio::test]
     async fn approve_without_bundle_config_fails_cleanly() {
         let mut f = fixture(true);
         f.approver.imessage.bundle_dir = None;
@@ -807,6 +845,7 @@ mod tests {
         let a = f.store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(a.action.status, "pending");
         assert_eq!(a.action.draft_body.as_deref(), Some("a better reply"));
+        assert_eq!(f.store.draft_context_receipts(&id).unwrap().len(), 1);
         assert_eq!(outbox_len(&f.store), 0);
     }
 
@@ -894,5 +933,31 @@ mod tests {
         assert!(posted.iter().any(|m| m.contains("imessage error 22")), "{posted:?}");
         assert!(posted.iter().any(|m| m.contains("may or may not")), "{posted:?}");
         assert_eq!(notify_outbox_failures(&f.store, &broker).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod owner_surface_failure_tests {
+    use super::*;
+    use augmentagent_store::Email;
+    #[tokio::test]
+    async fn an_owner_surface_failure_notifies_once_without_a_contact_action() {
+        let store=Store::open(":memory:").unwrap();
+        let b=store.bind_imessage_owner("owner-chat","owner@example.invalid",false,0).unwrap();
+        store.enqueue_imessage_owner_output(b.revision,"synthetic-notice","test",None,1).unwrap();
+        let item=store.claim_imessage_outbox().unwrap().unwrap();
+        store.complete_imessage_outbox(item.id,&ImessageSendOutcome::Unknown{reason:"synthetic uncertainty".into()}).unwrap();
+        struct Sink(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl augmentagent_approval_discord::ApprovalBroker for Sink {
+            async fn post_approval(&self,_:&str,_:&Email,_:&str)->Result<(),augmentagent_approval_discord::ApprovalError>{unreachable!()}
+            async fn post_flag_notice(&self,_:&Email,body:&str)->Result<(),augmentagent_approval_discord::ApprovalError>{
+                assert!(body.contains("uncertain")||body.contains("Uncertain"));self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(())
+            }
+        }
+        let sink=Sink(Default::default());
+        assert_eq!(notify_outbox_failures(&store,&sink).await.unwrap(),1);
+        assert_eq!(notify_outbox_failures(&store,&sink).await.unwrap(),0);
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst),1);
     }
 }

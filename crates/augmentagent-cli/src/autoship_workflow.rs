@@ -7,6 +7,33 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
+#[path = "autoship_merge_allowance.rs"]
+mod merge_allowance;
+#[path = "autoship_progress.rs"]
+pub(crate) mod progress;
+#[path = "autoship_milestone.rs"]
+mod milestone;
+#[path = "autoship_discord_ingress.rs"]
+pub(crate) mod discord_ingress;
+#[path = "autoship_review_epoch.rs"]
+mod review_epoch;
+#[path = "autoship_conversations.rs"]
+mod conversations;
+#[path = "autoship_owner_revision.rs"]
+mod owner_revision;
+#[path = "autoship_owner_turn.rs"]
+pub(crate) mod owner_turn;
+#[path = "autoship_owner_inbox.rs"]
+pub(crate) mod owner_inbox;
+#[path = "autoship_discord_controls.rs"]
+pub(crate) mod discord_controls;
+#[path = "autoship_owner_control.rs"]
+pub(crate) mod owner_control;
+#[path = "autoship_submission.rs"]
+pub(crate) mod submission;
+pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
+pub(crate) use merge_allowance::validate_merge_receipt_identity;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -163,6 +190,9 @@ fn observation_capacity(conn: &Connection, now_ms: i64, required: u64, cap: u64,
     Ok((!shipping || allow_shipping) && required > 0 && used.checked_add(reserved).and_then(|n|n.checked_add(required)).is_some_and(|total| total <= cap))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimPurpose { General, Productive, MergeReconciliation }
+
 pub struct WorkflowStore {
     conn: Connection,
 }
@@ -170,16 +200,19 @@ pub struct WorkflowStore {
 impl WorkflowStore {
     /// Preview existing protected state without schema initialization or writes.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
-        use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
-        let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
-            Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        use std::os::unix::fs::MetadataExt;
+        // Never open/close a raw OS descriptor for a live SQLite database.
+        // POSIX close() releases this process's locks for *every* connection.
+        // SQLite's VFS coordinates its own descriptors; NOFOLLOW supplies the
+        // link protection without bypassing that coordination.
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta)=>meta,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
             Err(error)=>return Err(error.into()),
         };
-        let meta=file.metadata()?;
         ensure!(meta.is_file() && meta.nlink()==1 && meta.uid()==unsafe {libc::geteuid()} && meta.mode()&0o077==0,"workflow preview state is not owner-private");
-        let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX|rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
         let after=std::fs::symlink_metadata(path)?;
-        ensure!(meta.dev()==after.dev() && meta.ino()==after.ino() && !after.file_type().is_symlink(),"workflow preview state changed during open");
+        ensure!(meta.dev()==after.dev() && meta.ino()==after.ino() && after.is_file() && after.nlink()==1 && after.uid()==meta.uid() && after.mode()&0o077==0,"workflow preview state changed during open");
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Some(Self {conn}))
     }
@@ -231,18 +264,21 @@ impl WorkflowStore {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        // Create privately before SQLite opens it. Reject links rather than
-        // allowing a reasoner-controlled path to redirect control-plane writes.
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        let metadata = file.metadata()?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let before=match std::fs::symlink_metadata(path) {
+            Ok(metadata)=> {
+                ensure!(metadata.is_file() && metadata.nlink()==1 && metadata.uid()==unsafe{libc::geteuid()},"state must be a singly linked regular file owned by daemon uid");
+                Some(metadata)
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>None,
+            Err(error)=>return Err(error.into()),
+        };
+        // SQLite opens/creates the file itself. Its new file is still empty;
+        // restrict it before any PRAGMA, schema, journal, or authority writes.
+        // Opening a second raw descriptor here would silently cancel locks
+        // belonging to other SQLite connections in this process on close().
+        let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE|rusqlite::OpenFlags::SQLITE_OPEN_CREATE|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX|rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+        let metadata=std::fs::symlink_metadata(path)?;
         ensure!(
             metadata.is_file() && metadata.nlink() == 1,
             "state must be a singly linked regular file"
@@ -251,8 +287,10 @@ impl WorkflowStore {
             metadata.uid() == unsafe { libc::geteuid() },
             "state must be owned by daemon uid"
         );
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        let conn = Connection::open(path)?;
+        if let Some(before)=before {ensure!(before.dev()==metadata.dev() && before.ino()==metadata.ino(),"workflow state changed during open");}
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;
+        let after=std::fs::symlink_metadata(path)?;
+        ensure!(metadata.dev()==after.dev() && metadata.ino()==after.ino() && after.is_file() && after.nlink()==1 && after.uid()==metadata.uid() && after.mode()&0o077==0,"workflow state changed before initialization");
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -265,6 +303,77 @@ impl WorkflowStore {
                 progress_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 wall_ms INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
                 tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS command_job (
+                workflow TEXT PRIMARY KEY, repository TEXT NOT NULL, target TEXT NOT NULL,
+                until_milestone TEXT NOT NULL, provider TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS discord_workflow_binding (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                workflow TEXT NOT NULL REFERENCES command_job(workflow), created_at INTEGER NOT NULL,
+                PRIMARY KEY(bot,owner,channel,workflow));
+            CREATE TABLE IF NOT EXISTS discord_command_ingress (
+                request_id TEXT PRIMARY KEY REFERENCES command_request(request_id), origin TEXT NOT NULL,
+                message_sha256 TEXT NOT NULL, response TEXT NOT NULL, state TEXT NOT NULL,
+                created_at INTEGER NOT NULL, dispatched_at INTEGER, remote_message TEXT, confirmed_at INTEGER);
+            CREATE TABLE IF NOT EXISTS discord_control_request (
+                request_id TEXT PRIMARY KEY, principal TEXT NOT NULL, origin TEXT NOT NULL,
+                message_sha256 TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES command_job(workflow),
+                response TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+                dispatched_at INTEGER, remote_message TEXT, confirmed_at INTEGER);
+            CREATE TABLE IF NOT EXISTS discord_workflow_selection (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                workflow TEXT NOT NULL REFERENCES command_job(workflow), message TEXT NOT NULL,
+                PRIMARY KEY(bot,owner,channel));
+            CREATE TABLE IF NOT EXISTS discord_control_frontier (
+                bot TEXT NOT NULL, owner TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES command_job(workflow),
+                message TEXT NOT NULL, PRIMARY KEY(bot,owner,workflow));
+            CREATE TABLE IF NOT EXISTS command_schedule (
+                workflow TEXT PRIMARY KEY REFERENCES command_job(workflow),
+                attempted_at INTEGER NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_native_session_owner (
+                provider TEXT NOT NULL, native_session TEXT NOT NULL, workflow TEXT NOT NULL REFERENCES workflow(id),
+                PRIMARY KEY(provider,native_session));
+            CREATE TABLE IF NOT EXISTS workflow_builder_conversation (
+                workflow TEXT NOT NULL REFERENCES workflow(id), provider TEXT NOT NULL, native_session TEXT NOT NULL,
+                uncertain INTEGER NOT NULL, binding TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(workflow,provider), UNIQUE(provider,native_session));
+            CREATE TABLE IF NOT EXISTS workflow_review_floor (
+                workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), after_seq INTEGER NOT NULL,
+                request_id TEXT NOT NULL REFERENCES discord_control_request(request_id));
+            CREATE TABLE IF NOT EXISTS workflow_owner_revision_fence (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_revision(request_id),
+                previous_generation INTEGER NOT NULL, next_generation INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_revision (
+                request_id TEXT PRIMARY KEY REFERENCES workflow_owner_turn(request_id), previous_contract TEXT NOT NULL,
+                next_contract TEXT NOT NULL, binding TEXT NOT NULL, owner_message_sha256 TEXT NOT NULL,
+                registration TEXT NOT NULL, activated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_turn (
+                workflow TEXT NOT NULL REFERENCES workflow(id), request_id TEXT PRIMARY KEY REFERENCES workflow_owner_message(request_id),
+                owner TEXT NOT NULL, lease_generation INTEGER NOT NULL, pause_revision INTEGER NOT NULL,
+                binding TEXT NOT NULL, state TEXT NOT NULL, started_at INTEGER NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_owner_turn ON workflow_owner_turn(workflow) WHERE state IN ('claimed','uncertain');
+            CREATE TABLE IF NOT EXISTS workflow_owner_message (
+                request_id TEXT PRIMARY KEY REFERENCES discord_control_request(request_id),
+                workflow TEXT NOT NULL REFERENCES command_job(workflow), body TEXT NOT NULL,
+                state TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_control (
+                workflow TEXT PRIMARY KEY, revision INTEGER NOT NULL, paused INTEGER NOT NULL,
+                principal TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_owner_control_event (
+                workflow TEXT NOT NULL, revision INTEGER NOT NULL, paused INTEGER NOT NULL,
+                principal TEXT NOT NULL, at_ms INTEGER NOT NULL, PRIMARY KEY(workflow,revision));
+            CREATE TABLE IF NOT EXISTS pr_ready_receipt (
+                workflow TEXT NOT NULL REFERENCES workflow(id), binding TEXT NOT NULL, pr INTEGER NOT NULL,
+                review_sha256 TEXT NOT NULL, published_at INTEGER NOT NULL, PRIMARY KEY(workflow,binding,pr));
+            CREATE TABLE IF NOT EXISTS command_attempt (
+                workflow TEXT PRIMARY KEY REFERENCES command_job(workflow), selected_at INTEGER NOT NULL,
+                finished_at INTEGER, outcome TEXT NOT NULL, reason TEXT NOT NULL, eligible_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_lane_turn (
+                repository TEXT PRIMARY KEY, yield_normal INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_client_intent (
+                request_id TEXT PRIMARY KEY, principal TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS command_request (
+                request_id TEXT PRIMARY KEY, principal TEXT NOT NULL, payload TEXT NOT NULL,
+                admission TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS scope_stage_response(workflow TEXT NOT NULL REFERENCES workflow(id),key TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(workflow,key));
             CREATE TABLE IF NOT EXISTS pr_readiness_dependencies(workflow TEXT PRIMARY KEY REFERENCES workflow(id),request_hash TEXT NOT NULL,base TEXT NOT NULL,evidence TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS issue_readiness_dependencies(repository TEXT NOT NULL,issue INTEGER NOT NULL,request_hash TEXT NOT NULL,base TEXT NOT NULL,kind TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(repository,issue));
@@ -310,6 +419,22 @@ impl WorkflowStore {
                 kind TEXT NOT NULL, binding TEXT NOT NULL, receipt TEXT, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS merge_mutation_receipt (
                 operation TEXT PRIMARY KEY REFERENCES operation(id), receipt TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS merge_allowance_dispatch (
+                operation TEXT PRIMARY KEY REFERENCES operation(id), repository TEXT NOT NULL,
+                pr INTEGER NOT NULL, pr_node_id TEXT NOT NULL, head TEXT NOT NULL,
+                generation INTEGER NOT NULL, reserved_at_ms INTEGER NOT NULL,
+                dispatched_at_ms INTEGER, merged_at_ms INTEGER, resolution TEXT,
+                state TEXT NOT NULL CHECK(state IN ('reserved','dispatched','confirmed','released')));
+            CREATE TABLE IF NOT EXISTS merge_transport_response (
+                operation TEXT PRIMARY KEY REFERENCES merge_allowance_dispatch(operation),
+                response TEXT NOT NULL, observed_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS merge_private_marker (
+                operation TEXT PRIMARY KEY REFERENCES merge_allowance_dispatch(operation),
+                protocol INTEGER NOT NULL CHECK(protocol=1), nonce TEXT NOT NULL UNIQUE);
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_pr
+                ON merge_allowance_dispatch(repository,pr) WHERE state<>'released';
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_merge_per_node
+                ON merge_allowance_dispatch(repository,pr_node_id) WHERE state<>'released';
             CREATE TABLE IF NOT EXISTS review (
                 workflow TEXT NOT NULL REFERENCES workflow(id), reviewer TEXT NOT NULL,
                 binding TEXT NOT NULL, approved INTEGER NOT NULL, evidence TEXT NOT NULL,
@@ -330,6 +455,18 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS workflow_event (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, workflow TEXT NOT NULL REFERENCES workflow(id),
                 generation INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_progress_delivery (
+                workflow TEXT NOT NULL, bot TEXT NOT NULL, owner TEXT NOT NULL, channel TEXT NOT NULL,
+                sequence INTEGER NOT NULL, nonce TEXT NOT NULL, content TEXT NOT NULL,
+                state TEXT NOT NULL, dispatched_at INTEGER NOT NULL, message TEXT,
+                confirmed_at INTEGER, PRIMARY KEY(workflow,bot,owner,channel,sequence));
+            CREATE TABLE IF NOT EXISTS workflow_progress_state (
+                workflow TEXT PRIMARY KEY, sequence INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                terminal INTEGER NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS workflow_progress_event (
+                workflow TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL,
+                created_at INTEGER NOT NULL, delivery_state TEXT NOT NULL DEFAULT 'queued',
+                PRIMARY KEY(workflow,sequence));
             COMMIT;")?;
         Ok(Self { conn })
     }
@@ -526,8 +663,18 @@ impl WorkflowStore {
         Ok(inserted)
     }
 
-    /// Returns None for an occupied/not-yet-eligible/terminal workflow. Claims
-    /// increment a fencing generation even when the same owner resumes.
+    /// Free merge reconciliation preserves command holds and merge ceilings.
+    /// Eligibility and ownership are checked atomically with the new lease.
+    pub fn claim_reconciliation(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::MergeReconciliation)
+    }
+
+    /// Productive workers cannot restart command holds or spend models on work
+    /// awaiting free reconciliation. A stale preview cannot authorize a claim.
+    pub fn claim_productive(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64) -> Result<Option<Lease>> {
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::Productive)
+    }
+
     pub fn claim(
         &mut self,
         workflow: &str,
@@ -535,6 +682,10 @@ impl WorkflowStore {
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<Option<Lease>> {
+        self.claim_inner(workflow, owner, now_ms, ttl_ms, ClaimPurpose::General)
+    }
+
+    fn claim_inner(&mut self, workflow: &str, owner: &str, now_ms: i64, ttl_ms: i64, purpose: ClaimPurpose) -> Result<Option<Lease>> {
         ensure!(
             !owner.is_empty() && ttl_ms > 0,
             "owner and positive lease ttl required"
@@ -554,6 +705,20 @@ impl WorkflowStore {
             bail!("unknown workflow");
         };
         let cp: Checkpoint = serde_json::from_str(&raw)?;
+        if purpose != ClaimPurpose::General {
+            if owner_control::read(&tx,workflow)?.is_some_and(|c|c.paused) {return Ok(None);}
+            let policy: Option<String> = tx.query_row("SELECT until_milestone FROM command_job WHERE workflow=?1", [workflow], |r| r.get(0)).optional()?;
+            if let Some(policy) = policy {
+                let until: submission::Milestone = serde_json::from_str(&policy)?;
+                let pending_merge: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operation o LEFT JOIN merge_allowance_dispatch d ON d.operation=o.id WHERE o.workflow=?1 AND o.kind=?2 AND (o.receipt IS NULL OR d.state='dispatched'))",
+                    params![workflow, serde_json::to_string(&OperationKind::MergePr)?], |r| r.get(0))?;
+                if cp.stage == Stage::Held || pending_merge
+                    || (purpose == ClaimPurpose::Productive && matches!(cp.stage, Stage::AwaitChecks | Stage::Merge))
+                    || (purpose == ClaimPurpose::MergeReconciliation && until == submission::Milestone::Pr) {
+                    return Ok(None);
+                }
+            }
+        }
         if leased > now_ms
             || cp.next.eligible_at_ms > now_ms
             || matches!(cp.stage, Stage::Merged | Stage::Retired)
@@ -689,6 +854,7 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx, lease, binding, now_ms)?;
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
         tx.execute("INSERT INTO operation(id,workflow,kind,binding,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING",
             params![id,lease.workflow,kind_json,binding_json,now_ms])?;
         let (receipt, recorded_binding): (Option<String>, String) = tx.query_row(
@@ -734,9 +900,9 @@ impl WorkflowStore {
             serde_json::from_str::<OperationKind>(&kind)? == OperationKind::MergePr,
             "mutation receipt requires merge operation"
         );
+        merge_allowance::validate_merge_receipt_identity(&tx, operation, receipt)?;
         ensure!(
-            receipt["client_mutation_id"].as_str() == Some(operation)
-                && receipt["expected_head"].as_str() == Some(binding.head.as_str()),
+            receipt["expected_head"].as_str() == Some(binding.head.as_str()),
             "mutation response identity differs from intent"
         );
         let pr: Option<u64> = tx.query_row(
@@ -764,7 +930,7 @@ impl WorkflowStore {
             )
             .optional()?;
         if let Some(prior) = prior {
-            ensure!(prior == raw, "immutable mutation receipt conflict");
+            merge_allowance::validate_merge_receipt_equivalence(&tx,operation,&serde_json::from_str(&prior)?,receipt)?;
         } else {
             ensure!(
                 completed.is_none(),
@@ -876,6 +1042,9 @@ impl WorkflowStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_lease(&tx, lease, now_ms)?;
+        let submitted_alias: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM command_job WHERE workflow=?1)", [&alias], |row| row.get(0))?;
+        ensure!(alias == lease.workflow || !submitted_alias, "submission-alias-conflict");
+
         let prior: Option<i64> = tx.query_row(
             "SELECT pr FROM workflow WHERE id=?1",
             [&lease.workflow],
@@ -923,6 +1092,7 @@ impl WorkflowStore {
     pub fn review_fragment(&mut self, lease: &Lease, binding: &Binding, key: &str, now: i64) -> Result<Option<String>> {
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,binding,now)?;
+        if owner_inbox::pending(&tx,&lease.workflow)?>0 {return Ok(None);}
         let generation:i64=tx.query_row("SELECT generation FROM workflow_audit_generation WHERE workflow=?1",[&lease.workflow],|r|r.get(0)).optional()?.unwrap_or(0);
         let value=tx.query_row("SELECT payload FROM review_fragment WHERE workflow=?1 AND audit_generation=?2 AND key=?3",
             params![lease.workflow,generation,key],|r|r.get(0)).optional()?;
@@ -982,6 +1152,7 @@ impl WorkflowStore {
     /// Returns only records for the current binding; this is evidence, not a
     /// merge verdict. The caller must apply independence and adjudication rules.
     pub fn current_reviews(&self, workflow: &str) -> Result<Vec<Review>> {
+        if self.pending_owner_messages(workflow)?>0 {return Ok(Vec::new());}
         let snapshot = self.snapshot(workflow)?.context("unknown workflow")?;
         let binding = snapshot.checkpoint.binding;
         let mut statement = self.conn.prepare("SELECT reviewer,approved,evidence FROM review WHERE workflow=?1 AND binding=?2 ORDER BY reviewer")?;
@@ -1058,6 +1229,7 @@ impl WorkflowStore {
         if let Some(prior) = prior {
             ensure!(prior == values, "charge receipt conflict");
         } else {
+            if charge.model_calls>0 {owner_turn::require_native_dispatch(&tx,lease,now_ms)?;}
             if let Some((purpose,binding,limit))=bounded {
                 ensure!(!purpose.is_empty() && limit>0,"bounded model-call purpose and limit required");
                 require_binding(&tx,lease,binding,now_ms)?;
@@ -1299,6 +1471,13 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub fn validate_dispatch(&mut self,lease:&Lease,binding:&Binding,now:i64)->Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        owner_turn::require_native_dispatch(&tx,lease,now)?;
+        tx.commit()?;Ok(())
+    }
+
     pub fn validate_lease(&mut self, lease: &Lease, binding: &Binding, now_ms: i64) -> Result<()> {
         let tx = self
             .conn
@@ -1525,6 +1704,7 @@ impl WorkflowStore {
         ensure!(operation.kind==OperationKind::CreatePr,"not a publication operation");
         let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_binding(&tx,lease,&operation.binding,now)?;
+        owner_control::require_dispatch(&tx,&lease.workflow)?;
         let owner:String=tx.query_row("SELECT workflow FROM operation WHERE id=?1 AND receipt IS NULL",[&operation.id],|r|r.get(0))?;
         ensure!(owner==lease.workflow,"publication operation ownership mismatch");
         let prior:Option<(i64,i64,Option<u64>)>=tx.query_row("SELECT attempt,dispatched_at,pr FROM publication_dispatch WHERE operation=?1",[&operation.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -1654,12 +1834,45 @@ fn event(
         "INSERT INTO workflow_event(workflow,generation,kind,payload,at_ms) VALUES(?1,?2,?3,?4,?5)",
         params![workflow, generation, kind, payload, now_ms],
     )?;
+    progress::project(tx,workflow,kind,now_ms)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn check_constructor_retains_other_connection_locks(test_name: &str, writable: bool) {
+        if let Some(path)=std::env::var_os("AUGMENTAGENT_WORKFLOW_LOCK_PROBE_DB") {
+            let db=Connection::open(path).unwrap();
+            db.busy_timeout(Duration::from_millis(50)).unwrap();
+            let result=db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; ROLLBACK;");
+            assert!(matches!(result,Err(rusqlite::Error::SqliteFailure(ref code,_)) if code.code==rusqlite::ErrorCode::DatabaseBusy || code.code==rusqlite::ErrorCode::DatabaseLocked),"external process acquired exclusive access during a live read: {result:?}");
+            return;
+        }
+        let temp=tempfile::tempdir().unwrap();let path=temp.path().join("workflow.db");
+        drop(WorkflowStore::open(&path).unwrap());
+        let held=Connection::open(&path).unwrap();
+        held.execute_batch("BEGIN;").unwrap();held.query_row("SELECT count(*) FROM workflow",[],|row|row.get::<_,i64>(0)).unwrap();
+        let probe=|| {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",test_name,"--nocapture"])
+                .env("AUGMENTAGENT_WORKFLOW_LOCK_PROBE_DB",&path).output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        };
+        probe();
+        if writable {drop(WorkflowStore::open(&path).unwrap());}
+        else {drop(WorkflowStore::open_read_only(&path).unwrap().unwrap());}
+        probe();
+        held.execute_batch("ROLLBACK;").unwrap();
+    }
+    #[test]
+    fn workflow_preview_preserves_other_connections_sqlite_locks() {
+        check_constructor_retains_other_connection_locks("autoship_workflow::tests::workflow_preview_preserves_other_connections_sqlite_locks",false);
+    }
+    #[test]
+    fn workflow_open_preserves_other_connections_sqlite_locks() {
+        check_constructor_retains_other_connection_locks("autoship_workflow::tests::workflow_open_preserves_other_connections_sqlite_locks",true);
+    }
     fn binding() -> Binding {
         Binding {
             head: "head-a".into(),
@@ -1678,6 +1891,62 @@ mod tests {
             .unwrap();
         (store, lease)
     }
+    #[test]
+    fn command_claim_rechecks_late_holds_and_pending_merges_atomically() {
+        for stage in [Stage::Held, Stage::AwaitChecks, Stage::Merge, Stage::Build] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let (mut controller,lease)=setup(&path);
+            controller.submit_authorized("command","owner",&submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged},21).unwrap();
+            let mut command=WorkflowStore::open(&path).unwrap();
+            assert_eq!(command.snapshot(&lease.workflow).unwrap().unwrap().checkpoint.stage,Stage::Intake);
+            let mut checkpoint=controller.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage=stage;checkpoint.next.reason="late-owner-hold".into();
+            controller.checkpoint(&lease,&checkpoint,30).unwrap();
+            if stage==Stage::Build {controller.begin_operation(&lease,OperationKind::MergePr,&binding(),31).unwrap();}
+            controller.release(&lease,32).unwrap();
+            let before=command.snapshot(&lease.workflow).unwrap().unwrap();
+            assert!(command.claim_productive(&lease.workflow,"command",40,1000).unwrap().is_none(), "command bypassed {stage:?}");
+            let after=command.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(after.checkpoint,before.checkpoint);assert_eq!(after.generation,before.generation);
+        }
+    }
+
+    #[test]
+    fn productive_claim_cannot_ignore_completed_operation_with_uncertain_dispatch() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+        let (mut store,lease)=setup(&path);
+        store.submit_authorized("command","owner",&submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged},21).unwrap();
+        store.attach_pr(&lease,1,22).unwrap();
+        let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.stage=Stage::Build;
+        store.checkpoint(&lease,&checkpoint,23).unwrap();
+        let op=store.begin_operation(&lease,OperationKind::MergePr,&binding(),24).unwrap();
+        store.reserve_merge(&lease,&op,"owner/repo",1,"PR_1",25,5).unwrap();
+        store.dispatch_marked_merge(&lease,&op,26,5).unwrap();
+        store.complete_operation(&lease,&op.id,"observed-merge",27).unwrap();
+        store.release(&lease,28).unwrap();
+        assert!(store.merge_reconciliation_needed(&lease.workflow).unwrap());
+        assert!(store.pending_operations(&lease.workflow).unwrap().is_empty());
+        assert!(store.claim_productive(&lease.workflow,"command",30,1000).unwrap().is_none(),"completed operation hid uncertain merge dispatch");
+        assert!(store.claim_reconciliation(&lease.workflow,"sweep",30,1000).unwrap().is_none(),"free claim bypassed uncertain dispatch");
+    }
+
+    #[test]
+    fn reconciliation_claim_respects_command_ceiling_and_late_hold() {
+        use submission::{Request,Target,Milestone};
+        for (stage,until,allowed) in [(Stage::Held,Milestone::Merged,false),(Stage::AwaitChecks,Milestone::Pr,false),(Stage::AwaitChecks,Milestone::Merged,true)] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
+            let mut controller=WorkflowStore::open(&path).unwrap();
+            controller.submit_authorized("command","owner",&Request {repository:"owner/repo".into(),target:Target::Issue(1),provider:None,until},1).unwrap();
+            controller.register("owner/repo#1","feature/fix",binding(),10).unwrap();
+            let lease=controller.claim("owner/repo#1","controller",20,1000).unwrap().unwrap();
+            let mut reconciler=WorkflowStore::open(&path).unwrap();
+            let mut checkpoint=reconciler.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage=stage;controller.checkpoint(&lease,&checkpoint,30).unwrap();controller.release(&lease,31).unwrap();
+            assert_eq!(reconciler.claim_reconciliation(&lease.workflow,"sweep",40,1000).unwrap().is_some(),allowed,"{stage:?} {until:?}");
+        }
+    }
+
     #[test]
     fn terminal_runtime_retirement_intent_survives_crash_and_settles_once() {
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("state.db");
@@ -2394,6 +2663,18 @@ mod tests {
         let link = dir.path().join("link.db");
         symlink(&path, &link).unwrap();
         assert!(WorkflowStore::open(&link).is_err());
+        assert!(WorkflowStore::open_read_only(&link).is_err());
+        let hardlink=dir.path().join("hardlink.db");
+        std::fs::hard_link(&path,&hardlink).unwrap();
+        assert!(WorkflowStore::open(&hardlink).is_err());
+        assert!(WorkflowStore::open_read_only(&hardlink).is_err());
+        std::fs::remove_file(hardlink).unwrap();
+        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(WorkflowStore::open_read_only(&path).is_err());
+        drop(WorkflowStore::open(&path).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
+        assert!(WorkflowStore::open_read_only(&path).unwrap().is_some());
+        assert!(WorkflowStore::open_read_only(&dir.path().join("missing.db")).unwrap().is_none());
     }
     // Invoked in a separate test process by crash_releases_sqlite_transaction.
     // Exiting bypasses Rust Drop, exercising SQLite crash recovery rather than

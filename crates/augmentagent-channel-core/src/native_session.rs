@@ -46,6 +46,7 @@ tokio::task_local! { pub static FRESH_REVIEW: bool; }
 #[derive(Default)]
 pub struct FreshBuilderSessions {
     sessions: Mutex<Vec<Arc<NativeSession>>>,
+    retain_runtime: bool,
 }
 #[derive(Debug, Clone)]
 pub struct ObservedConversation {
@@ -58,6 +59,18 @@ impl FreshBuilderSessions {
     pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
     pub async fn scope<T>(self: &Arc<Self>, call: impl std::future::Future<Output = T>) -> T {
         FRESH_BUILDERS.scope(Arc::clone(self), call).await
+    }
+    /// Restored workflow conversations outlive this controller scope. Their
+    /// native owner/audit fences still apply, and workflow retirement owns GC.
+    pub fn from_observed(observed:&[ObservedConversation])->anyhow::Result<Arc<Self>> {
+        let mut restored:Vec<Arc<NativeSession>>=Vec::new();
+        for observation in observed {
+            anyhow::ensure!(!observation.uncertain,"uncertain builder conversation requires reconciliation");
+            anyhow::ensure!(!observation.id.is_empty() && observation.id.len()<=512 && observation.id.bytes().all(|b|b.is_ascii_graphic()),"invalid native conversation identity");
+            anyhow::ensure!(!restored.iter().any(|s|s.provider()==observation.provider),"duplicate builder provider conversation");
+            restored.push(NativeSession::from_id(observation.provider,Some(observation.id.clone()))?);
+        }
+        Ok(Arc::new(Self {sessions:Mutex::new(restored),retain_runtime:true}))
     }
     pub fn observed(&self) -> Vec<ObservedConversation> {
         self.sessions.lock().expect("builder sessions mutex poisoned").iter().filter_map(|session| {
@@ -174,7 +187,7 @@ impl Drop for NativeSession {
 }
 impl Lease {
     pub(crate) fn register_vm_retirement(&self, path:std::path::PathBuf) {
-        if is_fresh_review() || FRESH_BUILDERS.try_with(|_|()).is_ok() {
+        if is_fresh_review() || FRESH_BUILDERS.try_with(|builders|!builders.retain_runtime).unwrap_or(false) {
             let mut paths=self.session.retired_vm.lock().expect("native retirement mutex poisoned");
             if !paths.contains(&path) { paths.push(path); }
         }
@@ -394,4 +407,89 @@ mod lease_drop_tests {
         }
         assert!(!session.is_uncertain(), "the mark belongs to the finished turn, not the next lease");
     }
+}
+
+#[cfg(test)]
+mod builder_restore_tests {
+    use super::*;
+    fn runtime_fixture(root:&std::path::Path,name:&str)->std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path=root.join("codex").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("owned.json"),"{}").unwrap();
+        path
+    }
+    fn finish_native_turn(provider:ProviderKind,runtime:&std::path::Path)->String {
+        let session=current_for(provider).unwrap().unwrap();
+        let mut lease=session.begin(provider).unwrap();
+        lease.register_vm_retirement(runtime.to_owned());
+        let id=match lease.launch() {
+            Launch::Resume {id}|Launch::Create {requested_id:Some(id)}=>id,
+            Launch::Create {requested_id:None}=>"observed-native-codex".into(),
+        };
+        lease.observe(&id).unwrap();lease.finish().unwrap()
+    }
+    #[tokio::test]
+    async fn restored_owner_builders_keep_runtime_after_controller_exit_and_resume_again() {
+        for provider in [ProviderKind::Codex,ProviderKind::Claude] {
+            for existing in [false,true] {
+                let root=tempfile::tempdir().unwrap();let runtime=runtime_fixture(root.path(),"session-owner");
+                let recorded=if existing {vec![ObservedConversation {provider,id:"previous-native-session".into(),uncertain:false}]} else {vec![]};
+                let sessions=FreshBuilderSessions::from_observed(&recorded).unwrap();
+                let id=sessions.scope(async {finish_native_turn(provider,&runtime)}).await;
+                let observed=sessions.observed();assert_eq!(observed.len(),1);drop(sessions);
+                assert!(!runtime.join("retired.json").exists(),"saved native conversation was retired when its controller exited: {provider:?}, existing={existing}");
+                let restored=FreshBuilderSessions::from_observed(&observed).unwrap();
+                let resumed=restored.scope(async {
+                    let session=current_for(provider).unwrap().unwrap();
+                    assert_eq!(session.begin(provider).unwrap().launch(),Launch::Resume {id:id.clone()});
+                    finish_native_turn(provider,&runtime)
+                }).await;
+                assert_eq!(resumed,id);drop(restored);
+                assert!(!runtime.join("retired.json").exists());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn scoped_builders_still_retire_their_completed_runtime() {
+        let root=tempfile::tempdir().unwrap();let runtime=runtime_fixture(root.path(),"session-scoped");
+        let sessions=FreshBuilderSessions::new();
+        sessions.scope(async {finish_native_turn(ProviderKind::Codex,&runtime)}).await;drop(sessions);
+        assert!(runtime.join("retired.json").exists());
+    }
+    #[tokio::test]
+    async fn independent_reviews_retire_even_inside_a_restored_builder() {
+        let root=tempfile::tempdir().unwrap();let runtime=runtime_fixture(root.path(),"session-reviewer");
+        let sessions=FreshBuilderSessions::from_observed(&[]).unwrap();
+        sessions.scope(async {
+            fresh_review_scope(ProviderKind::Claude,async {
+                finish_native_turn(ProviderKind::Claude,&runtime);Ok(())
+            }).await.unwrap();
+        }).await;drop(sessions);
+        assert!(runtime.join("retired.json").exists(),"reviewer runtime outlived its independent scope");
+    }
+    #[tokio::test]
+    async fn restored_builder_sessions_resume_their_provider_and_independent_review_stays_fresh() {
+        for provider in [ProviderKind::Codex,ProviderKind::Claude] {
+            let recorded=ObservedConversation {provider,id:format!("recorded-{}",provider.name()),uncertain:false};
+            let sessions=FreshBuilderSessions::from_observed(&[recorded.clone()]).expect("persisted native conversations cannot be restored");
+            sessions.scope(async {
+                let session=current_for(provider).unwrap().unwrap();let mut lease=session.begin(provider).unwrap();
+                assert_eq!(lease.launch(),Launch::Resume {id:recorded.id.clone()});lease.observe(&recorded.id).unwrap();lease.finish().unwrap();
+                let (_,id)=fresh_review_scope(provider,async {
+                    let session=current_for(provider)?.unwrap();let mut lease=session.begin(provider)?;
+                    let id=match lease.launch() {Launch::Create {requested_id:Some(id)}=>id,Launch::Create {requested_id:None}=>"independent-review".into(),_=>panic!("review reused a builder conversation")};lease.observe(&id)?;lease.finish()?;Ok(())
+                }).await.unwrap();assert_ne!(id,recorded.id);
+            }).await;
+        }
+    }
+    #[test]
+    fn uncertain_duplicate_and_invalid_restorations_are_refused() {
+        let mut observation=ObservedConversation {provider:ProviderKind::Codex,id:"native-one".into(),uncertain:true};
+        assert!(FreshBuilderSessions::from_observed(&[observation.clone()]).is_err());observation.uncertain=false;
+        assert!(FreshBuilderSessions::from_observed(&[observation.clone(),observation.clone()]).is_err());
+        observation.id="native id with whitespace".into();assert!(FreshBuilderSessions::from_observed(&[observation]).is_err());
+    }
+
 }

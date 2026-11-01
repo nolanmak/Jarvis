@@ -464,7 +464,13 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                 // builders.
                 let manifest = manifest_v1();
                 let system_prompt = code_mode_system(&manifest);
+                let shared_draft_context = augmentagent_channel_core::draft_workflow::prepare(
+                    &self.store, self.reasoner.as_ref(), &email,
+                    "Draft a response using relevant conversation and cross-platform evidence.",
+                    self.config.wiki_root.as_deref(),
+                ).await?;
                 let user_msg = code_mode_user_message(&email, "", "", "", "", "");
+                let user_msg = format!("{user_msg}\n\n{}", shared_draft_context.prompt());
                 // #1046: pin the quality tier. `model: None` emits no `--model`, so this
                 // draft inherited the owner's interactive model and quota (#448).
                 let code_mode_opts = augmentagent_channel_core::ReasonerOpts::pinned(
@@ -495,7 +501,8 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                         message_ctx.clone(),
                         ts_source.clone(),
                     )
-                    .with_wiki_hint(String::new());
+                    .with_wiki_hint(String::new())
+                    .with_draft_context(Some(&shared_draft_context));
                     if let Err(e) = code_mode::run_program(&ts_source, &manifest, &dispatcher).await {
                         let wrapped = augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
                             anyhow::anyhow!("run_program: {e}"),
@@ -526,6 +533,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                             "whatsapp code-mode attempt failed: {cme}; invoking self-repair"
                         );
                         let failure_ctx = FailureCtx {
+                            draft_context: Some(&shared_draft_context),
                             reasoner: self.reasoner.as_ref(),
                             opts: code_mode_opts.clone(),
                             user_msg: user_msg.clone(),
@@ -638,6 +646,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                         .unwrap_or_default();
                 let draft = draft_opts(skill_system, self.config.wiki_root.clone());
                 let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+                let draft_prompt = format!("{draft_prompt}\n\n{}", shared_draft_context.prompt());
                 let drafted = match self.reasoner.call(&draft, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -655,6 +664,8 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     }
                 };
 
+                let drafted = shared_draft_context.guard_draft(&drafted);
+
                 if self.config.dry_run {
                     let action_id = self.store.log_action(
                         &email.message_id,
@@ -665,6 +676,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                         Some(&drafted),
                         ActionStatus::DryRun,
                     )?;
+                anyhow::ensure!(shared_draft_context.attach(&self.store, &action_id)?, "Could not attach draft evidence receipt");
                     self.store
                         .mark_email_processed(&email.message_id, TriageResult::Reply)?;
                     println!(
@@ -675,6 +687,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     );
                     if let Some(record) = pending_classic_record {
                         let failure_ctx = FailureCtx {
+                            draft_context: Some(&shared_draft_context),
                             reasoner: self.reasoner.as_ref(),
                             opts: code_mode_opts.clone(),
                             user_msg: user_msg.clone(),
@@ -711,8 +724,10 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     Some(&drafted),
                     ActionStatus::Pending,
                 )?;
+                anyhow::ensure!(shared_draft_context.attach(&self.store, &action_id)?, "Could not attach draft evidence receipt");
                 if let Some(record) = pending_classic_record.as_ref() {
                     let failure_ctx = FailureCtx {
+                            draft_context: Some(&shared_draft_context),
                         reasoner: self.reasoner.as_ref(),
                         opts: code_mode_opts.clone(),
                         user_msg: user_msg.clone(),
@@ -894,6 +909,11 @@ mod tests {
     #[async_trait]
     impl Reasoner for ScriptedReasoner {
         async fn call(&self, _o: &ReasonerOpts, _u: &str) -> anyhow::Result<String> {
+            // Evidence selection is tested independently; keep the existing
+            // triage/draft script focused on the adapter's transport behavior.
+            if _o.system_prompt.starts_with("You select evidence for a messaging draft") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             Ok(self
                 .responses
                 .lock()

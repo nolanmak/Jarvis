@@ -43,6 +43,7 @@ case "$(uname -s)" in
 esac
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/update.log"
+PROVISION_PENDING="$LOG_DIR/autopr-provision-pending"
 STAMP="$LOG_DIR/built-commit"   # SHA the deployed artifacts were last built from
 LABEL="com.nolanmak.augmentagent"
 SYSTEMD_UNIT="augmentagent.service"
@@ -51,6 +52,15 @@ DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
+
+reconcile_native_runtime() {
+  if [ "$(uname -s)" = Linux ] && [ -f "$REPO_ROOT/scripts/ensure-native-runtime.py" ]; then
+    if ! /usr/bin/python3 "$REPO_ROOT/scripts/ensure-native-runtime.py" >> "$LOG" 2>&1; then
+      log "NATIVE RUNTIME RECONCILIATION FAILED — provider admission remains blocked; retrying next tick"
+      return 1
+    fi
+  fi
+}
 
 # Tell the owner on Discord. Best effort and never fatal: a webhook that is
 # unset or down must not stop a deploy. Anything this function reports is a
@@ -67,6 +77,28 @@ notify_owner() {
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
 . "$REPO_ROOT/scripts/lib/update-build.sh"
+
+# Artifact repair is independent of the executable's capability or health.
+secure_release_artifacts() {
+  python3 "$REPO_ROOT/scripts/secure-release-executables.py" "$REPO_ROOT/target/release" >> "$LOG" 2>&1
+}
+
+reconcile_worker_provisioning() {
+  # Keep this retry state independent of the compiled/deployed build stamp.
+  (umask 077; printf 'pending\n' > "$PROVISION_PENDING")
+  secure_release_artifacts || return 1
+  local worker_help=""
+  worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
+  case "$worker_help" in
+    *'Usage: augmentagent auto-pr-worker'*)
+      if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
+        log "AUTO-SHIP WORKER PROVISIONING FAILED — retry pending independently of build stamp"
+        return 1
+      fi ;;
+    *) log "auto-ship worker capability unavailable; skipping provisioning" ;;
+  esac
+  rm -f "$PROVISION_PENDING"
+}
 
 # #1571 — the unit no longer runs what this script builds. A drop-in that
 # overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
@@ -109,6 +141,33 @@ not restarting"
     return 0
   fi
   return 1
+}
+
+# Policy selection can change without a Git or executable update. Use the
+# ordinary daemon restart guards; the independent worker drains and reloads
+# itself at its next completed tick/sweep boundary.
+reconcile_native_selection() {
+  [ "$(uname -s)" = Linux ] || return 0
+  local helper="$REPO_ROOT/scripts/autoship-deployment-readiness.py" status=0
+  [ -f "$helper" ] || return 0
+  /usr/bin/python3 "$helper" --activation-needed \
+    --selection "${XDG_CONFIG_HOME:-$HOME/.config}/augmentagent/autoship-native.env" \
+    --receipts "$LOG_DIR/autoship-effective-config" || status=$?
+  case "$status" in
+    0) return 0 ;;
+    10) ;;
+    *) log "native policy activation evidence unavailable; keeping services and retrying next tick"; return 0 ;;
+  esac
+  if deploy_pinned_elsewhere || maybe_defer_restart || ! memory_pressure_ok || ! restart_budget_ok; then
+    log "native policy activation deferred by deployment guards; retrying next tick"
+    return 0
+  fi
+  if systemctl --user daemon-reload >> "$LOG" 2>&1 && restart_unit "$SYSTEMD_UNIT" "$DAEMON_BINARY"; then
+    record_restart
+    log "native policy activated for daemon; worker reloads after its active work drains; verify autoship readiness"
+  else
+    log "native policy activation failed; receipt remains pending for next tick"
+  fi
 }
 
 # Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
@@ -154,20 +213,21 @@ apply_update() {
       esac
     fi
     log "rust build ok (augmentagent + augmentagent-mcp-memory)"
-    # Install without starting a duplicate legacy loop. The worker starts
-    # after the daemon restart, and future daemon updates leave it running.
-    local worker_help=""
-    worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
-    case "$worker_help" in
-      *'Usage: augmentagent auto-pr-worker'*)
-        if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
-          log "AUTO-SHIP WORKER PROVISIONING FAILED — deployment stamp withheld"
-          return 1
-        fi ;;
-    esac
   else
     log "no rust code changed; skipping rust rebuild"
   fi
+
+  # Installer/template fixes need provisioning even when Cargo output is
+  # cached or only scripts changed. This reloads configuration without
+  # starting a duplicate loop or forcing an active worker to restart.
+  secure_release_artifacts || return 1
+  local PROVISION_FAILURE=0
+  reconcile_worker_provisioning || PROVISION_FAILURE=1
+
+  # The pulled helper or selected profile may be new, and a provider binary
+  # may have changed during compilation. Preserve the binary deployment's
+  # independent status: failed runtime repair must not freeze code updates.
+  reconcile_native_runtime || true
 
   if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
     log "rebuilding dashboard (changed files touched src/, views/, or package.json)"
@@ -365,6 +425,7 @@ will retry via the build-stamp mismatch path."
   fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
+  reconcile_native_selection
   # #1571 — a verified deploy on our own binary closes any pinned-deploy
   # alert; the next pin is a new incident and gets a new Discord message.
   rm -f "$PINNED_ALERT_STAMP"
@@ -374,9 +435,15 @@ will retry via the build-stamp mismatch path."
   if [ -x "$REPO_ROOT/target/release/augmentagent" ]; then
     "$REPO_ROOT/target/release/augmentagent" deploy prune >> "$LOG" 2>&1 || true
   fi
+  return "$PROVISION_FAILURE"
 }
 
 log "checking for updates"
+# This precedes every helper that can execute cached release artifacts.
+secure_release_artifacts || { log "release artifact validation failed; retrying next tick"; exit 1; }
+# Provider packages can move independently of Git, including when HEAD and
+# the build stamp are current. This also runs after a pull/build below.
+reconcile_native_runtime || true
 # #891 — housekeeping that must never run under a live build.
 trim_gate_cache_if_idle || true
 
@@ -397,6 +464,10 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   # (correctness over cost — this path only fires when something already went
   # wrong, not on the steady-state hot path).
   if [ "$BUILT" = "$LOCAL" ]; then
+    if [ -e "$PROVISION_PENDING" ]; then
+      reconcile_worker_provisioning || exit 1
+    fi
+    reconcile_native_selection
     log "up to date ($LOCAL)"
     exit 0
   fi
@@ -510,7 +581,7 @@ fi
 # Missing one means the PR merges but the daemon keeps the stale embedded copy.
 # scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
 # outside crates/ is added without being classified here.
-RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(ci-build-vm|native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/ci-contract\.(py|json)$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|docs/slack-app-manifest\.json$|scripts/(ci-build-vm|native-provider-(vm(-guest)?|mcp-relay|gateway)|run-resource-scope|autoship-deployment-readiness|autoship-verifier-checkout|autoship-registry-integrity|autoship-scope-guard|codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor|pdf-runtime|code-mode-compute(-guest|-prepare)?)\.py$|scripts/ci-contract\.(py|json)$|scripts/run-rs\.sh$|sidecars/code-mode-runner/runner\.ts$)'
 if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi

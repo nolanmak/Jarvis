@@ -19,6 +19,9 @@ pub mod codex;
 pub mod codex_tools;
 pub mod cooldown;
 pub mod decision;
+pub mod draft_context;
+pub mod draft_evidence;
+pub mod draft_workflow;
 pub mod engagement;
 pub mod fallback;
 pub mod gemini;
@@ -69,7 +72,7 @@ pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurf
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerError, ReasonerOpts};
 // #655 — multi-provider failover: one Reasoner seam, N provider adapters.
 pub use cooldown::CooldownLatch;
-pub use fallback::{build_workflow_pinned, build_workflow_reasoner, build_pinned, build_reasoner, ineligible_reason, FallbackReasoner, LaneAvailability};
+pub use fallback::{build_workflow_builder, build_workflow_pinned, build_workflow_reasoner, build_pinned, build_reasoner, ineligible_reason, FallbackReasoner, LaneAvailability};
 // #1040 — content-level endings and the completed-work re-dispatch guard.
 pub use handoff_outcome::CompletedWithoutSummary;
 pub use turn_failure::{FailureClass, TurnFailure};

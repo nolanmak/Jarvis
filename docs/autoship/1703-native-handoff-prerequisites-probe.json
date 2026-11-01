@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1713,
+  "scope": "Retained native runtime lifetime plus model/resource correlation and sealed audit writer ingress. Complete owner transfer and Discord consumer remain pending.",
+  "source_sha256": [
+    {
+      "path": "crates/augmentagent-channel-core/src/native_session.rs",
+      "sha256": "e9b405b5e32e5608fbccf3ba5f0ff31a55d8bcd80b596d9e214007dbd2015951"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/native_vm.rs",
+      "sha256": "c4259c016eb27a782188687b091a405a66acc152c2e1a3e73268c03b9a50ec9a"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/process_tree.rs",
+      "sha256": "ddf45e14c726f2ea92fb7bb946608e977644802e195ea195f9bcbdde9f7eac8d"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/tool_audit.rs",
+      "sha256": "7499ef25085cd72862746ddd26d96ff435cc3cb2f2e96bd6e51e22c750b03e00"
+    },
+    {
+      "path": "crates/augmentagent-channel-core/src/audit_chain.rs",
+      "sha256": "377055fe60ea5096a057a81480228f4fd7f4cb48b3acf6ec0ea5dddf2ddb00f3"
+    }
+  ],
+  "correlation": {
+    "red_commit": "ed66a02c",
+    "implementation_commit": "6ab706de",
+    "red_failed": 1,
+    "red_log_sha256": "38df85d19a0cfc77040db870e68c16709627296190bd816402d25b1b811ed5a5",
+    "affected_suite_passed": 41
+  },
+  "writer_ingress": {
+    "red_commit": "10a0a085",
+    "implementation_commit": "615cdda6",
+    "red_failed": 1,
+    "red_log_sha256": "37dd5d92aadae2fb0c2eea9775ec101dbf9c2faff8f6728a83ebcc7285106482",
+    "affected_suite_passed": 48,
+    "cross_process_race": "A separate controller attempts registration while source sealing holds the anchor lock; after seal it is refused with no ticket or continuity-loss marker."
+  },
+  "full_core_suite": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-channel-core --lib",
+    "source_tree_commit": "f399cdd9",
+    "passed": 678,
+    "failed": 0,
+    "ignored": 14,
+    "log_sha256": "de7fd777c4a4b230d79ce97628a369de0680d91fb14fdf4dd5f5f93028f8296a",
+    "prior_parallel_run": {
+      "passed": 677,
+      "failed": 1,
+      "ignored": 14,
+      "log_sha256": "2dff003bab77a16fbed8ea64c5376cd9d3ec718893be0f97718742589d260249",
+      "finding": "Native retirement fixture dropped its flock FD and immediately expected reclaim. Parallel forks can temporarily retain that description. Fixture now explicitly releases its flock before the immediate reclaim assertion; production prune logic is unchanged."
+    }
+  },
+  "design_audit": {
+    "file": "docs/autoship/1713-native-owner-transfer-design.json",
+    "revision": 5,
+    "seams_checked": 20,
+    "resolved_recheck_result": "20 of 20 hold",
+    "implementation_complete": false
+  },
+  "not_proved": [
+    "Healthy audit handoff seal/replay API",
+    "Transactional effective-owner transfer ledger and reservation integration",
+    "Owner turn promotion/completion and explicit pause preservation",
+    "Public Discord coding consumer",
+    "Live native continuation or full CLI/Discord issue-to-merge acceptance",
+    "Soak or autonomous daily throughput"
+  ]
+}

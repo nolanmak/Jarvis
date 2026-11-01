@@ -222,12 +222,20 @@ fn any_ok<T>(
     }
     match (ok.is_empty(), first_err) {
         (true, Some(e)) => Err(e),
+        (true,None)=>Err(ApprovalError::NotReady),
         _ => Ok(ok),
     }
 }
 
 #[async_trait]
 impl ApprovalBroker for MultiSurfaceBroker {
+    async fn post_imessage_owner_health(&self,id:i64,status:&str)->Result<(),ApprovalError> {
+        let mut results=Vec::new();
+        for (name,broker) in &self.surfaces {
+            if broker.is_available() && broker.can_post_notices() {results.push((*name,broker.post_imessage_owner_health(id,status).await));}
+        }
+        any_ok("owner iMessage health",results).map(|_|())
+    }
     async fn post_owner_alert(&self,notice:&augmentagent_store::alert_schedule::AlertNotice)
         ->Result<String,ApprovalError> {
         let Some((_,discord))=self.surfaces.iter().find(|(name,_)|*name=="discord") else {
@@ -243,6 +251,7 @@ impl ApprovalBroker for MultiSurfaceBroker {
     ) -> Result<(), ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {
+            if !broker.is_available() {continue;}
             results.push((*name, broker.post_approval(action_id, email, draft).await));
         }
         any_ok("card", results).map(|_| ())
@@ -251,6 +260,7 @@ impl ApprovalBroker for MultiSurfaceBroker {
     async fn note_compose_activity(&self, action_id: &str, email: &Email) -> Result<(), ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {
+            if !broker.is_available() || !broker.can_post_notices() {continue;}
             results.push((*name, broker.note_compose_activity(action_id, email).await));
         }
         any_ok("compose activity note", results).map(|_| ())
@@ -259,6 +269,7 @@ impl ApprovalBroker for MultiSurfaceBroker {
     async fn post_flag_notice(&self, email: &Email, reason: &str) -> Result<(), ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {
+            if !broker.is_available() || !broker.can_post_notices() {continue;}
             results.push((*name, broker.post_flag_notice(email, reason).await));
         }
         any_ok("flag notice", results).map(|_| ())
@@ -267,6 +278,7 @@ impl ApprovalBroker for MultiSurfaceBroker {
     async fn post_digest(&self, title: &str, body: &str) -> Result<(), ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {
+            if !broker.is_available() || !broker.can_post_notices() {continue;}
             results.push((*name, broker.post_digest(title, body).await));
         }
         any_ok("digest", results).map(|_| ())
@@ -282,6 +294,7 @@ impl ApprovalBroker for MultiSurfaceBroker {
     ) -> Result<Option<(u64, u64)>, ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {
+            if !broker.is_available() {continue;}
             results.push((
                 *name,
                 broker
@@ -310,6 +323,7 @@ impl ApprovalBroker for MultiSurfaceBroker {
     ) -> Result<Option<(u64, u64)>, ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {
+            if !broker.is_available() {continue;}
             results.push((
                 *name,
                 broker
@@ -326,6 +340,7 @@ impl ApprovalBroker for MultiSurfaceBroker {
     async fn delete_message(&self, channel_id: u64, message_id: u64) -> Result<(), ApprovalError> {
         let mut results = Vec::new();
         for (name, broker) in &self.surfaces {
+            if !broker.is_available() {continue;}
             results.push((*name, broker.delete_message(channel_id, message_id).await));
         }
         any_ok("delete", results).map(|_| ())

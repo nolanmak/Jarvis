@@ -4,8 +4,10 @@
 //! `augmentagent imessage allow-inbound` whose newest entry is from the
 //! other person gets triaged; a `reply` decision becomes a pending action
 //! with a draft and one approval card, the same flow as Telegram. Approve
-//! then queues the send (#1303). Groups, SMS/RCS and the first sync of a
-//! bundle never produce cards.
+//! then queues the send (#1303). SMS/RCS and the first sync of a bundle never
+//! produce cards. iMessage groups do (#1738), with a higher bar: the triage
+//! prompt carries [`GROUP_TRIAGE_POLICY`], and Approve sends to the exported
+//! chat guid only (`resolve_target`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +29,27 @@ const CONTEXT_ENTRIES: usize = 10;
 /// `emails.kind` of a message the owner started with `imessage compose`
 /// (#1635). Such cards are never retired by inbound traffic.
 pub const COMPOSE_KIND: &str = "compose";
+
+/// Appended to the trusted part of the triage prompt for a group card
+/// (#1738). The group's title and members ride in the card's Subject/To.
+pub const GROUP_TRIAGE_POLICY: &str = "\n\nThis message is from an iMessage GROUP chat (members in To; the owner's own entries are marked `me`). The bar for \"reply\" is higher than in a 1:1: choose \"reply\" only when the newest message addresses the owner (by name, a direct question to them, or an answer to something they said) or asks something that is clearly the owner's to answer. General chatter, reactions, logistics between other members and questions addressed to someone else are \"skip\", not \"flag\". Choose \"flag\" only for something important the owner must see today.";
+
+/// The group triage policy and draft note for `platform` (`email.platform`).
+/// iMessage keeps the exact #1739 wording (#448: triage prompt changes are
+/// measured, never incidental); other platforms swap in their own name.
+pub fn group_notes(platform: &str) -> (String, String) {
+    let name = match platform {
+        "whatsapp" => "WhatsApp",
+        _ => return (GROUP_TRIAGE_POLICY.into(), GROUP_DRAFT_NOTE.into()),
+    };
+    (
+        GROUP_TRIAGE_POLICY.replace("an iMessage GROUP", &format!("a {name} GROUP")),
+        GROUP_DRAFT_NOTE.replace("iMessage group", &format!("{name} group")),
+    )
+}
+
+/// Appended to the draft prompt for a group card (#1738).
+pub const GROUP_DRAFT_NOTE: &str = "\n\nThis reply goes to the whole iMessage group (members in To). Write one short message to the group; name the person you are answering when it would otherwise be unclear.";
 
 #[derive(Debug, Clone)]
 pub struct ImessageReplyConfig {
@@ -62,10 +85,11 @@ pub struct ImessageReplier {
 }
 
 /// The card email for a delta, or `None` when no card is owed: first sync,
-/// group, not iMessage, or the newest entry is the operator's own.
+/// not iMessage, or the newest entry is the operator's own. A group card
+/// names the group in the Subject and every member in To (#1738).
 pub fn reply_email(delta: &PollDelta) -> Option<Email> {
     let conv = &delta.conversation;
-    if delta.first_run || conv.service != "iMessage" || conv.is_group() {
+    if delta.first_run || conv.service != "iMessage" {
         return None;
     }
     let (idx, newest) = delta.new_entries.last()?;
@@ -73,8 +97,19 @@ pub fn reply_email(delta: &PollDelta) -> Option<Email> {
         return None;
     }
     let mut email = synthetic_imessage_email(conv, *idx, newest);
-    let start = delta.new_entries.len().saturating_sub(CONTEXT_ENTRIES);
-    email.body = delta.new_entries[start..]
+    email.body = context_body(&delta.new_entries);
+    if conv.is_group() {
+        email.subject = format!("iMessage group: {}", conv.title);
+        email.to = conv.participants.join(", ");
+    }
+    Some(email)
+}
+
+/// The last [`CONTEXT_ENTRIES`] entries as a card body, newest last. Shared
+/// by every bundle-backed replier (iMessage, WhatsApp #1764).
+pub fn context_body(entries: &[(usize, crate::bundle::MessageEntry)]) -> String {
+    let start = entries.len().saturating_sub(CONTEXT_ENTRIES);
+    entries[start..]
         .iter()
         .map(|(_, e)| {
             let mut s = format!("### [{}] {}\n{}", e.timestamp, e.sender, e.body);
@@ -85,14 +120,25 @@ pub fn reply_email(delta: &PollDelta) -> Option<Email> {
             s
         })
         .collect::<Vec<_>>()
-        .join("\n\n");
-    Some(email)
+        .join("\n\n")
 }
 
-enum Handled {
+/// What [`draft_card`] did with one card email.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handled {
     Card { superseded: usize },
     Skipped,
     Flagged,
+}
+
+/// The platform-neutral half of a bundle reply: triage, then draft, then one
+/// approval card that supersedes the thread's older card. Platforms keep
+/// their own gating (allowlists, own-send echoes) and call this (#1764).
+pub struct CardDrafter<'a> {
+    pub store: &'a Store,
+    pub reasoner: &'a dyn Reasoner,
+    pub approvals: &'a dyn ApprovalBroker,
+    pub config: &'a ImessageReplyConfig,
 }
 
 /// True when every new entry is the agent's own send coming back, so the
@@ -180,6 +226,9 @@ impl ImessageReplier {
     pub async fn handle_deltas(&self, deltas: &[PollDelta]) -> ReplyStats {
         let mut stats = ReplyStats::default();
         for delta in deltas {
+            if delta.conversation.chat_guid.as_deref().is_some_and(|guid|self.store.is_imessage_owner_conversation(guid).unwrap_or(true)) {
+                continue;
+            }
             if !delta.first_run {
                 let (own, manual) = split_own_entries(&self.store, delta);
                 stats.own_sends += own;
@@ -234,7 +283,7 @@ impl ImessageReplier {
                     continue;
                 }
             }
-            match self.handle_one(email).await {
+            match self.handle_one(email, delta.conversation.is_group()).await {
                 Ok(Handled::Card { superseded }) => {
                     stats.cards += 1;
                     stats.superseded += superseded;
@@ -250,6 +299,19 @@ impl ImessageReplier {
         stats
     }
 
+    async fn handle_one(&self, email: Email, group: bool) -> anyhow::Result<Handled> {
+        CardDrafter {
+            store: &self.store,
+            reasoner: self.reasoner.as_ref(),
+            approvals: self.approvals.as_ref(),
+            config: &self.config,
+        }
+        .draft(email, group, "superseded by a newer iMessage")
+        .await
+    }
+}
+
+impl CardDrafter<'_> {
     fn log(&self, email: &Email, draft: Option<&str>, status: ActionStatus) -> anyhow::Result<String> {
         Ok(self.store.log_action(
             &email.message_id,
@@ -262,11 +324,21 @@ impl ImessageReplier {
         )?)
     }
 
-    async fn handle_one(&self, email: Email) -> anyhow::Result<Handled> {
+    /// `supersede_reason` names the platform in the older card's status.
+    pub async fn draft(&self, email: Email, group: bool, supersede_reason: &str) -> anyhow::Result<Handled> {
+        let mut baseline = if augmentagent_channel_core::draft_workflow::enabled_for(&email.platform) {
+            augmentagent_channel_core::draft_context::load_seed(
+                self.store, &email, self.config.wiki_root.as_deref(),
+            )?.prompt()
+        } else { String::new() };
+        let (group_policy, group_note) = group_notes(&email.platform);
+        if group {
+            baseline.push_str(&group_policy);
+        }
         let triage = triage_opts(self.config.wiki_root.clone());
         let raw = self
             .reasoner
-            .call(&triage, &triage_user_message(&email, "", ""))
+            .call(&triage, &triage_user_message(&email, &baseline, ""))
             .await?;
         let decision = parse_decision(&raw)?;
         match decision.decision {
@@ -291,16 +363,26 @@ impl ImessageReplier {
 
         let skill = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
             .unwrap_or_default();
+        let context = augmentagent_channel_core::draft_workflow::prepare(
+            self.store, self.reasoner, &email,
+            "Draft a response to the latest incoming message using relevant conversation and cross-platform evidence.",
+            self.config.wiki_root.as_deref(),
+        ).await?;
         let draft_opts = draft_opts(skill, self.config.wiki_root.clone());
+        let mut evidence = context.prompt();
+        if group {
+            evidence.push_str(&group_note);
+        }
         let drafted = self
             .reasoner
-            .call(&draft_opts, &draft_user_message(&email, "", "", "", "", ""))
+            .call(&draft_opts, &draft_user_message(&email, &evidence, "", "", "", ""))
             .await?
             .trim()
             .to_string();
         if drafted.is_empty() {
             anyhow::bail!("draft came back empty");
         }
+        let drafted = context.guard_draft(&drafted);
         // One live reply card per conversation: the newer message replaces
         // it. A pending compose the owner started stays (#1635).
         let thread = email.thread_id.clone().unwrap_or_default();
@@ -308,11 +390,12 @@ impl ImessageReplier {
             .store
             .mark_pending_drafts_superseded_by_thread_except_kind(
                 &thread,
-                "superseded by a newer iMessage",
+                supersede_reason,
                 COMPOSE_KIND,
             )?
             .len();
         let action_id = self.log(&email, Some(&drafted), ActionStatus::Pending)?;
+        anyhow::ensure!(context.attach(self.store, &action_id)?, "draft evidence receipt could not be attached");
         if let Err(e) = self.approvals.post_approval(&action_id, &email, &drafted).await {
             self.store.update_action_status(
                 &action_id,
@@ -343,24 +426,35 @@ mod tests {
 
     const PHONE: &str = "+15555550100"; // pii-ok synthetic
 
-    struct Scripted(Mutex<std::collections::VecDeque<String>>, Mutex<usize>);
+    struct Scripted(Mutex<std::collections::VecDeque<String>>, Mutex<usize>, Mutex<Vec<String>>);
 
     impl Scripted {
         fn new(r: &[&str]) -> Arc<Self> {
             Arc::new(Self(
                 Mutex::new(r.iter().map(|s| s.to_string()).collect()),
                 Mutex::new(0),
+                Mutex::new(Vec::new()),
             ))
         }
         fn calls(&self) -> usize {
             *self.1.lock().unwrap()
         }
+        /// User messages of the counted (triage/draft) calls, in order.
+        fn prompts(&self) -> Vec<String> {
+            self.2.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl Reasoner for Scripted {
-        async fn call(&self, _o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+        async fn call(&self, o: &ReasonerOpts, _m: &str) -> anyhow::Result<String> {
+            // These fixtures count triage/draft decisions; evidence recovery
+            // has its own scripted cross-platform suite in channel-core.
+            if o.system_prompt.starts_with("You select evidence for a messaging draft") {
+                return Ok(r#"{"action":"ready","facts":[],"gaps":[]}"#.into());
+            }
             *self.1.lock().unwrap() += 1;
+            self.2.lock().unwrap().push(_m.to_string());
             Ok(self
                 .0
                 .lock()
@@ -401,6 +495,7 @@ mod tests {
             service: service.into(),
             chat_guid: None,
             newest_entry: None,
+            ..Default::default()
         }
     }
 
@@ -551,13 +646,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn groups_sms_rcs_and_first_sync_never_draft() {
+    async fn sms_rcs_and_first_sync_never_draft() {
         let f = fx();
-        for id in [PHONE, "chat900", "+15555550111"] { // pii-ok synthetic
+        for id in [PHONE, "+15555550111"] { // pii-ok synthetic
             f.store.allow_imessage_inbound(id).unwrap();
         }
         let deltas = vec![
-            delta(conv("chat900", "iMessage", &[PHONE, "+15555550111"]), &[(PHONE, "hi all")], false), // pii-ok synthetic
             delta(conv("+15555550111", "SMS", &["+15555550111"]), &[("+15555550111", "hi")], false), // pii-ok synthetic
             delta(conv("+15555550111", "RCS", &["+15555550111"]), &[("+15555550111", "hi")], false), // pii-ok synthetic
             delta(conv(PHONE, "iMessage", &[PHONE]), &[(PHONE, "hi")], true),
@@ -874,4 +968,123 @@ mod tests {
         assert!(f.broker.activity.lock().unwrap().is_empty());
     }
 
+    // ---- #1738: reply cards for iMessage group chats ----
+
+    const MEMBER: &str = "+15555550111"; // pii-ok synthetic
+    const GROUP: &str = "chat900";
+    const GUID: &str = "any;+;chat900";
+
+    fn group(guid: Option<&str>) -> Conversation {
+        let mut c = conv(GROUP, "iMessage", &[PHONE, MEMBER]);
+        c.title = "Ski Trip".into();
+        c.chat_guid = guid.map(String::from);
+        c
+    }
+
+    #[tokio::test]
+    async fn group_inbound_addressed_to_owner_raises_card() {
+        let f = fx();
+        f.store.allow_imessage_inbound(GROUP).unwrap();
+        let d = delta(group(Some(GUID)), &[(MEMBER, "lodge is booked"), (PHONE, "Sam, can you drive Friday?")], false);
+        ingest(&f.store, &d);
+        let card = reply_email(&d).unwrap();
+        let r = Scripted::new(&[REPLY, "Yes, I can drive Friday."]);
+        let stats = replier(&f, r.clone()).handle_deltas(&[d]).await;
+        assert_eq!(stats.cards, 1);
+        let prompts = r.prompts();
+        assert!(prompts[0].contains(GROUP_TRIAGE_POLICY), "triage carries the group bar");
+        assert!(prompts[0].contains(&format!("To: {PHONE}, {MEMBER}")), "{}", prompts[0]);
+        assert!(prompts[1].contains(GROUP_DRAFT_NOTE), "draft knows it goes to the group");
+        assert_eq!(card.subject, "iMessage group: Ski Trip");
+        assert_eq!(card.to, format!("{PHONE}, {MEMBER}"));
+        let id = &f.broker.cards.lock().unwrap()[0].0;
+        let a = f.store.get_action_with_email(id).unwrap().unwrap();
+        assert_eq!(a.email.thread_id.as_deref(), Some("imessage:chat900"));
+        let t = crate::resolve_target(a.email.thread_id.as_deref().unwrap(), &[group(Some(GUID))]).unwrap();
+        assert_eq!((t.target.as_str(), t.kind), (GUID, ImessageTargetKind::ChatGuid));
+    }
+
+    #[tokio::test]
+    async fn group_chatter_not_addressed_to_owner_raises_no_card() {
+        let f = fx();
+        f.store.allow_imessage_inbound(GROUP).unwrap();
+        let d = delta(group(Some(GUID)), &[(MEMBER, "lol same")], false);
+        ingest(&f.store, &d);
+        let r = Scripted::new(&[r#"{"decision":"skip","reason":"group chatter"}"#]);
+        let stats = replier(&f, r.clone()).handle_deltas(&[d]).await;
+        assert_eq!((stats.cards, stats.skipped, stats.flagged), (0, 1, 0));
+        assert_eq!(r.calls(), 1, "triage only, no draft");
+        assert!(r.prompts()[0].contains(GROUP_TRIAGE_POLICY));
+        assert!(f.broker.cards.lock().unwrap().is_empty());
+        assert_eq!(*f.broker.flags.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn group_without_allowlist_or_defaults_costs_nothing_even_if_a_member_is() {
+        let f = fx();
+        f.store.allow_imessage_inbound(MEMBER).unwrap();
+        let d = delta(group(Some(GUID)), &[(MEMBER, "Sam?")], false);
+        ingest(&f.store, &d);
+        let r = Scripted::new(&[REPLY, "x"]);
+        assert_eq!(replier(&f, r.clone()).handle_deltas(&[d]).await, ReplyStats::default());
+        assert_eq!(r.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn owner_inbound_defaults_draft_groups_with_no_per_group_step_unless_denied() {
+        let f = fx();
+        f.store.set_imessage_contact_defaults(true, false).unwrap();
+        let d = delta(group(Some(GUID)), &[(MEMBER, "Sam, you in?")], false);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[REPLY, "in"])).handle_deltas(&[d]).await;
+        assert_eq!(stats.cards, 1);
+        f.store.deny_imessage_inbound(GROUP).unwrap();
+        let mut d2 = delta(group(Some(GUID)), &[(MEMBER, "Sam??")], false);
+        d2.new_entries[0].0 = 20;
+        ingest(&f.store, &d2);
+        let r = Scripted::new(&[REPLY, "x"]);
+        assert_eq!(replier(&f, r.clone()).handle_deltas(&[d2]).await.cards, 0);
+        assert_eq!(r.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn first_run_backfill_never_drafts_group_history() {
+        let f = fx();
+        f.store.allow_imessage_inbound(GROUP).unwrap();
+        let d = delta(group(Some(GUID)), &[(MEMBER, "Sam, you in?")], true);
+        ingest(&f.store, &d);
+        let r = Scripted::new(&[REPLY, "x"]);
+        assert_eq!(replier(&f, r.clone()).handle_deltas(&[d]).await, ReplyStats::default());
+        assert_eq!(r.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn group_without_chat_guid_still_gets_a_card_whose_target_fails_closed() {
+        let f = fx();
+        f.store.allow_imessage_inbound(GROUP).unwrap();
+        let d = delta(group(None), &[(MEMBER, "Sam, you in?")], false);
+        ingest(&f.store, &d);
+        let stats = replier(&f, Scripted::new(&[REPLY, "in"])).handle_deltas(&[d]).await;
+        assert_eq!(stats.cards, 1);
+        assert_eq!(
+            crate::resolve_target("imessage:chat900", &[group(None)]),
+            Err(crate::TargetError::GroupUnsupported)
+        );
+    }
+
+    #[test]
+    fn imessage_keeps_its_exact_group_wording_and_whatsapp_gets_its_own() {
+        assert!(GROUP_TRIAGE_POLICY.starts_with("\n\nThis message is from an iMessage GROUP chat"));
+        assert_eq!(group_notes("imessage"), (GROUP_TRIAGE_POLICY.to_string(), GROUP_DRAFT_NOTE.to_string()));
+        let (policy, note) = group_notes("whatsapp");
+        assert!(policy.contains("from a WhatsApp GROUP chat") && !policy.contains("iMessage"), "{policy}");
+        assert!(note.contains("whole WhatsApp group") && !note.contains("iMessage"), "{note}");
+    }
+
+    #[test]
+    fn one_to_one_card_has_no_group_subject_or_recipients() {
+        let e = reply_email(&one_to_one(&[(PHONE, "hi")])).unwrap();
+        assert_eq!(e.subject, "iMessage: Alex");
+        assert!(e.to.is_empty());
+    }
 }

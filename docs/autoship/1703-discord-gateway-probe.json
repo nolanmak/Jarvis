@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1712,
+    1713,
+    1714
+  ],
+  "status": "gateway-and-queued-ack-recovery-verified-not-deployed",
+  "parent_commit": "75c1b40d43b0e3b082ca02ad60fa0a180a8d05e6",
+  "tests": {
+    "gateway_red": {
+      "log": "/tmp/autoship-1703-red-discord-gateway.log",
+      "cargo_exit": 101,
+      "failed": 3,
+      "assertion": "Commands and bound follow-ups were not consumed; failed sends and unverified destinations did not use the gateway boundary."
+    },
+    "recovery_red": {
+      "log": "/tmp/autoship-1703-red-discord-ack-recovery.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "A queued acknowledgement was not delivered by the recovery entry point."
+    },
+    "notification_registry_red": {
+      "log": "/tmp/autoship-1703-green-discord-gateway-cli.log",
+      "cargo_exit": 101,
+      "passed": 1455,
+      "failed": 2,
+      "assertion": "The new transport had two unregistered notification producer sites; both were added as origin-bound replies."
+    },
+    "discord_slack_green": {
+      "log": "/tmp/autoship-1703-green-discord-gateway-final.log",
+      "exit": 0,
+      "passed": 793,
+      "failed": 0,
+      "ignored": 1
+    },
+    "full_binary_green": {
+      "log": "/tmp/autoship-1703-green-discord-gateway-cli-verified.log",
+      "exit": 0,
+      "passed": 1457,
+      "failed": 0,
+      "ignored": 25
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-discord-gateway-cli-verified.log",
+      "exit": 0,
+      "status_readiness_passed": 14,
+      "submission_work_wait_passed": 17,
+      "resolution_passed": 10,
+      "failed": 0
+    }
+  },
+  "verified": [
+    "The production Discord event handler dispatches autoship before attachments, history and ordinary inference; WikiQuerier delegates to the shared durable CLI admission adapter.",
+    "Immutable configured owner identity and exact live private-channel recipient metadata gate admission and outbound sends. The production HTTP verifier is tested against a local server for owner DM, foreign recipient and group DM responses.",
+    "Accepted acknowledgements use atomic single-use dispatch claims, stable enforced nonces and disabled mentions. Exact returned message receipts confirm delivery; failed or lost responses remain uncertain and cannot be blindly replayed.",
+    "A single recovery task per broker reads queued acknowledgements at startup and periodically, independently of gateway message replay. It rechecks configured owner and destination before claiming and sending; uncertain acknowledgements are excluded.",
+    "The real-Git/scripted-GitHub fixture exercises the production gateway dispatcher and CLI adapter, repeated incoming messages, replay after PR closure, revoked GitHub permission, blocked coding follow-ups and recovery through fresh storage reads.",
+    "Conversation routing reads tolerate stores predating Discord admission. Ordinary unbound chat passes through; bound PR follow-ups receive an explicit unavailable response and do not enter wiki inference.",
+    "Owner command usage, explicit Slack parity blocker and notification producer registration describe the actual implemented surface."
+  ],
+  "limits": [
+    "Only initial PR admission is wired. Native coding follow-ups, workflow selection/control commands, owned-workspace session binding, stage-boundary serialization and provider handoff remain open.",
+    "Recovery scans a bounded batch of 128 queued acknowledgements for the configured bot/owner. Retry scheduling, degraded/dead-letter handling and fairness across persistently inaccessible destinations belong to the unfinished delivery service.",
+    "Uncertain sends remain parked: bounded remote-history reconciliation and explicit delivery resolution/rebind controls are not implemented. No exactly-once platform delivery claim is made.",
+    "Syntax/validation errors and unavailable-follow-up notices are immediate replies, not durable accepted-command acknowledgements.",
+    "Durable stage/progress/merge/deployment updates and configured operations routing remain open.",
+    "No production rollout, live Discord/native acceptance, paid native end-to-end rerun, hosted CI acceptance or required fault/unattended soak completed in this change."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-approval-discord/src/autoship.rs",
+      "sha256": "0a25694b5a3ab3fdde2b17e004b54a534f2e0ebe4d6cb8b3c2db202411cfe7ba"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/broker.rs",
+      "sha256": "7842b0f29b842fbfa8206de1618198a19725c2bcbf5d6d5259597a823548aea2"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/event_handler.rs",
+      "sha256": "ef46e2907616201cf603523d2b59238212c7ec884326c78d5d3c094952880d08"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/lib.rs",
+      "sha256": "912c814dfcc49a04ddb8943e0708a50ae4545003d2cb0fba88aa94548a4eeb6a"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/owner_commands.rs",
+      "sha256": "34ddc70fe4bbd6d626359f824f45ceb1d8d5865dac50f7af5f92534307a46b69"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/tests/owner_command_registry.rs",
+      "sha256": "d766ee05a6d7491775f2de8e4f5073be635d29882220050bd6469dae3809fdec"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "f8394b8a9649e5fa4fc3b6aadc47144b3ebbc95ec2f8de634133526e75f3025a"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_ingress.rs",
+      "sha256": "41fc99f8473d3d027c1b4bee7ce8b949f44287fe9fa8817b20a6257ddee3265f"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "129cccd7bdec1ec0b51161f20c1beffc38702ea414deff387b3ddc67b007b2bd"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/notify.rs",
+      "sha256": "e2d90fa7e6ff770bf1e5506c68bb7cdfdac84a1dba7ed5ef16a4fed3bd16f795"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "a5ea9515806919dd89f6122c5b3c9f9213012986d633c9ac2072dcccd6c15c41"
+    }
+  ]
+}

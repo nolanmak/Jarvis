@@ -12,6 +12,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
+import uuid
 import stat
 from pathlib import Path
 import subprocess
@@ -28,6 +30,7 @@ TESTS = {
     "adjudicator": "self_improve::native_acceptance::live_native_final_adjudicator_resolves_synthetic_contradiction",
     "writer": "self_improve::native_acceptance::live_native_writer_inventory_replay_1538",
     "file_edit": "self_improve::native_route_acceptance::live_native_guarded_file_edit",
+    "claude_file_edit": "self_improve::native_route_acceptance::live_native_guarded_claude_file_edit",
     "routed_transport": "self_improve::native_route_acceptance::live_native_operator_routed_transport",
 }
 
@@ -38,7 +41,7 @@ def reachable_build_memory(probe, declared_build_mb):
     # fixture observation runs in the controller's bounded command scope.
     # Routed transport uses the production configured constructor with no Bash.
     # Issue/adoption exercise builder and repair paths with guarded VM builds.
-    roles={'issue':'builder','adoption':'builder','writer':'reviewer','adjudicator':'reviewer','routed_transport':'reviewer','file_edit':'file_only'}
+    roles={'issue':'builder','adoption':'builder','writer':'reviewer','adjudicator':'reviewer','routed_transport':'reviewer','file_edit':'file_only','claude_file_edit':'file_only'}
     if set(roles)!=set(TESTS) or probe not in roles:
         raise ValueError('probe capabilities must be explicitly classified')
     if roles[probe] in ('reviewer','file_only'):
@@ -99,6 +102,28 @@ def verify_test_inventory(binary, expected):
     if tests!=[expected+': test']:
         raise ValueError('selected binary lacks the exact ignored acceptance test; rebuild through cargo-managed.sh')
     return hashlib.sha256(result.stdout).hexdigest()
+
+
+COMPLETION_WRAPPER = """
+import json, os, subprocess, sys
+os.umask(0o077)
+path, nonce = sys.argv[1:3]
+result = subprocess.run(sys.argv[3:])
+with open(path, 'x') as stream:
+    json.dump({'nonce': nonce, 'exit_code': result.returncode}, stream)
+    stream.flush()
+    os.fsync(stream.fileno())
+raise SystemExit(result.returncode if result.returncode >= 0 else 1)
+"""
+
+def completion_status(service_status, receipt, nonce, transcript, test):
+    # systemd considers an explicitly stopped service successful. Only a
+    # wrapper that observed the test process finish can attest completion.
+    if service_status != 0 or receipt != {'nonce': nonce, 'exit_code': 0}:
+        return service_status or 1
+    completed = re.search(r'^test ' + re.escape(test) + r' \.\.\. ok$', transcript, re.MULTILINE)
+    summary = re.search(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', transcript, re.MULTILINE)
+    return 0 if completed and summary else 1
 
 
 def main():
@@ -190,20 +215,27 @@ subprocess.run(['/usr/bin/git', 'rev-parse', 'refs/remotes/origin/main'], check=
                 "AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE", "AUGMENTAGENT_AUTOPR_HISTORY_FILE",
                 "AUGMENTAGENT_PRUNE_TARGET_DIRS", "AUGMENTAGENT_BUILD_STORAGE_PARENT_LEASE"):
         command += ["-u", key]
-    command += [str(binary), "--exact", TESTS[args.probe], "--ignored", "--nocapture"]
+    completion_nonce = uuid.uuid4().hex
+    completion_path = root / "test-completion.json"
+    command += ["/usr/bin/python3", "-I", "-c", COMPLETION_WRAPPER, str(completion_path), completion_nonce, str(binary), "--exact", TESTS[args.probe], "--ignored", "--nocapture"]
     tested_binary_digest=binary_digest(binary)
     if tested_binary_digest!=inventory_binary_digest:
         parser.error("selected binary changed after inventory validation; retry with a stable managed artifact")
     print(f"Evidence: {root}", flush=True)
     with (root / "transcript.log").open("w") as log:
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        completion = json.loads(completion_path.read_text())
+    except (OSError, ValueError):
+        completion = None
+    exit_code = completion_status(result.returncode, completion, completion_nonce, (root / "transcript.log").read_text(errors="replace"), TESTS[args.probe])
     route_unchanged=routing.unchanged(route_evidence)
     (root / "operator-route-final.json").write_text(json.dumps({"unchanged":route_unchanged,"initial_sha256":hashlib.sha256((root/"operator-route.json").read_bytes()).hexdigest()}))
     if not route_unchanged:
         raise RuntimeError("operator routing changed during probe; result cannot establish one route")
-    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": tested_binary_digest, "test_inventory_sha256": inventory_digest, "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": result.returncode, "no_production_mutation": True, "resource_preflight": budget}, indent=2) + "\n")
-    print(f"Exit: {result.returncode}; transcript: {root / 'transcript.log'}", flush=True)
-    return result.returncode
+    (root / "result.json").write_text(json.dumps({"probe": args.probe, "test": TESTS[args.probe], "binary": str(binary), "binary_sha256": tested_binary_digest, "test_inventory_sha256": inventory_digest, "vm_policy": str(policy), "vm_policy_sha256": policy_digest, "unit": unit, "exit_code": exit_code, "service_exit_code": result.returncode, "test_completed": completion is not None, "no_production_mutation": True, "resource_preflight": budget}, indent=2) + "\n")
+    print(f"Exit: {exit_code}; transcript: {root / 'transcript.log'}", flush=True)
+    return exit_code
 
 
 if __name__ == "__main__":

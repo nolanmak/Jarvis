@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1712,
+    1713,
+    1714
+  ],
+  "status": "discord-basic-controls-implemented-not-deployed",
+  "parent_commit": "0bf59c2ce7cb5bf7fb387fe4d9d0f0a9947fa6d5",
+  "tests": {
+    "control_red": {
+      "log": "/tmp/autoship-1703-red-discord-controls.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Durable Discord owner control was unavailable."
+    },
+    "focused_green": {
+      "log": "/tmp/autoship-1703-green-discord-controls.log",
+      "exit": 0,
+      "passed": 173
+    },
+    "full_cli_binary_green": {
+      "log": "/tmp/autoship-1703-green-discord-controls-full.log",
+      "exit": 0,
+      "passed": 1466,
+      "failed": 0,
+      "ignored": 25
+    },
+    "compiled_cli_green": {
+      "log": "/tmp/autoship-1703-green-discord-controls-cli.log",
+      "exit": 0,
+      "passed": 43,
+      "failed": 0
+    },
+    "help_surface_red": {
+      "log": "/tmp/autoship-1703-green-discord-controls-surfaces.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Longer registry help crossed the delivery chunk boundary; the test incorrectly treated a second chunk as the next command response."
+    },
+    "discord_slack_green": {
+      "log": "/tmp/autoship-1703-green-discord-controls-surfaces-final.log",
+      "exit": 0,
+      "passed": 793,
+      "failed": 0,
+      "ignored": 1
+    }
+  },
+  "verified": [
+    "Discord status/pause/resume accept optional explicit workflow; use selects only a workflow bound to the authenticated owner/private conversation. Unknown or ambiguous workflows cannot authorize changes.",
+    "Control results and acknowledgement intents commit atomically with owner-control mutation or selection. Injected acknowledgement insert failure rolls back pause, audit, ordering frontier and selection.",
+    "Replays preserve original target/result across restart; changed message identity/payload and admission/control request identity collisions reject. A delayed implicit control rejects when the selection changes; replay never retargets it.",
+    "Message ordering plus shared owner-control revision checks prevent observed stale resume from overriding a newer pause. GitHub access is checked again, and resume uses shared native/provider/resource readiness.",
+    "Production gateway adapter with real temporary Git and scripted GitHub verifies duplicate pause, blocked resume, status, selection, revoked permission and immutable rejected replay after access returns.",
+    "Control acknowledgement recovery uses the shared queued-to-uncertain claim and exact bound receipt; uncertain sends are not blindly resent. Original admission reply serialization remains readable.",
+    "Shared status distinguishes merge and deployment; unknown deployment remains unknown. Paused owner state does not claim process teardown."
+  ],
+  "limits": [
+    "No production deployment, live Discord/native acceptance, hosted CI acceptance or soak completion. No issue closed and no improved throughput claim.",
+    "Native Codex/Claude PR coding follow-ups, safe-boundary session acquisition, scope revision/re-review and provider handoff remain unfinished.",
+    "Pause quiescence, resume wait/authority options, cancel/model/adopt/readopt and delivery controls remain open.",
+    "Automatic progress/deployment updates, unknown-send reconciliation, retry/backoff/dead-letter and destination rebind remain open. This change implements durable control acknowledgements only.",
+    "Ordering protects against observed stale or changed selection and immutable retries; it cannot infer unseen messages or promise globally ordered delivery."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-approval-discord/src/owner_commands.rs",
+      "sha256": "b1f96bd828889696e737e589fddb31494da462561323cf92f1d7a1b22e5ded96"
+    },
+    {
+      "path": "crates/augmentagent-channel-slack/tests/owner_commands_surface.rs",
+      "sha256": "b664f03c0cfdbf190cd87d989cb923e4a1c4538e6b64d5a27d39eee6f1e2bf48"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "b36b7198eb667a087210cb867e2135abcb0be8c3eeb62dbe17f37450eb90e2f2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_ingress.rs",
+      "sha256": "02936e7d0c2bc12f4b1befd5a44c2fb2327c14743ef39fe69209c118da046b74"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_owner_control.rs",
+      "sha256": "06ada4699546465b0aed5c880c5d5681fcfed78cb4c00033ade93a53159cc99c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_workflow.rs",
+      "sha256": "cca52c6ea2eabea34664005105da66a8d351f659dfa76c91fa5172664b87d0a0"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "23101134c8ef50579b10a096643fc09eedbcc5441dd73a3203341793f991e550"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_controls.rs",
+      "sha256": "e89e9ae69f5fdc66027f5333c957682caa537d9a15756583163ec83bf78101c5"
+    }
+  ]
+}

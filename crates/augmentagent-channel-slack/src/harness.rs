@@ -285,6 +285,15 @@ impl SlackTurnHandler for SlackConversationHarness {
                 info!(turn = %turn.turn_id, "slack harness: turn cancelled by the owner");
                 Ok(reply(CANCELLED_REPLY))
             }
+            // #1774 — a host signal (deploy restart) stopped the provider;
+            // the turn is already closed as interrupted.
+            Err(e) if matches!(
+                augmentagent_channel_core::reasoner::ReasonerError::find_in(&e),
+                Some(augmentagent_channel_core::reasoner::ReasonerError::Interrupted { .. })
+            ) => {
+                warn!(turn = %turn.turn_id, error = %e, "slack harness: turn interrupted by a host signal");
+                Ok(reply(INTERRUPTED_REPLY))
+            }
             Err(e) if e.to_string().contains("uncertain") => {
                 warn!(turn = %turn.turn_id, error = %e, "slack harness: conversation session is uncertain");
                 Ok(reply(SESSION_UNCERTAIN_REPLY))

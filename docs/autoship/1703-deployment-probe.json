@@ -1,0 +1,50 @@
+{
+  "implementation": "effective deployment inspection following b143545b and merge a9b840ae",
+  "production_observation": {
+    "status": "selection-missing",
+    "matches": false,
+    "worker_running": true,
+    "expected_active": true,
+    "live_verified": false
+  },
+  "production_changes": false,
+  "evidence_scope": [
+    "Private effective-configuration receipts capture dotenv-loaded values and omit credential variables.",
+    "PID, process birth and boot bind receipts to the serving processes.",
+    "Read-only inspection compares selected policy, mapped executable, provider executable hashes, state root, and model configuration for daemon and worker.",
+    "CLI readiness reports deployment separately from caller role/resource observations."
+  ],
+  "limitations": [
+    "No production activation or deployment is proven by these fixtures.",
+    "Configuration equality is not live guarded provider acceptance.",
+    "CLI initiation, Discord sessions/progress and unattended soak remain open."
+  ],
+  "evidence_logs": [
+    "/tmp/autoship-1703-red-deployment-consumers.log",
+    "/tmp/autoship-1703-green-deployment-consumers.log",
+    "/tmp/autoship-1703-red-deployment-gate.log",
+    "/tmp/autoship-1703-green-deployment-gate.log",
+    "/tmp/autoship-1703-green-deployment-all.log",
+    "/tmp/autoship-1703-green-deployment-readiness.log",
+    "/tmp/autoship-1703-green-deployment-inventory.log",
+    "/tmp/autoship-1703-green-deployment-final-cli.log",
+    "/tmp/autoship-1703-green-deployment-final.log"
+  ],
+  "verification": {
+    "python_process_fixture_scenarios": 13,
+    "ci_contract_tests_passed": 17,
+    "isolated_delegated_worker_gate": "red: reached Git; green: workflow-deployment:selection-missing, no workspace writes",
+    "broader_unit_run": {
+      "passed": 1401,
+      "ignored": 24,
+      "failed": 1,
+      "failure": "source inventory needed the new read-only configuration helper reference"
+    },
+    "compiled_cli_tests_passed": 22,
+    "secret_scan": "gitleaks 8.30.1: no leaks",
+    "corrected_inventory_assertion": "passed focused rerun",
+    "final_compiled_cli_tests_passed": 22,
+    "final_deployment_tests": "2 unit tests and 1 compiled-worker test passed"
+  },
+  "debug_cli_sha256": "cc5df2895725a5077a08ff14ef937e6ec3de57d531212b034decf92602933fd2"
+}

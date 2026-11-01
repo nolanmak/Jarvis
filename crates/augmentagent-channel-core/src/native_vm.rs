@@ -38,29 +38,21 @@ struct Provider {
     environment: Vec<String>,
 }
 
+#[path = "native_readiness.rs"]
+pub mod readiness;
+
 /// Declaration-only native authentication readiness. This performs no inference
 /// and never treats a router credential as native provider authentication.
 pub fn declared_native_auth(provider:&str)->Result<bool> {
-    let Some(path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(false)};
-    native_auth_at(Path::new(&path),provider,|key| {
-        if key=="CODEX_API_KEY" {crate::secret_loader::load_provider_key(key)}
-        else {std::env::var(key).ok()}
-    })
+    declared_auth(readiness::credentials(provider))
 }
+#[cfg(test)]
 fn native_auth_at(path:&Path,provider:&str,environment:impl Fn(&str)->Option<String>)->Result<bool> {
-    let policy:Policy=serde_json::from_slice(&private(path)?)?;
-    ensure!(policy.version==1,"invalid native VM policy version");
-    let Some(profile)=policy.providers.get(provider) else{return Ok(false)};
-    let key=match provider {"codex"=>"CODEX_API_KEY","claude"=>"ANTHROPIC_API_KEY",_=>return Ok(false)};
-    if profile.environment.iter().any(|name|name==key) && environment(key).is_some_and(|value|!value.trim().is_empty()) {return Ok(true);}
-    let Some(path)=&profile.auth_file else{return Ok(false)};
-    let value:serde_json::Value=serde_json::from_slice(&private(path)?)?;
-    let nonempty=|pointer:&str|value.pointer(pointer).and_then(|v|v.as_str()).is_some_and(|value|!value.trim().is_empty());
-    Ok(match provider {
-        "codex"=>nonempty("/OPENAI_API_KEY") || (nonempty("/tokens/access_token") && nonempty("/tokens/refresh_token") && nonempty("/tokens/id_token")),
-        "claude"=>nonempty("/claudeAiOauth/accessToken") && nonempty("/claudeAiOauth/refreshToken"),
-        _=>false,
-    })
+    declared_auth(readiness::credentials_at(Some(path),provider,chrono::Utc::now().timestamp_millis(),environment))
+}
+fn declared_auth(report:readiness::CredentialReport)->Result<bool> {
+    ensure!(!matches!(report.status,readiness::CredentialStatus::PolicyInvalid|readiness::CredentialStatus::CredentialInvalid),"invalid private credential declaration");
+    Ok(report.permits_attempt())
 }
 pub(crate) fn declared_router_auth(provider:&str)->Result<bool> {
     let Some(path)=std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY") else{return Ok(false)};
@@ -493,6 +485,10 @@ mod tests {
         assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap(),2);
         assert_eq!(prune_and_count(temp.path()).unwrap(),2);
         assert!(held.exists()); assert!(resumable.exists()); assert!(!interrupted.exists());
+        // Parallel tests can fork while this fixture lock is open. Explicitly
+        // release our flock before dropping it so a child's brief pre-exec FD
+        // inheritance cannot turn this immediate reclamation assertion busy.
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
         drop(lock);
         assert_eq!(prune_and_count(temp.path()).unwrap(),1);
         assert!(!held.exists()); assert!(resumable.exists());

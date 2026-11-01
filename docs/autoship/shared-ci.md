@@ -1,7 +1,7 @@
 # Shared GitHub and Autoship CI commands
 
 `scripts/ci-contract.json` owns validation command bodies. Every `run` step in
-all 19 PR-validation workflows invokes `scripts/ci-contract.py step --hosted`
+all 12 PR-validation workflows invokes `scripts/ci-contract.py step --hosted`
 with its command ID. GitHub still owns its matrix, conditions, setup actions,
 working directories and environment. The contract mechanically inventories that
 metadata and binds exact workflow file hashes; it is not a second hand-written

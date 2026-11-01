@@ -303,6 +303,18 @@ pub const INTERRUPTED_TURN_NOTICE: &str = "Jarvis restarted while working on thi
      part-way and was not run again (it may already have done some of the work). Send it again \
      if you still need it.";
 
+/// #1774 — the owner-facing text for a failed query turn. When a host signal
+/// (deploy restart) stopped the provider, the turn runner has already closed
+/// the turn as interrupted in the store; the owner gets the #1396 restart
+/// notice, not a "provider unavailable" error — the provider said nothing.
+pub fn failed_turn_reply(error: &impl std::fmt::Display, interrupted: bool) -> String {
+    if interrupted {
+        INTERRUPTED_TURN_NOTICE.to_string()
+    } else {
+        format!("wiki query failed: {error}")
+    }
+}
+
 /// Where to post the notice for an interrupted turn: its channel, and the
 /// message to reply to when the turn is a text turn (`<channel>:<message>`).
 /// Any other turn ID (speech) gets a channel-level notice. `None` only when
@@ -324,11 +336,35 @@ pub fn interrupted_turn_target(
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("discord broker ready as {}", ready.user.name);
+        if let Some(store)=self.state.store.as_ref() {
+            ctx.data.write().await.insert::<OwnerMirrorKey>(Arc::new(crate::imessage_owner::OwnerSurface::new(store.clone())));
+        }
         // Stash the bot's own user id so `message()` can tell the bot's prior
         // replies apart from the user's questions when building conversation
         // context for follow-ups.
         let bot_user_id = ready.user.id;
         let _ = self.state.bot_user_id.set(bot_user_id);
+        if self.state.query_handler.is_some() && self.state.allowed_user_id.is_some()
+            && !self.state.autoship_delivery_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let state = Arc::downgrade(&self.state);
+            let transport = crate::autoship::DiscordTransport(Arc::clone(&ctx.http));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let Some(state) = state.upgrade() else { break; };
+                    let handler = state.query_handler.clone();
+                    let owner = state.allowed_user_id;
+                    let bot = state.bot_user_id.get().copied();
+                    drop(state);
+                    let (Some(handler), Some(owner), Some(bot)) = (handler, owner, bot) else { break; };
+                    if crate::autoship::drain_queued(handler.as_ref(), &transport, bot.get(), owner.get()).await.is_err() {
+                        warn!("could not read queued autoship acknowledgements");
+                    }
+                }
+            });
+        }
         if let Some(bridge) = &self.state.voice_bridge {
             bridge.set_shard(ctx.shard.clone()).await;
         }
@@ -423,8 +459,40 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn message_update(&self,ctx:Context,_old:Option<Message>,new:Option<Message>,event:serenity::all::MessageUpdateEvent) {
+        let Some(store)=self.state.store.as_ref() else {return};
+        let surface=crate::imessage_owner::OwnerSurface::new(store.clone());
+        if !surface.active() {return}
+        let message=match new {
+            Some(message)=>message,
+            None=>match event.channel_id.message(&ctx.http,event.id).await {Ok(m)=>m,Err(_)=>return},
+        };
+        if self.state.bot_user_id.get()!=Some(&message.author.id) {return}
+        let (parent,peer)=match message.channel_id.to_channel(&ctx.http).await {
+            Ok(Channel::Guild(c))=>(c.parent_id.map(|p|p.get()),None),
+            Ok(Channel::Private(c))=>(None,Some(c.recipient.id.get())),
+            _=>(None,None),
+        };
+        if let Err(error)=surface.mirror_discord(&message,parent,peer) {warn!("owner mirror update failed: {error}");}
+    }
+
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot {
+            if self.state.bot_user_id.get()==Some(&msg.author.id) {
+                if let Some(store)=self.state.store.as_ref() {
+                    let surface=crate::imessage_owner::OwnerSurface::new(store.clone());
+                    if surface.active() {
+                        let (parent,peer)=match msg.channel_id.to_channel(&ctx.http).await {
+                            Ok(Channel::Guild(c))=>(c.parent_id.map(|p|p.get()),None),
+                            Ok(Channel::Private(c))=>(None,Some(c.recipient.id.get())),
+                            _=>(None,None),
+                        };
+                        if let Err(error)=surface.mirror_discord(&msg,parent,peer) {
+                            warn!("owner iMessage mirror failed: {error}");
+                        }
+                    }
+                }
+            }
             return;
         }
         let Some(handler) = &self.state.query_handler else {
@@ -447,6 +515,18 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
+        let autoship_context = crate::autoship::Context {
+            bot: self.state.bot_user_id.get().map(|id| id.get()).unwrap_or(0),
+            owner: self.state.allowed_user_id.map(|id| id.get()),
+            author: msg.author.id.get(), channel: msg.channel_id.get(), message: msg.id.get(),
+            guild: msg.guild_id.map(|id| id.get()),
+        };
+        match crate::autoship::dispatch(handler.as_ref(), &crate::autoship::DiscordTransport(Arc::clone(&ctx.http)),
+            &autoship_context, &user_text).await {
+            Ok(false) => {},
+            Ok(true) => return,
+            Err(_) => { warn!("autoship command or delivery failed; message withheld from ordinary chat"); return; }
+        }
         // #1496: consume phone setup before attachments, history, native turn
         // claims or model inference, even if the phone adapter is unavailable.
         let phone_context = crate::phone::PhoneCommandContext {
@@ -640,6 +720,7 @@ impl EventHandler for Handler {
         let allowed_user_id = self.state.allowed_user_id;
         let wiki_root = self.state.wiki_root.clone();
         let voice_bridge = self.state.voice_bridge.clone();
+        let store = self.state.store.clone();
 
         info!(%channel_id, %msg_id, "discord query received");
         tokio::spawn(async move {
@@ -763,7 +844,15 @@ impl EventHandler for Handler {
                     // the daemon log too so a failed turn can be diagnosed
                     // without correlating Discord and the store by hand.
                     warn!(%channel_id, %msg_id, error = %e, "discord query failed");
-                    let mut err_msg = format!("wiki query failed: {e}");
+                    let interrupted = store.as_deref().is_some_and(|store| {
+                        store
+                            .discord_turn_interrupted(&channel_id.to_string(), &audit_ctx.session_id)
+                            .unwrap_or_else(|error| {
+                                warn!("could not read interrupted-turn state: {error}");
+                                false
+                            })
+                    });
+                    let mut err_msg = failed_turn_reply(&e, interrupted);
                     if let Some(f) = &footer {
                         err_msg.push_str("\n\n");
                         err_msg.push_str(f);
@@ -790,9 +879,9 @@ impl EventHandler for Handler {
                     return;
                 }
                 let reply = self.voice_command_reply(&ctx, &command).await;
-                if let Err(error) = command.edit_response(&ctx.http,
-                    EditInteractionResponse::new().content(reply)).await {
-                    warn!("could not post Discord voice command result: {error}");
+                match command.edit_response(&ctx.http,EditInteractionResponse::new().content(reply)).await {
+                    Ok(posted)=>mirror_interaction_output(&ctx,posted,command.user.id,command.guild_id).await,
+                    Err(error)=>warn!("could not post Discord voice command result: {error}"),
                 }
             }
             Interaction::Component(comp) => {
@@ -819,7 +908,7 @@ impl EventHandler for Handler {
                                     let update = crate::owner_alerts::status_update(&alert, chrono::Utc::now().timestamp_millis(), &comp.message.embeds);
                                     if let Err(error) = comp.channel_id.edit_message(&ctx.http, comp.message.id, update).await {
                                         warn!(alert_id=%id, "owner alert card refresh failed: {error}");
-                                        let _ = comp.create_followup(&ctx.http, CreateInteractionResponseFollowup::new()
+                                        let _ = owner_component_followup(&ctx, &comp, CreateInteractionResponseFollowup::new()
                                             .ephemeral(true)
                                             .content("The alert card could not be refreshed. The control outcome above still applies; the card may show an older status.")).await;
                                     }
@@ -869,13 +958,9 @@ impl EventHandler for Handler {
                         let comp_clone = comp.clone();
                         tokio::spawn(async move {
                             let outcome = dispatch_component_approval(&comp_clone, allowed, handler).await;
-                            if let Err(e) = deliver_approval_outcome(
-                                &ctx_clone.http,
-                                &comp_clone,
-                                &outcome,
-                                &action_id,
-                            ).await {
-                                warn!(%action_id, "failed to deliver approval outcome: {e}");
+                            match deliver_approval_outcome(&ctx_clone.http,&comp_clone,&outcome,&action_id).await {
+                                Ok(posted)=>mirror_interaction_output(&ctx_clone,posted,comp_clone.user.id,comp_clone.guild_id).await,
+                                Err(e)=>warn!(%action_id,"failed to deliver approval outcome: {e}"),
                             }
                         });
                     }
@@ -915,8 +1000,7 @@ impl EventHandler for Handler {
                     Verb::Revise => {
                         // Opening a modal IS the response — fast enough.
                         let modal = revise_modal(&cid.action_id, None);
-                        if let Err(e) = comp
-                            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                        if let Err(e) = owner_component_response(&ctx, &comp, CreateInteractionResponse::Modal(modal))
                             .await
                         {
                             warn!("failed to open revise modal: {e}");
@@ -947,8 +1031,7 @@ impl EventHandler for Handler {
                             return;
                         }
                         let modal = fill_ask_modal(&cid.action_id, &needs);
-                        if let Err(e) = comp
-                            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                        if let Err(e) = owner_component_response(&ctx, &comp, CreateInteractionResponse::Modal(modal))
                             .await
                         {
                             warn!("failed to open fill-ask modal: {e}");
@@ -1158,9 +1241,7 @@ impl EventHandler for Handler {
                             // the select displaying "Custom…"; re-picking
                             // still works.
                             let modal = schedule_modal(&cid.action_id);
-                            if let Err(e) = comp
-                                .create_response(
-                                    &ctx.http,
+                            if let Err(e) = owner_component_response(&ctx, &comp,
                                     CreateInteractionResponse::Modal(modal),
                                 )
                                 .await
@@ -1417,9 +1498,7 @@ impl EventHandler for Handler {
                     return;
                 }
                 if !is_authorized(self.state.allowed_user_id, modal.user.id) {
-                    let _ = modal
-                        .create_response(
-                            &ctx.http,
+                    let _ = owner_modal_response(&ctx, &modal,
                             CreateInteractionResponse::Message(
                                 CreateInteractionResponseMessage::new()
                                     .content("Not authorized.")
@@ -1432,9 +1511,7 @@ impl EventHandler for Handler {
                 // Defer the modal submission immediately — the revise work
                 // (reasoner call, create_draft, delete_draft) takes well over
                 // 3s, which is Discord's interaction ack deadline.
-                if let Err(e) = modal
-                    .create_response(
-                        &ctx.http,
+                if let Err(e) = owner_modal_response(&ctx, &modal,
                         CreateInteractionResponse::Defer(
                             CreateInteractionResponseMessage::new().ephemeral(true),
                         ),
@@ -1520,9 +1597,7 @@ impl EventHandler for Handler {
                         let filled =
                             extract_fill_values(&modal.data.components, &needs);
                         if filled.is_empty() {
-                            let _ = modal
-                                .create_followup(
-                                    &ctx.http,
+                            let _ = owner_modal_followup(&ctx, &modal,
                                     CreateInteractionResponseFollowup::new()
                                         .content(
                                             "No values supplied — draft unchanged.",
@@ -1601,9 +1676,7 @@ impl EventHandler for Handler {
 
                     // Follow up on the deferred modal interaction.
                     let message = describe(&outcome);
-                    if let Err(e) = modal_clone
-                        .create_followup(
-                            &ctx_clone.http,
+                    if let Err(e) = owner_modal_followup(&ctx_clone, &modal_clone,
                             CreateInteractionResponseFollowup::new()
                                 .content(message)
                                 .ephemeral(true),
@@ -1739,14 +1812,55 @@ where
 
 const TYPING_REFRESH_SECS: u64 = 9;
 
+// Private interaction replies are absent from gateway messages and REST history.
+struct OwnerMirrorKey;
+impl serenity::prelude::TypeMapKey for OwnerMirrorKey {
+    type Value=Arc<crate::imessage_owner::OwnerSurface>;
+}
+async fn mirror_interaction_output(ctx:&Context,mut message:Message,actor:UserId,guild:Option<serenity::all::GuildId>) {
+    let Some(surface)=ctx.data.read().await.get::<OwnerMirrorKey>().cloned() else {return};
+    let Ok(Some(origin))=surface.store.imessage_owner_context() else {return};
+    if actor.get()!=origin.owner_id {return;}
+    message.guild_id=guild;
+    let parent=match message.channel_id.to_channel(&ctx.http).await {
+        Ok(serenity::all::Channel::Guild(c))=>c.parent_id.map(|p|p.get()),
+        Ok(serenity::all::Channel::Private(c)) if c.recipient.id==actor=>None,
+        _=>return,
+    };
+    if let Err(error)=surface.mirror_discord(&message,parent,guild.is_none().then_some(actor.get())) {
+        warn!("owner iMessage private reply mirror failed: {error}");
+    }
+}
+async fn owner_component_response(ctx:&Context,comp:&serenity::all::ComponentInteraction,response:CreateInteractionResponse)->Result<(),serenity::Error> {
+    let visible=matches!(&response,CreateInteractionResponse::Message(_));
+    comp.create_response(&ctx.http,response).await?;
+    if visible {if let Ok(message)=comp.get_response(&ctx.http).await {mirror_interaction_output(ctx,message,comp.user.id,comp.guild_id).await;}}
+    Ok(())
+}
+async fn owner_modal_response(ctx:&Context,modal:&serenity::all::ModalInteraction,response:CreateInteractionResponse)->Result<(),serenity::Error> {
+    let visible=matches!(&response,CreateInteractionResponse::Message(_));
+    modal.create_response(&ctx.http,response).await?;
+    if visible {if let Ok(message)=modal.get_response(&ctx.http).await {mirror_interaction_output(ctx,message,modal.user.id,modal.guild_id).await;}}
+    Ok(())
+}
+async fn owner_component_followup(ctx:&Context,comp:&serenity::all::ComponentInteraction,builder:CreateInteractionResponseFollowup)->Result<Message,serenity::Error> {
+    let message=comp.create_followup(&ctx.http,builder).await?;
+    mirror_interaction_output(ctx,message.clone(),comp.user.id,comp.guild_id).await;
+    Ok(message)
+}
+async fn owner_modal_followup(ctx:&Context,modal:&serenity::all::ModalInteraction,builder:CreateInteractionResponseFollowup)->Result<Message,serenity::Error> {
+    let message=modal.create_followup(&ctx.http,builder).await?;
+    mirror_interaction_output(ctx,message.clone(),modal.user.id,modal.guild_id).await;
+    Ok(message)
+}
+
 /// Immediate, within-budget ack for a component interaction (Approve / Skip)
 /// before we start slow work. Follow up with `followup` once the work is done.
 async fn defer_ephemeral(
     ctx: &Context,
     comp: &serenity::all::ComponentInteraction,
 ) -> Result<(), serenity::Error> {
-    comp.create_response(
-        &ctx.http,
+    owner_component_response(&ctx, &comp,
         CreateInteractionResponse::Defer(
             CreateInteractionResponseMessage::new().ephemeral(true),
         ),
@@ -1760,9 +1874,7 @@ async fn followup(
     comp: &serenity::all::ComponentInteraction,
     message: &str,
 ) {
-    if let Err(e) = comp
-        .create_followup(
-            &ctx.http,
+    if let Err(e) = owner_component_followup(&ctx, &comp,
             CreateInteractionResponseFollowup::new()
                 .content(message)
                 .ephemeral(true),
@@ -1787,21 +1899,26 @@ async fn followup_with_recovery(
     action_id: &str,
 ) {
     log_resolved(comp, outcome, action_id);
-    if let Err(e) = comp
-        .create_followup(&ctx.http, approval_followup(outcome, action_id))
+    if let Err(e) = owner_component_followup(&ctx, &comp, approval_followup(outcome, action_id))
         .await
     {
         warn!("failed to send followup: {e}");
     }
 }
 
+/// Longest manual-send message shown inline with the card title prefix.
+const MANUAL_SEND_INLINE_MAX: usize = 1700;
+
 fn approval_followup(
     outcome: &ApprovalActionOutcome,
     action_id: &str,
 ) -> CreateInteractionResponseFollowup {
+    // #1765 — the paste-ready text must outlive the click (owner copies it
+    // later, often from a phone), so it is a normal message, not ephemeral.
+    let persistent = matches!(outcome, ApprovalActionOutcome::ManualSendReady { .. });
     let mut fu = CreateInteractionResponseFollowup::new()
         .content(describe(outcome))
-        .ephemeral(true)
+        .ephemeral(!persistent)
         .allowed_mentions(serenity::all::CreateAllowedMentions::new());
     if let ApprovalActionOutcome::AlreadyResolved { status, detail } = outcome {
         if offers_recompose(status, detail.as_deref()) {
@@ -1841,12 +1958,22 @@ async fn deliver_approval_outcome(
     comp: &serenity::all::ComponentInteraction,
     outcome: &ApprovalActionOutcome,
     action_id: &str,
-) -> Result<(), serenity::Error> {
+) -> Result<Message, serenity::Error> {
     log_resolved(comp, outcome, action_id);
     let mut followup = approval_followup(outcome, action_id);
     // #1507 — name the card the click acted on, so a reply can't be mistaken
     // for another card's (the owner approved a DM thinking it was a signature).
-    if let Some(title) = card_title(&comp.message) {
+    // #1765 — paste-ready text must never be cut: what the owner pastes is
+    // matched against the stored text. Too long for one message → attach it.
+    let manual_text = match outcome {
+        ApprovalActionOutcome::ManualSendReady { text, .. } => Some(text.as_str()),
+        _ => None,
+    };
+    if let Some(text) = manual_text.filter(|_| describe(outcome).chars().count() > MANUAL_SEND_INLINE_MAX) {
+        followup = followup
+            .content("Approved — not sent automatically. The reply is too long to show inline; paste the attached text into WhatsApp. The card closes as sent once the archive shows your message.")
+            .add_file(serenity::all::CreateAttachment::bytes(text.as_bytes().to_vec(), "whatsapp-reply.txt"));
+    } else if let Some(title) = card_title(&comp.message) {
         // Embed titles are capped at 256 by Discord; keep well inside the
         // 2000-char message limit so naming the card can't fail the reply.
         let title: String = title.chars().take(200).collect();
@@ -1863,11 +1990,11 @@ async fn deliver_approval_outcome(
             .to_string();
         followup = followup.add_file(serenity::all::CreateAttachment::bytes(bytes, name));
     }
-    comp.create_followup(http, followup).await?;
+    let posted=comp.create_followup(http, followup).await?;
     if should_delete_source(outcome) {
         comp.channel_id.delete_message(http, comp.message.id).await?;
     }
-    Ok(())
+    Ok(posted)
 }
 
 /// The card's embed title (its subject line), if it has one.
@@ -1911,9 +2038,7 @@ async fn ack_ephemeral(
     comp: &serenity::all::ComponentInteraction,
     message: &str,
 ) {
-    if let Err(e) = comp
-        .create_response(
-            &ctx.http,
+    if let Err(e) = owner_component_response(&ctx, &comp,
             CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content(message)
@@ -1952,9 +2077,7 @@ async fn modal_followup(
     message: &str,
     action_id: &str,
 ) {
-    if let Err(e) = modal
-        .create_followup(
-            &ctx.http,
+    if let Err(e) = owner_modal_followup(&ctx, &modal,
             CreateInteractionResponseFollowup::new()
                 .content(message)
                 .ephemeral(true),
@@ -2090,6 +2213,7 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
             | ApprovalActionOutcome::CalendarCreated { .. }
             | ApprovalActionOutcome::CalendarResponded { .. }
             | ApprovalActionOutcome::DocumentSigned { .. }
+            | ApprovalActionOutcome::ManualSendReady { .. }
             | ApprovalActionOutcome::Skipped
             | ApprovalActionOutcome::Revised { .. }
             | ApprovalActionOutcome::AlreadyResolved { .. }
@@ -3104,6 +3228,18 @@ mod tests {
             );
         }
         assert_eq!(interrupted_turn_target(&interrupted("not-a-channel", "x")), None);
+    }
+
+    // #1774 — a turn a host signal stopped gets the restart notice, not a
+    // "provider unavailable" error; any other failure keeps the error text.
+    #[test]
+    fn a_failed_turn_closed_as_interrupted_gets_the_restart_notice() {
+        let error = anyhow::anyhow!("reasoner chain exhausted for FullAgentic: claude: attempted");
+        assert_eq!(failed_turn_reply(&error, true), INTERRUPTED_TURN_NOTICE);
+        assert_eq!(
+            failed_turn_reply(&error, false),
+            "wiki query failed: reasoner chain exhausted for FullAgentic: claude: attempted"
+        );
     }
     use augmentagent_docs::doc_command_for;
 

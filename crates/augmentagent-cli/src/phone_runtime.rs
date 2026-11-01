@@ -33,11 +33,12 @@ pub async fn start(
     if dry_run {
         return Ok(None);
     }
+    let inbound = inbound_overrides(&store)?;
     let Some(settings) = Settings::from_lookup(|key| {
         if key == "OPENAI_API_KEY" {
             augmentagent_channel_core::secret_loader::load_provider_key(key)
         } else {
-            std::env::var(key).ok()
+            inbound.get(key).cloned().or_else(|| std::env::var(key).ok())
         }
     })? else {
         return Ok(None);
@@ -59,6 +60,16 @@ pub async fn start(
         router,
     });
     Ok(Some((endpoint, runtime)))
+}
+
+fn inbound_overrides(store: &Store) -> Result<std::collections::HashMap<&'static str, String>> {
+    let mut values = std::collections::HashMap::new();
+    for key in ["AUGMENTAGENT_PHONE_INBOUND_PIN", "AUGMENTAGENT_PHONE_INBOUND_PLATFORM", "AUGMENTAGENT_PHONE_INBOUND_ACCOUNT"] {
+        if let Some(value) = store.get_config(key)? {
+            values.insert(key, value);
+        }
+    }
+    Ok(values)
 }
 /// Cleanup remains available when normal phone startup is disabled or fails.
 pub fn cleanup_when_unavailable(
@@ -195,6 +206,17 @@ pub fn attach_slack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inbound_cli_settings_are_loaded_without_overriding_provider_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        store.set_config("AUGMENTAGENT_PHONE_INBOUND_PIN", "4831").unwrap();
+        store.set_config("AUGMENTAGENT_PHONE_INBOUND_PLATFORM", "discord").unwrap();
+        store.set_config("TWILIO_AUTH_TOKEN", "ignored-fixture-token").unwrap();
+        let values = inbound_overrides(&store).unwrap();
+        assert_eq!(values.get("AUGMENTAGENT_PHONE_INBOUND_PIN").map(String::as_str), Some("4831"));
+        assert!(!values.contains_key("TWILIO_AUTH_TOKEN"));
+    }
     #[test]
     fn unavailable_phone_marks_uncertain_calls_even_without_credentials_but_dry_run_does_not() {
         let dir = tempfile::tempdir().unwrap();
@@ -667,6 +689,7 @@ pub(crate) async fn native_text_turn(
         audit.session_id.clone(),
     )?;
     let cwd = wiki.to_string_lossy();
+    let cancel=query.turn_cancellation(&audit.session_id);
     let outcome = run_surface_turn(
         store,
         SurfaceTurnRequest {
@@ -688,7 +711,7 @@ pub(crate) async fn native_text_turn(
             );
             Ok(selected)
         },
-        None,
+        cancel.as_ref(),
         |prompt| async move {
             let _grant = tools.grant(&origin.owner, &origin.conversation, None)?;
             anyhow::ensure!(

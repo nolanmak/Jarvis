@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issues": [
+    1714,
+    1713
+  ],
+  "status": "uncertain-discord-command-acknowledgement-recovery-connected-not-deployed",
+  "parent_commit": "f962dd5cef794c5b451cd5abc17407da1f31cf24",
+  "tests": {
+    "red": {
+      "log": "/tmp/autoship-1703-red-ack-reconcile.log",
+      "cargo_exit": 101,
+      "failed": 1,
+      "assertion": "Lost admission/control acknowledgements are invisible to recovery."
+    },
+    "full_cli_green": {
+      "log": "/tmp/autoship-1703-green-ack-reconcile-cli.log",
+      "exit": 0,
+      "passed": 1477,
+      "failed": 0,
+      "ignored": 25,
+      "compiled_cli_passed": 43
+    },
+    "gateway_http_green": {
+      "log": "/tmp/autoship-1703-green-ack-reconcile-http.log",
+      "exit": 0,
+      "passed": 8,
+      "failed": 0
+    }
+  },
+  "verified": [
+    "Admission and owner-control acknowledgements are recovered from durable uncertain state without reapplying their commands. Restart regression preserves the single owner-control revision.",
+    "Recovery loads only the configured bot/owner principal and validates serialized origin, request ID, response ID and admission/control namespace uniqueness. Legacy stores without the newer control table remain readable.",
+    "The production reconnect worker verifies live private-recipient authority before history and before recording an exact message receipt.",
+    "Command acknowledgements must end with their original immutable request marker. Both acknowledgement and progress recovery share the same bounded exact-message history reader, requiring unique configured-bot author, exact content and bound destination.",
+    "Production gateway-adapter regression injects a lost pause acknowledgement, confirms it through history, then verifies repeated recovery adds no sends and leaves owner-control revision unchanged."
+  ],
+  "limits": [
+    "History is limited to 100 recent messages and a 15-second request deadline. Missing, altered, ambiguous or unavailable evidence leaves the attempt uncertain.",
+    "Explicit message resolution, owner-authorized duplicate-risk resend, typed backoff/degraded/dead-letter handling and delivery rebind remain open.",
+    "Native PR sessions, full lifecycle controls, operational routing, editable status, verified deployment outcomes, live acceptance, rollout and required soaks remain open. No child issue closed."
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-approval-discord/src/autoship.rs",
+      "sha256": "afe4a2a854ae2c8d6338e7fca04ee33545d08711207dd725fedaa12ba2312591"
+    },
+    {
+      "path": "crates/augmentagent-approval-discord/src/lib.rs",
+      "sha256": "4b865694d20e7b68d431a1c1cb828df055ddf7319326dee30505f9c7f52cb2c2"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_command.rs",
+      "sha256": "a59276806744203c137657cdc6437611e87998ccad8ca73ab6ccc4a77049ed68"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/autoship_discord_ingress.rs",
+      "sha256": "bd4e9024f88883aef83ede8dbda95afcaa31ca36a5fd7cb04c51ccc7e8a14c80"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/main.rs",
+      "sha256": "639a52801f07acf974fc775c19a1e455d663f2e00e5673050bb821c85402251c"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/self_improve_targeted.rs",
+      "sha256": "97c896ee4ebb4880890e7dba7355b39fc3f0445848064d618283763df75c3ac8"
+    }
+  ]
+}

@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 import sys
 
-from whatsapp_sync import sync
+from whatsapp_sync import source_staleness, sync
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = Path.home() / "Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"
@@ -68,6 +68,11 @@ def run(args):
             return
         result = sync(args.db, args.out, args.out / ".sync_state.json")
         print(f"synced {result['messages']} messages across {result['conversations']} conversations")
+        stale = source_staleness(args.db)
+        if stale:
+            print(f"WARNING: WhatsApp Desktop store has not been written for "
+                  f"{stale / 3600:.0f}h — open WhatsApp Desktop so it can sync, "
+                  f"or this export stays frozen", file=sys.stderr)
         # Retry transport even when there are no new messages since the last export.
         if args.remote:
             mirror(args.out, args.remote)

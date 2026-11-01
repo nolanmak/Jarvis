@@ -4,6 +4,12 @@ import importlib.util
 from pathlib import Path
 import unittest
 import tempfile
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
 
 spec=importlib.util.spec_from_file_location('native_probe',Path(__file__).with_name('autoship-native-acceptance-probe.py'))
 probe=importlib.util.module_from_spec(spec)
@@ -13,6 +19,54 @@ MIB=1024**2
 
 
 class Tests(unittest.TestCase):
+    def test_claude_guarded_edit_requires_its_own_ignored_test_and_file_only_budget(self):
+        expected='self_improve::native_route_acceptance::live_native_guarded_claude_file_edit'
+        self.assertEqual(probe.TESTS.get('claude_file_edit'),expected,
+                         'Claude must execute its guarded native edit test, not the Codex test or transport helper')
+        with tempfile.TemporaryDirectory() as temporary:
+            binary=Path(temporary)/'compiled-inventory-fixture'
+            binary.write_text('#!/usr/bin/python3\nimport sys\nassert sys.argv[1:]=='+repr(['--list','--ignored','--exact',expected])+"\nprint(sys.argv[-1]+': test')\nprint('1 test, 0 benchmarks')\n")
+            binary.chmod(0o700)
+            self.assertEqual(len(probe.verify_test_inventory(binary,probe.TESTS['claude_file_edit'])),64)
+            with self.assertRaises(ValueError):probe.verify_test_inventory(binary,probe.TESTS['file_edit'])
+        self.assertEqual(probe.reachable_build_memory('claude_file_edit',4096),0)
+        budget=probe.resource_budget(1024,probe.reachable_build_memory('claude_file_edit',4096),3*GIB)
+        self.assertEqual(budget['run_memory_bytes'],2*GIB)
+        self.assertEqual(budget['final_admission'],'RunScope')
+
+    def test_service_stop_without_bound_test_completion_is_not_success(self):
+        test=probe.TESTS['adoption'];nonce='fixture-generation'
+        passed=f"test {test} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"
+        receipt={'nonce':nonce,'exit_code':0}
+        for value,transcript in [(None,'running 1 test\n'),(None,passed),({'nonce':'old','exit_code':0},passed),(receipt,'running 1 test\n'),(receipt,passed.replace('1 passed','0 passed'))]:
+            with self.subTest(receipt=value,transcript=transcript):
+                self.assertNotEqual(probe.completion_status(0,value,nonce,transcript,test),0)
+        self.assertEqual(probe.completion_status(0,receipt,nonce,passed,test),0)
+        self.assertNotEqual(probe.completion_status(1,receipt,nonce,passed,test),0)
+        self.assertNotEqual(probe.completion_status(0,{'nonce':nonce,'exit_code':1},nonce,passed,test),0)
+
+    def test_actual_wrapper_records_completion_but_not_interrupted_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);test=probe.TESTS['adoption'];nonce='actual-wrapper'
+            for interrupted in (False,True):
+                receipt=root/('stopped.json' if interrupted else 'completed.json')
+                marker=root/'started'
+                child="import pathlib,time;pathlib.Path("+repr(str(marker))+").touch();time.sleep(30)" if interrupted else "print("+repr(f"test {test} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s")+")"
+                process=subprocess.Popen([sys.executable,'-I','-c',probe.COMPLETION_WRAPPER,str(receipt),nonce,sys.executable,'-c',child],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+                try:
+                    if interrupted:
+                        deadline=time.monotonic()+5
+                        while not marker.exists() and time.monotonic()<deadline:time.sleep(.01)
+                        self.assertTrue(marker.exists(),'child must actually start before interruption')
+                        os.killpg(process.pid,signal.SIGTERM)
+                    stdout,stderr=process.communicate(timeout=5)
+                    value=json.loads(receipt.read_text()) if receipt.exists() else None
+                    self.assertEqual(probe.completion_status(0,value,nonce,stdout,test)==0,not interrupted,stderr)
+                    self.assertEqual(receipt.exists(),not interrupted)
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid,signal.SIGKILL);process.communicate()
+
     def test_explicit_deferred_mode_preserves_full_limits_and_requires_controller_floor(self):
         available=6300*MIB
         with self.assertRaises(ValueError):probe.resource_budget(1024,4096,available)

@@ -204,11 +204,11 @@ pub fn canonical_keys() -> Vec<String> {
     parse_dotenv_keys(&blob)
 }
 
-/// `true` ⇒ the key name contains any of `SECRET_KEYWORDS` (case-insensitive).
+/// Secret keywords and PIN settings are masked case-insensitively.
 /// Public so unit tests can pin the rule and the dashboard can mirror it.
 pub fn is_secret(key: &str) -> bool {
     let up = key.to_ascii_uppercase();
-    SECRET_KEYWORDS.iter().any(|k| up.contains(k))
+    up.ends_with("_PIN") || SECRET_KEYWORDS.iter().any(|k| up.contains(k))
 }
 
 /// Fixed mask. Five stars matches the dashboard's existing redaction.
@@ -440,6 +440,8 @@ ALSO_KEY=value
     fn secret_detection_matches_spec() {
         // KEY / TOKEN / SECRET / PASSWORD / PASS / AUTH (case-insensitive).
         assert!(is_secret("GROQ_API_KEY"));
+        assert!(is_secret("AUGMENTAGENT_PHONE_INBOUND_PIN"));
+        assert_eq!(display_value("AUGMENTAGENT_PHONE_INBOUND_PIN", "4831"), "*****");
         assert!(is_secret("DISCORD_BOT_TOKEN"));
         assert!(is_secret("GITHUB_WEBHOOK_SECRET"));
         assert!(is_secret("DB_PASSWORD"));

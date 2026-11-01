@@ -52,6 +52,12 @@ pub fn describe(outcome: &ApprovalActionOutcome) -> String {
             format!("RSVP sent: {response} for \"{summary}\" on {account}.")
         }
         ApprovalActionOutcome::DocumentSigned { receipt, .. } => format!("Document signed. {receipt}"),
+        ApprovalActionOutcome::ManualSendReady { text, link } => {
+            let open = link.as_deref().map(|l| format!("\nOpen the chat: {l}")).unwrap_or_default();
+            format!(
+                "Approved — not sent automatically. Paste this into WhatsApp:\n```\n{text}\n```{open}\nThe card closes as sent once the archive shows your message."
+            )
+        }
         ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
         ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
         ApprovalActionOutcome::Scheduled { local, .. } => {

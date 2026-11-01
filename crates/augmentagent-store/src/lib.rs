@@ -6,6 +6,8 @@
 
 // #1289 — durable approval-card pointers per surface.
 pub mod email_guards;
+pub mod conversation_context;
+pub mod draft_context_receipts;
 pub mod approval_cards;
 pub mod approval_history;
 pub mod triage_outcomes;
@@ -14,6 +16,7 @@ pub mod alert_schedule;
 pub mod daemon_report;
 pub mod delivery;
 pub mod imessage;
+pub mod imessage_owner;
 pub mod models;
 pub mod linkedin_archive;
 pub mod notes;
@@ -57,7 +60,8 @@ pub use models::{
 pub use store::{
     ActionCodeModeFields, ActionWithEmail, BodyCompaction, DiscordConversation, InterruptedDiscordTurn,
     JournalSyncCursor, LoopFinding, LoopOccurrence,
-    NativeConversation, PendingActionRow, PendingNudge, RetryableReply, RevisionRecord, Store,
+    NativeConversation, PendingActionRow, whatsapp_default_coverable, MANUAL_SEND_PENDING,
+    MANUAL_SEND_UNCONFIRMED, PendingNudge, RetryableReply, RevisionRecord, Store,
     StoreError, StoreResult, SurfaceTurnResolution, SurfaceTurnState, SurfaceTurnStatus,
     NUDGE_INTERVAL_MS,
 };

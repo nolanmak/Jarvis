@@ -452,6 +452,7 @@ dependencies = [
  "augmentagent-phone",
  "augmentagent-store",
  "augmentagent-wiki",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "futures",
@@ -971,6 +972,8 @@ name = "augmentagent-channel-whatsapp-history"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
  "augmentagent-channel-core",
  "augmentagent-channel-imessage",
  "augmentagent-mcp-memory",
@@ -1048,6 +1051,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "serenity",
  "sha1",
  "sha2 0.10.9",

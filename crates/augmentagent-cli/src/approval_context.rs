@@ -153,6 +153,7 @@ impl ReplyApprover {
             ApprovalActionOutcome::CalendarResponded { response, .. } => {
                 ("completed", format!("rsvp={response}"))
             }
+            ApprovalActionOutcome::ManualSendReady { .. } => ("completed", "manual send pending".into()),
             ApprovalActionOutcome::Skipped => ("skipped", String::new()),
             ApprovalActionOutcome::Revised { .. } => ("revised", String::new()),
             ApprovalActionOutcome::Scheduled { at_ms, .. } => {

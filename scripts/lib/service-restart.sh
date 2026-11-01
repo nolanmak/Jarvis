@@ -112,7 +112,8 @@ agent_pid() {
 }
 
 agent_is_running() {
-  launchctl print "gui/$(id -u)/$1" 2>/dev/null | grep -q $'^\tstate = running$'
+  # Consume the whole report: grep -q can SIGPIPE launchctl under pipefail.
+  launchctl print "gui/$(id -u)/$1" 2>/dev/null | grep $'^\tstate = running$' >/dev/null
 }
 
 restart_agent() {

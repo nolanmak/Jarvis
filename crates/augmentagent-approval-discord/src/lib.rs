@@ -9,6 +9,8 @@
 //! still `pending`, across daemon restarts, unlimited timeouts.
 
 pub mod attachments;
+pub mod imessage_owner;
+pub mod imessage_owner_control;
 pub mod compute_inputs;
 pub mod conversation;
 pub mod interaction;
@@ -25,6 +27,7 @@ pub mod owner_alerts;
 // #1292 — the shared owner-command registry (Discord triggers, Slack mapping).
 pub mod owner_commands;
 pub mod phone;
+pub mod autoship;
 pub mod phone_delivery;
 mod process_loops;
 // #994 — register (casing) audit for outbound drafts. Public: the delivery
@@ -63,7 +66,7 @@ pub use layout::{scheduled_notice_message, schedule_modal, SCHEDULE_CUSTOM_VALUE
 pub use layout::reminder_buttons;
 pub use layout::auto_rsvp_notice_message;
 pub use loops::{
-    handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
+    handle_loop_command_with_model, handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
     validate_tz, LoopCommandParser, LoopPoster, LoopRunner, LoopScheduler, ParsedLoop,
 };
@@ -127,6 +130,10 @@ pub enum ApprovalActionOutcome {
     },
     /// A signed PDF was published, or its immutable receipt recovered.
     DocumentSigned { receipt: String, already_existed: bool, output: Option<(std::path::PathBuf, String)> },
+    /// #1765 — approved on a platform with no sender (WhatsApp archive cards):
+    /// nothing was sent. `text` is what the owner pastes; `link` opens the
+    /// chat when one is addressable. The archive later confirms the send.
+    ManualSendReady { text: String, link: Option<String> },
     /// Skip succeeded — draft deleted, action marked Rejected.
     Skipped,
     /// Revise succeeded — a new draft was created and should be re-posted as
@@ -169,6 +176,13 @@ pub enum ApprovalError {
 /// Discord API round-trip finishes, not when the user clicks a button.
 #[async_trait]
 pub trait ApprovalBroker: Send + Sync {
+    /// Dynamic surfaces must not count a disabled transport as successful delivery.
+    fn is_available(&self)->bool {true}
+    /// A mirror may use Discord's native output IDs for generic notifications.
+    fn can_post_notices(&self)->bool {true}
+    async fn post_imessage_owner_health(&self,id:i64,status:&str)->Result<(),ApprovalError> {
+        self.post_digest("iMessage delivery needs attention",&imessage_owner::health_description(id,status)).await
+    }
     async fn post_owner_alert(&self, _notice: &augmentagent_store::alert_schedule::AlertNotice)
         -> Result<String,ApprovalError> {
         Err(ApprovalError::Discord("owner alerts are not supported by this broker".into()))
@@ -437,6 +451,25 @@ pub trait ApprovalActionHandler: Send + Sync {
 /// there (#132 / #201).
 #[async_trait]
 pub trait QueryHandler: Send + Sync {
+    fn turn_cancellation(&self,_session_id:&str)->Option<tokio_util::sync::CancellationToken> {None}
+    /// A deterministic command from an already authenticated owner surface.
+    async fn owner_command(&self,ctx:&AuditCtx,text:&str)->Option<String> {
+        if let Some(channel)=ctx.channel_id {self.model_command_in_guild(ctx.guild_id,channel.get(),text).await} else {None}
+    }
+    fn autoship_bound(&self, _context: &autoship::Context) -> anyhow::Result<bool> { Ok(false) }
+    /// Called only after the gateway verifies the configured owner's private DM.
+    /// A durable acknowledgement must be claimed before returning its nonce.
+    async fn autoship_command(&self, _context: &autoship::Context, _text: &str) -> anyhow::Result<Option<autoship::Reply>> {
+        Ok(Some(autoship::Reply { content: "Autoship is unavailable in this connection.".into(), nonce: None }))
+    }
+    fn autoship_acknowledged(&self, _context: &autoship::Context, _message: u64) -> anyhow::Result<()> { Ok(()) }
+    fn autoship_pending(&self, _bot: u64, _owner: u64) -> anyhow::Result<Vec<autoship::Context>> { Ok(Vec::new()) }
+    fn autoship_claim_ack(&self, _context: &autoship::Context) -> anyhow::Result<Option<autoship::Reply>> { Ok(None) }
+    fn autoship_ack_uncertain(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::UncertainAcknowledgement>> {Ok(Vec::new())}
+    fn autoship_progress_uncertain(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::UncertainProgress>> {Ok(Vec::new())}
+    fn autoship_progress_pending(&self,_bot:u64,_owner:u64)->anyhow::Result<Vec<autoship::ProgressDelivery>> {Ok(Vec::new())}
+    fn autoship_progress_claim(&self,_delivery:&autoship::ProgressDelivery)->anyhow::Result<Option<autoship::Reply>> {Ok(None)}
+    fn autoship_progress_confirm(&self,_delivery:&autoship::ProgressDelivery,_message:u64)->anyhow::Result<()> {Ok(())}
     async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
 
     /// Attach the private voice-tool endpoint after the Discord gateway has
@@ -497,6 +530,7 @@ pub trait QueryHandler: Send + Sync {
 /// real notifier from these bits, since this crate cannot depend on
 /// `augmentagent-channel-core`'s `AuditNotifier` trait without a
 /// workspace cycle.
+#[derive(Clone)]
 pub struct AuditCtx {
     pub session_id: String,
     pub guild_id: Option<u64>,
@@ -519,3 +553,5 @@ impl AuditCtx {
         }
     }
 }
+
+pub use process_loops::handle as handle_process_command;

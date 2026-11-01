@@ -242,6 +242,9 @@ pub static PRODUCERS: &[Producer] = &[
     // -- Approval surfaces (#1289) -------------------------------------------
     act(p("approval_broker", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 4, BROKER, "Discord approval broker: cards, flag notices, digests")),
     act(p("owner_alert_discord", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 1, BROKER, "critical owner alerts with acknowledgment controls")),
+    p("imessage_owner_health_discord", "crates/augmentagent-approval-discord/src/broker.rs", "send_message(&", 1, Route::DiscordOnly("delivery-health fallback is excluded from the failing iMessage mirror"), "owner iMessage delivery failure fallback"),
+    p("imessage_owner_health_layout", "crates/augmentagent-approval-discord/src/imessage_owner.rs", "CreateMessage::new(", 1, Route::DiscordOnly("delivery-health footer prevents a recursive native failure notice"), "owner iMessage delivery-health message"),
+    p("imessage_owner_health_default", "crates/augmentagent-approval-discord/src/lib.rs", ".post_digest(", 1, BROKER, "delivery-health fallback on configured notice surfaces, excluding the iMessage mirror"),
     act(p("signing_approval", "crates/augmentagent-cli/src/document_signing.rs", "send_message(&", 1, BROKER, "`sign`: the document signing approval card with the unsigned review PDF")),
     act(p("owner_alert_scheduler", "crates/augmentagent-approval-discord/src/owner_alerts.rs", ".post_owner_alert(", 1, BROKER, "persistent owner alert escalation")),
     act(p("owner_alert_route", "crates/augmentagent-approval-discord/src/sync.rs", ".post_owner_alert(", 1, BROKER, "Discord-only route for owner alert controls")),
@@ -286,6 +289,8 @@ pub static PRODUCERS: &[Producer] = &[
     p("discord_replies", "crates/augmentagent-approval-discord/src/event_handler.rs", "CreateMessage::new(", 8, REPLY, "query answers, command replies, interrupted-turn notices"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "send_message(&", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
     p("phone_transcripts", "crates/augmentagent-approval-discord/src/phone_delivery.rs", "CreateMessage::new(", 1, REPLY, "phone transcripts restricted to the originating owner conversation"),
+    p("autoship_replies", "crates/augmentagent-approval-discord/src/autoship.rs", "send_message(&", 1, REPLY, "autoship acknowledgements restricted to the verified originating owner DM"),
+    p("autoship_replies", "crates/augmentagent-approval-discord/src/autoship.rs", "CreateMessage::new(", 1, REPLY, "autoship acknowledgements restricted to the verified originating owner DM"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "send_message(&", 6, REPLY, "Discord voice transcripts in the voice channel"),
     p("voice_bridge", "crates/augmentagent-approval-discord/src/voice_bridge.rs", "CreateMessage::new(", 7, REPLY, "Discord voice transcripts in the voice channel"),
     p("cli_discord_posts", CLI, "send_message(&", 7, Route::DiscordOnly("explicit `--post` Discord commands (compose/propose cards, wiki ask --post) and Discord loop output"), "one-shot Discord posts"),

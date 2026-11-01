@@ -308,10 +308,30 @@ the card, then the send interval once you approve.
 
 ### Limits
 
-- 1:1 iMessage conversations, text only. SMS and RCS conversations are
+- iMessage conversations, text only. SMS and RCS conversations are
   refused. Group chats need a `chat_guid` in the bundle index (written by
   this exporter, not by older jobs) and their own `allow-outbound` entry;
-  cards are never drafted for groups.
+  a group without a `chat_guid` still gets a card, but Approve is refused.
+  Compose is 1:1 only.
+
+### Group chats (#1738)
+
+Groups get reply cards like a 1:1 conversation, with a higher bar. They
+follow the same owner defaults as 1:1 chats (`contact-defaults`), so with
+inbound defaults on, every group drafts with no per-group step; without
+defaults, `allow-inbound <chat identifier>` opts one group in. Triage drafts only when the
+newest message addresses you (by name, a direct question, or an answer to
+something you said) or asks something that is clearly yours to answer.
+General chatter is ingested and skipped, not flagged. The card's subject is
+`iMessage group: <title>` and its To field lists every member. Approve sends
+to the group's `chat_guid`, never to a member's handle.
+
+`deny-inbound <chat identifier>` / `deny-outbound <chat identifier>` exclude
+one group even while the defaults are on. A member's own allowlist entry or
+denial does not apply to the group. The chat identifier is the key in
+`conversations/index.json` (a `chat…` id or a 32-character hex id).
+Teammate coverage (#1700) applies to group cards: a rostered teammate
+answering the asker in the group retires the card.
 - The Mac must be logged in and awake, with Messages signed in.
 - No attachments, tapbacks, edits or unsend. BlueBubbles and Messages'
   private API are not used; System Integrity Protection stays enabled.
@@ -342,7 +362,7 @@ names what to do:
 - the conversation must be on `allow-outbound`, and
   `AUGMENTAGENT_IMESSAGE_SEND_ENABLED=1` must be set.
 
-The owner can opt all existing and future one-to-one iMessage conversations into
+The owner can opt all existing and future iMessage conversations, groups included, into
 incoming reply drafting and outgoing approval cards with:
 
 ```sh
@@ -354,7 +374,7 @@ selected by the owner. `deny-inbound <handle>` and `deny-outbound <handle>` are
 persistent exceptions, even while the defaults are on; `allow-inbound` and
 `allow-outbound` remove the corresponding exception. `imessage allowlist` shows
 the defaults and exceptions. Set both flags to `false` to return to explicit
-allowlists. Groups still require explicit permission; compose remains 1:1 only.
+allowlists. Compose remains 1:1 only.
 Neither this policy nor composing bypasses Approve or the global send switch.
 The agent cannot change this policy from an ask session.
 

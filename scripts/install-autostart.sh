@@ -44,6 +44,8 @@ die() { printf '\033[1;31m[install-autostart ERR]\033[0m %s\n' "$*" >&2; exit 1;
 [ -x "$REPO_ROOT/target/release/augmentagent" ] \
   || die "release binary missing — run: cargo build --release -p augmentagent-cli"
 
+python3 "$REPO_ROOT/scripts/secure-release-executables.py" "$REPO_ROOT/target/release" || die "release artifact validation failed"
+
 python3 "$REPO_ROOT/scripts/pdf-runtime.py" || die "PDF runtime provisioning failed"
 
 install_macos() {

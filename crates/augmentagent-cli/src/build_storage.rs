@@ -1021,7 +1021,7 @@ fn reconcile_for(
     context: ReconcileContext<'_>, free_bytes: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<()> {
     let pressure = |required| crate::disk_pressure::reclaim(repo, required, context.held, false,
-        context.claims, free_bytes);
+        context.claims, free_bytes, Some(context.paths));
     reconcile_with_pressure(repo, target, state, floor_gb, cap_mb,
         ReconcileContext { ..context }, free_bytes, &pressure)
 }
@@ -1086,7 +1086,11 @@ fn reconcile_with_pressure(
     let remaining = crate::disk::disk_bytes(target);
     // Retain the root's small Cargo/ownership records even for an explicit
     // zero cap. Larger unprunable files must not silently defeat the budget.
-    let over_cap = !checkout_target && remaining > cap.saturating_add(1024 * 1024);
+    let available_after = readings.iter().zip(&reservations)
+        .map(|((_, free), reserved)| free.saturating_sub(*reserved)).min().unwrap_or(0);
+    let effective_cap = cap_for_free_space(remaining,
+        cap_mb.saturating_mul(1024 * 1024), available_after, reserve);
+    let over_cap = !checkout_target && remaining > effective_cap.saturating_add(1024 * 1024);
     let report = serde_json::json!({"at": chrono::Utc::now(), "target": target,
             "before_free_bytes": free, "after_free_bytes": after,
             "required_free_bytes": reserve, "admitted": refusal.is_none() && !over_cap && !reserved_busy,
@@ -1108,9 +1112,185 @@ fn reconcile_with_pressure(
     Ok(())
 }
 
+/// #1754 D1: `disk build` hands Cargo its leased target through
+/// `CARGO_TARGET_DIR`, which a `--target-dir` in the child argv silently
+/// overrides: the lease would cover one directory while Cargo writes another,
+/// unregistered one. Returns the offending argument.
+pub fn child_target_override(command: &[String]) -> Option<String> {
+    // Cargo's own arguments end at `--`; what follows goes to the program it runs.
+    command.iter().skip(1).take_while(|a| a.as_str() != "--")
+        .find(|a| a.as_str() == "--target-dir" || a.starts_with("--target-dir="))
+        .cloned()
+}
+
+/// A Cargo cache that housekeeping cannot see (#1754).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnmanagedCache {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub idle_days: Option<f64>,
+}
+
+/// Cargo caches beside a managed build parent that nothing owns (#1754 D3).
+///
+/// Only volumes that already hold a managed build parent are scanned (the
+/// owner's declared build volumes), so caches of other projects elsewhere are
+/// never reported. A child is listed when it is a real directory with a Cargo
+/// layout that no registry record, ownership marker, managed parent, or
+/// housekeeping root (`known`) accounts for. Nothing here deletes or adopts.
+pub fn unmanaged_caches(state: &Path, known: &[PathBuf], measure: bool, now: SystemTime) -> Vec<UnmanagedCache> {
+    let records = |dir: &str| -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(state.join(dir)) else { return vec![] };
+        entries.flatten()
+            .filter_map(|e| serde_json::from_slice::<serde_json::Value>(&std::fs::read(e.path()).ok()?).ok())
+            .filter_map(|v| v.get("path")?.as_str().map(PathBuf::from))
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .collect()
+    };
+    let parents = records("build-parents");
+    let owned = records("build-targets");
+    let known: Vec<PathBuf> = known.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+    let mut volumes: Vec<PathBuf> = parents.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
+    volumes.sort();
+    volumes.dedup();
+    let mut found = Vec::new();
+    for volume in volumes {
+        let Ok(children) = std::fs::read_dir(&volume) else { continue };
+        for child in children.flatten() {
+            let path = child.path();
+            if std::fs::symlink_metadata(&path).map_or(true, |m| !m.is_dir() || m.file_type().is_symlink())
+                || parents.contains(&path)
+                || owned.contains(&path)
+                || known.contains(&path)
+                || path.join(MARKER).exists()
+                || path.join(".augmentagent-build-parent.json").exists()
+                || !known_cargo_layout(&path)
+            {
+                continue;
+            }
+            // Measuring walks the whole tree; a quick count skips it.
+            let idle_days = measure.then(|| newest_write(&path)).flatten()
+                .map(|t| now.duration_since(t).unwrap_or_default().as_secs_f64() / 86_400.0);
+            let bytes = if measure { crate::disk::disk_bytes(&path) } else { 0 };
+            found.push(UnmanagedCache { path, bytes, idle_days });
+        }
+    }
+    found.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1754 D1
+    #[test]
+    fn a_child_target_dir_override_is_named_in_either_form() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(child_target_override(&argv(&["cargo", "test", "--target-dir", "/x"])).as_deref(), Some("--target-dir"));
+        assert_eq!(child_target_override(&argv(&["cargo", "build", "--target-dir=/x"])).as_deref(), Some("--target-dir=/x"));
+        assert_eq!(child_target_override(&argv(&["cargo", "build", "-p", "augmentagent-cli"])), None);
+        assert_eq!(child_target_override(&argv(&["cargo", "run", "--", "--target-dir", "/x"])), None,
+            "arguments after `--` belong to the program cargo runs");
+    }
+
+    // #1754 D3
+    fn cargo_cache(dir: &Path) {
+        std::fs::create_dir_all(dir.join("debug/deps")).unwrap();
+        std::fs::write(dir.join("CACHEDIR.TAG"), CACHE_TAG).unwrap();
+        std::fs::write(dir.join("debug/deps/x.rlib"), vec![1; 4096]).unwrap();
+    }
+
+    fn managed_volume(t: &Path) -> (PathBuf, PathBuf) {
+        let volume = t.join("volume");
+        let parent = volume.join("session-targets");
+        std::fs::create_dir_all(&parent).unwrap();
+        let state = t.join("state");
+        std::fs::create_dir_all(state.join("build-parents")).unwrap();
+        let record = serde_json::json!({"version": 1, "path": std::fs::canonicalize(&parent).unwrap(), "repo": "/repo/.git"});
+        std::fs::write(state.join("build-parents").join(key(&parent)), record.to_string()).unwrap();
+        (std::fs::canonicalize(&volume).unwrap(), state)
+    }
+
+    fn listed(state: &Path, known: &[PathBuf]) -> Vec<String> {
+        let mut names: Vec<String> = unmanaged_caches(state, known, true, SystemTime::now()).into_iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_unregistered_cache_beside_a_managed_parent_is_listed_with_its_size() {
+        let t = tempfile::tempdir().unwrap();
+        let (volume, state) = managed_volume(t.path());
+        cargo_cache(&volume.join("ad-hoc-target"));
+        let found = unmanaged_caches(&state, &[], true, SystemTime::now());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, volume.join("ad-hoc-target"));
+        assert!(found[0].bytes >= 4096);
+        assert!(found[0].idle_days.is_some_and(|d| d < 1.0));
+    }
+
+    #[test]
+    fn a_tagless_legacy_cache_is_listed_too() {
+        let t = tempfile::tempdir().unwrap();
+        let (volume, state) = managed_volume(t.path());
+        let legacy = volume.join("legacy-target");
+        std::fs::create_dir_all(legacy.join("debug/deps")).unwrap();
+        std::fs::create_dir_all(legacy.join("debug/.fingerprint")).unwrap();
+        std::fs::write(legacy.join(".rustc_info.json"), br#"{"rustc_fingerprint":1,"outputs":{}}"#).unwrap();
+        assert_eq!(listed(&state, &[]), vec!["legacy-target"]);
+    }
+
+    #[test]
+    fn owned_source_symlinked_and_non_cargo_children_are_not_listed() {
+        let t = tempfile::tempdir().unwrap();
+        let (volume, state) = managed_volume(t.path());
+        // Registered by a target record (any repository).
+        let registered = volume.join("registered-target");
+        cargo_cache(&registered);
+        std::fs::create_dir_all(state.join("build-targets")).unwrap();
+        std::fs::write(state.join("build-targets").join(key(&registered)),
+            serde_json::json!({"version": 1, "path": registered, "repo": "/other/.git", "worktree": null}).to_string()).unwrap();
+        // Carries an ownership marker.
+        let marked = volume.join("marked-target");
+        cargo_cache(&marked);
+        std::fs::write(marked.join(MARKER), "{}").unwrap();
+        // A housekeeping root already (gate cache, worktree target).
+        let discovered = volume.join("gate-target");
+        cargo_cache(&discovered);
+        // A source tree, a symlink to a cache, and a plain directory.
+        let source = volume.join("checkout");
+        cargo_cache(&source);
+        std::fs::write(source.join("Cargo.toml"), "[workspace]").unwrap();
+        let elsewhere = t.path().join("elsewhere-target");
+        cargo_cache(&elsewhere);
+        std::os::unix::fs::symlink(&elsewhere, volume.join("linked-target")).unwrap();
+        std::fs::create_dir_all(volume.join("notes")).unwrap();
+        // Children of the managed parent belong to its own discovery.
+        cargo_cache(&volume.join("session-targets/wt-1"));
+        assert!(listed(&state, &[discovered]).is_empty(), "{:?}", listed(&state, &[]));
+    }
+
+    #[test]
+    fn only_volumes_that_hold_a_managed_parent_are_scanned() {
+        let t = tempfile::tempdir().unwrap();
+        let (_volume, state) = managed_volume(t.path());
+        // A cache beside some other registered target (think ~/.cache) is not ours to report.
+        cargo_cache(&t.path().join("unrelated/other-project-target"));
+        assert!(listed(&state, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_quick_count_skips_measuring_sizes() {
+        let t = tempfile::tempdir().unwrap();
+        let (volume, state) = managed_volume(t.path());
+        cargo_cache(&volume.join("ad-hoc-target"));
+        let quick = unmanaged_caches(&state, &[], false, SystemTime::now());
+        assert_eq!(quick.len(), 1);
+        assert_eq!(quick[0].bytes, 0, "an unmeasured listing reports no size");
+        assert_eq!(quick[0].idle_days, None);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn pressure_reclamation_admits_checkout_release_and_retains_its_binary() {
@@ -1435,6 +1615,31 @@ mod tests {
         assert!(records[0].ephemeral);
         assert!(records[0].worktree.is_none());
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pressure_recovery_recomputes_effective_cache_cap() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("repo");
+        repo(&r);
+        let target = t.path().join("cache");
+        let state = t.path().join("state");
+        let _lease = Lease::try_at(&state).unwrap().unwrap();
+        register(&r, &target, None, &state).unwrap();
+        // Protected output cannot be pruned. Reclaiming another owned cache
+        // restores this filesystem's headroom without changing these bytes.
+        let retained = target.join("retained-output");
+        std::fs::write(&retained, vec![1; 2 * 1024 * 1024]).unwrap();
+        let recovered = std::cell::Cell::new(false);
+        let paths = vec![target.clone()];
+        let claims = Default::default();
+        let result = reconcile_with_pressure(&r, &target, &state, 25.0, 20_000,
+            ReconcileContext { held: None, claims: &claims, paths: &paths, update: false },
+            &|_| Some(if recovered.get() { 30 << 30 } else { 1 << 30 }),
+            &|_| { recovered.set(true); Ok(Vec::new()) });
+        assert!(result.is_ok(), "recovered headroom must admit on the same pass: {result:?}");
+        assert_eq!(std::fs::metadata(retained).unwrap().len(), 2 * 1024 * 1024);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn unreclaimable_cache_bytes_refuse_admission_without_deleting_unknown_files() {

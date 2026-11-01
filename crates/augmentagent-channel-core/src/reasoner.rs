@@ -279,6 +279,12 @@ pub enum ReasonerError {
     /// could race that process, so this error must stop the fallback chain.
     #[error("{provider} process cleanup is unverified; recovery requires reconciliation")]
     CleanupUncertain { provider: String },
+    /// #1774 — our own host stopped the provider CLI with a signal (a deploy
+    /// restart SIGTERMs the whole unit cgroup, the OOM killer SIGKILLs). The
+    /// provider said nothing, so this is never latched, and it stops the
+    /// chain: the next provider would be spawned into the dying cgroup.
+    #[error("{provider} was stopped by signal {signal} (daemon restart or kill), not by the provider")]
+    Interrupted { provider: String, signal: i32 },
 }
 
 impl From<crate::cli_gate::GateWaitTimeout> for ReasonerError {
@@ -526,6 +532,22 @@ fn month_number(token: &str) -> Option<u32> {
         .iter()
         .position(|m| t.starts_with(m))
         .map(|i| i as u32 + 1)
+}
+
+/// #1774 — the signal that stopped a provider CLI, if our host stopped it:
+/// either the process died of SIGHUP/SIGINT/SIGKILL/SIGTERM, or it trapped
+/// one and exited with the shell convention `128 + signal` (the `claude` CLI
+/// exits 143 on SIGTERM). No provider response produces these.
+pub fn interrupted_by_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    const HOST_STOPS: [i32; 4] = [1, 2, 9, 15];
+    let signal = status.signal().or_else(|| status.code().and_then(|code| code.checked_sub(128)))?;
+    HOST_STOPS.contains(&signal).then_some(signal)
+}
+
+/// The typed error for a provider CLI our host stopped (#1774).
+pub fn interrupted_error(provider: &str, signal: i32) -> anyhow::Error {
+    anyhow::Error::new(ReasonerError::Interrupted { provider: provider.to_string(), signal })
 }
 
 /// Wrap an untyped `CallError::Other` in the matching [`ReasonerError`]
@@ -1189,6 +1211,13 @@ impl ClaudeCliReasoner {
         } else {
             args.push("--allowedTools".into());
             args.push(opts.allowed_tools.join(" "));
+            // An empty auto-approval list is not the same as removing tools.
+            // Evidence selection and other text-only transforms execute reads
+            // through their coordinator, never through ambient CLI tools/MCP.
+            if !fresh_review && crate::providers::classify(opts) == crate::providers::CapabilityClass::TextOnly {
+                args.extend(["--tools".into(), "".into(), "--strict-mcp-config".into(),
+                    "--mcp-config".into(), r#"{"mcpServers":{}}"#.into(), "--disable-slash-commands".into()]);
+            }
         }
 
         // `--system-prompt` REPLACES Claude Code's default system (tools list,
@@ -1473,6 +1502,11 @@ impl ClaudeCliReasoner {
                 let _ = err.read_to_string(&mut stderr_buf).await;
             }
             warn!("claude exited {status:?}: {stderr_buf}");
+            // #1774 — a host kill (deploy restart) is not a provider
+            // failure: typed so the chain neither latches nor fails over.
+            if let Some(signal) = interrupted_by_signal(&status) {
+                return Err(CallError::Other(interrupted_error("claude", signal)));
+            }
             if is_cli_api_error(&final_text) {
                 // The request was refused, so the session itself is intact:
                 // release it rather than letting the dropped lease mark the
@@ -2122,6 +2156,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_imessage_compose_bare = "Bash(augmentagent imessage compose *)".to_string();
     let bash_imessage_allowlist_abs = format!("Bash({} imessage allowlist)", bin.display());
     let bash_imessage_allowlist_bare = "Bash(augmentagent imessage allowlist)".to_string();
+    let bash_message_context_abs = format!("Bash({} messages context *)", bin.display());
+    let bash_message_context_bare = "Bash(augmentagent messages context *)".to_string();
+    let bash_message_context_attach_abs = format!("Bash({} messages context-attach *)", bin.display());
+    let bash_message_context_attach_bare = "Bash(augmentagent messages context-attach *)".to_string();
     // #1061 — the same for the Apple Notes bundle, into the same session dir.
     let bash_notes_fetch_abs = format!("Bash({} apple-notes fetch-attachment *)", bin.display());
     let bash_notes_fetch_bare = "Bash(augmentagent apple-notes fetch-attachment *)".to_string();
@@ -2250,7 +2288,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         }
     }
     // The compose subprocess must use the daemon's existing bundle and gate.
-    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED"] {
+    for key in ["AUGMENTAGENT_IMESSAGE_REPO_DIR", "AUGMENTAGENT_IMESSAGE_SEND_ENABLED", "AUGMENTAGENT_DRAFT_CONTEXT_PLATFORMS"] {
         if let Ok(value) = std::env::var(key) {
             if !value.trim().is_empty() { env.push((key.into(), value)); }
         }
@@ -2383,6 +2421,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_imessage_fetch_bare,
             bash_imessage_compose_abs,
             bash_imessage_compose_bare,
+            bash_message_context_abs,
+            bash_message_context_bare,
+            bash_message_context_attach_abs,
+            bash_message_context_attach_bare,
             bash_imessage_allowlist_abs,
             bash_imessage_allowlist_bare,
             bash_notes_fetch_abs,
@@ -5310,6 +5352,33 @@ exit 1
         );
     }
 
+    /// #1774 — the 2026-11-01 deploy restart: exit 143 with nothing on
+    /// stderr, whether the CLI trapped SIGTERM itself or the provider
+    /// supervisor was stopped (`scripts/provider-supervisor.py` exits 128+15). Our host stopped it; the provider
+    /// is not unavailable.
+    #[tokio::test]
+    async fn a_sigterm_exit_is_interrupted_not_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, script) in [
+            ("fake-claude-sigterm-trapped", "cat >/dev/null\nexit 143\n"),
+            // The deploy restart's real shape: the cgroup SIGTERM reaches the
+            // provider supervisor, which reaps the CLI and exits 128+15.
+            ("fake-claude-supervisor-stopped", "cat >/dev/null\nkill -TERM $PPID\nsleep 5\n"),
+        ] {
+            let bin = stub_cli(&dir, name, script);
+            let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+            let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+            assert!(
+                matches!(ReasonerError::find_in(&err), Some(ReasonerError::Interrupted { signal: 15, .. })),
+                "{name}: {err:#}"
+            );
+        }
+        let bin = stub_cli(&dir, "fake-claude-exit-1", "cat >/dev/null\nexit 1\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })), "{err:#}");
+    }
+
     /// A permit must go back on every exit path: non-zero exit, and the
     /// caller's future being dropped (the #656 watchdog / a shutdown), so a
     /// capacity-1 gate never starves the next call.
@@ -5672,5 +5741,40 @@ mod message_tool_wiring {
                 "{doc_only} missing from the ask schema"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod interrupted_by_signal_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    /// #1774 — wait statuses as the kernel reports them: exit code `c` is
+    /// `c << 8`, death by signal `s` is `s`.
+    #[test]
+    fn host_signals_are_recognised_both_raw_and_as_128_plus_n() {
+        let exit = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let killed = std::process::ExitStatus::from_raw;
+        assert_eq!(interrupted_by_signal(&exit(143)), Some(15), "claude traps SIGTERM, exits 143");
+        assert_eq!(interrupted_by_signal(&killed(15)), Some(15));
+        assert_eq!(interrupted_by_signal(&exit(137)), Some(9));
+        assert_eq!(interrupted_by_signal(&killed(9)), Some(9));
+        assert_eq!(interrupted_by_signal(&exit(130)), Some(2));
+        assert_eq!(interrupted_by_signal(&exit(129)), Some(1));
+        assert_eq!(interrupted_by_signal(&exit(1)), None);
+        assert_eq!(interrupted_by_signal(&exit(0)), None);
+        assert_eq!(interrupted_by_signal(&exit(139)), None, "a crash (SIGSEGV) is not a host stop");
+        assert_eq!(interrupted_by_signal(&killed(11)), None);
+        assert_eq!(interrupted_by_signal(&exit(36608 >> 8)), Some(15), "the 2026-11-01 status");
+    }
+
+    #[test]
+    fn interrupted_is_not_provider_side() {
+        let error = interrupted_error("claude", 15);
+        let typed = ReasonerError::find_in(&error).unwrap();
+        assert!(!typed.is_provider_side());
+        // classify_other keeps an already-typed error as it is.
+        let kept = classify_other("claude", error);
+        assert!(matches!(ReasonerError::find_in(&kept), Some(ReasonerError::Interrupted { .. })));
     }
 }

@@ -98,10 +98,15 @@ mod embeddings_cmd;
 mod triage_prefilter_cmd;
 mod apple_notes;
 mod imessage_send;
+mod imessage_owner;
 mod imessage_compose;
 mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
+mod autoship_commands;
+mod autoship_cache_recovery;
+mod autoship_discord_command;
+mod autoship_deployment;
 mod autoship_contract;
 mod autoship_episode;
 mod autoship_metrics;
@@ -405,8 +410,7 @@ enum Cmd {
         #[command(subcommand)]
         op: TeamOp,
     },
-    /// Teammate-coverage shadow report, owner review and rollout gate
-    /// (#1702). The gate must PASS before `AUGMENTAGENT_TEAM_COVERAGE=on`.
+    /// Teammate-coverage decision report and owner review (#1702).
     TeamCoverage {
         #[command(subcommand)]
         op: TeamCoverageOp,
@@ -416,7 +420,7 @@ enum Cmd {
         #[command(subcommand)]
         op: messages_cmd::Op,
     },
-    /// Read-only WhatsApp archive ingestion (independent of the live channel).
+    /// WhatsApp archive ingestion, reply policy and reply cards (independent of the live channel).
     WhatsappHistory {
         #[command(subcommand)]
         op: whatsapp_history::Op,
@@ -992,6 +996,10 @@ enum DeployOp {
         /// Short name for the snapshot, e.g. the PR number.
         #[arg(long, default_value = "manual")]
         label: String,
+        /// Capture committed pages as pinned forensic evidence, including
+        /// corruption. The result cannot be restored as a rollback.
+        #[arg(long)]
+        forensic: bool,
     },
     /// Snapshots, newest first.
     List,
@@ -1085,6 +1093,11 @@ enum DiskOp {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Only list Cargo caches beside a managed build parent that nothing
+        /// registers (#1754), with size and idle days. With `--json`, an array
+        /// of `{path, bytes, idle_days}`.
+        #[arg(long, default_value_t = false)]
+        unmanaged: bool,
     },
 }
 #[derive(Subcommand)]
@@ -1098,6 +1111,39 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Inspect or repair only a corrupt derived PR adoption cache. Accounting
+    /// and owner controls must remain identical; defaults to read-only inspect.
+    RecoverAdoptionCache {
+        #[arg(long)] workflow_db: PathBuf,
+        #[arg(long)] apply: bool,
+        /// Resume an interrupted repair using its pinned managed snapshot.
+        #[arg(long, requires = "apply")] evidence: Option<PathBuf>,
+        #[arg(long)] json: bool,
+    },
+    /// Stop new dispatches; active-work teardown remains separately verified.
+    Pause(autoship_commands::control_command::Args),
+    /// Clear only the explicit owner pause after access and readiness checks.
+    Resume(autoship_commands::control_command::Args),
+    /// Execute one admitted workflow attempt through the normal gates.
+    Work(autoship_commands::work_command::WorkArgs),
+    /// Durably submit an explicit issue or PR; acceptance does not mean execution.
+    Run(autoship_commands::run_command::RunArgs),
+    /// Inspect native credential declarations; no provider calls or refresh.
+    Readiness { #[arg(long)] json: bool },
+    /// Resolve a pending merge using bound controller and GitHub evidence.
+    ResolveMerge {
+        #[arg(long)] operation: String,
+        #[arg(long, value_parser = ["autonomous", "manual", "not-merged"])] classification: String,
+        #[arg(long)] evidence: PathBuf,
+        #[arg(long)] json: bool,
+    },
+    /// Inspect a durable workflow without starting work or changing state.
+    Status {
+        #[arg(long)]
+        workflow: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Put `agent-gave-up` issues back in the pool by recorded reason code
     /// (`stuck:gate-red:<fp>`, `attempts:review-reject`, `scoper:not-fixable`,
     /// …). `--reason` matches the whole code or any whole `:` segment of it.
@@ -1593,6 +1639,11 @@ enum PersonOp {
 
 #[derive(Subcommand)]
 enum ImessageOp {
+    /// Private owner conversation and native approval-event transport.
+    Owner {
+        #[command(subcommand)]
+        op: imessage_owner::Op,
+    },
     /// Proactive owner alerts, separate from approved replies to contacts.
     Alerts {
         #[command(subcommand)]
@@ -1630,7 +1681,7 @@ enum ImessageOp {
     AllowInbound { identifier: String },
     /// Stop drafting reply cards for a conversation.
     DenyInbound { identifier: String },
-    /// Owner policy for existing and future one-to-one iMessage contacts.
+    /// Owner policy for existing and future iMessage conversations, groups included.
     /// Every outgoing message still requires approval; explicit denials win.
     ContactDefaults {
         #[arg(long, required = true, action = clap::ArgAction::Set)]
@@ -3074,6 +3125,45 @@ async fn main() -> Result<()> {
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
+    if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
+        let result=async {
+            let _storage=if apply {Some(build_storage::acquire().await?)}else{None};
+            let root=deploy_snapshot::snapshot_root().context("no snapshot retention root")?;
+            autoship_cache_recovery::recover(workflow_db,&root,apply,evidence.as_deref())
+        }.await;
+        let (code,value)=match result {
+            Ok(value)=>(0,value),
+            Err(error)=>(4,serde_json::json!({"schema_version":1,"state":"recovery-refused","error":format!("{error:#}")})),
+        };
+        if json {println!("{}",serde_json::to_string(&value)?);}else{println!("{}",serde_json::to_string_pretty(&value)?);}
+        std::process::exit(code);
+    }
+    if let Cmd::Autopr { op: AutoprOp::ResolveMerge { ref operation, ref classification, ref evidence, json } } = cli.cmd {
+        std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Work(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::work_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Pause(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::control_command::run(args,true).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Resume(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::control_command::run(args,false).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Run(ref args) } = cli.cmd {
+        std::process::exit(autoship_commands::run_command::run(args).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Readiness { json } } = cli.cmd {
+        let root=match tokio::process::Command::new("git").args(["rev-parse","--show-toplevel"]).output().await {
+            Ok(output) if output.status.success()=>String::from_utf8(output.stdout).ok()
+                .map(|root|PathBuf::from(root.trim())).filter(|root|root.is_absolute()),
+            _=>None,
+        };
+        std::process::exit(autoship_commands::run_readiness(root.as_deref(),json).await);
+    }
+    if let Cmd::Autopr { op: AutoprOp::Status { ref workflow, json } } = cli.cmd {
+        std::process::exit(autoship_commands::run_status(workflow, json));
+    }
     if let Cmd::AutoPrWorker { dry_run } = cli.cmd {
         return autoship_worker::run(std::env::current_dir()?, dry_run).await;
     }
@@ -3117,7 +3207,7 @@ async fn main() -> Result<()> {
         let release = repo_root.join("target/release");
         let mut out = std::io::stdout().lock();
         return match op {
-            DeployOp::Snapshot { label } => {
+            DeployOp::Snapshot { label, forensic } => {
                 // Snapshot allocation and builds must not spend the same
                 // measured filesystem reserve concurrently.
                 let _storage = build_storage::acquire().await?;
@@ -3126,6 +3216,10 @@ async fn main() -> Result<()> {
                     .clone()
                     .or_else(|| std::env::var("AUGMENTAGENT_DB").ok().map(PathBuf::from))
                     .unwrap_or_else(|| PathBuf::from("data.db"));
+                if *forensic {
+                    let dir=deploy_snapshot::snapshot_forensic(&db,&root,label,chrono::Utc::now())?;
+                    use std::io::Write as _;writeln!(out,"{}",dir.display())?;return Ok(());
+                }
                 let sha = std::process::Command::new("git")
                     .args(["rev-parse", "HEAD"])
                     .output()
@@ -3190,6 +3284,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             DiskOp::Build { target_dir, command, update } => {
+                if let Some(flag) = build_storage::child_target_override(command) {
+                    eprintln!("refusing `{flag}` in the build command: `disk build` already gives cargo its leased target \
+                        (--target-dir {}) and the flag would write to an unregistered directory instead. \
+                        Pass the directory as `--target-dir` to `disk build` (or `CARGO_TARGET_DIR=` before scripts/cargo-managed.sh). #1754",
+                        target_dir.display());
+                    std::process::exit(2);
+                }
                 let result = async {
                     let admitted: Result<Option<build_storage::Lease>> = async {
                         if build_storage::inherited_mode(target_dir, *update)? { Ok(None) }
@@ -3231,8 +3332,8 @@ async fn main() -> Result<()> {
                 },
                 &mut std::io::stdout().lock(),
             ),
-            DiskOp::Status { json } => {
-                disk::run_status(&repo_root, *json, &mut std::io::stdout().lock())
+            DiskOp::Status { json, unmanaged } => {
+                disk::run_status(&repo_root, *json, *unmanaged, &mut std::io::stdout().lock())
             }
         };
     }
@@ -3487,8 +3588,15 @@ async fn main() -> Result<()> {
             no_email,
         } => {
             let external_autopr = autoship_worker::external_enabled();
-            if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
-                warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+            match autoship_deployment::record("daemon", dry_run, external_autopr).await {
+                Ok(()) => {
+                    // A second serve must preserve both live configuration
+                    // evidence and the updater's matching isolation receipt.
+                    if let Err(error) = autoship_worker::record_host_mode(external_autopr) {
+                        warn!(%error, "could not publish auto-ship host mode; updater will retain conservative deferral");
+                    }
+                }
+                Err(error) => warn!(%error, "could not publish effective autoship configuration; preserving existing host evidence"),
             }
             // #1287 — a Discord configuration error must not stop the
             // surfaces that are configured (Slack alone, for one): report it
@@ -3556,6 +3664,7 @@ async fn main() -> Result<()> {
                 card_surfaces.clone(),
                 interrupted_discord_turns,
                 Some(discord_phone_pending.clone()),
+                true,
             )
             .await
             {
@@ -4250,13 +4359,14 @@ async fn main() -> Result<()> {
                 Ok(Some(config)) => {
                     let store_c = Arc::clone(&store);
                     let reasoner = build_reasoner();
+                    let bk = Arc::clone(&broker);
                     let root = cli.wiki_dir.clone();
                     let schema = root
                         .as_ref()
                         .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
                     let sd = shutdown.clone();
                     tasks.push(tokio::spawn(async move {
-                        whatsapp_history::run_loop(config, store_c, reasoner, root, schema, sd)
+                        whatsapp_history::run_loop(config, store_c, reasoner, bk, root, schema, sd)
                             .await
                     }));
                 }
@@ -5060,7 +5170,10 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
+        Cmd::WhatsappHistory { op: whatsapp_history::Op::PollOnce } => {
+            whatsapp_history::poll_command(store).await
+        }
+        Cmd::WhatsappHistory { op } => whatsapp_history::policy_command(&store, &op),
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
         Cmd::TriageCalibration { op } => self_improve::triage_calibration::run(store, op).await,
@@ -5073,6 +5186,7 @@ async fn main() -> Result<()> {
         },
         Cmd::Imessage { ref op } => match op {
             ImessageOp::Alerts { op } => owner_alerts::run(&store, op).await,
+            ImessageOp::Owner { op } => imessage_owner::run(&store, op),
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;
                 Ok(())
@@ -5636,6 +5750,13 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
+        Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache { .. } } => unreachable!("cache maintenance precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Run(..) } => unreachable!("submission precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Readiness { .. } } => unreachable!("readiness precedes application database initialization"),
+        Cmd::Autopr { op: AutoprOp::Status { .. } } => unreachable!("status precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Readmit { reason, dry_run, reset_history } } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             for n in self_improve::readmit(&root, &reason, dry_run, reset_history).await? {
@@ -8874,7 +8995,7 @@ async fn run_stale_approval_reconcile(
 
 #[derive(Subcommand, Debug)]
 enum TeamCoverageOp {
-    /// Every coverage decision in the window, with the summary and gate.
+    /// Every coverage decision in the window, with a summary line.
     Report {
         /// Only decisions from the last N days.
         #[arg(long, default_value_t = 30)]
@@ -8884,18 +9005,15 @@ enum TeamCoverageOp {
     },
     /// Mark a decision `correct` or `wrong` (re-reviewing replaces it).
     Review { action_id: String, verdict: String },
-    /// Evaluate the rollout gate over all decisions; exit 1 unless it passes.
-    Gate,
 }
 
 fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
-    use team_coverage::{gate, summarize, summary_line};
+    use team_coverage::{summarize, summary_line};
     let now = chrono::Utc::now().timestamp_millis();
     match op {
         TeamCoverageOp::Report { days, json } => {
             let rows = store.team_coverage_report(now - i64::from(days) * 86_400_000)?;
             let s = summarize(&rows);
-            let g = gate(&s, now);
             if json {
                 let v = serde_json::json!({
                     "rows": rows.iter().map(|r| serde_json::json!({
@@ -8917,7 +9035,6 @@ fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
                         "replied_anyway": s.replied_anyway,
                         "first_decided_ms": s.first_decided_ms,
                     },
-                    "gate": { "pass": g.pass, "reasons": g.reasons },
                 });
                 println!("{v}");
             } else {
@@ -8937,7 +9054,7 @@ fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
                         r.review.as_deref().unwrap_or("-"),
                     );
                 }
-                println!("{}", summary_line(&s, &g, now));
+                println!("{}", summary_line(&s));
             }
         }
         TeamCoverageOp::Review { action_id, verdict } => {
@@ -8945,17 +9062,6 @@ fn team_coverage_cmd(store: &Store, op: TeamCoverageOp) -> Result<()> {
                 anyhow::bail!("no team-coverage decision for action {action_id}");
             }
             println!("reviewed {action_id}: {verdict}");
-        }
-        TeamCoverageOp::Gate => {
-            let s = summarize(&store.team_coverage_report(0)?);
-            let g = gate(&s, now);
-            println!("{}", summary_line(&s, &g, now));
-            for r in &g.reasons {
-                println!("  - {r}");
-            }
-            if !g.pass {
-                std::process::exit(1);
-            }
         }
     }
     Ok(())
@@ -11336,6 +11442,7 @@ async fn run_reasoner_selftest(prompt: &str, profile: Option<&str>, tool_probe: 
 /// `FallbackReasoner` + `ask_opts`. Lives in the CLI to avoid a circular
 /// dep between the discord crate and the channel-email crate.
 struct WikiQuerier {
+    running_text_turns: dashmap::DashMap<String, Arc<imessage_owner::RunningTurn>>,
     reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
@@ -11368,6 +11475,7 @@ fn wiki_querier(
         voice_enabled,
         phone_tools: std::sync::OnceLock::new(),
         voice_tools: std::sync::OnceLock::new(),
+        running_text_turns: Default::default(),
         final_spoken_turns: dashmap::DashMap::new(),
     }
 }
@@ -11510,6 +11618,33 @@ fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
+    fn turn_cancellation(&self,session:&str)->Option<CancellationToken> {
+        self.running_text_turns.get(session).map(|r|r.cancel.clone())
+    }
+    async fn owner_command(&self,ctx:&augmentagent_approval_discord::AuditCtx,text:&str)->Option<String> {
+        imessage_owner::owner_command(self,ctx,text).await
+    }
+    fn autoship_bound(&self, context: &augmentagent_approval_discord::autoship::Context) -> anyhow::Result<bool> {
+        autoship_discord_command::gateway_bound(&autoship_workflow::default_path(), context)
+    }
+    async fn autoship_command(&self, context: &augmentagent_approval_discord::autoship::Context, text: &str)
+        -> anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {
+        autoship_discord_command::gateway_command(&self.repo_root, &autoship_workflow::default_path(), context, text).await
+    }
+    fn autoship_acknowledged(&self, context: &augmentagent_approval_discord::autoship::Context, message: u64) -> anyhow::Result<()> {
+        autoship_discord_command::gateway_acknowledged(&autoship_workflow::default_path(), context, message)
+    }
+    fn autoship_ack_uncertain(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::UncertainAcknowledgement>> {autoship_discord_command::ack_uncertain(&autoship_workflow::default_path(),bot,owner)}
+    fn autoship_progress_uncertain(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::UncertainProgress>> {autoship_discord_command::progress_uncertain(&autoship_workflow::default_path(),bot,owner)}
+    fn autoship_progress_pending(&self,bot:u64,owner:u64)->anyhow::Result<Vec<augmentagent_approval_discord::autoship::ProgressDelivery>> {autoship_discord_command::progress_pending(&autoship_workflow::default_path(),bot,owner)}
+    fn autoship_progress_claim(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery)->anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {autoship_discord_command::progress_claim(&autoship_workflow::default_path(),delivery)}
+    fn autoship_progress_confirm(&self,delivery:&augmentagent_approval_discord::autoship::ProgressDelivery,message:u64)->anyhow::Result<()> {autoship_discord_command::progress_confirm(&autoship_workflow::default_path(),delivery,message)}
+    fn autoship_pending(&self, bot: u64, owner: u64) -> anyhow::Result<Vec<augmentagent_approval_discord::autoship::Context>> {
+        autoship_discord_command::gateway_pending(&autoship_workflow::default_path(), bot, owner)
+    }
+    fn autoship_claim_ack(&self, context: &augmentagent_approval_discord::autoship::Context) -> anyhow::Result<Option<augmentagent_approval_discord::autoship::Reply>> {
+        autoship_discord_command::gateway_claim_ack(&autoship_workflow::default_path(), context)
+    }
     fn attach_voice_tools(&self, service: Arc<augmentagent_approval_discord::voice_tool::VoiceToolService>) {
         let _ = self.voice_tools.set(service);
     }
@@ -11554,6 +11689,9 @@ impl QueryHandler for WikiQuerier {
             let bin=self.repo_root.join("target/release/augmentagent");
             for prefix in ["augmentagent".to_string(),bin.display().to_string()] {
                 opts.allowed_tools.push(format!("Bash({prefix} approvals history*)"));
+                if self.conversation_store.as_ref().is_some_and(|store|augmentagent_approval_discord::imessage_owner::OwnerSurface::new(store.clone()).active()) {
+                    opts.allowed_tools.push(format!("Bash({prefix} imessage owner history*)"));
+                }
             }
         }
 
@@ -11677,6 +11815,17 @@ impl QueryHandler for WikiQuerier {
         history: &str,
         current: &str,
     ) -> anyhow::Result<String> {
+        let (cancel,_running)=imessage_owner::begin_turn(self,ctx);
+        let mut combined_history=history.to_owned();
+        if ctx.owner_authorized && !augmentagent_approval_discord::imessage_owner::owner_chat_active() {
+            if let (Some(store),Some(channel))=(self.conversation_store.as_ref(),ctx.channel_id) {
+                if augmentagent_approval_discord::imessage_owner::OwnerSurface::new(store.clone()).active() {
+                combined_history.push_str("\n\n");
+                combined_history.push_str(&store.imessage_owner_chat_history(&channel.get().to_string())?);
+                }
+            }
+        }
+        let history=combined_history.as_str();
         let legacy_prompt = || {
             if history.is_empty() { current.to_string() }
             else { format!("{history}\n\nuser's current message:\n{current}") }
@@ -11698,10 +11847,12 @@ impl QueryHandler for WikiQuerier {
         let (Some(guild_id), Some(channel_id), Some(store)) =
             (ctx.guild_id, ctx.channel_id, self.conversation_store.as_ref())
         else {
-            return self.answer(ctx, &legacy_prompt()).await;
+            let prompt=legacy_prompt();
+            return tokio::select! { _=cancel.cancelled()=>Err(anyhow::anyhow!("Owner text stop requested; cleanup unconfirmed")), result=self.answer(ctx,&prompt)=>result };
         };
         if !self.voice_enabled || !ctx.owner_authorized {
-            return self.answer(ctx, &legacy_prompt()).await;
+            let prompt=legacy_prompt();
+            return tokio::select! { _=cancel.cancelled()=>Err(anyhow::anyhow!("Owner text stop requested; cleanup unconfirmed")), result=self.answer(ctx,&prompt)=>result };
         }
         let guild = guild_id.to_string();
         let channel = channel_id.get().to_string();
@@ -11739,7 +11890,7 @@ impl QueryHandler for WikiQuerier {
                         )
                         .selected(Some(&channel))
                     },
-                    None,
+                    Some(&cancel),
                     |prompt| async move { self.answer(ctx, &prompt).await },
                 )
                 .await?;
@@ -11997,7 +12148,7 @@ mod query_delivery_contract_tests {
         let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into(),
             conversation_store: None, conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
             phone_tools: std::sync::OnceLock::new(),
-            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
+            voice_tools: std::sync::OnceLock::new(), running_text_turns: Default::default(), final_spoken_turns: dashmap::DashMap::new() };
         for turn in 0..2 {
             let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
             ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
@@ -12060,7 +12211,7 @@ mod query_delivery_contract_tests {
             repo_root: fixture.path().to_path_buf(), conversation_store: None,
             conversation_scheduler: Arc::new(augmentagent_approval_discord::conversation::ConversationScheduler::new()), voice_enabled: false,
             phone_tools: std::sync::OnceLock::new(),
-            voice_tools: std::sync::OnceLock::new(), final_spoken_turns: dashmap::DashMap::new() };
+            voice_tools: std::sync::OnceLock::new(), running_text_turns: Default::default(), final_spoken_turns: dashmap::DashMap::new() };
         let mut context = augmentagent_approval_discord::AuditCtx::empty();
         context.session_id = "synthetic-channel:synthetic-turn".into();
         let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
@@ -13870,13 +14021,10 @@ impl ReplyApprover {
         // LinkedIn has no server-side draft to swap — we just regenerate
         // text, update the action row, and re-post the card.
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => strip_approval_envelope_markers(s.trim()),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -13976,13 +14124,10 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -14161,13 +14306,10 @@ impl ReplyApprover {
         // text, update the action row in place, and let the broker re-post the
         // card. Mirrors `revise_discord` / `revise_linkedin`.
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -14267,13 +14409,10 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -14411,13 +14550,10 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -14597,6 +14733,7 @@ impl ApprovalActionHandler for ReplyApprover {
                 | ApprovalActionOutcome::CalendarCreated { already_existed: false, .. }
                 | ApprovalActionOutcome::DocumentSigned { already_existed: false, .. }
                 | ApprovalActionOutcome::Scheduled { .. }
+                | ApprovalActionOutcome::ManualSendReady { .. }
         ) {
             self.trigger_next_nudge().await;
         }
@@ -14771,6 +14908,11 @@ impl ReplyApprover {
         }
         if action.email.platform == imessage_send::PLATFORM {
             return self.approve_imessage(action_id, action).await;
+        }
+        // #1765 — WhatsApp archive cards have no sender: Approve hands the
+        // owner the text to paste. Never the live sidecar, never Gmail.
+        if augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email) {
+            return whatsapp_history::approve(&self.store, action_id, &action);
         }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
@@ -15220,7 +15362,9 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.skip_socialapi(action_id, action);
         }
-        if action.email.platform == imessage_send::PLATFORM {
+        if action.email.platform == imessage_send::PLATFORM
+            || augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email)
+        {
             return self.skip_imessage(action_id, action);
         }
         if is_linkedin_email(&action.email) {
@@ -15305,7 +15449,11 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.revise_socialapi(action_id, feedback, action).await;
         }
-        if action.email.platform == imessage_send::PLATFORM {
+        // #1765 — WhatsApp archive cards have no server draft either; never
+        // the Gmail tail below (Composio call against the monthly cap).
+        if action.email.platform == imessage_send::PLATFORM
+            || augmentagent_channel_whatsapp_history::reply::is_history_card(&action.email)
+        {
             return self
                 .revise_without_server_draft(action_id, feedback, action)
                 .await;
@@ -15369,10 +15517,10 @@ impl ReplyApprover {
         };
 
         // 1. Generate revised draft via reasoner.
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt =
-            augmentagent_channel_core::prompt::redraft_message(&action.email, &previous_draft, feedback);
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
+        let redraft = match augmentagent_channel_core::draft_workflow::redraft(
+            &self.store, self.reasoner.as_ref(), &action.email, action_id,
+            &previous_draft, feedback, self.wiki_root.as_deref(), &self.draft_skill,
+        ).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
@@ -16112,6 +16260,7 @@ async fn build_broker(
         // is then live: only `serve` closes interrupted turns (#1396).
         Vec::new(),
         None,
+        false,
     )
     .await
 }
@@ -16131,10 +16280,12 @@ async fn build_approval_surfaces(
     surfaces: augmentagent_approval_discord::CardSurfaces,
     interrupted_discord_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
     phone_pending: Option<discord_phone::PendingSlot>,
+    start_owner_worker: bool,
 ) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
         return Ok((Arc::new(NoopBroker), None));
     }
+    let owner_enabled=store.imessage_owner_binding()?.is_some_and(|b|b.enabled);
     let slack = slack.filter(|_| routing.slack);
     let token = if routing.discord {
         std::env::var("DISCORD_BOT_TOKEN").ok()
@@ -16145,7 +16296,7 @@ async fn build_approval_surfaces(
         );
         None
     };
-    if token.is_none() && slack.is_none() {
+    if token.is_none() && slack.is_none() && !owner_enabled {
         if routing.discord {
             warn!("DISCORD_BOT_TOKEN unset; approval broker disabled (replies will error)");
         } else {
@@ -16168,6 +16319,7 @@ async fn build_approval_surfaces(
             warn!("COMPOSIO_API_KEY unset: approvals of Gmail and calendar cards will fail until it is set");
             String::new()
         }
+        (Err(_), None) if owner_enabled => String::new(),
         (Err(_), None) => anyhow::bail!("COMPOSIO_API_KEY env var required"),
     };
     let calendar = Arc::new(
@@ -16189,6 +16341,12 @@ async fn build_approval_surfaces(
     // Keep handles for the broker before `store` is moved into the approver:
     // the #37 Revise-triple capture.
     let store_for_broker = Arc::clone(&store);
+    let owner_surface=Arc::new(augmentagent_approval_discord::imessage_owner::OwnerSurface::new(store.clone()));
+    let owner_card:Arc<dyn augmentagent_approval_discord::ApprovalCardSurface>=owner_surface.clone();
+    surfaces.register(&owner_card);
+    let shared_query=cli.wiki_dir.as_ref().map(|root|Arc::new(wiki_querier(
+        reasoner.clone(),root.clone(),repo_root.clone(),store.clone(),
+        std::env::var("AUGMENTAGENT_DISCORD_VOICE_ENABLED").as_deref()==Ok("1"))));
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
@@ -16210,14 +16368,10 @@ async fn build_approval_surfaces(
     let mut brokers: Vec<(&'static str, Arc<dyn ApprovalBroker>)> = Vec::new();
     if let Some(token) = token {
         // With Slack beside it, Discord decisions redraw the Slack cards.
-        let handler: Arc<dyn ApprovalActionHandler> = match &slack {
-            Some(_) => Arc::new(augmentagent_approval_discord::SyncingActionHandler::new(
-                "discord",
-                Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
-                surfaces.clone(),
-            )),
-            None => Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>,
-        };
+        let handler: Arc<dyn ApprovalActionHandler> = Arc::new(
+            augmentagent_approval_discord::SyncingActionHandler::new(
+                "discord", Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>, surfaces.clone(),
+            ));
         match start_discord_broker(
             cli,
             store_for_broker,
@@ -16227,6 +16381,7 @@ async fn build_approval_surfaces(
             &repo_root,
             interrupted_discord_turns,
             phone_pending,
+            shared_query.clone(),
         )
         .await
         {
@@ -16239,7 +16394,7 @@ async fn build_approval_surfaces(
             }
             // #1287 / #1289 — a Discord failure must not take the Slack
             // approvals down with it.
-            Err(e) if slack.is_some() => {
+            Err(e) if slack.is_some() || owner_enabled => {
                 tracing::error!(
                     "discord approval broker disabled: {e:#}. Approvals continue on Slack; fix \
                      the Discord settings and restart the daemon."
@@ -16254,6 +16409,14 @@ async fn build_approval_surfaces(
         slack.set_handler(Arc::clone(&approver) as Arc<dyn ApprovalActionHandler>);
         slack.register();
         brokers.push(("slack", slack as Arc<dyn ApprovalBroker>));
+    }
+    brokers.push(("imessage-owner",owner_surface.clone() as Arc<dyn ApprovalBroker>));
+    if start_owner_worker {
+        if let Some(query)=shared_query {
+            let handler:Arc<dyn ApprovalActionHandler>=Arc::new(augmentagent_approval_discord::SyncingActionHandler::new(
+                "imessage-owner",approver.clone(),surfaces.clone()));
+            imessage_owner::start_runtime(owner_surface,handler,query);
+        }
     }
     let names: Vec<&str> = brokers.iter().map(|(n, _)| *n).collect();
     info!(surfaces = %names.join(","), "approval cards go to these surfaces");
@@ -16303,9 +16466,10 @@ async fn start_discord_broker(
     token: String,
     handler: Arc<dyn ApprovalActionHandler>,
     reasoner: &Arc<FallbackReasoner>,
-    repo_root: &Path,
+    _repo_root: &Path,
     interrupted_turns: Vec<augmentagent_store::InterruptedDiscordTurn>,
     phone_pending: Option<discord_phone::PendingSlot>,
+    shared_query: Option<Arc<WikiQuerier>>,
 ) -> Result<DiscordApprovalBroker> {
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
         .context("DISCORD_CHANNEL_ID env var required")?
@@ -16326,15 +16490,7 @@ async fn start_discord_broker(
     let voice_socket_path = resolve_discord_voice_socket(voice_enabled,
         std::env::var_os("AUGMENTAGENT_DISCORD_VOICE_SOCKET"), std::env::var_os("XDG_RUNTIME_DIR"))?;
 
-    let query_handler: Option<Arc<WikiQuerier>> = cli.wiki_dir.as_ref().map(|root| {
-        Arc::new(wiki_querier(
-            Arc::clone(reasoner),
-            root.clone(),
-            repo_root.to_path_buf(),
-            Arc::clone(&store),
-            voice_enabled,
-        ))
-    });
+    let query_handler=shared_query;
     // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
     // exists (keyring/env); without it the command replies with the
     // not-configured notice and the daemon is otherwise unaffected.
@@ -16374,16 +16530,22 @@ async fn journal_ops_from_env(
     cli: &Cli,
     reasoner: &Arc<FallbackReasoner>,
 ) -> Option<Arc<dyn augmentagent_approval_discord::JournalOps>> {
+    journal_ops_for_wiki(cli.wiki_dir.clone(), reasoner).await
+}
+
+async fn journal_ops_for_wiki(
+    wiki_root: Option<PathBuf>,
+    reasoner: &Arc<FallbackReasoner>,
+) -> Option<Arc<dyn augmentagent_approval_discord::JournalOps>> {
     match augmentagent_channel_journal::JournalRuntime::from_env().await {
         Ok(Some(runtime)) => {
-            let wiki_schema = cli
-                .wiki_dir
+            let wiki_schema = wiki_root
                 .as_ref()
                 .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
             Some(Arc::new(CliJournalOps {
                 runtime,
                 reasoner: Arc::clone(reasoner),
-                wiki_root: cli.wiki_dir.clone(),
+                wiki_root: wiki_root.clone(),
                 wiki_schema,
             }))
         }
@@ -24094,3 +24256,4 @@ async fn dispatch_linkedin_read(op: &LinkedinOp, reader: &augmentagent_channel_l
 
 #[cfg(test)]
 mod linkedin_read_dispatch_tests;
+

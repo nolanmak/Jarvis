@@ -302,6 +302,7 @@ pub struct AuditLogger {
     path: PathBuf,
     model_call_observer:
         Arc<std::sync::Mutex<Option<Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>>>>,
+    dispatch_observer: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>>>,
     run_resources_required: Arc<std::sync::atomic::AtomicBool>,
     native_runtime_owner: Arc<std::sync::Mutex<Option<crate::native_vm::RuntimeOwner>>>,
     resource_capacity_seen: Arc<std::sync::atomic::AtomicBool>,
@@ -429,6 +430,18 @@ impl AuditLogger {
         Ok(())
     }
 
+    /// Workflow admission for both model and verification launches. This must
+    /// run again at the supervisor's final release, after asynchronous setup.
+    pub fn set_dispatch_observer(&self,observer:Arc<dyn Fn()->anyhow::Result<()>+Send+Sync>)->anyhow::Result<()> {
+        *self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?=Some(observer);
+        Ok(())
+    }
+    pub fn dispatch_allowed(&self)->anyhow::Result<()> {
+        let observer=self.dispatch_observer.lock().map_err(|_|anyhow::anyhow!("dispatch observer lock poisoned"))?.clone();
+        if let Some(observer)=observer {observer()?;}
+        Ok(())
+    }
+
     pub fn set_model_call_observer(
         &self,
         observer: Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
@@ -441,6 +454,16 @@ impl AuditLogger {
     }
 
     pub fn model_call_admitted(&self, provider: &str) -> anyhow::Result<()> {
+        self.record_model_admission(provider,None)
+    }
+
+    /// Bind a protected model turn to the exact controller resource receipt.
+    /// Ordering alone cannot associate it with a later quiescence proof.
+    pub(crate) fn model_call_admitted_in_scope(&self,provider:&str,identity:&serde_json::Value)->anyhow::Result<()> {
+        self.record_model_admission(provider,Some(identity))
+    }
+
+    fn record_model_admission(&self,provider:&str,identity:Option<&serde_json::Value>)->anyhow::Result<()> {
         let observer = self
             .model_call_observer
             .lock()
@@ -450,7 +473,12 @@ impl AuditLogger {
             observer(provider)?;
         }
         if self.anchored.is_some() {
-            self.record_controller(serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider}))?;
+            let mut record=serde_json::json!({"actor":"controller","kind":"model_call_admitted","actual_provider":provider});
+            if let Some(identity)=identity {
+                record["admission_schema_version"]=2.into();
+                record["resource_identity"]=identity.clone();
+            }
+            self.record_controller(record)?;
         }
         Ok(())
     }
@@ -473,6 +501,7 @@ impl AuditLogger {
         Self {
             path,
             model_call_observer: Arc::new(std::sync::Mutex::new(None)),
+            dispatch_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_observer: Arc::new(std::sync::Mutex::new(None)),
             resource_capacity_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_resources_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -597,6 +626,16 @@ impl AuditLogger {
     /// Register BEFORE spawning a writer. Durable tickets survive cancellation
     /// and process death; a restarted logger cannot silently forget lost rows.
     pub fn begin_write(&self) -> anyhow::Result<AuditWriteGuard> {
+        if let Some(sink)=&self.anchored {
+            let result=sink.with_open_generation(||self.register_writer_ticket());
+            if result.as_ref().is_err_and(|error|!error.is::<crate::audit_chain::GenerationSealed>()) {
+                self.mark_failed();
+            }
+            result
+        } else {self.register_writer_ticket()}
+    }
+
+    fn register_writer_ticket(&self)->anyhow::Result<AuditWriteGuard> {
         let pending = if let Some(dir) = &self.pending_dir {
             let path = dir.join(uuid::Uuid::new_v4().to_string());
             let result = (|| -> anyhow::Result<()> {
@@ -818,6 +857,13 @@ fn is_private_imessage_compose(tool: &str, args: &serde_json::Value) -> bool {
 
 const PRIVATE_COMPOSE_COMMAND: &str = "augmentagent imessage compose [recipient and body omitted; inspect approval card]";
 
+fn is_private_draft_context(tool: &str, args: &serde_json::Value) -> bool {
+    static CONTEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+        regex::Regex::new(r#"(?i)\bmessages["']?\s+["']?context(?:-receipts)?\b"#).expect("context audit pattern"));
+    tool == "Bash" && args.get("command").and_then(|v|v.as_str())
+        .is_some_and(|command|CONTEXT.is_match(&command.replace("\\\n", "")))
+}
+
 /// Pair a captured `tool_use` block with its later `tool_result` and produce
 /// the [`AuditRecord`] both the log and the notifier consume. `provider` is
 /// the adapter that served the call (#1047).
@@ -839,9 +885,13 @@ pub fn build_audit_record(
     // value. Omit the whole payload, including descriptions, pipes/heredocs,
     // and result echoes, rather than attempting to parse private shell args.
     let private_compose = is_private_imessage_compose(&tool, &args);
-    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) } else { args };
+    let private_context = is_private_draft_context(&tool, &args);
+    let args = if private_compose { serde_json::json!({"command": PRIVATE_COMPOSE_COMMAND}) }
+        else if private_context {serde_json::json!({"command":"augmentagent messages context [private request and evidence omitted]"})} else { args };
     let (captured, _truncated) = truncate_stream(if private_compose {
         "[iMessage compose output omitted; inspect approval card]"
+    } else if private_context {
+        "[Private draft evidence omitted; inspect the context receipt]"
     } else { result_content });
     // Bash failures from the CLI surface as `is_error=true` with the command
     // output in the result content. We have no real exit code from the
@@ -1334,6 +1384,58 @@ mod tests {
         let anchor = dir.path().join("anchors/workflow.json");
         let logger = AuditLogger::protected(log.clone(), anchor.clone(), &[]).unwrap();
         (dir, logger, log, anchor)
+    }
+
+    #[tokio::test]
+    async fn sealed_generation_refuses_writer_registration_without_leaving_a_ticket() {
+        let (_dir,logger,_,_)=protected_fixture();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
+        logger.anchored.as_ref().unwrap().seal_for_recovery(|_|Ok(serde_json::json!({"fixture":"sealed"}))).unwrap();
+        assert!(logger.begin_write().is_err(),"sealed audit accepted a new writer ticket");
+        assert_eq!(logger.pending_writers.load(std::sync::atomic::Ordering::Acquire),0);
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
+        assert!(!logger.failure_path.as_ref().unwrap().exists(),"expected closed-generation refusal poisoned continuity");
+    }
+
+    #[test]
+    fn audit_seal_serializes_cross_process_writer_registration() {
+        const CHILD:&str="AUDIT_INGRESS_CHILD_ROOT";
+        if let Some(root)=std::env::var_os(CHILD) {
+            let root=PathBuf::from(root);
+            let logger=AuditLogger::protected(root.join("logs/workflow.log"),root.join("anchors/workflow.json"),&[]).unwrap();
+            std::fs::write(root.join("writer-ready"),b"ready").unwrap();
+            assert!(logger.begin_write().is_err(),"writer crossed a sealed generation");
+            return;
+        }
+        let (dir,logger,_,_)=protected_fixture();
+        logger.record_controller(serde_json::json!({"actor":"controller","kind":"fixture"})).unwrap();
+        let sink=logger.anchored.as_ref().unwrap().clone();
+        let (entered,ready)=std::sync::mpsc::channel();
+        let (release,proceed)=std::sync::mpsc::channel();
+        let sealer=std::thread::spawn(move ||sink.seal_for_recovery(|_| {
+            entered.send(()).unwrap();
+            proceed.recv_timeout(std::time::Duration::from_secs(10))?;
+            Ok(serde_json::json!({"fixture":"sealed"}))
+        }));
+        ready.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","tool_audit::tests::audit_seal_serializes_cross_process_writer_registration","--nocapture"])
+            .env(CHILD,dir.path()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        while !dir.path().join("writer-ready").exists() && std::time::Instant::now()<deadline {
+            if child.try_wait().unwrap().is_some(){break;}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let saw_ready=dir.path().join("writer-ready").exists();
+        let pending_during_seal=std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_some();
+        release.send(()).unwrap();
+        sealer.join().unwrap().unwrap();
+        let output=child.wait_with_output().unwrap();
+        assert!(saw_ready,"child failed before registration: {}",String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(),"{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert!(!pending_during_seal,"writer registered while the sealer held the anchor gate");
+        assert!(std::fs::read_dir(logger.pending_dir.as_ref().unwrap()).unwrap().next().is_none());
+        assert!(!logger.failure_path.as_ref().unwrap().exists());
     }
 
     #[tokio::test]

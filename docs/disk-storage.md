@@ -18,7 +18,17 @@ Set `AUGMENTAGENT_BUILD_PARENT` to place that
 parent on a build volume, `CARGO_TARGET_DIR` for a specific cache, or
 `AUGMENTAGENT_STORAGE_BIN` for a supporting binary during bootstrap.
 Do not start an external `CARGO_TARGET_DIR=... cargo ...` build outside this
-wrapper. The wrapper contains test temporary files under the target's `tmp/` on the
+wrapper (#1754). `disk build` refuses a `--target-dir` inside its child command,
+because Cargo would write to that directory instead of the leased one. In Claude
+Code, the project hook `scripts/cargo-target-guard.py` blocks bare `cargo` with
+`CARGO_TARGET_DIR=`/`CARGO_BUILD_TARGET_DIR=` or `--target-dir`; prefix
+`AUGMENTAGENT_ALLOW_UNMANAGED_TARGET=1` only to bootstrap the storage commands.
+Whatever slips past (other clients, `bash -c`, exported variables) is listed by
+`augmentagent disk status`: Cargo caches directly inside a volume that holds a
+managed build parent, owned by no registration, marker, or housekeeping root.
+`disk status --unmanaged [--json]` prints only that list, with size, idle days,
+and an `augmentagent disk register --root DIR --abandoned` suggestion; `disk prune`
+prints the count. Nothing adopts or deletes them automatically. The wrapper contains test temporary files under the target's `tmp/` on the
 measured filesystem and reclaims scratch before its next admission. It defaults
 dev/test debuginfo to zero and strips provider secrets
 from build subprocesses using the gate policy. It also finds the deployed
@@ -119,17 +129,26 @@ the disk, admission still refuses rather than lowering the reserve. Reclaimed
 dependencies can make the next build slower, but do not require relocating or
 replacing the deployed executable.
 
+For a specific build admission, pressure cleanup considers only filesystems
+containing that writer's monitored target, profile, and scratch paths. A release
+build blocked on the root filesystem does not pressure-delete warm Cargo caches
+on an unrelated build volume, even if that volume is also below the same
+threshold. Multiple monitored filesystems remain independently eligible, and
+unknown or empty filesystem scope refuses cleanup. Discovering `disk prune`
+continues proactive pressure cleanup across all owned build filesystems. A
+filesystem with no eligible cache still refuses admission; this does not change
+the free-space floor, growth reservation, ownership, or live-build exclusions.
+
 The same pass retires registered Autoship worktrees under
 `.self-improve-worktrees` after 24 hours without writes. It holds the fresh,
 resume, and per-PR run locks, requires HEAD to be reachable from `origin/main`,
 and requires a clean tracked, untracked, and ignored-file inventory. Git locks,
 process references (including working directories), and unavailable evidence
 keep the checkout. Compiler inventory and readable process status/command lines
-are mandatory. For these reproducible resources only, permission-denied
-ptrace handles (`exe`, `cwd`, `fd`) from non-dumpable login/key agents are
-optional; otherwise normal SSH sessions would freeze all cleanup. Visible
-references still protect resources, and rollback snapshot retention retains
-its stricter all-reference policy. Removal uses `git worktree remove` without force and retains
+are mandatory. Permission-denied ptrace handles (`exe`, `cwd`, `fd`) from
+non-dumpable login/key agents are optional; otherwise normal SSH sessions
+would freeze all cleanup. Visible references still protect resources, and
+rollback snapshot retention applies the same reference policy (#1753). Removal uses `git worktree remove` without force and retains
 branches. External or unrecognized worktrees, unmerged commits (including
 squash-merged heads without ancestry proof), dirty work, and ignored private
 files are preserved; a deleted remote branch alone is not proof of safety.
@@ -184,7 +203,13 @@ augmentagent deploy prune --dry-run --json
 ```
 
 Pins, running executables, open files, command arguments, and service references
-prevent expiry. Unreadable reference evidence keeps candidates. Unknown folders
+prevent expiry. Unreadable reference evidence keeps candidates; the one
+exception is the permission wall the kernel puts around non-dumpable login/key
+agents (`sshd`, `ssh-agent`, `(sd-pam)`), whose `exe`/`cwd`/`fd` are denied even
+to their own user while their status and command line stay readable (#1753).
+Each kept snapshot says why: `kept: pinned`, `kept: referenced`, or
+`kept: reference probe unavailable (<first blocker>; +N more)`. A pin is
+reported ahead of the others. A budget refusal names the same blocker. Unknown folders
 under the snapshot root are preserved. Stray backup deletion still requires
 `--strays --yes`.
 

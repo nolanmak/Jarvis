@@ -27,4 +27,7 @@ pub use sync::{
     batched_delta_email, poll_once, ImessageReport, ImessageSyncer, PollDelta, PollStats,
 };
 pub use target::{conversation_identifier, resolve_target, ImessageTarget, TargetError};
-pub use reply::{only_own_sends, reply_email, ImessageReplier, ImessageReplyConfig, ReplyStats};
+pub use reply::{
+    context_body, group_notes, only_own_sends, reply_email, CardDrafter, Handled, ImessageReplier,
+    ImessageReplyConfig, ReplyStats, GROUP_DRAFT_NOTE, GROUP_TRIAGE_POLICY,
+};

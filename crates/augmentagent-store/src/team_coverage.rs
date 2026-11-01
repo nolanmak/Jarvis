@@ -17,6 +17,9 @@ pub struct ThreadMessage {
     pub body: String,
     /// `None` = unknown recipients; the rule fails closed on it.
     pub recipients: Option<Recipients>,
+    /// The triage agent's verdict on this message (`reply` / `flag` /
+    /// `skip` / …), or `None` when it was never triaged.
+    pub triage: Option<String>,
 }
 
 /// A coverage decision. `mode` is `shadow` (logged only) or `on` (retired).
@@ -75,7 +78,7 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
             "SELECT messageId, fromEmail, COALESCE(receivedAt, ''), COALESCE(body, ''), \
-                    toAddrs, ccAddrs \
+                    toAddrs, ccAddrs, triageResult \
                FROM emails \
               WHERE threadId = ?1 \
                 AND (accountEntityId = ?2 \
@@ -87,11 +90,12 @@ impl Store {
         let rows = stmt.query_map(params![thread_id, account_entity_id], |r| {
             let to: Option<String> = r.get(4)?;
             let cc: Option<String> = r.get(5)?;
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, to, cc))
+            let triage: Option<String> = r.get(6)?;
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, to, cc, triage))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (message_id, from, received_at, body, to, cc) = row?;
+            let (message_id, from, received_at, body, to, cc, triage) = row?;
             // Unparseable recipient JSON is unknown, never empty.
             let parse = |raw: Option<String>| {
                 raw.and_then(|r| serde_json::from_str::<Vec<String>>(&r).ok())
@@ -100,7 +104,8 @@ impl Store {
                 (Some(to), Some(cc)) => Some(Recipients { to, cc }),
                 _ => None,
             };
-            out.push(ThreadMessage { message_id, from, received_at, body, recipients });
+            let triage = triage.filter(|t| !t.is_empty());
+            out.push(ThreadMessage { message_id, from, received_at, body, recipients, triage });
         }
         Ok(out)
     }
