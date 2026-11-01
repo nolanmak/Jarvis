@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location('build_vm', Path(__file__).parents[1] / 'codex-build-vm.py')
 vm = importlib.util.module_from_spec(SPEC)
@@ -13,6 +14,40 @@ SPEC.loader.exec_module(vm)
 
 
 class SnapshotValidationTests(unittest.TestCase):
+    def test_internal_build_hard_links_can_reach_the_vm_boundary_unchanged(self):
+        class BoundaryReached(Exception): pass
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);workspace=root/'workspace';workspace.mkdir()
+            (workspace/'build').mkdir();artifact=workspace/'build/addon.node';artifact.write_bytes(b'synthetic compiled addon')
+            alias=workspace/'addon.node';os.link(artifact,alias)
+            runtime=vm.Runtime();runtime.config={}
+            with patch.object(vm.tempfile,'TemporaryDirectory',side_effect=BoundaryReached),self.assertRaises(BoundaryReached):
+                vm.run(runtime,workspace,['true'],{})
+            self.assertEqual(artifact.stat().st_ino,alias.stat().st_ino)
+            self.assertEqual(alias.read_bytes(),b'synthetic compiled addon')
+
+    def test_internal_aliases_cannot_hide_an_external_link_or_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);workspace=root/'workspace';workspace.mkdir()
+            outside=root/'outside';outside.mkdir();secret=outside/'private';secret.write_bytes(b'SYNTHETIC_PRIVATE')
+            os.link(secret,workspace/'first');os.link(secret,workspace/'second')
+            (workspace/'outside-directory').symlink_to(outside,target_is_directory=True)
+            with self.assertRaisesRegex(vm.Unavailable,'hard links'):
+                vm.run(None,workspace,['true'],{})
+            self.assertEqual(secret.read_bytes(),b'SYNTHETIC_PRIVATE')
+
+    def test_snapshot_link_set_is_rechecked_after_census_before_exposure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);workspace=root/'workspace';workspace.mkdir()
+            artifact=workspace/'addon.node';artifact.write_bytes(b'synthetic addon');os.link(artifact,workspace/'alias.node')
+            outside=root/'escaped';walk=vm.os.walk
+            def changed_walk(*args,**kwargs):
+                yield from walk(*args,**kwargs)
+                os.link(artifact,outside)
+            with patch.object(vm.os,'walk',side_effect=changed_walk),self.assertRaisesRegex(vm.Unavailable,'hard links'):
+                vm.run(None,workspace,['true'],{})
+            self.assertTrue(outside.is_file(),'fixture never reached the post-census mutation')
+
     def test_executable_toolchain_requires_trusted_ownership_and_permissions(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
