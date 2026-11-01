@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1715,
+  "scope": "GitHub boundary acceptance evidence provenance, not production CLI or Discord acceptance.",
+  "test_first_commit": "97e548c0",
+  "implementation_commit": "1576ffb1",
+  "source_sha256": [
+    {
+      "path": "scripts/autoship-github-acceptance.py",
+      "sha256": "2cae6d4dae892598e0854f887b876de3e219f0838e47b01e7a2dc10ea482946e"
+    },
+    {
+      "path": "scripts/test-autoship-github-acceptance.py",
+      "sha256": "8bf7c3b2f8a823c33520b31e0e609a652b9c4fd7dc0de040eeff54667d4bfbd9"
+    },
+    {
+      "path": "scripts/ci-contract.json",
+      "sha256": "8fa3a991d45fa236feed8d5ddce8b08ab90ba22ce9eccf98c97ed2a4a3c87d75"
+    }
+  ],
+  "red": {
+    "command": "python3 scripts/test-autoship-github-acceptance.py",
+    "passed": 1,
+    "failed": 3,
+    "failure": "Old driver reached the GitHub boundary with missing/mismatched artifact or unbound completed stage.",
+    "log_sha256": "b45f08147db21c1f49a8dfa6edbb12210ffa36f2dbd2ebf1d843629df194522d"
+  },
+  "green": {
+    "command": "python3 scripts/test-autoship-github-acceptance.py",
+    "passed": 7,
+    "failed": 0,
+    "log_sha256": "6ca638ae0f395c6b47b06e4bea81eb37c109c0256eba76624abf31d514b3be03"
+  },
+  "ci_contract": {
+    "verify": true,
+    "tests_passed": 18
+  },
+  "guarantees": [
+    "Version-2 checkpoints bind test artifact SHA-256 and byte length.",
+    "Completed stages bind the same artifact and exact log hash.",
+    "Legacy checkpoints and unbound stages refuse before any GitHub operation; historical files remain untouched.",
+    "Linux executable FD pins the tested inode across path replacement; in-place changes refuse dispatch.",
+    "Final result includes tested artifact identity."
+  ],
+  "limits": [
+    "Tests use a refusing GitHub executable and local subprocess fixtures; no repositories or PRs were created.",
+    "No claim of current-build remote merge, normal rollout, provider readiness, Discord coding or soak.",
+    "Historical archived acceptance repositories are not unarchived or relabeled as current proof."
+  ]
+}
