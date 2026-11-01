@@ -16,6 +16,17 @@ use std::{
 };
 
 const LIMIT: u64 = 64 * 1024 * 1024;
+/// Reference to one fully committed record, captured under its append lock.
+/// The record digest covers its exact JSON line without the trailing newline;
+/// the committed digest covers the complete log prefix through that newline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppendReceipt {
+    pub version: u32,
+    pub sequence: u64,
+    pub record_sha256: String,
+    pub committed_audit_sha256: String,
+}
 #[derive(Debug)]
 pub(crate) struct GenerationSealed;
 impl std::fmt::Display for GenerationSealed {
@@ -130,6 +141,9 @@ impl AnchoredAudit {
             "audit lock failed"
         );
         self.append_locked(record)
+    }
+    pub fn append_receipted(&self, _record: serde_json::Value) -> Result<AppendReceipt> {
+        bail!("audit append receipt is not implemented")
     }
     /// Validate without replaying uncertain records, then atomically prevent all
     /// future appends. The caller validates kernel quiescence while holding the
@@ -296,6 +310,63 @@ mod tests {
         )
         .unwrap();
         (dir, sink)
+    }
+    #[test]
+    fn append_receipt_keeps_each_concurrent_writer_bound_to_its_own_record() {
+        let (_directory, sink) = setup();
+        let workers: Vec<_> = (0..8).map(|worker| {
+            let sink = sink.clone();
+            std::thread::spawn(move || (worker, sink.append_receipted(serde_json::json!({"actor":"controller","kind":"native_launch_intent","worker":worker})).unwrap()))
+        }).collect();
+        let receipts: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        let bytes = fs::read(&sink.log).unwrap();
+        let lines: Vec<_> = bytes.split_inclusive(|byte| *byte==b'\n').collect();
+        assert_eq!(lines.len(), 8);
+        for (worker, receipt) in receipts {
+            assert_eq!(receipt.version, 1);
+            let index = usize::try_from(receipt.sequence-1).unwrap();
+            let line = lines[index];
+            let row: serde_json::Value = serde_json::from_slice(line).unwrap();
+            assert_eq!(row["worker"], worker);
+            assert_eq!(row["audit_chain"]["sequence"], receipt.sequence);
+            assert_eq!(receipt.record_sha256, digest(&line[..line.len()-1]));
+            assert_eq!(receipt.committed_audit_sha256, digest(&lines[..=index].concat()));
+        }
+    }
+    #[test]
+    fn append_receipt_identifies_the_new_record_after_recovering_a_pending_append() {
+        let (_directory, sink) = setup();
+        sink.append(serde_json::json!({"kind":"first"})).unwrap();
+        let mut anchor: Anchor = serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+        anchor.pending = Some("{\"kind\":\"recovered\"}\n".into());
+        sink.save(&anchor).unwrap();
+        private_open(&sink.log, true).unwrap().write_all(b"{\"kind\":").unwrap();
+        let receipt = sink.append_receipted(serde_json::json!({"kind":"new-launch"})).unwrap();
+        assert_eq!(receipt.sequence, 3);
+        let bytes = fs::read(&sink.log).unwrap();
+        let lines: Vec<_> = bytes.split_inclusive(|byte| *byte==b'\n').collect();
+        assert_eq!(lines.len(), 3);
+        let row: serde_json::Value = serde_json::from_slice(lines[2]).unwrap();
+        assert_eq!(row["kind"], "new-launch");
+        assert_eq!(receipt.record_sha256, digest(&lines[2][..lines[2].len()-1]));
+        assert_eq!(receipt.committed_audit_sha256, digest(&bytes));
+    }
+    #[test]
+    fn append_receipt_refuses_sealed_or_corrupt_authority_without_rewriting_it() {
+        for seal in [false, true] {
+            let (_directory, sink) = setup();
+            sink.append(serde_json::json!({"kind":"first"})).unwrap();
+            if seal {
+                sink.seal_for_recovery(|_| Ok(serde_json::json!({}))).unwrap();
+            } else {
+                let mut bytes = fs::read(&sink.log).unwrap();
+                bytes[2] ^= 1;
+                fs::write(&sink.log, bytes).unwrap();
+            }
+            let before = fs::read(&sink.log).unwrap();
+            assert!(sink.append_receipted(serde_json::json!({"kind":"late"})).is_err());
+            assert_eq!(fs::read(&sink.log).unwrap(), before);
+        }
     }
     #[test]
     fn recovery_seal_preserves_interrupted_tail_and_blocks_late_writers() {
