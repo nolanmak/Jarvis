@@ -1010,7 +1010,12 @@ async fn an_interrupted_answer_is_reported_without_a_retry_and_is_not_an_uncerta
     eventually("interruption reported", || h.answers(DM, None).len() == 1).await;
     assert_eq!(h.answers(DM, None)[0], INTERRUPTED_REPLY);
 
-    // Nothing re-ran it: no second agent call and no provider call at all.
+    // Nothing re-ran it: the inbound event is consumed, not requeued, and
+    // there is no second agent call and no provider call at all.
+    eventually("inbound event consumed", || {
+        h.inbound_status(&format!("{DM}:{stopped}")) == "handled"
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(agent.seen.lock().unwrap().len(), 1);
     assert!(provider.calls().is_empty());
