@@ -945,7 +945,7 @@ mod tests {
                 .unwrap();
         } else {
             ledger.db.execute_batch("ALTER TABLE native_authority_epoch RENAME TO previous_epoch;
-            CREATE TABLE native_authority_epoch(id INTEGER PRIMARY KEY,version INTEGER NOT NULL,epoch TEXT NOT NULL,root_identity_sha256 TEXT NOT NULL,ledger_identity_sha256 TEXT NOT NULL,state TEXT NOT NULL,origin TEXT NOT NULL);
+            CREATE TABLE native_authority_epoch(id INTEGER PRIMARY KEY,version INTEGER NOT NULL,epoch TEXT NOT NULL,root_identity_sha256 TEXT NOT NULL,ledger_identity_sha256 TEXT NOT NULL,state_lock_identity_sha256 TEXT NOT NULL,state TEXT NOT NULL,origin TEXT NOT NULL);
             INSERT INTO native_authority_epoch SELECT * FROM previous_epoch; DROP TABLE previous_epoch;").unwrap();
         }
         drop(ledger);

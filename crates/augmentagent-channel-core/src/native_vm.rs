@@ -111,8 +111,12 @@ impl StateLock {
     fn acquire(root:&Path) -> Result<Self> {
         let directory=root.symlink_metadata()?;
         ensure!(directory.is_dir() && !directory.file_type().is_symlink() && directory.uid()==unsafe{libc::geteuid()} && directory.mode() & 0o077==0,"native state root is not private");
-        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW).open(root.join("state.lock"))?;
+        let mut established=false;
+        for name in ["runtime-retirement.sqlite","authority-epoch.json"] {
+            match root.join(name).symlink_metadata() {Ok(_)=>established=true,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>(),Err(error)=>return Err(error.into())}
+        }
+        let file=std::fs::OpenOptions::new().read(true).write(true).create(!established).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(root.join("state.lock"))?;
         let info=file.metadata()?;
         ensure!(info.is_file() && info.uid()==unsafe{libc::geteuid()} && info.nlink()==1 && info.mode() & 0o077==0,"unsafe native state lock");
         ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX)}==0,"native state lock unavailable");
@@ -224,6 +228,9 @@ pub fn retire_owned_runtimes(audit_path:&Path, owner:&RuntimeOwner) -> Result<us
 }
 #[cfg(test)]
 fn retirement_db(root:&Path)->Result<rusqlite::Connection> {
+    // Legacy fixtures include the persistent lock created before the database.
+    let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(root.join("state.lock"))?;
+    file.sync_all()?;std::fs::File::open(root)?.sync_all()?;
     let path=root.join("runtime-retirement.sqlite");
     let file=std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)?;
     let info=file.metadata()?;

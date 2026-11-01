@@ -12,7 +12,7 @@ use std::{
 const DATABASE: &str = "runtime-retirement.sqlite";
 const MARKER: &str = "authority-epoch.json";
 const BOOTSTRAP: &str = "authority-bootstrap.json";
-const EPOCH_SCHEMA: &str = "CREATE TABLE native_authority_epoch(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,epoch TEXT NOT NULL,root_identity_sha256 TEXT NOT NULL,ledger_identity_sha256 TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('initializing','active')),origin TEXT NOT NULL CHECK(origin IN ('fresh','legacy')))";
+const EPOCH_SCHEMA: &str = "CREATE TABLE native_authority_epoch(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,epoch TEXT NOT NULL,root_identity_sha256 TEXT NOT NULL,ledger_identity_sha256 TEXT NOT NULL,state_lock_identity_sha256 TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('initializing','active')),origin TEXT NOT NULL CHECK(origin IN ('fresh','legacy')))";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +21,7 @@ pub(super) struct StoreIdentity {
     pub epoch: String,
     pub root_identity_sha256: String,
     pub ledger_identity_sha256: String,
+    pub state_lock_identity_sha256: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,7 +177,7 @@ fn epoch_row(db: &rusqlite::Connection) -> Result<Option<(StoreIdentity, String,
             == 1,
         R::PreparedCorrupt
     );
-    let row=db.query_row("SELECT version,epoch,root_identity_sha256,ledger_identity_sha256,state,origin FROM native_authority_epoch WHERE id=1",[],|row|Ok((StoreIdentity {version:row.get(0)?,epoch:row.get(1)?,root_identity_sha256:row.get(2)?,ledger_identity_sha256:row.get(3)?},row.get::<_,String>(4)?,row.get::<_,String>(5)?))).optional()?;
+    let row=db.query_row("SELECT version,epoch,root_identity_sha256,ledger_identity_sha256,state_lock_identity_sha256,state,origin FROM native_authority_epoch WHERE id=1",[],|row|Ok((StoreIdentity {version:row.get(0)?,epoch:row.get(1)?,root_identity_sha256:row.get(2)?,ledger_identity_sha256:row.get(3)?,state_lock_identity_sha256:row.get(4)?},row.get::<_,String>(5)?,row.get::<_,String>(6)?))).optional()?;
     let (value, state, origin) = row.context(R::PreparedCorrupt)?;
     ensure!(
         value.version == 1
@@ -190,6 +191,7 @@ fn epoch_row(db: &rusqlite::Connection) -> Result<Option<(StoreIdentity, String,
 pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection> {
     lock_matches(root, lock)?;
     let root_hash = identity(&root.metadata()?)?;
+    let lock_hash = identity(&lock.0.metadata()?)?;
     let marker: Option<StoreIdentity> = optional(root, MARKER)?;
     let bootstrap: Option<Bootstrap> = optional(root, BOOTSTRAP)?;
     if let Some(intent) = &bootstrap {
@@ -237,7 +239,8 @@ pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection
             value.version == 1
                 && canonical_uuid(&value.epoch)
                 && value.root_identity_sha256 == root_hash
-                && value.ledger_identity_sha256 == ledger_hash,
+                && value.ledger_identity_sha256 == ledger_hash
+                && value.state_lock_identity_sha256 == lock_hash,
             R::PreparedCorrupt
         );
     }
@@ -260,7 +263,9 @@ pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection
     let prior = epoch_row(&db)?;
     let value = if let Some((value, state, _origin)) = prior {
         ensure!(
-            value.root_identity_sha256 == root_hash && value.ledger_identity_sha256 == ledger_hash,
+            value.root_identity_sha256 == root_hash
+                && value.ledger_identity_sha256 == ledger_hash
+                && value.state_lock_identity_sha256 == lock_hash,
             R::PreparedCorrupt
         );
         if let Some(marker) = &marker {
@@ -291,16 +296,18 @@ pub(super) fn open(root: &Path, lock: &StateLock) -> Result<rusqlite::Connection
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             root_identity_sha256: root_hash,
             ledger_identity_sha256: ledger_hash,
+            state_lock_identity_sha256: lock_hash,
         };
         let tx = db.unchecked_transaction()?;
         tx.execute_batch(EPOCH_SCHEMA)?;
         tx.execute(
-            "INSERT INTO native_authority_epoch VALUES(1,?1,?2,?3,?4,'initializing',?5)",
+            "INSERT INTO native_authority_epoch VALUES(1,?1,?2,?3,?4,?5,'initializing',?6)",
             rusqlite::params![
                 value.version,
                 value.epoch,
                 value.root_identity_sha256,
                 value.ledger_identity_sha256,
+                value.state_lock_identity_sha256,
                 origin
             ],
         )?;
@@ -327,7 +334,8 @@ pub(super) fn activate(root: &Path, lock: &StateLock, db: &rusqlite::Connection)
     ensure!(
         value == marker
             && value.root_identity_sha256 == identity(&root.metadata()?)?
-            && value.ledger_identity_sha256 == identity(&root.join(DATABASE).symlink_metadata()?)?,
+            && value.ledger_identity_sha256 == identity(&root.join(DATABASE).symlink_metadata()?)?
+            && value.state_lock_identity_sha256 == identity(&lock.0.metadata()?)?,
         R::PreparedCorrupt
     );
     db.execute(
