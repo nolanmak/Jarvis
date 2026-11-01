@@ -6326,6 +6326,14 @@ async fn gh_json(repo_root: &Path, endpoint: &str) -> serde_json::Value {
     }
 }
 
+async fn recovered_revision_diff(worktree:&Path)->Result<String> {
+    // These edits predate integration. Compare against their own committed PR
+    // head; newer main changes are checked after normal integration, not charged
+    // to the interrupted editor as apparent deletions or reversions here.
+    let (ok,diff,error)=run("git",&["diff","--cached","HEAD"],worktree).await?;
+    anyhow::ensure!(ok,"cannot inspect recovered edits: {error}");Ok(diff)
+}
+
 /// Resume a sitting draft PR (#866): re-review it against today's `main`,
 /// revise against fresh findings, and merge on a double LGTM.
 ///
@@ -6539,8 +6547,7 @@ async fn resume_draft_pr(
         }
         let (staged, _, error) = run("git", &["add", "-A"], &worktree).await?;
         anyhow::ensure!(staged, "cannot stage recovered edits: {error}");
-        let (diff_ok, recovered_diff, _) = run("git", &["diff", "--cached", "origin/main"], &worktree).await?;
-        anyhow::ensure!(diff_ok, "cannot inspect recovered edits");
+        let recovered_diff = recovered_revision_diff(&worktree).await?;
         anyhow::ensure!(blast_radius_hit_in_diff(&recovered_diff).is_none(), "recovered edits touch a guarded path");
         let (_, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
         for file in staged_names.lines() {
@@ -11992,6 +11999,70 @@ mod progress_tests;
 
 #[cfg(test)]
 mod tests {
+    async fn recovered_git(root:&Path,args:&[&str])->String {
+        let out=tokio::process::Command::new("/usr/bin/git")
+            .args(["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null"])
+            .args(args).current_dir(root).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+        assert!(out.status.success(),"fixture Git failed: {}",String::from_utf8_lossy(&out.stderr));String::from_utf8(out.stdout).unwrap()
+    }
+    async fn recovered_revision_fixture()->tempfile::TempDir {
+        let root=tempfile::tempdir().unwrap();let p=root.path();
+        recovered_git(p,&["init","-q","-b","main"]).await;
+        std::fs::create_dir_all(p.join(".github/workflows")).unwrap();
+        std::fs::write(p.join(".github/workflows/ci.yml"),"name: initial\n").unwrap();
+        std::fs::write(p.join("safe.txt"),"original behavior\n").unwrap();
+        recovered_git(p,&["add","."]).await;recovered_git(p,&["commit","-qm","initial"]).await;
+        recovered_git(p,&["checkout","-qb","candidate"]).await;
+        std::fs::write(p.join("safe.txt"),"candidate behavior\n").unwrap();
+        recovered_git(p,&["add","."]).await;recovered_git(p,&["commit","-qm","original PR change"]).await;
+        recovered_git(p,&["checkout","-q","main"]).await;
+        std::fs::write(p.join(".github/workflows/ci.yml"),"name: newer-main\n").unwrap();
+        std::fs::write(p.join("Cargo.lock"),"synthetic newer-main lock\n").unwrap();
+        recovered_git(p,&["add","."]).await;recovered_git(p,&["commit","-qm","unrelated main maintenance"]).await;
+        recovered_git(p,&["update-ref","refs/remotes/origin/main","HEAD"]).await;
+        recovered_git(p,&["checkout","-q","candidate"]).await;
+        std::fs::create_dir_all(p.join("autoship_verifiers")).unwrap();
+        std::fs::create_dir_all(p.join("crates/example/src/bin")).unwrap();
+        std::fs::write(p.join("autoship_verifiers/observe.py"),"print('synthetic observed data')\n").unwrap();
+        std::fs::write(p.join("crates/example/src/bin/autoship_case.rs"),"fn main(){}\n").unwrap();
+        recovered_git(p,&["add","."]).await;root
+    }
+    #[tokio::test]
+    async fn recovered_revision_ignores_unrelated_main_changes_and_preserves_them_on_merge() {
+        let root=recovered_revision_fixture().await;let p=root.path();
+        let diff=recovered_revision_diff(p).await.unwrap();
+        assert!(blast_radius_hit_in_diff(&diff).is_none(),"unrelated newer main files were misclassified as recovered edits");
+        assert!(diff.contains("autoship_verifiers/observe.py") && diff.contains("crates/example/src/bin/autoship_case.rs"));
+        assert!(!diff.contains(".github/workflows") && !diff.contains("Cargo.lock"));
+        recovered_git(p,&["commit","-qm","checkpoint recovered adapters"]).await;
+        recovered_git(p,&["merge","--no-edit","origin/main"]).await;
+        assert_eq!(std::fs::read_to_string(p.join(".github/workflows/ci.yml")).unwrap(),"name: newer-main\n");
+        assert_eq!(std::fs::read_to_string(p.join("Cargo.lock")).unwrap(),"synthetic newer-main lock\n");
+        let final_diff=recovered_git(p,&["diff","origin/main","HEAD"]).await;
+        assert!(blast_radius_hit_in_diff(&final_diff).is_none(),"post-integration full PR guard must still apply");
+        assert!(final_diff.contains("candidate behavior") && final_diff.contains("autoship_verifiers/observe.py"));
+    }
+    #[tokio::test]
+    async fn recovered_revision_still_reports_actual_guarded_edits_without_discarding_them() {
+        let root=recovered_revision_fixture().await;let p=root.path();
+        std::fs::write(p.join(".github/workflows/ci.yml"),"name: unauthorized recovered change\n").unwrap();
+        recovered_git(p,&["add","."]).await;
+        assert!(blast_radius_hit_in_diff(&recovered_revision_diff(p).await.unwrap()).is_some());
+        assert_eq!(std::fs::read_to_string(p.join(".github/workflows/ci.yml")).unwrap(),"name: unauthorized recovered change\n");
+        assert!(recovered_git(p,&["diff","--cached","--name-only","HEAD"]).await.contains(".github/workflows/ci.yml"));
+    }
+    #[tokio::test]
+    async fn recovered_revision_keeps_final_guard_for_preexisting_guarded_pr_changes() {
+        let root=recovered_revision_fixture().await;let p=root.path();
+        std::fs::create_dir(p.join("private")).unwrap();std::fs::write(p.join("private/auth.rs"),"synthetic protected PR change\n").unwrap();
+        recovered_git(p,&["add","."]).await;recovered_git(p,&["commit","-qm","original protected PR content"]).await;
+        std::fs::write(p.join("autoship_verifiers/second.py"),"print('another observation')\n").unwrap();
+        recovered_git(p,&["add","."]).await;
+        assert!(blast_radius_hit_in_diff(&recovered_revision_diff(p).await.unwrap()).is_none(),"ordinary recovered adapter should remain checkpointable");
+        recovered_git(p,&["commit","-qm","checkpoint ordinary adapter"]).await;recovered_git(p,&["merge","--no-edit","origin/main"]).await;
+        assert!(blast_radius_hit_in_diff(&recovered_git(p,&["diff","origin/main","HEAD"]).await).is_some(),"final PR guard lost the original protected change");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn queued_command_wakes_sleeping_worker_without_waiting_for_normal_tick() {
         use super::*;

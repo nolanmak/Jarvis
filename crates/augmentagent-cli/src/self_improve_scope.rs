@@ -265,11 +265,55 @@ fn response_key(purpose:&str,epoch:&str,contract:&str,correction:bool,attempt:u3
     if correction {amendment::digest(serde_json::to_string(&("completed-contract-correction-v1",original)).unwrap().as_bytes())}
     else {amendment::digest(original.as_bytes())}
 }
+#[derive(Debug)]
+struct CompletedContract<T> {value:T,repair:Option<ProposalFramingRepair>}
+#[derive(Debug)]
+struct ProposalFramingRepair {original_sha256:String,recovered_sha256:String,removed_byte_offset:usize,response:String}
+fn validate_completed_contract<T>(raw:&str,validate:impl Fn(&str)->Result<T>)->Result<CompletedContract<T>> {
+    let problem=match validate(raw) {Ok(value)=>return Ok(CompletedContract {value,repair:None}),Err(problem)=>problem};
+    let Some(repair)=surplus_contract_closer(raw) else{return Err(problem)};
+    // The strict validator, including original requirements and every semantic
+    // constraint, runs again. Nothing inside the decoded object is rewritten.
+    let value=validate(&repair.response)?;
+    Ok(CompletedContract {value,repair:Some(repair)})
+}
+fn surplus_contract_closer(raw:&str)->Option<ProposalFramingRepair> {
+    if raw.len()>2*1024*1024 {return None;}
+    let marker="```autoship-contract\n";let mut markers=raw.match_indices(marker);
+    let (start,_)=markers.next()?;if markers.next().is_some() {return None;}
+    let body_start=start+marker.len();let body=&raw[body_start..];
+    let mut decoder=serde_json::Deserializer::from_str(body);
+    // Typed decoding rejects unknown/duplicate typed fields and incomplete JSON.
+    // It also locates the end without treating braces or fences in strings as framing.
+    let _:ContractProposal=serde::Deserialize::deserialize(&mut decoder).ok()?;
+    let consumed=decoder.into_iter::<serde::de::IgnoredAny>().byte_offset();
+    let tail=body.get(consumed..)?;let trimmed=tail.trim_start();
+    let after_closer=trimmed.strip_prefix('}')?;
+    let after_fence=after_closer.trim_start().strip_prefix("```")?;
+    if !after_fence.trim().is_empty() {return None;}
+    let offset=body_start+consumed+tail.len()-trimmed.len();
+    let mut response=raw.to_owned();if response.remove(offset)!='}' {return None;}
+    Some(ProposalFramingRepair {original_sha256:amendment::digest(raw.as_bytes()),
+        recovered_sha256:amendment::digest(response.as_bytes()),removed_byte_offset:offset,response})
+}
+fn record_completed_contract<T>(workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,completed:CompletedContract<T>)->Result<T> {
+    if let Some(repair)=completed.repair {
+        let audit=workflow.audit_logger();workflow.validate_before_side_effect()?;
+        audit.record_controller(serde_json::json!({"version":1,"actor":"controller","kind":"scope_contract_framing_recovered",
+            "workflow":workflow.id(),"workflow_binding":workflow.binding(),"purpose":purpose,"scope_epoch_sha256":amendment::digest(epoch.as_bytes()),
+            "repair_rule":"one-surplus-root-closer-v1","original_response_sha256":repair.original_sha256,
+            "recovered_response_sha256":repair.recovered_sha256,"removed_byte_offset":repair.removed_byte_offset,"additional_model_calls":0}))?;
+        workflow.validate_before_side_effect()?;
+    }
+    Ok(completed.value)
+}
 /// Read completed historical replies only, through the current workflow fence.
 /// The caller must validate them against the full current requirements. This
 /// cannot generate another response or rewrite any previous response slot.
 pub(super) fn cached_persistent<T>(workflow:&workflow::WorkflowGuard,purpose:&str,epoch:&str,validate:impl Fn(&str)->Result<T>)->Result<Option<T>> {
-    cached_completed_generation(|correction,attempt|workflow.scope_stage_response(&response_key(purpose,epoch,&workflow.binding().contract,correction,attempt)),validate)
+    let completed=cached_completed_generation(|correction,attempt|workflow.scope_stage_response(&response_key(purpose,epoch,&workflow.binding().contract,correction,attempt)),
+        |raw|validate_completed_contract(raw,&validate))?;
+    completed.map(|completed|record_completed_contract(workflow,purpose,epoch,completed)).transpose()
 }
 /// Persist completed model output before parsing/side effects. Provider or
 /// infrastructure errors do not consume the bounded *completed-response*
@@ -281,8 +325,10 @@ pub(super) async fn persistent<T>(root:&Path,workflow:&workflow::WorkflowGuard,p
     };
     let generate=|request:String|async move {workflow.check_resource_policy()?;let raw=run_inner(root,workflow.repository(),workflow,&request,contract).await?;workflow.audit_health().await?;Ok(raw)};
     if contract {
-        recoverable_contract_generation(prompt,|correction,attempt|workflow.scope_stage_response(&key(correction,attempt)),
-            |correction,attempt,raw|workflow.record_scope_stage_response(&key(correction,attempt),raw),generate,validate).await
+        let completed=recoverable_contract_generation(prompt,|correction,attempt|workflow.scope_stage_response(&key(correction,attempt)),
+            |correction,attempt,raw|workflow.record_scope_stage_response(&key(correction,attempt),raw),generate,
+            |raw|validate_completed_contract(raw,&validate)).await?;
+        record_completed_contract(workflow,purpose,epoch,completed)
     } else {
         recoverable_generation(prompt,|attempt|workflow.scope_stage_response(&key(false,attempt)),
             |attempt,raw|workflow.record_scope_stage_response(&key(false,attempt),raw),generate,validate).await
@@ -332,6 +378,139 @@ where R:Fn(bool,u32)->Result<Option<String>>,W:Fn(bool,u32,&str)->Result<()>,G:F
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn framing_fixture()->(String,String) {
+        let example=CONTRACT_PROMPT.split_once("Complete schema example:\n").unwrap().1.split_once("\nEnd schema example.").unwrap().0;
+        (format!("```autoship-contract\n{example}\n```"),format!("```autoship-contract\n{example}}}\n```"))
+    }
+    #[tokio::test]
+    async fn completed_contract_framing_recovers_cached_surplus_closer_without_new_calls_or_slot_rewrites() {
+        let (valid,malformed)=framing_fixture();
+        let strict=|raw:&str|parse_proposal_for(raw,AcceptanceSource::PullRequest(841));
+        assert!(strict(&malformed).is_err(),"strict parser must continue rejecting the original malformed reply");
+        let saved=BTreeMap::from([((false,0),malformed.clone()),((false,1),malformed.clone()),((true,0),malformed.clone()),((true,1),malformed.clone())]);
+        let accepted=recoverable_contract_generation("preserve every original requirement",|correction,attempt|Ok(saved.get(&(correction,attempt)).cloned()),
+            |_,_,_|panic!("framing recovery must not replace completed responses"),|_|async{panic!("saved recoverable reply must not dispatch another model")},
+            |raw|validate_completed_contract(raw,&strict)).await.unwrap();
+        assert_eq!(serde_json::to_value(accepted.value).unwrap(),serde_json::to_value(strict(&valid).unwrap()).unwrap());
+        let repair=accepted.repair.expect("accepted framing recovery requires an explicit receipt");
+        assert_eq!(repair.response,valid);assert_eq!(repair.original_sha256,amendment::digest(malformed.as_bytes()));
+        assert_eq!(repair.recovered_sha256,amendment::digest(valid.as_bytes()));
+        assert_eq!(&malformed[repair.removed_byte_offset..repair.removed_byte_offset+1],"}");
+        assert_eq!(saved.len(),4);assert!(saved.values().all(|raw|raw==&malformed));
+    }
+    #[test]
+    fn completed_contract_framing_keeps_strict_rejection_for_ambiguous_or_changed_semantics() {
+        let (valid,_)=framing_fixture();let marker="```autoship-contract\n";
+        let body=valid.strip_prefix(marker).unwrap().strip_suffix("\n```").unwrap();
+        for suffix in ["}}\n```","}\n{}\n```","}\n```\nextra","}\n```autoship-contract\n{}\n```","\n{}\n```"] {
+            let raw=format!("{marker}{body}{suffix}");
+            assert!(validate_completed_contract(&raw,|raw|parse_proposal_for(raw,AcceptanceSource::PullRequest(841))).is_err(),"accepted ambiguous suffix: {suffix}");
+        }
+        let wrong=|raw:&str|->Result<ContractProposal>{let proposal=parse_proposal_for(raw,AcceptanceSource::Issue(840))?;Ok(proposal)};
+        assert!(validate_completed_contract(&format!("{marker}{body}}}\n```"),wrong).is_err(),"framing recovery changed source authority");
+        let wrong_requirement=|raw:&str|->Result<ContractProposal>{let proposal=parse_proposal_for(raw,AcceptanceSource::PullRequest(841))?;
+            ensure!(proposal.contract.criteria[0].requirement=="a different full owner requirement","original requirement mismatch");Ok(proposal)};
+        assert!(validate_completed_contract(&format!("{marker}{body}}}\n```"),wrong_requirement).is_err(),"framing recovery bypassed the full requirements validator");
+    }
+    #[test]
+    fn completed_contract_framing_preserves_every_byte_inside_unicode_pinned_source() {
+        let (valid,_)=framing_fixture();let marker="```autoship-contract\n";
+        let mut value:serde_json::Value=serde_json::from_str(valid.strip_prefix(marker).unwrap().strip_suffix("\n```").unwrap()).unwrap();
+        let script=format!("{}\n# α }} ```autoship-contract\n# literal \\n stays literal\n",value["files"]["autoship_verifiers/observe.py"].as_str().unwrap());
+        value["files"]["autoship_verifiers/observe.py"]=script.clone().into();
+        let valid=format!("{marker}{value}\n```");let malformed=format!("{marker}{value}}}\n```");
+        let accepted=validate_completed_contract(&malformed,|raw|parse_proposal_for(raw,AcceptanceSource::PullRequest(841))).unwrap();
+        assert_eq!(accepted.value.files["autoship_verifiers/observe.py"],script);
+        let repair=accepted.repair.unwrap();assert_eq!(repair.response,valid);
+        assert_eq!(malformed.len(),repair.response.len()+1);
+    }
+    #[test]
+    fn completed_contract_framing_cannot_recover_unknown_or_duplicate_typed_fields() {
+        let (valid,_)=framing_fixture();let marker="```autoship-contract\n";
+        let mut value:serde_json::Value=serde_json::from_str(valid.strip_prefix(marker).unwrap().strip_suffix("\n```").unwrap()).unwrap();
+        let duplicate=format!("{{\"contract\":{},\"contract\":{},\"files\":{}}}",value["contract"],value["contract"],value["files"]);
+        value["grant_shipping_authority"]=true.into();
+        for body in [duplicate,value.to_string()] {
+            assert!(validate_completed_contract(&format!("{marker}{body}}}\n```"),|raw|parse_proposal_for(raw,AcceptanceSource::PullRequest(841))).is_err());
+        }
+    }
+    #[test]
+    #[ignore = "requires explicit private completed-response input and a new receipt path; no provider or verifier execution"]
+    fn completed_contract_framing_private_replay() -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Input {issue:u64,responses:Vec<Row>}
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Row {key:String,response:String}
+        let input=PathBuf::from(std::env::var("AUTOSHIP_PROPOSAL_REPLAY_INPUT")?);
+        let output=PathBuf::from(std::env::var("AUTOSHIP_PROPOSAL_REPLAY_RECEIPT")?);
+        ensure!(input.is_absolute() && output.is_absolute() && input!=output,"explicit distinct diagnostic paths required");
+        ensure!(std::fs::metadata(&input)?.len()<=8*1024*1024,"diagnostic input exceeds bound");
+        let input:Input=serde_json::from_slice(&std::fs::read(input)?)?;
+        ensure!(input.issue>0 && !input.responses.is_empty() && input.responses.len()<=64,"invalid replay selection");
+        let mut rows=Vec::new();let mut accepted=0;
+        for row in input.responses {
+            let result=validate_completed_contract(&row.response,|raw|parse_proposal_for(raw,AcceptanceSource::Issue(input.issue)));
+            match result {
+                Ok(completed)=>{
+                    accepted+=1;
+                    rows.push(serde_json::json!({"key":row.key,"accepted":true,"original_sha256":amendment::digest(row.response.as_bytes()),
+                        "recovery":completed.repair.as_ref().map(|p|serde_json::json!({"recovered_sha256":p.recovered_sha256,"removed_byte_offset":p.removed_byte_offset})),
+                        "pinned_files":completed.value.files.iter().map(|(path,bytes)|serde_json::json!({"path":path,"sha256":amendment::digest(bytes.as_bytes())})).collect::<Vec<_>>()}));
+                },
+                Err(error)=>rows.push(serde_json::json!({"key":row.key,"accepted":false,"original_sha256":amendment::digest(row.response.as_bytes()),"reason":format!("{error:#}")})),
+            }
+        }
+        let receipt=serde_json::json!({"version":1,"kind":"completed-contract-framing-private-replay","issue":input.issue,
+            "controller_source_sha256":amendment::digest(include_str!("self_improve_scope.rs").as_bytes()),"accepted":accepted,"total":rows.len(),"rows":rows,
+            "additional_model_calls":0,"owner_requirements_verified":false,"baseline_behavior_verified":false,"shipping_authority":false});
+        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(output)?;
+        file.write_all(&serde_json::to_vec_pretty(&receipt)?)?;file.sync_all()?;
+        ensure!(accepted>0,"no saved proposal passed strict source/schema validation after framing recovery");
+        println!("Private replay: {accepted} accepted; no model calls or behavioral/shipping authority.");Ok(())
+    }
+    #[tokio::test]
+    async fn completed_contract_framing_receipt_is_protected_and_original_slot_remains_immutable() {framing_receipt_fixture(false).await;}
+    #[tokio::test]
+    async fn completed_contract_framing_receipt_failure_cannot_return_a_recovered_proposal() {framing_receipt_fixture(true).await;}
+    async fn framing_receipt_fixture(failed:bool) {
+        let repo=tempfile::tempdir().unwrap();
+        // Managed tests place TMPDIR under the builder cache; protected audit
+        // state must remain outside that entire admitted writable root.
+        let control=tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(repo.path().join("implementation.py"),"def add(a,b): return a-b\n").unwrap();
+        for args in [vec!["init","-q"],vec!["add","."],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","initial"],vec!["update-ref","refs/remotes/origin/main","HEAD"]] {
+            let out=tokio::process::Command::new("/usr/bin/git").args(args).current_dir(repo.path()).env_clear().env("PATH","/usr/bin:/bin").output().await.unwrap();
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        }
+        let database=control.path().join("workflow.db");
+        let guard=workflow::WorkflowGuard::acquire_fixture(&database,workflow::Start {repo_root:repo.path(),worktree:repo.path(),
+            repository:"owner/repo",source_issue:None,pr:Some(841),branch:"fixture",contract:"full original requirements",environment:"fixture"}).await.unwrap().unwrap();
+        let (_,malformed)=framing_fixture();let key=response_key("fixture-contract","original-epoch",&guard.binding().contract,false,0);
+        guard.record_scope_stage_response(&key,&malformed).unwrap();let audit=guard.audit_logger();
+        // Interrupt a registered writer after completed validation, before
+        // receipt publication. Neither recovery nor a replay can clear it.
+        let completed=failed.then(||validate_completed_contract(&malformed,|raw|parse_proposal_for(raw,AcceptanceSource::PullRequest(841))).unwrap());
+        if failed {drop(audit.begin_write().unwrap());}
+        let result=if let Some(completed)=completed {record_completed_contract(&guard,"fixture-contract","original-epoch",completed).map(Some)}
+            else {cached_persistent(&guard,"fixture-contract","original-epoch",|raw|parse_proposal_for(raw,AcceptanceSource::PullRequest(841)))};
+        let readonly=augmentagent_store::rusqlite::Connection::open_with_flags(&database,augmentagent_store::rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let original:String=readonly.query_row("SELECT response FROM scope_stage_response WHERE workflow=?1 AND key=?2",[guard.id(),key.as_str()],|row|row.get(0)).unwrap();
+        assert_eq!(original,malformed);drop(readonly);
+        assert_eq!(crate::autoship_workflow::WorkflowStore::open(&database).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,0);
+        if failed {assert!(result.is_err(),"failed protected receipt returned an accepted recovery");}
+        else {
+            assert!(result.unwrap().is_some());audit.protected_health().unwrap();
+            let rows:Vec<serde_json::Value>=std::fs::read_to_string(audit.path()).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+            let row=rows.iter().find(|row|row["kind"]=="scope_contract_framing_recovered").expect("recovery has no protected controller receipt");
+            assert_eq!(row["original_response_sha256"],amendment::digest(malformed.as_bytes()));
+            assert_eq!(row["repair_rule"],"one-surplus-root-closer-v1");assert_eq!(row["additional_model_calls"],0);
+        }
+        drop(guard);
+    }
     #[test]
     fn cached_completed_contract_revalidates_all_slots_without_generation() {
         let visited=std::sync::Mutex::new(Vec::new());
