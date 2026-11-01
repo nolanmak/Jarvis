@@ -2701,6 +2701,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_guard_installs_native_launch_journal_before_provider_binding() {
+        let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
+        let guard=WorkflowGuard::acquire_at(&path,Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",
+            source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"},millis()).await.unwrap().unwrap();
+        assert!(guard.audit_logger().set_native_launch_observer(Arc::new(|_|Ok(()))).is_err(),
+            "guard returned without installing its native launch journal");
+        assert!(guard.store.lock().unwrap().native_owner_binding(guard.id(),guard.lease.generation).unwrap().is_none(),
+            "legacy owner must not be backfilled from current policy");
+    }
+
+    #[tokio::test]
     async fn component_budget_is_consumed_only_at_actual_native_admission() {
         let dir=repo();let control=control_dir();let path=control.path().join("workflow.db");
         let guard=WorkflowGuard::acquire_at(&path,Start{repo_root:dir.path(),worktree:dir.path(),repository:"owner/repo",source_issue:Some(77),pr:None,branch:"fixture",contract:"C1",environment:"test"},millis()).await.unwrap().unwrap();

@@ -90,6 +90,13 @@ fn indexed(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedRecord> {
 const COLUMNS: &str="record,intent_id,workflow,sequence,lease_generation,provider,runtime_relative_path,native_session";
 
 impl WorkflowStore {
+    /// Verify the original protected controller record before journaling it.
+    pub fn record_verified_native_launch(&mut self, _lease:&Lease, _binding:&Binding,
+        _audit:&augmentagent_channel_core::AuditLogger,
+        _prepared:&augmentagent_channel_core::native_vm::PreparedLaunchRecord,
+        _now:i64)->Result<NativeLaunchRecord> {
+        anyhow::bail!("verified native launch bridge not implemented")
+    }
     /// Persist before releasing a native prompt. This records a launch intent,
     /// including a missing provider ID, without declaring runtime certainty.
     pub fn record_native_launch_intent(&mut self, lease: &Lease, binding: &Binding,
@@ -159,6 +166,9 @@ mod tests {
 
     // These are workflow metadata fixtures, not verified physical native stores.
     fn setup(path: &Path, workflow: &str, bound: bool) -> (WorkflowStore, Lease, Binding) {
+        setup_at_audit(path,workflow,bound,"/private/source-audit")
+    }
+    fn setup_at_audit(path:&Path, workflow:&str, bound:bool, audit:&str)->(WorkflowStore,Lease,Binding) {
         let mut store = WorkflowStore::open(path).unwrap();
         let binding = Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
         store.register(workflow,"candidate",binding.clone(),1).unwrap();
@@ -169,10 +179,70 @@ mod tests {
                 "store":{"version":1,"epoch":"e7c8c03c-03ca-4994-8a9c-d76a359f729b",
                     "root_identity_sha256":"a".repeat(64),"ledger_identity_sha256":"b".repeat(64),
                     "state_lock_identity_sha256":"c".repeat(64)}})).unwrap();
-            store.register_initial_native_owner(&lease,&binding,"/private/source-audit",&native,3).unwrap();
-        } else {store.register_native_owner(&lease,"/private/source-audit",3).unwrap();}
+            store.register_initial_native_owner(&lease,&binding,audit,&native,3).unwrap();
+        } else {store.register_native_owner(&lease,audit,3).unwrap();}
         (store,lease,binding)
     }
+    // Real protected audit bytes with synthetic workflow/store metadata: this
+    // exercises the bridge, not a provider launch or physical-store authority.
+    fn protected_launch(root:&Path, bound:bool)->(WorkflowStore,Lease,Binding,augmentagent_channel_core::AuditLogger,
+        augmentagent_channel_core::native_vm::PreparedLaunchRecord) {
+        for name in ["logs","anchors"] {std::fs::create_dir(root.join(name)).unwrap();}
+        let audit=augmentagent_channel_core::AuditLogger::protected(root.join("logs/native.jsonl"),root.join("anchors/native.json"),&[]).unwrap();
+        let (store,lease,binding)=setup_at_audit(&root.join("workflow.db"),"owner/repo/pr/7",bound,audit.path().to_str().unwrap());
+        let source_owner=RuntimeOwner {workflow_id:lease.workflow.clone(),lease_generation:lease.generation};
+        audit.set_native_runtime_owner(source_owner.clone()).unwrap();
+        let intent=augmentagent_channel_core::native_vm::PreparedLaunchIntent {version:1,
+            intent_id:uuid::Uuid::new_v4().to_string(),source_owner,source_audit_path:audit.path().into(),
+            provider:"codex".into(),runtime_relative_path:"codex/session-first".into(),native_session_id:None,
+            launch_sha256:"a".repeat(64),creation_receipt_sha256:"b".repeat(64)};
+        let mut row=serde_json::to_value(&intent).unwrap();row["actor"]="controller".into();row["kind"]="native_launch_intent".into();
+        let controller_receipt=audit.record_controller_receipted(row).unwrap();
+        (store,lease,binding,audit,augmentagent_channel_core::native_vm::PreparedLaunchRecord {intent,controller_receipt})
+    }
+    #[test]
+    fn native_launch_bridge_verifies_exact_audit_record_and_persists_nullable_id() {
+        let root=tempfile::tempdir().unwrap();
+        let (mut store,lease,binding,audit,prepared)=protected_launch(root.path(),true);
+        let first=store.record_verified_native_launch(&lease,&binding,&audit,&prepared,4).unwrap();
+        assert_eq!(first.intent.controller_receipt,Some(prepared.controller_receipt.clone()));
+        assert_eq!(first.intent.native_session_id,None);assert_eq!(first.source_owner,prepared.intent.source_owner);
+        assert_eq!(store.record_verified_native_launch(&lease,&binding,&audit,&prepared,5).unwrap(),first);
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap().model_calls,0);
+        drop(store);let store=WorkflowStore::open(&root.path().join("workflow.db")).unwrap();
+        assert_eq!(store.native_launch_intents(&lease.workflow).unwrap(),vec![first]);
+    }
+    #[test]
+    fn native_launch_bridge_rejects_receipts_for_changed_launch_owner_or_candidate() {
+        for mode in ["intent","owner","audit","provider","version","hash","receipt","candidate"] {
+            let root=tempfile::tempdir().unwrap();
+            let (mut store,lease,mut binding,audit,mut prepared)=protected_launch(root.path(),true);
+            match mode {
+                "intent"=>prepared.intent.intent_id=uuid::Uuid::new_v4().to_string(),
+                "owner"=>prepared.intent.source_owner.lease_generation+=1,
+                "audit"=>prepared.intent.source_audit_path=root.path().join("foreign-audit"),
+                "provider"=>prepared.intent.provider="claude".into(),
+                "version"=>prepared.intent.version=2,
+                "hash"=>prepared.intent.launch_sha256="c".repeat(64),
+                "receipt"=>prepared.controller_receipt.record_sha256="c".repeat(64),
+                "candidate"=>binding.head="changed".into(),
+                _=>unreachable!(),
+            }
+            assert!(store.record_verified_native_launch(&lease,&binding,&audit,&prepared,4).is_err(),"accepted {mode}");
+            assert!(store.native_launch_intents(&lease.workflow).unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn native_launch_bridge_refuses_missing_original_binding_and_stale_lease() {
+        for bound in [false,true] {
+            let root=tempfile::tempdir().unwrap();
+            let (mut store,lease,binding,audit,prepared)=protected_launch(root.path(),bound);
+            if bound {store.claim(&lease.workflow,"replacement",200,100).unwrap().unwrap();}
+            assert!(store.record_verified_native_launch(&lease,&binding,&audit,&prepared,if bound {201}else{4}).is_err());
+            assert!(store.native_launch_intents(&lease.workflow).unwrap().is_empty());
+        }
+    }
+
     fn intent(id: u128) -> NativeLaunchIntent {
         NativeLaunchIntent {intent_id:uuid::Uuid::from_u128(id).to_string(),provider:submission::Provider::Codex,
             runtime_relative_path:"codex/session-first".into(),native_session_id:None,
