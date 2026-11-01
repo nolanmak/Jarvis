@@ -52,7 +52,8 @@
     "full_core_failed": 0,
     "full_core_ignored": 14,
     "full_core_log_sha256": "2b659eaf740fef0ab6cefbbfc9a0aff37555024056b2307b987d0898cb0b56f3",
-    "wrapper": "scripts/cargo-managed.sh"
+    "wrapper": "scripts/cargo-managed.sh",
+    "native_subset_scope": "Subset passed before final fail-closed marker error handling and formatting; full-core run covers the exact final source hashes."
   },
   "verified": [
     "immutable request binding and typed historical receipt verification",
@@ -67,8 +68,7 @@
     "remaining aborted source peers stay held for authorized reconciliation",
     "resume and terminal retirement resolve immutable creation provenance through current ledger chain",
     "scope retirement captures launch authority and preserves pending/transferred/aborted peers",
-    "late alias observation refuses during preparation and after ownership changes",
-    "normal native allocation deducts pending growth while retaining existing free-space guard"
+    "late alias observation refuses during preparation and after ownership changes"
   ],
   "not_proved": [
     "complete filesystem-scanned inventory/export manifest validation",
@@ -77,5 +77,8 @@
     "typed S outcome projection and public transfer entry point",
     "workflow preparation/settlement, observation history, owner-turn completion and Discord consumer",
     "live current-build continuation, CLI/GitHub/Discord acceptance, soak or shipping throughput"
+  ],
+  "implemented_not_independently_exercised": [
+    "normal native allocation deducts pending growth while retaining existing free-space guard"
   ]
 }
