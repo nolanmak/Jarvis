@@ -440,7 +440,13 @@ mod tests {
         }
         let f = fixture(true);
         std::env::set_var("AUGMENTAGENT_NATIVE_VM_POLICY", policy(&f));
+        let binding =
+            super::super::ownership::capture_transfer_binding(&f.request, &observation(), &|| {
+                Ok(())
+            })
+            .unwrap();
         let result = super::super::ownership::transfer(
+            &binding,
             &f.request,
             &observation(),
             &f.sources,
@@ -460,6 +466,7 @@ mod tests {
         }
         assert_eq!(
             super::super::ownership::transfer(
+                &binding,
                 &f.request,
                 &observation(),
                 &f.sources,
@@ -741,6 +748,200 @@ mod tests {
             Some(State::Aborted)
         );
         assert_eq!(ledger.reserved_bytes().unwrap(), 0);
+    }
+    fn empty_binding_fixture() -> Fixture {
+        let mut f = fixture(false);
+        for provider in ["codex", "claude"] {
+            std::fs::remove_dir_all(f.root.join(provider)).unwrap();
+        }
+        f.request.inventory.clear();
+        f
+    }
+    fn binding_for(f: &Fixture, path: &Path) -> super::super::ownership::TransferBinding {
+        super::super::owner_outcome::capture_with_policy(
+            Some(path),
+            &f.request,
+            &observation(),
+            &|| Ok(()),
+        )
+        .unwrap()
+    }
+    fn run_bound(
+        f: &Fixture,
+        path: &Path,
+        binding: &super::super::ownership::TransferBinding,
+    ) -> TransferOutcome {
+        super::super::owner_outcome::transfer_bound_with_policy(
+            Some(path),
+            binding,
+            &f.request,
+            &observation(),
+            &f.sources,
+            &f.destination,
+            &|| Ok(()),
+        )
+    }
+    fn binding_selection_change_refuses(root_change: bool) {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let writer = f.sources[0].begin_write().unwrap();
+        assert!(matches!(
+            run_bound(&f, &path, &binding),
+            TransferOutcome::Deferred {
+                reason: TransferReason::LockBusy,
+                ..
+            }
+        ));
+        writer.complete();
+        let other = tempfile::tempdir().unwrap();
+        directory(other.path());
+        super::super::initialize_native_test_store(other.path());
+        let shadow_before = std::fs::read(other.path().join("runtime-retirement.sqlite")).unwrap();
+        let original_before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+        let audit_before = audit_bytes(&f);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if root_change {
+            value["state_root"] = json!(other.path());
+        } else {
+            value["max_sessions"] = json!(9);
+        }
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let result = run_bound(&f, &path, &binding);
+        assert!(
+            matches!(
+                &result,
+                TransferOutcome::Held {
+                    reason: TransferReason::AuthorityConflict,
+                    ..
+                }
+            ),
+            "pending request changed policy/store: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(other.path().join("runtime-retirement.sqlite")).unwrap(),
+            shadow_before
+        );
+        assert_eq!(
+            std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+            original_before
+        );
+        assert_eq!(audit_bytes(&f), audit_before);
+    }
+    #[test]
+    fn native_handoff_binding_policy_change_cannot_resume_original_request() {
+        binding_selection_change_refuses(false);
+    }
+    #[test]
+    fn native_handoff_binding_root_change_never_interprets_absence_in_replacement_store() {
+        binding_selection_change_refuses(true);
+    }
+    #[test]
+    fn native_handoff_binding_historical_lookup_uses_original_store_without_selected_policy_or_certainty(
+    ) {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let TransferOutcome::Completed(receipt) = run_bound(&f, &path, &binding) else {
+            panic!("fixture transfer did not complete")
+        };
+        let persisted = serde_json::to_vec(&binding).unwrap();
+        let restored = serde_json::from_slice(&persisted).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        for source in &f.sources {
+            std::fs::remove_file(source.path()).unwrap();
+        }
+        let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+        let mut uncertain = observation();
+        uncertain.certain = false;
+        assert_eq!(
+            super::super::ownership::transfer_receipt(
+                &restored,
+                &f.request,
+                &uncertain,
+                &|| Ok(())
+            ),
+            Ok(Some(receipt))
+        );
+        assert_eq!(
+            std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn native_handoff_binding_prepared_lookup_is_read_only_and_missing_original_store_stays_unknown(
+    ) {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        let writer = f.sources[0].begin_write().unwrap();
+        assert!(matches!(
+            run_bound(&f, &path, &binding),
+            TransferOutcome::Deferred {
+                reason: TransferReason::LockBusy,
+                ..
+            }
+        ));
+        writer.complete();
+        let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+        assert_eq!(
+            super::super::ownership::transfer_receipt(
+                &binding,
+                &f.request,
+                &observation(),
+                &|| Ok(())
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+            before
+        );
+        std::fs::remove_file(f.root.join("runtime-retirement.sqlite")).unwrap();
+        let expected = TransferOutcome::Unknown {
+            reason: TransferReason::PendingUnknown,
+            transfer_id: f.request.transfer_id.clone(),
+        };
+        assert_eq!(
+            super::super::ownership::transfer_receipt(
+                &binding,
+                &f.request,
+                &observation(),
+                &|| Ok(())
+            ),
+            Err(expected.clone())
+        );
+        assert_eq!(run_bound(&f, &path, &binding), expected);
+        assert!(!f.root.join("runtime-retirement.sqlite").exists());
+    }
+    #[test]
+    fn native_handoff_binding_missing_authority_tables_are_never_recreated() {
+        let f = empty_binding_fixture();
+        let path = policy(&f);
+        let binding = binding_for(&f, &path);
+        assert!(matches!(
+            run_bound(&f, &path, &binding),
+            TransferOutcome::Completed(_)
+        ));
+        {
+            let _lock = super::super::StateLock::acquire(&f.root).unwrap();
+            let db = augmentagent_store::rusqlite::Connection::open(
+                f.root.join("runtime-retirement.sqlite"),
+            )
+            .unwrap();
+            db.execute_batch("DROP TABLE native_transfer_link;DROP TABLE native_transfer_close;DROP TABLE native_transfer_claim;DROP TABLE native_transfer_source;DROP TABLE native_transfer;DROP TABLE native_transfer_meta;").unwrap();
+        }
+        let before = std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap();
+        let expected = TransferOutcome::Unknown {
+            reason: TransferReason::PendingUnknown,
+            transfer_id: f.request.transfer_id.clone(),
+        };
+        assert_eq!(run_bound(&f, &path, &binding), expected);
+        assert_eq!(
+            std::fs::read(f.root.join("runtime-retirement.sqlite")).unwrap(),
+            before
+        );
     }
     struct Fixture {
         _temporary: tempfile::TempDir,

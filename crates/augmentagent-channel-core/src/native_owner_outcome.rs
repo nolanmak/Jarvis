@@ -3,7 +3,10 @@ use super::ownership::{TransferReceipt, TransferRequest};
 use crate::tool_audit::AuditLogger;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferReason {
@@ -111,9 +114,74 @@ impl TransferOutcome {
     }
 }
 
+/// Persist only in protected workflow state, before attempting the transfer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferBinding {
+    version: u32,
+    policy_sha256: String,
+    canonical_state_root: PathBuf,
+    store: super::owner_store::StoreIdentity,
+}
+pub fn capture_transfer_binding(
+    request: &TransferRequest,
+    observation: &TransferObservation,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> Result<TransferBinding, TransferOutcome> {
+    let path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
+    capture_with_policy(
+        path.as_deref().map(Path::new),
+        request,
+        observation,
+        current,
+    )
+}
+pub(super) fn capture_with_policy(
+    policy: Option<&Path>,
+    request: &TransferRequest,
+    observation: &TransferObservation,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> Result<TransferBinding, TransferOutcome> {
+    let selected = load_selection(policy, request, observation, current)?;
+    let result = (|| -> anyhow::Result<TransferBinding> {
+        let lock = super::StateLock::acquire(&selected.root)?;
+        let _ledger = super::owner_ledger::Ledger::open(&selected.root, &lock)?;
+        let store = serde_json::from_slice(&super::private(
+            &selected.root.join("authority-epoch.json"),
+        )?)?;
+        Ok(TransferBinding {
+            version: 1,
+            policy_sha256: selected.context.policy_sha256.clone().unwrap(),
+            canonical_state_root: selected.root.clone(),
+            store,
+        })
+    })();
+    result.map_err(|_| TransferOutcome::Unknown {
+        reason: TransferReason::PendingUnknown,
+        transfer_id: request.transfer_id.clone(),
+    })
+}
+/// Historical receipt lookup grants no productive authority.
+pub fn transfer_receipt(
+    _binding: &TransferBinding,
+    request: &TransferRequest,
+    _observation: &TransferObservation,
+    _current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> Result<Option<TransferReceipt>, TransferOutcome> {
+    Err(TransferOutcome::Unknown {
+        reason: TransferReason::PendingUnknown,
+        transfer_id: request.transfer_id.clone(),
+    })
+}
+struct Selection<'a> {
+    policy: super::Policy,
+    root: PathBuf,
+    context: FingerprintContext<'a>,
+}
 /// Uses the same selected private native policy as Launch. This transfers
 /// historical authority only; the caller must settle and recheck before dispatch.
 pub fn transfer(
+    binding: &TransferBinding,
     request: &TransferRequest,
     observation: &TransferObservation,
     sources: &[Arc<AuditLogger>],
@@ -121,8 +189,9 @@ pub fn transfer(
     current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> TransferOutcome {
     let path = std::env::var_os("AUGMENTAGENT_NATIVE_VM_POLICY");
-    transfer_with_policy(
+    transfer_bound_with_policy(
         path.as_deref().map(Path::new),
+        binding,
         request,
         observation,
         sources,
@@ -131,14 +200,12 @@ pub fn transfer(
     )
 }
 
-pub(super) fn transfer_with_policy(
+fn load_selection<'a>(
     policy_path: Option<&Path>,
     request: &TransferRequest,
-    observation: &TransferObservation,
-    sources: &[Arc<AuditLogger>],
-    destination: &Arc<AuditLogger>,
+    observation: &'a TransferObservation,
     current: &dyn Fn() -> Result<(), TransferFenceError>,
-) -> TransferOutcome {
+) -> Result<Selection<'a>, TransferOutcome> {
     use TransferReason as R;
     let mut context = FingerprintContext::new(request, observation);
     let preflight_hold =
@@ -151,42 +218,42 @@ pub(super) fn transfer_with_policy(
             None
         };
     let Some(policy_path) = policy_path else {
-        return context.failure(
+        return Err(context.failure(
             preflight_hold.unwrap_or(R::RuntimeUnavailable),
             "missing-policy",
-        );
+        ));
     };
     let bytes = match super::private(policy_path) {
         Ok(bytes) => bytes,
         Err(error) => {
             let (reason, category) = classify(&error);
-            return context.failure(
+            return Err(context.failure(
                 preflight_hold.unwrap_or(if reason == R::InventoryMissing {
                     R::RuntimeUnavailable
                 } else {
                     reason
                 }),
                 category,
-            );
+            ));
         }
     };
     context.policy_sha256 = Some(sha(&bytes));
     let policy: super::Policy = match serde_json::from_slice(&bytes) {
         Ok(policy) => policy,
-        Err(_) => return context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none"),
+        Err(_) => return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none")),
     };
     if policy.version != 1
         || !(512..=4096).contains(&policy.memory_mb)
         || policy.max_state_bytes < super::SESSION_BYTES
         || policy.max_sessions == 0
     {
-        return context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none");
+        return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none"));
     }
     let root = match policy.state_root.canonicalize() {
         Ok(root) => root,
         Err(error) => {
             let (reason, category) = classify(&error.into());
-            return context.failure(preflight_hold.unwrap_or(reason), category);
+            return Err(context.failure(preflight_hold.unwrap_or(reason), category));
         }
     };
     match root.metadata() {
@@ -195,27 +262,46 @@ pub(super) fn transfer_with_policy(
                 || info.uid() != unsafe { libc::geteuid() }
                 || info.mode() & 0o077 != 0
             {
-                return context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none");
+                return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none"));
             }
             context.root_identity_sha256 =
                 Some(sha(format!("{}:{}", info.dev(), info.ino()).as_bytes()));
         }
         Err(error) => {
             let (reason, category) = classify(&error.into());
-            return context.failure(preflight_hold.unwrap_or(reason), category);
+            return Err(context.failure(preflight_hold.unwrap_or(reason), category));
         }
     }
     if let Some(reason) = preflight_hold {
-        return context.failure(reason, "none");
+        return Err(context.failure(reason, "none"));
     }
     if let Err(error) = current() {
         let (reason, category) = classify(&error.into());
-        return context.failure(reason, category);
+        return Err(context.failure(reason, category));
     }
+    Ok(Selection {
+        policy,
+        root,
+        context,
+    })
+}
+
+pub(super) fn transfer_with_policy(
+    policy_path: Option<&Path>,
+    request: &TransferRequest,
+    observation: &TransferObservation,
+    sources: &[Arc<AuditLogger>],
+    destination: &Arc<AuditLogger>,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> TransferOutcome {
+    let mut selected = match load_selection(policy_path, request, observation, current) {
+        Ok(selected) => selected,
+        Err(outcome) => return outcome,
+    };
     let fence = || current().map_err(anyhow::Error::new);
     let error = match super::owner_handoff::handoff_at(
-        &root,
-        policy.max_state_bytes,
+        &selected.root,
+        selected.policy.max_state_bytes,
         request,
         sources,
         destination,
@@ -224,7 +310,26 @@ pub(super) fn transfer_with_policy(
         Ok(receipt) => return TransferOutcome::Completed(receipt),
         Err(error) => error,
     };
-    reconcile_failure(&root, request, &mut context, &error)
+    reconcile_failure(&selected.root, request, &mut selected.context, &error)
+}
+
+pub(super) fn transfer_bound_with_policy(
+    policy_path: Option<&Path>,
+    _binding: &TransferBinding,
+    request: &TransferRequest,
+    observation: &TransferObservation,
+    sources: &[Arc<AuditLogger>],
+    destination: &Arc<AuditLogger>,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> TransferOutcome {
+    transfer_with_policy(
+        policy_path,
+        request,
+        observation,
+        sources,
+        destination,
+        current,
+    )
 }
 
 pub(super) fn reconcile_failure(
