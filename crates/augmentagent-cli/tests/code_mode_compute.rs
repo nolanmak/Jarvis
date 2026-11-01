@@ -271,44 +271,60 @@ fn orchestration_limits_keep_typed_report_codes() {
     assert_eq!(report(root.path())["cleanup"]["cleanupVerified"], true);
 }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires provisioned KVM and private build-volume scratch; real CLI signal/recovery QA"]
 fn real_cli_signals_clean_managed_inputs_and_vm_work() {
     cli_signal_cleanup(SignalStage::Running);
 }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires provisioned private scratch; signals the CLI before helper readiness"]
 fn real_cli_startup_signals_are_reported_and_cleaned() {
     cli_signal_cleanup(SignalStage::Startup { stalled: false });
 }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires private scratch; holds compute helper stopped throughout cancellation"]
 fn real_cli_stalled_startup_cancellation_reaps_helper() {
     cli_signal_cleanup(SignalStage::Startup { stalled: true });
 }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires KVM, pinned pip and public NumPy wheel; stops an active wheel fetch"]
 fn real_cli_download_cancellation_reaps_stalled_fetch() {
     cli_signal_cleanup(SignalStage::Download);
 }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires KVM and private scratch; cancels after actual binary logs reach the host"]
 fn real_cli_cancelled_logs_preserve_partial_binary_output() {
     cli_signal_cleanup(SignalStage::LoggedExecution);
 }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires KVM, pinned pip and public NumPy wheel; pauses preparation after pip announces installation"]
 fn real_cli_install_cancellation_reaps_preparation_vm() {
     cli_signal_cleanup(SignalStage::Install);
 }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 enum SignalStage { Running, Startup { stalled: bool }, Download, Install, LoggedExecution }
 
+// pidfd process pinning is Linux-only; the VM compute backend is too.
+#[cfg(target_os = "linux")]
 fn cli_signal_cleanup(stage: SignalStage) {
     let startup = matches!(stage, SignalStage::Startup { .. });
     let stalled = matches!(stage, SignalStage::Startup { stalled: true } | SignalStage::Download);
