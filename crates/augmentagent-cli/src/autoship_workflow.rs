@@ -200,16 +200,19 @@ pub struct WorkflowStore {
 impl WorkflowStore {
     /// Preview existing protected state without schema initialization or writes.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>> {
-        use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
-        let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
-            Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        use std::os::unix::fs::MetadataExt;
+        // Never open/close a raw OS descriptor for a live SQLite database.
+        // POSIX close() releases this process's locks for *every* connection.
+        // SQLite's VFS coordinates its own descriptors; NOFOLLOW supplies the
+        // link protection without bypassing that coordination.
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta)=>meta,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
             Err(error)=>return Err(error.into()),
         };
-        let meta=file.metadata()?;
         ensure!(meta.is_file() && meta.nlink()==1 && meta.uid()==unsafe {libc::geteuid()} && meta.mode()&0o077==0,"workflow preview state is not owner-private");
-        let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX|rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
         let after=std::fs::symlink_metadata(path)?;
-        ensure!(meta.dev()==after.dev() && meta.ino()==after.ino() && !after.file_type().is_symlink(),"workflow preview state changed during open");
+        ensure!(meta.dev()==after.dev() && meta.ino()==after.ino() && after.is_file() && after.nlink()==1 && after.uid()==meta.uid() && after.mode()&0o077==0,"workflow preview state changed during open");
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Some(Self {conn}))
     }
@@ -261,18 +264,21 @@ impl WorkflowStore {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        // Create privately before SQLite opens it. Reject links rather than
-        // allowing a reasoner-controlled path to redirect control-plane writes.
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        let metadata = file.metadata()?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let before=match std::fs::symlink_metadata(path) {
+            Ok(metadata)=> {
+                ensure!(metadata.is_file() && metadata.nlink()==1 && metadata.uid()==unsafe{libc::geteuid()},"state must be a singly linked regular file owned by daemon uid");
+                Some(metadata)
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>None,
+            Err(error)=>return Err(error.into()),
+        };
+        // SQLite opens/creates the file itself. Its new file is still empty;
+        // restrict it before any PRAGMA, schema, journal, or authority writes.
+        // Opening a second raw descriptor here would silently cancel locks
+        // belonging to other SQLite connections in this process on close().
+        let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE|rusqlite::OpenFlags::SQLITE_OPEN_CREATE|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX|rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+        let metadata=std::fs::symlink_metadata(path)?;
         ensure!(
             metadata.is_file() && metadata.nlink() == 1,
             "state must be a singly linked regular file"
@@ -281,8 +287,10 @@ impl WorkflowStore {
             metadata.uid() == unsafe { libc::geteuid() },
             "state must be owned by daemon uid"
         );
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        let conn = Connection::open(path)?;
+        if let Some(before)=before {ensure!(before.dev()==metadata.dev() && before.ino()==metadata.ino(),"workflow state changed during open");}
+        std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;
+        let after=std::fs::symlink_metadata(path)?;
+        ensure!(metadata.dev()==after.dev() && metadata.ino()==after.ino() && after.is_file() && after.nlink()==1 && after.uid()==metadata.uid() && after.mode()&0o077==0,"workflow state changed before initialization");
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -1833,6 +1841,38 @@ fn event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn check_constructor_retains_other_connection_locks(test_name: &str, writable: bool) {
+        if let Some(path)=std::env::var_os("AUGMENTAGENT_WORKFLOW_LOCK_PROBE_DB") {
+            let db=Connection::open(path).unwrap();
+            db.busy_timeout(Duration::from_millis(50)).unwrap();
+            let result=db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; ROLLBACK;");
+            assert!(matches!(result,Err(rusqlite::Error::SqliteFailure(ref code,_)) if code.code==rusqlite::ErrorCode::DatabaseBusy || code.code==rusqlite::ErrorCode::DatabaseLocked),"external process acquired exclusive access during a live read: {result:?}");
+            return;
+        }
+        let temp=tempfile::tempdir().unwrap();let path=temp.path().join("workflow.db");
+        drop(WorkflowStore::open(&path).unwrap());
+        let held=Connection::open(&path).unwrap();
+        held.execute_batch("BEGIN;").unwrap();held.query_row("SELECT count(*) FROM workflow",[],|row|row.get::<_,i64>(0)).unwrap();
+        let probe=|| {
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",test_name,"--nocapture"])
+                .env("AUGMENTAGENT_WORKFLOW_LOCK_PROBE_DB",&path).output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        };
+        probe();
+        if writable {drop(WorkflowStore::open(&path).unwrap());}
+        else {drop(WorkflowStore::open_read_only(&path).unwrap().unwrap());}
+        probe();
+        held.execute_batch("ROLLBACK;").unwrap();
+    }
+    #[test]
+    fn workflow_preview_preserves_other_connections_sqlite_locks() {
+        check_constructor_retains_other_connection_locks("autoship_workflow::tests::workflow_preview_preserves_other_connections_sqlite_locks",false);
+    }
+    #[test]
+    fn workflow_open_preserves_other_connections_sqlite_locks() {
+        check_constructor_retains_other_connection_locks("autoship_workflow::tests::workflow_open_preserves_other_connections_sqlite_locks",true);
+    }
     fn binding() -> Binding {
         Binding {
             head: "head-a".into(),
@@ -2623,6 +2663,18 @@ mod tests {
         let link = dir.path().join("link.db");
         symlink(&path, &link).unwrap();
         assert!(WorkflowStore::open(&link).is_err());
+        assert!(WorkflowStore::open_read_only(&link).is_err());
+        let hardlink=dir.path().join("hardlink.db");
+        std::fs::hard_link(&path,&hardlink).unwrap();
+        assert!(WorkflowStore::open(&hardlink).is_err());
+        assert!(WorkflowStore::open_read_only(&hardlink).is_err());
+        std::fs::remove_file(hardlink).unwrap();
+        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(WorkflowStore::open_read_only(&path).is_err());
+        drop(WorkflowStore::open(&path).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
+        assert!(WorkflowStore::open_read_only(&path).unwrap().is_some());
+        assert!(WorkflowStore::open_read_only(&dir.path().join("missing.db")).unwrap().is_none());
     }
     // Invoked in a separate test process by crash_releases_sqlite_transaction.
     // Exiting bypasses Rust Drop, exercising SQLite crash recovery rather than

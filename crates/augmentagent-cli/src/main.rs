@@ -104,6 +104,7 @@ mod owner_alerts;
 mod autopr_eval;
 mod autopr_health;
 mod autoship_commands;
+mod autoship_cache_recovery;
 mod autoship_discord_command;
 mod autoship_deployment;
 mod autoship_contract;
@@ -995,6 +996,10 @@ enum DeployOp {
         /// Short name for the snapshot, e.g. the PR number.
         #[arg(long, default_value = "manual")]
         label: String,
+        /// Capture committed pages as pinned forensic evidence, including
+        /// corruption. The result cannot be restored as a rollback.
+        #[arg(long)]
+        forensic: bool,
     },
     /// Snapshots, newest first.
     List,
@@ -1106,6 +1111,15 @@ enum PhoneOp {
 }
 #[derive(Subcommand)]
 enum AutoprOp {
+    /// Inspect or repair only a corrupt derived PR adoption cache. Accounting
+    /// and owner controls must remain identical; defaults to read-only inspect.
+    RecoverAdoptionCache {
+        #[arg(long)] workflow_db: PathBuf,
+        #[arg(long)] apply: bool,
+        /// Resume an interrupted repair using its pinned managed snapshot.
+        #[arg(long, requires = "apply")] evidence: Option<PathBuf>,
+        #[arg(long)] json: bool,
+    },
     /// Stop new dispatches; active-work teardown remains separately verified.
     Pause(autoship_commands::control_command::Args),
     /// Clear only the explicit owner pause after access and readiness checks.
@@ -3111,6 +3125,19 @@ async fn main() -> Result<()> {
     if let Cmd::ModelTool { channel, ref readiness } = cli.cmd {
         return model_tool::serve(channel, readiness);
     }
+    if let Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache {ref workflow_db,apply,ref evidence,json} } = cli.cmd {
+        let result=async {
+            let _storage=if apply {Some(build_storage::acquire().await?)}else{None};
+            let root=deploy_snapshot::snapshot_root().context("no snapshot retention root")?;
+            autoship_cache_recovery::recover(workflow_db,&root,apply,evidence.as_deref())
+        }.await;
+        let (code,value)=match result {
+            Ok(value)=>(0,value),
+            Err(error)=>(4,serde_json::json!({"schema_version":1,"state":"recovery-refused","error":format!("{error:#}")})),
+        };
+        if json {println!("{}",serde_json::to_string(&value)?);}else{println!("{}",serde_json::to_string_pretty(&value)?);}
+        std::process::exit(code);
+    }
     if let Cmd::Autopr { op: AutoprOp::ResolveMerge { ref operation, ref classification, ref evidence, json } } = cli.cmd {
         std::process::exit(autoship_commands::merge_recovery::run(operation, classification, evidence, json).await);
     }
@@ -3180,7 +3207,7 @@ async fn main() -> Result<()> {
         let release = repo_root.join("target/release");
         let mut out = std::io::stdout().lock();
         return match op {
-            DeployOp::Snapshot { label } => {
+            DeployOp::Snapshot { label, forensic } => {
                 // Snapshot allocation and builds must not spend the same
                 // measured filesystem reserve concurrently.
                 let _storage = build_storage::acquire().await?;
@@ -3189,6 +3216,10 @@ async fn main() -> Result<()> {
                     .clone()
                     .or_else(|| std::env::var("AUGMENTAGENT_DB").ok().map(PathBuf::from))
                     .unwrap_or_else(|| PathBuf::from("data.db"));
+                if *forensic {
+                    let dir=deploy_snapshot::snapshot_forensic(&db,&root,label,chrono::Utc::now())?;
+                    use std::io::Write as _;writeln!(out,"{}",dir.display())?;return Ok(());
+                }
                 let sha = std::process::Command::new("git")
                     .args(["rev-parse", "HEAD"])
                     .output()
@@ -5719,6 +5750,7 @@ async fn main() -> Result<()> {
             .await?;
             std::process::exit(code);
         }
+        Cmd::Autopr { op: AutoprOp::RecoverAdoptionCache { .. } } => unreachable!("cache maintenance precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::ResolveMerge { .. } } => unreachable!("merge resolution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Work(..) } => unreachable!("work execution precedes application database initialization"),
         Cmd::Autopr { op: AutoprOp::Pause(..)|AutoprOp::Resume(..) } => unreachable!("owner control precedes application database initialization"),
