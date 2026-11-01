@@ -1277,7 +1277,7 @@ pub fn run_prune_with_leases(repo_root: &Path, opts: &Options, out: &mut dyn Wri
             let claims = allocation.claims(None)?;
             let required = (crate::build_storage::admission_floor_gb() * GIB) as u64;
             reports.extend(crate::disk_pressure::reclaim(repo_root, required, held,
-                opts.dry_run, &claims, &available_bytes)?);
+                opts.dry_run, &claims, &available_bytes, None)?);
         }
     }
 

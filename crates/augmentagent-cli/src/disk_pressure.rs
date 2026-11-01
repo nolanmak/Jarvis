@@ -37,6 +37,7 @@ pub fn reclaim(
     dry_run: bool,
     claims: &crate::storage_reservations::Claims,
     free_bytes: &dyn Fn(&Path) -> Option<u64>,
+    admission_paths: Option<&[std::path::PathBuf]>,
 ) -> Result<Vec<RootReport>> {
     let procs = crate::disk::build_procs();
     let mut refs = crate::snapshot_refs::collect_rebuildable();
@@ -71,20 +72,36 @@ pub fn reclaim(
             &std::env::var("AUGMENTAGENT_PRUNE_TARGET_DIRS").unwrap_or_default(),
         ),
     );
-    reports.extend(reclaim_roots(
+    let headroom = |path: &Path| {
+        Ok(free_bytes(path).context("cannot measure pressure filesystem")?
+            .saturating_sub(claims.reserved_on(path)?))
+    };
+    let reclaimed = if let Some(paths) = admission_paths {
+        reclaim_roots_for_paths(&roots, paths, required, held, dry_run,
+            procs.as_deref(), &refs, &headroom)?
+    } else {reclaim_roots(
         &roots,
         required,
         held,
         dry_run,
         procs.as_deref(),
         &refs,
-        &|path| {
-            Ok(free_bytes(path)
-                .context("cannot measure pressure filesystem")?
-                .saturating_sub(claims.reserved_on(path)?))
-        },
-    )?);
+        &headroom,
+    )?};
+    reports.extend(reclaimed);
     Ok(reports)
+}
+
+pub(crate) fn reclaim_roots_for_paths(
+    roots: &[Root], paths: &[std::path::PathBuf], required: u64,
+    held: Option<&TargetLeases>, dry_run: bool, procs: Option<&[BuildProc]>,
+    refs: &References, headroom: &dyn Fn(&Path) -> Result<u64>,
+) -> Result<Vec<RootReport>> {
+    let devices=paths.iter().map(|path|crate::disk::device_id(path)
+        .context("cannot determine admission pressure filesystem"))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    anyhow::ensure!(!devices.is_empty(),"admission pressure requires a filesystem");
+    reclaim_scoped_roots(roots,required,held,dry_run,procs,refs,headroom,Some(&devices))
 }
 
 pub(crate) fn reclaim_roots(
@@ -95,6 +112,14 @@ pub(crate) fn reclaim_roots(
     procs: Option<&[BuildProc]>,
     refs: &References,
     headroom: &dyn Fn(&Path) -> Result<u64>,
+) -> Result<Vec<RootReport>> {
+    reclaim_scoped_roots(roots,required,held,dry_run,procs,refs,headroom,None)
+}
+
+fn reclaim_scoped_roots(
+    roots:&[Root], required:u64, held:Option<&TargetLeases>, dry_run:bool,
+    procs:Option<&[BuildProc]>, refs:&References, headroom:&dyn Fn(&Path)->Result<u64>,
+    devices:Option<&std::collections::BTreeSet<u64>>,
 ) -> Result<Vec<RootReport>> {
     let mut reports = Vec::new();
     let mut projected_freed = std::collections::BTreeMap::<u64, u64>::new();
@@ -111,6 +136,9 @@ pub(crate) fn reclaim_roots(
                 continue;
             }
             let device = std::fs::metadata(profile)?.dev();
+            if devices.is_some_and(|devices|!devices.contains(&device)) {
+                continue;
+            }
             let simulated = if dry_run {
                 projected_freed.get(&device).copied().unwrap_or(0)
             } else {
@@ -249,7 +277,9 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            Self::in_directory(tempfile::tempdir().unwrap())
+        }
+        fn in_directory(dir: tempfile::TempDir) -> Self {
             let target = dir.path().join("target");
             let deps = target.join("release/deps");
             std::fs::create_dir_all(&deps).unwrap();
@@ -293,6 +323,49 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn admission_pressure_preserves_an_unrelated_filesystem_even_when_both_are_low() {
+        for dry_run in [true,false] {
+            let requested=Fixture::new();
+            let unrelated=Fixture::in_directory(tempfile::tempdir_in("/dev/shm").unwrap());
+            assert_ne!(std::fs::metadata(&requested.root.path).unwrap().dev(),
+                std::fs::metadata(&unrelated.root.path).unwrap().dev(),"fixture needs two real filesystems");
+            let reports=reclaim_roots_for_paths(&[unrelated.root.clone(),requested.root.clone()],
+                &[requested.root.path.join("future/output")],65536,None,dry_run,Some(&[]),&requested.refs,
+                &|path|Ok(if path.starts_with(&unrelated.root.path) && !unrelated.deps.exists() {65536} else {0})).unwrap();
+            assert!(unrelated.deps.exists(),"reclaimed warm cache on a filesystem unused by this admission");
+            assert!(!reports.iter().any(|r|r.path.starts_with(&unrelated.root.path.to_string_lossy().into_owned()) && r.removed>0),
+                "cleanup reported unrelated filesystem reclamation");
+            assert!(reports.iter().any(|r|r.path.starts_with(&requested.root.path.to_string_lossy().into_owned()) && r.removed>0));
+            assert_eq!(requested.deps.exists(),dry_run);
+        }
+    }
+
+    #[test]
+    fn admission_pressure_rejects_an_unknown_or_empty_scope_before_cache_removal() {
+        let fixture=Fixture::new();
+        for paths in [Vec::new(),vec![std::path::PathBuf::new()]] {
+            assert!(reclaim_roots_for_paths(std::slice::from_ref(&fixture.root),&paths,
+                65536,None,false,Some(&[]),&fixture.refs,&|_|Ok(0)).is_err());
+            assert!(fixture.deps.exists());
+        }
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn admission_pressure_reclaims_each_explicitly_used_filesystem() {
+        let first=Fixture::new();
+        let second=Fixture::in_directory(tempfile::tempdir_in("/dev/shm").unwrap());
+        let paths=vec![first.root.path.clone(),second.root.path.clone(),first.root.path.join("future/output")];
+        reclaim_roots_for_paths(&[first.root.clone(),second.root.clone()],&paths,
+            65536,None,false,Some(&[]),&first.refs,&|p|Ok(if p.starts_with(&first.root.path) {
+                if first.deps.exists(){0}else{65536}
+            } else if second.deps.exists(){0}else{65536})).unwrap();
+        assert!(!first.deps.exists());assert!(!second.deps.exists());
+        assert!(first.binary.exists());assert!(second.binary.exists());
     }
 
     #[test]

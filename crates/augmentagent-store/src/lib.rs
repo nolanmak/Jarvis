@@ -16,6 +16,7 @@ pub mod alert_schedule;
 pub mod daemon_report;
 pub mod delivery;
 pub mod imessage;
+pub mod imessage_owner;
 pub mod models;
 pub mod linkedin_archive;
 pub mod notes;

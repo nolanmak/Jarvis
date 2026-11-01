@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "epic": 1703,
+  "issue": 1676,
+  "behavior_commit": "30aed321",
+  "observed_failure": "Updater root filesystem admission remained below 25GiB while pressure cleanup reclaimed an unrelated /mnt/build Cargo cache.",
+  "test_first_commit": "2c06b517",
+  "red": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent disk_pressure::tests::admission_pressure_preserves_an_unrelated_filesystem_even_when_both_are_low -- --test-threads=1",
+    "wrapper_exit_code": 1,
+    "test_exit_code": 101,
+    "failed": 1,
+    "log": "/tmp/autoship-1703-red-pressure-filesystem-scope.log"
+  },
+  "green": {
+    "command": "scripts/cargo-managed.sh test -p augmentagent-cli --bin augmentagent pressure -- --test-threads=1",
+    "exit_code": 0,
+    "passed": 14,
+    "log": "/tmp/autoship-1703-green-pressure-filesystem-scope.log"
+  },
+  "coverage": [
+    "Two real Linux filesystems; dry-run and actual reclamation preserve unrelated warm caches",
+    "All explicitly monitored filesystems remain eligible",
+    "Nearest-existing-ancestor resolution supports future output paths",
+    "Empty or unmeasurable scope fails before Cargo cache deletion",
+    "Existing process/lease/reference exclusions, symlink and unknown-data protection, deployed-binary retention and reservation tests remain green"
+  ],
+  "limitations": [
+    "No claim that root filesystem headroom has been restored",
+    "Does not add native VM image-cache pruning or relocate deployment output",
+    "Normal updater rollout and live resource recovery remain pending; issue1676 and epic1703 stay open"
+  ],
+  "source_files": [
+    {
+      "path": "crates/augmentagent-cli/src/disk_pressure.rs",
+      "sha256": "2e5cf584ac3af57d7cf73021850ba197b98c4d234eabec8cfa833d789feef364"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/build_storage.rs",
+      "sha256": "0826efbaf16605ec2a1f6083aeddd58a0f8390e4cad30deacf73b839a22ad923"
+    },
+    {
+      "path": "crates/augmentagent-cli/src/disk.rs",
+      "sha256": "60930d320fb149f29dedeefacf5e01789b65957421af7f13f43ea773ef25321a"
+    }
+  ]
+}

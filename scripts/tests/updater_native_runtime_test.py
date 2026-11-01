@@ -18,7 +18,7 @@ class UpdaterRuntimeTests(unittest.TestCase):
                 return subprocess.check_output(['git',*args],cwd=cwd,text=True,stderr=subprocess.DEVNULL).strip()
             git('init','--bare',str(origin));git('init','-b','main')
             (repo/'scripts/lib').mkdir(parents=True)
-            for source in ['check-for-updates.sh','lib/service-restart.sh','lib/update-build.sh']:
+            for source in ['check-for-updates.sh','secure-release-executables.py','lib/service-restart.sh','lib/update-build.sh']:
                 shutil.copyfile(ROOT/'scripts'/source,repo/'scripts'/source)
             (repo/'scripts/ensure-native-runtime.py').write_text("import os,pathlib,sys\np=pathlib.Path(os.environ['CALLS']);p.write_text(p.read_text()+'called\\n' if p.exists() else 'called\\n')\nsys.exit(int(os.environ.get('RECONCILE_EXIT','0')))\n")
             git('add','.');git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','fixture')

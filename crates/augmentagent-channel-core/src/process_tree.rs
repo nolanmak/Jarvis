@@ -59,6 +59,7 @@ impl ProcessGroup {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+        let mut resource_identity=None;
         if self.resource_required {
             let parsed=private_read(&self.receipt.with_file_name("resource-accounting.json")).ok()
                 .and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -71,9 +72,15 @@ impl ProcessGroup {
             if let Some(logger)=logger.filter(|logger|logger.is_protected()) {
                 logger.record_controller(serde_json::json!({"actor":"controller","kind":"run_resource_admitted","provider":provider,"observation":observation}))?;
             }
+            resource_identity=Some(observation["identity"].clone());
         }
         if let Some(logger)=logger {logger.dispatch_allowed()?;}
-        if model { if let Some(logger)=logger { logger.model_call_admitted(provider)?; } }
+        if model { if let Some(logger)=logger {
+            match &resource_identity {
+                Some(identity)=>logger.model_call_admitted_in_scope(provider,identity)?,
+                None=>logger.model_call_admitted(provider)?,
+            }
+        } }
         let mut proceed=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.receipt.with_file_name("launch-continue"))?;
         proceed.write_all(b"admitted\n")?;
         proceed.sync_all()?;
@@ -103,19 +110,23 @@ fn cleanup_receipt_complete(bytes:&[u8])->bool {
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if !self.receipt.exists() {
+        // Creation precedes the supervisor's write/chmod/fsync. A visible
+        // pathname is not yet a complete proof; give publication the same
+        // bounded wait as a missing receipt, without accepting partial bytes.
+        let complete=|| private_read(&self.receipt).is_ok_and(|bytes|cleanup_receipt_complete(&bytes));
+        if !complete() {
             // Signal the supervisor, which retains ownership of detached
             // grandchildren and acknowledges only after reaping every child.
             unsafe { libc::kill(self.id, libc::SIGTERM); }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !self.receipt.exists() && std::time::Instant::now() < deadline {
+            while !complete() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         if let Ok(audit)=self.resource_audit.lock() {
             if let Some((provider,logger))=audit.as_ref() { let _=self.resource_outcome(provider,Some(logger)); }
         }
-        let mut processes_settled = std::fs::read(&self.receipt).is_ok_and(|bytes| cleanup_receipt_complete(&bytes));
+        let mut processes_settled = complete();
         if !processes_settled {
             unsafe { libc::kill(self.id,libc::SIGKILL); }
             if self.resource_required {
@@ -633,6 +644,32 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[test]
+    fn cleanup_waits_for_complete_receipt_after_path_is_created() {
+        for prefix in [b"".as_slice(),b"all-descendants-".as_slice()] {
+            let directory=tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+            let receipt=directory.path().join("cleanup-complete");
+            let mut output=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
+            output.write_all(prefix).unwrap();output.sync_all().unwrap();
+            let mut child=std::process::Command::new("sleep").arg("5").spawn().unwrap();
+            let id=child.id() as libc::pid_t;
+            let prefix_length=prefix.len();
+            let writer=std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _=child.kill();child.wait().unwrap();
+                // Publish completion only after the fixture's actual child is reaped.
+                output.write_all(&b"all-descendants-reaped\n"[prefix_length..]).unwrap();output.sync_all().unwrap();
+            });
+            let clean=Arc::new(AtomicBool::new(false));
+            let group=ProcessGroup{id,receipt,clean:clean.clone(),active_request:None,
+                resource_required:false,vm_preflight:false,resource_observed:AtomicBool::new(false),
+                resource_audit:std::sync::Mutex::new(None),_directory:directory};
+            drop(group);writer.join().unwrap();
+            assert!(clean.load(Ordering::SeqCst),"receipt existence was mistaken for completed publication");
+        }
+    }
+
+    #[test]
     fn setup_diagnostics_do_not_masquerade_as_capacity_or_echo_untrusted_detail() {
         assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"FileNotFoundError","message":"private path"})),Some("FileNotFoundError"));
         assert_eq!(native_setup_category(&serde_json::json!({"phase":"native_setup_failed","native_vm_failure":"private credentials"})),Some("BoundaryFailure"));
@@ -836,6 +873,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), rows, "clearing must not edit the journal");
         // Idle to the sweep, yet still unsettled, so recovery can act on it.
         assert!(request_idle(&journal).unwrap() && !crate::handoff::request_finished(&journal).unwrap());
+    }
+
+    #[tokio::test]
+    async fn model_admission_binds_the_exact_supervisor_resource_identity() {
+        let directory=tempfile::tempdir_in("/tmp").unwrap();
+        for name in ["logs","anchors"] {std::fs::create_dir(directory.path().join(name)).unwrap();}
+        let log=directory.path().join("logs/audit.jsonl");
+        let logger=Arc::new(crate::tool_audit::AuditLogger::protected(log.clone(),directory.path().join("anchors/audit.json"),&[]).unwrap());
+        let count=Arc::new(std::sync::atomic::AtomicUsize::new(0));let billed=count.clone();
+        logger.set_model_call_observer(Arc::new(move |_|{billed.fetch_add(1,Ordering::SeqCst);Ok(())})).unwrap();
+        let command=Command::new("/usr/bin/true");
+        let (mut child,mut group)=spawn_admitted(&command,true,Arc::new(AtomicBool::new(true)),None,false).unwrap();
+        // Exercise the real supervisor admission boundary with a disposable
+        // controller receipt. This tests correlation, not kernel quiescence.
+        let identity=serde_json::json!({"host_sha256":"synthetic-host","boot_id":"synthetic-boot",
+            "path":"/sys/fs/cgroup/synthetic-run","inode":42,"limits":{"memory_max_bytes":1024}});
+        write_private(&group.receipt.with_file_name("resource-accounting.json"),
+            serde_json::json!({"phase":"admitted","exhausted":false,"identity":identity}).to_string().as_bytes());
+        group.resource_required=true;
+        group.admit_model("codex",Some(&logger)).await.unwrap();
+        assert!(child.wait().await.unwrap().success());drop(group);
+        let rows:Vec<serde_json::Value>=std::fs::read_to_string(log).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        let resource=rows.iter().find(|r|r["kind"]=="run_resource_admitted").unwrap();
+        let model=rows.iter().find(|r|r["kind"]=="model_call_admitted").unwrap();
+        assert_eq!(model["resource_identity"],resource["observation"]["identity"],
+            "model admission has no binding to the resource scope whose quiescence will be verified");
+        assert_eq!(model["admission_schema_version"],2);
+        assert_eq!(model["actual_provider"],resource["provider"]);
+        assert_eq!(count.load(Ordering::SeqCst),1);
     }
 
     #[tokio::test]

@@ -89,7 +89,10 @@ impl Store {
         summary: &str,
     ) -> StoreResult<Option<i64>> {
         self.with_conn(|c| {
-            let n = c.execute(
+            let tx=rusqlite::Transaction::new_unchecked(c,rusqlite::TransactionBehavior::Immediate)?;
+            crate::imessage_owner::guard_action(&tx,action,false)
+                .map_err(|_|rusqlite::Error::InvalidQuery)?;
+            let n = tx.execute(
                 "INSERT OR IGNORE INTO approval_history
                 (action_id,interaction_id,surface,actor,conversation,verb,revision,kind,summary)
                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -105,7 +108,8 @@ impl Store {
                     bounded(summary, 400)
                 ],
             )?;
-            Ok((n == 1).then(|| c.last_insert_rowid()))
+            let seq=(n==1).then(||tx.last_insert_rowid());
+            tx.commit()?; Ok(seq)
         })
     }
     pub fn finish_approval(&self, seq: i64, outcome: &str, detail: &str) -> StoreResult<()> {

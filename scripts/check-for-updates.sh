@@ -43,6 +43,7 @@ case "$(uname -s)" in
 esac
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/update.log"
+PROVISION_PENDING="$LOG_DIR/autopr-provision-pending"
 STAMP="$LOG_DIR/built-commit"   # SHA the deployed artifacts were last built from
 LABEL="com.nolanmak.augmentagent"
 SYSTEMD_UNIT="augmentagent.service"
@@ -76,6 +77,28 @@ notify_owner() {
 # shellcheck source=lib/service-restart.sh
 . "$REPO_ROOT/scripts/lib/service-restart.sh"
 . "$REPO_ROOT/scripts/lib/update-build.sh"
+
+# Artifact repair is independent of the executable's capability or health.
+secure_release_artifacts() {
+  python3 "$REPO_ROOT/scripts/secure-release-executables.py" "$REPO_ROOT/target/release" >> "$LOG" 2>&1
+}
+
+reconcile_worker_provisioning() {
+  # Keep this retry state independent of the compiled/deployed build stamp.
+  (umask 077; printf 'pending\n' > "$PROVISION_PENDING")
+  secure_release_artifacts || return 1
+  local worker_help=""
+  worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
+  case "$worker_help" in
+    *'Usage: augmentagent auto-pr-worker'*)
+      if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
+        log "AUTO-SHIP WORKER PROVISIONING FAILED — retry pending independently of build stamp"
+        return 1
+      fi ;;
+    *) log "auto-ship worker capability unavailable; skipping provisioning" ;;
+  esac
+  rm -f "$PROVISION_PENDING"
+}
 
 # #1571 — the unit no longer runs what this script builds. A drop-in that
 # overrides ExecStart (2026-10-20: a rollout pinned a frozen copy of the
@@ -190,20 +213,16 @@ apply_update() {
       esac
     fi
     log "rust build ok (augmentagent + augmentagent-mcp-memory)"
-    # Install without starting a duplicate legacy loop. The worker starts
-    # after the daemon restart, and future daemon updates leave it running.
-    local worker_help=""
-    worker_help=$("$DAEMON_BINARY" auto-pr-worker --help 2>/dev/null) || true
-    case "$worker_help" in
-      *'Usage: augmentagent auto-pr-worker'*)
-        if ! bash "$REPO_ROOT/scripts/ensure-autopr-worker.sh" >> "$LOG" 2>&1; then
-          log "AUTO-SHIP WORKER PROVISIONING FAILED — deployment stamp withheld"
-          return 1
-        fi ;;
-    esac
   else
     log "no rust code changed; skipping rust rebuild"
   fi
+
+  # Installer/template fixes need provisioning even when Cargo output is
+  # cached or only scripts changed. This reloads configuration without
+  # starting a duplicate loop or forcing an active worker to restart.
+  secure_release_artifacts || return 1
+  local PROVISION_FAILURE=0
+  reconcile_worker_provisioning || PROVISION_FAILURE=1
 
   # The pulled helper or selected profile may be new, and a provider binary
   # may have changed during compilation. Preserve the binary deployment's
@@ -416,9 +435,12 @@ will retry via the build-stamp mismatch path."
   if [ -x "$REPO_ROOT/target/release/augmentagent" ]; then
     "$REPO_ROOT/target/release/augmentagent" deploy prune >> "$LOG" 2>&1 || true
   fi
+  return "$PROVISION_FAILURE"
 }
 
 log "checking for updates"
+# This precedes every helper that can execute cached release artifacts.
+secure_release_artifacts || { log "release artifact validation failed; retrying next tick"; exit 1; }
 # Provider packages can move independently of Git, including when HEAD and
 # the build stamp are current. This also runs after a pull/build below.
 reconcile_native_runtime || true
@@ -442,6 +464,9 @@ if [ "$LOCAL" = "$REMOTE" ]; then
   # (correctness over cost — this path only fires when something already went
   # wrong, not on the steady-state hot path).
   if [ "$BUILT" = "$LOCAL" ]; then
+    if [ -e "$PROVISION_PENDING" ]; then
+      reconcile_worker_provisioning || exit 1
+    fi
     reconcile_native_selection
     log "up to date ($LOCAL)"
     exit 0

@@ -1,0 +1,208 @@
+{
+  "status": "Audited core-transfer amendment; implementation pending beyond resource correlation and audit writer-ingress prerequisites. Does not enable Discord coding.",
+  "scope": "Native VM runtime ownership transfer required by #1713 under #1703. Preserve healthy saved builder exports and provider aliases across a fenced controller handoff. This does not itself claim or finish an owner turn.",
+  "source_contracts": {
+    "native_vm": "crates/augmentagent-channel-core/src/native_vm.rs",
+    "audit": "crates/augmentagent-channel-core/src/tool_audit.rs and audit_chain.rs",
+    "workflow": "crates/augmentagent-cli/src/self_improve_workflow.rs and autoship_owner_turn.rs",
+    "retention": "#1746 preserves restored runtimes; retirement still owns final reclamation"
+  },
+  "glossary": {
+    "workflow_lease": "SQLite authority to dispatch or mutate a workflow; expiry never proves descendants stopped.",
+    "runtime_owner": "A RuntimeOwner value contains workflow_id + lease_generation. When used as current authority in this amendment it always means effective_owner, never merely the creation value in owned.json.",
+    "audit_generation": "Protected audit log/anchor namespace. A handoff seals the previous namespace and supplies a distinct healthy destination.",
+    "transfer": "A durable old-owner/audit to new-owner/audit migration, preserving exact completed exports and aliases. It is not a native model turn, workflow retirement or shipment.",
+    "builder_inventory": "Controller-observed provider/session IDs from protected workflow state. A provider alias resolves an ID to an owned runtime; neither a model response nor an audit UUID alone supplies this authority.",
+    "creation_owner": "Immutable owner/audit provenance in owned.json at runtime creation. It is not overwritten on handoff.",
+    "effective_owner": "Latest validated owner/audit in the native transfer ledger for this runtime, or its creation owner/audit when no transfer exists. Native resume, owner retirement and stale-scope cleanup use this one derived authority."
+  },
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "Add a Linux controller API that transfers all supplied source runtime owners to one newer owner of the same workflow and a distinct protected audit path. Require a current workflow lease in the caller immediately before the API and in the sealing callback. Source owners are an explicit immutable list; never infer them from a branch name or the last heartbeat.",
+      "why": "A healthy runtime is currently either active-owned or retired. Retirement prevents resuming its saved native conversation."
+    },
+    {
+      "id": "D2",
+      "decision": "Use the existing native policy state root, StateLock and per-session kernel flock locks. Validate source/destination workflow identity, strictly increasing generation, absolute audit paths, private regular metadata, and exact registered builder inventory before changing any runtime owner. Bound the transfer to 64 source owners and 64 sessions; overflow is a named capacity refusal and never truncates inventory. Retired sessions are excluded from migration. Every non-retired source runtime must resolve to a supplied observed builder conversation; missing/uncertain observation, missing alias/export/completion, diagnostic or failed completion, foreign workflow, changed audit path and symlinks refuse. Empty inventory is valid only when no non-retired source runtime exists. A destination owner already closed in retired_owner refuses. Completion must be version 1, exit_code 0, diagnostic_only absent/false, launch_sha256 valid SHA-256, a single safe generation-* directory, worker_quiescence.remaining_workers == 0 and quiet_scans >= 2. Recursively hash the referenced export generation with no symlinks, regular owner-private files, <=64 MiB and <=4096 files; preserve exact alias and creation receipt bytes. Completion itself does not substitute for current kernel quiescence. The core scans all non-retired runtimes for the workflow and rejects any effective source owner/session omitted from the explicit request. Native session IDs are nonempty ASCII graphic strings of at most 256 bytes, matching Launch::observe_session; a longer workflow observation is ineligible rather than silently truncated.",
+      "why": "Keeping a session ID does not prove the export belongs to this workflow, and a completed controller process does not prove child quiescence."
+    },
+    {
+      "id": "D3",
+      "decision": "Lock order is native StateLock, then all affected session locks in lexical path order, then protected audit anchor locks. Session locks are nonblocking: busy means free deferral with no runtime metadata changes. Under these locks, run a controller callback that verifies and seals each source audit generation. Add healthy-handoff sealing to AuditLogger/AnchoredAudit: reject failed continuity, pending append or writer tickets; verify anchored bytes; verify every recorded required run-resource identity with run_resources::verify_quiescent; require every model admission to carry admission_schema_version 2 and the identical resource_identity JSON from exactly one preceding run_resource_admitted observation for the same provider; reject duplicate, missing, legacy-unbound or conflicting model-to-resource correlation; require prior controller generation less than destination generation. The seal is immutable and idempotent. Existing interrupted-audit recovery stays separate. The destination audit is a distinct private namespace and healthy before transfer starts. ProcessGroup::admit supplies the controller-read resource identity to AuditLogger at the same model charge/release boundary; legacy unprotected/non-deferred accounting retains its existing API and does not become eligible handoff proof. Protected writer ticket registration must acquire the same cross-process anchor lock as sealing, check that the generation is open, and create/fsync its ticket plus increment the local writer count before releasing that lock. Sealing excludes new registrations while checking outstanding tickets and publishing its seal. A late registration against a sealed generation refuses without creating a new ticket. Existing-seal replay is read-only: first verify the same handoff/request identity and anchored bytes, then return the identical stored proof without calling protected_health or appending. Rejected post-seal writes cannot invalidate a previously verified seal; real pre-seal continuity loss still prevents the initial seal. Add deterministic cross-process registration/sealing race and seal/late-write/crash/replay tests.",
+      "why": "Kernel-empty resource removal revokes waiting supervisors, session locks protect exports, and sealing structurally rejects late audit writes. These are complementary controls."
+    },
+    {
+      "id": "D4",
+      "decision": "Use a versioned native-state transfer ledger in the same private FULL-synchronous SQLite database as retired_owner. The immutable request binds a controller-generated transfer UUID, workflow, sorted source effective owners/audit paths, destination owner/audit, exact observed provider/session/runtime mapping and creation-receipt/export/completion hashes. Reuse of a UUID with different inputs refuses. Prepare durably before sealing; after obtaining the immutable seal proofs, atomically commit old-owner closure, every effective-owner mapping and the completed receipt in one native SQLite transaction. A source owner already closed by terminal retirement or a different transfer refuses. Matching pending transfer replay revalidates the same inventory/proofs. The ledger is the authority for effective ownership; owned.json remains immutable creation provenance.",
+      "why": "There is no reason to rewrite runtime files to transfer ownership. One native SQLite commit can move all effective owners together and retain original provenance; audit sealing remains a separately recoverable boundary."
+    },
+    {
+      "id": "D5",
+      "decision": "Do not replace owned.json or any export, completion or alias file. Add a resolver that verifies the immutable creation receipt hash and follows the native ledger to the latest effective owner/audit. The initial source is creation provenance; each completed transfer must extend the exact prior effective owner and strictly increase the generation within the same workflow. A malformed or disconnected chain refuses. Commit all source-to-destination mappings and old-owner closure atomically. A completed transfer replays its immutable receipt without reapplying old mappings, even if a later valid transfer has advanced a runtime again. No per-runtime staging files or rename cleanup protocol is introduced.",
+      "why": "Immutable creation receipts plus one transactional effective-owner authority avoid half-renamed files, downgrade races and duplicate homes for current ownership."
+    },
+    {
+      "id": "D6",
+      "decision": "Old-owner closure fences subsequent native preparation through owner_retired. Resume resolves effective ownership and then validates that workflow/audit authority against the destination; successful completion, exact provider alias, non-retired runtime, guarded scope and current resource admission remain mandatory. Do not write retired.json or retired-owner.json for migrated sessions. Destination terminal retirement resolves effective ownership before marking sessions; replaying source retirement cannot mark a now-transferred runtime. Pruning retains its actual native predicate: validated retirement markers plus an available session flock. This amendment adds no process-reference checker. Transfer creates no retirement marker; destination/source retirement and delayed Drop must first resolve effective authority. Existing terminal reconciliation still owns kernel quiescence before authorizing retirement; a lock alone never proves descendants stopped.",
+      "why": "The previous owner must lose dispatch authority while the new owner retains a resumable export."
+    },
+    {
+      "id": "D7",
+      "decision": "Return a private version-1 transfer receipt containing transfer UUID, canonical request SHA-256, source inventory digest, old-owner closure entries, source audit seal SHA-256 list, destination owner/audit and a sorted per-runtime effective-mapping array. Each mapping binds provider, SHA-256 of observed native session ID, relative runtime path, immutable creation-receipt SHA-256, completion SHA-256, export-manifest SHA-256, destination effective owner/audit and transfer UUID. The wire_contract section is normative for all schemas, projections, sorting, exact byte encoding and hash exclusions; both sides use its shared core implementation. The controller acknowledges only after checking this receipt against its immutable pending request and current ledger authority. Completion is not owner-message applied, review passed, model readiness, ship or deployment. Caller must persist pending handoff before external I/O, recheck its current lease before acknowledgement and reject partial receipts for native dispatch.",
+      "why": "The core runtime transfer cannot substitute for the workflow state machine."
+    },
+    {
+      "id": "D8",
+      "decision": "Make scope-exit retirement carry the owner/audit observed at native launch. NativeSession retirement entries hold path plus expected effective owner/audit, not only a path. At retirement, reacquire StateLock, resolve current effective ownership and mark only if it still equals that expected authority. A delayed old controller Drop cannot retire a runtime transferred to a newer owner. Fresh independent reviewers still retire their own unmigrated runtimes; retained builder scopes remain retained under #1746.",
+      "why": "Kernel worker quiescence does not prove an old controller has dropped every Rust Arc; unconditional path-only retirement would bypass handoff fencing."
+    }
+  ],
+  "failure_and_replay": [
+    "Before prepare: validation/busy/unknown failures change no effective owner or retired-owner authority. Caller exposes a bounded reason and retries only on a relevant change or persisted S backoff.",
+    "After prepare but before sealing: replay revalidates immutable inventory and uses the same transfer request. It cannot invent or substitute an observed session.",
+    "After a source audit seal but before its proof is stored: replay obtains the identical immutable proof from the anchor. A sealed source is never unsealed; pending handoff remains visible.",
+    "After seal proofs but before the native SQLite commit: pending replay performs the one transaction. If commit succeeded but its response was lost, the same ID returns the completed receipt without replaying old mappings. A later transfer or retirement cannot be undone by that replay.",
+    "Missing/corrupt prepared records, changed source metadata and incompatible authority remain explicit held/unknown outcomes. Preserve all runtime/audit bytes; no ownership guessing or model dispatch. Caller integration must provide a named reconciler or explicit operator recovery before public consumer enablement."
+  ],
+  "build_order_with_testable_exits": [
+    "1. Real filesystem red tests: old owner cannot safely resume under a distinct new audit; current retirement destroys that path. Add healthy anchored-audit seal tests, including busy/forged resource identity, pending writer, corruption and immutable seal replay.",
+    "2. Implement transfer validation, locks and durable ledger. Test Codex and Claude fixtures with exact aliases and completed exports. Verify no metadata writes on invalid/unknown inventory or live session lock. Include certain -> uncertain -> refusal, multiple retained sessions for one provider and invalid/overlong observed native IDs.",
+    "3. Add subprocess crash injection after prepare, each audit seal and native ledger commit before response. Replay must preserve creation receipts, exports and aliases byte-for-byte and never downgrade a later transfer. Race two controllers and destination/source retirement with transfer. Prove a delayed old scope Drop cannot mark a transferred session retired.",
+    "4. Run affected native/audit suites through scripts/cargo-managed.sh and required hosted CI. No paid provider dispatch in these core fixtures. Attach tested source hashes as a list of path/sha256 records and preserve failed artifacts.",
+    "5. Only after this core contract passes: implement the caller protocol in WorkflowGuard, ownership promotion, owner-turn completion/pause preservation and public gateway/worker consumer. Then perform real guarded Codex/Claude continuation and Discord live acceptance. Core merge alone never closes D or E."
+  ],
+  "non_goals": [
+    "No host shell fallback, new provider subscription, refresh grant expansion, lowered resource floor, provider route changes, owner pause removal, review/CI bypass or external message sending.",
+    "No import or relabel of uncertain legacy native conversations. Keep them held for explicit existing reconciliation or a separately verified fresh-conversation handoff.",
+    "No changes to merge-only accounting or shipping allowance authority."
+  ],
+  "accepted_risks": [
+    {
+      "risk": "Native/workflow SQLite and runtime files are separate durable stores.",
+      "control": "Immutable prepared transfer and replay receipt; workflow caller must fence acknowledgement and dispatch.",
+      "ends_when": "Not eliminated by this amendment; caller integration and subprocess crash acceptance must demonstrate reconciliation."
+    },
+    {
+      "risk": "Host-owner filesystem compromise remains outside this trust boundary.",
+      "control": "Private metadata, no-follow opens, exact hashes, kernel locks and protected audit roots.",
+      "ends_when": "No claim of a hostile-host security boundary."
+    }
+  ],
+  "open_threads": [
+    {
+      "id": "O1",
+      "owner": "Root source audit",
+      "status": "Resolved for schema/lifetime; behavioral race tests remain required.",
+      "evidence": [
+        "scripts/native-provider-vm.py opens session/lock at lines 573-574, holds it through guest/export publication, and closes it at line 837 before final bridge/child termination. Kernel resource proof is therefore independently required.",
+        "complete.json version 1 is published at lines 804-808 only after QEMU wait; export generation is bounded by MAX_HOME=64 MiB and 4096 received files.",
+        "native_vm::Launch::observe_session writes aliases under StateLock after native response; inventory validation must therefore refuse missing/unobserved aliases instead of inferring identity."
+      ],
+      "blocks": "No longer a schema guess; D2/D3/D8 tests must verify these boundaries before implementation handoff."
+    },
+    {
+      "id": "O2",
+      "owner": "Workflow caller integration after core tests",
+      "question": "Before caller coding/enablement, implement an immutable observation table keyed by workflow/provider/session/observation sequence retaining certainty, binding, source owner/audit and observation time. Select the latest observation per retained runtime regardless of certainty, then refuse if that latest observation is uncertain; never filter uncertainty away before selecting. Only an explicit verified reconciliation may establish a subsequent certain observation. Read this immutable history, not only workflow_builder_conversation (latest per provider), and exclude uncertain/missing provenance. Preserve the existing session-owner uniqueness fence. The request uses the shared wire_contract and complete core-scanned runtime inventory. Implement durable preparation/promotion plus a named handoff reconciler through S persistence; all are public-enable blockers.",
+      "blocks": "Public Discord coding and live acceptance; core API alone does not supply it."
+    },
+    {
+      "id": "O3",
+      "owner": "Workflow caller integration after core tests",
+      "question": "Complete owner turn with actual candidate/contract verification, preserve prior explicit owner pause, invalidate old reviews, handle new input during a turn and rotate guard/audit/resource callbacks safely after contract revision.",
+      "blocks": "Public Discord coding and live acceptance."
+    }
+  ],
+  "draft_revision": 5,
+  "ledger_retention": {
+    "authority_owner": "Native runtime storage manager; this amendment adds no ledger garbage collector.",
+    "retention": "Transfer requests, completed receipts, source audit seal bindings, chain links and owner-closure tombstones are append-only and retained indefinitely, including after runtime directory reclamation. Runtime pruning never removes this database or its authority records.",
+    "capacity": "Before preparing a new transfer, enforce a 128 MiB native ledger budget and the existing policy state budget. Account for live SQLite/WAL bytes plus twice the encoded request/proof/receipt upper bound and 1 MiB allocation margin. Refuse native-transfer-history-capacity when the reservation will not fit; do not lower resource floors, delete authority history or overwrite a pending request. Existing receipt replay remains read-only apart from SQLite recovery and does not allocate new transfer history. A commit or fsync failure after sealing remains a visible pending handoff for safe replay after supported capacity restoration. Persist reserved_bytes in every prepared transfer. Subsequent transfer admission counts the full reservations of all unresolved transfers in addition to actual DB/WAL bytes; conservatively retain each full reservation until its completed commit. Release its reservation atomically with that commit. A crash preserves it. Before normal native runtime allocation, native preparation also deducts outstanding transfer growth from both the policy state budget and available filesystem capacity while preserving its existing 1 GiB free-space guard. Pending replay uses its existing reservation and is not admitted as a new transfer; never double-reserve it. Bound stored seal references to 1 MiB and completed receipt to 256 KiB; prepare computes its exact request length plus those maxima before reservation. Larger proof material stays in its protected source anchor, with path/hash references in the ledger.",
+    "future_trigger": "Any future ledger compaction requires a separate reviewed migration that preserves permanent fencing tombstones, every live runtime ownership chain and completed-receipt replay authority. It is outside this amendment; no current reader may assume such compaction."
+  },
+  "wire_contract": {
+    "shared_implementation": "Expose one native-core canonical_bytes/request_digest/inventory_digest/verify_receipt implementation and typed version-1 request/receipt structures to the workflow caller. Caller and core must use it; do not implement independent serializers.",
+    "canonical_bytes": "Recursively sort object keys by UTF-8 bytes; compact JSON, no insignificant whitespace, UTF-8 output, no Unicode normalization, no floats. Emit non-ASCII characters literally; escape quote and backslash, use \\b/\\t/\\n/\\f/\\r for those five controls and lowercase \\u00xx for other U+0000..U+001F. Never escape slash or printable non-ASCII characters. Include byte-level vectors with non-ASCII, slash, backslash, quotes and controls.",
+    "request_fields": [
+      "version:1",
+      "transfer_id:canonical UUID",
+      "workflow_id:string",
+      "source_owners:array of {owner:{workflow_id,lease_generation},audit_path}, sorted by generation then audit_path bytes",
+      "destination:{owner:{workflow_id,lease_generation},audit_path}",
+      "inventory:array of runtime rows sorted by provider then runtime_relative_path bytes"
+    ],
+    "inventory_row_fields": [
+      "provider:codex|claude",
+      "native_session_id:private observed ID",
+      "runtime_relative_path:provider/session-* relative to canonical native state root",
+      "creation_owner:{workflow_id,lease_generation}",
+      "creation_audit_path:absolute path",
+      "effective_owner:{workflow_id,lease_generation}",
+      "effective_audit_path:absolute path",
+      "creation_receipt_sha256:hash of original owned.json bytes",
+      "completion_sha256:hash of original complete.json bytes",
+      "alias_sha256:hash of original alias bytes",
+      "export_manifest_sha256:hash of canonical derived export manifest"
+    ],
+    "source_inventory_digest": "SHA-256 of canonical_bytes({version:1,inventory:request.inventory}); include every row field exactly as declared. The canonical request hash covers the complete request with no omitted field.",
+    "export_manifest": "Derived only; do not create a file inside the export. Object {version:1,entries:[...]}. Include every directory below the referenced generation, including empty directories, as {kind:\"directory\",path}; include each regular file as {kind:\"file\",path,bytes,sha256}. Exclude the generation root itself. Paths are UTF-8 POSIX relative paths with no empty, dot, parent or absolute component; preserve literal backslashes as filename characters. Reject invalid UTF-8, duplicate paths, symlinks and non-regular files. Sort entries by raw UTF-8 path bytes. File hashes cover original content bytes. D2 file/byte bounds and privacy checks apply.",
+    "receipt_fields": [
+      "version:1",
+      "transfer_id:request.transfer_id",
+      "request_sha256:canonical complete request hash",
+      "source_inventory_sha256:defined above",
+      "source_closures:request.source_owners with closed:true, same ordering",
+      "source_seals:array of {audit_path,seal_sha256}, sorted by audit_path bytes",
+      "destination:request.destination",
+      "mappings:array of {provider,native_session_sha256,runtime_relative_path,creation_receipt_sha256,completion_sha256,export_manifest_sha256,effective_owner,effective_audit_path,transfer_id}, ordered as request.inventory and using destination authority",
+      "receipt_sha256:SHA-256 of canonical receipt object omitting only this field"
+    ],
+    "verification": "Reject unknown fields or versions, duplicate rows/source owners, incomplete source/session coverage, changed digest or destination. Source seal hash covers the canonical immutable proof returned by the anchor. Completed replay returns the stored receipt; current-authority verification is separate and may report superseded/retired while leaving that historical receipt intact."
+  },
+  "outcome_contract": {
+    "shape": "Typed core result: Completed(receipt), Deferred(reason,fingerprint), Held(reason,fingerprint), Unknown(reason,transfer_id). No raw exception text is a public reason.",
+    "capacity": [
+      "native-transfer-lock-busy",
+      "native-transfer-state-capacity",
+      "native-transfer-history-capacity"
+    ],
+    "dependency": [
+      "native-transfer-inventory-missing",
+      "native-transfer-runtime-unavailable"
+    ],
+    "provenance_hold": [
+      "native-transfer-conversation-uncertain",
+      "native-transfer-invalid-request",
+      "native-transfer-authority-conflict",
+      "native-transfer-metadata-invalid",
+      "native-transfer-audit-corrupt",
+      "native-transfer-prepared-corrupt"
+    ],
+    "transient": [
+      "native-transfer-persist-retry"
+    ],
+    "unknown": [
+      "native-transfer-pending-unknown"
+    ],
+    "projection": "Capacity maps to S CapacityHold; dependency maps to S DependencyHold. Both are unpaid observations eligible next five-minute reconciliation cycle, subject to changed authoritative dependencies and capacity. Provenance holds require named explicit verified reconciliation/operator recovery; time alone never clears them. Transient I/O failure uses S persisted 5/10/20/40/60-minute backoff, capped at 60; ENOSPC maps to capacity instead. Unknown maps to reconciliation-only for the exact transfer UUID; no fresh native dispatch or new transfer. Success adds no ship/debit. The current command queue fixed five-minute scheduling is not the S failure backoff implementation.",
+    "fingerprints": "Bind reason plus request digest, native policy hash/state-root identity, observed conversation revision and alias/completion hashes; capacity adds current reservation/capacity class, transient failure adds fixed I/O category. Never include credentials, raw private paths or owner message text in public projection. The caller owns S persistence and the named handoff reconciler, both required before public enablement."
+  },
+  "audit": {
+    "revision_reviewed": 3,
+    "fresh_reader": "Four findings verified and resolved: correlation, receipt definition, retention and owner vocabulary.",
+    "seams_checked": 20,
+    "seams_held_without_change": 12,
+    "findings_after_dedup": [
+      "complete observation inventory interface",
+      "normative hashing/request/export manifest schema",
+      "atomic writer ingress during sealing",
+      "read-only sealed-proof replay after rejected late write",
+      "native pruning predicate scope",
+      "typed native-to-S outcomes and backoff mapping",
+      "crash-surviving capacity reservations"
+    ],
+    "revision_4_status": "Eight changed seams rechecked. Seven held; S2 latest-observation ambiguity was corrected in revision 5 and its final focused recheck holds.",
+    "revision_5_result": "20 of 20 consolidated seams hold after verified resolutions; core transfer ledger, healthy seal/replay, retirement authority resolver and workflow consumer still need implementation/tests. Specification audit is not production acceptance."
+  }
+}

@@ -194,6 +194,9 @@ impl ImessageReplier {
     pub async fn handle_deltas(&self, deltas: &[PollDelta]) -> ReplyStats {
         let mut stats = ReplyStats::default();
         for delta in deltas {
+            if delta.conversation.chat_guid.as_deref().is_some_and(|guid|self.store.is_imessage_owner_conversation(guid).unwrap_or(true)) {
+                continue;
+            }
             if !delta.first_run {
                 let (own, manual) = split_own_entries(&self.store, delta);
                 stats.own_sends += own;

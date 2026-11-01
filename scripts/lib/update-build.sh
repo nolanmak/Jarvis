@@ -3,6 +3,8 @@
 # and 1 for an actual build failure. The caller leaves its stamp unchanged.
 run_update_build() {
   local cli="$1" target="$2" help="" output="" code=0 legacy=0
+  local repair="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secure-release-executables.py"
+  python3 "$repair" "$target/release" >> "$LOG" 2>&1 || return 1
   local driver=(cargo)
   if help=$("$cli" disk build --help 2>/dev/null); then
     case "$help" in
@@ -28,7 +30,7 @@ run_update_build() {
     esac
   fi
   case "$code" in
-    0) return 0 ;;
+    0) python3 "$repair" "$target/release" >> "$LOG" 2>&1 || return 1; return 0 ;;
     75) log "update deferred: storage busy; retry next tick"; return 75 ;;
     73) log "update deferred: low disk space or storage budget; retry after reclamation"; return 73 ;;
     76) log "update deferred: storage admission unavailable; retry next tick"; return 76 ;;

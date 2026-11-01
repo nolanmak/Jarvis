@@ -485,6 +485,10 @@ mod tests {
         assert_eq!(retire_owned_at(temp.path(),Path::new("/audit/one"),&RuntimeOwner{workflow_id:"workflow".into(),lease_generation:1}).unwrap(),2);
         assert_eq!(prune_and_count(temp.path()).unwrap(),2);
         assert!(held.exists()); assert!(resumable.exists()); assert!(!interrupted.exists());
+        // Parallel tests can fork while this fixture lock is open. Explicitly
+        // release our flock before dropping it so a child's brief pre-exec FD
+        // inheritance cannot turn this immediate reclamation assertion busy.
+        assert_eq!(unsafe{libc::flock(lock.as_raw_fd(),libc::LOCK_UN)},0);
         drop(lock);
         assert_eq!(prune_and_count(temp.path()).unwrap(),1);
         assert!(!held.exists()); assert!(resumable.exists());
