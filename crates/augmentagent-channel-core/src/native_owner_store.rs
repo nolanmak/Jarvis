@@ -30,7 +30,7 @@ struct Bootstrap {
     epoch: String,
     root_identity_sha256: String,
 }
-fn identity(info: &std::fs::Metadata) -> Result<String> {
+pub(super) fn identity(info: &std::fs::Metadata) -> Result<String> {
     use sha2::{Digest, Sha256};
     Ok(format!(
         "{:x}",
@@ -326,6 +326,71 @@ pub(super) fn initializing(db: &rusqlite::Connection) -> Result<bool> {
 }
 pub(super) fn verify_migration(db: &rusqlite::Connection) -> Result<()> {
     validate_legacy(db)
+}
+pub(super) fn validate_bound_metadata(root: &Path, expected: &StoreIdentity) -> Result<()> {
+    let info = root.symlink_metadata()?;
+    ensure!(
+        info.is_dir()
+            && !info.file_type().is_symlink()
+            && info.uid() == unsafe { libc::geteuid() }
+            && info.mode() & 0o077 == 0,
+        R::PreparedCorrupt
+    );
+    let marker: StoreIdentity = optional(root, MARKER)?.context(R::PreparedCorrupt)?;
+    ensure!(
+        marker == *expected && marker.root_identity_sha256 == identity(&info)?,
+        R::PreparedCorrupt
+    );
+    for (name, hash) in [
+        (DATABASE, &expected.ledger_identity_sha256),
+        ("state.lock", &expected.state_lock_identity_sha256),
+    ] {
+        let info = root.join(name).symlink_metadata()?;
+        regular(&info)?;
+        ensure!(identity(&info)? == *hash, R::PreparedCorrupt);
+    }
+    Ok(())
+}
+pub(super) fn current_identity(
+    root: &Path,
+    lock: &StateLock,
+    db: &rusqlite::Connection,
+) -> Result<StoreIdentity> {
+    lock_matches(root, lock)?;
+    let (value, state, _) = epoch_row(db)?.context(R::PreparedCorrupt)?;
+    ensure!(
+        state == "active" && value.state_lock_identity_sha256 == identity(&lock.0.metadata()?)?,
+        R::PreparedCorrupt
+    );
+    validate_bound_metadata(root, &value)?;
+    Ok(value)
+}
+pub(super) fn open_bound(
+    root: &Path,
+    lock: &StateLock,
+    expected: &StoreIdentity,
+    read_only: bool,
+) -> Result<rusqlite::Connection> {
+    lock_matches(root, lock)?;
+    validate_bound_metadata(root, expected)?;
+    let flags = if read_only {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    };
+    let db = rusqlite::Connection::open_with_flags(
+        root.join(DATABASE),
+        flags | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    ensure!(
+        current_identity(root, lock, &db)? == *expected,
+        R::PreparedCorrupt
+    );
+    db.pragma_update(None, "foreign_keys", "ON")?;
+    if !read_only {
+        db.pragma_update(None, "synchronous", "FULL")?;
+    }
+    Ok(db)
 }
 pub(super) fn activate(root: &Path, lock: &StateLock, db: &rusqlite::Connection) -> Result<()> {
     lock_matches(root, lock)?;

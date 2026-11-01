@@ -402,6 +402,40 @@ fn validate_all_history(db: &rusqlite::Connection) -> Result<()> {
     }
     Ok(())
 }
+fn validate_schema(db: &rusqlite::Connection) -> Result<()> {
+    for name in [
+        "retired_owner",
+        "native_transfer_meta",
+        "native_transfer",
+        "native_transfer_claim",
+        "native_transfer_source",
+        "native_transfer_close",
+        "native_transfer_link",
+    ] {
+        ensure!(
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [name],
+                |row| row.get::<_, bool>(0)
+            )?,
+            R::PreparedCorrupt
+        );
+    }
+    ensure!(
+        db.query_row(
+            "SELECT version FROM native_transfer_meta WHERE id=1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )? == 1,
+        R::PreparedCorrupt
+    );
+    {
+        let mut check = db.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = check.query([])?;
+        ensure!(rows.next()?.is_none(), R::PreparedCorrupt);
+    }
+    Ok(())
+}
 impl<'a> Ledger<'a> {
     pub fn open(root: &'a Path, lock: &'a StateLock) -> Result<Self> {
         let held = lock.0.metadata()?;
@@ -412,7 +446,8 @@ impl<'a> Ledger<'a> {
         );
         let db = super::owner_store::open(root, lock)?;
         db.pragma_update(None, "foreign_keys", "ON")?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS native_transfer_meta(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
+        if super::owner_store::initializing(&db)? {
+            db.execute_batch("CREATE TABLE IF NOT EXISTS native_transfer_meta(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
             INSERT OR IGNORE INTO native_transfer_meta VALUES(1,1);
             CREATE TABLE IF NOT EXISTS native_transfer(id TEXT PRIMARY KEY,request_json BLOB NOT NULL,request_sha256 TEXT NOT NULL,claims_json BLOB NOT NULL,claims_sha256 TEXT NOT NULL,reserved_bytes INTEGER NOT NULL CHECK(reserved_bytes>0),state TEXT NOT NULL CHECK(state IN ('prepared','completed','aborted')),receipt_json BLOB,seals_json BLOB);
             CREATE TABLE IF NOT EXISTS native_transfer_claim(kind TEXT NOT NULL,key TEXT NOT NULL,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),PRIMARY KEY(kind,key));
@@ -421,19 +456,8 @@ impl<'a> Ledger<'a> {
             CREATE TABLE IF NOT EXISTS native_transfer_close(workflow TEXT NOT NULL,generation INTEGER NOT NULL,audit_path TEXT NOT NULL,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),PRIMARY KEY(workflow,generation));
             CREATE TABLE IF NOT EXISTS native_transfer_link(seq INTEGER PRIMARY KEY AUTOINCREMENT,transfer_id TEXT NOT NULL REFERENCES native_transfer(id),ordinal INTEGER NOT NULL,runtime TEXT NOT NULL,UNIQUE(transfer_id,ordinal),UNIQUE(transfer_id,runtime));
             CREATE INDEX IF NOT EXISTS native_transfer_link_runtime ON native_transfer_link(runtime,seq);")?;
-        ensure!(
-            db.query_row(
-                "SELECT version FROM native_transfer_meta WHERE id=1",
-                [],
-                |row| row.get::<_, i64>(0)
-            )? == 1,
-            R::PreparedCorrupt
-        );
-        {
-            let mut check = db.prepare("PRAGMA foreign_key_check")?;
-            let mut rows = check.query([])?;
-            ensure!(rows.next()?.is_none(), R::PreparedCorrupt);
         }
+        validate_schema(&db)?;
         growth(&db)?;
         if super::owner_store::initializing(&db)? {
             super::owner_store::verify_migration(&db)?;
@@ -441,6 +465,26 @@ impl<'a> Ledger<'a> {
         }
         super::owner_store::activate(root, lock, &db)?;
         std::fs::File::open(root)?.sync_all()?;
+        Ok(Self {
+            root,
+            _lock: lock,
+            db,
+        })
+    }
+    pub fn store_identity(&self) -> Result<super::owner_store::StoreIdentity> {
+        super::owner_store::current_identity(self.root, self._lock, &self.db)
+    }
+    pub fn open_bound(
+        root: &'a Path,
+        lock: &'a StateLock,
+        expected: &super::owner_store::StoreIdentity,
+        read_only: bool,
+    ) -> Result<Self> {
+        let db = super::owner_store::open_bound(root, lock, expected, read_only)?;
+        validate_schema(&db)?;
+        if !read_only {
+            growth(&db)?;
+        }
         Ok(Self {
             root,
             _lock: lock,

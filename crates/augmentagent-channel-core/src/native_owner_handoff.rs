@@ -325,6 +325,7 @@ fn exact_inventory_row(
     ensure!(actual == *declared, R::MetadataInvalid);
     Ok(())
 }
+#[cfg(test)]
 pub(super) fn handoff_at(
     root: &Path,
     max_state_bytes: u64,
@@ -333,10 +334,60 @@ pub(super) fn handoff_at(
     destination: &Arc<AuditLogger>,
     current: &dyn Fn() -> Result<()>,
 ) -> Result<TransferReceipt> {
+    handoff_impl(
+        root,
+        max_state_bytes,
+        request,
+        sources,
+        destination,
+        current,
+        None,
+    )
+}
+pub(super) fn handoff_bound_at(
+    root: &Path,
+    max_state_bytes: u64,
+    request: &TransferRequest,
+    sources: &[Arc<AuditLogger>],
+    destination: &Arc<AuditLogger>,
+    current: &dyn Fn() -> Result<()>,
+    expected: &super::owner_store::StoreIdentity,
+) -> Result<TransferReceipt> {
+    handoff_impl(
+        root,
+        max_state_bytes,
+        request,
+        sources,
+        destination,
+        current,
+        Some(expected),
+    )
+}
+fn handoff_impl(
+    root: &Path,
+    max_state_bytes: u64,
+    request: &TransferRequest,
+    sources: &[Arc<AuditLogger>],
+    destination: &Arc<AuditLogger>,
+    current: &dyn Fn() -> Result<()>,
+    expected: Option<&super::owner_store::StoreIdentity>,
+) -> Result<TransferReceipt> {
     current()?;
     request.validate()?;
     let lock = super::StateLock::acquire(root)?;
-    let mut ledger = Ledger::open(root, &lock)?;
+    let mut ledger = match expected {
+        Some(expected) => Ledger::open_bound(root, &lock, expected, false)?,
+        None => {
+            #[cfg(test)]
+            {
+                Ledger::open(root, &lock)?
+            }
+            #[cfg(not(test))]
+            {
+                anyhow::bail!(R::InvalidRequest)
+            }
+        }
+    };
     match ledger.state_for(request)? {
         Some(State::Completed(receipt)) => {
             receipt.verify(request)?;

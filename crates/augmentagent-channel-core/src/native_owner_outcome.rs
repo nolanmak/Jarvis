@@ -1,6 +1,7 @@
 //! Bounded controller results. Only `public_status` is suitable for transport.
 use super::ownership::{TransferReceipt, TransferRequest};
 use crate::tool_audit::AuditLogger;
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 use std::{
@@ -136,42 +137,159 @@ pub fn capture_transfer_binding(
         current,
     )
 }
+impl TransferBinding {
+    fn valid(&self) -> bool {
+        self.version == 1
+            && digest(&self.policy_sha256)
+            && self.canonical_state_root.is_absolute()
+            && self
+                .canonical_state_root
+                .to_str()
+                .is_some_and(|path| !path.contains('\0'))
+            && !self
+                .canonical_state_root
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            && self.store.version == 1
+            && uuid::Uuid::parse_str(&self.store.epoch)
+                .is_ok_and(|id| id.to_string() == self.store.epoch)
+            && [
+                &self.store.root_identity_sha256,
+                &self.store.ledger_identity_sha256,
+                &self.store.state_lock_identity_sha256,
+            ]
+            .into_iter()
+            .all(|hash| digest(hash))
+    }
+}
+fn selected_fence(
+    policy: Option<&Path>,
+    expected: &str,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
+) -> anyhow::Result<()> {
+    current().map_err(anyhow::Error::new)?;
+    let bytes = super::private(policy.context(TransferReason::PersistRetry)?)
+        .context(TransferReason::PersistRetry)?;
+    anyhow::ensure!(sha(&bytes) == expected, TransferReason::AuthorityConflict);
+    Ok(())
+}
 pub(super) fn capture_with_policy(
     policy: Option<&Path>,
     request: &TransferRequest,
     observation: &TransferObservation,
     current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> Result<TransferBinding, TransferOutcome> {
-    let selected = load_selection(policy, request, observation, current)?;
+    let selected = load_selection(policy, request, observation, current, None)?;
+    let expected = selected
+        .context
+        .policy_sha256
+        .as_deref()
+        .expect("loaded policy digest");
     let result = (|| -> anyhow::Result<TransferBinding> {
         let lock = super::StateLock::acquire(&selected.root)?;
-        let _ledger = super::owner_ledger::Ledger::open(&selected.root, &lock)?;
-        let store = serde_json::from_slice(&super::private(
-            &selected.root.join("authority-epoch.json"),
-        )?)?;
+        selected_fence(policy, expected, current)?;
+        let ledger = super::owner_ledger::Ledger::open(&selected.root, &lock)?;
+        let store = ledger.store_identity()?;
+        selected_fence(policy, expected, current)?;
         Ok(TransferBinding {
             version: 1,
-            policy_sha256: selected.context.policy_sha256.clone().unwrap(),
+            policy_sha256: expected.into(),
             canonical_state_root: selected.root.clone(),
             store,
         })
     })();
-    result.map_err(|_| TransferOutcome::Unknown {
-        reason: TransferReason::PendingUnknown,
-        transfer_id: request.transfer_id.clone(),
+    result.map_err(|error| {
+        let (reason, category) = classify(&error);
+        if error.is::<TransferFenceError>()
+            || matches!(
+                reason,
+                TransferReason::AuthorityConflict | TransferReason::PersistRetry
+            )
+        {
+            selected.context.failure(reason, category)
+        } else {
+            unknown(request)
+        }
     })
 }
-/// Historical receipt lookup grants no productive authority.
-pub fn transfer_receipt(
-    _binding: &TransferBinding,
+fn historical_context<'a>(
+    binding: &TransferBinding,
     request: &TransferRequest,
-    _observation: &TransferObservation,
-    _current: &dyn Fn() -> Result<(), TransferFenceError>,
+    observation: &'a TransferObservation,
+) -> Result<FingerprintContext<'a>, TransferOutcome> {
+    let mut context = FingerprintContext::new(request, observation);
+    if !binding.valid()
+        || request.validate().is_err()
+        || observation.revision == 0
+        || !digest(&observation.sha256)
+    {
+        return Err(context.failure(TransferReason::InvalidRequest, "none"));
+    }
+    context.bind(binding);
+    context.policy_sha256 = Some(binding.policy_sha256.clone());
+    context.root_identity_sha256 = Some(binding.store.root_identity_sha256.clone());
+    Ok(context)
+}
+/// Historical lookup uses only the original private binding. It neither
+/// consults selected policy nor grants dispatch, and never creates authority.
+pub fn transfer_receipt(
+    binding: &TransferBinding,
+    request: &TransferRequest,
+    observation: &TransferObservation,
+    current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> Result<Option<TransferReceipt>, TransferOutcome> {
-    Err(TransferOutcome::Unknown {
+    let mut context = historical_context(binding, request, observation)?;
+    if let Err(error) = current() {
+        let (reason, category) = classify(&error.into());
+        return Err(context.failure(reason, category));
+    }
+    let state = read_bound_state(binding, request, &mut context);
+    if let Err(error) = current() {
+        let (reason, category) = classify(&error.into());
+        return Err(context.failure(reason, category));
+    }
+    match state {
+        Ok(Some(super::owner_ledger::State::Completed(receipt))) => Ok(Some(receipt)),
+        Ok(Some(super::owner_ledger::State::Aborted)) => {
+            Err(context.failure(TransferReason::AuthorityConflict, "none"))
+        }
+        Ok(_) => Ok(None),
+        Err(error)
+            if error.downcast_ref::<TransferReason>()
+                == Some(&TransferReason::AuthorityConflict) =>
+        {
+            Err(context.failure(TransferReason::AuthorityConflict, "none"))
+        }
+        Err(_) => Err(unknown(request)),
+    }
+}
+fn unknown(request: &TransferRequest) -> TransferOutcome {
+    TransferOutcome::Unknown {
         reason: TransferReason::PendingUnknown,
         transfer_id: request.transfer_id.clone(),
-    })
+    }
+}
+fn read_bound_state(
+    binding: &TransferBinding,
+    request: &TransferRequest,
+    context: &mut FingerprintContext<'_>,
+) -> anyhow::Result<Option<super::owner_ledger::State>> {
+    let root = &binding.canonical_state_root;
+    super::owner_store::validate_bound_metadata(root, &binding.store)?;
+    let lock = super::StateLock::acquire(root)?;
+    let ledger = super::owner_ledger::Ledger::open_bound(root, &lock, &binding.store, true)?;
+    let state = ledger.state_for(request)?;
+    context.free_class = super::available_bytes(root)
+        .ok()
+        .map(|bytes| bytes / super::SESSION_BYTES);
+    context.reserved_class = ledger
+        .reserved_bytes()
+        .ok()
+        .map(|bytes| bytes / (1024 * 1024));
+    context.history_class = super::owner_ledger::history_bytes(root)
+        .ok()
+        .map(|bytes| bytes / (1024 * 1024));
+    Ok(state)
 }
 struct Selection<'a> {
     policy: super::Policy,
@@ -205,9 +323,13 @@ fn load_selection<'a>(
     request: &TransferRequest,
     observation: &'a TransferObservation,
     current: &dyn Fn() -> Result<(), TransferFenceError>,
+    binding: Option<&TransferBinding>,
 ) -> Result<Selection<'a>, TransferOutcome> {
     use TransferReason as R;
     let mut context = FingerprintContext::new(request, observation);
+    if let Some(binding) = binding {
+        context.bind(binding);
+    }
     let preflight_hold =
         if request.validate().is_err() || observation.revision == 0 || !digest(&observation.sha256)
         {
@@ -256,6 +378,9 @@ fn load_selection<'a>(
             return Err(context.failure(preflight_hold.unwrap_or(reason), category));
         }
     };
+    if root.to_str().is_none() {
+        return Err(context.failure(TransferReason::MetadataInvalid, "none"));
+    }
     match root.metadata() {
         Ok(info) => {
             if !info.is_dir()
@@ -264,8 +389,10 @@ fn load_selection<'a>(
             {
                 return Err(context.failure(preflight_hold.unwrap_or(R::MetadataInvalid), "none"));
             }
-            context.root_identity_sha256 =
-                Some(sha(format!("{}:{}", info.dev(), info.ino()).as_bytes()));
+            context.root_identity_sha256 = Some(match super::owner_store::identity(&info) {
+                Ok(hash) => hash,
+                Err(_) => return Err(context.failure(TransferReason::MetadataInvalid, "none")),
+            });
         }
         Err(error) => {
             let (reason, category) = classify(&error.into());
@@ -286,6 +413,7 @@ fn load_selection<'a>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn transfer_with_policy(
     policy_path: Option<&Path>,
     request: &TransferRequest,
@@ -294,44 +422,84 @@ pub(super) fn transfer_with_policy(
     destination: &Arc<AuditLogger>,
     current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> TransferOutcome {
-    let mut selected = match load_selection(policy_path, request, observation, current) {
-        Ok(selected) => selected,
-        Err(outcome) => return outcome,
-    };
-    let fence = || current().map_err(anyhow::Error::new);
-    let error = match super::owner_handoff::handoff_at(
-        &selected.root,
-        selected.policy.max_state_bytes,
-        request,
-        sources,
-        destination,
-        &fence,
-    ) {
-        Ok(receipt) => return TransferOutcome::Completed(receipt),
-        Err(error) => error,
-    };
-    reconcile_failure(&selected.root, request, &mut selected.context, &error)
+    match capture_with_policy(policy_path, request, observation, current) {
+        Ok(binding) => transfer_bound_with_policy(
+            policy_path,
+            &binding,
+            request,
+            observation,
+            sources,
+            destination,
+            current,
+        ),
+        Err(outcome) => outcome,
+    }
 }
-
 pub(super) fn transfer_bound_with_policy(
     policy_path: Option<&Path>,
-    _binding: &TransferBinding,
+    binding: &TransferBinding,
     request: &TransferRequest,
     observation: &TransferObservation,
     sources: &[Arc<AuditLogger>],
     destination: &Arc<AuditLogger>,
     current: &dyn Fn() -> Result<(), TransferFenceError>,
 ) -> TransferOutcome {
-    transfer_with_policy(
-        policy_path,
+    if !binding.valid() {
+        return FingerprintContext::new(request, observation)
+            .failure(TransferReason::InvalidRequest, "none");
+    }
+    let mut selected =
+        match load_selection(policy_path, request, observation, current, Some(binding)) {
+            Ok(selected) => selected,
+            Err(outcome) => return outcome,
+        };
+    if selected.context.policy_sha256.as_deref() != Some(&binding.policy_sha256)
+        || selected.root != binding.canonical_state_root
+    {
+        return selected
+            .context
+            .failure(TransferReason::AuthorityConflict, "none");
+    }
+    let fence = || {
+        selected_fence(policy_path, &binding.policy_sha256, current)?;
+        super::owner_store::validate_bound_metadata(&binding.canonical_state_root, &binding.store)
+    };
+    let error = match super::owner_handoff::handoff_bound_at(
+        &selected.root,
+        selected.policy.max_state_bytes,
         request,
-        observation,
         sources,
         destination,
-        current,
-    )
+        &fence,
+        &binding.store,
+    ) {
+        Ok(receipt) => return TransferOutcome::Completed(receipt),
+        Err(error) => error,
+    };
+    match read_bound_state(binding, request, &mut selected.context) {
+        Ok(Some(super::owner_ledger::State::Completed(receipt))) => {
+            TransferOutcome::Completed(receipt)
+        }
+        Ok(Some(super::owner_ledger::State::Aborted)) => selected
+            .context
+            .failure(TransferReason::AuthorityConflict, "none"),
+        Ok(_) => {
+            let (reason, category) = classify(&error);
+            selected.context.failure(reason, category)
+        }
+        Err(error)
+            if error.downcast_ref::<TransferReason>()
+                == Some(&TransferReason::AuthorityConflict) =>
+        {
+            selected
+                .context
+                .failure(TransferReason::AuthorityConflict, "none")
+        }
+        Err(_) => unknown(request),
+    }
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_failure(
     root: &Path,
     request: &TransferRequest,
@@ -392,6 +560,7 @@ fn digest(value: &str) -> bool {
 }
 pub(super) struct FingerprintContext<'a> {
     request_sha256: String,
+    binding_sha256: Option<String>,
     observation: &'a TransferObservation,
     policy_sha256: Option<String>,
     root_identity_sha256: Option<String>,
@@ -408,6 +577,7 @@ impl<'a> FingerprintContext<'a> {
         );
         Self {
             request_sha256,
+            binding_sha256: None,
             observation,
             policy_sha256: None,
             root_identity_sha256: None,
@@ -416,9 +586,15 @@ impl<'a> FingerprintContext<'a> {
             history_class: None,
         }
     }
+    fn bind(&mut self, binding: &TransferBinding) {
+        self.binding_sha256 = serde_json::to_value(binding)
+            .ok()
+            .and_then(|value| super::ownership::canonical_bytes(&value).ok())
+            .map(|bytes| sha(&bytes));
+    }
     fn failure(&self, reason: TransferReason, io_category: &str) -> TransferOutcome {
         use TransferReason as R;
-        let mut value = serde_json::json!({"version":1,"reason":reason.code(),"request_sha256":self.request_sha256,
+        let mut value = serde_json::json!({"version":1,"reason":reason.code(),"request_sha256":self.request_sha256,"binding_sha256":self.binding_sha256,
             "policy_sha256":self.policy_sha256,"root_identity_sha256":self.root_identity_sha256,
             "observation_revision":self.observation.revision,"observation_sha256":self.observation.sha256,"certain":self.observation.certain});
         if matches!(reason, R::LockBusy | R::StateCapacity | R::HistoryCapacity) {
