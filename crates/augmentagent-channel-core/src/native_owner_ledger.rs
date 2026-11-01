@@ -750,6 +750,95 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn native_store_identity_missing_ledger_never_recreates_prepared_authority() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::retirement_db(root.path()).unwrap();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let request = request("workflow");
+        Ledger::open(root.path(), &lock)
+            .unwrap()
+            .prepare(&request, &endpoints(&request), u64::MAX)
+            .unwrap();
+        let db = root.path().join("runtime-retirement.sqlite");
+        std::fs::remove_file(&db).unwrap();
+        assert!(
+            Ledger::open(root.path(), &lock).is_err(),
+            "missing prepared authority was silently recreated"
+        );
+        assert!(
+            !db.exists(),
+            "refusal created a replacement authority database"
+        );
+    }
+    #[test]
+    fn native_store_identity_replacement_is_rejected_before_sqlite_mutates_it() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::retirement_db(root.path()).unwrap();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        let request = request("workflow");
+        Ledger::open(root.path(), &lock)
+            .unwrap()
+            .prepare(&request, &endpoints(&request), u64::MAX)
+            .unwrap();
+        let db = root.path().join("runtime-retirement.sqlite");
+        let retained = tempfile::tempdir().unwrap();
+        std::fs::rename(&db, retained.path().join("original.sqlite")).unwrap();
+        super::super::write(&db, b"").unwrap();
+        assert!(
+            Ledger::open(root.path(), &lock).is_err(),
+            "replacement ledger became fresh authority"
+        );
+        assert_eq!(
+            std::fs::metadata(db).unwrap().len(),
+            0,
+            "refusal modified the replacement file"
+        );
+    }
+    #[test]
+    fn native_store_identity_bare_root_does_not_imply_fresh_authority() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = StateLock::acquire(root.path()).unwrap();
+        assert!(
+            Ledger::open(root.path(), &lock).is_err(),
+            "empty directory was treated as permission to bootstrap authority"
+        );
+        assert!(!root.path().join("runtime-retirement.sqlite").exists());
+    }
+    #[test]
+    fn native_store_identity_verified_legacy_migration_keeps_closures_and_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::retirement_db(root.path())
+            .unwrap()
+            .execute(
+                "INSERT INTO retired_owner VALUES('/audit/original','workflow',1)",
+                [],
+            )
+            .unwrap();
+        let owner = RuntimeOwner {
+            workflow_id: "workflow".into(),
+            lease_generation: 1,
+        };
+        let lock = StateLock::acquire(root.path()).unwrap();
+        assert!(Ledger::open(root.path(), &lock)
+            .unwrap()
+            .is_closed(&owner)
+            .unwrap());
+        let epoch = std::fs::read(root.path().join("authority-epoch.json"))
+            .expect("legacy migration published no durable epoch");
+        assert!(Ledger::open(root.path(), &lock)
+            .unwrap()
+            .is_closed(&owner)
+            .unwrap());
+        assert_eq!(
+            std::fs::read(root.path().join("authority-epoch.json")).unwrap(),
+            epoch
+        );
+    }
     fn request(workflow: &str) -> TransferRequest {
         let source = RuntimeOwner {
             workflow_id: workflow.into(),
