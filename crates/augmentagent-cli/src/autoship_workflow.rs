@@ -25,6 +25,8 @@ mod owner_revision;
 pub(crate) mod owner_turn;
 #[path = "autoship_native_owner_binding.rs"]
 mod native_owner_binding;
+#[path = "autoship_native_launch.rs"]
+pub(crate) mod native_launch;
 #[path = "autoship_owner_inbox.rs"]
 pub(crate) mod owner_inbox;
 #[path = "autoship_discord_controls.rs"]
