@@ -369,4 +369,46 @@ mod tests {
         assert!(ledger.state(&request.transfer_id).is_err());
     }
 
+    fn physical_runtime(root:&Path,request:&mut TransferRequest)->std::path::PathBuf {
+        let row=&mut request.inventory[0];let path=root.join(&row.runtime_relative_path);
+        std::fs::create_dir_all(&path).unwrap();std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bytes=serde_json::to_vec(&json!({"version":1,"owner":row.creation_owner,"audit_path":row.creation_audit_path})).unwrap();
+        super::super::write(&path.join("owned.json"),&bytes).unwrap();row.creation_receipt_sha256=sha(&bytes);
+        super::super::write(&path.join("complete.json"),br#"{"version":1,"exit_code":0,"generation":"generation-one","worker_quiescence":{"remaining_workers":0,"quiet_scans":2}}"#).unwrap();path
+    }
+    #[test]
+    fn native_ledger_existing_fenced_retirement_aborts_prepared_handoff() {
+        let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let request=request("workflow");let source=&request.source_owners[0];
+        let mut ledger=Ledger::open(root.path(),&lock).unwrap();ledger.prepare(&request,&endpoints(&request),u64::MAX).unwrap();
+        super::super::retire_owned_at(root.path(),Path::new(&source.audit_path),&source.owner).unwrap();
+        assert_eq!(ledger.state(&request.transfer_id).unwrap(),Some(State::Aborted));assert_eq!(ledger.reserved_bytes().unwrap(),0);
+    }
+    #[test]
+    fn native_ledger_resume_and_terminal_retirement_use_effective_owner() {
+        let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let mut request=request("workflow");let runtime=physical_runtime(root.path(),&mut request);
+        let original=std::fs::read(runtime.join("owned.json")).unwrap();let source=&request.source_owners[0];let destination=&request.destination;
+        let mut ledger=Ledger::open(root.path(),&lock).unwrap();ledger.prepare(&request,&endpoints(&request),u64::MAX).unwrap();ledger.commit(&request,seals(&request)).unwrap();
+        assert!(super::super::validate_resume_owner(root.path(),&runtime,Path::new(&destination.audit_path),&destination.owner).is_ok(),"destination cannot resume its transferred conversation");
+        assert_eq!(super::super::retire_owned_at(root.path(),Path::new(&source.audit_path),&source.owner).unwrap(),0);
+        assert!(!runtime.join("retired-owner.json").exists());
+        assert_eq!(super::super::retire_owned_at(root.path(),Path::new(&destination.audit_path),&destination.owner).unwrap(),1);
+        assert!(runtime.join("retired-owner.json").is_file());assert_eq!(std::fs::read(runtime.join("owned.json")).unwrap(),original);
+    }
+
+    #[test]
+    fn native_ledger_delayed_scope_exit_preserves_pending_transferred_and_aborted_peers() {
+        for phase in ["prepared","completed","aborted-peer"] {
+            let root=fixture();let lock=StateLock::acquire(root.path()).unwrap();let mut request=request("workflow");
+            request.destination.owner.lease_generation=3;
+            let peer=Authority{owner:RuntimeOwner{workflow_id:"workflow".into(),lease_generation:2},audit_path:"/audit/peer".into()};request.source_owners.push(peer.clone());
+            let runtime=physical_runtime(root.path(),&mut request);
+            let mut ledger=Ledger::open(root.path(),&lock).unwrap();ledger.prepare(&request,&endpoints(&request),u64::MAX).unwrap();
+            if phase=="completed" {ledger.commit(&request,seals(&request)).unwrap();}
+            if phase=="aborted-peer" {ledger.abort_and_retire(&peer.audit_path,&peer.owner).unwrap();}
+            drop(ledger);drop(lock);
+            super::super::retire(&runtime);
+            assert!(!runtime.join("retired.json").exists(),"late source scope retired a {phase} runtime");
+        }
+    }
+
 }
