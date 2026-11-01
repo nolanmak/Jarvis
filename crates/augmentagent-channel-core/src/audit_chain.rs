@@ -82,6 +82,11 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 impl AnchoredAudit {
+    /// Verify a historical append reference against this existing audit only.
+    /// This lookup grants no current runtime or transfer authority.
+    pub fn read_receipt(&self, _receipt: &AppendReceipt) -> Result<serde_json::Value> {
+        bail!("exact audit receipt lookup is not implemented")
+    }
     /// Writer registration and sealing share this cross-process ingress gate.
     /// The callback must persist its ticket before releasing the anchor lock.
     pub(crate) fn with_open_generation<T>(&self,register:impl FnOnce()->Result<T>)->Result<T> {
@@ -305,6 +310,77 @@ impl AnchoredAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_lookup_returns_its_exact_record_after_later_appends_and_sealing() {
+        let (_directory, sink) = setup();
+        let first = sink.append_receipted(serde_json::json!({"kind":"launch","request":"original"})).unwrap();
+        sink.append(serde_json::json!({"kind":"later","request":"other"})).unwrap();
+        let before_log = fs::read(&sink.log).unwrap();
+        let before_anchor = fs::read(&sink.anchor).unwrap();
+        let row = sink.read_receipt(&first).unwrap();
+        assert_eq!(row["kind"], "launch");
+        assert_eq!(row["request"], "original");
+        assert_eq!(fs::read(&sink.log).unwrap(), before_log);
+        assert_eq!(fs::read(&sink.anchor).unwrap(), before_anchor);
+        sink.seal_for_recovery(|_| Ok(serde_json::json!({"verified":"fixture"}))).unwrap();
+        let sealed = fs::read(&sink.anchor).unwrap();
+        assert_eq!(sink.read_receipt(&first).unwrap(), row);
+        assert_eq!(fs::read(&sink.anchor).unwrap(), sealed);
+    }
+    #[test]
+    fn receipt_lookup_rejects_forged_or_mismatched_references() {
+        let (_directory, sink) = setup();
+        let receipt = sink.append_receipted(serde_json::json!({"kind":"launch"})).unwrap();
+        for mode in ["version", "zero", "future", "record", "prefix", "uppercase", "short"] {
+            let mut wrong = receipt.clone();
+            match mode {
+                "version" => wrong.version = 2,
+                "zero" => wrong.sequence = 0,
+                "future" => wrong.sequence += 1,
+                "record" => wrong.record_sha256 = "0".repeat(64),
+                "prefix" => wrong.committed_audit_sha256 = "0".repeat(64),
+                "uppercase" => wrong.record_sha256 = "A".repeat(64),
+                "short" => { wrong.record_sha256.pop(); },
+                _ => unreachable!(),
+            }
+            assert!(sink.read_receipt(&wrong).is_err(), "{mode}");
+        }
+        let (_other_directory, other) = setup();
+        other.append(serde_json::json!({"kind":"different"})).unwrap();
+        assert!(other.read_receipt(&receipt).is_err());
+        assert_eq!(sink.read_receipt(&receipt).unwrap()["kind"], "launch");
+    }
+    #[test]
+    fn receipt_lookup_does_not_recreate_missing_evidence() {
+        for missing in ["log", "anchor", "lock"] {
+            let (_directory, sink) = setup();
+            let receipt = sink.append_receipted(serde_json::json!({"kind":"launch"})).unwrap();
+            let path = match missing { "log" => sink.log.clone(), "anchor" => sink.anchor.clone(), _ => sink.anchor.with_extension("lock") };
+            fs::remove_file(&path).unwrap();
+            assert!(sink.read_receipt(&receipt).is_err(), "{missing}");
+            assert!(!path.exists(), "lookup recreated {missing}");
+        }
+    }
+    #[test]
+    fn receipt_lookup_refuses_corruption_or_pending_data_without_repair() {
+        for mode in ["corrupt", "counter", "pending", "tail"] {
+            let (_directory, sink) = setup();
+            let receipt = sink.append_receipted(serde_json::json!({"kind":"launch"})).unwrap();
+            match mode {
+                "corrupt" => { let mut bytes=fs::read(&sink.log).unwrap(); bytes[2]^=1; fs::write(&sink.log,bytes).unwrap(); },
+                "counter" | "pending" => {
+                    let mut anchor: Anchor=serde_json::from_slice(&fs::read(&sink.anchor).unwrap()).unwrap();
+                    if mode=="counter" {anchor.sequence+=1;} else {anchor.pending=Some("{\"next\":true}\n".into());}
+                    sink.save(&anchor).unwrap();
+                },
+                "tail" => private_open(&sink.log,true).unwrap().write_all(b"uncertain").unwrap(),
+                _ => unreachable!(),
+            }
+            let log=fs::read(&sink.log).unwrap(); let anchor=fs::read(&sink.anchor).unwrap();
+            assert!(sink.read_receipt(&receipt).is_err(), "{mode}");
+            assert_eq!(fs::read(&sink.log).unwrap(),log); assert_eq!(fs::read(&sink.anchor).unwrap(),anchor);
+        }
+    }
     fn setup() -> (tempfile::TempDir, AnchoredAudit) {
         let dir = tempfile::tempdir().unwrap();
         for name in ["logs", "anchors", "work"] {
