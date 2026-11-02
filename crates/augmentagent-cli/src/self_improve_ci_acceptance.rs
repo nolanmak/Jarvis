@@ -26,7 +26,7 @@ import os,sys
 from pathlib import Path
 if '--crate-name' in sys.argv and sys.argv[sys.argv.index('--crate-name')+1]=='generated_input_consumer':
     with Path('/tmp/ci-fixture-rustc-count').open('a') as stream:stream.write('compile\n')
-os.execv(sys.argv[1],sys.argv[1:])
+os.execvp(sys.argv[1],sys.argv[1:])
 "#)?;
     std::fs::set_permissions(root.join("rustc-counter.py"),std::fs::Permissions::from_mode(0o755))?;
     git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
