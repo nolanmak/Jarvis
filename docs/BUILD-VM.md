@@ -209,6 +209,10 @@ separate required work.
 
 ### Candidate protected Cargo planner (#1807, not enabled)
 
+The [planner proposal](ci-cargo-planner.md) records the actual guest request and
+fingerprint observations, proposed unit identity/cleanup rules and the remaining
+blocking questions. It does not enable the mode or hand off a final C contract.
+
 This is a candidate mechanism under interrogation. The capability probe and an unprivileged native exec-denial primitive are
 implemented; protected Cargo execution, artifact invalidation and the final
 passing-proof producer are not. This section does not authorize a rollout or a
