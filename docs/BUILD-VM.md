@@ -268,6 +268,17 @@ recover known interrupted state without manual fence deletion. C must also
 publish the exact unit-to-suite mapping with the single D7 schema/API before
 consumer handoff. This audit does not establish implementation readiness.
 
+The existing descendant supervisor now accepts explicit internal `forward_fds`
+and `close_after_spawn` tuples for a relay experiment. It forwards jobserver
+pipes and releases its copy of an exec-start pipe immediately after dispatch,
+so Rust can drain captured output before the tool exits. Post-spawn errors stay
+inside the original descendant cleanup guard. Storage lease descriptors cannot
+be released through this interface. Real subprocess regressions cover large
+captured output, exit status, invalid descriptors, storage retention and an
+injected post-spawn failure with a detached child. The ordinary Linux CLI suite
+runs these cases. No command-line/environment switch enables this interface,
+and it establishes no planner credential or artifact isolation.
+
 Disposable boundary tests may exercise a specified gate under the existing VM
 admission before production activation. They must never fall back to unchecked
 privileged execution or create a reusable CI/merge proof. Unsupported capability

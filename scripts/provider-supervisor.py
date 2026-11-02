@@ -11,7 +11,7 @@ import sys
 import time
 
 
-def supervise(receipt, argv):
+def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=()):
     libc = ctypes.CDLL(None, use_errno=True)
     stopping = False
 
@@ -107,8 +107,22 @@ def supervise(receipt, argv):
             raise RuntimeError('invalid inherited storage descriptor set')
         for descriptor in storage_fds:
             os.fstat(descriptor)  # fail before launch on a missing inherited FD
+        if (not isinstance(forward_fds, tuple)
+                or not isinstance(close_after_spawn, tuple)
+                or len(forward_fds) > 64 or len(close_after_spawn) > 64
+                or any(type(fd) is not int or fd < 3 for fd in forward_fds)
+                or any(type(fd) is not int or fd < 3 for fd in close_after_spawn)
+                or len(set(forward_fds)) != len(forward_fds)
+                or len(set(close_after_spawn)) != len(close_after_spawn)
+                or any(fd not in forward_fds or fd in storage_fds for fd in close_after_spawn)):
+            raise RuntimeError('invalid explicit child descriptor set')
+        inherited = tuple(sorted(set(storage_fds) | set(forward_fds)))
+        if len(inherited) > 64:
+            raise RuntimeError('too many inherited child descriptors')
+        for descriptor in forward_fds:
+            os.fstat(descriptor)
         child = subprocess.Popen(argv, start_new_session=True,
-                                 pass_fds=storage_fds,
+                                 pass_fds=inherited,
                                  preexec_fn=scope.attach_child if scope else None)
     except BaseException:
         if scope:
@@ -119,6 +133,12 @@ def supervise(receipt, argv):
         raise
     status = None
     try:
+        # Close exec-start pipe copies immediately after dispatch, inside the
+        # descendant cleanup guard. A failed close must never take the launch-
+        # failed path, which may acknowledge cleanup without a child to reap.
+        # Storage ownership remains held through the original cleanup path.
+        for descriptor in close_after_spawn:
+            os.close(descriptor)
         if vm_preflight:
             vm_ready = Path(receipt).with_name('vm-ready')
             deadline = time.monotonic() + 60

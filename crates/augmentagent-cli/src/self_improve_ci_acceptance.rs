@@ -7,6 +7,17 @@ const CARGO_EXEC_DENIAL_LIBRARY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/l
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 const CARGO_EXEC_DENIAL_CASES:&[u8]=include_bytes!("ci_cargo_exec_cases.py");
 
+#[cfg(target_os="linux")]
+#[test]
+fn supervised_descriptor_handoff_requires_original_descendant_cleanup() {
+    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/provider_supervisor_test.py");
+    let output=std::process::Command::new("python3").arg("-I").arg(tests).output().unwrap();
+    let diagnostics=String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(),"supervised descriptor cases failed: {diagnostics}");
+    assert!(diagnostics.contains("Ran 4 tests") && !diagnostics.contains("skipped"),
+        "supervised descriptor cases did not execute: {diagnostics}");
+}
+
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 #[test]
 fn native_exec_denial_is_process_local_and_covers_real_syscalls() {
