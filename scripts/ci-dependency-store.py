@@ -26,6 +26,7 @@ def _module(name,filename):
 cache=_module('seed_cache','ci-cache-generation.py')
 artifacts=_module('seed_artifacts','ci-dependency-artifacts.py')
 FreshnessHold=cache.FreshnessHold
+RETIREMENT_VERSION=3
 
 
 def _encoded(value):
@@ -118,19 +119,23 @@ def _producer_control(control,producer):
 
 def _producer_history(path,producer):
     _,control=_producer(path.parent.parent,producer)
-    original={'control':control,'produced':None,'published':None}
-    for name in ('produced','published'):
-        child=path/(name+'.json')
+    original={'control':control,'produced':None,'published':None,'downloads':None}
+    for name,filename in (('produced','produced.json'),('published','published.json'),('downloads','cargo-home-seeded.json')):
+        child=path/filename
         if child.exists() or child.is_symlink():original[name]=_document(child)
     _validate_producer_history(original,producer)
     return original
 
 
 def _validate_producer_history(original,producer):
-    if not isinstance(original,dict) or set(original)!={'control','produced','published'}:
+    if not isinstance(original,dict) or set(original)!={'control','produced','published','downloads'}:
         raise FreshnessHold('metadata_torn')
     _producer_control(original['control'],producer)
     produced=original['produced'];published=original['published']
+    downloads=original['downloads']
+    if downloads is not None and (not isinstance(downloads,dict) or type(downloads.get('version')) is not int
+            or downloads!={'version':1,'kind':'ci-downloads-seeded'}):
+        raise FreshnessHold('metadata_torn')
     command=original['control']['command']
     if produced is not None and (not isinstance(produced,dict)
             or set(produced)!={'version','command','units','source_trees'}
@@ -206,7 +211,7 @@ def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=No
             finished=completed/(producer+'.json')
             if finished.exists() or finished.is_symlink():
                 prior=_document(finished)
-                if (set(prior)!={'version','state','original','authorization'} or prior['version']!=2
+                if (set(prior)!={'version','state','original','authorization'} or prior['version']!=RETIREMENT_VERSION
                         or prior['state']!='reclaimed' or producer not in releases
                         or prior['authorization']!=releases[producer]):continue
                 _validate_producer_history(prior['original'],producer)
@@ -218,7 +223,7 @@ def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=No
             intent=_document(receipt) if receipt.exists() or receipt.is_symlink() else None
             if intent is not None:
                 if (set(intent)!={'version','state','original','authorization'} or type(intent['version']) is not int
-                        or intent['version']!=2 or intent['state'] not in ('reclaiming','reclaimed')):
+                        or intent['version']!=RETIREMENT_VERSION or intent['state'] not in ('reclaiming','reclaimed')):
                     raise FreshnessHold('metadata_torn')
                 original=intent['original'];_validate_producer_history(original,producer)
                 authorization=intent['authorization']
@@ -235,10 +240,10 @@ def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=No
                 if intent is not None and intent['state']=='reclaimed':raise FreshnessHold('cleanup_uncertain')
                 cache._directory(path,0o700,create=False)
                 children={child.name for child in path.iterdir()}
-                if children-{'control.json','produced.json','published.json','target','cargo-home'}:
+                if children-{'control.json','produced.json','published.json','cargo-home-seeded.json','target','cargo-home'}:
                     raise FreshnessHold('invalidation_unsafe')
-                for name in ('control','produced','published'):
-                    child=path/(name+'.json')
+                for name,filename in (('control','control.json'),('produced','produced.json'),('published','published.json'),('downloads','cargo-home-seeded.json')):
+                    child=path/filename
                     if child.exists() or child.is_symlink():
                         if _document(child)!=original[name]:raise FreshnessHold('metadata_torn')
                     elif original[name] is not None and intent is None:raise FreshnessHold('metadata_missing')
@@ -250,11 +255,11 @@ def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=No
                             or info.st_gid!=control['worker_gid'] or info.st_mode&0o077):
                         raise FreshnessHold('invalidation_unsafe')
         except (FreshnessHold,OSError,ValueError,TypeError,KeyError):continue
-        if intent is None:cache._write_record(receipt,{'version':2,'state':'reclaiming','original':original,'authorization':authorization})
+        if intent is None:cache._write_record(receipt,{'version':RETIREMENT_VERSION,'state':'reclaiming','original':original,'authorization':authorization})
         try:
             if path.exists():shutil.rmtree(path)
             _fsync_directory(producers)
-            cache._write_record(receipt,{'version':2,'state':'reclaimed','original':original,'authorization':authorization})
+            cache._write_record(receipt,{'version':RETIREMENT_VERSION,'state':'reclaimed','original':original,'authorization':authorization})
             os.rename(receipt,completed/receipt.name)
             _fsync_directory(completed);_fsync_directory(pending)
         except OSError:raise FreshnessHold('cleanup_uncertain') from None

@@ -23,6 +23,7 @@ class RetentionTests(unittest.TestCase):
 
     def producer(self, root):
         result=fixtures.StoreTests().fixture(root)
+        store.cache._write_record(result[3].parent/'cargo-home-seeded.json',{'version':1,'kind':'ci-downloads-seeded'})
         if not hasattr(self,'releases'):self.releases={}
         self.releases[result[1]]=result[-1]
         return result
@@ -61,6 +62,7 @@ class RetentionTests(unittest.TestCase):
                     self.assertEqual(record['state'], 'reclaimed')
                     self.assertEqual(record['original']['control']['command'], next(x[2] for x in items if x[1] == producer))
                     self.assertEqual(record['original']['produced']['command'], record['original']['control']['command'])
+                    self.assertEqual(record['original']['downloads'],{'version':1,'kind':'ci-downloads-seeded'})
             self.releases={key:ack for key,ack in self.releases.items() if key not in reclaimed}
             self.assertEqual(len(self.reclaim(root, [protected])), 1)
 
@@ -79,6 +81,17 @@ class RetentionTests(unittest.TestCase):
             self.assertTrue(target.is_dir())
             self.assertEqual(unknown.joinpath('owner-data').read_text(), 'keep')
             self.assertTrue(escaped.is_symlink())
+
+    def test_unknown_download_seed_metadata_preserves_the_released_producer(self):
+        for marker in ({'version':2,'kind':'ci-downloads-seeded'},
+                       {'version':True,'kind':'ci-downloads-seeded'},
+                       {'version':1,'kind':'untrusted'},
+                       {'version':1,'kind':'ci-downloads-seeded','extra':True}):
+            with self.subTest(marker=marker),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);_,producer,_,target,_,_=self.producer(root)
+                store.cache._write_record(target.parent/'cargo-home-seeded.json',marker)
+                self.assertEqual(self.reclaim(root,[]),[])
+                self.assertTrue(target.is_dir())
 
     def test_interrupted_deletion_recovers_original_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
