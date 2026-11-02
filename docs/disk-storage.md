@@ -55,6 +55,12 @@ they never execute a candidate-controlled host wrapper. Deterministic host gates
 and explicit host/legacy builders retain verified target leases and parent-proof
 checks. No model output can opt into the narrower admission path.
 
+Shared CI admission (`admit_ci`) boots the build VM, so it waits up to 300 s for
+the deployment exclusion and the build lease instead of failing on the first
+busy attempt (#1816). Each attempt takes both or neither, so a waiting CI run
+never holds the deployment lock while the build lease is busy. On timeout it
+defers with the busy lock's existing `retry CI admission` text.
+
 Isolated shared CI also records a private cleanup hold before its supervisor
 starts. The hold binds the exact source, controller and target directories to
 the resource identity observed at admission, before the command is released.

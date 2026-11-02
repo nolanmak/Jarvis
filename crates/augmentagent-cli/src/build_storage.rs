@@ -137,9 +137,12 @@ impl Drop for Lease {
     }
 }
 
+/// How long a writer waits in line for the build lease before deferring.
+pub const LEASE_WAIT: Duration = Duration::from_secs(300);
+
 pub async fn acquire() -> Result<Lease> {
     let state = state_dir()?;
-    let until = tokio::time::Instant::now() + Duration::from_secs(300);
+    let until = tokio::time::Instant::now() + LEASE_WAIT;
     loop {
         if let Some(lock) = Lease::try_at(&state)? {
             return Ok(lock);
@@ -791,12 +794,44 @@ pub async fn admit(repo: &Path, target: &Path) -> Result<Lease> {
 // Serialize it with updater writes until that growth has a dedicated reservation.
 // Exclusion is acquired before normal admission, never while holding Admission.
 pub async fn admit_ci(repo: &Path, target: &Path) -> Result<Lease> {
-    let state = state_dir()?;
-    let exclusion = ci_update_exclusion(&state)?;
-    let mut lease = Lease::try_at(&state)?
-        .ok_or_else(|| crate::storage_reservations::Busy("build lease is held; retry CI admission".into()))?;
-    lease.ci_update_exclusion = Some(exclusion);
+    let lease = wait_ci_leases(&state_dir()?, LEASE_WAIT).await?;
     admit_with_lease(repo, target, None, lease).await
+}
+
+/// Shared CI boots the build VM, so it waits in line behind managed and
+/// deployment builds instead of failing on the first busy attempt. Each
+/// attempt is all-or-nothing: a busy build lease drops the update exclusion
+/// before sleeping, so a waiting CI run never blocks deploys. Only contention
+/// is retried; validation errors return at once. On timeout the error names
+/// whichever lock was busy on the last attempt.
+async fn wait_ci_leases(state: &Path, wait: Duration) -> Result<Lease> {
+    let until = tokio::time::Instant::now() + wait;
+    let mut announced = false;
+    loop {
+        let busy = match ci_update_exclusion(state) {
+            Ok(exclusion) => match Lease::try_at(state)? {
+                Some(mut lease) => {
+                    lease.ci_update_exclusion = Some(exclusion);
+                    return Ok(lease);
+                }
+                None => {
+                    drop(exclusion);
+                    "build lease is held; retry CI admission"
+                }
+            },
+            Err(error) if error.downcast_ref::<crate::storage_reservations::Busy>().is_some() =>
+                "deployment build is active; retry CI admission",
+            Err(error) => return Err(error),
+        };
+        if tokio::time::Instant::now() >= until {
+            return Err(crate::storage_reservations::Busy(busy.into()).into());
+        }
+        if !announced {
+            announced = true;
+            tracing::info!(reason = busy, wait_secs = wait.as_secs(), "shared CI waiting in line for host build lease");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn ci_update_exclusion(state: &Path) -> Result<std::fs::File> {
@@ -1791,7 +1826,8 @@ mod inherited_ci_storage_tests {
     async fn ci_leases_time_out_busy_and_hold_nothing() {
         let state = tempfile::tempdir().unwrap();
         let _build = Lease::try_at(state.path()).unwrap().unwrap();
-        let error = wait_ci_leases(state.path(), Duration::from_millis(600)).await.unwrap_err();
+        let error = wait_ci_leases(state.path(), Duration::from_millis(600)).await
+            .err().expect("CI must not acquire while a build holds the lease");
         assert!(error.downcast_ref::<crate::storage_reservations::Busy>().is_some(), "{error:#}");
         assert!(error.to_string().contains("build lease is held; retry CI admission"), "{error:#}");
         assert!(ci_update_exclusion(state.path()).is_ok(), "timed-out CI kept the update exclusion");
