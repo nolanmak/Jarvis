@@ -284,6 +284,7 @@ class Relay:
 
 
 def _worker(arguments):
+    if os.geteuid() == 0: raise ValueError('unprivileged relay worker required')
     payload, acknowledgement, receipt, library, *mapping = arguments
     payload, acknowledgement = int(payload), int(acknowledgement)
     _payload(payload)  # Validate before any tool can run or an FD is remapped.
@@ -305,6 +306,7 @@ def _worker(arguments):
 
 
 def _execute(arguments):
+    if os.geteuid() == 0: raise ValueError('unprivileged relay exec required')
     payload, ack, library = arguments
     payload, ack = int(payload), int(ack)
     os.set_inheritable(ack, False)
