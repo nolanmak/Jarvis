@@ -20,9 +20,8 @@ use crate::layout::WikiLayout;
 
 /// Multi-platform identity block lifted from a `people/<slug>.md` front-matter.
 ///
-/// `email` is a `Vec<String>` because one person often has multiple addresses.
-/// The other fields are `Option<String>` — one account per platform is the
-/// normal case; upgrade to `Vec` only if that changes.
+/// List-valued identity fields preserve legacy scalar YAML while allowing
+/// multiple handles. The remaining account fields are `Option<String>`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct Identities {
     #[serde(default, deserialize_with = "one_or_many")]
@@ -40,8 +39,8 @@ pub struct Identities {
     /// Lenient like the other list fields: a legacy bare scalar still parses.
     #[serde(default, deserialize_with = "one_or_many")]
     pub whatsapp: Vec<String>,
-    #[serde(default)]
-    pub instagram: Option<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub instagram: Vec<String>,
     /// E.164-normalized phone (#62). Multi-valued — a person commonly has a
     /// mobile + a work line; CRM ingestion union-merges them.
     #[serde(default, deserialize_with = "one_or_many")]
@@ -97,7 +96,7 @@ impl Identities {
             "twitter" => self.twitter.as_deref() == Some(id),
             "slack" => self.slack.as_deref() == Some(id),
             "whatsapp" => self.whatsapp.iter().any(|h| h == id),
-            "instagram" => self.instagram.as_deref() == Some(id),
+            "instagram" => self.instagram.iter().any(|h| h == id),
             "phone" => {
                 // E.164 ids compared verbatim (already normalized upstream).
                 self.phone.iter().any(|p| p == id)
@@ -447,6 +446,36 @@ mod tests {
         assert_eq!(p.identities.email, vec!["a@example.com"]);
         assert_eq!(p.identities.imessage, vec!["29694"], "number stringified");
         assert!(index.lookup("imessage", "29694").is_some());
+    }
+
+    #[test]
+    fn instagram_accepts_scalar_and_list_shapes() {
+        let (_d, layout) = layout_with_pages(&[
+            (
+                "scalar-person",
+                "kind: person\nidentities:\n  instagram: scalar_handle",
+            ),
+            (
+                "sequence-person",
+                "kind: person\nidentities:\n  instagram: [first_handle, second_handle]",
+            ),
+        ]);
+
+        let index = IdentityIndex::build(&layout).unwrap();
+
+        assert_eq!(index.len(), 2, "both shapes must index");
+        assert_eq!(
+            index.lookup("instagram", "scalar_handle").map(|p| p.slug.as_str()),
+            Some("scalar-person")
+        );
+        assert_eq!(
+            index.lookup("instagram", "first_handle").map(|p| p.slug.as_str()),
+            Some("sequence-person")
+        );
+        assert_eq!(
+            index.lookup("instagram", "second_handle").map(|p| p.slug.as_str()),
+            Some("sequence-person")
+        );
     }
 
     #[test]
