@@ -17,7 +17,20 @@ async fn live_shared_ci_cache_freshness_replay() -> Result<()> {
     audit.require_run_resources()?;
     augmentagent_channel_core::run_resources::check_requirement("shared_ci_vm",Some(&audit))?;
     let target=crate::build_storage::effective_target(&root);
-    let storage=crate::build_storage::admit_ci(&root,&target).await?;
+    // The host's idle probe is advisory. Competing managed builds can acquire
+    // the lease before this test starts; retry only typed storage deferrals,
+    // with no guest, model call or protected storage ownership held meanwhile.
+    let admission_deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(300);
+    let storage=loop {
+        match crate::build_storage::admit_ci(&root,&target).await {
+            Ok(storage)=>break storage,
+            Err(error) if error.downcast_ref::<crate::storage_reservations::Busy>().is_some()
+                && tokio::time::Instant::now()<admission_deadline => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error)=>return Err(error),
+        }
+    };
     let fixture=tempfile::Builder::new().prefix("freshness-source-fixture-").tempdir_in(&target)?;
     let repo=fixture.path();std::fs::create_dir(repo.join("src"))?;
     std::fs::write(repo.join("Cargo.toml"),"[package]\nname = \"freshness-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n")?;

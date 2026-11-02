@@ -192,7 +192,8 @@ class BuildVMExtensionTests(unittest.TestCase):
    with self.assertRaisesRegex(vm.Unavailable,'separate owned'):vm.run(self.runtime(root),root/'workspace',['true'],{},ci_context=context)
  def test_supervised_ci_has_no_900_second_wall_kill(self):
   with tempfile.TemporaryDirectory() as d:
-   root=Path(d);self.setup(root);polls=[];clock=[0]
+   root=Path(d);context=self.setup(root);polls=[];clock=[0]
+   receipt_reclaimed=['12345678-1234-4234-8234-123456789abc']
    class Broker:
     requests=0;bytes=0
     def __init__(self,control):self.control=control
@@ -201,13 +202,19 @@ class BuildVMExtensionTests(unittest.TestCase):
     pid=999999
     def __init__(self,argv,**kwargs):
      self.calls=0;self.returncode=None;cleanup=Path(argv[3]);cleanup.write_text('all-descendants-reaped\n')
-     result=cleanup.parent/'control/outcome.json';result.write_text('{"exit_code":0,"stdout":"finished","stderr":""}');result.chmod(0o600)
+     result=cleanup.parent/'control/outcome.json';result.write_text(json.dumps({'exit_code':0,'stdout':'finished','stderr':'','cache_reclaimed':receipt_reclaimed}));result.chmod(0o600)
     def wait(self,timeout):
      self.calls+=1
      if self.calls<3:raise subprocess.TimeoutExpired('fixture',timeout)
      self.returncode=0;return 0
     def poll(self):return self.returncode
    with patch.object(vm.subprocess,'run',side_effect=self.openssl),patch.object(vm.subprocess,'Popen',Process),patch.object(vm.dependency_proxy,'Broker',Broker),patch.object(vm.time,'monotonic',side_effect=lambda:clock[0]):
-    result=vm.run(self.runtime(root),root/'workspace',['true'],{},scratch_dir=root/'scratch',timeout=None)
+    result=vm.run(self.runtime(root),root/'workspace',['true'],{},scratch_dir=root/'scratch',timeout=None,ci_context=context)
    self.assertEqual(result['stdout'],'finished');self.assertEqual(polls,[1,1,1]);self.assertEqual(clock[0],3000)
+   for invalid in (None,'unknown',['not-a-generation'],[True],receipt_reclaimed*2,receipt_reclaimed*3,
+                   ['12345678-1234-1234-8234-123456789abc']):
+    receipt_reclaimed=invalid
+    with patch.object(vm.subprocess,'run',side_effect=self.openssl),patch.object(vm.subprocess,'Popen',Process),patch.object(vm.dependency_proxy,'Broker',Broker),patch.object(vm.time,'monotonic',side_effect=lambda:clock[0]):
+     with self.assertRaisesRegex(vm.Unavailable,'invalid CI cache cleanup receipt'):
+      vm.run(self.runtime(root),root/'workspace',['true'],{},scratch_dir=root/'scratch',timeout=None,ci_context=context)
 if __name__=='__main__':unittest.main()

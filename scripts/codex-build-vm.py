@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import shlex
@@ -476,7 +477,8 @@ poweroff -f
                 if ci_context is not None:
                     reclaimed=result['cache_reclaimed']
                     if (not isinstance(reclaimed,list) or len(reclaimed)>2
-                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',value) is None for value in reclaimed)):
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',value) is None for value in reclaimed)
+                            or len(set(reclaimed))!=len(reclaimed)):
                         raise Unavailable('invalid CI cache cleanup receipt')
                 return result
             finally:
