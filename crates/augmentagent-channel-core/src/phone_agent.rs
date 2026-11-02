@@ -110,6 +110,12 @@ impl PhoneAgent {
         self.summary_reasoner = reasoner;
         self
     }
+    /// Install the read-only attention data adapter for Live dispatch.
+    pub fn with_attention_provider(self, _provider: Arc<dyn crate::phone_attention::AttentionProvider>) -> Self {
+        // Red-first scaffolding: the existing native path is unchanged until
+        // the end-to-end latency regression demonstrates its blocking behavior.
+        self
+    }
     /// Whether utterances go to the fast conversational layer (#1546).
     pub fn uses_fast_layer(&self) -> bool {
         self.fast.is_some()

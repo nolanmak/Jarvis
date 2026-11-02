@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Explicitly enabled by downstream integration fixtures, never runtime config.
+test-support = []
+
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
 async-trait.workspace = true
