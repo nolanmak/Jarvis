@@ -292,6 +292,9 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--spec',type=Path,required=True);args=parser.parse_args()
     progress={'stage':'request_read'}
     try:result=execute(json.loads(private_bytes(args.spec)),progress=progress)
+    except vm.GuestUnavailable as error:
+        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm',
+                'stage':progress['stage'],'category':'Unavailable','guest_diagnostic':error.diagnostic}
     except vm.FreshnessUnavailable as error:
         result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm',
                 'freshness_hold':cache_generation.validate_hold(error.diagnostic),'stage':progress['stage'],'category':'FreshnessHold'}

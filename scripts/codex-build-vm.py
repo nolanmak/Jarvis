@@ -37,6 +37,24 @@ class FreshnessUnavailable(Unavailable):
         super().__init__('shared CI prerequisite unavailable: source/cache freshness')
 
 
+def guest_diagnostic(value):
+    value=value if isinstance(value,dict) else {}
+    stages={'load_dependency_controller','prepare_producer','bind_producer_cache','hide_producer_cache',
+            'resolve_dependencies','freeze_resolution','compile_dependencies','record_producer',
+            'publish_dependencies','prepare_generation','execute_command'}
+    categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
+                'IsADirectoryError','CalledProcessError','ValueError','KeyError','ModuleNotFoundError','ImportError'}
+    return {'stage':value.get('stage') if value.get('stage') in stages else 'unknown',
+            'category':value.get('category') if value.get('category') in categories else 'unknown',
+            'errno':value.get('errno') if type(value.get('errno')) is int and 0<=value['errno']<=4096 else None}
+
+
+class GuestUnavailable(Unavailable):
+    def __init__(self,value):
+        self.diagnostic=guest_diagnostic(value)
+        super().__init__('VM controller phase unavailable')
+
+
 def private_json(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor) as stream:
@@ -99,12 +117,19 @@ from pathlib import Path
 job=json.loads(Path('/job.json').read_text())
 ci_cache={}
 ci_dependency=None
+guest_stage='load_dependency_controller'
 if job.get('ci_context'):
     exec(compile(Path('/ci-tools/cache-generation.py').read_bytes(),'/ci-tools/cache-generation.py','exec'),ci_cache)
     if job.get('ci_dependency'):
-        import importlib.util
-        spec=importlib.util.spec_from_file_location('ci_dependency_guest','/ci-tools/ci-dependency-guest.py')
-        ci_dependency=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci_dependency)
+        try:
+            import importlib.util
+            spec=importlib.util.spec_from_file_location('ci_dependency_guest','/ci-tools/ci-dependency-guest.py')
+            ci_dependency=importlib.util.module_from_spec(spec);spec.loader.exec_module(ci_dependency)
+        except Exception as error:
+            Path('/root/control/outcome.json').write_text(json.dumps({'error':'VM controller initialization unavailable',
+                'guest_diagnostic':{'stage':guest_stage,'category':type(error).__name__,'errno':getattr(error,'errno',None)}}))
+            Path('/root/control/outcome.json').chmod(0o600)
+            raise SystemExit(0)
 uid=job['uid'];gid=job['gid']
 os.makedirs('/home/worker',mode=0o700,exist_ok=True)
 os.chown('/home/worker',uid,gid)
@@ -216,6 +241,10 @@ def run_worker(argv):
             result={'error':'VM command exceeded output limit'}
     return result
 
+def observe_phase(value):
+    global guest_stage
+    guest_stage=value
+
 try:
     cache_reclaimed=[]
     dependency_result=None
@@ -227,14 +256,16 @@ try:
     threading.Thread(target=registry.serve_forever,daemon=True).start()
     if action and action['kind']=='produce':
         environment.pop('GIT_ALTERNATE_OBJECT_DIRECTORIES',None)
-        dependency_result=ci_dependency.produce(action,seed_binding,job['ci_generation']['command'],uid,gid,run_worker,bind_ci_cache,hide_ci_cache)
+        dependency_result=ci_dependency.produce(action,seed_binding,job['ci_generation']['command'],uid,gid,run_worker,bind_ci_cache,hide_ci_cache,observe_phase)
         result={'exit_code':0,'stdout':'','stderr':''}
     elif action and action['kind']=='publish':
+        guest_stage='publish_dependencies'
         dependency_result=ci_dependency.publish(action,seed_binding)
         result={'exit_code':0,'stdout':'','stderr':''}
     else:
       if job.get('build_cache'):
         if job.get('ci_context'):
+            guest_stage='prepare_generation'
             if os.geteuid()!=0:raise OSError('CI cache preparation requires the guest controller')
             generation=job['ci_generation']
             cache_reclaimed=ci_cache['reclaim']('/build-cache',generation['retained_generations'],uid,gid)
@@ -252,6 +283,7 @@ try:
             hide_ci_cache()
         else:
             seed_build_cache()
+      guest_stage='execute_command'
       result=run_worker(job['argv'])
     if job.get('ci_context'):result['cache_reclaimed']=cache_reclaimed
     if dependency_result is not None:result['dependency_result']=dependency_result
@@ -263,7 +295,8 @@ except Exception as error:
         result={'error':'CI source/cache freshness unavailable','freshness_hold':error.diagnostic()}
     else:
         full=getattr(error,'errno',None) in (errno.ENOSPC,errno.EDQUOT) or 'No space left on device' in str(error)
-        result={'error':'VM build cache is full' if full else 'VM command could not start'}
+        result={'error':'VM build cache is full' if full else 'VM command could not start',
+                'guest_diagnostic':{'stage':guest_stage,'category':type(error).__name__,'errno':getattr(error,'errno',None)}}
 path=Path('/root/control/outcome.json')
 with path.open('w') as receipt:
     os.chmod(path,0o600);json.dump(result,receipt);receipt.flush();os.fsync(receipt.fileno())
@@ -532,6 +565,8 @@ poweroff -f
                         # The CI adapter validates this bounded diagnostic.
                         # Controller bundle programs execute only in the guest.
                         raise FreshnessUnavailable(result['freshness_hold'])
+                    if ci_context is not None and set(result)=={'error','guest_diagnostic'}:
+                        raise GuestUnavailable(result['guest_diagnostic'])
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)

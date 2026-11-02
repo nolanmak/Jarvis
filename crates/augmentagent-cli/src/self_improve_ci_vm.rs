@@ -71,6 +71,8 @@ pub(super) struct Outcome {
     pub dependency_result: Option<serde_json::Value>,
     #[serde(default)]
     source_kind:Option<String>,
+    #[serde(default)]
+    guest_diagnostic:Option<serde_json::Value>,
 }
 impl Outcome {
     // This envelope is emitted before a guest exists and may not carry source
@@ -126,6 +128,12 @@ impl Outcome {
         if let Some(value) = &self.freshness_hold {
             diagnostic["freshness_hold"] = serde_json::to_value(crate::autoship_freshness::Hold::parse(value))
                 .expect("bounded freshness protocol serializes");
+        }
+        if let Some(value)=&self.guest_diagnostic {
+            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command")).unwrap_or("unknown");
+            let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
+            diagnostic["guest"]=serde_json::json!({"stage":stage,"category":category,
+                "errno":value["errno"].as_i64().filter(|value|(0..=4096).contains(value))});
         }
         diagnostic
     }

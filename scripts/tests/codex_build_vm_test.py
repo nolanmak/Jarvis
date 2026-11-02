@@ -14,6 +14,12 @@ SPEC.loader.exec_module(vm)
 
 
 class SnapshotValidationTests(unittest.TestCase):
+    def test_guest_failure_diagnostic_keeps_only_protocol_enums_and_errno(self):
+        self.assertEqual(vm.guest_diagnostic({'stage':'hide_producer_cache','category':'CalledProcessError','errno':22,
+                                              'message':'private source or credential contents'}),
+                         {'stage':'hide_producer_cache','category':'CalledProcessError','errno':22})
+        self.assertEqual(vm.guest_diagnostic({'stage':'private path','category':'private contents','errno':True}),
+                         {'stage':'unknown','category':'unknown','errno':None})
     def test_internal_build_hard_links_can_reach_the_vm_boundary_unchanged(self):
         class BoundaryReached(Exception): pass
         with tempfile.TemporaryDirectory() as temporary:

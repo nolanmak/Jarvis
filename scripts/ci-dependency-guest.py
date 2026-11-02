@@ -24,7 +24,8 @@ def _result(value,kind):
     return result
 
 
-def produce(action,binding,command,uid,gid,run_worker,bind_cache,hide_cache):
+def produce(action,binding,command,uid,gid,run_worker,bind_cache,hide_cache,phase=lambda _:None):
+    phase('prepare_producer')
     if os.geteuid()!=0:raise FreshnessHold('invalidation_unsafe')
     identity=action['source_sha256'];producer=action['producer']
     try:workspace.verify_source(Path('/workspace'),identity,owner_uid=uid)
@@ -41,10 +42,14 @@ def produce(action,binding,command,uid,gid,run_worker,bind_cache,hide_cache):
     subprocess.run(mount,check=True)
     Path('/workspace/target').mkdir(mode=0o755)
     target,home=store.prepare_isolated_producer('/build-cache',binding,producer,command,uid,gid)
+    phase('bind_producer_cache')
     bind_cache(target)
+    phase('hide_producer_cache')
     cache=hide_cache()
+    phase('resolve_dependencies')
     resolved=_result(run_worker(['/usr/bin/python3','-I','/ci-tools/ci-dependency-driver.py','resolve','--identity',identity]),'isolated-resolution')
     policy=json.loads(Path('/workspace/seed-inputs.json').read_bytes())
+    phase('freeze_resolution')
     try:workspace.verify_resolution(resolved['metadata'],resolved['lockfile'],policy)
     except workspace.InputsUnknown:raise FreshnessHold('input_census_unknown') from None
     lock=Path('/workspace/Cargo.lock');info=lock.lstat()
@@ -52,7 +57,9 @@ def produce(action,binding,command,uid,gid,run_worker,bind_cache,hide_cache):
     if (not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_uid!=uid
             or lock.read_text()!=resolved['lockfile']):raise FreshnessHold('input_census_unknown')
     os.chown(lock,0,0);lock.chmod(0o444);Path('/workspace').chmod(0o555)
+    phase('compile_dependencies')
     compiled=_result(run_worker(['/usr/bin/python3','-I','/ci-tools/ci-dependency-driver.py','compile','--identity',identity]),'isolated-compilation')
+    phase('record_producer')
     store.record_isolated_output(cache,producer,command,resolved['metadata'],compiled['messages'])
     # The host must still prove whole-VM quiescence. This disposition is never
     # a passing required check or an acknowledgement for publication.
