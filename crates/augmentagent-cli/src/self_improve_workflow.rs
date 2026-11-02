@@ -1738,8 +1738,10 @@ pub(super) async fn prepare_resume_worktree_at_head(
         anyhow::ensure!(matches!(expected.len(),40|64) && expected.bytes().all(|b|b.is_ascii_hexdigit())
             && fetched.eq_ignore_ascii_case(expected),"resolved PR head changed before execution; candidate preserved");
         if exists {
-            anyhow::ensure!(git_evidence(&path,&["rev-parse","HEAD"]).await?.eq_ignore_ascii_case(expected),
-                "resumed candidate differs from authorized PR head; candidate preserved");
+            let actual = git_evidence(&path, &["rev-parse", "HEAD"]).await?;
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(RetainedHeadMismatch { path, actual, published: fetched }.into());
+            }
         }
     }
     if exists {
@@ -1760,6 +1762,40 @@ pub(super) async fn prepare_resume_worktree_at_head(
     anyhow::ensure!(ok, "cannot create resumed PR worktree: {error}");
     Ok(path)
 }
+
+/// Prepare retained execution for fresh verification. Merge admission continues
+/// to use the strict exact-head helper above.
+pub(super) async fn prepare_resume_candidate(
+    repo_root: &Path, repository: &str, pr: u64, branch: &str, expected_head: Option<&str>,
+) -> Result<PathBuf> {
+    prepare_resume_candidate_at(&path(), repo_root, repository, pr, branch, expected_head).await
+}
+
+async fn prepare_resume_candidate_at(
+    state: &Path, repo_root: &Path, repository: &str, pr: u64, branch: &str, expected_head: Option<&str>,
+) -> Result<PathBuf> {
+    let error = match prepare_resume_worktree_at_head(repo_root, pr, branch, expected_head).await {
+        Ok(path) => return Ok(path),
+        Err(error) => error,
+    };
+    let Some(mismatch) = error.downcast_ref::<RetainedHeadMismatch>() else { return Err(error); };
+    let Some(store) = WorkflowStore::open_read_only(state)? else { return Err(error); };
+    let Some(recorded) = store.retained_candidate_head(repository, pr, branch,
+        &mismatch.published, &mismatch.actual, millis())? else { return Err(error); };
+    let (descendant, _, _) = run("git", &["merge-base", "--is-ancestor", &mismatch.published, &recorded], &mismatch.path).await?;
+    anyhow::ensure!(descendant && git_evidence(&mismatch.path, &["rev-parse", "HEAD"]).await? == recorded,
+        "retained candidate does not extend its recorded publication; candidate preserved");
+    Ok(mismatch.path.clone())
+}
+
+#[derive(Debug)]
+struct RetainedHeadMismatch { path: PathBuf, actual: String, published: String }
+impl std::fmt::Display for RetainedHeadMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("resumed candidate differs from authorized PR head; candidate preserved")
+    }
+}
+impl std::error::Error for RetainedHeadMismatch {}
 
 async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
     let (ok, out, _) = run("git", args, worktree).await?;
@@ -1808,6 +1844,63 @@ mod tests {
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         dir
     }
+    #[tokio::test]
+    async fn retained_recorded_candidate_resumes_after_unpublished_integration() {
+        let dir = repo();
+        let state = control_dir();
+        let database = state.path().join("workflow.db");
+        let remote = state.path().join("remote.git");
+        assert!(run("git", &["init", "--bare", "-q", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["remote", "add", "origin", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["push", "origin", "HEAD:fixture"], dir.path()).await.unwrap().0);
+        let published = git_evidence(dir.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        let candidate = prepare_resume_worktree_at_head(dir.path(), 42, "fixture", Some(&published)).await.unwrap();
+        let original = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut store = WorkflowStore::open(&database).unwrap();
+        store.register("owner/repo#77", "fixture", original.clone(), 10).unwrap();
+        let lease = store.claim("owner/repo#77", "original-worker", 20, 60_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, "owner/repo", 42, 21).unwrap();
+        let pushed = store.begin_operation(&lease, OperationKind::Push, &original, 22).unwrap();
+        store.complete_operation(&lease, &pushed.id, &format!("git-head:{published}"), 23).unwrap();
+        std::fs::write(candidate.join("code.txt"), "retained repair\n").unwrap();
+        assert!(run("git", &["add", "code.txt"], &candidate).await.unwrap().0);
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "retained candidate"], &candidate).await.unwrap().0);
+        let retained = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.binding = retained.clone();
+        checkpoint.stage = Stage::Verify;
+        checkpoint.next = NextAction { reason: "verification_infrastructure_retry".into(), action: "retry_verification".into(), eligible_at_ms: 30 };
+        store.checkpoint(&lease, &checkpoint, 24).unwrap();
+        store.release(&lease, 25).unwrap();
+        let before = store.snapshot(&lease.workflow).unwrap().unwrap();
+        let events = store.events(&lease.workflow).unwrap();
+        let recovered = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("recorded unpublished candidate must remain executable for fresh verification");
+        assert_eq!(recovered, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), retained.head);
+        assert_eq!(std::fs::read_to_string(candidate.join("code.txt")).unwrap(), "retained repair\n");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(), before);
+        assert_eq!(store.events(&lease.workflow).unwrap(), events);
+        assert_eq!(git_evidence(dir.path(), &["ls-remote", "origin", "refs/heads/fixture"]).await.unwrap(),
+            format!("{published}\trefs/heads/fixture"), "recovery must not publish the retained candidate");
+        assert!(prepare_resume_worktree_at_head(dir.path(), 42, "fixture", Some(&published)).await.is_err(),
+            "the exact-head merge helper must keep rejecting the unpublished head");
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&"f".repeat(40))).await.is_err(),
+            "a changed remote resolution must not use retained-candidate recovery");
+        assert!(run("git", &["checkout", "--orphan", "unrelated-fixture"], &candidate).await.unwrap().0);
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "unrelated root"], &candidate).await.unwrap().0);
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+            "an unrecorded local head cannot inherit the old recovery authority");
+        let mut unrelated = retained;
+        unrelated.head = git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap();
+        let next_lease = store.claim(&lease.workflow, "fixture-authority", 40, 60_000).unwrap().unwrap();
+        checkpoint.binding = unrelated;
+        store.checkpoint(&next_lease, &checkpoint, 41).unwrap();
+        store.release(&next_lease, 42).unwrap();
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+            "matching protected metadata cannot replace publication ancestry");
+    }
+
     #[tokio::test]
     async fn claimed_owner_guard_admits_native_work_without_granting_shipping() {
         let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");let now=millis();

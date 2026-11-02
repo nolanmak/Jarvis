@@ -202,7 +202,7 @@ pub(super) async fn resume(
     let Some(_lock) = RunLock::try_acquire(&lock_path)? else {
         return Ok(RunReport::held("adopted PR worktree busy".into()));
     };
-    let worktree = workflow::prepare_resume_worktree_at_head(repo, pr.pr, &pr.branch,Some(&pr.head)).await?;
+    let worktree = workflow::prepare_resume_candidate(repo, &pr.repository, pr.pr, &pr.branch, Some(&pr.head)).await?;
     let request = format!("Pull request #{}: {}\n{}", pr.pr, pr.title, pr.body);
     let environment = recovery::environment_identity(&worktree).await?;
     let Some(mut guard) = workflow::WorkflowGuard::acquire(workflow::Start {
