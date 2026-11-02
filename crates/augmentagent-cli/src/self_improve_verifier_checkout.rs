@@ -2,10 +2,11 @@
 //! staged substitutions, symlinks, bytecode or dependency search directories.
 use super::*;
 pub(in crate::self_improve) const EXPORTER: &str = include_str!("../../../scripts/autoship-verifier-checkout.py");
-/// Stable source pathname preserves Cargo dependency fingerprints. Contents are
-/// nevertheless reconstructed on every run; nothing is trusted as a source cache.
+/// A source pathname may be reused after cleanup. A reconstruction always has
+/// a new controller-owned generation, including reconstruction of the same HEAD.
 pub(in crate::self_improve) struct OwnedCheckout {
     path: PathBuf,
+    generation: String,
     owner: PathBuf,
     identity: Vec<u8>,
     _lock: std::fs::File,
@@ -13,6 +14,10 @@ pub(in crate::self_improve) struct OwnedCheckout {
 impl OwnedCheckout {
     pub(in crate::self_improve) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(in crate::self_improve) fn generation(&self) -> &str {
+        &self.generation
     }
 }
 impl Drop for OwnedCheckout {
@@ -109,6 +114,7 @@ pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &st
     std::fs::File::open(&container)?.sync_all()?;
     Ok(OwnedCheckout {
         path,
+        generation: uuid::Uuid::new_v4().to_string(),
         owner,
         identity,
         _lock: lock,
@@ -186,8 +192,8 @@ pub(super) async fn materialize(
             std::fs::create_dir_all(target.parent().context("verifier file lacks parent")?)?;
             std::fs::write(&target, &expected)?;
         }
-        // Identical immutable inputs retain identical mtimes and pathnames,
-        // so a fresh clean export does not invalidate Cargo's warm cache.
+        // Preserve literal committed timestamps. They cannot authorize compiled
+        // artifact reuse after this source generation is reconstructed.
         std::fs::File::open(&target)?
             .set_times(std::fs::FileTimes::new().set_modified(modified))?;
     }
@@ -202,6 +208,19 @@ pub(super) async fn materialize(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reconstructed_same_head_has_a_new_generation_at_the_same_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let first = allocate(parent.path(), "head", "contract").unwrap();
+        let path = first.path().to_owned();
+        let generation = first.generation().to_owned();
+        assert_eq!(first.generation(), generation, "steps sharing a checkout keep one generation");
+        drop(first);
+        let second = allocate(parent.path(), "head", "contract").unwrap();
+        assert_eq!(second.path(), path);
+        assert_ne!(second.generation(), generation, "same HEAD/path cannot resurrect the old generation");
+    }
+
     #[cfg(target_os="linux")]
     #[test]
     fn verifier_source_drop_and_reallocation_require_settled_cleanup() {
