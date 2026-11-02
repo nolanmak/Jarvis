@@ -2,6 +2,68 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Complete a real compiled fixture plan, then prove a newer failing run
+/// cannot return the previous run's protected local-completion capability.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_complete_coverage() -> Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-complete-coverage",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("ci-complete-fixture-").tempdir_in("/tmp")?;
+    let root=fixture.path();
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;
+    fixture::install(root)?;
+    std::fs::write(root.join("arithmetic.py"),"def add(a, b):\n    return a + b\n")?;
+    git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
+        "-c","core.hooksPath=/dev/null","commit","-qm","working arithmetic"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    fixture::scope(root,async {
+        let completed=verify_admitted(root,&audit,&storage,&target).await?;
+        let record=completed.receipt().value();
+        ensure!(record["kind"]=="shared_ci_local_complete" && record["reusable_passing_proof"]==false
+            && record["shipping_authority"]==false && record["binding"]["verification_head"]==head,
+            "local completion was misbound or claimed final freshness authority");
+        let commands=record["command_receipts"].as_object().context("local coverage missing")?;
+        ensure!(commands.len()==1,"fixture plan coverage was partial or overcounted");
+        for (id,hash) in commands {
+            let command=audit.controller_receipt(hash.as_str().context("command receipt hash missing")?)?;
+            ensure!(command.value()["check"]==*id && command.value()["status"]=="passed",
+                "local coverage used another command's receipt");
+        }
+        for (field,kind) in [("started_receipt_sha256","shared_ci_started"),("plan_receipt_sha256","shared_ci_plan")] {
+            let prior=audit.controller_receipt(record[field].as_str().context("coverage lineage missing")?)?;
+            ensure!(prior.value()["kind"]==kind && prior.value()["run_id"]==record["run_id"],
+                "local completion borrowed another execution's plan or start");
+        }
+        let old=completed.receipt().payload_sha256().to_owned();
+        std::fs::write(root.join("arithmetic.py"),"def add(a, b):\n    return 0\n")?;
+        git(root,&["add","arithmetic.py"]).await?;
+        git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
+            "-c","core.hooksPath=/dev/null","commit","-qm","intentional assertion failure"]).await?;
+        let error=verify_admitted(root,&audit,&storage,&target).await.err()
+            .context("failing newer CI run returned a completed capability")?;
+        ensure!(format!("{error:#}").contains("shared CI check"),"new run failed before source assertion: {error:#}");
+        ensure!(audit.controller_receipt(&old)?.value()["binding"]["verification_head"]==head,
+            "failed retry corrupted historical completion evidence");
+        std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,"kind":"real_shared_ci_complete_coverage","local_checks_covered":commands.len(),
+            "protected_start_plan_and_command_lineage":true,"newer_failed_run_cannot_return_old_completion":true,
+            "historical_completion_preserved":true,"full_ci_pass":false,"shipping_authority":false,
+            "autonomous_merges_claimed":0}))?)?;
+        Ok::<_,anyhow::Error>(())
+    }).await??;
+    drop(storage);
+    Ok(())
+}
+
 /// Publication requires a second, separately supervised VM after the original
 /// producer has exited. This checks actual Cargo reuse and kernel permissions.
 #[tokio::test]

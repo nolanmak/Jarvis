@@ -4594,7 +4594,7 @@ async fn verification_gate(worktree: &Path, audit: &Arc<augmentagent_channel_cor
     CiGateResult(async {
         audit.dispatch_allowed()?;
         gate_disk_guard()?;
-        shared_ci::verify(worktree, audit).await
+        shared_ci::verify(worktree, audit).await.map(|_|())
     }.await)
 }
 

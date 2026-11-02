@@ -7,6 +7,20 @@ use super::*;
 pub(in crate::self_improve) mod fixture;
 #[path = "self_improve_ci_vm.rs"]
 mod vm;
+#[path = "self_improve_ci_coverage.rs"]
+mod coverage;
+
+/// Protected completion of the local plan. This is not the final reusable
+/// freshness proof: generated inputs and the current workflow binding remain
+/// separate prerequisites for that publication.
+pub(super) struct CompletedLocalCi {
+    receipt: augmentagent_channel_core::tool_audit::ProtectedControllerReceipt,
+}
+impl CompletedLocalCi {
+    pub(super) fn receipt(&self) -> &augmentagent_channel_core::tool_audit::ProtectedControllerReceipt {
+        &self.receipt
+    }
+}
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -382,11 +396,20 @@ async fn snapshot(
 pub(super) async fn verify(
     root: &Path,
     audit: &Arc<augmentagent_channel_core::AuditLogger>,
-) -> Result<()> {
-    let binding_before = binding(root).await?;
+) -> Result<CompletedLocalCi> {
     let target = crate::build_storage::effective_target(root);
     let storage = crate::build_storage::admit_ci(root, &target).await?;
-    let vm = vm::Session::prepare(root, &target)
+    verify_admitted(root,audit,&storage,&target).await
+}
+
+async fn verify_admitted(root: &Path, audit: &Arc<augmentagent_channel_core::AuditLogger>,
+    storage: &crate::build_storage::Lease, target: &Path) -> Result<CompletedLocalCi> {
+    let binding_before = binding(root).await?;
+    let run_id=uuid::Uuid::new_v4().to_string();
+    let started=audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_started",
+        "run_id":run_id,"binding":binding_before,"shipping_authority":false}))
+        .context("shared CI prerequisite unavailable: start receipt not committed")?;
+    let vm = vm::Session::prepare(root, target)
         .context("shared CI prerequisite unavailable: prepare isolated CI runtime")?;
     let names = git(
         root,
@@ -404,7 +427,7 @@ pub(super) async fn verify(
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .collect();
-    let discovery_source = snapshot(root, &binding_before, &target).await?;
+    let discovery_source = snapshot(root, &binding_before, target).await?;
     let discovered = vm
         .run(
             "plan",
@@ -416,8 +439,8 @@ pub(super) async fn verify(
             &[],
             &[],
             None,
-            &storage,
-            &target,
+            storage,
+            target,
             audit,
             std::time::Duration::from_secs(180),
         )
@@ -441,10 +464,12 @@ pub(super) async fn verify(
     // A version probe may itself execute candidate path-toolchain code. It ran
     // inside the VM and cannot be allowed to supply modified source to tests.
     drop(discovery_source);
-    let dependency_seed=vm.dependency_seed(root,&binding_before,&target,&storage,audit).await?;
-    audit.record_controller(serde_json::json!({"kind":"shared_ci_plan", "binding":binding_before,
+    let dependency_seed=vm.dependency_seed(root,&binding_before,target,storage,audit).await?;
+    let plan_receipt=audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_plan", "run_id":run_id,"binding":binding_before,
         "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
-        "checks":plan.checks.iter().map(|check| serde_json::json!({"id":check.id,"status":check.status,"reason":check.reason})).collect::<Vec<_>>()}))?;
+        "checks":plan.checks.iter().map(|check| serde_json::json!({"id":check.id,"status":check.status,"reason":check.reason,"workflow":check.workflow,"job":check.job,"matrix":check.matrix})).collect::<Vec<_>>()}))
+        .context("shared CI prerequisite unavailable: plan receipt not committed")?;
+    let mut coverage=coverage::Coverage::from_plan(&plan);
     let mut source: Option<verifier_checkout::OwnedCheckout> = None;
     let mut group: Option<String> = None;
     let mut job_started = std::time::Instant::now();
@@ -454,7 +479,7 @@ pub(super) async fn verify(
         if new_group {
             job_started = std::time::Instant::now();
             drop(source.take());
-            source = Some(snapshot(root, &binding_before, &target).await?);
+            source = Some(snapshot(root, &binding_before, target).await?);
             group = Some(next_group);
         }
         let source_root = source
@@ -472,8 +497,8 @@ pub(super) async fn verify(
                 &[],
                 &[],
                 None,
-                &storage,
-                &target,
+                storage,
+                target,
                 audit,
                 check.remaining(job_started.elapsed())?,
                 if new_group {dependency_seed.as_ref()} else {None},
@@ -496,17 +521,24 @@ pub(super) async fn verify(
                 failure_excerpt(&outcome.stderr, 8000)
             );
         }
+        coverage.record(&check.id,outcome.command_receipt.as_ref()
+            .context("shared CI prerequisite unavailable: completed check lacks protected command receipt")?,
+            &binding_before,&vm.authority_sha256)?;
     }
     ensure!(
         binding(root).await? == binding_before,
         "{PREREQUISITE}: candidate source changed during shared CI"
     );
     vm.validate_runtime(true)?;
-    audit.record_controller(serde_json::json!({"kind":"shared_ci_local_complete", "binding":binding_before,
+    let commands=coverage.complete()?;
+    let receipt=audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_local_complete", "run_id":run_id,"binding":binding_before,
+        "started_receipt_sha256":started.payload_sha256(),"plan_receipt_sha256":plan_receipt.payload_sha256(),
+        "command_receipts":commands,"input_provenance_status":"preparation_only","reusable_passing_proof":false,
         "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
         "remote_required":plan.checks.iter().filter(|check|check.status=="remote_required").map(|check|&check.id).collect::<Vec<_>>(),
-        "shipping_authority":false}))?;
-    Ok(())
+        "shipping_authority":false}))
+        .context("shared CI prerequisite unavailable: local completion receipt not committed")?;
+    Ok(CompletedLocalCi {receipt})
 }
 
 async fn iteration(
