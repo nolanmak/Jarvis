@@ -28,6 +28,32 @@ pub(crate) enum Recovery {
 }
 
 impl Reason {
+    pub(crate) const ALL: [Self; 10] = [Self::LegacyFormat,Self::MetadataMissing,Self::MetadataTorn,
+        Self::GenerationMismatch,Self::InputCensusUnknown,Self::ArtifactProvenanceUnknown,
+        Self::AuthorityChanged,Self::InvalidationUnsafe,Self::CleanupUncertain,Self::FreshnessUnknown];
+
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::LegacyFormat=>"legacy_format", Self::MetadataMissing=>"metadata_missing",
+            Self::MetadataTorn=>"metadata_torn", Self::GenerationMismatch=>"generation_mismatch",
+            Self::InputCensusUnknown=>"input_census_unknown", Self::ArtifactProvenanceUnknown=>"artifact_provenance_unknown",
+            Self::AuthorityChanged=>"authority_changed", Self::InvalidationUnsafe=>"invalidation_unsafe",
+            Self::CleanupUncertain=>"cleanup_uncertain", Self::FreshnessUnknown=>"freshness_unknown",
+        }
+    }
+
+    pub(crate) fn retry_reason(self) -> String { format!("ci_freshness_{}",self.code()) }
+
+    pub(crate) fn retry_action(self) -> &'static str {
+        match self.recovery() {
+            Recovery::RevalidateInputs=>"retry_freshness_revalidate_inputs",
+            Recovery::RebuildSourceArtifacts=>"retry_freshness_rebuild_source_artifacts",
+            Recovery::RestoreTrustedDependencies=>"retry_freshness_restore_trusted_dependencies",
+            Recovery::AwaitVerifiedCleanup=>"retry_freshness_await_verified_cleanup",
+            Recovery::AwaitCompatibleController=>"retry_freshness_await_compatible_controller",
+        }
+    }
+
     pub(crate) fn recovery(self) -> Recovery {
         match self {
             Self::LegacyFormat | Self::AuthorityChanged | Self::FreshnessUnknown => Recovery::AwaitCompatibleController,
@@ -37,6 +63,26 @@ impl Reason {
             Self::InvalidationUnsafe | Self::CleanupUncertain => Recovery::AwaitVerifiedCleanup,
         }
     }
+}
+
+pub(crate) fn reason_from_retry(code: &str) -> Option<Reason> {
+    let value=code.strip_prefix("ci_freshness_")?;
+    Reason::ALL.into_iter().find(|reason|reason.code()==value)
+}
+
+pub(crate) fn retry_next(code: &str, eligible_at_ms: i64) -> crate::autoship_workflow::NextAction {
+    let (reason,action)=reason_from_retry(code).map_or_else(
+        ||("verification_infrastructure_retry".into(),"retry_verification".into()),
+        |reason|(reason.retry_reason(),reason.retry_action().into()));
+    crate::autoship_workflow::NextAction {reason,action,eligible_at_ms}
+}
+
+pub(crate) fn is_ci_retry(next: &crate::autoship_workflow::NextAction) -> bool {
+    *next==retry_next(&next.reason,next.eligible_at_ms)
+}
+
+pub(crate) fn is_progress_code(code: &str) -> bool {
+    reason_from_retry(code).is_some() || Reason::ALL.into_iter().any(|reason|reason.retry_action()==code)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
