@@ -234,7 +234,7 @@ fn account_ref(platform: &str, account_id: &str) -> StoreResult<SurfaceAccountRe
         .map_err(|e| StoreError::InvalidInput(format!("stored surface account: {e}")))
 }
 
-fn load_binding(
+pub(crate) fn load_binding(
     conn: &Connection,
     account: &SurfaceAccountRef,
 ) -> StoreResult<Option<SurfaceOwnerBinding>> {

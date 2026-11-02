@@ -171,3 +171,94 @@ fn voice_backend_snapshot_is_immutable_and_old_calls_keep_legacy_transport() {
         .is_err());
     assert!(store.phone_set_voice_backend(&call.id, "unknown").is_err());
 }
+
+#[test]
+fn ambiguous_voice_send_survives_restart_without_becoming_accepted_or_replayed() {
+    let (dir, store, id) = fixture();
+    store.phone_claim_relay(&id, "CA-test").unwrap();
+    store.phone_bind_live_session(&id, "session-one").unwrap();
+    let task = store
+        .phone_enqueue_live_dispatch(&id, "session-one", "del", "Check synthetic deadline")
+        .unwrap();
+    store
+        .phone_finish_dispatch(&id, &task, "Synthetic deadline Tuesday at 5 PM.")
+        .unwrap();
+    store
+        .phone_live_reply_intent(&id, "session-one", "del", "outgoing-one", 36, true)
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path().join("phone.db")).unwrap();
+    assert!(
+        store
+            .phone_live_results(&id, "session-one")
+            .unwrap()
+            .is_empty(),
+        "a possibly sent result is not automatically retransmitted"
+    );
+    assert_eq!(
+        store
+            .phone_live_result_disposition(&id, "del")
+            .unwrap()
+            .as_deref(),
+        Some("sending")
+    );
+    assert_eq!(
+        store.phone_pending_dispatches().unwrap()[0]
+            .result
+            .as_deref(),
+        Some("Synthetic deadline Tuesday at 5 PM."),
+        "chat/native result is independent"
+    );
+    store.phone_end_live_session(&id, "session-one").unwrap();
+    assert_eq!(
+        store
+            .phone_live_result_disposition(&id, "del")
+            .unwrap()
+            .as_deref(),
+        Some("discarded")
+    );
+    assert!(
+        !store
+            .phone_live_reply_settle(&id, "session-one", "outgoing-one", true)
+            .unwrap(),
+        "late acceptance cannot resurrect an ended publication"
+    );
+}
+
+#[test]
+fn cleanup_preserves_confirmed_context_acceptance_but_marks_unsent_results_discarded() {
+    let (_dir, store, id) = fixture();
+    store.phone_claim_relay(&id, "CA-test").unwrap();
+    store.phone_bind_live_session(&id, "session-one").unwrap();
+    for (delegation, accepted) in [("accepted", true), ("unsent", false)] {
+        let task = store
+            .phone_enqueue_live_dispatch(&id, "session-one", delegation, "Synthetic work")
+            .unwrap();
+        store
+            .phone_finish_dispatch(&id, &task, "Synthetic result")
+            .unwrap();
+        if accepted {
+            store
+                .phone_live_reply_intent(&id, "session-one", delegation, "accepted-event", 16, true)
+                .unwrap();
+            assert!(store
+                .phone_live_reply_settle(&id, "session-one", "accepted-event", true)
+                .unwrap());
+        }
+    }
+    store.phone_end_live_session(&id, "session-one").unwrap();
+    assert_eq!(
+        store
+            .phone_live_result_disposition(&id, "accepted")
+            .unwrap()
+            .as_deref(),
+        Some("accepted")
+    );
+    assert_eq!(
+        store
+            .phone_live_result_disposition(&id, "unsent")
+            .unwrap()
+            .as_deref(),
+        Some("discarded")
+    );
+}

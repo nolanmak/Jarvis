@@ -186,6 +186,7 @@ pub fn attach_slack(
     inner: Arc<dyn SlackTurnHandler>,
 ) -> Result<Arc<dyn SlackTurnHandler>> {
     let io = Arc::new(SlackPhoneIo::new(store.clone(), history, wake));
+    let attention=Arc::new(crate::phone_attention::PhoneAttention::new(store.clone()));
     let bridge = Arc::new(PhoneAgent::new(
         store,
         endpoint.service.clone(),
@@ -195,7 +196,7 @@ pub fn attach_slack(
         augmentagent_channel_slack::commands::slack_selection(
             augmentagent_channel_core::model_selection::config_path(),
         ),
-    ));
+    ).with_attention_provider(attention));
     let registration = endpoint.router.register("slack", bridge)?;
     Ok(Arc::new(SlackHandler {
         inner,

@@ -11,7 +11,7 @@ class ContractTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);cargo=root/'cargo';calls=root/'calls'
    cargo.write_text('#!'+sys.executable+'\nimport json,os,sys\nwith open(os.environ["CALLS"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n');cargo.chmod(0o700)
-   done=subprocess.run(['bash','--noprofile','--norc','-ec',body],env={'PATH':str(root)+':/usr/bin:/bin','CALLS':str(calls)},capture_output=True,text=True)
+   done=subprocess.run(['bash','--noprofile','--norc','-ec',body],cwd=ROOT,env={'PATH':str(root)+':/usr/bin:/bin','CALLS':str(calls)},capture_output=True,text=True)
    self.assertEqual(done.returncode,0,done.stderr)
    rows=[json.loads(line) for line in calls.read_text().splitlines()]
    self.assertEqual(len(rows),2,rows)
