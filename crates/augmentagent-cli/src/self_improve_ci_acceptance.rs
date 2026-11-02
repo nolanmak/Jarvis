@@ -348,7 +348,37 @@ async fn generated_input_mutation(build_script:bool,resolution:bool,read_trace:b
     let fixture=tempfile::Builder::new().prefix("generated-input-fixture-").tempdir_in(&target)?;
     let root=fixture.path();std::fs::create_dir(root.join("src"))?;
     if read_trace {
-        std::fs::write(root.join("ci-input-lookups.py"),include_bytes!("../../../scripts/ci-input-lookups.py"))?;
+        for (name,bytes) in [
+            ("ci-input-lookups.py",include_bytes!("../../../scripts/ci-input-lookups.py").as_slice()),
+            ("ci-lookup-inputs.py",include_bytes!("../../../scripts/ci-lookup-inputs.py").as_slice()),
+            ("ci-input-manifest.py",include_bytes!("../../../scripts/ci-input-manifest.py").as_slice()),
+            ("ci-cache-generation.py",include_bytes!("../../../scripts/ci-cache-generation.py").as_slice()),
+        ] {std::fs::write(root.join(name),bytes)?;}
+        std::fs::write(root.join("ci-fixture-inputs.py"),r#"import importlib.util,json,sys
+from pathlib import Path
+def load(name):
+ spec=importlib.util.spec_from_file_location(name,Path('/workspace')/(name+'.py'))
+ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+def snapshots():
+ manifest=load('ci-input-manifest')
+ return {name:[str(path),manifest.snapshot({name:path})] for name,path in
+  [('source',Path('/workspace/src')),('generated',Path('/workspace/node_modules/generated'))]}
+def content_observations(trace):
+ inputs=load('ci-lookup-inputs');lookups=load('ci-input-lookups')
+ queries=[q for q in lookups.path_queries(trace) if q['syscall'] in ('statx','openat')
+  and q.get('path',b'').endswith((b'/chosen.rs',b'/chosen/mod.rs'))]
+ assert queries,'actual module queries required'
+ before=inputs.LookupCensus(json.loads(Path('target/ci-fixture-inputs-before.json').read_text())).observe(queries)
+ unrelated=inputs.LookupCensus(json.loads(Path('target/ci-fixture-inputs-unrelated.json').read_text())).observe(queries)
+ after=inputs.LookupCensus(snapshots()).observe(queries,require_original_results=False)
+ return {'lookup_content_inputs_changed':before['sha256']!=after['sha256'],
+  'unrelated_generated_input_keeps_identity':before==unrelated,
+  'original_lookup_content_sha256':before['sha256'],'changed_lookup_content_sha256':after['sha256'],
+  'content_input_closure_complete':after['input_closure_complete']}
+if __name__=='__main__':
+ assert len(sys.argv)==3 and sys.argv[1]=='snapshot' and sys.argv[2] in ('before','unrelated')
+ Path('target/ci-fixture-inputs-'+sys.argv[2]+'.json').write_text(json.dumps(snapshots()))
+"#)?;
     }
     std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n")?;
     std::fs::write(root.join("Cargo.lock"),"version=4\n[[package]]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\n")?;
@@ -395,7 +425,7 @@ os.execvp(sys.argv[1],sys.argv[1:])
     let bound=binding(root).await?;let session=vm::Session::prepare(root,&target)?;
     let source=snapshot(root,&bound,&target).await?;
     let timeout=std::time::Duration::from_secs(180);
-    let generate_old=if resolution {r#"python3 -I - <<'PY'
+    let mut generate_old=if resolution {r#"python3 -I - <<'PY'
 import os
 from pathlib import Path
 root=Path('node_modules/generated');(root/'chosen').mkdir(parents=True)
@@ -403,13 +433,15 @@ files={root/'mod.rs':"mod chosen;pub fn value()->&'static str{chosen::VALUE}\n",
  root/'chosen/mod.rs':'pub const VALUE:&str="OLD";\n'}
 for path,source in files.items():
  path.write_text(source);os.utime(path,ns=(946684800000000000,946684800000000000))
-PY"#} else {"python3 -I -c 'import os;from pathlib import Path;p=Path(\"node_modules/generated.txt\");p.write_text(\"OLD\");os.utime(p,ns=(946684800000000000,946684800000000000))'"};
-    let generate_new=if resolution {r#"python3 -I - <<'PY'
+PY"#} else {"python3 -I -c 'import os;from pathlib import Path;p=Path(\"node_modules/generated.txt\");p.write_text(\"OLD\");os.utime(p,ns=(946684800000000000,946684800000000000))'"}.to_owned();
+    if read_trace {generate_old.push_str("\npython3 -I /workspace/ci-fixture-inputs.py snapshot before");}
+    let mut generate_new=if resolution {r#"python3 -I - <<'PY'
 import os
 from pathlib import Path
 path=Path('node_modules/generated/chosen.rs');path.write_text('pub const VALUE:&str="NEW";\n')
 os.utime(path,ns=(946684800000000000,946684800000000000))
 PY"#.to_owned()} else {generate_old.replace("OLD","NEW")};
+    if read_trace {generate_new=format!("python3 -I -c 'from pathlib import Path;Path(\"node_modules/generated/unrelated.rs\").write_text(\"unrelated\")'\npython3 -I /workspace/ci-fixture-inputs.py snapshot unrelated\n{generate_new}");}
     let compile=if resolution {r#"python3 -I - <<'PY'
 import json,os,subprocess,sys
 from pathlib import Path
@@ -424,7 +456,7 @@ for line in result.stdout.splitlines():
 if result.returncode:raise SystemExit(result.returncode)
 raise SystemExit(subprocess.run(['target/debug/generated-input-consumer']).returncode)
 PY"#} else {"RUSTC_WRAPPER=/workspace/rustc-counter.py cargo build --offline --locked --message-format=json > target/messages.json && python3 -I -c 'from pathlib import Path;p=Path(\"/tmp/ci-fixture-rustc-count\");print(\"CALLS=\"+str(len(p.read_text().splitlines()) if p.exists() else 0))' && target/debug/generated-input-consumer"};
-    let old=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(generate_old),&storage,&target,&audit,timeout).await?;
+    let old=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(&generate_old),&storage,&target,&audit,timeout).await?;
     ensure!(old.status=="passed","initial generator failed: {}",old.stderr);
     let first=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
     ensure!(first.status=="passed" && first.stdout.trim()=="CALLS=1\nOLD","initial generated input did not execute: {} {}",first.stdout,first.stderr);
@@ -450,10 +482,13 @@ all_queries=lookups.path_queries(trace.read_bytes())
 opened_module=[query for query in all_queries if query.get('resolved_path')==b'/workspace/node_modules/generated/chosen/mod.rs' and query['intent']=='read']
 directory_reads=[query for query in all_queries if query['syscall']=='getdents64']
 device_reads=[query for query in all_queries if query.get('descriptor_kind') in ('character-device','block-device')]
+spec=importlib.util.spec_from_file_location('fixture_inputs','/workspace/ci-fixture-inputs.py')
+fixture_inputs=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture_inputs)
+content=fixture_inputs.content_observations(trace.read_bytes())
 print(json.dumps({'trace':trace.read_text(),'dep_infos':dep_infos,'trusted_input_closure':False,
  'missing_module_queries':len(missing),'lookup_observation':lookups.observation(queries),
  'decoded_path_queries':len(all_queries),'opened_module_queries':len(opened_module),
- 'directory_read_queries':len(directory_reads),'device_read_queries':len(device_reads)}),flush=True)
+ 'directory_read_queries':len(directory_reads),'device_read_queries':len(device_reads),**content}),flush=True)
 result=subprocess.run(['rustc','--edition=2021','--crate-name','resolution_control','src/main.rs','-o','target/resolution-control'],capture_output=True,text=True)
 sys.stderr.write(result.stderr);sys.stdout.write(result.stdout);raise SystemExit(result.returncode)
 PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o target/resolution-control"};
@@ -468,6 +503,9 @@ PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o
         value["missing_module_queries"].as_u64().is_some_and(|count|count>0)
         && value["opened_module_queries"].as_u64().is_some_and(|count|count>0)
         && value["directory_read_queries"].as_u64().is_some_and(|count|count>0)
+        && value["lookup_content_inputs_changed"]==true
+        && value["unrelated_generated_input_keeps_identity"]==true
+        && value["content_input_closure_complete"]==false
         && value["lookup_observation"]["input_closure_complete"]==false
         && value["lookup_observation"]["shipping_authority"]==false
         && value["dep_infos"].as_object().is_some_and(|files|!files.is_empty()
@@ -486,6 +524,8 @@ PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o
         "opened_module_queries":lookup_observation.as_ref().map(|value|&value["opened_module_queries"]),
         "directory_read_queries":lookup_observation.as_ref().map(|value|&value["directory_read_queries"]),
         "device_read_queries":lookup_observation.as_ref().map(|value|&value["device_read_queries"]),
+        "lookup_content_inputs_changed":lookup_observation.as_ref().map(|value|&value["lookup_content_inputs_changed"]),
+        "unrelated_generated_input_keeps_identity":lookup_observation.as_ref().map(|value|&value["unrelated_generated_input_keeps_identity"]),
         "trusted_input_closure":false,"cargo_metadata_isolation_established":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&report)?)?;
