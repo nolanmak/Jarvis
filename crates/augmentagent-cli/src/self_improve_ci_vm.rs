@@ -17,6 +17,7 @@ pub(super) struct Session {
     cache: PathBuf,
     pub authority_sha256: String,
     completed_generations: std::sync::Mutex<std::collections::BTreeMap<String, Completion>>,
+    execution: tokio::sync::Mutex<()>,
 }
 struct Completion {
     command: String,
@@ -279,6 +280,7 @@ impl Session {
             cache: cache_root.join("cache.img"),
             authority_sha256,
             completed_generations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            execution: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -298,6 +300,15 @@ impl Session {
         audit: &Arc<augmentagent_channel_core::AuditLogger>,
         deadline: std::time::Duration,
     ) -> Result<Outcome> {
+        // One image cannot be mounted by concurrent guests. Reconcile even
+        // when this caller still owns the outer storage lease: an earlier
+        // canceled command may have left a durable unknown teardown hold.
+        let _execution=self.execution.lock().await;
+        if !crate::build_storage::ci_holds::may_cleanup_after_reconcile(target).unwrap_or(false) {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
+                "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
+                "evidence_sha256":digest(b"prior shared CI teardown remains unverified")})).into());
+        }
         let generation = source.generation().to_owned();
         let source_lifetime=source.lifetime();
         let source = source.path();
@@ -432,6 +443,31 @@ impl Session {
 mod tests {
     use super::*;
 
+    #[cfg(target_os="linux")]
+    #[test]
+    fn unsettled_prior_hold_blocks_same_lease_session_before_any_new_command() {
+        crate::build_storage::ci_holds::with_test_registry(|root,_| {
+            let storage=crate::build_storage::Lease::try_at(root).unwrap().unwrap();
+            let source=verifier_checkout::allocate(root,"head","contract").unwrap();
+            let hold=crate::build_storage::ci_holds::Hold::begin(root,source.path(),root,root,&"a".repeat(64)).unwrap();
+            let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:root.join("never-opened.img"),
+                authority_sha256:String::new(),completed_generations:Default::default(),execution:Default::default()};
+            let control=tempfile::Builder::new().prefix("ci-refusal-control-").tempdir_in("/tmp").unwrap();
+            let audit=workflow::workflow_audit(&control.path().join("workflow.db"),"prior-cleanup-refusal",None).unwrap();
+            let binding=super::super::tests::binding_fixture();
+            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let error=runtime.block_on(session.run("repository",&source,root,&binding,None,&[],&[],&[],
+                Some("touch forbidden-dispatch"),&storage,root,&audit,std::time::Duration::from_secs(1)))
+                .err().expect("unsettled prior hold permitted a second VM command");
+            let hold_error=error.downcast_ref::<crate::autoship_freshness::Hold>().expect("cleanup refusal lost typed freshness disposition");
+            assert_eq!(hold_error.reason,crate::autoship_freshness::Reason::CleanupUncertain);
+            assert!(!root.join("forbidden-dispatch").exists());
+            assert!(!root.join("never-opened.img").exists());
+            assert!(!crate::build_storage::ci_holds::may_cleanup(root).unwrap());
+            drop(hold);
+        });
+    }
+
     #[test]
     fn dropped_job_sources_stop_pinning_cache_while_live_sources_keep_their_acknowledgement() {
         let directory=tempfile::tempdir().unwrap();
@@ -439,7 +475,7 @@ mod tests {
         let second=verifier_checkout::allocate(directory.path(),"head-b","contract").unwrap();
         let first_id=first.generation().to_owned();let second_id=second.generation().to_owned();
         let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:directory.path().join("unused"),
-            authority_sha256:String::new(),completed_generations:Default::default()};
+            authority_sha256:String::new(),completed_generations:Default::default(),execution:Default::default()};
         session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime()});
         session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime()});
         assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([first_id.clone(),second_id.clone()])));
