@@ -6,6 +6,115 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 const CARGO_EXEC_DENIAL_LIBRARY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_exec.so"));
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 const CARGO_EXEC_DENIAL_CASES:&[u8]=include_bytes!("ci_cargo_exec_cases.py");
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_RELAY_LIBRARY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_relay.so"));
+
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn cargo_relay_spawn_interface_fixture() {
+    if std::env::var("JARVIS_CARGO_RELAY_FIXTURE").as_deref()!=Ok("1") {return;}
+    use std::os::unix::ffi::OsStringExt;
+    let args=[c"true".as_ptr(),std::ptr::null()];
+    let env:[*const libc::c_char;1]=[std::ptr::null()];
+    assert_eq!(unsafe {libc::syscall(libc::SYS_execve,c"/bin/true".as_ptr(),args.as_ptr(),env.as_ptr())},-1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::EPERM));
+    println!("RAW_EXEC_DENIED");
+    let job=std::env::var("JARVIS_RELAY_TEST_JOB_FD").unwrap();
+    let output=std::process::Command::new("/usr/bin/python3").args(["-I","-c",&format!(
+        "import os;assert os.environb[b'RAW']==b'\\xffdata';assert os.read({job},1)==b'+';os.write(1,b'x'*(1024*1024));raise SystemExit(17)")])
+        .env("RAW",std::ffi::OsString::from_vec(b"\xffdata".to_vec()))
+        .current_dir(std::env::current_dir().unwrap()).output().unwrap();
+    assert_eq!(output.status.code(),Some(17));
+    assert_eq!(output.stdout,vec![b'x';1024*1024]);
+    let missing=std::process::Command::new("/missing-jarvis-relay-tool").output().unwrap_err();
+    assert_eq!(missing.raw_os_error(),Some(libc::ENOENT));
+    println!("RELAY_STD_COMPLETE");
+}
+
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn same_uid_cargo_relay_exercises_real_rust_spawns_and_refuses_unsupported_requests() {
+    let directory=tempfile::tempdir().unwrap();let library=directory.path().join("relay.so");
+    std::fs::write(&library,CARGO_RELAY_LIBRARY).unwrap();
+    for (name,count) in [("ci_cargo_relay_test.py",5),("ci_cargo_relay_native_test.py",5)] {
+        let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests").join(name);
+        let output=std::process::Command::new("python3").arg("-I").arg(tests)
+            .env("AUGMENTAGENT_CARGO_RELAY_LIBRARY",&library)
+            .env("AUGMENTAGENT_RELAY_FIXTURE_BINARY",std::env::current_exe().unwrap()).output().unwrap();
+        let diagnostics=String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(),"relay cases failed: {diagnostics}");
+        assert!(diagnostics.contains(&format!("Ran {count} tests")) && !diagnostics.contains("skipped"),
+            "relay cases did not execute: {diagnostics}");
+    }
+}
+
+/// Interface feasibility only: every process still has the ordinary worker UID.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_same_uid_cargo_relay()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"same-uid-cargo-relay",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("cargo-relay-fixture-").tempdir_in(&target)?;
+    let root=fixture.path();
+    for (path,bytes) in [
+        ("relay.so",CARGO_RELAY_LIBRARY),
+        ("ci-cargo-relay.py",include_bytes!("../../../scripts/ci-cargo-relay.py").as_slice()),
+        ("provider-supervisor.py",include_bytes!("../../../scripts/provider-supervisor.py").as_slice()),
+        ("Cargo.toml",b"[workspace]\nmembers=['app','macros']\nresolver='2'\n".as_slice()),
+        ("Cargo.lock",b"version=4\n[[package]]\nname='relay-app'\nversion='0.1.0'\ndependencies=['relay-macros']\n[[package]]\nname='relay-macros'\nversion='0.1.0'\n".as_slice()),
+        ("app/Cargo.toml",b"[package]\nname='relay-app'\nversion='0.1.0'\nedition='2021'\nbuild='build.rs'\n[dependencies]\nrelay-macros={path='../macros'}\n".as_slice()),
+        ("app/build.rs",b"fn main(){let p=std::path::PathBuf::from(std::env::var_os(\"OUT_DIR\").unwrap());std::fs::write(p.join(\"generated.rs\"),\"const GENERATED:usize=17;\").unwrap();println!(\"cargo:rerun-if-changed=build.rs\");}\n".as_slice()),
+        ("app/src/lib.rs",b"include!(concat!(env!(\"OUT_DIR\"),\"/generated.rs\"));relay_macros::pass!{pub fn value()->usize{GENERATED}}\n#[test]fn generated_input(){assert_eq!(value(),17);}\n".as_slice()),
+        ("macros/Cargo.toml",b"[package]\nname='relay-macros'\nversion='0.1.0'\nedition='2021'\n[lib]\nproc-macro=true\n".as_slice()),
+        ("macros/src/lib.rs",b"extern crate proc_macro;#[proc_macro]pub fn pass(input:proc_macro::TokenStream)->proc_macro::TokenStream{input}\n".as_slice()),
+    ] {
+        let path=root.join(path);std::fs::create_dir_all(path.parent().unwrap())?;std::fs::write(path,bytes)?;
+    }
+    git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","same UID Cargo relay fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let binding=binding(root).await?;let session=vm::Session::prepare(&owner,&target)?;
+    let source=snapshot(root,&binding,&target).await?;
+    let command=r#"python3 -I - <<'PY'
+import importlib.util,json,os,shutil,subprocess,tempfile
+from pathlib import Path
+control=Path(tempfile.mkdtemp(prefix='jcr-',dir='/tmp'));control.chmod(0o700)
+library=Path('/workspace/target/relay-experiment.so');shutil.copyfile('/workspace/relay.so',library)
+for name in ('ci-cargo-relay.py','provider-supervisor.py'):shutil.copyfile('/workspace/'+name,control/name)
+spec=importlib.util.spec_from_file_location('relay',control/'ci-cargo-relay.py');relay=importlib.util.module_from_spec(spec);spec.loader.exec_module(relay)
+results=[]
+with relay.Relay(control,library=library,timeout=30) as server:
+ for attempt in range(2):
+  fd=server.config_fd()
+  try:
+   environment=os.environ.copy();environment.update(LD_PRELOAD=str(library),JARVIS_CARGO_RELAY_FD=str(fd))
+   result=subprocess.run(['/toolchain/bin/cargo','test','--workspace','--offline'],cwd='/workspace',env=environment,pass_fds=(fd,),capture_output=True,text=True,timeout=120)
+  finally:os.close(fd)
+  results.append({'exit_code':result.returncode,'stdout':result.stdout[-6000:],'stderr':result.stderr[-6000:]})
+  if result.returncode:break
+ completed=list(server.completed);errors=list(server.errors)
+print(json.dumps({'cargo_runs':results,'supervised_tools':len(completed),'cleanup_verified':all(r['cleanup']=='all-descendants-reaped' for r in completed),'relay_errors':errors,'cargo_metadata_isolation_established':False,'shipping_authority':False}))
+assert len(results)==2 and all(r['exit_code']==0 for r in results),results
+assert len(completed)>=4 and not errors
+PY"#;
+    let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
+        &storage,&target,&audit,std::time::Duration::from_secs(300)).await?;
+    let observations:serde_json::Value=serde_json::from_str(&result.stdout).unwrap_or(serde_json::Value::Null);
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "version":1,"kind":"real_shared_ci_same_uid_cargo_relay","head":head,"generation":source.generation(),
+        "status":result.status,"observations":observations,"stderr":result.stderr,
+        "actual_vm_commands":1,"cargo_metadata_isolation_established":false,"full_ci_pass":false,
+        "shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
+    ensure!(result.status=="passed","same UID Cargo relay guest regression failed: {}",result.stdout);
+    drop(source);drop(session);drop(storage);Ok(())
+}
 
 #[cfg(target_os="linux")]
 #[test]

@@ -215,8 +215,9 @@ to change the operator's toolchain channel, provider grant or VM restrictions.
    direct exec calls, with tool execution delegated to a controller relay under a
    separate unprivileged credential. A preload adapter may translate the pinned
    Cargo/std-library spawn interfaces to that relay; the kernel denial remains
-   mandatory if interposition misses a call. The actual relay, credential
-   transition and loader protocol remain unimplemented and unaccepted. Unsupported ABI,
+   mandatory if interposition misses a call. A same-UID interface experiment now
+   exercises that delegation; the protected relay, credential transition and
+   production loader protocol remain unimplemented and unaccepted. Unsupported ABI,
    missing listener, ambiguous caller identity or unknown executable must refuse.
    A capability observation establishes none of this enforcement. Application
    environment/arguments cannot select the launcher, credentials or gate policy.
@@ -278,6 +279,39 @@ captured output, exit status, invalid descriptors, storage retention and an
 injected post-spawn failure with a detached child. The ordinary Linux CLI suite
 runs these cases. No command-line/environment switch enables this interface,
 and it establishes no planner credential or artifact isolation.
+
+The interface experiment in `ci-cargo-relay.py` refuses root and uses a private
+0700 Unix socket directory, same-UID peer credentials and an immutable nonce-bearing
+configuration memfd. Its separate preload library installs the existing
+deny-exec filter before main. Hooks translate `execv`/`execve`/`execvp`/`execvpe`
+and supported `posix_spawn` calls into bounded requests. The Rust fixture proved
+that returning ENOSYS from `posix_spawn` does not establish an `execvp` fallback;
+the adapter therefore implements the observed spawn path. It records supported
+close/dup/chdir/fchdir actions through their public APIs and forks a proxy that
+releases its exec-start pipe only after the delegated tool's launch handshake.
+Other actions and non-default process-group/scheduling/credential attributes
+refuse. There is no unchecked native execution fallback.
+
+Prototype wire format (little-endian, not C's passing-proof schema): the sealed
+160-byte configuration contains `JARVCFG1`, UID/PID/timeout, a 32-byte nonce and
+a 108-byte socket path. A 300-byte `JARVREQ1` frame carries the nonce and at most
+64 original descriptor numbers; SCM_RIGHTS carries a sealed argument memfd,
+stdio and inheritable FIFO descriptors. The `JARVARG1` memfd contains flags,
+argument/environment counts and length-prefixed file/cwd/search-path/argv/env
+bytes, bounded to 8 MiB, 4096 entries and 1 MiB per string. Unknown inheritable
+regular/socket descriptors refuse. `JARVRSP1` start/finish/error frames are
+16 bytes. Each tool runs through the original supervisor. The endpoint bounds
+concurrency to four, requests to 4096 and each declared tool deadline to at most
+60 seconds; uncertain cleanup retains a failing state and never publishes a
+passing receipt. Tool environment bytes are applied only by the unprivileged
+exec bootstrap, after removing this experiment's preload/control selector.
+
+This is not the accepted planner execution protocol. In particular, signal and
+process-group semantics beyond the tested spawn cases, complete ABI/loader
+coverage, separate credentials, immutable per-unit inputs/output publication,
+graph-based invalidation and final suite-proof binding remain open. The endpoint
+reports metadata isolation and shipping authority as false. No production
+launcher, merge consumer or final C schema uses it.
 
 Disposable boundary tests may exercise a specified gate under the existing VM
 admission before production activation. They must never fall back to unchecked
