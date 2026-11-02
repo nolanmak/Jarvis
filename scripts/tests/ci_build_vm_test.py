@@ -32,6 +32,38 @@ class AdapterTests(unittest.TestCase):
     return {'exit_code':0,'stdout':json.dumps(plan),'stderr':''}
    with patch.object(vm.Runtime,'load',return_value=object()):result=adapter.execute(request,run=execute)
    self.assertEqual(result['status'],'planned');self.assertEqual(len(seen),1)
+
+ def test_dependency_production_requires_an_isolated_source_and_cannot_report_passing_ci(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);request=self.fixture(root)
+   source=root/'producer';source.mkdir(mode=0o700)
+   workspace=adapter.dependency_workspace
+   metadata={'version':1,'workspace_root':'/workspace','packages':[
+    {'id':'leaf','name':'leaf','version':'1.0.0','source':'registry+https://github.com/rust-lang/crates.io-index',
+     'manifest_path':'/ci-cargo-home/registry/src/pinned/leaf/Cargo.toml',
+     'targets':[{'kind':['lib'],'src_path':'/ci-cargo-home/registry/src/pinned/leaf/src/lib.rs'}]}],
+    'resolve':{'nodes':[{'id':'leaf','dependencies':[],'features':[]}]}}
+   lock='version=4\n[[package]]\nname="leaf"\nversion="1.0.0"\nsource="registry+https://github.com/rust-lang/crates.io-index"\nchecksum="'+'a'*64+'"\n'
+   files=workspace.source_files(metadata,lock);identity=workspace.write_source(source,files)
+   dependency={'kind':'produce','producer':str(uuid.uuid4()),'source_sha256':identity,
+    'dependency_inputs_sha256':hashlib.sha256(files['seed-inputs.json']).hexdigest()}
+   request.update(operation='dependency',workspace=str(source),dependency=dependency,build_cache=str(root/'registered-image'))
+   seen=[]
+   def execute(*args,**options):
+    seen.append(options)
+    self.assertEqual(options['ci_context']['dependency_action']['kind'],'produce')
+    self.assertIn('ci-dependency-store.py',options['ci_context']['dependency_programs'])
+    return {'exit_code':0,'stdout':'','stderr':'','cache_reclaimed':[],
+     'dependency_result':{'version':1,'kind':'produced','producer':dependency['producer'],
+      'command':request['command_id'],'dependency_inputs_sha256':dependency['dependency_inputs_sha256'],
+      'shipping_authority':False}}
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+    side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+    result=adapter.execute(request,run=execute)
+    self.assertEqual(result['status'],'seed_produced')
+    (source/'application.rs').write_text('unapproved application code')
+    with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+    self.assertEqual(len(seen),1)
  def test_wrong_guest_binding_never_becomes_authority(self):
   with tempfile.TemporaryDirectory() as d:
    request=self.fixture(Path(d))

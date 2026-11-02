@@ -16,6 +16,7 @@ import posixpath
 from pathlib import Path
 import stat
 import tempfile
+import shutil
 
 BASE=Path(__file__).resolve().parent
 def _module(name,filename):
@@ -259,6 +260,14 @@ def _publish(directory,producer,ack):
             or ack['command']!=control['command'] or ack['authority_sha256']!=binding['authority_sha256']
             or ack['cache_identity_sha256']!=binding['cache_identity_sha256'] or not cache._digest(ack['quiescence_sha256'])):
         raise FreshnessHold('cleanup_uncertain')
+    publication=path/'published.json'
+    if publication.exists() or publication.is_symlink():
+        receipt=_document(publication)
+        if (set(receipt)!={'version','seed','ack'} or receipt['version']!=1 or receipt['ack']!=ack
+                or not cache._digest(receipt['seed'])):raise FreshnessHold('artifact_provenance_unknown')
+        read_seed(directory,receipt['seed'],binding)
+        _retire_published_payload(path)
+        return receipt['seed']
     produced=_document(path/'produced.json')
     if (set(produced)!={'version','command','units','source_trees'} or type(produced['version']) is not int
             or produced['version']!=1 or produced['command']!=control['command']
@@ -283,6 +292,8 @@ def _publish(directory,producer,ack):
     final=seeds/identity
     if final.exists() or final.is_symlink():
         if read_seed(directory,identity,binding)!=manifest:raise FreshnessHold('metadata_torn')
+        cache._write_record(publication,{'version':1,'seed':identity,'ack':ack})
+        _retire_published_payload(path)
         return identity
     staging=Path(tempfile.mkdtemp(prefix='.publishing-',dir=seeds))
     # The original VM is positively quiescent. Hard links preserve exact Cargo
@@ -305,7 +316,27 @@ def _publish(directory,producer,ack):
     fd=os.open(seeds,os.O_RDONLY|os.O_DIRECTORY)
     try:os.fsync(fd)
     finally:os.close(fd)
+    cache._write_record(publication,{'version':1,'seed':identity,'ack':ack})
+    _retire_published_payload(path)
     return identity
+
+
+def _retire_published_payload(path):
+    # Publication retained original host quiescence and the immutable seed now
+    # owns every selected inode. Keep the original control and publication
+    # receipt; only its known private payload is eligible for bounded cleanup.
+    if not shutil.rmtree.avoids_symlink_attacks:raise FreshnessHold('cleanup_uncertain')
+    for name in ('target','cargo-home'):
+        child=path/name
+        if not child.exists() and not child.is_symlink():continue
+        info=child.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_dev!=path.stat().st_dev:
+            raise FreshnessHold('cleanup_uncertain')
+        try:shutil.rmtree(child)
+        except OSError:raise FreshnessHold('cleanup_uncertain') from None
+    descriptor=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
 
 
 def read_seed(directory,identity,binding):

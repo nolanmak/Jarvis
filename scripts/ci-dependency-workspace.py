@@ -180,10 +180,15 @@ def write_source(root,files):
     return identity
 
 
-def verify_source(root,identity,*,owner_uid=None):
+def verify_source(root,identity,*,owner_uid=None,allow_target=False,generated_lock=False):
     root=Path(root);owner_uid=os.getuid() if owner_uid is None else owner_uid
+    names={'Cargo.toml','src','seed-inputs.json','seed-lock.toml'}
+    if allow_target:
+        names.add('target')
+        if (root/'target').is_symlink() or not (root/'target').is_dir():raise InputsUnknown()
+    if generated_lock:names.add('Cargo.lock')
     if (not root.is_absolute() or root.resolve()!=root or not root.is_dir()
-            or {path.name for path in root.iterdir()}!={'Cargo.toml','src','seed-inputs.json','seed-lock.toml'}
+            or {path.name for path in root.iterdir()}!=names
             or (root/'src').is_symlink() or not (root/'src').is_dir()
             or {path.name for path in (root/'src').iterdir()}!={'lib.rs'}):raise InputsUnknown()
     files={}

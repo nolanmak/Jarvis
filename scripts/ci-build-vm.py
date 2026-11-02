@@ -9,6 +9,40 @@ vm=importlib.util.module_from_spec(spec);spec.loader.exec_module(vm)
 cache_spec=importlib.util.spec_from_file_location('ci_cache_generation',BASE/'ci-cache-generation.py')
 cache_generation=importlib.util.module_from_spec(cache_spec);cache_spec.loader.exec_module(cache_generation)
 CACHE_PROGRAM=(BASE/'ci-cache-generation.py').read_bytes()
+dependency_spec=importlib.util.spec_from_file_location('ci_dependency_workspace',BASE/'ci-dependency-workspace.py')
+dependency_workspace=importlib.util.module_from_spec(dependency_spec);dependency_spec.loader.exec_module(dependency_workspace)
+DEPENDENCY_PROGRAMS={name:(BASE/name).read_bytes() for name in (
+ 'ci-cache-generation.py','ci-dependency-seed.py','ci-dependency-artifacts.py','ci-dependency-workspace.py',
+ 'ci-dependency-store.py','ci-dependency-driver.py','ci-dependency-guest.py')}
+
+
+def dependency_action(request):
+    value=request.get('dependency')
+    if value is None:
+        if request['operation']=='dependency':raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        return None
+    if not isinstance(value,dict):raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    kind=value.get('kind')
+    fields={'kind','dependency_inputs_sha256'}
+    if kind in ('produce','publish'):
+        fields|={'producer','source_sha256'}
+        if kind=='publish':fields.add('ack')
+        if request['operation']!='dependency' or not cache_generation._uuid(value.get('producer')) or not cache_generation._digest(value.get('source_sha256')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    elif kind=='install':
+        fields.add('seed')
+        if request['operation'] not in ('step','targeted','baseline','repository') or not cache_generation._digest(value.get('seed')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    else:raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    if set(value)!=fields or not cache_generation._digest(value.get('dependency_inputs_sha256')):
+        raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    if kind=='publish':
+        ack=value['ack']
+        if (not isinstance(ack,dict) or set(ack)!={'command','authority_sha256','cache_identity_sha256','quiescence_sha256'}
+                or not cache_generation._uuid(ack.get('command'))
+                or any(not cache_generation._digest(ack.get(key)) for key in ('authority_sha256','cache_identity_sha256','quiescence_sha256'))):
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
+    return dict(value)
 
 
 def private_bytes(path,limit=2*1024*1024):
@@ -119,7 +153,7 @@ def cargo_request(request):
         if not isinstance(values,list) or len(values)>128 or any(not isinstance(value,str) or len(value)>256 or not re.fullmatch(pattern,value) for value in values):
             raise vm.Unavailable('invalid CI '+label)
     operation=request['operation']
-    if operation in ('plan','step','repository') and (packages or filters):raise vm.Unavailable('irrelevant CI cargo arguments')
+    if operation in ('plan','step','repository','dependency') and (packages or filters):raise vm.Unavailable('irrelevant CI cargo arguments')
     if operation=='targeted' and (not packages or filters):raise vm.Unavailable('targeted CI requires packages and no filters')
     if operation=='repository':
         command=request.get('command')
@@ -133,8 +167,9 @@ def execute(request,run=vm.run,progress=None):
     progress["stage"]="request_schema"
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
               'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations'}
-    optional={'id','changed_files','cache_bytes','packages','filters','command'}
-    if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository'):raise vm.Unavailable('invalid CI VM request')
+    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency'}
+    if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository','dependency'):raise vm.Unavailable('invalid CI VM request')
+    dependency=dependency_action(request)
     if not cache_generation._uuid(request['source_generation']) or not cache_generation._uuid(request['command_id']) or (request['predecessor'] is not None and not cache_generation._uuid(request['predecessor'])):raise cache_generation.FreshnessHold('generation_mismatch')
     retained=request['retained_generations']
     if (not isinstance(retained,list) or not 1<=len(retained)<=4096
@@ -155,13 +190,19 @@ def execute(request,run=vm.run,progress=None):
     generation=None
     if request['operation']!='plan':
         progress['stage']='source_census'
-        outputs=cache_generation.declared_outputs(workspace)
+        outputs={} if request['operation']=='dependency' else cache_generation.declared_outputs(workspace)
         directories=['target',*[name for name,kind in outputs.items() if kind=='directory']]
         files=[name for name,kind in outputs.items() if kind=='file']
-        source_inputs=cache_generation.source_census(workspace,Path(request['git_objects']),request['head'],
-            generated_directories=directories,generated_files=files)
+        if request['operation']=='dependency':
+            try:source_inputs=dependency_workspace.verify_source(workspace,dependency['source_sha256'])
+            except dependency_workspace.InputsUnknown:raise cache_generation.FreshnessHold('input_census_unknown') from None
+            policy_sha=hashlib.sha256((workspace/'seed-inputs.json').read_bytes()).hexdigest()
+            if policy_sha!=dependency['dependency_inputs_sha256']:raise cache_generation.FreshnessHold('input_census_unknown')
+        else:
+            source_inputs=cache_generation.source_census(workspace,Path(request['git_objects']),request['head'],
+                generated_directories=directories,generated_files=files)
         target=workspace/'target'
-        target.mkdir(mode=0o700,exist_ok=True)
+        if request['operation']!='dependency':target.mkdir(mode=0o700,exist_ok=True)
         for name,kind in outputs.items():
             path=workspace/name
             if kind=='directory':path.mkdir(mode=0o700,exist_ok=True)
@@ -203,7 +244,8 @@ def execute(request,run=vm.run,progress=None):
         info=Path(request['build_cache']).stat()
         generation['binding']['cache_identity_sha256']=hashlib.sha256(json.dumps([info.st_dev,info.st_ino,info.st_size],separators=(',',':')).encode()).hexdigest()
         cache_generation.validate_binding(generation['binding'])
-        if request['operation']=='step':
+        if request['operation']=='dependency':command=['/usr/bin/true']
+        elif request['operation']=='step':
             identifier=request.get('id')
             if not isinstance(identifier,str) or len(identifier)>4096 or '\0' in identifier:raise vm.Unavailable('invalid CI command identity')
             command+=['step','--vm-runtime','--id',identifier,'--input-head',request['head'],'--input-base',request['base'],'--state-dir','/ci-runtime']
@@ -214,16 +256,32 @@ def execute(request,run=vm.run,progress=None):
     progress['stage']='vm_launch'
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
                 ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract,
-                            'cache_program':CACHE_PROGRAM,'generation':generation})
+                            'cache_program':CACHE_PROGRAM,'generation':generation,
+                            'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency})
     progress['stage']='receipt_validate'
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),
             'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
-            'cache_reclaimed':outcome.get('cache_reclaimed',[])}
+            'cache_reclaimed':outcome.get('cache_reclaimed',[]),
+            'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
+    if dependency is not None:
+        observed=outcome.get('dependency_result')
+        if (not isinstance(observed,dict) or observed.get('version')!=1 or observed.get('shipping_authority') is not False
+                or observed.get('dependency_inputs_sha256')!=dependency['dependency_inputs_sha256']
+                or observed.get('kind')!={'produce':'produced','publish':'published','install':'installed'}[dependency['kind']]):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        if dependency['kind'] in ('produce','publish') and observed.get('producer')!=dependency['producer']:
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        if dependency['kind']=='produce' and observed.get('command')!=request['command_id']:
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
+        if dependency['kind'] in ('publish','install') and not cache_generation._digest(observed.get('seed')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        result['dependency_result']=observed
     if outcome['exit_code']==0:
         if request['operation']=='plan':
             plan=json.loads(outcome['stdout'])
             if plan.get('head')!=request['head'] or plan.get('base')!=request['base'] or plan.get('contract_sha256')!=result['contract_sha256']:raise vm.Unavailable('guest CI plan binding mismatch')
             result.update(status='planned',plan=plan)
+        elif request['operation']=='dependency':result['status']='seed_'+result['dependency_result']['kind']
         else:result['status']='passed'
     elif 'shared CI prerequisite unavailable' in outcome['stderr']:result['status']='prerequisite_hold'
     else:result['status']='failed'
@@ -244,5 +302,5 @@ def main():
         # Local diagnostics deliberately omit raw paths, requests and exception text.
         result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','reason':'CI VM setup unavailable','category':type(error).__name__ if type(error).__name__ in ('Unavailable','OSError','PermissionError','FileNotFoundError','ValueError','KeyError','JSONDecodeError','CalledProcessError') else 'SetupError','stage':progress['stage'],'errno':error.errno if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4096 else None}
     print(json.dumps(result,sort_keys=True))
-    return 0 if result['status'] in ('passed','planned') else 2
+    return 0 if result['status'] in ('passed','planned','seed_produced','seed_published') else 2
 if __name__=='__main__':raise SystemExit(main())

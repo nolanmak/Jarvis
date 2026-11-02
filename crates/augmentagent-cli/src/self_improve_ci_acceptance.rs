@@ -2,6 +2,101 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Publication requires a second, separately supervised VM after the original
+/// producer has exited. This checks actual Cargo reuse and kernel permissions.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_dependency_seed_replay()->Result<()> {
+    let root=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&root),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-dependency-seed",Some(&root))?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&root);
+    let storage=crate::build_storage::admit_ci(&root,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("dependency-seed-fixture-").tempdir_in(&target)?;
+    let repo=fixture.path();std::fs::create_dir(repo.join("src"))?;
+    let registry="registry+https://github.com/rust-lang/crates.io-index";
+    let package_id="registry+https://github.com/rust-lang/crates.io-index#itoa@1.0.18";
+    let lock=format!("version = 4\n[[package]]\nname = \"seed-consumer\"\nversion = \"0.0.0\"\ndependencies = [\"itoa\"]\n\n[[package]]\nname = \"itoa\"\nversion = \"1.0.18\"\nsource = \"{registry}\"\nchecksum = \"8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682\"\n");
+    std::fs::write(repo.join("Cargo.lock"),&lock)?;
+    std::fs::write(repo.join("Cargo.toml"),"[package]\nname = \"seed-consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n[dependencies]\nitoa = \"=1.0.18\"\n")?;
+    std::fs::write(repo.join("src/main.rs"),"fn main() { println!(\"{}\", itoa::Buffer::new().format(42)); }\n")?;
+    git(repo,&["-c","init.templateDir=","init","-q"]).await?;
+    git(repo,&["add","."]).await?;
+    git(repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","seed consumer"]).await?;
+    let head=git(repo,&["rev-parse","HEAD"]).await?;
+    git(repo,&["update-ref","refs/remotes/origin/main",head.trim()]).await?;
+    let binding=binding(repo).await?;
+    let metadata=serde_json::json!({"version":1,"workspace_root":"/workspace","packages":[
+        {"id":"root","name":"seed-consumer","version":"0.0.0","source":null,"manifest_path":"/workspace/Cargo.toml",
+         "targets":[{"kind":["bin"],"src_path":"/workspace/src/main.rs"}]},
+        {"id":package_id,"name":"itoa","version":"1.0.18","source":registry,
+         "manifest_path":"/ci-cargo-home/registry/src/pinned/itoa-1.0.18/Cargo.toml",
+         "targets":[{"kind":["lib"],"src_path":"/ci-cargo-home/registry/src/pinned/itoa-1.0.18/src/lib.rs"}]}],
+         "resolve":{"nodes":[{"id":"root","dependencies":[package_id],"features":[]},
+                                    {"id":package_id,"dependencies":[],"features":[]}]}});
+    let session=vm::Session::prepare(&root,&target)?;
+    let producer_source=session.dependency_source(&metadata,&lock,&binding,&target).await?;
+    let producer=uuid::Uuid::new_v4().to_string();
+    let mut action=serde_json::json!({"kind":"produce","producer":producer,
+        "source_sha256":producer_source.source_sha256,"dependency_inputs_sha256":producer_source.dependency_inputs_sha256});
+    ensure!(session.producer_ack(&producer_source.source,&producer).is_err(),"unexecuted producer received an acknowledgement");
+    let timeout=std::time::Duration::from_secs(180);
+    let outcome=session.run_with_dependency("dependency",&producer_source.source,repo,&binding,None,&[],&[],&[],None,
+        &storage,&target,&audit,timeout,Some(&action)).await?;
+    ensure!(outcome.status=="seed_produced","producer disposition invalid");
+    ensure!(outcome.dependency_result.as_ref().context("producer receipt missing")?["cargo_exit_code"]==0,"isolated Cargo compilation failed");
+    action["kind"]="publish".into();action["ack"]=session.producer_ack(&producer_source.source,&producer)?;
+    let outcome=session.run_with_dependency("dependency",&producer_source.source,repo,&binding,None,&[],&[],&[],None,
+        &storage,&target,&audit,timeout,Some(&action)).await?;
+    let published=outcome.dependency_result.context("published seed receipt missing")?;
+    ensure!(published["units"]==1,"isolated producer did not publish exactly the external unit");
+    let install=serde_json::json!({"kind":"install","seed":published["seed"],"dependency_inputs_sha256":producer_source.dependency_inputs_sha256});
+    let build=r#"set -e
+cargo build --offline --locked --message-format=json > target/messages.json
+python3 -c 'import json; from pathlib import Path
+units=[json.loads(line) for line in Path("target/messages.json").read_text().splitlines()]
+compiled=[m["target"]["name"] for m in units if m["reason"]=="compiler-artifact" and not m["fresh"]]
+print(json.dumps(sorted(compiled)))'
+target/debug/seed-consumer
+"#;
+    let mut generations=Vec::new();
+    for _ in 0..2 {
+        let source=snapshot(repo,&binding,&target).await?;generations.push(source.generation().to_owned());
+        let first=session.run_with_dependency("repository",&source,repo,&binding,None,&[],&[],&[],Some(build),
+            &storage,&target,&audit,timeout,Some(&install)).await?;
+        ensure!(first.status=="passed" && first.stdout.trim()=="[\"seed-consumer\"]\n42",
+            "external unit recompiled or consumer failed: {} {}",first.stdout,first.stderr);
+        let again=session.run("repository",&source,repo,&binding,None,&[],&[],&[],Some(build),
+            &storage,&target,&audit,timeout).await?;
+        ensure!(again.status=="passed" && again.stdout.trim()=="[]\n42","compatible same-job units recompiled: {} {}",again.stdout,again.stderr);
+        let tamper=r#"python3 -c 'import errno,os; from pathlib import Path
+p=next(Path("target/debug/deps").glob("libitoa-*.rlib"))
+for operation in (lambda:p.write_bytes(b"corrupt"),lambda:p.unlink(),lambda:p.parent.rename(p.parent.with_name("moved"))):
+ try: operation()
+ except OSError as error: assert error.errno in (errno.EROFS,errno.EACCES,errno.EPERM),error
+ else: raise SystemExit("trusted artifact or ancestor was mutable")
+assert os.environ["CARGO_HOME"]=="/ci-cargo-home"
+try:list(Path("/build-cache").iterdir())
+except PermissionError:pass
+else:raise SystemExit("shared image visible")
+print("SEALED")'"#;
+        let tamper=session.run("repository",&source,repo,&binding,None,&[],&[],&[],Some(tamper),
+            &storage,&target,&audit,timeout).await?;
+        ensure!(tamper.status=="passed" && tamper.stdout.trim()=="SEALED","trusted seed confinement failed: {} {}",tamper.stdout,tamper.stderr);
+    }
+    ensure!(generations[0]!=generations[1],"source reconstruction reused generation");
+    let receipt=serde_json::json!({"version":1,"kind":"real_shared_ci_dependency_seed_replay","seed":published["seed"],
+        "adapter_authority":session.authority_sha256,"generations":generations,
+        "external_units_recompiled_across_generations":0,"same_job_compatible_units_recompiled":0,
+        "seed_corruption_denied":true,"full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
+    audit.record_controller(receipt.clone())?;audit.protected_health()?;
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+    Ok(())
+}
+
 /// Behavioral cache replay through the production adapter and actual managed
 /// image. This grants no workflow, review, publication or merge authority.
 #[tokio::test]

@@ -9,6 +9,14 @@ const BUILD_VM: &[u8] = include_bytes!("../../../scripts/codex-build-vm.py");
 const PROXY: &[u8] = include_bytes!("../../../scripts/build-dependency-proxy.py");
 const SUPERVISOR: &[u8] = include_bytes!("../../../scripts/provider-supervisor.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
+const DEPENDENCY_PROGRAMS:[(&str,&[u8]);6]=[
+    ("ci-dependency-seed.py",include_bytes!("../../../scripts/ci-dependency-seed.py")),
+    ("ci-dependency-artifacts.py",include_bytes!("../../../scripts/ci-dependency-artifacts.py")),
+    ("ci-dependency-workspace.py",include_bytes!("../../../scripts/ci-dependency-workspace.py")),
+    ("ci-dependency-store.py",include_bytes!("../../../scripts/ci-dependency-store.py")),
+    ("ci-dependency-driver.py",include_bytes!("../../../scripts/ci-dependency-driver.py")),
+    ("ci-dependency-guest.py",include_bytes!("../../../scripts/ci-dependency-guest.py")),
+];
 
 pub(super) struct Session {
     directory: Option<tempfile::TempDir>,
@@ -22,6 +30,13 @@ pub(super) struct Session {
 struct Completion {
     command: String,
     source: std::sync::Weak<()>,
+    quiescence_sha256:String,
+    producer:Option<String>,
+}
+pub(super) struct DependencySource {
+    pub source:verifier_checkout::OwnedCheckout,
+    pub source_sha256:String,
+    pub dependency_inputs_sha256:String,
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
@@ -52,6 +67,10 @@ pub(super) struct Outcome {
     freshness_hold: Option<serde_json::Value>,
     #[serde(default)]
     pub cache_reclaimed: Vec<String>,
+    #[serde(default)]
+    pub dependency_result: Option<serde_json::Value>,
+    #[serde(default)]
+    source_kind:Option<String>,
 }
 impl Outcome {
     // This envelope is emitted before a guest exists and may not carry source
@@ -118,7 +137,7 @@ impl Outcome {
         ensure!(
             matches!(
                 self.status.as_str(),
-                "planned" | "passed" | "failed" | "prerequisite_hold"
+                "planned" | "passed" | "failed" | "prerequisite_hold" | "seed_produced" | "seed_published"
             ),
             "{PREREQUISITE}: unknown VM disposition"
         );
@@ -139,7 +158,15 @@ impl Outcome {
                 && self.contract_sha256 == binding.contract_sha256,
             "{PREREQUISITE}: CI VM result has stale or mismatched source/contract binding"
         );
-        if self.status == "planned" || self.status == "passed" {
+        if operation=="dependency" {
+            let value=self.dependency_result.as_ref().context("shared CI prerequisite unavailable: dependency phase receipt missing")?;
+            ensure!(self.source_kind.as_deref()==Some("dependency_inputs") && self.exit_code==Some(0)
+                && self.plan.is_none() && value["version"]==1 && value["shipping_authority"]==false
+                && matches!((self.status.as_str(),value["kind"].as_str()),
+                    ("seed_produced",Some("produced"))|("seed_published",Some("published"))),
+                "{PREREQUISITE}: dependency phase cannot certify passing CI");
+        } else if self.status == "planned" || self.status == "passed" {
+            ensure!(self.source_kind.as_deref().is_none_or(|value|value=="git"),"{PREREQUISITE}: CI verdict has no Git source");
             ensure!(
                 self.exit_code == Some(0),
                 "{PREREQUISITE}: VM success lacks successful supervised exit"
@@ -200,6 +227,40 @@ impl Drop for Session {
     }
 }
 impl Session {
+    /// Data-only construction by controller-pinned code. No candidate program,
+    /// Cargo hook or compiler executes on the host.
+    pub(super) async fn dependency_source(&self,metadata:&serde_json::Value,lockfile:&str,
+        binding:&Binding,target:&Path)->Result<DependencySource> {
+        let input=serde_json::to_vec(&serde_json::json!({"metadata":metadata,"lockfile":lockfile}))?;
+        ensure!(input.len()<=16*1024*1024,"{PREREQUISITE}: oversized dependency declarations");
+        let key=digest(&input);
+        let source=verifier_checkout::allocate(target.parent().context("CI target parent missing")?,
+            &binding.verification_head,&format!("dependency:{}:{key}",binding.contract_sha256))?;
+        let bundle=self.directory.as_ref().context("CI session bundle missing")?.path();
+        let spec=bundle.join(format!("dependency-inputs-{}.json",uuid::Uuid::new_v4()));
+        private_write(&spec,&input)?;
+        let program=r#"import hashlib,importlib.util,json,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('workspace',Path(sys.argv[1])/'ci-dependency-workspace.py')
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+data=json.loads(Path(sys.argv[2]).read_bytes())
+files=module.source_files(data['metadata'],data['lockfile'])
+identity=module.write_source(Path(sys.argv[3]),files)
+print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sha256(files['seed-inputs.json']).hexdigest()}))
+"#;
+        let result=Command::new("/usr/bin/python3").args(["-I","-c",program]).arg(bundle).arg(&spec).arg(source.path())
+            .env_clear().env("PATH","/usr/bin:/bin").stdin(Stdio::null()).kill_on_drop(true).output().await?;
+        let _=std::fs::remove_file(spec);
+        ensure!(result.status.success(),"{PREREQUISITE}: dependency source construction failed");
+        let value:serde_json::Value=serde_json::from_slice(&result.stdout)?;
+        let hash=|key:&str|->Result<String> {
+            let value=value[key].as_str().context("dependency source identity missing")?;
+            ensure!(value.len()==64 && value.bytes().all(|c|c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),"invalid dependency source identity");
+            Ok(value.to_owned())
+        };
+        Ok(DependencySource {source,source_sha256:hash("source_sha256")?,dependency_inputs_sha256:hash("dependency_inputs_sha256")?})
+    }
+
     fn cache_state(&self,generation:&str)->Result<(Option<String>,BTreeSet<String>)> {
         let mut completed=self.completed_generations.lock()
             .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
@@ -265,14 +326,21 @@ impl Session {
         ] {
             private_write(&directory.path().join(name), bytes)?;
         }
+        for (name,bytes) in DEPENDENCY_PROGRAMS {private_write(&directory.path().join(name),bytes)?;}
         for name in ["state", "scratch"] {
             private_directory(&directory.path().join(name))?;
         }
         let cache_root = target.join("ci-vm");
         private_directory(&cache_root)?;
+        let mut executable=std::fs::File::open(if cfg!(target_os="linux") {PathBuf::from("/proc/self/exe")} else {std::env::current_exe()?})?;
+        let mut executable_digest=Sha256::new();let mut buffer=[0_u8;65536];
+        loop {let read=executable.read(&mut buffer)?;if read==0 {break;}executable_digest.update(&buffer[..read]);}
+        let executable_sha256=format!("{:x}",executable_digest.finalize());
+        let dependency_programs:std::collections::BTreeMap<_,_>=DEPENDENCY_PROGRAMS.iter().map(|(name,bytes)|(*name,digest(bytes))).collect();
         let authority_sha256 = digest(&serde_json::to_vec(&serde_json::json!({
             "runtime":digest(&runtime),"adapter":digest(ADAPTER),"build_vm":digest(BUILD_VM),"proxy":digest(PROXY),
-            "supervisor":digest(SUPERVISOR),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes}))?);
+            "supervisor":digest(SUPERVISOR),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes,
+            "controller_executable_sha256":executable_sha256,"dependency_programs":dependency_programs}))?);
         Ok(Self {
             directory: Some(directory),
             memory_mb,
@@ -300,6 +368,16 @@ impl Session {
         audit: &Arc<augmentagent_channel_core::AuditLogger>,
         deadline: std::time::Duration,
     ) -> Result<Outcome> {
+        self.run_with_dependency(operation,source,root,binding,check,changed,packages,filters,owner_command,
+            storage,target,audit,deadline,None).await
+    }
+
+    pub(super) async fn run_with_dependency(
+        &self,operation:&str,source:&verifier_checkout::OwnedCheckout,root:&Path,binding:&Binding,
+        check:Option<&Check>,changed:&[String],packages:&[String],filters:&[String],owner_command:Option<&str>,
+        storage:&crate::build_storage::Lease,target:&Path,audit:&Arc<augmentagent_channel_core::AuditLogger>,
+        deadline:std::time::Duration,dependency:Option<&serde_json::Value>,
+    )->Result<Outcome> {
         // One image cannot be mounted by concurrent guests. Reconcile even
         // when this caller still owns the outer storage lease: an earlier
         // canceled command may have left a durable unknown teardown hold.
@@ -337,6 +415,7 @@ impl Session {
             "runner":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.py"),"contract":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.json"),
             "head":binding.verification_head,"base":binding.base,"id":check.map(|value|&value.id),"changed_files":changed,
             "packages":packages,"filters":filters,"command":owner_command,
+            "dependency":dependency,
             "scratch":self.directory.as_ref().expect("owned CI session").path().join("scratch"),
             "build_cache":if operation=="plan" {None} else {Some(&self.cache)},
             "cache_bytes":if operation=="plan" {None} else {Some(self.cache_bytes)},
@@ -397,9 +476,12 @@ impl Session {
         resources.record_outcome("shared_ci_vm", Some(audit))?;
         let quiescence=resources.verified_quiescence()
             .context("shared CI prerequisite unavailable: command teardown not verified")?;
-        audit.record_controller(serde_json::json!({"kind":"shared_ci_vm_quiescent", "operation":operation,
+        let quiescence_receipt=serde_json::json!({"kind":"shared_ci_vm_quiescent", "operation":operation,
             "binding":binding,"controller_authority_sha256":self.authority_sha256,
-            "proof":quiescence.evidence(),"shipping_authority":false}))?;
+            "command":command_id,"generation":generation,
+            "proof":quiescence.evidence(),"shipping_authority":false});
+        audit.record_controller(quiescence_receipt.clone())?;
+        let quiescence_sha256=digest(&serde_json::to_vec(&quiescence_receipt)?);
         // Keep the exact scope evidence and storage hold through settlement.
         hold.settle().context("shared CI prerequisite unavailable: storage cleanup settlement unavailable")?;
         let output = output.unwrap()?;
@@ -425,17 +507,30 @@ impl Session {
                 "evidence_sha256":digest(&serde_json::to_vec(&outcome.cache_reclaimed)?)})).into());
         }
         ensure!(
-            output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned"),
+            output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
-        if operation != "plan" && outcome.status == "passed" {
+        if operation != "plan" && matches!(outcome.status.as_str(),"passed"|"seed_produced"|"seed_published") {
             // Published only after kernel quiescence, storage settlement and
             // receipt validation. A dropped/failed invocation cannot mint it.
             self.completed_generations.lock()
                 .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
-                .insert(generation, Completion {command:command_id,source:source_lifetime});
+                .insert(generation, Completion {command:command_id,source:source_lifetime,quiescence_sha256,
+                    producer:outcome.dependency_result.as_ref().filter(|value|value["kind"]=="produced")
+                        .and_then(|value|value["producer"].as_str()).map(str::to_owned)});
         }
         Ok(outcome)
+    }
+
+    pub(super) fn producer_ack(&self,source:&verifier_checkout::OwnedCheckout,producer:&str)->Result<serde_json::Value> {
+        let completed=self.completed_generations.lock().map_err(|_|anyhow::anyhow!("CI completion store poisoned"))?;
+        let record=completed.get(source.generation()).context("shared CI prerequisite unavailable: producer completion missing")?;
+        ensure!(record.source.strong_count()>0 && record.producer.as_deref()==Some(producer),
+            "{PREREQUISITE}: producer has no matching live source acknowledgement");
+        let meta=std::fs::metadata(&self.cache)?;
+        let identity=digest(&serde_json::to_vec(&(meta.dev(),meta.ino(),meta.len()))?);
+        Ok(serde_json::json!({"command":record.command,"authority_sha256":self.authority_sha256,
+            "cache_identity_sha256":identity,"quiescence_sha256":record.quiescence_sha256}))
     }
 }
 
@@ -476,8 +571,8 @@ mod tests {
         let first_id=first.generation().to_owned();let second_id=second.generation().to_owned();
         let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:directory.path().join("unused"),
             authority_sha256:String::new(),completed_generations:Default::default(),execution:Default::default()};
-        session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime()});
-        session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime()});
+        session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime(),quiescence_sha256:"a".repeat(64),producer:None});
+        session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime(),quiescence_sha256:"b".repeat(64),producer:None});
         assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([first_id.clone(),second_id.clone()])));
         drop(first);
         assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([second_id.clone()])));
@@ -546,5 +641,23 @@ mod tests {
                 .is_err());
         }
         assert!(receipt.validate(&binding, "plan").is_err());
+    }
+
+    #[test]
+    fn dependency_receipt_cannot_certify_application_ci() {
+        let binding=super::super::tests::binding_fixture();
+        for (status,kind) in [("seed_produced","produced"),("seed_published","published")] {
+            let data=serde_json::json!({"version":1,"boundary":"existing-build-vm","status":status,
+                "head":"head","base":"base","contract_sha256":"contract","exit_code":0,
+                "source_kind":"dependency_inputs","dependency_result":{"version":1,"kind":kind,"shipping_authority":false}});
+            let receipt:Outcome=serde_json::from_value(data.clone()).unwrap();
+            receipt.validate(&binding,"dependency").unwrap();
+            assert!(receipt.validate(&binding,"step").is_err());
+            let mut forged=data;
+            forged["status"]=serde_json::json!("passed");
+            let receipt:Outcome=serde_json::from_value(forged).unwrap();
+            assert!(receipt.validate(&binding,"dependency").is_err());
+            assert!(receipt.validate(&binding,"step").is_err());
+        }
     }
 }

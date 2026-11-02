@@ -266,6 +266,43 @@ def _write_record(path, value):
             pass
 
 
+def seed_layout(generation, binding):
+    """Only a privileged, binding-specific installation may seal job roots."""
+    path = Path(generation) / "dependency-layout.json"
+    if not path.exists() and not path.is_symlink():
+        return None
+    value = _read_record(path)
+    if (set(value) != {"version", "binding", "seed", "state"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or value["binding"] != binding or not _digest(value["seed"])
+            or value["state"] not in ("installing", "ready")):
+        raise FreshnessHold("artifact_provenance_unknown")
+    return value
+
+
+def begin_seed_install(target, binding, seed):
+    target = Path(target)
+    validate_binding(binding)
+    if target.name != "target" or target.resolve() != target or not _digest(seed):
+        raise FreshnessHold("invalidation_unsafe")
+    control = _read_record(target.parent / "control.json")
+    if control.get("binding") != binding:
+        raise FreshnessHold("generation_mismatch")
+    prior = seed_layout(target.parent, binding)
+    if prior is not None and prior["seed"] != seed:
+        raise FreshnessHold("artifact_provenance_unknown")
+    _write_record(target.parent / "dependency-layout.json",
+                  {"version": 1, "binding": binding, "seed": seed, "state": "installing"})
+
+
+def finish_seed_install(target, binding, seed):
+    target = Path(target)
+    prior = seed_layout(target.parent, binding)
+    if prior is None or prior["seed"] != seed or prior["state"] != "installing":
+        raise FreshnessHold("artifact_provenance_unknown")
+    _write_record(target.parent / "dependency-layout.json", prior | {"state": "ready"})
+
+
 def prepare(cache, binding, command, worker_uid, worker_gid, *, predecessor=None):
     """Allocate a fresh target or resume after a controller-acknowledged exit.
 
@@ -313,9 +350,15 @@ def prepare(cache, binding, command, worker_uid, worker_gid, *, predecessor=None
             raise FreshnessHold("generation_mismatch")
         if not _uuid(prior["active_command"]) or predecessor != prior["active_command"] or command == predecessor:
             raise FreshnessHold("cleanup_uncertain")
+        layout = seed_layout(generation, binding)
+        if layout is not None and layout["state"] != "ready":
+            raise FreshnessHold("artifact_provenance_unknown")
         info = target.lstat()
+        owner = os.geteuid() if layout else worker_uid
+        group = os.getegid() if layout else worker_gid
+        mode = 0o1777 if layout else 0o700
         if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != worker_uid or info.st_gid != worker_gid or info.st_mode & 0o077):
+                or info.st_uid != owner or info.st_gid != group or stat.S_IMODE(info.st_mode) != mode):
             raise FreshnessHold("invalidation_unsafe")
     _write_record(record, {"version": FORMAT_VERSION, "binding": binding, "active_command": command})
     return target
@@ -448,10 +491,17 @@ def reclaim(cache, protected_generations, worker_uid, worker_gid, *, limit=2):
             if original["binding"]["generation"] != generation.name or (receipt is not None and receipt["original"] != original):
                 raise FreshnessHold("generation_mismatch")
             children = {child.name for child in generation.iterdir()}
-            if children - {"control.json", "target", "cargo-home", "outputs"}:
+            layout = seed_layout(generation, original["binding"])
+            if children - {"control.json", "target", "cargo-home", "outputs", "dependency-layout.json", "cargo-home-seeded.json"}:
                 raise FreshnessHold("invalidation_unsafe")
-            for name in children - {"control.json"}:
+            if "cargo-home-seeded.json" in children and _read_record(generation / "cargo-home-seeded.json") != {"version":1,"kind":"ci-downloads-seeded"}:
+                raise FreshnessHold("metadata_torn")
+            for name in children - {"control.json", "dependency-layout.json", "cargo-home-seeded.json"}:
                 info = (generation / name).lstat()
+                if layout and name in ("target", "cargo-home") and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o1777:
+                    if info.st_dev != generation.stat().st_dev or info.st_gid != os.getegid():
+                        raise FreshnessHold("invalidation_unsafe")
+                    continue
                 owner = os.geteuid() if name == "outputs" else worker_uid
                 if (not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or info.st_mode & 0o022
                         or info.st_dev != generation.stat().st_dev

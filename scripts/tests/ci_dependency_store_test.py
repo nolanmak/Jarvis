@@ -59,6 +59,20 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(manifest['producer']['quiescence_sha256'],'1'*64)
             self.assertFalse(manifest['shipping_authority'])
             self.assertEqual(manifest['units'][0]['unit_identity_status'],'sealed_producer_fingerprint')
+            self.assertFalse(target.exists())
+            self.assertFalse(home.exists())
+            self.assertTrue((target.parent/'published.json').is_file())
+
+    def test_interrupted_published_payload_cleanup_replays_original_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,producer,command,target,home,ack=self.fixture(root)
+            with patch.object(store.shutil,'rmtree',side_effect=OSError('interrupted cleanup')):
+                with self.assertRaises(store.FreshnessHold):store.publish(root,producer,ack)
+            receipt=store._document(target.parent/'published.json')
+            seed=store.publish(root,producer,ack)
+            self.assertEqual(seed,receipt['seed'])
+            self.assertFalse(target.exists());self.assertFalse(home.exists())
+            self.assertEqual(store.read_seed(root,seed,binding)['producer']['command'],command)
 
     def test_candidate_artifacts_cannot_promote_themselves_by_supplying_matching_hashes(self):
         with tempfile.TemporaryDirectory() as directory:

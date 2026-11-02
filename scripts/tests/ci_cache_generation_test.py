@@ -80,6 +80,31 @@ class GenerationTests(unittest.TestCase):
                 "contract_sha256": "c" * 64, "authority_sha256": "d" * 64,
                 "cache_identity_sha256": "e" * 64, "source_inputs_sha256": "f" * 64}
 
+    def test_seed_install_requires_a_complete_original_binding_before_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding=self.binding();command=str(uuid.uuid4())
+            target=self.prepare(root,binding,command)
+            cache.begin_seed_install(target,binding,'1'*64)
+            with self.assertRaises(cache.FreshnessHold):
+                self.prepare(root,binding,str(uuid.uuid4()),predecessor=command)
+            target.chmod(0o1777)
+            cache.finish_seed_install(target,binding,'1'*64)
+            resumed=self.prepare(root,binding,str(uuid.uuid4()),predecessor=command)
+            self.assertEqual(resumed,target)
+            with self.assertRaises(cache.FreshnessHold):
+                cache.begin_seed_install(target,binding,'2'*64)
+            self.assertEqual(cache.reclaim(root,[],os.getuid(),os.getgid()),[binding['generation']])
+
+    def test_interrupted_seed_install_is_reclaimed_without_reusing_partial_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding=self.binding();command=str(uuid.uuid4())
+            target=self.prepare(root,binding,command)
+            cache.begin_seed_install(target,binding,'1'*64)
+            target.chmod(0o1777)
+            with self.assertRaises(cache.FreshnessHold):
+                self.prepare(root,binding,str(uuid.uuid4()),predecessor=command)
+            self.assertEqual(cache.reclaim(root,[],os.getuid(),os.getgid()),[binding['generation']])
+
     def test_declared_generated_outputs_have_separate_writable_roots_in_one_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
