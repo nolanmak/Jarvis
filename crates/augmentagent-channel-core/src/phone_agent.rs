@@ -4,7 +4,7 @@ use crate::{
     providers::ProviderKind,
     reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts},
     surface_turn::{
-        run_surface_turn_waiting, run_surface_turn_with_history, QueueWait, SurfaceTurnOutcome,
+        run_surface_turn_waiting, QueueWait, SurfaceTurnOutcome,
         SurfaceTurnRequest,
     },
 };
@@ -28,6 +28,7 @@ use std::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// A native phone turn still waiting for the shared conversation queue
 /// after this long hears [`QUEUE_NOTICE`] (#1548)...
@@ -83,6 +84,7 @@ impl PhoneAgent {
             selection: selection.clone(),
             history: Arc::new(HistoryCache::default()),
             inflight: dispatch_inflight(),
+            attention: None,
         });
         let bridge = Self {
             store,
@@ -108,6 +110,11 @@ impl PhoneAgent {
     /// Tool-free model for post-call memory and spoken results. Tests inject a scripted one.
     pub fn with_summary_reasoner(mut self, reasoner: Arc<dyn Reasoner>) -> Self {
         self.summary_reasoner = reasoner;
+        self
+    }
+    /// Install the read-only attention data adapter for Live dispatch.
+    pub fn with_attention_provider(mut self, provider: Arc<dyn crate::phone_attention::AttentionProvider>) -> Self {
+        Arc::make_mut(&mut self.dispatch).attention=Some(provider);
         self
     }
     /// Whether utterances go to the fast conversational layer (#1546).
@@ -292,6 +299,7 @@ struct FastBridge {
     selection: Selection,
     history: Arc<HistoryCache>,
     inflight: Arc<Mutex<HashSet<(String, String)>>>,
+    attention: Option<Arc<dyn crate::phone_attention::AttentionProvider>>,
 }
 type DispatchInflight = Arc<Mutex<HashSet<(String, String)>>>;
 fn dispatch_inflight() -> DispatchInflight {
@@ -417,7 +425,26 @@ impl FastBridge {
             }
             return Ok(());
         }
-        let result = if job.state == "ready" {
+        let attention_request=crate::phone_attention::routine_request(&job.description);
+        let result = if job.state=="queued" && self.attention.is_some() && attention_request.is_some()
+            && self.store.phone_voice_backend(&call.id)?=="openai_live" {
+            // Validate the same selected native route/authority before using
+            // any owner data. This read never queues another reasoning turn.
+            native_selection(&self.store,&self.selection,&origin.conversation)?;
+            if !self.store.phone_start_dispatch(&call.id,task_id)? {return Ok(());}
+            let started=tokio::time::Instant::now();
+            let checked=tokio::time::timeout(Duration::from_secs(6),self.attention.as_ref().unwrap().check(&origin).instrument(tracing::info_span!("phone_attention",call_id=%call.id,task_id))).await;
+            self.service.authorize_call_origin(call)?;
+            let answer=match checked {
+                Ok(Ok(Some(answer))) if !answer.trim().is_empty() && answer.len()<=8_000=>answer,
+                Ok(Ok(None))=>"No attention sources are configured for this conversation, so I haven't checked your calendar or inbox.".into(),
+                _=>"I couldn't finish checking your attention sources. I can't confirm whether anything important is missing; we can keep talking.".into(),
+            };
+            tracing::info!(call_id=%call.id,task_id,source_ms=started.elapsed().as_millis() as u64,"phone attention facts ready without native queue wait");
+            let result=format!("Phone task — Jarvis: {answer}");
+            self.store.phone_finish_attention_dispatch(&call.id,task_id,attention_request.as_deref().unwrap(),&result)?;
+            result
+        } else if job.state == "ready" {
             job.result
                 .ok_or_else(|| anyhow::anyhow!("missing phone task result"))?
         } else {
@@ -457,12 +484,14 @@ impl FastBridge {
         let current = format!("[Dispatched by voice from a live phone call. Do this work, then reply here with the result.]\n\n{description}");
         let ctx = self.io.audit_context(origin, task_id);
         let cwd = self.cwd.to_string_lossy();
+        let queue_notice=||{};
+        let queue_entered=|waited:Duration|tracing::info!(call_id=%call.id,task_id,queue_ms=waited.as_millis() as u64,"phone native conversation queue entered");
         let outcome = augmentagent_phone::context::scope(
             origin.clone(),
             None,
             optional_progress(
                 events.cloned(),
-                run_surface_turn_with_history(
+                run_surface_turn_waiting(
                     &self.store,
                     SurfaceTurnRequest {
                         turn: &turn,
@@ -486,16 +515,19 @@ impl FastBridge {
                             .is_some_and(|c| {
                                 c.conversation_id() == origin.conversation.conversation_id()
                             });
-                        augmentagent_approval_discord::interaction::owner_history(
+                        let native_started=tokio::time::Instant::now();
+                        let result=augmentagent_approval_discord::interaction::owner_history(
                             private,
-                            native_phone_turn(self.agent.answer(&ctx, &prompt)),
-                        )
-                        .await
+                            crate::phone_timing::scope(&call.id,task_id,native_phone_turn(self.agent.answer(&ctx, &prompt))),
+                        ).await;
+                        tracing::info!(call_id=%call.id,task_id,native_ms=native_started.elapsed().as_millis() as u64,success=result.is_ok(),"phone native task finished");
+                        result
                     },
                     || async {
                         self.service.authorize_call_origin(call)?;
                         self.io.history(origin).await
                     },
+                    Some(QueueWait{notice_after:QUEUE_NOTICE_AFTER,repeat:QUEUE_NOTICE_EVERY,notice:&queue_notice,entered:&queue_entered}),
                 ),
             ),
         )

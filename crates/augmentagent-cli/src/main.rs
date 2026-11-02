@@ -13,6 +13,7 @@ mod composio_auth_tool;
 mod calendar_rsvp;
 mod voice_tool;
 mod phone_runtime;
+mod phone_attention;
 mod phone_metrics;
 mod local_phone_transport;
 mod local_phone;
@@ -3254,6 +3255,7 @@ async fn main() -> Result<()> {
                     strays: *strays,
                     yes: *yes,
                     keep: deploy_snapshot::keep_from_env(),
+                    budget_bytes: None,
                 },
                 *json,
                 &mut out,

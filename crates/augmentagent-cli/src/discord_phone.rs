@@ -628,7 +628,7 @@ pub fn install(
             )
             .selected(Some(chat.conversation_id()))
         }),
-    ));
+    ).with_attention_provider(Arc::new(crate::phone_attention::PhoneAttention::new(store.clone()))));
     let transport = Arc::new(phone_delivery::DiscordTransport::new(
         connection.http,
         connection.bot_user_id,

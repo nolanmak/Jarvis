@@ -1371,6 +1371,7 @@ impl ClaudeCliReasoner {
         })?;
 
         process_group.admit_model("claude",launch_audit.as_ref()).await?;
+        crate::phone_timing::spawned("claude");
 
         if let Some(mut stdin) = child.stdin.take() {
             // #1626 — from the first byte on, the CLI may have the turn.
@@ -1596,6 +1597,7 @@ pub(crate) fn audit_stream_line(
     notifier: Option<&Arc<dyn AuditNotifier>>,
 ) {
     for ev in parse_stream_event(line) {
+        crate::phone_timing::claude_event(&ev);
         match ev {
             ToolEvent::Use { id, name, input } => {
                 let intent = logger.filter(|logger| logger.is_protected()).and_then(|logger|
