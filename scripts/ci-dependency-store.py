@@ -46,6 +46,33 @@ def _binding(value):
         raise FreshnessHold('artifact_provenance_unknown')
 
 
+def _index_path(directory,binding):
+    _binding(binding)
+    namespace=_root(directory)/'ci-dependency-index';cache._directory(namespace,0o700,create=True)
+    key={name:binding[name] for name in ('authority_sha256','cache_identity_sha256','contract_sha256','dependency_inputs_sha256')}
+    return namespace/(_digest(key)+'.json')
+
+
+def index_seed(directory,identity,binding):
+    read_seed(directory,identity,binding)
+    path=_index_path(directory,binding)
+    # Preserve replaced metadata, including unknown/torn prior index entries.
+    if path.exists() or path.is_symlink():
+        retired=path.parent/'superseded';cache._directory(retired,0o700,create=True)
+        os.rename(path,retired/(path.stem+'-'+__import__('uuid').uuid4().hex+'.json'))
+    cache._write_record(path,{'version':1,'seed':identity})
+
+
+def lookup_seed(directory,binding):
+    path=_index_path(directory,binding)
+    if not path.exists() and not path.is_symlink():return None
+    value=_document(path)
+    if set(value)!={'version','seed'} or type(value['version']) is not int or value['version']!=1:
+        raise FreshnessHold('metadata_torn')
+    read_seed(directory,value['seed'],binding)
+    return value['seed']
+
+
 def _document(path):
     try:
         fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC)
@@ -404,6 +431,15 @@ def install(directory,identity,binding,target,home):
         if destination.resolve()!=destination:raise FreshnessHold('invalidation_unsafe')
         if destination.exists() and (destination.stat().st_uid!=os.geteuid() or _file_info(destination)!=expected):
             raise FreshnessHold('artifact_provenance_unknown')
+    # Empty or partially successful producers still need one coherent layout.
+    # Never let a ready installation receipt describe worker-owned roots.
+    image=_root(directory)
+    for root in roots.values():
+        if (not root.is_absolute() or root.resolve()!=root or not root.is_relative_to(image)
+                or root==image or not root.is_dir() or root.stat().st_dev!=image.stat().st_dev):
+            raise FreshnessHold('invalidation_unsafe')
+    for root in roots.values():
+        os.chown(root,os.geteuid(),os.getegid());os.chmod(root,0o1777)
     for name,expected in manifest['files'].items():
         relative=_relative(name);root=roots[relative.parts[0]]
         chain=[root]

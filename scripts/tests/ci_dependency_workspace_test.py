@@ -5,13 +5,34 @@ import tempfile
 from pathlib import Path
 import tomllib
 import unittest
+import subprocess
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('seed_workspace',ROOT/'scripts/ci-dependency-workspace.py')
 workspace=importlib.util.module_from_spec(spec);spec.loader.exec_module(workspace)
+driver_spec=importlib.util.spec_from_file_location('seed_driver',ROOT/'scripts/ci-dependency-driver.py')
+driver=importlib.util.module_from_spec(driver_spec);driver_spec.loader.exec_module(driver)
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_broken_source_manifest_reaches_required_ci_but_network_refusal_is_a_prerequisite(self):
+        with patch.object(driver.subprocess,'run',return_value=subprocess.CompletedProcess([],101,b'',b'error: failed to parse manifest at `/workspace/Cargo.toml`')):
+            self.assertEqual(driver.observe()['kind'],'source-resolution-failed')
+        for error in (b'failed to download registry inputs',b'failed to parse manifest at `/ci-cargo-home/registry/src/pkg/Cargo.toml`'):
+            with self.subTest(error=error),patch.object(driver.subprocess,'run',return_value=subprocess.CompletedProcess([],101,b'',error)),self.assertRaises(driver.workspace.InputsUnknown):
+                driver.observe()
+
+    def test_observation_emits_only_checked_declarations_from_the_read_only_guest(self):
+        metadata,lock=self.inputs();metadata['packages'][0]['metadata']={'private':'application content'}
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'Cargo.lock').write_text(lock)
+            with patch.object(driver.subprocess,'run',return_value=subprocess.CompletedProcess([],0,json.dumps(metadata).encode(),b'')) as call,patch.object(driver,'Path',side_effect=lambda name:root/name):
+                result=driver.observe()
+            self.assertEqual(call.call_args.args[0],['/toolchain/bin/cargo','metadata','--locked','--format-version','1'])
+            self.assertNotIn('private',json.dumps(result));self.assertFalse(result['shipping_authority'])
+            self.assertEqual(result['metadata']['resolve'],metadata['resolve'])
+
     def inputs(self):
         metadata={'version':1,'workspace_root':'/workspace','packages':[
             {'id':'root','name':'application','version':'0.1.0','source':None,'manifest_path':'/workspace/Cargo.toml',

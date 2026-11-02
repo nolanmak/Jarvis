@@ -14,6 +14,45 @@ store=importlib.util.module_from_spec(spec);spec.loader.exec_module(store)
 
 
 class StoreTests(unittest.TestCase):
+    def test_empty_seed_installation_still_has_consistent_sealed_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,_,_,_,_,_=self.fixture(root)
+            producer=str(uuid.uuid4());command=str(uuid.uuid4())
+            store.prepare_isolated_producer(root,binding,producer,command,os.getuid(),os.getgid())
+            metadata={'version':1,'workspace_root':'/workspace','packages':[
+                {'id':'root','name':'empty','source':None,'manifest_path':'/workspace/Cargo.toml'}],
+                'resolve':{'nodes':[{'id':'root','dependencies':[],'features':[]}]}}
+            store.record_isolated_output(root,producer,command,metadata,[])
+            ack={'command':command,'authority_sha256':binding['authority_sha256'],
+                 'cache_identity_sha256':binding['cache_identity_sha256'],'quiescence_sha256':'1'*64}
+            seed=store.publish(root,producer,ack)
+            target=root/'empty-target';home=root/'empty-home';target.mkdir();home.mkdir()
+            store.install(root,seed,binding,target,home)
+            self.assertEqual(target.stat().st_mode&0o1777,0o1777)
+            self.assertEqual(home.stat().st_mode&0o1777,0o1777)
+
+    def test_index_lookup_revalidates_seed_bytes_and_survives_a_changed_source_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,producer,command,target,home,ack=self.fixture(root)
+            self.assertIsNone(store.lookup_seed(root,binding))
+            seed=store.publish(root,producer,ack);store.index_seed(root,seed,binding)
+            self.assertEqual(store.lookup_seed(root,binding|{'source_head':'1'*40,'source_inputs_sha256':'2'*64}),seed)
+            self.assertIsNone(store.lookup_seed(root,binding|{'authority_sha256':'3'*64}))
+            artifact=root/'ci-trusted-dependencies'/seed/'files/target/debug/deps/libleaf-0123456789abcdef.rlib'
+            artifact.unlink()
+            with self.assertRaises(store.FreshnessHold):store.lookup_seed(root,binding)
+
+    def test_replacing_a_torn_index_preserves_old_metadata_and_requires_a_valid_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,producer,command,target,home,ack=self.fixture(root)
+            seed=store.publish(root,producer,ack);path=store._index_path(root,binding)
+            path.write_text('torn');path.chmod(0o600)
+            with self.assertRaises(store.FreshnessHold):store.lookup_seed(root,binding)
+            store.index_seed(root,seed,binding)
+            retired=list((path.parent/'superseded').iterdir())
+            self.assertEqual(len(retired),1);self.assertEqual(retired[0].read_text(),'torn')
+            self.assertEqual(store.lookup_seed(root,binding),seed)
+
     def fixture(self,root):
         binding={field:char*64 for field,char in [('authority_sha256','a'),('cache_identity_sha256','b'),
             ('contract_sha256','c'),('source_inputs_sha256','d'),('dependency_inputs_sha256','e')]}

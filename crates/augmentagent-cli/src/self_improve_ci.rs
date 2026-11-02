@@ -441,6 +441,7 @@ pub(super) async fn verify(
     // A version probe may itself execute candidate path-toolchain code. It ran
     // inside the VM and cannot be allowed to supply modified source to tests.
     drop(discovery_source);
+    let dependency_seed=vm.dependency_seed(root,&binding_before,&target,&storage,audit).await?;
     audit.record_controller(serde_json::json!({"kind":"shared_ci_plan", "binding":binding_before,
         "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
         "checks":plan.checks.iter().map(|check| serde_json::json!({"id":check.id,"status":check.status,"reason":check.reason})).collect::<Vec<_>>()}))?;
@@ -449,7 +450,8 @@ pub(super) async fn verify(
     let mut job_started = std::time::Instant::now();
     for check in plan.checks.iter().filter(|check| check.status == "ready") {
         let next_group = serde_json::to_string(&(&check.workflow, &check.job, &check.matrix))?;
-        if group.as_ref() != Some(&next_group) {
+        let new_group=group.as_ref()!=Some(&next_group);
+        if new_group {
             job_started = std::time::Instant::now();
             drop(source.take());
             source = Some(snapshot(root, &binding_before, &target).await?);
@@ -460,7 +462,7 @@ pub(super) async fn verify(
             .context("CI source snapshot unavailable")?;
         info!(check = %check.id, "verification gate: isolated shared CI check");
         let outcome = vm
-            .run(
+            .run_with_dependency(
                 "step",
                 source_root,
                 root,
@@ -474,6 +476,7 @@ pub(super) async fn verify(
                 &target,
                 audit,
                 check.remaining(job_started.elapsed())?,
+                if new_group {dependency_seed.as_ref()} else {None},
             )
             .await?;
         ensure!(
@@ -539,9 +542,10 @@ async fn iteration(
     let storage = crate::build_storage::admit_ci(root, &target).await?;
     let vm = vm::Session::prepare(root, &target)
         .context("shared CI prerequisite unavailable: prepare isolated iteration")?;
+    let dependency_seed=vm.dependency_seed(root,&before,&target,&storage,audit).await?;
     let source = snapshot(root, &before, &target).await?;
     let outcome = vm
-        .run(
+        .run_with_dependency(
             operation,
             &source,
             root,
@@ -555,6 +559,7 @@ async fn iteration(
             &target,
             audit,
             std::time::Duration::from_secs(github_job_timeout()),
+            dependency_seed.as_ref(),
         )
         .await?;
     ensure!(
@@ -610,9 +615,10 @@ pub(super) async fn repository(
     let storage = crate::build_storage::admit_ci(root, &target).await?;
     let vm = vm::Session::prepare(root, &target)
         .context("shared CI prerequisite unavailable: prepare owner repository gate")?;
+    let dependency_seed=vm.dependency_seed(root,&before,&target,&storage,audit).await?;
     let source = snapshot(root, &before, &target).await?;
     let outcome = vm
-        .run(
+        .run_with_dependency(
             "repository",
             &source,
             root,
@@ -626,6 +632,7 @@ pub(super) async fn repository(
             &target,
             audit,
             std::time::Duration::from_secs(github_job_timeout()),
+            dependency_seed.as_ref(),
         )
         .await?;
     ensure!(

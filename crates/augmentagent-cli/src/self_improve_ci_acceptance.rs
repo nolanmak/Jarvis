@@ -53,7 +53,15 @@ async fn live_shared_ci_dependency_seed_replay()->Result<()> {
         &storage,&target,&audit,timeout,Some(&action)).await?;
     let published=outcome.dependency_result.context("published seed receipt missing")?;
     ensure!(published["units"]==1,"isolated producer did not publish exactly the external unit");
-    let install=serde_json::json!({"kind":"install","seed":published["seed"],"dependency_inputs_sha256":producer_source.dependency_inputs_sha256});
+    let install=session.dependency_seed(repo,&binding,&target,&storage,&audit).await?
+        .context("ordinary verification did not select its dependency seed")?;
+    ensure!(install["seed"]==published["seed"],"automatic lookup did not reuse the protected seed");
+    let reopened=vm::Session::prepare(&root,&target)?;
+    ensure!(reopened.authority_sha256==session.authority_sha256,"equivalent controller restart changed trusted authority");
+    let restored=reopened.dependency_seed(repo,&binding,&target,&storage,&audit).await?
+        .context("controller restart lost the trusted dependency seed")?;
+    ensure!(restored==install,"restart selected a different seed");
+    drop(reopened);
     let build=r#"set -e
 cargo build --offline --locked --message-format=json > target/messages.json
 python3 -c 'import json; from pathlib import Path
@@ -91,7 +99,8 @@ print("SEALED")'"#;
     let receipt=serde_json::json!({"version":1,"kind":"real_shared_ci_dependency_seed_replay","seed":published["seed"],
         "adapter_authority":session.authority_sha256,"generations":generations,
         "external_units_recompiled_across_generations":0,"same_job_compatible_units_recompiled":0,
-        "seed_corruption_denied":true,"full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
+        "seed_corruption_denied":true,"automatic_seed_lookup":true,"equivalent_controller_restart_reuses_seed":true,
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     audit.record_controller(receipt.clone())?;audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
     Ok(())

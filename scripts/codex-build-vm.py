@@ -268,6 +268,9 @@ try:
         guest_stage='publish_dependencies'
         dependency_result=ci_dependency.publish(action,seed_binding)
         result={'exit_code':0,'stdout':'','stderr':''}
+    elif action and action['kind']=='lookup':
+        dependency_result=ci_dependency.lookup(action,seed_binding)
+        result={'exit_code':0,'stdout':'','stderr':''}
     else:
       if job.get('build_cache'):
         if job.get('ci_context'):
@@ -423,7 +426,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             raise Unavailable('invalid controller CI context')
         dependency=ci_context.get('dependency_action')
         if dependency is not None and not isinstance(dependency,dict):raise Unavailable('invalid dependency action')
-        auxiliary_dependency=dependency is not None and dependency.get('kind') in ('produce','publish')
+        auxiliary_dependency=dependency is not None and dependency.get('kind') in ('produce','publish','lookup')
         if 'dependency_programs' in ci_context:
             programs=ci_context.get('dependency_programs')
             expected={'ci-cache-generation.py','ci-dependency-seed.py','ci-dependency-artifacts.py','ci-dependency-workspace.py',

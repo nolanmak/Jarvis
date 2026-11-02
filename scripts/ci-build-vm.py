@@ -33,6 +33,10 @@ def dependency_action(request):
         fields.add('seed')
         if request['operation'] not in ('step','targeted','baseline','repository') or not cache_generation._digest(value.get('seed')):
             raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+    elif kind=='lookup':
+        fields.add('source_sha256')
+        if request['operation']!='dependency' or not cache_generation._digest(value.get('source_sha256')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
     else:raise cache_generation.FreshnessHold('artifact_provenance_unknown')
     if set(value)!=fields or not cache_generation._digest(value.get('dependency_inputs_sha256')):
         raise cache_generation.FreshnessHold('artifact_provenance_unknown')
@@ -267,13 +271,15 @@ def execute(request,run=vm.run,progress=None):
         observed=outcome.get('dependency_result')
         if (not isinstance(observed,dict) or observed.get('version')!=1 or observed.get('shipping_authority') is not False
                 or observed.get('dependency_inputs_sha256')!=dependency['dependency_inputs_sha256']
-                or observed.get('kind')!={'produce':'produced','publish':'published','install':'installed'}[dependency['kind']]):
+                or observed.get('kind')!={'produce':'produced','publish':'published','install':'installed','lookup':'lookup'}[dependency['kind']]):
             raise cache_generation.FreshnessHold('artifact_provenance_unknown')
         if dependency['kind'] in ('produce','publish') and observed.get('producer')!=dependency['producer']:
             raise cache_generation.FreshnessHold('artifact_provenance_unknown')
         if dependency['kind']=='produce' and observed.get('command')!=request['command_id']:
             raise cache_generation.FreshnessHold('cleanup_uncertain')
         if dependency['kind'] in ('publish','install') and not cache_generation._digest(observed.get('seed')):
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        if dependency['kind']=='lookup' and observed.get('seed') is not None and not cache_generation._digest(observed['seed']):
             raise cache_generation.FreshnessHold('artifact_provenance_unknown')
         result['dependency_result']=observed
     if outcome['exit_code']==0:
@@ -305,5 +311,5 @@ def main():
         # Local diagnostics deliberately omit raw paths, requests and exception text.
         result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','reason':'CI VM setup unavailable','category':type(error).__name__ if type(error).__name__ in ('Unavailable','OSError','PermissionError','FileNotFoundError','ValueError','KeyError','JSONDecodeError','CalledProcessError') else 'SetupError','stage':progress['stage'],'errno':error.errno if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4096 else None}
     print(json.dumps(result,sort_keys=True))
-    return 0 if result['status'] in ('passed','planned','seed_produced','seed_published') else 2
+    return 0 if result['status'] in ('passed','planned','seed_produced','seed_published','seed_lookup') else 2
 if __name__=='__main__':raise SystemExit(main())

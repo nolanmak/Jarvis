@@ -145,7 +145,7 @@ impl Outcome {
         ensure!(
             matches!(
                 self.status.as_str(),
-                "planned" | "passed" | "failed" | "prerequisite_hold" | "seed_produced" | "seed_published"
+                "planned" | "passed" | "failed" | "prerequisite_hold" | "seed_produced" | "seed_published" | "seed_lookup"
             ),
             "{PREREQUISITE}: unknown VM disposition"
         );
@@ -171,7 +171,7 @@ impl Outcome {
             ensure!(self.source_kind.as_deref()==Some("dependency_inputs") && self.exit_code==Some(0)
                 && self.plan.is_none() && value["version"]==1 && value["shipping_authority"]==false
                 && matches!((self.status.as_str(),value["kind"].as_str()),
-                    ("seed_produced",Some("produced"))|("seed_published",Some("published"))),
+                    ("seed_produced",Some("produced"))|("seed_published",Some("published"))|("seed_lookup",Some("lookup"))),
                 "{PREREQUISITE}: dependency phase cannot certify passing CI");
         } else if self.status == "planned" || self.status == "passed" {
             ensure!(self.source_kind.as_deref().is_none_or(|value|value=="git"),"{PREREQUISITE}: CI verdict has no Git source");
@@ -235,6 +235,64 @@ impl Drop for Session {
     }
 }
 impl Session {
+    pub(super) async fn dependency_seed(&self,root:&Path,binding:&Binding,target:&Path,
+        storage:&crate::build_storage::Lease,audit:&Arc<augmentagent_channel_core::AuditLogger>)
+        ->Result<Option<serde_json::Value>> {
+        let inputs=super::snapshot(root,binding,target).await?;
+        if !inputs.path().join("Cargo.toml").is_file() {return Ok(None);}
+        let timeout=std::time::Duration::from_secs(300);
+        let observed=self.run("repository",&inputs,root,binding,None,&[],&[],&[],
+            Some("/usr/bin/python3 -I /ci-tools/ci-dependency-driver.py observe"),storage,target,audit,timeout).await?;
+        let unknown=||crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,
+            "reason":"input_census_unknown","recovery":"revalidate_inputs",
+            "evidence_sha256":digest(b"isolated dependency declarations unavailable")}));
+        if observed.status!="passed" {return Err(unknown().into());}
+        let value:serde_json::Value=serde_json::from_str(&observed.stdout).map_err(|_|unknown())?;
+        if value["version"]==1 && value["kind"]=="source-resolution-failed" && value["shipping_authority"]==false {
+            audit.record_controller(serde_json::json!({"kind":"shared_ci_dependency_seed_source_resolution_failed",
+                "binding":binding,"next":"ordinary_required_check","shipping_authority":false}))?;
+            return Ok(None);
+        }
+        ensure!(value["version"]==1 && value["kind"]=="observed-inputs" && value["shipping_authority"]==false,
+            "{PREREQUISITE}: invalid dependency observation");
+        let lockfile=value["lockfile"].as_str().context("shared CI prerequisite unavailable: lock declarations missing")?;
+        let source=self.dependency_source(&value["metadata"],lockfile,binding,target).await?;
+        drop(inputs);
+        let policy:serde_json::Value=serde_json::from_slice(&std::fs::read(source.source.path().join("seed-inputs.json"))?)?;
+        if policy["packages"].as_object().is_some_and(|value|value.is_empty()) {return Ok(None);}
+        let lookup=serde_json::json!({"kind":"lookup","source_sha256":source.source_sha256,
+            "dependency_inputs_sha256":source.dependency_inputs_sha256});
+        let found=self.run_with_dependency("dependency",&source.source,root,binding,None,&[],&[],&[],None,
+            storage,target,audit,timeout,Some(&lookup)).await;
+        let mut seed=None;
+        match found {
+            Ok(found)=>seed=found.dependency_result.and_then(|value|value["seed"].as_str().map(str::to_owned)),
+            Err(error) if error.downcast_ref::<crate::autoship_freshness::Hold>().is_some_and(|hold|
+                matches!(hold.reason,crate::autoship_freshness::Reason::ArtifactProvenanceUnknown
+                    |crate::autoship_freshness::Reason::MetadataMissing|crate::autoship_freshness::Reason::MetadataTorn))=>{
+                audit.record_controller(serde_json::json!({"kind":"shared_ci_dependency_seed_reconstruct",
+                    "binding":binding,"dependency_inputs_sha256":source.dependency_inputs_sha256,
+                    "shipping_authority":false}))?;
+            },
+            Err(error)=>return Err(error),
+        }
+        if seed.is_none() {
+            let producer=uuid::Uuid::new_v4().to_string();
+            let mut action=serde_json::json!({"kind":"produce","producer":producer,
+                "source_sha256":source.source_sha256,"dependency_inputs_sha256":source.dependency_inputs_sha256});
+            self.run_with_dependency("dependency",&source.source,root,binding,None,&[],&[],&[],None,
+                storage,target,audit,std::time::Duration::from_secs(github_job_timeout()),Some(&action)).await?;
+            action["kind"]="publish".into();action["ack"]=self.producer_ack(&source.source,&producer)?;
+            let published=self.run_with_dependency("dependency",&source.source,root,binding,None,&[],&[],&[],None,
+                storage,target,audit,timeout,Some(&action)).await?;
+            seed=published.dependency_result.and_then(|value|value["seed"].as_str().map(str::to_owned));
+        }
+        let seed=seed.context("shared CI prerequisite unavailable: trusted dependency seed missing")?;
+        audit.record_controller(serde_json::json!({"kind":"shared_ci_dependency_seed_ready","binding":binding,
+            "seed":seed,"dependency_inputs_sha256":source.dependency_inputs_sha256,"shipping_authority":false}))?;
+        Ok(Some(serde_json::json!({"kind":"install","seed":seed,"dependency_inputs_sha256":source.dependency_inputs_sha256})))
+    }
+
     /// Data-only construction by controller-pinned code. No candidate program,
     /// Cargo hook or compiler executes on the host.
     pub(super) async fn dependency_source(&self,metadata:&serde_json::Value,lockfile:&str,
@@ -259,7 +317,11 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         let result=Command::new("/usr/bin/python3").args(["-I","-c",program]).arg(bundle).arg(&spec).arg(source.path())
             .env_clear().env("PATH","/usr/bin:/bin").stdin(Stdio::null()).kill_on_drop(true).output().await?;
         let _=std::fs::remove_file(spec);
-        ensure!(result.status.success(),"{PREREQUISITE}: dependency source construction failed");
+        if !result.status.success() {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,
+                "reason":"input_census_unknown","recovery":"revalidate_inputs",
+                "evidence_sha256":digest(b"dependency source construction refused unproven declarations")})).into());
+        }
         let value:serde_json::Value=serde_json::from_slice(&result.stdout)?;
         let hash=|key:&str|->Result<String> {
             let value=value[key].as_str().context("dependency source identity missing")?;
@@ -515,7 +577,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
                 "evidence_sha256":digest(&serde_json::to_vec(&outcome.cache_reclaimed)?)})).into());
         }
         ensure!(
-            output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published"),
+            output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published" | "seed_lookup"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
         if operation != "plan" && matches!(outcome.status.as_str(),"passed"|"seed_produced"|"seed_published") {

@@ -73,9 +73,17 @@ def publish(action,binding):
     if os.geteuid()!=0:raise FreshnessHold('invalidation_unsafe')
     identity=store.publish('/build-cache',action['producer'],action['ack'])
     manifest=store.read_seed('/build-cache',identity,binding)
+    store.index_seed('/build-cache',identity,binding)
     return {'version':1,'kind':'published','seed':identity,'producer':action['producer'],
             'units':len(manifest['units']),'dependency_inputs_sha256':binding['dependency_inputs_sha256'],
             'shipping_authority':False}
+
+
+def lookup(action,binding):
+    if os.geteuid()!=0:raise FreshnessHold('invalidation_unsafe')
+    identity=store.lookup_seed('/build-cache',binding)
+    return {'version':1,'kind':'lookup','seed':identity,
+            'dependency_inputs_sha256':binding['dependency_inputs_sha256'],'shipping_authority':False}
 
 
 def install(action,binding,target,home):

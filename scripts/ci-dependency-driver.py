@@ -8,12 +8,37 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 
 spec=importlib.util.spec_from_file_location('driver_workspace',Path(__file__).with_name('ci-dependency-workspace.py'))
 workspace=importlib.util.module_from_spec(spec);spec.loader.exec_module(workspace)
+
+
+def observe():
+    # This runs only in the existing VM against the immutable Git source.
+    # Emit declarations, never application bytes or executable configuration.
+    result=subprocess.run(['/toolchain/bin/cargo','metadata','--locked','--format-version','1'],
+        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    if result.returncode:
+        # A broken tracked manifest must reach the ordinary required check,
+        # which records actionable red. It cannot become an endless seed retry.
+        if len(result.stderr)<=1024*1024 and re.search(rb"failed to parse (?:manifest|lock file) at [`\"']?/workspace/",result.stderr):
+            return {'version':1,'kind':'source-resolution-failed','shipping_authority':False}
+        raise workspace.InputsUnknown()
+    if len(result.stdout)>16*1024*1024:raise workspace.InputsUnknown()
+    metadata=json.loads(result.stdout)
+    packages=[{key:package[key] for key in ('id','name','version','source','manifest_path')}
+              |{'targets':[{key:target[key] for key in ('kind','src_path')} for target in package['targets']]}
+              for package in metadata['packages']]
+    nodes=[{key:node[key] for key in ('id','dependencies','features')} for node in metadata['resolve']['nodes']]
+    trimmed={'version':metadata['version'],'workspace_root':metadata['workspace_root'],'packages':packages,'resolve':{'nodes':nodes}}
+    workspace.inputs.reusable_packages(trimmed)
+    lockfile=Path('Cargo.lock').read_text()
+    if len(lockfile.encode())>16*1024*1024:raise workspace.InputsUnknown()
+    return {'version':1,'kind':'observed-inputs','metadata':trimmed,'lockfile':lockfile,'shipping_authority':False}
 
 
 def resolve(identity,*,owner_uid=0):
@@ -54,10 +79,10 @@ def compile_units(identity,*,owner_uid=0):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['resolve','compile'])
-    parser.add_argument('--identity',required=True);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['observe','resolve','compile'])
+    parser.add_argument('--identity');args=parser.parse_args()
     try:
-        value=resolve(args.identity) if args.operation=='resolve' else compile_units(args.identity)
+        value=observe() if args.operation=='observe' else resolve(args.identity) if args.operation=='resolve' else compile_units(args.identity)
         print(json.dumps(value,sort_keys=True));return 0
     except (workspace.InputsUnknown,OSError,ValueError,KeyError):
         print('dependency input census unavailable',file=sys.stderr);return 2
