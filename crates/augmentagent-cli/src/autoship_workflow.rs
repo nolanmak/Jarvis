@@ -31,6 +31,7 @@ pub(crate) mod discord_controls;
 pub(crate) mod owner_control;
 #[path = "autoship_verification_retry.rs"]
 mod verification_retry;
+pub use verification_retry::VerificationDomain;
 #[path = "autoship_submission.rs"]
 pub(crate) mod submission;
 pub use merge_allowance::{MergeAllowance, MergeDispatchRecord, MergeReleaseProof, merge_request_not_executed};
