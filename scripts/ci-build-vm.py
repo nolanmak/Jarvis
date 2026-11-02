@@ -289,6 +289,12 @@ def execute(request,run=vm.run,progress=None):
                             'cache_program':CACHE_PROGRAM,'generation':generation,'worker_programs':WORKER_PROGRAMS,
                             'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency})
     progress['stage']='receipt_validate'
+    reclaimed_seeds=outcome.get('seed_reclaimed')
+    protected_seed=dependency.get('seed') if dependency and dependency.get('kind')=='install' else None
+    if (not isinstance(reclaimed_seeds,list) or len(reclaimed_seeds)>2
+            or any(not cache_generation._digest(value) or value==protected_seed for value in reclaimed_seeds)
+            or len(set(reclaimed_seeds))!=len(reclaimed_seeds)):
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
     reclaimed_producers=outcome.get('producer_reclaimed',[])
     if (not isinstance(reclaimed_producers,list) or len(reclaimed_producers)>2
             or any(not cache_generation._uuid(value) or value in producers for value in reclaimed_producers)
@@ -302,6 +308,7 @@ def execute(request,run=vm.run,progress=None):
             'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
             'cache_reclaimed':outcome.get('cache_reclaimed',[]),
             'producer_reclaimed':reclaimed_producers,
+            'seed_reclaimed':reclaimed_seeds,
             'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
     if request['operation'] not in ('plan','dependency'):
         try:observed_inputs=input_boundary.validate_observation(outcome.get('input_write_observation'),guest_workers,len(outputs))

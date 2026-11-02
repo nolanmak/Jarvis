@@ -39,7 +39,7 @@ class FreshnessUnavailable(Unavailable):
 
 def guest_diagnostic(value):
     value=value if isinstance(value,dict) else {}
-    stages={'load_dependency_controller','reclaim_producers','prepare_producer','bind_producer_cache','hide_producer_cache',
+    stages={'load_dependency_controller','reclaim_producers','reclaim_seeds','prepare_producer','bind_producer_cache','hide_producer_cache',
             'resolve_dependencies','freeze_resolution','compile_dependencies','record_producer',
             'publish_dependencies','prepare_generation','execute_command'}
     categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
@@ -278,6 +278,7 @@ def observe_phase(value):
 try:
     cache_reclaimed=[]
     producer_reclaimed=[]
+    seed_reclaimed=[]
     dependency_result=None
     cache_preparation=None
     action=job.get('ci_dependency')
@@ -285,6 +286,10 @@ try:
         guest_stage='reclaim_producers'
         producer_reclaimed=ci_dependency.store.reclaim_producers('/build-cache',job['ci_generation']['retained_producers'],
             cache_identity=job['ci_generation']['binding']['cache_identity_sha256'],eligible=job['ci_generation']['producer_retirements'])
+        guest_stage='reclaim_seeds'
+        seed_reclaimed=ci_dependency.store.reclaim_seeds('/build-cache',
+            cache_identity=job['ci_generation']['binding']['cache_identity_sha256'],
+            protected_seeds=[action['seed']] if action and action['kind']=='install' else [])
     if action:
         original=job['ci_generation']['binding']
         seed_binding={key:original[key] for key in ('authority_sha256','cache_identity_sha256','contract_sha256','source_inputs_sha256')}
@@ -331,6 +336,7 @@ try:
     if job.get('ci_context'):
         result['cache_reclaimed']=cache_reclaimed
         result['producer_reclaimed']=producer_reclaimed
+        result['seed_reclaimed']=seed_reclaimed
         result['guest_worker_quiescence']={'version':1,'kind':'ci-guest-command-quiescence',
             'worker_free':True,'scopes':guest_worker_receipts,'shipping_authority':False}
     if dependency_result is not None:result['dependency_result']=dependency_result
@@ -628,13 +634,20 @@ poweroff -f
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
-                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
+                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
                 if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
                 if ci_context is not None and 'cache_preparation' in result:expected.add('cache_preparation')
                 if ci_context is not None and 'input_write_observation' in result:expected.add('input_write_observation')
                 if set(result) != expected or type(result['exit_code']) is not int:
                     raise Unavailable('invalid VM result')
                 if ci_context is not None:
+                    seeds=result['seed_reclaimed']
+                    action=ci_context.get('dependency_action')
+                    protected_seed=action.get('seed') if action and action.get('kind')=='install' else None
+                    if (not isinstance(seeds,list) or len(seeds)>2
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{64}',value) is None
+                                or value==protected_seed for value in seeds) or len(set(seeds))!=len(seeds)):
+                        raise Unavailable('invalid CI seed cleanup receipt')
                     producer_reclaimed=result['producer_reclaimed']
                     protected=(ci_context.get('generation') or {}).get('retained_producers',[])
                     if (not isinstance(producer_reclaimed,list) or len(producer_reclaimed)>2

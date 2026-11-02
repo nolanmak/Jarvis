@@ -14,6 +14,86 @@ store=importlib.util.module_from_spec(spec);spec.loader.exec_module(store)
 
 
 class StoreTests(unittest.TestCase):
+    def released_seed(self, root):
+        binding,producer,command,target,home,ack=self.fixture(root)
+        seed=store.publish(root,producer,ack)
+        self.assertEqual(store.reclaim_producers(root,[],cache_identity=binding['cache_identity_sha256'],
+            eligible=[{'producer':producer,'ack':ack}]),[producer])
+        return binding,seed
+
+    def test_orphan_seed_reclamation_preserves_index_producer_and_generation_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,producer,command,target,home,ack=self.fixture(root)
+            old=store.publish(root,producer,ack)
+            self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[])
+            store.reclaim_producers(root,[],cache_identity=binding['cache_identity_sha256'],
+                eligible=[{'producer':producer,'ack':ack}])
+            store.index_seed(root,old,binding)
+            self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[])
+            generation={key:binding[key] for key in ('authority_sha256','cache_identity_sha256','contract_sha256','source_inputs_sha256')}
+            generation.update(generation=str(uuid.uuid4()),head=binding['source_head'],tree='1'*40)
+            target=store.cache.prepare(root,generation,str(uuid.uuid4()),os.getuid(),os.getgid())
+            home=target.parent/'cargo-home';home.mkdir(mode=0o700)
+            store.cache.begin_seed_install(target,generation,old)
+            store.install(root,old,binding,target,home)
+            store.cache.finish_seed_install(target,generation,old)
+            _,new=self.released_seed(root);store.index_seed(root,new,binding)
+            self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[])
+            self.assertEqual(store.cache.reclaim(root,[],os.getuid(),os.getgid()),[generation['generation']])
+            self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[old])
+            self.assertEqual(store.lookup_seed(root,binding),new)
+            self.assertFalse((root/'ci-trusted-dependencies'/old).exists())
+
+    def test_orphan_seed_reclamation_is_bounded_and_keeps_other_hard_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);released=[self.released_seed(root) for _ in range(3)]
+            binding,seed=released[0]
+            source=root/'ci-trusted-dependencies'/seed/'files/target/debug/deps/libleaf-0123456789abcdef.rlib'
+            sentinel=root/'retained-artifact';os.link(source,sentinel)
+            before=sentinel.read_bytes();inode=sentinel.stat().st_ino
+            first=store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256'])
+            second=store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256'])
+            self.assertEqual(len(first),2);self.assertEqual(len(second),1)
+            self.assertEqual(set(first+second),{seed for _,seed in released})
+            self.assertEqual((sentinel.read_bytes(),sentinel.stat().st_ino),(before,inode))
+            self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[])
+
+    def test_orphan_seed_reclamation_replays_an_original_interrupted_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,seed=self.released_seed(root)
+            def interrupted(path):
+                artifact=Path(path)/'files/target/debug/deps/libleaf-0123456789abcdef.rlib'
+                artifact.unlink()
+                raise OSError('interrupted after first unlink')
+            with patch.object(store.shutil,'rmtree',side_effect=interrupted):
+                with self.assertRaises(store.FreshnessHold):
+                    store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256'])
+            self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[seed])
+            self.assertFalse((root/'ci-trusted-dependencies'/seed).exists())
+
+    def test_unknown_seed_contents_references_and_foreign_cache_are_preserved(self):
+        for case in ('extra-file','symlink','unknown-index','unknown-generation','unknown-producer','foreign-cache','missing-release','protected-install'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);binding,seed=self.released_seed(root)
+                path=root/'ci-trusted-dependencies'/seed
+                if case=='extra-file':(path/'unknown').write_bytes(b'preserve')
+                if case=='symlink':(path/'unknown').symlink_to(root/'outside')
+                if case=='unknown-index':
+                    namespace=root/'ci-dependency-index';namespace.mkdir(mode=0o700)
+                    (namespace/('0'*64+'.json')).write_bytes(b'torn')
+                if case=='unknown-generation':
+                    namespace=root/'ci-source-generations';namespace.mkdir(mode=0o711)
+                    (namespace/str(uuid.uuid4())).mkdir(mode=0o711)
+                if case=='unknown-producer':
+                    namespace=root/'ci-dependency-producers'
+                    (namespace/str(uuid.uuid4())).mkdir(mode=0o700)
+                if case=='missing-release':
+                    for receipt in (root/'ci-producer-retirements'/'completed').iterdir():receipt.unlink()
+                identity='0'*64 if case=='foreign-cache' else binding['cache_identity_sha256']
+                self.assertEqual(store.reclaim_seeds(root,cache_identity=identity,
+                    protected_seeds=[seed] if case=='protected-install' else []),[])
+                self.assertTrue(path.is_dir())
+
     def test_empty_seed_installation_still_has_consistent_sealed_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);binding,_,_,_,_,_=self.fixture(root)

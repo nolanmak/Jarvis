@@ -167,9 +167,23 @@ absent from the current session. Cleanup removes at most two eligible producers
 per command. It records original control/publication metadata and retirement
 authorization durably before deletion, and can resume a committed interrupted
 retirement under normal storage admission. The physical cache must still match.
-Published seeds and installed hard links remain intact. Unknown ownership is
-preserved; recovery of unreleased producers across process death and bounded
-trusted-seed retention remain unfinished.
+Published seeds and installed hard links remain intact during producer cleanup.
+Unknown ownership is preserved; recovery of unreleased producers across process
+death remains unfinished.
+
+Before workers start, the same admitted controller can reclaim at most two
+orphaned published seeds. It inventories all current indexes, allocated source
+generations and producer controls, and protects the current installation request.
+An absent producer alone is insufficient: reclamation requires its original
+completed retirement and matching publication/host acknowledgement. The existing
+storage lease remains held across seed lookup and consumption. Current indexed
+seeds and installed generations stay warm. Unknown references, extra files,
+symlinks, foreign cache identities and incomplete inventories retain the payload.
+An original manifest is committed before unlinking; interrupted deletion resumes
+only from that matching private intent. Host audit records the reclaimed seed
+identities after original VM quiescence. This bounds orphan cleanup per command;
+global retention across distinct current dependency indexes and bounded history
+retention remain unfinished. This is not recovery of the full legacy image.
 
 Shared CI runs each worker command through the existing descendant supervisor
 inside the guest. The controller retains its cleanup receipt under the guest's

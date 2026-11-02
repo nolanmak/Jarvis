@@ -585,6 +585,38 @@ print("SEALED")'"#;
     let after_retirement=session.dependency_seed(repo,&binding,&target,&storage,&audit).await?
         .context("producer retirement removed the independent published seed")?;
     ensure!(after_retirement==install,"producer retirement changed trusted seed lookup");
+    // Supersede one real published seed with another independently supervised
+    // producer. Ordinary admitted work must reclaim the released orphan while
+    // preserving the current index and any generation still using either seed.
+    let replacement=session.dependency_source(&metadata,&lock,&binding,&target).await?;
+    let replacement_id=uuid::Uuid::new_v4().to_string();
+    let mut replacement_action=serde_json::json!({"kind":"produce","producer":replacement_id,
+        "source_sha256":replacement.source_sha256,"dependency_inputs_sha256":replacement.dependency_inputs_sha256});
+    let produced=session.run_with_dependency("dependency",&replacement.source,repo,&binding,None,&[],&[],&[],None,
+        &storage,&target,&audit,timeout,Some(&replacement_action)).await?;
+    ensure!(produced.status=="seed_produced","replacement producer did not execute");
+    replacement_action["kind"]="publish".into();
+    replacement_action["ack"]=session.producer_ack(&replacement.source,&replacement_id)?;
+    let republished=session.run_with_dependency("dependency",&replacement.source,repo,&binding,None,&[],&[],&[],None,
+        &storage,&target,&audit,timeout,Some(&replacement_action)).await?;
+    let replacement_seed=republished.dependency_result.context("replacement publication missing")?["seed"]
+        .as_str().context("replacement seed missing")?.to_owned();
+    let original_seed=published["seed"].as_str().context("original seed missing")?;
+    ensure!(replacement_seed!=original_seed,"independent producer reused the old publication identity");
+    drop(replacement);
+    let mut orphan_retired=false;
+    for _ in 0..4 {
+        let source=snapshot(repo,&binding,&target).await?;
+        let outcome=session.run("repository",&source,repo,&binding,None,&[],&[],&[],Some("printf ORPHAN_RETIRED"),
+            &storage,&target,&audit,timeout).await?;
+        ensure!(outcome.status=="passed" && !outcome.seed_reclaimed.contains(&replacement_seed),
+            "current indexed seed was reclaimed");
+        if outcome.seed_reclaimed.iter().any(|value|value==original_seed) {orphan_retired=true;break;}
+    }
+    ensure!(orphan_retired,"released unindexed seed was not reclaimed by ordinary admitted work");
+    let current=session.dependency_seed(repo,&binding,&target,&storage,&audit).await?
+        .context("orphan reclamation lost current dependency seed")?;
+    ensure!(current["seed"]==replacement_seed,"orphan reclamation changed the current index");
     let receipt=serde_json::json!({"version":1,"kind":"real_shared_ci_dependency_seed_replay","seed":published["seed"],
         "adapter_authority":session.authority_sha256,"generations":generations,
         "external_units_recompiled_across_generations":0,"same_job_compatible_units_recompiled":0,
@@ -593,6 +625,7 @@ print("SEALED")'"#;
         "declared_generated_namespace_aliases_observed":true,"unchanged_generated_inputs_preserve_compatible_reuse":true,
         "live_producer_preserved":true,"inactive_producer_retired_after_source_drop":true,
         "published_seed_survives_producer_retirement":true,
+        "released_unindexed_seed_reclaimed":true,"current_index_survives_orphan_reclamation":true,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     audit.record_controller(receipt.clone())?;audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;

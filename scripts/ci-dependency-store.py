@@ -267,6 +267,159 @@ def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=No
     return reclaimed
 
 
+def _bounded_entries(path,mode):
+    if not path.exists() and not path.is_symlink():return []
+    cache._directory(path,mode,create=False)
+    import itertools
+    entries=list(itertools.islice(path.iterdir(),1025))
+    if len(entries)>1024:raise FreshnessHold('cleanup_uncertain')
+    return entries
+
+
+def _seed_references(root):
+    """Census all allocated owners, rather than infer release from this job."""
+    seeds=set();producers=set()
+    for path in _bounded_entries(root/'ci-dependency-index',0o700):
+        if path.name=='superseded':
+            cache._directory(path,0o700,create=False)
+            continue  # Historical records are never consulted by lookup_seed.
+        if path.suffix!='.json' or not cache._digest(path.stem):raise FreshnessHold('cleanup_uncertain')
+        value=_document(path)
+        if value.keys()!={'version','seed'} or type(value['version']) is not int or value['version']!=1 or not cache._digest(value['seed']):
+            raise FreshnessHold('cleanup_uncertain')
+        seeds.add(value['seed'])
+    for path in _bounded_entries(root/'ci-source-generations',0o711):
+        if not cache._uuid(path.name):raise FreshnessHold('cleanup_uncertain')
+        cache._directory(path,0o711,create=False)
+        control=cache._read_record(path/'control.json')
+        if (control.keys()!={'version','binding','active_command'} or type(control['version']) is not int
+                or control['version']!=cache.FORMAT_VERSION or not cache._uuid(control['active_command'])):
+            raise FreshnessHold('cleanup_uncertain')
+        cache.validate_binding(control['binding'])
+        if control['binding']['generation']!=path.name:raise FreshnessHold('cleanup_uncertain')
+        layout=cache.seed_layout(path,control['binding'])
+        if layout is not None:seeds.add(layout['seed'])
+    for path in _bounded_entries(root/'ci-dependency-producers',0o700):
+        _,control=_producer(root,path.name)
+        producers.add(control['producer'])
+    return seeds,producers
+
+
+def _released_seed(root,identity,manifest,cache_identity):
+    """Require the original acknowledged producer retirement, never absence."""
+    if (manifest.keys()!={'version','kind','binding','producer','units','files','shipping_authority'}
+            or type(manifest['version']) is not int or manifest['version']!=1
+            or manifest['kind']!='trusted-dependency-seed' or manifest['shipping_authority'] is not False
+            or _digest(manifest)!=identity):raise FreshnessHold('cleanup_uncertain')
+    _binding(manifest['binding'])
+    if manifest['binding']['cache_identity_sha256']!=cache_identity:raise FreshnessHold('cleanup_uncertain')
+    producer=manifest['producer']
+    if (not isinstance(producer,dict) or producer.keys()!={'id','kind','command','authority_sha256','cache_identity_sha256','quiescence_sha256'}
+            or not cache._uuid(producer['id'])):raise FreshnessHold('cleanup_uncertain')
+    history=root/'ci-producer-retirements'/'completed'
+    cache._directory(history.parent,0o700,create=False);cache._directory(history,0o700,create=False)
+    receipt=_document(history/(producer['id']+'.json'))
+    if (receipt.keys()!={'version','state','original','authorization'} or type(receipt['version']) is not int
+            or receipt['version']!=RETIREMENT_VERSION or receipt['state']!='reclaimed'):
+        raise FreshnessHold('cleanup_uncertain')
+    original=receipt['original'];_validate_producer_history(original,producer['id'])
+    _retirement_ack(original['control'],receipt['authorization'])
+    ack={key:producer[key] for key in ('command','authority_sha256','cache_identity_sha256','quiescence_sha256')}
+    if (original['control']['binding']!=manifest['binding'] or original['control']['kind']!=producer['kind']
+            or original['published']!={'version':1,'seed':identity,'ack':ack} or receipt['authorization']!=ack):
+        raise FreshnessHold('cleanup_uncertain')
+
+
+def _remaining_seed_inventory(path,manifest):
+    """Unknown bytes or links are preserved, including during crash replay."""
+    cache._directory(path,0o700,create=False)
+    files=manifest['files']
+    if not isinstance(files,dict) or len(files)>100_000:raise FreshnessHold('cleanup_uncertain')
+    expected={'manifest.json':None}
+    directories={'.','files'}
+    for name,info in files.items():
+        relative=Path('files')/_relative(name)
+        expected[str(relative)]=info
+        directories.update(str(parent) for parent in relative.parents)
+    count=0
+    for base,dirs,names in os.walk(path,followlinks=False):
+        for name in dirs:
+            entry=Path(base)/name;info=entry.lstat();count+=1
+            if (str(entry.relative_to(path)) not in directories or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid!=os.geteuid() or info.st_dev!=path.stat().st_dev or info.st_mode&0o002):
+                raise FreshnessHold('cleanup_uncertain')
+        for name in names:
+            entry=Path(base)/name;relative=str(entry.relative_to(path));info=entry.lstat();count+=1
+            if (relative not in expected or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid!=os.geteuid() or info.st_dev!=path.stat().st_dev):
+                raise FreshnessHold('cleanup_uncertain')
+            if relative=='manifest.json':
+                if _document(entry)!=manifest:raise FreshnessHold('cleanup_uncertain')
+            elif (not isinstance(expected[relative],dict) or stat.S_IMODE(info.st_mode)!=expected[relative].get('mode')
+                    or _file_info(entry)!=expected[relative]):raise FreshnessHold('cleanup_uncertain')
+        if count>200_000:raise FreshnessHold('cleanup_uncertain')
+
+
+def reclaim_seeds(directory,*,cache_identity,protected_seeds=(),limit=2):
+    """Reclaim only unreferenced published seeds under original R admission.
+
+    The caller is the privileged controller before workers start. A complete
+    owner/index census and the original producer's completed retirement are
+    mandatory. Current indexes remain warm; this is orphan reclamation, not a
+    global eviction policy. Unknown state is retained. Persist an original
+    manifest before unlinking and replay only that exact interrupted intent.
+    """
+    if (not cache._digest(cache_identity) or type(limit) is not int or not 1<=limit<=2
+            or not isinstance(protected_seeds,(list,tuple)) or len(protected_seeds)>4096
+            or any(not cache._digest(value) for value in protected_seeds)
+            or not shutil.rmtree.avoids_symlink_attacks):raise FreshnessHold('cleanup_uncertain')
+    root=_root(directory)
+    try:
+        referenced,producers=_seed_references(root);referenced.update(protected_seeds)
+        seeds=root/'ci-trusted-dependencies';candidates=_bounded_entries(seeds,0o700)
+    except (FreshnessHold,OSError,ValueError,KeyError,TypeError):return []
+    history=root/'ci-seed-retirements';cache._directory(history,0o700,create=True)
+    pending=history/'pending';completed=history/'completed'
+    for path in (pending,completed):cache._directory(path,0o700,create=True)
+    try:incomplete=_bounded_entries(pending,0o700)
+    except (FreshnessHold,OSError):return []
+    identities=[path.stem for path in incomplete if path.suffix=='.json']
+    identities.extend(path.name for path in candidates)
+    reclaimed=[];seen=set()
+    for identity in identities:
+        if len(reclaimed)>=limit:break
+        if not cache._digest(identity) or identity in seen or identity in referenced:continue
+        seen.add(identity);path=seeds/identity;receipt=pending/(identity+'.json')
+        try:
+            intent=_document(receipt) if receipt.exists() or receipt.is_symlink() else None
+            if intent is not None:
+                if (intent.keys()!={'version','state','manifest'} or type(intent['version']) is not int
+                        or intent['version']!=1 or intent['state'] not in ('reclaiming','reclaimed')):raise FreshnessHold('cleanup_uncertain')
+                manifest=intent['manifest']
+                if not isinstance(manifest,dict):raise FreshnessHold('cleanup_uncertain')
+            else:
+                manifest=_document(path/'manifest.json')
+                read_seed(root,identity,manifest['binding'])
+            _released_seed(root,identity,manifest,cache_identity)
+            if manifest['producer']['id'] in producers:continue
+            if path.exists() or path.is_symlink():
+                if intent is not None and intent['state']=='reclaimed':raise FreshnessHold('cleanup_uncertain')
+                _remaining_seed_inventory(path,manifest)
+            elif intent is None:raise FreshnessHold('cleanup_uncertain')
+        except (FreshnessHold,OSError,ValueError,KeyError,TypeError):continue
+        if intent is None:cache._write_record(receipt,{'version':1,'state':'reclaiming','manifest':manifest})
+        try:
+            if path.exists():shutil.rmtree(path)
+            _fsync_directory(seeds)
+            # Keep the original receipt until its completion is durable.
+            cache._write_record(receipt,{'version':1,'state':'reclaimed','manifest':manifest})
+            os.rename(receipt,completed/receipt.name)
+            _fsync_directory(completed);_fsync_directory(pending)
+        except OSError:raise FreshnessHold('cleanup_uncertain') from None
+        reclaimed.append(identity)
+    return reclaimed
+
+
 def prepare_isolated_producer(directory,binding,producer,command,worker_uid,worker_gid):
     _binding(binding)
     if (not cache._uuid(producer) or not cache._uuid(command)

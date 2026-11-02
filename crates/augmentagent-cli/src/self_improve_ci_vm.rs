@@ -197,6 +197,8 @@ pub(super) struct Outcome {
     #[serde(default)]
     pub producer_reclaimed: Vec<String>,
     #[serde(default)]
+    pub seed_reclaimed: Vec<String>,
+    #[serde(default)]
     pub dependency_result: Option<serde_json::Value>,
     #[serde(default)]
     source_kind:Option<String>,
@@ -816,15 +818,25 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             uuid::Uuid::parse_str(value).is_err() || retained_generations.contains(value))
             || outcome.producer_reclaimed.len()>2 || outcome.producer_reclaimed.iter().any(|value|
                 uuid::Uuid::parse_str(value).is_err() || retained_producers.contains(value))
-            || outcome.producer_reclaimed.iter().collect::<BTreeSet<_>>().len()!=outcome.producer_reclaimed.len() {
+            || outcome.producer_reclaimed.iter().collect::<BTreeSet<_>>().len()!=outcome.producer_reclaimed.len()
+            || outcome.seed_reclaimed.len()>2 || outcome.seed_reclaimed.iter().any(|value|
+                value.len()!=64 || !value.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f'))
+                    || dependency.is_some_and(|action|action["kind"]=="install" && action["seed"]==*value))
+            || outcome.seed_reclaimed.iter().collect::<BTreeSet<_>>().len()!=outcome.seed_reclaimed.len() {
             return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
                 "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
-                "evidence_sha256":digest(&serde_json::to_vec(&(&outcome.cache_reclaimed,&outcome.producer_reclaimed))?)})).into());
+                "evidence_sha256":digest(&serde_json::to_vec(&(&outcome.cache_reclaimed,&outcome.producer_reclaimed,&outcome.seed_reclaimed))?)})).into());
         }
         ensure!(
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published" | "seed_lookup"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
+        if !outcome.seed_reclaimed.is_empty() {
+            audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_orphan_seeds_reclaimed","version":1,
+                "binding":binding,"command":command_id,"seed_ids":outcome.seed_reclaimed,
+                "physical_cache_sha256":self.cache_identity()?,"quiescence_receipt_sha256":quiescence_sha256,
+                "shipping_authority":false}))?;
+        }
         if !outcome.producer_reclaimed.is_empty() {
             audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_producers_reclaimed","version":1,
                 "binding":binding,"command":command_id,"producer_ids":outcome.producer_reclaimed,
