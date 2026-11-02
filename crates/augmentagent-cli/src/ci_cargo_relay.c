@@ -81,7 +81,7 @@ static void forward_signal(int number, siginfo_t *information, void *context) {
     if (information && information->si_code>0
         && (number==SIGSEGV || number==SIGILL || number==SIGFPE || number==SIGBUS
             || number==SIGTRAP || number==SIGSYS)) _exit(125);
-    struct response frame={.magic="JARVSIG2",.stage=(uint32_t)number,.value=0};
+    struct response frame={.magic={'J','A','R','V','S','I','G','2'},.stage=(uint32_t)number,.value=0};
     if (proxy_connection<0 || send(proxy_connection,&frame,sizeof(frame),MSG_DONTWAIT|MSG_NOSIGNAL)!=(ssize_t)sizeof(frame))
         proxy_signal_failure=1;
     errno=saved_errno;
@@ -317,7 +317,7 @@ static int delegate_exec(const char *file, char *const argv[], char *const envp[
     if (size != sizeof(peer) || peer.uid != config.uid || peer.pid != (pid_t)config.pid) {
         errno = EPERM; goto failed;
     }
-    struct request request = {.magic = "JARVREQ2", .count = 3, .numbers = {0,1,2}};
+    struct request request = {.magic = {'J','A','R','V','R','E','Q','2'}, .count = 3, .numbers = {0,1,2}};
     memcpy(request.token, config.token, sizeof(request.token));
     int passed[65] = {payload,0,1,2};
     if (walk_descriptors(0, connection, payload, &request, passed) < 0) goto failed;

@@ -2,6 +2,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,9 @@ spec.loader.exec_module(relay)
 FIXTURE = 'self_improve::shared_ci::acceptance::cargo_relay_spawn_interface_fixture'
 
 
+@unittest.skipUnless(sys.platform=='linux' and platform.machine()=='x86_64','requires Linux x86-64')
+@unittest.skipUnless(any(os.environ.get(name) for name in ('AUGMENTAGENT_CARGO_RELAY_LIBRARY',
+    'AUGMENTAGENT_RELAY_FIXTURE_BINARY')),'requires managed native relay build; mandatory through the Rust adapter')
 class NativeRelayTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='jcr-native-', dir='/tmp')))
