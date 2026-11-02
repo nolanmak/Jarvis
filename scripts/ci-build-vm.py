@@ -6,6 +6,9 @@ from pathlib import Path
 BASE=Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('ci_build_runtime',BASE/'codex-build-vm.py')
 vm=importlib.util.module_from_spec(spec);spec.loader.exec_module(vm)
+cache_spec=importlib.util.spec_from_file_location('ci_cache_generation',BASE/'ci-cache-generation.py')
+cache_generation=importlib.util.module_from_spec(cache_spec);cache_spec.loader.exec_module(cache_generation)
+CACHE_PROGRAM=(BASE/'ci-cache-generation.py').read_bytes()
 
 
 def private_bytes(path,limit=2*1024*1024):
@@ -128,9 +131,16 @@ def cargo_request(request):
 def execute(request,run=vm.run,progress=None):
     progress={} if progress is None else progress
     progress["stage"]="request_schema"
-    required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache'}
+    required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
+              'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations'}
     optional={'id','changed_files','cache_bytes','packages','filters','command'}
-    if set(request)-required-optional or not required<=set(request) or request['version']!=1 or request['operation'] not in ('plan','step','targeted','baseline','repository'):raise vm.Unavailable('invalid CI VM request')
+    if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository'):raise vm.Unavailable('invalid CI VM request')
+    if not cache_generation._uuid(request['source_generation']) or not cache_generation._uuid(request['command_id']) or (request['predecessor'] is not None and not cache_generation._uuid(request['predecessor'])):raise cache_generation.FreshnessHold('generation_mismatch')
+    retained=request['retained_generations']
+    if (not isinstance(retained,list) or not 1<=len(retained)<=4096
+            or any(not cache_generation._uuid(value) for value in retained) or len(set(retained))!=len(retained)
+            or request['source_generation'] not in retained):raise cache_generation.FreshnessHold('cleanup_uncertain')
+    if not cache_generation._digest(request['controller_authority_sha256']):raise cache_generation.FreshnessHold('authority_changed')
     if not all(isinstance(request[key],str) and re.fullmatch(r'[a-f0-9]{40,64}',request[key]) for key in ('head','base')):raise vm.Unavailable('CI candidate binding invalid')
     cargo=cargo_request(request)
     progress['stage']='controller_bundle'
@@ -142,6 +152,28 @@ def execute(request,run=vm.run,progress=None):
     for path in (workspace,state,scratch):
         info=path.lstat()
         if path.resolve()!=path or not path.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:raise vm.Unavailable('CI snapshot/state/scratch is not private')
+    generation=None
+    if request['operation']!='plan':
+        progress['stage']='source_census'
+        outputs=cache_generation.declared_outputs(workspace)
+        directories=['target',*[name for name,kind in outputs.items() if kind=='directory']]
+        files=[name for name,kind in outputs.items() if kind=='file']
+        source_inputs=cache_generation.source_census(workspace,Path(request['git_objects']),request['head'],
+            generated_directories=directories,generated_files=files)
+        target=workspace/'target'
+        target.mkdir(mode=0o700,exist_ok=True)
+        for name,kind in outputs.items():
+            path=workspace/name
+            if kind=='directory':path.mkdir(mode=0o700,exist_ok=True)
+            else:
+                try:
+                    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                    os.close(fd)
+                except FileExistsError:pass
+        generation={'binding':{'generation':request['source_generation'],'head':request['head'],'tree':request['tree'],
+            'contract_sha256':hashlib.sha256(contract).hexdigest(),'authority_sha256':request['controller_authority_sha256'],
+            'source_inputs_sha256':source_inputs},'command':request['command_id'],'predecessor':request['predecessor'],
+            'outputs':outputs,'retained_generations':retained}
     # The supplied snapshot has controller-generated Git metadata, never the
     # source worktree's config/hooks. Rebind only its private alternate file.
     progress['stage']='git_alternate'
@@ -168,6 +200,9 @@ def execute(request,run=vm.run,progress=None):
         if not isinstance(request['build_cache'],str):raise vm.Unavailable('managed CI cache image is required')
         progress['stage']='cache_prepare'
         ensure_cache(request['build_cache'],request.get('cache_bytes'),lease)
+        info=Path(request['build_cache']).stat()
+        generation['binding']['cache_identity_sha256']=hashlib.sha256(json.dumps([info.st_dev,info.st_ino,info.st_size],separators=(',',':')).encode()).hexdigest()
+        cache_generation.validate_binding(generation['binding'])
         if request['operation']=='step':
             identifier=request.get('id')
             if not isinstance(identifier,str) or len(identifier)>4096 or '\0' in identifier:raise vm.Unavailable('invalid CI command identity')
@@ -178,10 +213,12 @@ def execute(request,run=vm.run,progress=None):
             command=['/usr/bin/python3','-I','-c',CARGO_OPERATIONS,json.dumps(cargo,separators=(',',':'))]
     progress['stage']='vm_launch'
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
-                ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract})
+                ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract,
+                            'cache_program':CACHE_PROGRAM,'generation':generation})
     progress['stage']='receipt_validate'
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),
-            'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr']}
+            'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
+            'cache_reclaimed':outcome.get('cache_reclaimed',[])}
     if outcome['exit_code']==0:
         if request['operation']=='plan':
             plan=json.loads(outcome['stdout'])
@@ -197,6 +234,12 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--spec',type=Path,required=True);args=parser.parse_args()
     progress={'stage':'request_read'}
     try:result=execute(json.loads(private_bytes(args.spec)),progress=progress)
+    except vm.FreshnessUnavailable as error:
+        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm',
+                'freshness_hold':cache_generation.validate_hold(error.diagnostic),'stage':progress['stage'],'category':'FreshnessHold'}
+    except cache_generation.FreshnessHold as error:
+        result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','freshness_hold':error.diagnostic(),
+                'stage':progress['stage'],'category':'FreshnessHold'}
     except (OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
         # Local diagnostics deliberately omit raw paths, requests and exception text.
         result={'version':1,'status':'prerequisite_hold','boundary':'existing-build-vm','reason':'CI VM setup unavailable','category':type(error).__name__ if type(error).__name__ in ('Unavailable','OSError','PermissionError','FileNotFoundError','ValueError','KeyError','JSONDecodeError','CalledProcessError') else 'SetupError','stage':progress['stage'],'errno':error.errno if isinstance(error,OSError) and type(error.errno) is int and 0<=error.errno<=4096 else None}

@@ -114,8 +114,7 @@ impl CapacityAccounting {
         anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
             .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
-        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
-            && checkpoint.next.action == "retry_verification"
+        anyhow::ensure!(crate::autoship_freshness::is_ci_retry(&checkpoint.next)
             && checkpoint.next.eligible_at_ms == deferred.eligible_at_ms,
             "CI deferral has no matching durable schedule");
         self.retry_report(deferred.to_string())
@@ -1387,14 +1386,18 @@ impl WorkflowGuard {
 
     pub(super) async fn defer_verification_infrastructure(&mut self,error:&anyhow::Error)->Result<Option<i64>> {
         let message=format!("{error:#}");
-        let Some(code)=infra_failure_reason(&message) else {return Ok(None);};
+        let freshness=error.downcast_ref::<crate::autoship_freshness::Hold>();
+        let reason=freshness.map(|hold|hold.reason.retry_reason());
+        let code=match reason.as_deref().or_else(||infra_failure_reason(&message)) {Some(code)=>code,None=>return Ok(None)};
         self.validate_before_side_effect()?;
         self.audit_health().await?;
-        let dependency=format!("{:x}",Sha256::digest(self.environment.as_bytes()));
+        let dependency=freshness.map_or_else(||format!("{:x}",Sha256::digest(self.environment.as_bytes())),
+            |hold|hold.evidence_sha256.clone());
         let eligible=self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
             .defer_verification_infrastructure(&self.lease,&self.binding,code,&dependency,millis())?;
         self.audit_event("verification_infrastructure_retry",serde_json::json!({
             "failure_code":code,"dependency_sha256":dependency,"eligible_at_ms":eligible,
+            "freshness_hold":freshness,
             "failure_sha256":format!("{:x}",Sha256::digest(message.as_bytes()))}))?;
         Ok(Some(eligible))
     }
@@ -1516,8 +1519,7 @@ impl WorkflowGuard {
     pub(super) fn finish_ci_deferral(&mut self) -> Result<()> {
         let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
             .snapshot(self.id())?.context("retry workflow missing")?.checkpoint;
-        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
-            && checkpoint.next.action == "retry_verification", "no durable CI deferral to release");
+        anyhow::ensure!(crate::autoship_freshness::is_ci_retry(&checkpoint.next), "no durable CI deferral to release");
         self.release_after_teardown()
     }
 
@@ -2915,6 +2917,45 @@ mod tests {
                 }
                 guard.finish().unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_freshness_gate_defers_before_paid_repair_even_with_error_context() {
+        use crate::autoship_freshness::{Hold,Reason};
+        for reason in Reason::ALL {
+            let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");
+            let mut guard=WorkflowGuard::acquire_at(&path,Start {repo_root:dir.path(),worktree:dir.path(),
+                repository:"owner/repo",source_issue:Some(77),pr:Some(88),branch:"fixture",
+                contract:"C1",environment:"rust-a"},millis()).await.unwrap().unwrap();
+            guard.checkpoint(Stage::Review,"candidate_ready","run_verifier",0,&["receipt".into()]).await.unwrap();
+            let accounting=guard.capacity_accounting(true).unwrap();
+            let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let error=anyhow::Error::new(Hold::parse(&serde_json::json!({"version":1,"reason":reason,
+                "recovery":reason.recovery(),"evidence_sha256":"c".repeat(64)})))
+                .context("post-revision required check");
+            let mut repairs=0;
+            let outcome:Result<RunReport>=async {
+                if let Err(_) = CiGateResult(Err(error)).for_workflow(&mut guard).await? {
+                    repairs+=1;
+                    guard.audit_logger().model_call_admitted("codex")?;
+                }
+                Ok(RunReport::built("repaired".into()))
+            }.await;
+            let report=accounting.settle_ci(outcome).unwrap();
+            let after=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(repairs,0);assert!(report.is_idle() && !report.billed);
+            assert_eq!(after.checkpoint.stage,Stage::Review);
+            assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+            assert_eq!(after.model_calls,before.model_calls);
+            assert_eq!(after.progress_at_ms,before.progress_at_ms);
+            assert_eq!(after.checkpoint.next.reason,reason.retry_reason());
+            assert_eq!(after.checkpoint.next.action,reason.retry_action());
+            assert!(after.lease_until_ms<=millis());
+            let (_,status)=crate::autoship_commands::status(&path,guard.id(),millis(),5);
+            assert_eq!(status["ci_freshness"]["evidence_sha256"],"c".repeat(64));
+            guard.finish().unwrap();
         }
     }
 

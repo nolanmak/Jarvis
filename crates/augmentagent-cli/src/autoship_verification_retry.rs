@@ -130,9 +130,7 @@ impl WorkflowStore {
         {
             ensure!(
                 same(prior)
-                    && checkpoint.next.reason == "verification_infrastructure_retry"
-                    && checkpoint.next.action == "retry_verification"
-                    && checkpoint.next.eligible_at_ms == prior.eligible_at_ms,
+                    && checkpoint.next == crate::autoship_freshness::retry_next(&prior.failure_code,prior.eligible_at_ms),
                 "verification retry replay changed within its owner generation"
             );
             return Ok(prior.eligible_at_ms);
@@ -156,11 +154,7 @@ impl WorkflowStore {
             eligible_at_ms: now.saturating_add(delay),
         };
         retry.validate()?;
-        checkpoint.next = NextAction {
-            reason: "verification_infrastructure_retry".into(),
-            action: "retry_verification".into(),
-            eligible_at_ms: retry.eligible_at_ms,
-        };
+        checkpoint.next = crate::autoship_freshness::retry_next(failure_code,retry.eligible_at_ms);
         let checkpoint = serde_json::to_string(&checkpoint)?;
         // Candidate, evidence, progress clock, model charges and merge allowance
         // are preserved. Both events and the retry schedule commit together.
@@ -172,18 +166,11 @@ impl WorkflowStore {
             &tx,
             &lease.workflow,
             lease.generation,
-            "checkpoint",
-            &checkpoint,
-            now,
-        )?;
-        event(
-            &tx,
-            &lease.workflow,
-            lease.generation,
             "verification_infrastructure_retry",
             &serde_json::to_string(&retry)?,
             now,
         )?;
+        event(&tx,&lease.workflow,lease.generation,"checkpoint",&checkpoint,now)?;
         tx.commit()?;
         Ok(retry.eligible_at_ms)
     }
@@ -212,6 +199,45 @@ mod tests {
         store.checkpoint(&lease, &checkpoint, 21).unwrap();
         (store, lease, binding)
     }
+    #[test]
+    fn every_freshness_hold_reaches_real_status_and_private_outbox_without_spend_or_fake_progress() {
+        use crate::autoship_freshness::Reason;
+        for reason in Reason::ALL {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("workflow.db");
+            let mut store=WorkflowStore::open(&path).unwrap();
+            let origin=super::super::discord_ingress::DiscordOrigin {bot:11,owner:22,channel:33,message:44};
+            let request=submission::Request {repository:"owner/repo".into(),target:submission::Target::Issue(1),provider:None,until:submission::Milestone::Merged};
+            let id=store.submit_discord_authorized(&origin,&request,&"a".repeat(64),1).unwrap().admission.workflow;
+            let binding=Binding {head:"head".into(),contract:"contract".into(),evidence_hash:"evidence".into()};
+            store.register(&id,"fix",binding.clone(),10).unwrap();
+            let lease=store.claim(&id,"worker",20,60_000).unwrap().unwrap();
+            let mut cp=store.snapshot(&id).unwrap().unwrap().checkpoint;
+            cp.stage=Stage::Review;cp.evidence=vec!["preserved-receipt".into()];
+            store.checkpoint(&lease,&cp,21).unwrap();
+            let before=store.snapshot(&id).unwrap().unwrap();
+            let due=store.defer_verification_infrastructure(&lease,&binding,&reason.retry_reason(),&"b".repeat(64),30).unwrap();
+            let after=store.snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.checkpoint.stage,Stage::Review);
+            assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+            assert_eq!(after.progress_at_ms,before.progress_at_ms);
+            assert_eq!(after.model_calls,before.model_calls);
+            assert_eq!(after.attempts,before.attempts);
+            let event=store.latest_progress(&id).unwrap().unwrap();
+            assert_eq!(event.reason,reason.retry_reason());assert_eq!(event.next_action,reason.retry_action());
+            assert_eq!(event.eligible_at_ms,Some(due));assert_eq!(event.evidence_digest,"b".repeat(64));
+            assert_eq!(event.kind,"retry-scheduled");
+            let (code,status)=crate::autoship_commands::status(&path,&id,31,5);
+            assert_eq!(code,0);assert_eq!(status["reason"],reason.retry_reason());
+            assert_eq!(status["next_action"],reason.retry_action());
+            assert_eq!(status["ci_freshness"]["reason"],serde_json::to_value(reason).unwrap());
+            assert_eq!(status["ci_freshness"]["evidence_sha256"],"b".repeat(64));
+            assert_eq!(status["allowance"]["confirmed"],0);
+            let (_,message)=store.claim_progress(&origin,&id,event.sequence,32).unwrap().unwrap();
+            assert!(message.contains(&reason.retry_reason()) && message.contains(reason.retry_action()));
+            assert!(message.contains(&"b".repeat(64)));
+        }
+    }
+
     #[test]
     fn ci_infrastructure_retry_preserves_build_and_review_stages_without_new_spend() {
         for stage in [

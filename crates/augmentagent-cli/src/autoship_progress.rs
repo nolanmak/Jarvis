@@ -29,6 +29,13 @@ fn exists(conn:&Connection)->Result<bool> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_progress_event')",[],|r|r.get(0))?)
 }
 impl WorkflowStore {
+    pub fn latest_progress(&self,workflow:&str)->Result<Option<Progress>> {
+        if !exists(&self.conn)? {return Ok(None);}
+        let raw:Option<String>=self.conn.query_row("SELECT payload FROM workflow_progress_state WHERE workflow=?1",
+            [workflow],|row|row.get(0)).optional()?;
+        raw.map(|raw|Ok(serde_json::from_str(&raw)?)).transpose()
+    }
+
     pub fn progress_events(&self,workflow:&str)->Result<Vec<Progress>> {
         if !exists(&self.conn)? {return Ok(Vec::new());}
         let mut stmt=self.conn.prepare("SELECT payload FROM workflow_progress_event WHERE workflow=?1 ORDER BY sequence")?;
@@ -103,11 +110,13 @@ fn code(value:&str,fallback:&str)->String {
         "await_owner_resume"|"claim_workflow"|"awaiting-worker-claim"|
         "merge-allowance-exhausted"|"merge-reconciliation-required"|
         "review_changes_requested"|"ci_failed"|"merge_conflict"|"head_changed"|
-        "retry_worker_attempt"|"inspect_workflow"|"await_worker") {value.into()} else {fallback.into()}
+        "retry_worker_attempt"|"inspect_workflow"|"await_worker"|
+        "verification_infrastructure_retry"|"retry_verification")
+        || crate::autoship_freshness::is_progress_code(value) {value.into()} else {fallback.into()}
 }
 
 pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Result<()> {
-    if !matches!(source,"registered"|"checkpoint"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed") {return Ok(());}
+    if !matches!(source,"registered"|"checkpoint"|"verification_infrastructure_retry"|"autonomous_merge_confirmed"|"command_queued"|"command_attempt_finished"|"owner_control_changed") {return Ok(());}
     let previous:Option<(i64,String,bool)>=tx.query_row("SELECT sequence,fingerprint,terminal FROM workflow_progress_state WHERE workflow=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if previous.as_ref().is_some_and(|p|p.2) {return Ok(());}
     let snapshot:Option<(String,Option<u64>)>=tx.query_row("SELECT checkpoint,pr FROM workflow WHERE id=?1",[workflow],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -120,8 +129,10 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let mut reason=checkpoint.as_ref().map_or_else(||"awaiting-worker-claim".into(),|c|code(&c.next.reason,"workflow-state-changed"));
     let mut action=checkpoint.as_ref().map_or_else(||"claim_workflow".into(),|c|code(&c.next.action,"inspect_workflow"));
     let mut eligible=checkpoint.as_ref().map(|c|c.next.eligible_at_ms);
+    let ci_retry=checkpoint.as_ref().is_some_and(|c|crate::autoship_freshness::is_ci_retry(&c.next));
+    if ci_retry {kind="retry-scheduled".into();}
     let attempt:Option<(String,String,i64)>=tx.query_row("SELECT outcome,reason,eligible_at FROM command_attempt WHERE workflow=?1 AND finished_at IS NOT NULL",[workflow],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    if source=="command_attempt_finished" {
+    if source=="command_attempt_finished" && !ci_retry {
         if let Some((outcome,why,at))=&attempt {
             kind=if outcome=="progress" {"worker-progress"} else {"retry-scheduled"}.into();
             reason=code(why,"worker-attempt-finished");action="inspect_workflow".into();eligible=Some(*at);
@@ -133,8 +144,22 @@ pub(super) fn project(tx:&Transaction<'_>,workflow:&str,source:&str,now:i64)->Re
     let terminal=confirmed || stage==Some(Stage::Retired);
     if confirmed {stage=Some(Stage::Merged);kind="merged".into();reason="autonomous-merge-confirmed".into();action="inspect_deployment".into();eligible=None;}
     let evidence=checkpoint.as_ref().map(|c|(&c.binding,&c.evidence,&c.next.reason,&c.next.action));
-    let evidence_digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&evidence)?));
-    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&kind,stage,&reason,&action,&evidence_digest))?));
+    let mut evidence_digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&evidence)?));
+    if let Some(checkpoint)=checkpoint.as_ref().filter(|c|crate::autoship_freshness::reason_from_retry(&c.next.reason).is_some()) {
+        let raw:Option<String>=tx.query_row("SELECT e.payload FROM workflow_event e JOIN workflow w ON w.id=e.workflow WHERE e.workflow=?1 AND e.kind='verification_infrastructure_retry' AND e.generation=w.generation ORDER BY e.seq DESC LIMIT 1",[workflow],|row|row.get(0)).optional()?;
+        if let Some(retry)=raw.and_then(|raw|serde_json::from_str::<serde_json::Value>(&raw).ok()) {
+            if retry["failure_code"]==checkpoint.next.reason && retry["eligible_at_ms"].as_i64()==Some(checkpoint.next.eligible_at_ms)
+                && retry["binding"]==serde_json::to_value(&checkpoint.binding)? {
+                if let Some(digest)=retry["dependency_sha256"].as_str().filter(|value|value.len()==64 && value.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f'))) {
+                    evidence_digest=digest.into();
+                }
+            }
+        }
+    }
+    // A changed CI retry deadline is useful owner information. Ordinary
+    // checkpoint timestamps still deduplicate unchanged blocker updates.
+    let retry_deadline=if ci_retry {eligible} else {None};
+    let fingerprint=format!("{:x}",Sha256::digest(serde_json::to_vec(&(&kind,stage,&reason,&action,retry_deadline,&evidence_digest))?));
     let changed=previous.as_ref().is_none_or(|p|p.1!=fingerprint);
     let sequence=previous.as_ref().map_or(1,|p|p.0+i64::from(changed));
     let progress=Progress {workflow:workflow.into(),sequence,kind,stage,reason,next_action:action,eligible_at_ms:eligible,

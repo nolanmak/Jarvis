@@ -8,6 +8,7 @@ const ADAPTER: &[u8] = include_bytes!("../../../scripts/ci-build-vm.py");
 const BUILD_VM: &[u8] = include_bytes!("../../../scripts/codex-build-vm.py");
 const PROXY: &[u8] = include_bytes!("../../../scripts/build-dependency-proxy.py");
 const SUPERVISOR: &[u8] = include_bytes!("../../../scripts/provider-supervisor.py");
+const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 
 pub(super) struct Session {
     directory: Option<tempfile::TempDir>,
@@ -15,6 +16,12 @@ pub(super) struct Session {
     cache_bytes: u64,
     cache: PathBuf,
     pub authority_sha256: String,
+    completed_generations: std::sync::Mutex<std::collections::BTreeMap<String, Completion>>,
+    execution: tokio::sync::Mutex<()>,
+}
+struct Completion {
+    command: String,
+    source: std::sync::Weak<()>,
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
@@ -41,6 +48,10 @@ pub(super) struct Outcome {
     category: Option<String>,
     #[serde(default)]
     errno: Option<i64>,
+    #[serde(default)]
+    freshness_hold: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cache_reclaimed: Vec<String>,
 }
 impl Outcome {
     // This envelope is emitted before a guest exists and may not carry source
@@ -60,6 +71,7 @@ impl Outcome {
                         | "storage_lease"
                         | "runtime_load"
                         | "cache_prepare"
+                        | "source_census"
                         | "command_prepare"
                         | "vm_launch"
                         | "receipt_validate"
@@ -73,6 +85,7 @@ impl Outcome {
                 matches!(
                     *value,
                     "Unavailable"
+                        | "FreshnessHold"
                         | "SetupError"
                         | "OSError"
                         | "ValueError"
@@ -89,8 +102,13 @@ impl Outcome {
                 )
             })
             .unwrap_or("unknown");
-        serde_json::json!({"stage":stage,"category":category,
-            "errno":self.errno.filter(|value| (0..=4096).contains(value))})
+        let mut diagnostic = serde_json::json!({"stage":stage,"category":category,
+            "errno":self.errno.filter(|value| (0..=4096).contains(value))});
+        if let Some(value) = &self.freshness_hold {
+            diagnostic["freshness_hold"] = serde_json::to_value(crate::autoship_freshness::Hold::parse(value))
+                .expect("bounded freshness protocol serializes");
+        }
+        diagnostic
     }
     fn validate(&self, binding: &Binding, operation: &str) -> Result<()> {
         ensure!(
@@ -104,6 +122,11 @@ impl Outcome {
             ),
             "{PREREQUISITE}: unknown VM disposition"
         );
+        if let Some(value) = &self.freshness_hold {
+            // Even a contradictory success/failed-code envelope cannot turn
+            // incomplete freshness into a source verdict.
+            return Err(crate::autoship_freshness::Hold::parse(value).into());
+        }
         if self.status == "prerequisite_hold" {
             bail!(
                 "{PREREQUISITE}: admitted CI VM requires environment/resource recovery; {}",
@@ -177,6 +200,16 @@ impl Drop for Session {
     }
 }
 impl Session {
+    fn cache_state(&self,generation:&str)->Result<(Option<String>,BTreeSet<String>)> {
+        let mut completed=self.completed_generations.lock()
+            .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
+        // Dead source owners cannot pin completed job artifacts. Durable
+        // storage holds independently fence unknown live descendants.
+        completed.retain(|_,completion|completion.source.strong_count()>0);
+        Ok((completed.get(generation).map(|value|value.command.clone()),completed.keys().cloned()
+            .chain(std::iter::once(generation.to_owned())).collect()))
+    }
+
     pub(super) fn prepare(root: &Path, target: &Path) -> Result<Self> {
         use augmentagent_channel_core::codex_tools::{build_runner, BuildRunner};
         let BuildRunner::Vm(runtime_path) = build_runner() else {
@@ -225,6 +258,7 @@ impl Session {
             ("codex-build-vm.py", BUILD_VM),
             ("build-dependency-proxy.py", PROXY),
             ("provider-supervisor.py", SUPERVISOR),
+            ("ci-cache-generation.py", CACHE_GENERATION),
             ("ci-contract.py", RUNNER.as_bytes()),
             ("ci-contract.json", contract.as_bytes()),
             ("runtime.json", runtime.as_slice()),
@@ -238,20 +272,22 @@ impl Session {
         private_directory(&cache_root)?;
         let authority_sha256 = digest(&serde_json::to_vec(&serde_json::json!({
             "runtime":digest(&runtime),"adapter":digest(ADAPTER),"build_vm":digest(BUILD_VM),"proxy":digest(PROXY),
-            "supervisor":digest(SUPERVISOR),"cache_bytes":limits.cache_bytes}))?);
+            "supervisor":digest(SUPERVISOR),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes}))?);
         Ok(Self {
             directory: Some(directory),
             memory_mb,
             cache_bytes: limits.cache_bytes,
             cache: cache_root.join("cache.img"),
             authority_sha256,
+            completed_generations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            execution: tokio::sync::Mutex::new(()),
         })
     }
 
     pub(super) async fn run(
         &self,
         operation: &str,
-        source: &Path,
+        source: &verifier_checkout::OwnedCheckout,
         root: &Path,
         binding: &Binding,
         check: Option<&Check>,
@@ -264,6 +300,20 @@ impl Session {
         audit: &Arc<augmentagent_channel_core::AuditLogger>,
         deadline: std::time::Duration,
     ) -> Result<Outcome> {
+        // One image cannot be mounted by concurrent guests. Reconcile even
+        // when this caller still owns the outer storage lease: an earlier
+        // canceled command may have left a durable unknown teardown hold.
+        let _execution=self.execution.lock().await;
+        if !crate::build_storage::ci_holds::may_cleanup_after_reconcile(target).unwrap_or(false) {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
+                "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
+                "evidence_sha256":digest(b"prior shared CI teardown remains unverified")})).into());
+        }
+        let generation = source.generation().to_owned();
+        let source_lifetime=source.lifetime();
+        let source = source.path();
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let (predecessor,retained_generations)=self.cache_state(&generation)?;
         let files = storage.inherited_files()?;
         let fd = files.first().context("CI storage lease unavailable")?;
         let meta = fd.metadata()?;
@@ -278,7 +328,10 @@ impl Session {
             root.join(objects)
         }
         .canonicalize()?;
-        let request = serde_json::json!({"version":1,"operation":operation,
+        let request = serde_json::json!({"version":2,"operation":operation,
+            "source_generation":generation,"command_id":command_id,"predecessor":predecessor,
+            "retained_generations":retained_generations,
+            "tree":binding.index_tree,"controller_authority_sha256":self.authority_sha256,
             "runtime_config":self.directory.as_ref().expect("owned CI session").path().join("runtime.json"),"workspace":source,
             "state":self.directory.as_ref().expect("owned CI session").path().join("state"),"git_objects":objects,
             "runner":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.py"),"contract":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.json"),
@@ -365,10 +418,23 @@ impl Session {
             }))?;
         }
         outcome.validate(binding, operation)?;
+        if outcome.cache_reclaimed.len()>2 || outcome.cache_reclaimed.iter().any(|value|
+            uuid::Uuid::parse_str(value).is_err() || retained_generations.contains(value)) {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
+                "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
+                "evidence_sha256":digest(&serde_json::to_vec(&outcome.cache_reclaimed)?)})).into());
+        }
         ensure!(
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
+        if operation != "plan" && outcome.status == "passed" {
+            // Published only after kernel quiescence, storage settlement and
+            // receipt validation. A dropped/failed invocation cannot mint it.
+            self.completed_generations.lock()
+                .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
+                .insert(generation, Completion {command:command_id,source:source_lifetime});
+        }
         Ok(outcome)
     }
 }
@@ -376,6 +442,63 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn unsettled_prior_hold_blocks_same_lease_session_before_any_new_command() {
+        crate::build_storage::ci_holds::with_test_registry(|root,_| {
+            let storage=crate::build_storage::Lease::try_at(root).unwrap().unwrap();
+            let source=verifier_checkout::allocate(root,"head","contract").unwrap();
+            let hold=crate::build_storage::ci_holds::Hold::begin(root,source.path(),root,root,&"a".repeat(64)).unwrap();
+            let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:root.join("never-opened.img"),
+                authority_sha256:String::new(),completed_generations:Default::default(),execution:Default::default()};
+            let control=tempfile::Builder::new().prefix("ci-refusal-control-").tempdir_in("/tmp").unwrap();
+            let audit=workflow::workflow_audit(&control.path().join("workflow.db"),"prior-cleanup-refusal",None).unwrap();
+            let binding=super::super::tests::binding_fixture();
+            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let error=runtime.block_on(session.run("repository",&source,root,&binding,None,&[],&[],&[],
+                Some("touch forbidden-dispatch"),&storage,root,&audit,std::time::Duration::from_secs(1)))
+                .err().expect("unsettled prior hold permitted a second VM command");
+            let hold_error=error.downcast_ref::<crate::autoship_freshness::Hold>().expect("cleanup refusal lost typed freshness disposition");
+            assert_eq!(hold_error.reason,crate::autoship_freshness::Reason::CleanupUncertain);
+            assert!(!root.join("forbidden-dispatch").exists());
+            assert!(!root.join("never-opened.img").exists());
+            assert!(!crate::build_storage::ci_holds::may_cleanup(root).unwrap());
+            drop(hold);
+        });
+    }
+
+    #[test]
+    fn dropped_job_sources_stop_pinning_cache_while_live_sources_keep_their_acknowledgement() {
+        let directory=tempfile::tempdir().unwrap();
+        let first=verifier_checkout::allocate(directory.path(),"head-a","contract").unwrap();
+        let second=verifier_checkout::allocate(directory.path(),"head-b","contract").unwrap();
+        let first_id=first.generation().to_owned();let second_id=second.generation().to_owned();
+        let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:directory.path().join("unused"),
+            authority_sha256:String::new(),completed_generations:Default::default(),execution:Default::default()};
+        session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime()});
+        session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime()});
+        assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([first_id.clone(),second_id.clone()])));
+        drop(first);
+        assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([second_id.clone()])));
+        drop(second);
+        assert_eq!(session.cache_state("new-generation").unwrap(),(None,BTreeSet::from(["new-generation".into()])));
+    }
+
+    #[test]
+    fn freshness_hold_survives_transport_and_cannot_certify_success_or_code_failure() {
+        let binding = super::super::tests::binding_fixture();
+        for status in ["passed", "failed", "prerequisite_hold"] {
+            let value = serde_json::json!({"version":1,"boundary":"existing-build-vm","status":status,
+                "head":"head","base":"base","contract_sha256":"contract","exit_code":0,
+                "freshness_hold":{"version":1,"reason":"input_census_unknown","recovery":"revalidate_inputs","evidence_sha256":"a".repeat(64)}});
+            let receipt: Outcome = serde_json::from_value(value).unwrap();
+            let error = receipt.validate(&binding, "step").unwrap_err();
+            let hold = error.downcast_ref::<crate::autoship_freshness::Hold>().expect("typed hold lost at VM boundary");
+            assert_eq!(hold.reason, crate::autoship_freshness::Reason::InputCensusUnknown);
+            assert_eq!(receipt.setup_diagnostic()["freshness_hold"]["reason"], "input_census_unknown");
+        }
+    }
 
     #[test]
     fn setup_failure_retains_safe_phase_without_exception_content() {

@@ -133,9 +133,7 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
         let pr_url = snapshot
             .pr
             .map(|pr| format!("https://github.com/{repository}/pull/{pr}"));
-        Ok(Some((
-            code,
-            json!({"schema_version":1,"workflow":workflow,"repository":repository,"target":target,
+        let mut body=json!({"schema_version":1,"workflow":workflow,"repository":repository,"target":target,
             "accepted":true,"complete":complete,"head":snapshot.checkpoint.binding.head,
             "stage":snapshot.checkpoint.stage,"reason":if paused && !complete && !recovery_needed {"owner-pause-requested"} else {&snapshot.checkpoint.next.reason},
             "next_action":if paused && !complete && !recovery_needed {"await_quiescence_or_owner_resume"} else {&snapshot.checkpoint.next.action},"eligible_at_ms":snapshot.checkpoint.next.eligible_at_ms,
@@ -146,8 +144,15 @@ pub fn status_for_milestone(path: &Path, workflow: &str, now: i64, cap: u32,
             "deployment":{"state":"unknown"},"allowance":allowance,"pending_merge_operations":pending,"pending_merge_evidence":pending_evidence,
             "resources":{"attempts":snapshot.attempts,"model_calls":snapshot.model_calls,"tokens":snapshot.tokens,"wall_ms":snapshot.wall_ms},
             "lease":{"active":snapshot.lease_until_ms > now,"generation":snapshot.generation},
-            "progress_at_ms":snapshot.progress_at_ms,"last_attempt":attempt}),
-        )))
+            "progress_at_ms":snapshot.progress_at_ms,"last_attempt":attempt});
+        if let Some(reason)=crate::autoship_freshness::reason_from_retry(&snapshot.checkpoint.next.reason)
+            .filter(|reason|snapshot.checkpoint.next.action==reason.retry_action()) {
+            if let Some(progress)=store.latest_progress(workflow)? {
+                body["ci_freshness"]=json!({"reason":reason,"recovery":reason.recovery(),
+                    "evidence_sha256":progress.evidence_digest});
+            }
+        }
+        Ok(Some((code,body)))
     })();
     match observed {
         Ok(Some(result)) => result,

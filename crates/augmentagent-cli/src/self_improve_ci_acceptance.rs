@@ -2,6 +2,137 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Behavioral cache replay through the production adapter and actual managed
+/// image. This grants no workflow, review, publication or merge authority.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_cache_freshness_replay() -> Result<()> {
+    let root=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&root),"evidence must be outside candidate");
+    std::fs::create_dir(&evidence)?;
+    std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    ensure!(evidence.canonicalize()?==evidence,"evidence must be literal");
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-cache-freshness",Some(&root))?;
+    audit.require_run_resources()?;
+    augmentagent_channel_core::run_resources::check_requirement("shared_ci_vm",Some(&audit))?;
+    let target=crate::build_storage::effective_target(&root);
+    // The host's idle probe is advisory. Competing managed builds can acquire
+    // the lease before this test starts; retry only typed storage deferrals,
+    // with no guest, model call or protected storage ownership held meanwhile.
+    let admission_deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(300);
+    let storage=loop {
+        match crate::build_storage::admit_ci(&root,&target).await {
+            Ok(storage)=>break storage,
+            Err(error) if error.downcast_ref::<crate::storage_reservations::Busy>().is_some()
+                && tokio::time::Instant::now()<admission_deadline => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error)=>return Err(error),
+        }
+    };
+    let fixture=tempfile::Builder::new().prefix("freshness-source-fixture-").tempdir_in(&target)?;
+    let repo=fixture.path();std::fs::create_dir(repo.join("src"))?;
+    std::fs::write(repo.join("Cargo.toml"),"[package]\nname = \"freshness-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n")?;
+    std::fs::write(repo.join("Cargo.lock"),"version = 4\n[[package]]\nname = \"freshness-fixture\"\nversion = \"0.0.0\"\n")?;
+    git(repo,&["-c","init.templateDir=","init","-q"]).await?;
+    async fn commit(repo:&Path,source:&str)->Result<String> {
+        std::fs::write(repo.join("src/main.rs"),source)?;
+        git(repo,&["add","."]).await?;
+        let result=Command::new("/usr/bin/git").args(["-c","core.hooksPath=/dev/null","-c","commit.gpgsign=false",
+            "-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","-qm","synthetic source"])
+            .current_dir(repo).env_clear().env("PATH","/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
+            .env("GIT_AUTHOR_DATE","2000-01-01T00:00:00Z").env("GIT_COMMITTER_DATE","2000-01-01T00:00:00Z")
+            .output().await?;
+        ensure!(result.status.success(),"fixture commit failed");
+        Ok(git(repo,&["rev-parse","HEAD"]).await?.trim().into())
+    }
+    let original="fn main() { println!(\"first\"); }\n#[test] fn regression() { assert_eq!(2+2,4); }\n";
+    let first=commit(repo,original).await?;
+    git(repo,&["update-ref","refs/remotes/origin/main",&first]).await?;
+    let session=vm::Session::prepare(&root,&target)?;
+    let a=binding(repo).await?;let source=snapshot(repo,&a,&target).await?;
+    let first_generation=source.generation().to_owned();
+    let stamp=std::fs::metadata(source.path().join("src/main.rs"))?.modified()?;
+    let command=r#"set -e
+cat > target/rustc-probe <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> /workspace/target/compiler-calls
+exec "$@"
+SH
+chmod 700 target/rustc-probe
+RUSTC_WRAPPER=/workspace/target/rustc-probe cargo run --offline --locked --quiet
+python3 -c 'from pathlib import Path; print("UNITS="+str(sum("--crate-name freshness_fixture " in line for line in Path("target/compiler-calls").read_text().splitlines())))'
+"#;
+    let timeout=std::time::Duration::from_secs(180);
+    let mut reclaimed=0;
+    for _ in 0..2 {
+        let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some(command),&storage,&target,&audit,timeout).await?;
+        reclaimed+=outcome.cache_reclaimed.len();
+        ensure!(outcome.status=="passed" && outcome.stdout.trim()=="first\nUNITS=1",
+            "same-generation output/reuse mismatch: {} {}",outcome.stdout,outcome.stderr);
+    }
+    let tamper=r#"python3 -c 'import errno; from pathlib import Path
+p=Path("src/main.rs")
+try: p.write_text("fn main() {}")
+except OSError as error:
+ assert error.errno in (errno.EROFS,errno.EACCES,errno.EPERM); print("TRACKED_READ_ONLY")
+else: raise SystemExit("tracked source was writable")'"#;
+    let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some(tamper),&storage,&target,&audit,timeout).await?;
+    ensure!(outcome.status=="passed" && outcome.stdout.trim()=="TRACKED_READ_ONLY","tracked-source substitution was possible");
+    let private_cache=r#"python3 -c 'import os; from pathlib import Path
+assert os.environ["CARGO_HOME"]=="/ci-cargo-home"
+try: list(Path("/build-cache").iterdir())
+except PermissionError: pass
+else: raise SystemExit("worker can inspect shared cache generations")
+try: open("/dev/vda","rb")
+except PermissionError: pass
+else: raise SystemExit("worker can read the underlying cache block device")
+print("CACHE_ROOT_PRIVATE")'"#;
+    let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some(private_cache),&storage,&target,&audit,timeout).await?;
+    ensure!(outcome.status=="passed" && outcome.stdout.trim()=="CACHE_ROOT_PRIVATE","shared cache was visible outside the job mounts");
+    let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some("cargo test --offline --locked --quiet"),&storage,&target,&audit,timeout).await?;
+    ensure!(outcome.status=="passed" && outcome.stdout.contains("1 passed"),"original assertion did not execute");
+    drop(source);
+    commit(repo,"fn main() { println!(\"other\"); }\n").await?;
+    let b=binding(repo).await?;let source=snapshot(repo,&b,&target).await?;
+    ensure!(std::fs::metadata(source.path().join("src/main.rs"))?.modified()?==stamp,"fixture timestamps differ");
+    let outcome=session.run("repository",&source,repo,&b,None,&[],&[],&[],Some(command),&storage,&target,&audit,timeout).await?;
+    ensure!(outcome.status=="passed" && outcome.stdout.trim()=="other\nUNITS=1","changed source ran stale output: {} {}",outcome.stdout,outcome.stderr);
+    drop(source);
+    commit(repo,"fn main() { missing_function(); }\n").await?;
+    let bad=binding(repo).await?;let source=snapshot(repo,&bad,&target).await?;
+    let outcome=session.run("repository",&source,repo,&bad,None,&[],&[],&[],Some("cargo build --offline --locked --quiet"),&storage,&target,&audit,timeout).await?;
+    ensure!(outcome.status=="failed" && outcome.stderr.contains("E0425"),"compile error was hidden by stale success");
+    drop(source);
+    commit(repo,"fn main() {}\n#[test] fn regression() { assert_eq!(2+2,5); }\n").await?;
+    let bad=binding(repo).await?;let source=snapshot(repo,&bad,&target).await?;
+    let outcome=session.run("repository",&source,repo,&bad,None,&[],&[],&[],Some("cargo test --offline --locked --quiet"),&storage,&target,&audit,timeout).await?;
+    reclaimed+=outcome.cache_reclaimed.len();
+    ensure!(outcome.status=="failed" && outcome.stdout.contains("1 failed"),"failing assertion was hidden by stale success");
+    drop(source);
+    git(repo,&["reset","--hard",&first]).await?;
+    let restored=binding(repo).await?;let source=snapshot(repo,&restored,&target).await?;
+    ensure!(source.generation()!=first_generation,"same-HEAD reconstruction inherited its generation");
+    let outcome=session.run("repository",&source,repo,&restored,None,&[],&[],&[],Some(command),&storage,&target,&audit,timeout).await?;
+    reclaimed+=outcome.cache_reclaimed.len();
+    ensure!(outcome.status=="passed" && outcome.stdout.trim()=="first\nUNITS=1","same-HEAD reconstruction inherited changed artifacts");
+    ensure!(reclaimed>0,"bounded reclamation did not retire any prior quiescent generation");
+    audit.protected_health()?;
+    let receipt=serde_json::json!({"version":1,"kind":"real_shared_ci_cache_freshness_replay",
+        "adapter_authority":session.authority_sha256,"equal_old_timestamps":true,"changed_output":true,
+        "compile_error_observed":"E0425","failing_assertion_observed":true,"same_head_reconstruction":true,
+        "same_generation_compatible_units_recompiled":0,"tracked_source_read_only":true,
+        "shared_cache_root_private":true,"stable_cargo_home":true,
+        "reclaimed_generations_observed":reclaimed,"active_generation_preserved":true,
+        "trusted_external_seed_tested":false,"full_ci_pass":false,"shipping_authority":false,
+        "additional_model_calls":0,"autonomous_merges_claimed":0});
+    audit.record_controller(receipt.clone())?;audit.protected_health()?;
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+    Ok(())
+}
+
 /// Observe the exact Rust build check that fails in the deployed main gate.
 /// Persist bounded private output even on failure; no production verdict is set.
 #[tokio::test]
@@ -23,7 +154,7 @@ async fn live_shared_ci_rust_build_diagnostic() -> Result<()> {
     let storage=crate::build_storage::admit_ci(&root,&target).await?;
     let session=vm::Session::prepare(&root,&target)?;
     let source=snapshot(&root,&before,&target).await?;
-    let discovered=session.run("plan",source.path(),&root,&before,None,&["Cargo.toml".into()],&[],&[],None,
+    let discovered=session.run("plan",&source,&root,&before,None,&["Cargo.toml".into()],&[],&[],None,
         &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
     ensure!(discovered.status=="planned","guest planning unavailable");
     let plan:Plan=serde_json::from_value(discovered.plan.context("guest plan missing")?)?;plan.validate(&before)?;
@@ -40,7 +171,7 @@ try:
  fd=os.open(library,os.O_WRONLY); os.close(fd); writable=True
 except OSError: pass
 print(json.dumps({"cache":str(cache),"library_bytes":library.stat().st_size,"writable":writable,"interfaces":sorted(p.name for p in Path("/sys/class/net").iterdir()),"home":os.environ["HOME"]}))'"#;
-        let probe=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some(command),
+        let probe=session.run("repository",&source,&root,&before,None,&[],&[],&[],Some(command),
             &storage,&target,&audit,std::time::Duration::from_secs(180)).await;
         let mut diagnostic=match &probe {
             Ok(outcome)=>serde_json::json!({"status":outcome.status,"stdout":outcome.stdout,"stderr":outcome.stderr}),
@@ -67,7 +198,7 @@ print(json.dumps({"cache":str(cache),"library_bytes":library.stat().st_size,"wri
     let rust_build_attempted=onnx_probe_error.is_none();
     let observed=if let Some(error)=onnx_probe_error {Err(error)} else {async {
         drop(source);let source=snapshot(&root,&before,&target).await?;
-        session.run("step",source.path(),&root,&before,Some(check),&[],&[],&[],None,
+        session.run("step",&source,&root,&before,Some(check),&[],&[],&[],None,
             &storage,&target,&audit,check.remaining(std::time::Duration::ZERO)?).await
     }.await};
     let (status,stdout,stderr,error)=match observed {
@@ -108,14 +239,14 @@ async fn live_shared_ci_internal_links() -> Result<()> {
     std::fs::write(fixture.join("addon.node"),"owned build artifact")?;
     std::fs::hard_link(fixture.join("addon.node"),fixture.join("alias.node"))?;
     let command=r#"python3 -c 'import json; from pathlib import Path; a=Path("autoship-internal-link-fixture/addon.node"); b=a.with_name("alias.node"); print(json.dumps({"same_inode":a.stat().st_ino==b.stat().st_ino,"link_count":a.stat().st_nlink,"value":b.read_text()}))'"#;
-    let outcome=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some(command),&storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    let outcome=session.run("repository",&source,&root,&before,None,&[],&[],&[],Some(command),&storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
     let observed:serde_json::Value=serde_json::from_str(outcome.stdout.trim())?;
     ensure!(observed==serde_json::json!({"same_inode":true,"link_count":2,"value":"owned build artifact"}),"guest did not observe the unchanged internal aliases");
     // POSIX hard links require one filesystem. Keep this external fixture in
     // the admitted target, outside the exported snapshot, rather than /tmp.
     let external=tempfile::NamedTempFile::new_in(&target)?;std::fs::write(external.path(),"private host fixture")?;
     std::fs::hard_link(external.path(),fixture.join("external-alias"))?;
-    let refused=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some("touch autoship-internal-link-fixture/negative-dispatched"),&storage,&target,&audit,std::time::Duration::from_secs(180)).await;
+    let refused=session.run("repository",&source,&root,&before,None,&[],&[],&[],Some("touch autoship-internal-link-fixture/negative-dispatched"),&storage,&target,&audit,std::time::Duration::from_secs(180)).await;
     ensure!(refused.is_err(),"external host alias was admitted");
     ensure!(!fixture.join("negative-dispatched").exists() && std::fs::read_to_string(external.path())?=="private host fixture","negative probe reached execution or changed host data");
     ensure!(binding(&root).await?==before,"diagnostic changed source binding");audit.protected_health()?;
@@ -157,7 +288,7 @@ async fn live_shared_ci_vm_smoke() -> Result<()> {
     // This is explicit diagnostic selection, not a claim about actual changed
     // paths or complete applicability on this branch.
     let diagnostic_paths = vec!["scripts/tests/model_router_install_test.py".to_owned()];
-    let discovered = session.run("plan", source.path(), &root, &before, None,
+    let discovered = session.run("plan", &source, &root, &before, None,
         &diagnostic_paths, &[], &[], None, &storage, &target, &audit,
         std::time::Duration::from_secs(180)).await?;
     ensure!(discovered.status == "planned", "real guest planning did not succeed");
@@ -170,7 +301,7 @@ async fn live_shared_ci_vm_smoke() -> Result<()> {
     // Production recreates the snapshot after prerequisite probes, too.
     drop(source);
     let source = snapshot(&root, &before, &target).await?;
-    let outcome = session.run("step", source.path(), &root, &before, Some(check),
+    let outcome = session.run("step", &source, &root, &before, Some(check),
         &[], &[], &[], None, &storage, &target, &audit,
         check.remaining(std::time::Duration::ZERO)?).await?;
     ensure!(outcome.status == "passed", "real guest Python check failed: {}", outcome.stderr);
