@@ -87,6 +87,30 @@ impl Check {
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+fn failure_excerpt(output: &str, max: usize) -> String {
+    // Cargo can end a failure with one enormous rustc invocation. Bound each
+    // wide line first so the final excerpt retains the preceding diagnostic
+    // and the command's exit reason instead of only dependency arguments.
+    let mut compact = String::new();
+    for line in output.split_inclusive('\n') {
+        if line.len() <= 2048 {
+            compact.push_str(line);
+            continue;
+        }
+        let mut head = 512;
+        while !line.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = line.len() - 512;
+        while !line.is_char_boundary(tail) {
+            tail += 1;
+        }
+        compact.push_str(&line[..head]);
+        compact.push_str(" … [long line shortened] … ");
+        compact.push_str(&line[tail..]);
+    }
+    truncate_tail(&compact, max)
+}
 impl Plan {
     fn validate(&self, binding: &Binding) -> Result<()> {
         ensure!(
@@ -401,7 +425,7 @@ pub(super) async fn verify(
     ensure!(
         discovered.status == "planned",
         "{PREREQUISITE}: guest prerequisite discovery failed: {}",
-        truncate_tail(&discovered.stderr, 8192)
+        failure_excerpt(&discovered.stderr, 8192)
     );
     let plan: Plan = serde_json::from_value(
         discovered
@@ -466,8 +490,8 @@ pub(super) async fn verify(
             bail!(
                 "shared CI check {} failed:\n{}\n{}",
                 check.id,
-                truncate_tail(&outcome.stdout, 16000),
-                truncate_tail(&outcome.stderr, 8000)
+                failure_excerpt(&outcome.stdout, 16000),
+                failure_excerpt(&outcome.stderr, 8000)
             );
         }
     }
@@ -554,8 +578,8 @@ pub(super) async fn targeted(
     ensure!(
         outcome.status == "passed",
         "targeted CI failed:\n{}\n{}",
-        truncate_tail(&outcome.stdout, 16000),
-        truncate_tail(&outcome.stderr, 8000)
+        failure_excerpt(&outcome.stdout, 16000),
+        failure_excerpt(&outcome.stderr, 8000)
     );
     Ok(())
 }
@@ -615,8 +639,8 @@ pub(super) async fn repository(
     ensure!(
         outcome.status == "passed",
         "owner repository verification failed:\n{}\n{}",
-        truncate_tail(&outcome.stdout, 16000),
-        truncate_tail(&outcome.stderr, 8000)
+        failure_excerpt(&outcome.stdout, 16000),
+        failure_excerpt(&outcome.stderr, 8000)
     );
     Ok(())
 }
@@ -624,6 +648,31 @@ pub(super) async fn repository(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failure_excerpt_keeps_compiler_diagnostics_before_a_wide_command() {
+        let stderr = format!(
+            "error[E0308]: mismatched types\n --> crates/augmentagent-messages/src/people.rs:108:23\nexpected `&Option<String>`, found `&Vec<String>`\nerror: could not compile `augmentagent-messages`\nCaused by:\n  process didn't exit successfully: `rustc {}` (exit status: 1)\n",
+            "--extern dependency=/build-cache/target/debug/deps/library.rlib ".repeat(2000)
+        );
+        let excerpt = failure_excerpt(&stderr, 8000);
+        assert!(excerpt.contains("error[E0308]"), "compiler error was replaced by command noise");
+        assert!(excerpt.contains("people.rs:108:23"));
+        assert!(excerpt.contains("expected `&Option<String>`, found `&Vec<String>`"));
+        assert!(excerpt.contains("exit status: 1"));
+        assert!(excerpt.len() <= 8003);
+    }
+    #[test]
+    fn failure_excerpt_preserves_small_output_and_bounds_unicode_commands() {
+        let small = "error[E0308]: mismatched types\n --> people.rs:108:23\n";
+        assert_eq!(failure_excerpt(small, 8000), small);
+        let wide = format!("{small}process didn't exit successfully: `rustc {}` (exit status: 1)\n", "🦀".repeat(10000));
+        for limit in [0, 1, 2, 1024, 8000] {
+            assert!(failure_excerpt(&wide, limit).len() <= limit + '…'.len_utf8());
+        }
+        let excerpt = failure_excerpt(&wide, 8000);
+        assert!(excerpt.contains("error[E0308]"));
+        assert!(excerpt.ends_with("(exit status: 1)\n"));
+    }
     pub(super) fn binding_fixture() -> Binding {
         Binding {
             head: "head".into(),
