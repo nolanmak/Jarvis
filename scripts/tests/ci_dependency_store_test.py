@@ -114,6 +114,31 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[seed])
                 self.assertFalse(receipt.exists())
 
+    def test_uncommitted_seed_retirement_namespace_cannot_delete_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,seed=self.released_seed(root)
+            original_sync=store._fsync_directory
+            def failed_parent_commit(path):
+                if path==root:raise OSError('retirement namespace parent not durable')
+                return original_sync(path)
+            with patch.object(store,'_fsync_directory',side_effect=failed_parent_commit):
+                with self.assertRaises(store.FreshnessHold):
+                    store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256'])
+            self.assertTrue((root/'ci-trusted-dependencies'/seed/'manifest.json').is_file())
+
+    def test_uncommitted_producer_retirement_namespace_cannot_delete_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding,producer,command,target,home,ack=self.fixture(root)
+            original_sync=store._fsync_directory
+            def failed_parent_commit(path):
+                if path==root:raise OSError('retirement namespace parent not durable')
+                return original_sync(path)
+            with patch.object(store,'_fsync_directory',side_effect=failed_parent_commit):
+                with self.assertRaises(store.FreshnessHold):
+                    store.reclaim_producers(root,[],cache_identity=binding['cache_identity_sha256'],
+                        eligible=[{'producer':producer,'ack':ack}])
+            self.assertTrue(target.is_dir());self.assertTrue(home.is_dir())
+
     def test_empty_seed_installation_still_has_consistent_sealed_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);binding,_,_,_,_,_=self.fixture(root)

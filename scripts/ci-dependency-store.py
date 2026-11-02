@@ -157,6 +157,16 @@ def _fsync_directory(path):
     finally:os.close(descriptor)
 
 
+def _retirement_directories(root,name):
+    """Commit the complete intent namespace before any payload is unlinked."""
+    history=root/name;pending=history/'pending';completed=history/'completed'
+    try:
+        for path in (history,pending,completed):cache._directory(path,0o700,create=True)
+        for path in (pending,completed,history,root):_fsync_directory(path)
+    except OSError:raise FreshnessHold('cleanup_uncertain') from None
+    return pending,completed
+
+
 def _retirement_ack(control,ack):
     if (not isinstance(ack,dict) or set(ack)!={'command','authority_sha256','cache_identity_sha256','quiescence_sha256'}
             or ack['command']!=control['command'] or not cache._digest(ack['quiescence_sha256'])
@@ -195,9 +205,7 @@ def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=No
     root=_root(directory);producers=root/'ci-dependency-producers'
     if not producers.exists() and not producers.is_symlink():return []
     cache._directory(producers,0o700,create=False)
-    history=root/'ci-producer-retirements';cache._directory(history,0o700,create=True)
-    pending=history/'pending';completed=history/'completed'
-    for path in (pending,completed):cache._directory(path,0o700,create=True)
+    pending,completed=_retirement_directories(root,'ci-producer-retirements')
     # Completed history is outside the pending discovery window. Old receipts
     # cannot starve interrupted retirement recovery as the archive grows.
     candidates=[path.stem for path in itertools.islice(pending.iterdir(),1024) if path.suffix=='.json']
@@ -328,6 +336,9 @@ def _released_seed(root,identity,manifest,cache_identity):
     if (original['control']['binding']!=manifest['binding'] or original['control']['kind']!=producer['kind']
             or original['published']!={'version':1,'seed':identity,'ack':ack} or receipt['authorization']!=ack):
         raise FreshnessHold('cleanup_uncertain')
+    # Original producer records may predate namespace durability enforcement.
+    # Commit that already validated acknowledgement before removing its seed.
+    for path in (history,history.parent,root):_fsync_directory(path)
 
 
 def _remaining_seed_inventory(path,manifest):
@@ -378,9 +389,7 @@ def reclaim_seeds(directory,*,cache_identity,protected_seeds=(),limit=2):
         referenced,producers=_seed_references(root);referenced.update(protected_seeds)
         seeds=root/'ci-trusted-dependencies';candidates=_bounded_entries(seeds,0o700)
     except (FreshnessHold,OSError,ValueError,KeyError,TypeError):return []
-    history=root/'ci-seed-retirements';cache._directory(history,0o700,create=True)
-    pending=history/'pending';completed=history/'completed'
-    for path in (pending,completed):cache._directory(path,0o700,create=True)
+    pending,completed=_retirement_directories(root,'ci-seed-retirements')
     try:incomplete=_bounded_entries(pending,0o700)
     except (FreshnessHold,OSError):return []
     identities=[path.stem for path in incomplete if path.suffix=='.json']
