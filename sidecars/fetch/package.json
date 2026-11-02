@@ -13,14 +13,14 @@
     "test": "npm run build && node --test test/*.test.js"
   },
   "dependencies": {
-    "dotenv": "^17.3.1",
-    "playwright": "^1.52.0",
+    "dotenv": "^18.0.9",
+    "playwright": "^1.64.1",
     "turndown": "^7.2.0"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.6.5",
     "@types/turndown": "^5.0.5",
     "ts-node": "^10.9.2",
-    "typescript": "^5.7.0"
+    "typescript": "^7.0.2"
   }
 }
