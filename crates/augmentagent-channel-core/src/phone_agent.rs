@@ -437,7 +437,9 @@ impl FastBridge {
             let check = self.attention.as_ref().unwrap().check_with_progress(&origin, progress)
                 .instrument(tracing::info_span!("phone_attention",call_id=%call.id,task_id));
             tokio::pin!(check);
-            let deadline = tokio::time::sleep(Duration::from_secs(6));
+            // Leave room for authorization/store work around the provider's
+            // five-second source reads without changing those source bounds.
+            let deadline = tokio::time::sleep(Duration::from_secs(7));
             tokio::pin!(deadline);
             let mut continuing = false;
             let checked = loop {
@@ -449,7 +451,7 @@ impl FastBridge {
                         continuing = true;
                         // Extend once for bounded source retries. Repeated or
                         // unacknowledged progress cannot keep a job alive.
-                        deadline.as_mut().reset(started + Duration::from_secs(36));
+                        deadline.as_mut().reset(started + Duration::from_secs(40));
                         if self.store.phone_attention_notice(&call.id, task_id, &notice).is_err() {
                             tracing::warn!(call_id=%call.id, task_id, "phone source progress unavailable; final answer remains independent");
                         }
