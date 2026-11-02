@@ -1902,6 +1902,7 @@ impl Store {
             if changed == 1 {
                 tx.execute("UPDATE phone_live_dispatches SET result=?3 WHERE call_id=?1 AND task_id=?2 AND delivered=0 AND EXISTS(SELECT 1 FROM phone_live_sessions s WHERE s.call_id=?1 AND s.active=1)",
                     params![call_id,task_id,result])?;
+                tx.execute("DELETE FROM phone_attention_notices WHERE call_id=?1 AND task_id=?2", params![call_id,task_id])?;
             }
             Ok(())
         })
@@ -2060,6 +2061,7 @@ impl Store {
     pub fn phone_end_live_session(&self, call_id: &str, session_id: &str) -> PhoneResult<()> {
         transaction(self, |tx| {
             live_binding(tx, call_id, session_id)?;
+            tx.execute("DELETE FROM phone_attention_notices WHERE call_id=?1",[call_id])?;
             tx.execute(
                 "UPDATE phone_live_sessions SET active=0 WHERE call_id=?1",
                 [call_id],
@@ -2081,6 +2083,7 @@ impl Store {
     pub fn phone_reconcile_live_sessions(&self) -> PhoneResult<()> {
         transaction(self, |tx| {
             tx.execute("UPDATE phone_live_sessions SET active=0 WHERE active=1 AND call_id IN (SELECT id FROM phone_calls WHERE state!='connected' OR stop_requested=1 OR ended_ms IS NOT NULL)", [])?;
+            tx.execute("DELETE FROM phone_attention_notices WHERE call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0)",[])?;
             tx.execute("INSERT INTO phone_live_result_receipts(call_id,delegation_id,disposition) SELECT call_id,delegation_id,'discarded' FROM phone_live_dispatches WHERE delivered=0 AND call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0) ON CONFLICT(call_id,delegation_id) DO UPDATE SET disposition='discarded' WHERE disposition IN ('pending','sending')",[])?;
             tx.execute("UPDATE phone_live_reply_intents SET disposition='discarded' WHERE disposition='sending' AND call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0)",[])?;
             tx.execute("UPDATE phone_live_dispatches SET delivered=1,result=NULL WHERE delivered=0 AND call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0)", [])?;

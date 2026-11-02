@@ -181,6 +181,17 @@ CREATE TABLE IF NOT EXISTS phone_dispatch_jobs (
     PRIMARY KEY(call_id, task_id)
 );
 
+-- One best-effort source-gap notice. Claim intent precedes socket I/O;
+-- neither issuance nor a provider acknowledgment means a task is complete.
+CREATE TABLE IF NOT EXISTS phone_attention_notices (
+    call_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    notice TEXT,
+    claimed INTEGER NOT NULL DEFAULT 0 CHECK(claimed IN (0,1)),
+    PRIMARY KEY(call_id,task_id),
+    FOREIGN KEY(call_id,task_id) REFERENCES phone_dispatch_jobs(call_id,task_id)
+);
+
 -- One immutable provider session per durably claimed phone relay.
 CREATE TABLE IF NOT EXISTS phone_live_sessions (
     call_id TEXT PRIMARY KEY REFERENCES phone_calls(id),

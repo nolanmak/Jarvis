@@ -3,7 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use augmentagent_channel_calendar::{CalendarApi, ComposioCalendarClient, MeetingPayload};
-use augmentagent_channel_core::phone_attention::AttentionProvider;
+use augmentagent_channel_core::phone_attention::{AttentionProgress, AttentionProvider};
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
 use augmentagent_store::{phone::PhoneOrigin, Account, Store};
 use chrono::{Local, Utc};
@@ -15,6 +15,7 @@ use std::{
 };
 use tokio::sync::OnceCell;
 const FRESH_MS: i64 = 300_000;
+#[derive(Clone)]
 struct SourceView {
     name: String,
     checked_ms: Option<i64>,
@@ -173,12 +174,20 @@ fn accounts(store: &Store) -> Result<Vec<Account>> {
 }
 struct CachedSource {
     view: SourceView,
-    expires_ms: i64,
+    expires_at: tokio::time::Instant,
+}
+#[derive(Hash, PartialEq, Eq)]
+struct SourceKey {
+    calendar: bool,
+    account: String,
+    connection: Option<String>,
+    entity: String,
+    email: String,
 }
 pub struct PhoneAttention {
     store: Arc<Store>,
     reads: Arc<dyn Reads>,
-    cache: Mutex<HashMap<String, Arc<OnceCell<CachedSource>>>>,
+    cache: Mutex<HashMap<SourceKey, Arc<OnceCell<CachedSource>>>>,
 }
 impl PhoneAttention {
     pub fn new(store: Arc<Store>) -> Self {
@@ -195,23 +204,25 @@ impl PhoneAttention {
         }
     }
     async fn source(&self, account: &Account, calendar: bool) -> SourceView {
-        let key = format!(
-            "{}:{}",
-            if calendar { "calendar" } else { "inbox" },
-            account.entity_id
-        );
-        let now = Utc::now().timestamp_millis();
+        let key = SourceKey {
+            calendar,
+            account: account.id.clone(),
+            connection: account.connection_id.clone(),
+            entity: account.entity_id.clone(),
+            email: account.email.clone(),
+        };
+        let now = tokio::time::Instant::now();
         let cell = {
             let mut cache = self.cache.lock().unwrap();
             let expired = cache
                 .get(&key)
                 .and_then(|c| c.get())
-                .is_some_and(|c| c.expires_ms <= now);
+                .is_some_and(|c| c.expires_at <= now);
             if expired {
                 cache.remove(&key);
             }
             if cache.len() >= 64 && !cache.contains_key(&key) {
-                cache.retain(|_, c| c.get().is_none_or(|v| v.expires_ms > now));
+                cache.retain(|_, c| c.get().is_none_or(|v| v.expires_at > now));
             }
             cache.entry(key).or_default().clone()
         };
@@ -246,12 +257,12 @@ impl PhoneAttention {
                     "phone attention source read finished"
                 );
                 CachedSource {
-                    expires_ms: Utc::now().timestamp_millis()
-                        + if calendar && view.complete {
-                            FRESH_MS
+                    expires_at: tokio::time::Instant::now()
+                        + Duration::from_millis(if calendar && view.complete {
+                            FRESH_MS as u64
                         } else {
                             1000
-                        },
+                        }),
                     view,
                 }
             })
@@ -265,77 +276,150 @@ impl PhoneAttention {
         }
     }
 }
-#[async_trait]
-impl AttentionProvider for PhoneAttention {
-    async fn check(&self, origin: &PhoneOrigin) -> Result<Option<String>> {
+impl PhoneAttention {
+    fn validate_plan(
+        &self,
+        origin: &PhoneOrigin,
+        revision: i64,
+        configured: &[Account],
+    ) -> Result<()> {
         let binding = self.store.surface_owner_binding(origin.owner.account())?;
-        let revision = binding.as_ref().map(|b| b.revision);
         anyhow::ensure!(
-            binding.is_some_and(|b| b.owner == origin.owner
+            binding.is_some_and(|b| b.revision == revision
+                && b.owner == origin.owner
                 && b.is_control_conversation(origin.conversation.conversation_id())),
-            "phone attention origin is no longer authorized"
+            "phone attention authorization changed during reads"
         );
-        let accounts = accounts(&self.store)?;
-        if accounts.is_empty() {
+        let identity = |rows: &[Account]| {
+            rows.iter()
+                .map(|a| {
+                    (
+                        a.id.clone(),
+                        a.connection_id.clone(),
+                        a.entity_id.clone(),
+                        a.email.clone(),
+                        a.active,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        anyhow::ensure!(
+            identity(&accounts(&self.store)?) == identity(configured),
+            "attention source configuration changed during check"
+        );
+        Ok(())
+    }
+    async fn run_check(
+        &self,
+        origin: &PhoneOrigin,
+        progress: AttentionProgress,
+    ) -> Result<Option<String>> {
+        let binding = self.store.surface_owner_binding(origin.owner.account())?;
+        let binding = binding
+            .filter(|b| {
+                b.owner == origin.owner
+                    && b.is_control_conversation(origin.conversation.conversation_id())
+            })
+            .ok_or_else(|| anyhow::anyhow!("phone attention origin is no longer authorized"))?;
+        let configured = accounts(&self.store)?;
+        if configured.is_empty() {
             return Ok(Some(
                 "No calendar or inbox accounts are enabled, so I haven't checked them.".into(),
             ));
         }
-        anyhow::ensure!(accounts.len() <= 32, "too many attention sources");
-        let mut checks = FuturesUnordered::new();
-        for account in &accounts {
-            checks.push(Box::pin(async move { self.source(account, true).await })
-                as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = SourceView> + Send + '_>,
-                >);
-            checks.push(Box::pin(async move { self.source(account, false).await }));
+        anyhow::ensure!(configured.len() <= 32, "too many attention sources");
+        let plan = (0..configured.len())
+            .flat_map(|i| [(i, true), (i, false)])
+            .collect::<Vec<_>>();
+        let mut views: Vec<Option<SourceView>> = vec![None; plan.len()];
+        // Two retries of missing coverage only. The initial healthy-source
+        // answer still has the same five-second concurrent source bounds.
+        for attempt in 0..3 {
+            self.validate_plan(origin, binding.revision, &configured)?;
+            let now = Utc::now().timestamp_millis();
+            let mut checks = FuturesUnordered::new();
+            for (index, &(account, calendar)) in plan.iter().enumerate() {
+                if views[index]
+                    .as_ref()
+                    .is_some_and(|v| fresh(v, now) && v.complete)
+                {
+                    continue;
+                }
+                let account = &configured[account];
+                checks.push(async move { (index, self.source(account, calendar).await) });
+            }
+            while let Some((index, view)) = checks.next().await {
+                views[index] = Some(view);
+            }
+            self.validate_plan(origin, binding.revision, &configured)?;
+            let views_now = views.iter().flatten().cloned().collect::<Vec<_>>();
+            let now = Utc::now().timestamp_millis();
+            let complete = views_now.iter().all(|v| fresh(v, now) && v.complete);
+            let actionable = views_now
+                .iter()
+                .any(|v| fresh(v, now) && !v.facts.is_empty());
+            if complete || actionable || attempt == 2 {
+                let mut answer = render(&views_now, now);
+                if !complete && !actionable {
+                    answer.push_str(" Those sources are still incomplete after two retries. I've stopped this check; we can keep talking.");
+                }
+                return Ok(Some(answer));
+            }
+            progress.source_gap(&missing_notice(&views_now, now));
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
-        let mut views = vec![];
-        while let Some(view) = checks.next().await {
-            views.push(view);
-        }
-        let binding = self.store.surface_owner_binding(origin.owner.account())?;
-        anyhow::ensure!(
-            binding.is_some_and(|b| b.owner == origin.owner
-                && b.is_control_conversation(origin.conversation.conversation_id())),
-            "phone attention authorization changed during reads"
-        );
-        let current = self.store.with_conn(|c| {
-            c.prepare("SELECT id,entityId,active FROM gmail_accounts WHERE active=1 ORDER BY id")?
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, bool>(2)?,
-                    ))
-                })?
-                .collect::<augmentagent_store::rusqlite::Result<Vec<_>>>()
-        })?;
-        anyhow::ensure!(
-            current
-                == accounts
-                    .iter()
-                    .map(|a| (a.id.clone(), a.entity_id.clone(), a.active))
-                    .collect::<Vec<_>>()
-                && self
-                    .store
-                    .surface_owner_binding(origin.owner.account())?
-                    .map(|b| b.revision)
-                    == revision,
-            "attention source configuration changed during check"
-        );
-        Ok(Some(render(&views, Utc::now().timestamp_millis())))
+        unreachable!("bounded attention attempts always return")
     }
 }
+#[async_trait]
+impl AttentionProvider for PhoneAttention {
+    async fn check(&self, origin: &PhoneOrigin) -> Result<Option<String>> {
+        self.run_check(origin, AttentionProgress::default()).await
+    }
+    async fn check_with_progress(
+        &self,
+        origin: &PhoneOrigin,
+        progress: AttentionProgress,
+    ) -> Result<Option<String>> {
+        self.run_check(origin, progress).await
+    }
+}
+fn fresh(view: &SourceView, now: i64) -> bool {
+    view.checked_ms
+        .is_some_and(|t| t <= now && now - t <= FRESH_MS)
+}
+fn missing_notice(views: &[SourceView], now: i64) -> String {
+    let missing = views
+        .iter()
+        .filter(|v| !fresh(v, now) || !v.complete)
+        .collect::<Vec<_>>();
+    let pieces = missing
+        .iter()
+        .take(2)
+        .map(|v| {
+            let mut text = format!("{} {}", v.name, v.gap.unwrap_or("is incomplete"));
+            if text.len() > 200 {
+                let mut end = 200;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push_str("…");
+            }
+            text
+        })
+        .collect::<Vec<_>>();
+    format!("The attention check is incomplete. Still missing: {}{}. I'm continuing to check; I don't have verified findings yet.",
+        pieces.join("; "), if missing.len() > 2 { "; and other required sources" } else { "" })
+}
+
 fn render(views: &[SourceView], now: i64) -> String {
     let mut facts = vec![];
     let mut gaps = vec![];
     let mut complete = !views.is_empty();
     let mut oldest: Option<i64> = None;
     for view in views {
-        let fresh = view
-            .checked_ms
-            .is_some_and(|t| t <= now && now - t <= FRESH_MS);
+        let fresh = fresh(view, now);
         if fresh {
             facts.extend(view.facts.iter().take(3).cloned());
             oldest = match (oldest, view.checked_ms) {
@@ -460,6 +544,7 @@ mod tests {
         inbox_calls: std::sync::atomic::AtomicUsize,
         actionable: bool,
         failures: usize,
+        first: tokio::sync::Notify,
     }
     #[async_trait]
     impl Reads for RecoveringReads {
@@ -472,6 +557,9 @@ mod tests {
             let attempt = self
                 .inbox_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                self.first.notify_one();
+            }
             if attempt < self.failures {
                 anyhow::bail!("synthetic temporary source outage");
             }
@@ -495,6 +583,7 @@ mod tests {
             inbox_calls: 0.into(),
             actionable,
             failures: 1,
+            first: Default::default(),
         });
         let (_dir, provider, origin) = fixture(reads.clone());
         let started = tokio::time::Instant::now();
@@ -531,8 +620,11 @@ mod tests {
     async fn persistent_source_failure_has_bounded_retries_and_never_becomes_all_clear() {
         use std::sync::atomic::Ordering::SeqCst;
         let reads = Arc::new(RecoveringReads {
-            calendar_calls: 0.into(), inbox_calls: 0.into(),
-            actionable: false, failures: usize::MAX,
+            calendar_calls: 0.into(),
+            inbox_calls: 0.into(),
+            actionable: false,
+            failures: usize::MAX,
+            first: Default::default(),
         });
         let (_dir, provider, origin) = fixture(reads.clone());
         let started = tokio::time::Instant::now();
@@ -540,22 +632,117 @@ mod tests {
         assert!(answer.contains("Still missing") && !answer.contains("I found no"));
         assert!(started.elapsed() <= Duration::from_secs(36));
         assert_eq!(reads.calendar_calls.load(SeqCst), 1);
-        assert_eq!(reads.inbox_calls.load(SeqCst), 3,
-            "make two bounded retries, then report the unresolved source honestly");
+        assert_eq!(
+            reads.inbox_calls.load(SeqCst),
+            3,
+            "make two bounded retries, then report the unresolved source honestly"
+        );
     }
     #[tokio::test(start_paused = true)]
     async fn healthy_verified_empty_check_finishes_without_background_retries() {
         use std::sync::atomic::Ordering::SeqCst;
         let reads = Arc::new(RecoveringReads {
-            calendar_calls: 0.into(), inbox_calls: 0.into(),
-            actionable: false, failures: 0,
+            calendar_calls: 0.into(),
+            inbox_calls: 0.into(),
+            actionable: false,
+            failures: 0,
+            first: Default::default(),
         });
         let (_dir, provider, origin) = fixture(reads.clone());
         let started = tokio::time::Instant::now();
-        assert!(provider.check(&origin).await.unwrap().unwrap().contains("I found no pending triaged inbox items"));
+        assert!(provider
+            .check(&origin)
+            .await
+            .unwrap()
+            .unwrap()
+            .contains("I found no pending triaged inbox items"));
         assert!(started.elapsed() <= Duration::from_secs(5));
         assert_eq!(reads.calendar_calls.load(SeqCst), 1);
         assert_eq!(reads.inbox_calls.load(SeqCst), 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_incomplete_checks_share_the_retry_and_keep_the_healthy_snapshot() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = Arc::new(RecoveringReads {
+            calendar_calls: 0.into(),
+            inbox_calls: 0.into(),
+            actionable: true,
+            failures: 1,
+            first: Default::default(),
+        });
+        let (_dir, provider, origin) = fixture(reads.clone());
+        let (a, b) = tokio::join!(provider.check(&origin), provider.check(&origin));
+        assert!(a.unwrap().unwrap().contains("Synthetic approval deadline"));
+        assert!(b.unwrap().unwrap().contains("Synthetic approval deadline"));
+        assert_eq!(reads.calendar_calls.load(SeqCst), 1);
+        assert_eq!(reads.inbox_calls.load(SeqCst), 2);
+    }
+    async fn invalidate_during_retry(revoke: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = Arc::new(RecoveringReads {
+            calendar_calls: 0.into(),
+            inbox_calls: 0.into(),
+            actionable: true,
+            failures: 1,
+            first: Default::default(),
+        });
+        let (_dir, provider, origin) = fixture(reads.clone());
+        let provider = Arc::new(provider);
+        let task_provider = provider.clone();
+        let task_origin = origin.clone();
+        let task = tokio::spawn(async move { task_provider.check(&task_origin).await });
+        reads.first.notified().await;
+        if revoke {
+            provider
+                .store
+                .unbind_surface_owner(origin.owner.account())
+                .unwrap();
+        } else {
+            provider
+                .store
+                .with_conn(|c| c.execute("UPDATE gmail_accounts SET active=0", []))
+                .unwrap();
+        }
+        assert!(
+            task.await.unwrap().is_err(),
+            "a changed source plan or authority cancels the check before another read"
+        );
+        assert_eq!(reads.inbox_calls.load(SeqCst), 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn revoked_owner_cannot_resume_an_incomplete_check() {
+        invalidate_during_retry(true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn changed_source_plan_cannot_resume_an_incomplete_check() {
+        invalidate_during_retry(false).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn reconnected_source_requires_its_own_fresh_snapshot() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = Arc::new(FakeReads {
+            calendar_calls: 0.into(),
+            inbox_calls: 0.into(),
+            slow_inbox: false,
+        });
+        let (_dir, provider, origin) = fixture(reads.clone());
+        provider.check(&origin).await.unwrap();
+        provider
+            .store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE gmail_accounts SET connectionId='new-connection' WHERE active=1",
+                    [],
+                )
+            })
+            .unwrap();
+        provider.check(&origin).await.unwrap();
+        assert_eq!(
+            reads.calendar_calls.load(SeqCst),
+            2,
+            "a reconnected source cannot borrow the prior connection's check time"
+        );
+        assert_eq!(reads.inbox_calls.load(SeqCst), 2);
     }
     fn fixture(reads: Arc<dyn Reads>) -> (tempfile::TempDir, PhoneAttention, PhoneOrigin) {
         use augmentagent_store::{
