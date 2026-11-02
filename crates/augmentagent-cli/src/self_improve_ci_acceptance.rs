@@ -43,6 +43,14 @@ async fn live_shared_ci_complete_coverage() -> Result<()> {
             ensure!(prior.value()["kind"]==kind && prior.value()["run_id"]==record["run_id"],
                 "local completion borrowed another execution's plan or start");
         }
+        let current_context=crate::autoship_workflow::Binding {head:head.clone(),
+            contract:"isolated-ci-fixture-v1".into(),evidence_hash:digest(b"isolated CI fixture acceptance context")};
+        let expected=proof::CiExpectation::current(root,"fixture/shared-ci#1",&current_context).await?;
+        let refused=proof::publish_passing_ci(&audit,&completed,&expected).err()
+            .context("preparation-only actual CI execution minted a final passing proof")?;
+        ensure!(refused.downcast_ref::<crate::autoship_freshness::Hold>().is_some_and(|hold|
+            hold.reason==crate::autoship_freshness::Reason::InputCensusUnknown),
+            "preparation-only refusal was not the expected typed input prerequisite: {refused:#}");
         let old=completed.receipt().payload_sha256().to_owned();
         std::fs::write(root.join("arithmetic.py"),"def add(a, b):\n    return 0\n")?;
         git(root,&["add","arithmetic.py"]).await?;
@@ -56,6 +64,8 @@ async fn live_shared_ci_complete_coverage() -> Result<()> {
         std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
             "version":1,"kind":"real_shared_ci_complete_coverage","local_checks_covered":commands.len(),
             "protected_start_plan_and_command_lineage":true,"newer_failed_run_cannot_return_old_completion":true,
+            "current_git_runtime_and_owned_generation_expectations":true,
+            "preparation_only_actual_producer_refused_final_ci_authority":true,
             "historical_completion_preserved":true,"full_ci_pass":false,"shipping_authority":false,
             "autonomous_merges_claimed":0}))?)?;
         Ok::<_,anyhow::Error>(())

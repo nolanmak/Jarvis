@@ -86,20 +86,171 @@ pub(crate) enum SourceMode {
 /// Trusted caller expectations, derived from its owned checkout/registration,
 /// current runtime census and declared invocation, never from a model response.
 pub(crate) struct InputExpectation {
-    pub source: Binding,
-    pub mode: SourceMode,
-    pub generation: String,
-    pub command: String,
-    pub invocation: Invocation,
-    pub authority_sha256: String,
-    pub physical_cache_sha256: String,
-    pub overlay_registration_sha256: Option<String>,
+    source: Binding,
+    mode: SourceMode,
+    generation: String,
+    command: String,
+    invocation: Invocation,
+    authority_sha256: String,
+    physical_cache_sha256: String,
+    overlay_registration_sha256: Option<String>,
 }
 pub(crate) struct CiExpectation {
-    pub workflow: String,
-    pub binding: crate::autoship_workflow::Binding,
-    pub source: Binding,
-    pub authority_sha256: String,
+    workflow: String,
+    binding: crate::autoship_workflow::Binding,
+    source: Binding,
+    authority_sha256: String,
+}
+impl CiExpectation {
+    /// Reconstruct current authority from controller-pinned code/config and
+    /// actual runtime bytes. Neither a receipt nor a model supplies these
+    /// expectations. This starts no VM and cannot publish a passing proof.
+    pub(crate) async fn current(
+        root: &Path,
+        workflow: &str,
+        workflow_binding: &crate::autoship_workflow::Binding,
+    ) -> Result<Self> {
+        use crate::autoship_freshness::Reason;
+        let source = binding(root).await.map_err(|_| {
+            hold(
+                Reason::InputCensusUnknown,
+                "current candidate Git binding unavailable",
+            )
+        })?;
+        let target = crate::build_storage::effective_target(root);
+        let session = vm::Session::prepare(root, &target).map_err(|_| {
+            hold(
+                Reason::AuthorityChanged,
+                "current controller/runtime authority unavailable",
+            )
+        })?;
+        let after = binding(root).await.map_err(|_| {
+            hold(
+                Reason::InputCensusUnknown,
+                "candidate changed while measuring current authority",
+            )
+        })?;
+        if source != after {
+            return Err(hold(
+                Reason::GenerationMismatch,
+                "candidate changed while measuring current authority",
+            ));
+        }
+        Self::from_current_observation(
+            workflow,
+            workflow_binding,
+            source,
+            session.authority_sha256.clone(),
+        )
+    }
+    fn from_current_observation(
+        workflow: &str,
+        workflow_binding: &crate::autoship_workflow::Binding,
+        source: Binding,
+        authority_sha256: String,
+    ) -> Result<Self> {
+        use crate::autoship_freshness::Reason;
+        workflow_binding.validate()?;
+        validate_source(&source)?;
+        if workflow.is_empty()
+            || workflow.len() > 1024
+            || workflow.chars().any(char::is_control)
+            || !oid(&workflow_binding.head)
+            || !sha(&workflow_binding.evidence_hash)
+            || source.head != workflow_binding.head
+            || source.verification_head != source.head
+            || !source.status.is_empty()
+        {
+            return Err(hold(
+                Reason::GenerationMismatch,
+                "current required CI expects a clean exact workflow head",
+            ));
+        }
+        if !sha(&authority_sha256) {
+            return Err(hold(
+                Reason::AuthorityChanged,
+                "current runtime authority missing",
+            ));
+        }
+        Ok(Self {
+            workflow: workflow.to_owned(),
+            binding: workflow_binding.clone(),
+            source,
+            authority_sha256,
+        })
+    }
+}
+impl InputExpectation {
+    /// Expectations for an actual owned execution, measured independently of
+    /// guest JSON. Registered verifier overlays have a separate registration
+    /// requirement and cannot be silently inferred as ordinary staged source.
+    pub(super) async fn current_execution(
+        root: &Path,
+        owned: &verifier_checkout::OwnedCheckout,
+        requested: &Binding,
+        command: &str,
+        invocation: Invocation,
+        session: &vm::Session,
+    ) -> Result<Self> {
+        use crate::autoship_freshness::Reason;
+        invocation.digest()?;
+        validate_source(requested)?;
+        let source = binding_at(root, &requested.base_ref).await.map_err(|_| {
+            hold(
+                Reason::InputCensusUnknown,
+                "current execution Git source unavailable",
+            )
+        })?;
+        let exported_head = git(owned.path(), &["rev-parse", "HEAD"])
+            .await
+            .map_err(|_| {
+                hold(
+                    Reason::InputCensusUnknown,
+                    "owned export Git head unavailable",
+                )
+            })?;
+        if source != *requested
+            || exported_head.trim() != requested.verification_head
+            || !uuid(owned.generation())
+            || !uuid(command)
+        {
+            return Err(hold(
+                Reason::GenerationMismatch,
+                "current execution source/generation no longer matches its request",
+            ));
+        }
+        session.validate_runtime(false)?;
+        if !sha(&session.authority_sha256) {
+            return Err(hold(
+                Reason::AuthorityChanged,
+                "current execution runtime authority missing",
+            ));
+        }
+        let physical_cache_sha256 = session.cache_identity()?;
+        let mode = if source.head == source.verification_head && source.status.is_empty() {
+            SourceMode::CommittedGit
+        } else if source.head != source.verification_head && !source.status.is_empty() {
+            SourceMode::StagedSnapshot
+        } else {
+            return Err(hold(
+                Reason::InputCensusUnknown,
+                "execution source mode is inconsistent",
+            ));
+        };
+        Ok(Self {
+            source,
+            mode,
+            generation: owned.generation().to_owned(),
+            command: command.to_owned(),
+            invocation,
+            authority_sha256: session.authority_sha256.clone(),
+            physical_cache_sha256,
+            overlay_registration_sha256: None,
+        })
+    }
+    pub(super) fn physical_cache_sha256(&self) -> &str {
+        &self.physical_cache_sha256
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,7 +278,9 @@ struct Inputs {
 }
 // Null is an explicit observation of absence. Omitting the field is an
 // incomplete manifest and must not silently deserialize to the same evidence.
-pub(super) fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+pub(super) fn required_nullable<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: DeserializeOwned,
@@ -868,6 +1021,53 @@ pub(super) fn publish_passing_ci(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn current_ci_expectations_refuse_dirty_foreign_or_unbounded_workflow_context() {
+        let (_dir, _audit, inputs, _expected) = fixture();
+        let context = crate::autoship_workflow::Binding {
+            head: inputs.source.head.clone(),
+            contract: "owner-contract-v1".into(),
+            evidence_hash: "f".repeat(64),
+        };
+        assert!(CiExpectation::from_current_observation(
+            "owner/repo#1",
+            &context,
+            inputs.source.clone(),
+            inputs.authority_sha256.clone()
+        )
+        .is_ok());
+        for fault in [
+            "head",
+            "staged",
+            "dirty",
+            "evidence",
+            "workflow",
+            "authority",
+            "source-contract",
+        ] {
+            let mut source = inputs.source.clone();
+            let mut binding = context.clone();
+            let mut workflow = "owner/repo#1".to_owned();
+            let mut authority = inputs.authority_sha256.clone();
+            match fault {
+                "head" => binding.head = "d".repeat(40),
+                "staged" => {
+                    source.verification_head = "d".repeat(40);
+                    source.status = "M  source.rs\n".into();
+                }
+                "dirty" => source.status = "?? unknown\n".into(),
+                "evidence" => binding.evidence_hash = "unknown".into(),
+                "workflow" => workflow = "owner/repo#1\n".into(),
+                "authority" => authority = "unknown".into(),
+                _ => source.contract_sha256 = "unknown".into(),
+            }
+            assert!(
+                CiExpectation::from_current_observation(&workflow, &binding, source, authority)
+                    .is_err(),
+                "{fault}"
+            );
+        }
+    }
     fn fixture() -> (
         tempfile::TempDir,
         std::sync::Arc<augmentagent_channel_core::AuditLogger>,

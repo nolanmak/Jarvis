@@ -316,6 +316,16 @@ impl Drop for Session {
     }
 }
 impl Session {
+    pub(super) fn cache_identity(&self)->Result<String> {
+        let invalid=||crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,
+            "reason":"artifact_provenance_unknown","recovery":"restore_trusted_dependencies",
+            "evidence_sha256":digest(b"current physical CI cache identity unavailable")}));
+        let meta=std::fs::symlink_metadata(&self.cache).map_err(|_|invalid())?;
+        if !meta.is_file() || meta.nlink()!=1 || meta.uid()!=unsafe{libc::geteuid()} || meta.mode() & 0o077!=0 {
+            return Err(invalid().into());
+        }
+        Ok(digest(&serde_json::to_vec(&(meta.dev(),meta.ino(),meta.len()))?))
+    }
     pub(super) fn validate_runtime(&self,content:bool)->Result<()> {
         let expected=self.runtime_identity.as_ref().context("shared CI prerequisite unavailable: runtime identity missing")?;
         let current=runtime_identity(self.directory.as_ref().context("CI controller bundle missing")?.path(),content)?;
@@ -556,6 +566,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         }
         let generation = source.generation().to_owned();
         let source_lifetime=source.lifetime();
+        let owned_source=source;
         let source = source.path();
         let command_id = uuid::Uuid::new_v4().to_string();
         let (predecessor,retained_generations)=self.cache_state(&generation)?;
@@ -693,10 +704,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
                 _=>unreachable!(),
             };
             let invocation_sha256=invocation.digest()?;
-            let cache=std::fs::metadata(&self.cache)
-                .context("shared CI prerequisite unavailable: physical cache identity missing")?;
-            let cache_identity=digest(&serde_json::to_vec(&(cache.dev(),cache.ino(),cache.len()))?);
-            let prepared=outcome.validated_preparation(binding,&generation,&command_id,&self.authority_sha256,&cache_identity)?;
+            let expected=proof::InputExpectation::current_execution(root,owned_source,binding,&command_id,invocation,self).await?;
+            let prepared=outcome.validated_preparation(binding,&generation,&command_id,&self.authority_sha256,expected.physical_cache_sha256())?;
             // Preparation proves the original invocation/cache relationship.
             // Generated-input attestation and full planned coverage must still
             // be established before C can publish its final passing proof.
@@ -738,6 +747,56 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_cache_identity_refuses_replacement_aliases_and_shared_writes() {
+        let directory=tempfile::tempdir().unwrap();let cache=directory.path().join("cache.img");
+        let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:cache.clone(),
+            authority_sha256:String::new(),runtime_identity:None,completed_generations:Default::default(),execution:Default::default()};
+        assert!(session.cache_identity().is_err());
+        std::fs::write(&cache,b"cache-a").unwrap();std::fs::set_permissions(&cache,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let original=session.cache_identity().unwrap();
+        std::fs::rename(&cache,directory.path().join("original.img")).unwrap();
+        std::fs::write(&cache,b"cache-b").unwrap();std::fs::set_permissions(&cache,std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(session.cache_identity().unwrap(),original,"a replaced image retained the original physical identity");
+        std::fs::set_permissions(&cache,std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(session.cache_identity().is_err());
+        std::fs::set_permissions(&cache,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias=directory.path().join("alias.img");std::fs::hard_link(&cache,&alias).unwrap();
+        assert!(session.cache_identity().is_err());std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_file(&cache).unwrap();std::os::unix::fs::symlink(directory.path().join("original.img"),&cache).unwrap();
+        assert!(session.cache_identity().is_err());
+    }
+
+    #[tokio::test]
+    async fn execution_expectations_measure_current_git_and_owned_export() {
+        let directory=tempfile::tempdir().unwrap();let root=directory.path().join("repo");std::fs::create_dir(&root).unwrap();
+        git(&root,&["init","-q"]).await.unwrap();std::fs::write(root.join("source.rs"),"original source\n").unwrap();
+        git(&root,&["add","."]).await.unwrap();
+        git(&root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","original"]).await.unwrap();
+        let head=git(&root,&["rev-parse","HEAD"]).await.unwrap().trim().to_owned();
+        git(&root,&["update-ref","refs/remotes/origin/main",&head]).await.unwrap();
+        let requested=super::super::binding(&root).await.unwrap();
+        let source=verifier_checkout::allocate(directory.path(),&head,"ci-contract").unwrap();
+        git(source.path(),&["init","-q"]).await.unwrap();
+        std::fs::write(source.path().join(".git/HEAD"),format!("{head}\n")).unwrap();
+        std::fs::write(source.path().join(".git/objects/info/alternates"),format!("{}\n",root.join(".git/objects").display())).unwrap();
+        let bundle=tempfile::tempdir().unwrap();
+        let measured=RuntimeIdentity {version:1,content_sha256:None,metadata_sha256:"a".repeat(64),files:1,bytes:1};
+        std::fs::write(bundle.path().join("ci-runtime-identity.py"),format!("print({:?})\n",serde_json::to_string(&measured).unwrap())).unwrap();
+        let cache=directory.path().join("cache.img");std::fs::write(&cache,b"fixture-cache").unwrap();
+        std::fs::set_permissions(&cache,std::fs::Permissions::from_mode(0o600)).unwrap();
+        let session=Session {directory:Some(bundle),memory_mb:0,cache_bytes:0,cache,
+            authority_sha256:"b".repeat(64),runtime_identity:Some(measured),completed_generations:Default::default(),execution:Default::default()};
+        let command=uuid::Uuid::new_v4().to_string();
+        let invocation=||proof::Invocation::Targeted {packages:vec!["fixture".into()]};
+        assert!(proof::InputExpectation::current_execution(&root,&source,&requested,&command,invocation(),&session).await.is_ok());
+        std::fs::write(root.join("source.rs"),"changed source\n").unwrap();git(&root,&["add","source.rs"]).await.unwrap();
+        assert!(proof::InputExpectation::current_execution(&root,&source,&requested,&command,invocation(),&session).await.is_err());
+        git(&root,&["reset","--hard","HEAD"]).await.unwrap();
+        std::fs::write(source.path().join(".git/HEAD"),format!("{}\n","f".repeat(40))).unwrap();
+        assert!(proof::InputExpectation::current_execution(&root,&source,&requested,&command,invocation(),&session).await.is_err());
+    }
 
     #[cfg(target_os="linux")]
     #[test]
