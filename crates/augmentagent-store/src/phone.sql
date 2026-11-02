@@ -284,3 +284,16 @@ CREATE TABLE IF NOT EXISTS phone_live_reply_intents (
     PRIMARY KEY(call_id,event_id),
     FOREIGN KEY(call_id,delegation_id) REFERENCES phone_live_dispatches(call_id,delegation_id)
 );
+
+-- Completed fast read facts await the next already-requested native turn.
+-- This is context, never a new reasoning/tool job and never a speech retry.
+CREATE TABLE IF NOT EXISTS phone_attention_context (
+    call_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    native_session_id TEXT,
+    content TEXT,
+    consumed_turn_id TEXT,
+    PRIMARY KEY(call_id,task_id),
+    FOREIGN KEY(call_id,task_id) REFERENCES phone_dispatch_jobs(call_id,task_id)
+);

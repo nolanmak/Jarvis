@@ -1933,6 +1933,8 @@ fn live_binding(tx: &Transaction<'_>, call_id: &str, session_id: &str) -> PhoneR
 }
 #[path = "phone_live_delivery.rs"]
 mod delivery;
+#[path = "phone_attention.rs"]
+mod attention;
 
 impl Store {
     /// Trusted ingress only, after callback verification and durable relay claim.

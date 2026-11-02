@@ -32,7 +32,7 @@ fn startup_pins_audio_model_voice_and_client_delegation() {
         start["session"]["audio"]["format"],
         json!({"type":"audio/pcmu","rate":8000})
     );
-    assert_eq!(start["session"]["delegation"], json!({"type":"client"}));
+    assert_eq!(start["session"]["delegation"], json!({"type":"client","acknowledgement_delay_ms":800}));
     assert_eq!(s.state(), LiveState::Starting);
     assert_eq!(s.start().err(), Some(LiveError::State));
     assert_eq!(s.audio(&[255; 160]).err(), Some(LiveError::State));
@@ -231,7 +231,7 @@ fn invalid_timeline_and_nonclient_delegation_fail_closed() {
 }
 
 #[test]
-fn only_correlated_probed_delegation_rejection_can_keep_the_session_active() {
+fn probed_nonfatal_rejection_preserves_session_and_only_correlated_commands_can_repair() {
     for mode in [
         "recoverable",
         "uncorrelated",
@@ -259,6 +259,8 @@ fn only_correlated_probed_delegation_rejection_can_keep_the_session_active() {
                 "a definitively rejected reference must not destroy a usable session"
             );
             assert_eq!(s.state(), LiveState::Active);
+            if mode=="uncorrelated" {assert!(matches!(result.unwrap(),LiveInput::Ignored));}
+            else {assert!(matches!(result.unwrap(),LiveInput::CommentaryRejected{..}));}
             assert!(s.audio(&[255; 160]).is_ok());
         } else {
             let e = result.err().expect("unproven recovery remains terminal");

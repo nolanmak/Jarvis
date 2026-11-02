@@ -381,6 +381,7 @@ impl CodexCliReasoner {
         })?;
 
         process_group.admit_model(provider,launch_audit.as_ref()).await?;
+        crate::phone_timing::spawned(provider);
 
         if let Some(mut stdin) = child.stdin.take() {
             // #1626 — from the first byte on, the CLI may have the turn.
@@ -431,6 +432,7 @@ impl CodexCliReasoner {
                 debug!("{provider} jsonl parse skip: {line}");
                 continue;
             };
+            crate::phone_timing::codex_event(&v);
             let kind = v.get("type").and_then(|t| t.as_str());
             if kind == Some("thread.started") {
                 if let (Some(vm), Some(id)) = (&native_vm, v.get("thread_id").and_then(|value|value.as_str())) {

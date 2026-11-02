@@ -42,11 +42,15 @@ impl Clock for ClockFixture {
         1000
     }
 }
-struct TelephonyFixture;
+#[derive(Default)]
+struct TelephonyFixture {
+    creates: AtomicUsize,
+}
 #[async_trait]
 impl Telephony for TelephonyFixture {
     async fn create(&self, _: DialRequest) -> Result<String, ProviderError> {
-        panic!("incoming fixture must not dial")
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        Ok("CA00000000000000000000000000000001".into())
     }
     async fn hangup(&self, _: &str) -> Result<(), ProviderError> {
         Ok(())
@@ -87,6 +91,7 @@ impl AttentionProvider for Source {
     }
 }
 struct Native {
+    slow: bool,
     started: Arc<Notify>,
     release: Notify,
     calls: AtomicUsize,
@@ -96,15 +101,15 @@ struct Native {
 impl QueryHandler for Native {
     async fn answer(&self, ctx: &AuditCtx, prompt: &str) -> anyhow::Result<String> {
         assert!(ctx.owner_authorized);
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         // Existing behavior sends the ordinary attention check through this
         // slow path. A passing implementation bypasses it for the first answer.
-        if !prompt.contains("Tuesday at 5 PM") {
+        if (self.slow && index == 0) || (!self.slow && !prompt.contains("Tuesday at 5 PM")) {
             self.release.notified().await;
         }
         assert!(
-            prompt.contains("Tuesday at 5 PM"),
+            self.slow || prompt.contains("Tuesday at 5 PM"),
             "the native follow-up must receive the facts already supplied by the fast read path"
         );
         let mut opts = ReasonerOpts::pinned(
@@ -113,12 +118,20 @@ impl QueryHandler for Native {
         );
         opts.session_id = Some(ctx.session_id.clone());
         self.provider.call(&opts, prompt).await?;
-        Ok("The deadline is Tuesday at 5 PM.".into())
+        Ok(if self.slow && index == 0 {
+            "The synthetic deadline is Tuesday at 5 PM. ".repeat(42)
+        } else {
+            "The deadline is Tuesday at 5 PM.".into()
+        })
     }
 }
 fn signature(path: &str, fields: &[(String, String)]) -> String {
     let mut mac = Hmac::<Sha1>::new_from_slice(b"synthetic-token").unwrap();
-    let origin=if path.starts_with("/phone/relay/") {PUBLIC.replacen("https://","wss://",1)} else {PUBLIC.into()};
+    let origin = if path.starts_with("/phone/relay/") {
+        PUBLIC.replacen("https://", "wss://", 1)
+    } else {
+        PUBLIC.into()
+    };
     mac.update(format!("{origin}{path}").as_bytes());
     let mut fields = fields.to_vec();
     fields.sort();
@@ -131,9 +144,7 @@ fn signature(path: &str, fields: &[(String, String)]) -> String {
 fn wire(value: Value) -> Message {
     Message::Text(value.to_string().into())
 }
-#[tokio::test]
-async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps_followup_context()
-{
+async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
     let account =
@@ -148,6 +159,42 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
     store
         .phone_import_destination("canonical", "+12025550123", 0)
         .unwrap();
+    let busy_provider = Arc::new(
+        RecordingNativeProvider::new(ProviderKind::Claude).holding_on("Existing blocked work"),
+    );
+    let busy_task = if busy {
+        let task_store = store.clone();
+        let task_chat = chat.clone();
+        let provider = busy_provider.clone();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let task = tokio::spawn(async move {
+            let turn = augmentagent_store::SurfaceTurnRef::new(task_chat, "busy-text").unwrap();
+            augmentagent_channel_core::surface_turn::run_surface_turn(
+                &task_store,
+                augmentagent_channel_core::surface_turn::SurfaceTurnRequest {
+                    turn: &turn,
+                    history: "",
+                    current: "Existing blocked work",
+                    cwd: &cwd,
+                },
+                || Ok(Some(ProviderKind::Claude)),
+                None,
+                |prompt| async move {
+                    let opts = ReasonerOpts::pinned(
+                        augmentagent_channel_core::ModelTier::Fast,
+                        "Synthetic held native turn",
+                    );
+                    provider.call(&opts, &prompt).await
+                },
+            )
+            .await
+            .unwrap();
+        });
+        busy_provider.started.notified().await;
+        Some(task)
+    } else {
+        None
+    };
     let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/", peer.local_addr().unwrap());
     let config = PhoneConfig::new(
@@ -155,7 +202,7 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
         PUBLIC,
         "synthetic-verification-key-at-least-32-bytes",
         vec![OwnerLink {
-            surface_owner: owner,
+            surface_owner: owner.clone(),
             owner_id: "canonical".into(),
         }],
     )
@@ -165,9 +212,10 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
     ))
     .unwrap()
     .with_live(Some(LiveConfig::for_test(endpoint)));
+    let telephony = Arc::new(TelephonyFixture::default());
     let service = Arc::new(PhoneService::new(
         store.clone(),
-        Arc::new(TelephonyFixture),
+        telephony.clone(),
         Arc::new(ClockFixture),
         config,
     ));
@@ -177,6 +225,7 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
         reads: AtomicUsize::new(0),
     });
     let native = Arc::new(Native {
+        slow,
         started: started.clone(),
         release: Notify::new(),
         calls: AtomicUsize::new(0),
@@ -207,36 +256,64 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
     .await
     .unwrap();
     let peer_task = tokio::spawn(async move {
+        if !inbound {
+            let (tcp, _) = peer.accept().await.unwrap();
+            let mut preflight = accept_async(tcp).await.unwrap();
+            let _ = preflight.next().await.unwrap().unwrap();
+            preflight.send(wire(json!({"type":"session.started","session":{"id":"preflight","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}))).await.unwrap();
+            let close = preflight.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(close.to_text().unwrap()).unwrap()["type"],
+                "session.close"
+            );
+            preflight.send(wire(json!({"type":"session.closed","reason":"close_requested","session":{"id":"preflight"},"usage":{"seconds":0.5}}))).await.unwrap();
+        }
         let (tcp, _) = peer.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
         let _ = ws.next().await.unwrap().unwrap();
         ws.send(wire(json!({"type":"session.started","session":{"id":"live-integration","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}))).await.unwrap();
         for v in [
-            json!({"type":"session.input_transcript.delta","event_id":"user-1a","delta":"Anything important ","start_ms":0,"end_ms":50}),
-            json!({"type":"session.input_transcript.delta","event_id":"user-1b","delta":"I'm missing right now?","start_ms":50,"end_ms":100}),
-            json!({"type":"session.delegation.created","event_id":"delegated-1","offset_ms":110,"delegation":{"id":"del-1","type":"delegation","target":"client"}}),
+            json!({"type":"session.input_transcript.delta","event_id":"greeting-user","delta":"What's up Jarvis?","start_ms":0,"end_ms":10}),
+            json!({"type":"session.output_transcript.delta","event_id":"greeting-assistant","delta":"Hi.","start_ms":10,"end_ms":20}),
+            json!({"type":"session.input_transcript.delta","event_id":"user-1a","delta":if slow {"Research the synthetic "}else{"Anything important "},"start_ms":30,"end_ms":80}),
+            json!({"type":"session.input_transcript.delta","event_id":"user-1b","delta":if slow {"project deadlines."}else{"I'm missing right now?"},"start_ms":80,"end_ms":130}),
+            json!({"type":"session.delegation.created","event_id":"delegated-1","offset_ms":140,"delegation":{"id":"del-1","type":"delegation","target":"client"}}),
         ] {
             ws.send(wire(v)).await.unwrap();
         }
         let mut answered = 0;
+        let mut rejected = false;
+        let mut queued_acks = 0;
         while let Some(Ok(Message::Text(text))) = ws.next().await {
             let v: Value = serde_json::from_str(&text).unwrap();
             if v["type"] == "session.close" {
                 ws.send(wire(json!({"type":"session.closed","reason":"close_requested","session":{"id":"live-integration"},"usage":{"seconds":3.}}))).await.unwrap();
                 break;
             }
+            if v["type"] == "session.thinking.append" {
+                queued_acks += 1;
+                assert_eq!(v["content"], "");
+                continue;
+            }
             if v["type"] != "session.commentary.append" {
                 continue;
             }
-            assert!(
-                v["content"].as_str().unwrap().contains("Tuesday at 5 PM"),
-                "only useful verified facts count as the result"
-            );
+            let useful = v["content"].as_str().unwrap().contains("Tuesday at 5 PM");
+            if slow && useful && !rejected {
+                rejected = true;
+                ws.send(wire(json!({"type":"error","error":{"type":"invalid_request_error","code":null,"param":"delegation_id","client_event_id":v["event_id"],"message":"Unknown client or Decision delegation."}}))).await.unwrap();
+                continue;
+            }
             ws.send(wire(
                 json!({"type":"session.commentary.appended","client_event_id":v["event_id"]}),
             ))
             .await
             .unwrap();
+            // Progress and later pieces of the same result cannot stand in
+            // for the second request's actual answer.
+            if !useful || (answered > 0 && v["delegation_id"] != "del-2") {
+                continue;
+            }
             ws.send(wire(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([140+answered;160])}))).await.unwrap();
             answered += 1;
             if answered == 1 {
@@ -249,6 +326,11 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
             }
         }
         assert_eq!(answered, 2);
+        assert_eq!(
+            queued_acks, 2,
+            "exactly one application-owned quiet acknowledgment per delegation"
+        );
+        assert_eq!(rejected, slow);
     });
     let client = reqwest::Client::new();
     let fields: Vec<(String, String)> = [
@@ -261,28 +343,67 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
     .into_iter()
     .map(|(k, v)| (k.into(), v.into()))
     .collect();
-    let incoming = client
-        .post(format!("{local}/phone/incoming"))
-        .header("x-twilio-signature", signature("/phone/incoming", &fields))
-        .form(&fields)
-        .send()
-        .await
-        .unwrap();
-    assert!(incoming.status().is_success());
-    let call = store.phone_inbound_by_sid("CA00000000000000000000000000000001").unwrap();
-    let path = format!("/phone/incoming/{}", call.id);
-    let mut pin = fields.clone();
-    pin.push(("Digits".into(), "4831".into()));
-    let response = client
-        .post(format!("{local}{path}"))
-        .header("x-twilio-signature", signature(&path, &pin))
-        .form(&pin)
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let (call, response) = if inbound {
+        let incoming = client
+            .post(format!("{local}/phone/incoming"))
+            .header("x-twilio-signature", signature("/phone/incoming", &fields))
+            .form(&fields)
+            .send()
+            .await
+            .unwrap();
+        assert!(incoming.status().is_success());
+        let call = store
+            .phone_inbound_by_sid("CA00000000000000000000000000000001")
+            .unwrap();
+        let path = format!("/phone/incoming/{}", call.id);
+        let mut pin = fields.clone();
+        pin.push(("Digits".into(), "4831".into()));
+        let response = client
+            .post(format!("{local}{path}"))
+            .header("x-twilio-signature", signature(&path, &pin))
+            .form(&pin)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        (call, response)
+    } else {
+        let grant = service.authorize(&owner, &chat).unwrap();
+        let receipt = service
+            .tool(
+                &grant,
+                "call_owner",
+                json!({"request_id":"outbound-variant"}),
+            )
+            .await
+            .unwrap();
+        let call = store
+            .phone_provider_call(receipt["id"].as_str().unwrap())
+            .unwrap();
+        let path = format!("/phone/start/{}", call.id);
+        let mut outbound = fields.clone();
+        for (k, v) in &mut outbound {
+            match k.as_str() {
+                "Direction" => *v = "outbound-api".into(),
+                "From" => *v = "+12025550456".into(),
+                "To" => *v = "+12025550123".into(),
+                _ => {}
+            }
+        }
+        let response = client
+            .post(format!("{local}{path}"))
+            .header("x-twilio-signature", signature(&path, &outbound))
+            .form(&outbound)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        (call, response)
+    };
     assert!(response.contains("<Stream "));
     let address = local.replacen("http://", "ws://", 1) + &format!("/phone/relay/{}", call.id);
     let mut request = address.into_client_request().unwrap();
@@ -302,7 +423,10 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
         .expect("source or native work must start");
     let start = tokio::time::Instant::now();
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::advance(Duration::from_secs(if slow { 94 } else { 2 })).await;
+    if slow {
+        native.release.notify_one();
+    }
     tokio::time::resume();
     for expected in [140, 141] {
         let frame=tokio::time::timeout(Duration::from_secs(1),ws.next()).await.expect("useful attention facts must reach the call by three seconds without waiting for full native completion").unwrap().unwrap();
@@ -313,19 +437,37 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
         let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(v["media"]["payload"], STANDARD.encode([expected; 160]));
         let _ = ws.next().await.unwrap().unwrap();
-        if expected == 140 {
+        if expected == 140 && !slow {
             assert!(start.elapsed() < Duration::from_secs(3));
+            if busy {
+                busy_provider.release.notify_one();
+            }
         }
     }
-    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        source.reads.load(Ordering::SeqCst),
+        if slow { 0 } else { 1 }
+    );
     assert_eq!(
         native.calls.load(Ordering::SeqCst),
-        1,
+        if slow { 2 } else { 1 },
         "only the follow-up needs native reasoning"
     );
+    assert_eq!(
+        telephony.creates.load(Ordering::SeqCst),
+        if inbound { 0 } else { 1 }
+    );
+    if slow {
+        let ids = native.provider.observed_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
+    }
     assert!(!store.phone_provider_call(&call.id).unwrap().stop_requested);
     ws.send(wire(json!({"event":"stop","sequenceNumber":"2","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA00000000000000000000000000000001"}}))).await.unwrap();
     peer_task.await.unwrap();
+    if let Some(task) = busy_task {
+        task.await.unwrap();
+    }
     runtime.shutdown().await.unwrap();
     assert!(io
         .mirrors
@@ -333,4 +475,23 @@ async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps
         .unwrap()
         .iter()
         .any(|(_, s)| s.contains("Tuesday at 5 PM")));
+}
+
+#[tokio::test]
+async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps_followup_context()
+{
+    exercise_call(false, true, false).await;
+}
+#[tokio::test]
+async fn incoming_slow_native_result_recovers_rejected_context_and_answers_the_next_question() {
+    exercise_call(true, true, false).await;
+}
+#[tokio::test]
+async fn outbound_attention_check_uses_the_same_result_and_native_followup_path() {
+    exercise_call(false, false, false).await;
+}
+
+#[tokio::test]
+async fn attention_facts_and_history_handoff_bypass_an_active_shared_native_turn() {
+    exercise_call(false, true, true).await;
 }

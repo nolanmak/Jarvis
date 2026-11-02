@@ -13,9 +13,16 @@ use std::{
 
 pub enum LiveAction {
     None,
-    Queued { task_id: String },
-    Clarify { delegation_id: String },
-    QueueFull { delegation_id: String },
+    Queued {
+        task_id: String,
+        delegation_id: String,
+    },
+    Clarify {
+        delegation_id: String,
+    },
+    QueueFull {
+        delegation_id: String,
+    },
 }
 struct Reply {
     delegation: String,
@@ -58,8 +65,10 @@ pub struct LiveCall {
     context: LiveContext,
     replies: HashMap<String, Reply>,
     result_offsets: HashMap<String, usize>,
+    last_result: Option<String>,
     context_results: HashSet<String>,
     expired_replies: Vec<String>,
+    notices: Vec<(String, String, tokio::time::Instant, bool)>,
     pending_delegations: VecDeque<(String, f64, tokio::time::Instant, bool)>,
     last_user_fragment: Option<tokio::time::Instant>,
 }
@@ -83,8 +92,10 @@ impl LiveCall {
             context: LiveContext::default(),
             replies: HashMap::new(),
             result_offsets: HashMap::new(),
+            last_result: None,
             context_results: HashSet::new(),
             expired_replies: Vec::new(),
+            notices: Vec::new(),
             pending_delegations: VecDeque::new(),
             last_user_fragment: None,
         })
@@ -207,7 +218,49 @@ impl LiveCall {
             Err(_) => return Err(LiveError::Unavailable),
         };
         self.service.dispatch_ready.notify_one();
-        Ok(LiveAction::Queued { task_id })
+        self.notices.push((
+            id.clone(),
+            task_id.clone(),
+            tokio::time::Instant::now(),
+            false,
+        ));
+        tracing::info!(call_id=%self.call_id,task_id=%task_id,offset_hint_ms=offset,"phone live request accepted for dispatch");
+        Ok(LiveAction::Queued {
+            task_id,
+            delegation_id: id,
+        })
+    }
+    pub fn delay_notice(&mut self) -> Result<Option<PhoneLiveResult>, LiveError> {
+        self.service
+            .authorize_call(&self.call_id)
+            .map_err(|_| LiveError::Access)?;
+        if !self.replies.is_empty() || !self.pending_results()?.is_empty() {
+            return Ok(None);
+        }
+        let jobs = self
+            .service
+            .store
+            .phone_pending_dispatches()
+            .map_err(|_| LiveError::Unavailable)?;
+        for (delegation, task, started, notified) in &mut self.notices {
+            if *notified || started.elapsed() < std::time::Duration::from_secs(10) {
+                continue;
+            }
+            *notified = true;
+            let Some(job) = jobs
+                .iter()
+                .find(|j| j.call_id == self.call_id && j.task_id == *task)
+            else {
+                continue;
+            };
+            let phase = match job.state.as_str() {
+                "queued" => "still queued",
+                "running" => "still running",
+                _ => continue,
+            };
+            return Ok(Some(PhoneLiveResult{delegation_id:delegation.clone(),result:format!("The task is {phase}; I don't have its verified findings yet. We can keep talking while it finishes.")}));
+        }
+        Ok(None)
     }
     pub fn pending_results(&self) -> Result<Vec<PhoneLiveResult>, LiveError> {
         self.service
@@ -218,6 +271,14 @@ impl LiveCall {
             .store
             .phone_live_results(&self.call_id, &self.session_id)
             .map_err(|_| LiveError::Unavailable)?;
+        if let Some(index) = self
+            .last_result
+            .as_ref()
+            .and_then(|last| results.iter().position(|r| &r.delegation_id == last))
+        {
+            let next = (index + 1) % results.len();
+            results.rotate_left(next);
+        }
         for result in &mut results {
             let offset = self
                 .result_offsets
@@ -267,6 +328,7 @@ impl LiveCall {
                 end == result.result.len(),
             )
             .map_err(|_| LiveError::Unavailable)?;
+        self.last_result = Some(delegation_id.into());
         self.replies.insert(
             event_id.into(),
             Reply {

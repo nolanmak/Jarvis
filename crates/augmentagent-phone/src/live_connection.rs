@@ -145,6 +145,13 @@ impl LiveConnection {
         self.send(event).await?;
         Ok(id)
     }
+    pub(crate) async fn acknowledge_queued(
+        &mut self,
+        delegation_id: &str,
+    ) -> Result<(), LiveError> {
+        let event = self.session.thinking(delegation_id)?;
+        self.send(event).await
+    }
     pub(crate) fn prepare_commentary(
         &mut self,
         delegation_id: Option<&str>,
