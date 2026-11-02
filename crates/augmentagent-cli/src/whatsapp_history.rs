@@ -377,8 +377,10 @@ mod approve_tests {
             body: "Sam, can you drive?".into(),
             attachments: vec![],
         };
+        // Stored the way `poll_once` stores it.
         let stored = history::email(&conv, 4, &entry);
-        store.upsert_email(&stored).unwrap();
+        store.upsert_email_backfill(&stored, 1).unwrap();
+        store.record_reply_recipients(&stored).unwrap();
         let gid = store
             .log_action(&stored.message_id, stored.thread_id.as_deref(), &stored.from, "WhatsApp group: Ski Trip",
                         Some(&stored.body), Some("yes"), ActionStatus::Pending)
