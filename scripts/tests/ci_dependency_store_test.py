@@ -94,6 +94,26 @@ class StoreTests(unittest.TestCase):
                     protected_seeds=[seed] if case=='protected-install' else []),[])
                 self.assertTrue(path.is_dir())
 
+    def test_orphan_seed_retirement_recovers_after_unlink_and_completion_boundaries(self):
+        for boundary in ('payload-removed','completion-written'):
+            with self.subTest(boundary=boundary),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);binding,seed=self.released_seed(root)
+                namespace=root/'ci-trusted-dependencies'
+                original_sync=store._fsync_directory
+                def interrupted_sync(path):
+                    if path==namespace:raise OSError('crash after unlink')
+                    return original_sync(path)
+                fault=patch.object(store,'_fsync_directory',side_effect=interrupted_sync) if boundary=='payload-removed' else \
+                    patch.object(store.os,'rename',side_effect=OSError('crash after completion write'))
+                with fault,self.assertRaises(store.FreshnessHold):
+                    store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256'])
+                self.assertFalse((namespace/seed).exists())
+                receipt=root/'ci-seed-retirements'/'pending'/(seed+'.json')
+                self.assertEqual(store._document(receipt)['state'],
+                    'reclaiming' if boundary=='payload-removed' else 'reclaimed')
+                self.assertEqual(store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256']),[seed])
+                self.assertFalse(receipt.exists())
+
     def test_empty_seed_installation_still_has_consistent_sealed_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);binding,_,_,_,_,_=self.fixture(root)
