@@ -386,7 +386,9 @@ mod tests {
     /// What `poll_once` stores before replies run.
     fn ingest(store: &Store, d: &Delta) {
         for (i, e) in &d.entries {
-            store.upsert_email(&email(&d.conversation, *i, e)).unwrap();
+            let row = email(&d.conversation, *i, e);
+            store.upsert_email_backfill(&row, 1).unwrap();
+            store.record_reply_recipients(&row).unwrap();
         }
     }
 
