@@ -1142,6 +1142,30 @@ mod tests {
         assert!(!unexpected.exists(), "detached tool survived the daemon crash");
     }
 
+    /// #1779 D2 — the supervisor forwards how the provider ended. A child
+    /// killed by a signal while the supervisor lives (OOM SIGKILL, `pkill
+    /// claude`) exits 128+n, so `interrupted_by_signal` sees it instead of a
+    /// bare 1 that reads as "provider unavailable". A stopped supervisor still
+    /// exits 143 and an ordinary exit code passes through unchanged.
+    #[tokio::test]
+    async fn supervisor_forwards_a_child_signal_death_as_128_plus_n() {
+        for (script, expected) in [
+            ("kill -KILL $$", 137),
+            ("kill -HUP $$", 129),
+            ("exit 7", 7),
+            ("exit 0", 0),
+            ("kill -TERM $PPID; sleep 5", 143),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            let (mut child, group) =
+                spawn_supervised(&command, false, Arc::new(AtomicBool::new(true)), None).unwrap();
+            let status = child.wait().await.unwrap();
+            drop(group);
+            assert_eq!(status.code(), Some(expected), "{script}: {status:?}");
+        }
+    }
+
     #[tokio::test]
     async fn request_is_exclusive_until_verified_cleanup_then_can_resume() {
         let directory = tempfile::tempdir().unwrap();

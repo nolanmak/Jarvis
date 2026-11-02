@@ -1270,9 +1270,10 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 
     /// #1040 — once the turn began, a failure nothing explains is not
     /// evidence of an outage: a message-less `turn.failed`, or a process
-    /// that died mid-turn without a word (the supervisor reports a signal
-    /// death as a plain exit 1, so it is indistinguishable from any other
-    /// silent exit). For a write-capable call tools may already have run, so
+    /// that crashed mid-turn without a word (a signal outside the host-stop
+    /// set, forwarded as 128+n since #1779 — still unexplained). A host stop
+    /// (SIGKILL/TERM/INT/HUP) is `Interrupted` instead; see
+    /// `a_host_killed_codex_is_interrupted_in_every_class`. For a write-capable call tools may already have run, so
     /// fail safe: untyped. #1069 review H1: a text-only or read-only call
     /// cannot repeat a write, and an untyped ending there would respawn codex
     /// on every call during an outage the table does not know, so it is an
@@ -1284,7 +1285,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         read_opts.allowed_tools = vec!["Read".into(), "Grep".into()];
         for (name, body) in [
             ("fake-codex-bare-failure", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{}}'\nexit 1\n"),
-            ("fake-codex-killed", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\nkill -9 $$\n"),
+            ("fake-codex-crashed", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\nkill -SEGV $$\n"),
             ("fake-codex-model", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"unexpected status 404 Not Found: model_not_found\"}}'\nexit 1\n"),
         ] {
             let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
@@ -1296,6 +1297,23 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
                 assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
                     "{name} ({label}): {err:#}");
             }
+        }
+    }
+
+    /// #1779 D2 — a codex killed by a host signal mid-turn (OOM SIGKILL,
+    /// `pkill`) is now forwarded as 128+9 and typed `Interrupted` in every
+    /// capability class: never latched, never failed over, never a strike.
+    #[tokio::test]
+    async fn a_host_killed_codex_is_interrupted_in_every_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut read_opts = opts();
+        read_opts.allowed_tools = vec!["Read".into(), "Grep".into()];
+        let body = "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\nkill -9 $$\n";
+        let reasoner = CodexCliReasoner { kind: ProviderKind::Codex, bin: stub(&dir, "fake-codex-killed", body), gate: crate::cli_gate::CliGate::global(), usage_log: crate::token_usage::UsageLogger::global(), };
+        for (label, options) in [("write", write_opts(&dir)), ("text", opts()), ("read", read_opts)] {
+            let err = reasoner.call(&options, "synthetic request").await.unwrap_err();
+            assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Interrupted { signal: 9, .. })),
+                "{label}: {err:#}");
         }
     }
 
