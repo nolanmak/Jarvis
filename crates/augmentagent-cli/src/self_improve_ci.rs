@@ -501,6 +501,7 @@ pub(super) async fn verify(
         binding(root).await? == binding_before,
         "{PREREQUISITE}: candidate source changed during shared CI"
     );
+    vm.validate_runtime(true)?;
     audit.record_controller(serde_json::json!({"kind":"shared_ci_local_complete", "binding":binding_before,
         "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
         "remote_required":plan.checks.iter().filter(|check|check.status=="remote_required").map(|check|&check.id).collect::<Vec<_>>(),
@@ -566,6 +567,7 @@ async fn iteration(
         binding(root).await? == before,
         "{PREREQUISITE}: candidate changed during isolated iteration"
     );
+    vm.validate_runtime(true)?;
     audit.record_controller(serde_json::json!({"kind":"shared_ci_iteration", "binding":before,
         "operation":operation,"packages":packages,"filters":filters,"status":outcome.status,
         "execution_boundary":"existing-build-vm","vm_authority_sha256":vm.authority_sha256,
@@ -639,6 +641,7 @@ pub(super) async fn repository(
         binding_at(root, &base_ref).await? == before,
         "{PREREQUISITE}: repository changed during isolated owner gate"
     );
+    vm.validate_runtime(true)?;
     audit.record_controller(serde_json::json!({"kind":"owner_repository_ci", "binding":before,
         "owner_command_sha256":digest(owner_command.as_bytes()),"status":outcome.status,
         "execution_boundary":"existing-build-vm","vm_authority_sha256":vm.authority_sha256,"shipping_authority":false}))?;

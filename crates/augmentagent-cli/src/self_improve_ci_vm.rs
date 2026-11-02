@@ -9,6 +9,7 @@ const BUILD_VM: &[u8] = include_bytes!("../../../scripts/codex-build-vm.py");
 const PROXY: &[u8] = include_bytes!("../../../scripts/build-dependency-proxy.py");
 const SUPERVISOR: &[u8] = include_bytes!("../../../scripts/provider-supervisor.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
+const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
 const DEPENDENCY_PROGRAMS:[(&str,&[u8]);6]=[
     ("ci-dependency-seed.py",include_bytes!("../../../scripts/ci-dependency-seed.py")),
     ("ci-dependency-artifacts.py",include_bytes!("../../../scripts/ci-dependency-artifacts.py")),
@@ -24,8 +25,34 @@ pub(super) struct Session {
     cache_bytes: u64,
     cache: PathBuf,
     pub authority_sha256: String,
+    runtime_identity:Option<RuntimeIdentity>,
     completed_generations: std::sync::Mutex<std::collections::BTreeMap<String, Completion>>,
     execution: tokio::sync::Mutex<()>,
+}
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+struct RuntimeIdentity {
+    version:u32,
+    content_sha256:Option<String>,
+    metadata_sha256:String,
+    files:u64,
+    bytes:u64,
+}
+fn runtime_identity(bundle:&Path,content:bool)->Result<RuntimeIdentity> {
+    let hold=||crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,
+        "reason":"authority_changed","recovery":"await_compatible_controller",
+        "evidence_sha256":digest(b"trusted runtime input identity unavailable or changed")}));
+    let mut command=std::process::Command::new("/usr/bin/python3");
+    command.arg("-I").arg(bundle.join("ci-runtime-identity.py")).arg("--config").arg(bundle.join("runtime.json"));
+    if !content {command.arg("--metadata-only");}
+    let output=command.env_clear().env("PATH","/usr/bin:/bin").stdin(std::process::Stdio::null()).output().map_err(|_|hold())?;
+    if !output.status.success() || output.stdout.len()>4096 {return Err(hold().into());}
+    let value:RuntimeIdentity=serde_json::from_slice(&output.stdout).map_err(|_|hold())?;
+    let sha=|value:&str|value.len()==64 && value.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f'));
+    if value.version!=1 || !sha(&value.metadata_sha256)
+        || (content && !value.content_sha256.as_deref().is_some_and(sha))
+        || (!content && value.content_sha256.is_some()) {return Err(hold().into());}
+    Ok(value)
 }
 struct Completion {
     command: String,
@@ -235,6 +262,17 @@ impl Drop for Session {
     }
 }
 impl Session {
+    pub(super) fn validate_runtime(&self,content:bool)->Result<()> {
+        let expected=self.runtime_identity.as_ref().context("shared CI prerequisite unavailable: runtime identity missing")?;
+        let current=runtime_identity(self.directory.as_ref().context("CI controller bundle missing")?.path(),content)?;
+        if current.metadata_sha256!=expected.metadata_sha256 || current.files!=expected.files || current.bytes!=expected.bytes
+            || (content && current.content_sha256!=expected.content_sha256) {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,
+                "reason":"authority_changed","recovery":"await_compatible_controller",
+                "evidence_sha256":digest(b"trusted runtime changed during admitted CI execution")})).into());
+        }
+        Ok(())
+    }
     pub(super) async fn dependency_seed(&self,root:&Path,binding:&Binding,target:&Path,
         storage:&crate::build_storage::Lease,audit:&Arc<augmentagent_channel_core::AuditLogger>)
         ->Result<Option<serde_json::Value>> {
@@ -390,6 +428,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             ("build-dependency-proxy.py", PROXY),
             ("provider-supervisor.py", SUPERVISOR),
             ("ci-cache-generation.py", CACHE_GENERATION),
+            ("ci-runtime-identity.py", RUNTIME_IDENTITY),
             ("ci-contract.py", RUNNER.as_bytes()),
             ("ci-contract.json", contract.as_bytes()),
             ("runtime.json", runtime.as_slice()),
@@ -407,16 +446,20 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         loop {let read=executable.read(&mut buffer)?;if read==0 {break;}executable_digest.update(&buffer[..read]);}
         let executable_sha256=format!("{:x}",executable_digest.finalize());
         let dependency_programs:std::collections::BTreeMap<_,_>=DEPENDENCY_PROGRAMS.iter().map(|(name,bytes)|(*name,digest(bytes))).collect();
+        let runtime_identity=runtime_identity(directory.path(),true)?;
         let authority_sha256 = digest(&serde_json::to_vec(&serde_json::json!({
             "runtime":digest(&runtime),"adapter":digest(ADAPTER),"build_vm":digest(BUILD_VM),"proxy":digest(PROXY),
             "supervisor":digest(SUPERVISOR),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes,
-            "controller_executable_sha256":executable_sha256,"dependency_programs":dependency_programs}))?);
+            "controller_executable_sha256":executable_sha256,"dependency_programs":dependency_programs,
+            "runtime_identity_program":digest(RUNTIME_IDENTITY),"runtime_content_sha256":runtime_identity.content_sha256,
+            "runtime_metadata_sha256":runtime_identity.metadata_sha256}))?);
         Ok(Self {
             directory: Some(directory),
             memory_mb,
             cache_bytes: limits.cache_bytes,
             cache: cache_root.join("cache.img"),
             authority_sha256,
+            runtime_identity:Some(runtime_identity),
             completed_generations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             execution: tokio::sync::Mutex::new(()),
         })
@@ -570,6 +613,11 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             }))?;
         }
         outcome.validate(binding, operation)?;
+        // Runtime changes cannot become actionable source failures or authorize
+        // producer publication. The complete gate also rehashes the bytes.
+        if operation=="dependency" || outcome.status=="failed" {
+            self.validate_runtime(outcome.status=="failed")?;
+        }
         if outcome.cache_reclaimed.len()>2 || outcome.cache_reclaimed.iter().any(|value|
             uuid::Uuid::parse_str(value).is_err() || retained_generations.contains(value)) {
             return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
@@ -616,7 +664,7 @@ mod tests {
             let source=verifier_checkout::allocate(root,"head","contract").unwrap();
             let hold=crate::build_storage::ci_holds::Hold::begin(root,source.path(),root,root,&"a".repeat(64)).unwrap();
             let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:root.join("never-opened.img"),
-                authority_sha256:String::new(),completed_generations:Default::default(),execution:Default::default()};
+                authority_sha256:String::new(),runtime_identity:None,completed_generations:Default::default(),execution:Default::default()};
             let control=tempfile::Builder::new().prefix("ci-refusal-control-").tempdir_in("/tmp").unwrap();
             let audit=workflow::workflow_audit(&control.path().join("workflow.db"),"prior-cleanup-refusal",None).unwrap();
             let binding=super::super::tests::binding_fixture();
@@ -640,7 +688,7 @@ mod tests {
         let second=verifier_checkout::allocate(directory.path(),"head-b","contract").unwrap();
         let first_id=first.generation().to_owned();let second_id=second.generation().to_owned();
         let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:directory.path().join("unused"),
-            authority_sha256:String::new(),completed_generations:Default::default(),execution:Default::default()};
+            authority_sha256:String::new(),runtime_identity:None,completed_generations:Default::default(),execution:Default::default()};
         session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime(),quiescence_sha256:"a".repeat(64),producer:None});
         session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime(),quiescence_sha256:"b".repeat(64),producer:None});
         assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([first_id.clone(),second_id.clone()])));
