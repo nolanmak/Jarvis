@@ -1384,6 +1384,15 @@ impl WorkflowGuard {
             .map(|r| r.evidence))
     }
 
+    pub(super) async fn verification_gate_passed(&mut self,domain:durable::VerificationDomain)->Result<()> {
+        if self.audit.resource_capacity_seen() {return Ok(());}
+        self.audit_health().await?;
+        self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
+            .record_verification_gate_passed(&self.lease,&self.binding,domain,millis())?;
+        self.audit_event("verification_gate_passed",serde_json::json!({"domain":domain}))?;
+        Ok(())
+    }
+
     pub(super) async fn defer_verification_infrastructure(&mut self,error:&anyhow::Error)->Result<Option<i64>> {
         let message=format!("{error:#}");
         let freshness=error.downcast_ref::<crate::autoship_freshness::Hold>();
@@ -2855,6 +2864,43 @@ mod tests {
         }
         assert!(guard.bounded_native_calls("component".into(),2,async {guard.audit_logger().model_call_admitted("codex")}).await.is_err());
         assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,2);
+    }
+
+    #[tokio::test]
+    async fn ci_gate_reports_meaningful_success_only_after_a_passing_result() {
+        for disposition in ["passed","source-failed","infrastructure-failed"] {
+            let directory=repo();let state=control_dir();let path=state.path().join("workflow.db");
+            let mut guard=WorkflowGuard::acquire_at(&path,Start {
+                repo_root:directory.path(),worktree:directory.path(),repository:"owner/repo",
+                source_issue:Some(77),pr:Some(88),branch:"fixture",contract:"C1",environment:"rust-a"
+            },millis()).await.unwrap().unwrap();
+            guard.checkpoint(Stage::Review,"candidate_ready","run_verifier",0,&["receipt".into()]).await.unwrap();
+            let before=WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+            let result=match disposition {
+                "passed"=>Ok(()),
+                "source-failed"=>Err(anyhow::anyhow!("error[E0308]: mismatched types")),
+                _=>Err(anyhow::anyhow!("shared CI prerequisite unavailable: network offline")),
+            };
+            let outcome=CiGateResult(result).for_workflow(&mut guard).await;
+            match disposition {
+                "passed"=>assert!(matches!(outcome,Ok(Ok(())))),
+                "source-failed"=>assert!(matches!(outcome,Ok(Err(_)))),
+                _=>assert!(outcome.unwrap_err().downcast_ref::<CiInfrastructureDeferred>().is_some()),
+            }
+            let store=WorkflowStore::open(&path).unwrap();
+            let passed:Vec<_>=store.events(guard.id()).unwrap().into_iter()
+                .filter(|(_,kind,_,_)|kind=="verification_gate_passed").collect();
+            assert_eq!(passed.len(),usize::from(disposition=="passed"));
+            if let Some((_,_,raw,_))=passed.first() {
+                let value:serde_json::Value=serde_json::from_str(raw).unwrap();
+                assert_eq!(value["domain"],"ci");assert_eq!(value["binding"],serde_json::to_value(&before.checkpoint.binding).unwrap());
+            }
+            let after=store.snapshot(guard.id()).unwrap().unwrap();
+            assert_eq!(after.model_calls,before.model_calls);assert_eq!(after.attempts,before.attempts);
+            assert_eq!(after.progress_at_ms,before.progress_at_ms);
+            assert_eq!(after.checkpoint.binding,before.checkpoint.binding);assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+            drop(store);guard.finish().unwrap();
+        }
     }
 
     #[tokio::test]

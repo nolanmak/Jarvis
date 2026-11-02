@@ -4620,7 +4620,13 @@ impl CiGateResult {
     /// Outer errors stop the attempt. Only the inner code failure may enter a
     /// repair branch, after infrastructure and capacity have been ruled out.
     async fn for_workflow(self, workflow: &mut workflow::WorkflowGuard) -> Result<Result<()>> {
-        let Err(error) = self.0 else { return Ok(Ok(())); };
+        let error=match self.0 {
+            Ok(())=>{
+                workflow.verification_gate_passed(crate::autoship_workflow::VerificationDomain::Ci).await?;
+                return Ok(Ok(()));
+            }
+            Err(error)=>error,
+        };
         // Capacity has its own durable recovery and accounting boundary.
         if workflow.audit_logger().resource_capacity_seen() {
             return Err(error);

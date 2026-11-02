@@ -1,7 +1,7 @@
 //! Retry failed infrastructure without changing the candidate or owner holds.
 use super::*;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Retry {
     version: u32,
@@ -59,6 +59,39 @@ impl Retry {
     }
 }
 
+/// A completed verification gate is meaningful progress for its own domain.
+/// Starting a stage, editing a head, or passing CI cannot clear acceptance debt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationDomain { Ci, Acceptance }
+impl VerificationDomain {
+    fn for_failure(code: &str) -> Self {
+        if code=="acceptance verifier infrastructure" {Self::Acceptance} else {Self::Ci}
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatePassed { version: u32, domain: VerificationDomain, binding: Binding }
+
+fn gate_passed_since(tx: &Transaction<'_>, lease: &Lease, after_seq: i64, after_ms: i64,
+    domain: VerificationDomain, now: i64) -> Result<bool> {
+    let mut statement=tx.prepare("SELECT payload,generation,at_ms FROM workflow_event WHERE workflow=?1 AND kind='verification_gate_passed' AND seq>?2 ORDER BY seq LIMIT 1025")?;
+    let rows=statement.query_map(params![lease.workflow,after_seq],|row|
+        Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)))?;
+    let mut recovered=false;
+    for (index,row) in rows.enumerate() {
+        let (raw,generation,at)=row?;
+        ensure!(index<1024 && raw.len()<=8192,"verification success history exceeds bound");
+        let passed:GatePassed=serde_json::from_str(&raw)?;
+        passed.binding.validate()?;
+        ensure!(passed.version==1 && generation>0 && generation<=lease.generation && at>=after_ms && at<=now
+            && serde_json::to_value(&passed)?==serde_json::from_str::<serde_json::Value>(&raw)?,
+            "verification success history is invalid or newer than current authority");
+        recovered|=passed.domain==domain;
+    }
+    Ok(recovered)
+}
+
 fn retryable_stage(stage: Stage) -> bool {
     matches!(
         stage,
@@ -72,6 +105,19 @@ fn retryable_stage(stage: Stage) -> bool {
 }
 
 impl WorkflowStore {
+    /// Called after the controller's actual successful gate, never at stage
+    /// entry. Completion remains recordable after an owner pause; it cannot
+    /// clear that pause, schedule productive work, or change any accounting.
+    pub fn record_verification_gate_passed(&mut self, lease: &Lease, binding: &Binding,
+        domain: VerificationDomain, now: i64) -> Result<()> {
+        let tx=self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_binding(&tx,lease,binding,now)?;
+        event(&tx,&lease.workflow,lease.generation,"verification_gate_passed",
+            &serde_json::to_string(&GatePassed {version:1,domain,binding:binding.clone()})?,now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn defer_verification_infrastructure(
         &mut self,
         lease: &Lease,
@@ -95,29 +141,20 @@ impl WorkflowStore {
             retryable_stage(checkpoint.stage),
             "only an active pre-merge CI stage can be deferred"
         );
-        let previous: Option<String> = tx.query_row(
-            "SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' ORDER BY seq DESC LIMIT 1",
-            [&lease.workflow], |r| r.get(0)).optional()?;
-        let previous = previous
-            .map(|raw| -> Result<Retry> {
-                ensure!(
-                    raw.len() <= 8192,
-                    "verification retry history exceeds bound"
-                );
-                let prior: Retry = serde_json::from_str(&raw)?;
-                prior.validate()?;
-                ensure!(
-                    prior.generation <= lease.generation && prior.failed_at_ms <= now,
-                    "verification retry history is newer than its current authority"
-                );
-                ensure!(
-                    serde_json::to_value(&prior)?
-                        == serde_json::from_str::<serde_json::Value>(&raw)?,
-                    "verification retry contains unknown binding fields"
-                );
-                Ok(prior)
-            })
-            .transpose()?;
+        let decode = |raw: &str| -> Result<Retry> {
+            ensure!(raw.len()<=8192,"verification retry history exceeds bound");
+            let prior:Retry=serde_json::from_str(raw)?;
+            prior.validate()?;
+            ensure!(prior.generation<=lease.generation && prior.failed_at_ms<=now,
+                "verification retry history is newer than its current authority");
+            ensure!(serde_json::to_value(&prior)?==serde_json::from_str::<serde_json::Value>(raw)?,
+                "verification retry contains unknown binding fields");
+            Ok(prior)
+        };
+        let previous:Option<(i64,String)>=tx.query_row(
+            "SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' ORDER BY seq DESC LIMIT 1",
+            [&lease.workflow],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let previous=previous.map(|(seq,raw)|decode(&raw).map(|retry|(seq,retry))).transpose()?;
         let same = |prior: &Retry| {
             prior.binding == *binding
                 && prior.stage() == checkpoint.stage
@@ -126,6 +163,7 @@ impl WorkflowStore {
         };
         if let Some(prior) = previous
             .as_ref()
+            .map(|(_,retry)|retry)
             .filter(|p| p.generation == lease.generation && progress_at <= p.failed_at_ms)
         {
             ensure!(
@@ -135,10 +173,22 @@ impl WorkflowStore {
             );
             return Ok(prior.eligible_at_ms);
         }
-        let failures = previous
-            .as_ref()
-            .filter(|p| same(p) && progress_at <= p.failed_at_ms)
-            .map_or(1, |p| p.failures.saturating_add(1));
+        // Count the failure/dependency epoch, not attempts to work on it.
+        // Looking up its own history also prevents alternating failure classes
+        // or dependency toggles from erasing an unchanged failure's backoff.
+        let matching=if previous.as_ref().is_some_and(|(_,prior)|
+            prior.failure_code==failure_code && prior.dependency_sha256==dependency_sha256) {
+            previous.clone()
+        } else {
+            let raw:Option<(i64,String)>=tx.query_row(
+                "SELECT seq,payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' AND json_extract(payload,'$.failure_code')=?2 AND json_extract(payload,'$.dependency_sha256')=?3 ORDER BY seq DESC LIMIT 1",
+                params![lease.workflow,failure_code,dependency_sha256],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+            raw.map(|(seq,raw)|decode(&raw).map(|retry|(seq,retry))).transpose()?
+        };
+        let failures=if let Some((seq,prior))=matching {
+            if gate_passed_since(&tx,lease,seq,prior.failed_at_ms,VerificationDomain::for_failure(failure_code),now)? {1}
+            else {prior.failures.saturating_add(1)}
+        } else {1};
         let delay = 300_000_i64
             .saturating_mul(1 << (failures - 1).min(4))
             .min(3_600_000);
@@ -199,6 +249,115 @@ mod tests {
         store.checkpoint(&lease, &checkpoint, 21).unwrap();
         (store, lease, binding)
     }
+    #[test]
+    fn unchanged_dependency_keeps_backoff_across_new_heads_stage_starts_and_restarts() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("workflow.db");
+        let (mut store,mut lease,mut binding)=setup(&path);
+        let mut due=store.defer_verification_infrastructure(&lease,&binding,
+            "acceptance verifier infrastructure",&"a".repeat(64),30).unwrap();
+        store.release(&lease,31).unwrap();
+        for (attempt,delay) in [600_000,1_200_000,2_400_000,3_600_000].into_iter().enumerate() {
+            drop(store);store=WorkflowStore::open(&path).unwrap();
+            lease=store.claim_productive(&lease.workflow,&format!("worker-{attempt}"),due,60_000).unwrap().unwrap();
+            let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            binding.head=format!("changed-head-{attempt}");binding.evidence_hash=format!("changed-context-{attempt}");
+            checkpoint.binding=binding.clone();checkpoint.stage=Stage::Build;
+            checkpoint.next=NextAction {reason:"repair_started".into(),action:"repair".into(),eligible_at_ms:0};
+            store.checkpoint(&lease,&checkpoint,due+1).unwrap();
+            checkpoint.stage=Stage::Verify;checkpoint.next.reason="verification_started".into();
+            store.checkpoint(&lease,&checkpoint,due+2).unwrap();
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+            let allowance=store.merge_allowance(due+3,5).unwrap();
+            let next=store.defer_verification_infrastructure(&lease,&binding,
+                "acceptance verifier infrastructure",&"a".repeat(64),due+3).unwrap();
+            assert_eq!(next,due+3+delay,"source edits and stage-start checkpoints reset an unchanged failure");
+            let after=store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(after.progress_at_ms,before.progress_at_ms);
+            assert_eq!(after.checkpoint.binding,before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence,before.checkpoint.evidence);
+            assert_eq!(after.model_calls,before.model_calls);
+            assert_eq!(store.merge_allowance(due+4,5).unwrap(),allowance);
+            store.release(&lease,due+4).unwrap();due=next;
+        }
+    }
+
+    #[test]
+    fn only_a_successful_gate_in_the_affected_domain_resets_backoff() {
+        let directory=tempfile::tempdir().unwrap();let path=directory.path().join("workflow.db");
+        let (mut store,lease,binding)=setup(&path);
+        let due=store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),30).unwrap();
+        store.release(&lease,31).unwrap();
+        let lease=store.claim_productive(&lease.workflow,"next",due,60_000).unwrap().unwrap();
+        let before=store.snapshot(&lease.workflow).unwrap().unwrap();
+        store.record_verification_gate_passed(&lease,&binding,VerificationDomain::Ci,due+1).unwrap();
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before,"gate evidence mutated scheduling/accounting");
+        let next=store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),due+2).unwrap();
+        assert_eq!(next,due+2+600_000,"CI success cleared unresolved acceptance verification");
+        store.release(&lease,due+3).unwrap();
+        let lease=store.claim_productive(&lease.workflow,"recovered",next,60_000).unwrap().unwrap();
+        store.record_verification_gate_passed(&lease,&binding,VerificationDomain::Acceptance,next+1).unwrap();
+        drop(store);let mut store=WorkflowStore::open(&path).unwrap();
+        assert_eq!(store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),next+2).unwrap(),next+2+300_000);
+    }
+
+    #[test]
+    fn alternating_failure_keys_cannot_erase_an_unchanged_epochs_backoff() {
+        let directory=tempfile::tempdir().unwrap();let (mut store,lease,binding)=setup(&directory.path().join("workflow.db"));
+        let first=store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),30).unwrap();
+        store.release(&lease,31).unwrap();
+        let lease=store.claim_productive(&lease.workflow,"different-failure",first,60_000).unwrap().unwrap();
+        let different=store.defer_verification_infrastructure(&lease,&binding,"network",&"b".repeat(64),first+1).unwrap();
+        assert_eq!(different,first+1+300_000);
+        store.release(&lease,first+2).unwrap();
+        let lease=store.claim_productive(&lease.workflow,"same-failure",different,60_000).unwrap().unwrap();
+        assert_eq!(store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),different+1).unwrap(),different+1+600_000);
+    }
+
+    #[test]
+    fn gate_completion_is_fenced_preserves_holds_and_cannot_credit_corrupt_history() {
+        for fault in ["stale","wrong-binding","paused","held","version","unknown-field","binding-field","future-generation","future-clock"] {
+            let directory=tempfile::tempdir().unwrap();let (mut store,lease,binding)=setup(&directory.path().join("workflow.db"));
+            let due=store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),30).unwrap();
+            store.release(&lease,31).unwrap();
+            let lease=store.claim_productive(&lease.workflow,"next",due,60_000).unwrap().unwrap();
+            let mut passed_lease=lease.clone();let mut passed_binding=binding.clone();
+            match fault {
+                "stale"=>passed_lease.generation+=1,
+                "wrong-binding"=>passed_binding.head="other-head".into(),
+                "paused"=>{store.set_owner_pause(&lease.workflow,"github:owner",0,true,due+1).unwrap();},
+                "held"=>{let mut checkpoint=store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+                    checkpoint.stage=Stage::Held;store.checkpoint(&lease,&checkpoint,due+1).unwrap();},
+                _=>{},
+            }
+            let before=store.snapshot(&lease.workflow).unwrap().unwrap();let events=store.events(&lease.workflow).unwrap();
+            let result=store.record_verification_gate_passed(&passed_lease,&passed_binding,VerificationDomain::Acceptance,due+2);
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+            if matches!(fault,"stale"|"wrong-binding") {
+                assert!(result.is_err());assert_eq!(store.events(&lease.workflow).unwrap(),events);continue;
+            }
+            result.unwrap();
+            if matches!(fault,"paused"|"held") {
+                assert!(store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),due+3).is_err());
+                assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);continue;
+            }
+            let raw:String=store.conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='verification_gate_passed' ORDER BY seq DESC LIMIT 1",[&lease.workflow],|row|row.get(0)).unwrap();
+            let mut value:serde_json::Value=serde_json::from_str(&raw).unwrap();
+            match fault {
+                "version"=>value["version"]=2.into(),
+                "unknown-field"=>value["unrecognized"]=true.into(),
+                "binding-field"=>value["binding"]["unrecognized"]=true.into(),
+                "future-generation"=>{store.conn.execute("UPDATE workflow_event SET generation=?2 WHERE workflow=?1 AND kind='verification_gate_passed'",params![lease.workflow,lease.generation+1]).unwrap();},
+                "future-clock"=>{store.conn.execute("UPDATE workflow_event SET at_ms=?2 WHERE workflow=?1 AND kind='verification_gate_passed'",params![lease.workflow,due+100]).unwrap();},
+                _=>unreachable!(),
+            }
+            store.conn.execute("UPDATE workflow_event SET payload=?2 WHERE workflow=?1 AND kind='verification_gate_passed'",params![lease.workflow,value.to_string()]).unwrap();
+            let events=store.events(&lease.workflow).unwrap();
+            assert!(store.defer_verification_infrastructure(&lease,&binding,"acceptance verifier infrastructure",&"a".repeat(64),due+3).is_err(),"{fault}");
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(),before);
+            assert_eq!(store.events(&lease.workflow).unwrap(),events);
+        }
+    }
+
     #[test]
     fn every_freshness_hold_reaches_real_status_and_private_outbox_without_spend_or_fake_progress() {
         use crate::autoship_freshness::Reason;
@@ -419,6 +578,7 @@ mod tests {
         store.checkpoint(&lease, &cp, now + 2).unwrap();
         cp.stage = Stage::Verify;
         store.checkpoint(&lease, &cp, now + 3).unwrap();
+        store.record_verification_gate_passed(&lease,&binding,VerificationDomain::Ci,now+3).unwrap();
         assert_eq!(
             store
                 .defer_verification_infrastructure(
@@ -430,7 +590,7 @@ mod tests {
                 )
                 .unwrap(),
             now + 4 + 300_000,
-            "real stage progress did not reset the consecutive failure backoff"
+            "a successful verification gate did not reset its failure backoff"
         );
     }
     #[test]
