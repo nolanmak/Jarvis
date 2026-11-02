@@ -1,5 +1,6 @@
 """Publication protocol/filesystem tests; real producer/UID acceptance is separate."""
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,37 @@ store=importlib.util.module_from_spec(spec);spec.loader.exec_module(store)
 
 
 class StoreTests(unittest.TestCase):
+    def test_retirement_capacity_errors_keep_resource_classification_and_recoverable_intents(self):
+        for kind in ('seed','producer'):
+            for boundary in ('namespace','completion'):
+                for code in (errno.ENOSPC,errno.EDQUOT):
+                    with self.subTest(kind=kind,boundary=boundary,errno=code),tempfile.TemporaryDirectory() as directory:
+                        root=Path(directory)
+                        if kind=='seed':
+                            binding,identity=self.released_seed(root)
+                            payload=root/'ci-trusted-dependencies'/identity
+                            operation=lambda:store.reclaim_seeds(root,cache_identity=binding['cache_identity_sha256'])
+                        else:
+                            binding,identity,command,target,home,ack=self.fixture(root)
+                            payload=target.parent
+                            operation=lambda:store.reclaim_producers(root,[],cache_identity=binding['cache_identity_sha256'],
+                                eligible=[{'producer':identity,'ack':ack}])
+                        original_sync=store._fsync_directory;original_write=store.cache._write_record
+                        def sync(path):
+                            if path==root:raise OSError(code,'logical cache capacity unavailable')
+                            return original_sync(path)
+                        def write(path,value):
+                            if value.get('state')=='reclaimed':raise OSError(code,'logical cache capacity unavailable')
+                            return original_write(path,value)
+                        fault=patch.object(store,'_fsync_directory',side_effect=sync) if boundary=='namespace' else \
+                            patch.object(store.cache,'_write_record',side_effect=write)
+                        with fault,self.assertRaises(OSError) as observed:operation()
+                        self.assertEqual(observed.exception.errno,code)
+                        if boundary=='namespace':self.assertTrue(payload.is_dir())
+                        else:
+                            pending=root/('ci-seed-retirements' if kind=='seed' else 'ci-producer-retirements')/'pending'/(identity+'.json')
+                            self.assertEqual(store._document(pending)['state'],'reclaiming')
+                        self.assertEqual(operation(),[identity])
     def released_seed(self, root):
         binding,producer,command,target,home,ack=self.fixture(root)
         seed=store.publish(root,producer,ack)

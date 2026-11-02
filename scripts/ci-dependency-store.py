@@ -9,6 +9,7 @@ quiescence acknowledgement. Candidate generation directories are never producers
 These records are cache provenance, not passing CI or merge authorization.
 """
 import hashlib
+import errno
 import importlib.util
 import json
 import os
@@ -157,13 +158,20 @@ def _fsync_directory(path):
     finally:os.close(descriptor)
 
 
+def _cleanup_failure(error):
+    # Let the existing guest resource mapper retain logical disk/quota refusal
+    # instead of mislabelling a known capacity error as unknown provenance.
+    if error.errno in (errno.ENOSPC,errno.EDQUOT):raise error from None
+    raise FreshnessHold('cleanup_uncertain') from None
+
+
 def _retirement_directories(root,name):
     """Commit the complete intent namespace before any payload is unlinked."""
     history=root/name;pending=history/'pending';completed=history/'completed'
     try:
         for path in (history,pending,completed):cache._directory(path,0o700,create=True)
         for path in (pending,completed,history,root):_fsync_directory(path)
-    except OSError:raise FreshnessHold('cleanup_uncertain') from None
+    except OSError as error:_cleanup_failure(error)
     return pending,completed
 
 
@@ -270,7 +278,7 @@ def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=No
             cache._write_record(receipt,{'version':RETIREMENT_VERSION,'state':'reclaimed','original':original,'authorization':authorization})
             os.rename(receipt,completed/receipt.name)
             _fsync_directory(completed);_fsync_directory(pending)
-        except OSError:raise FreshnessHold('cleanup_uncertain') from None
+        except OSError as error:_cleanup_failure(error)
         reclaimed.append(producer)
     return reclaimed
 
@@ -415,7 +423,10 @@ def reclaim_seeds(directory,*,cache_identity,protected_seeds=(),limit=2):
                 if intent is not None and intent['state']=='reclaimed':raise FreshnessHold('cleanup_uncertain')
                 _remaining_seed_inventory(path,manifest)
             elif intent is None:raise FreshnessHold('cleanup_uncertain')
-        except (FreshnessHold,OSError,ValueError,KeyError,TypeError):continue
+        except OSError as error:
+            if error.errno in (errno.ENOSPC,errno.EDQUOT):raise
+            continue
+        except (FreshnessHold,ValueError,KeyError,TypeError):continue
         if intent is None:cache._write_record(receipt,{'version':1,'state':'reclaiming','manifest':manifest})
         try:
             if path.exists():shutil.rmtree(path)
@@ -424,7 +435,7 @@ def reclaim_seeds(directory,*,cache_identity,protected_seeds=(),limit=2):
             cache._write_record(receipt,{'version':1,'state':'reclaimed','manifest':manifest})
             os.rename(receipt,completed/receipt.name)
             _fsync_directory(completed);_fsync_directory(pending)
-        except OSError:raise FreshnessHold('cleanup_uncertain') from None
+        except OSError as error:_cleanup_failure(error)
         reclaimed.append(identity)
     return reclaimed
 
@@ -677,7 +688,7 @@ def _retire_published_payload(path):
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_dev!=path.stat().st_dev:
             raise FreshnessHold('cleanup_uncertain')
         try:shutil.rmtree(child)
-        except OSError:raise FreshnessHold('cleanup_uncertain') from None
+        except OSError as error:_cleanup_failure(error)
     descriptor=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
     try:os.fsync(descriptor)
     finally:os.close(descriptor)
