@@ -170,6 +170,9 @@ try:
             ci_target=ci_cache['prepare']('/build-cache',generation['binding'],generation['command'],uid,gid,
                 predecessor=generation['predecessor'])
             subprocess.run(['/usr/bin/mount','--bind',str(ci_target),'/workspace/target'],check=True)
+            output_mounts=ci_cache['prepare_outputs'](ci_target,generation['outputs'],uid,gid)
+            for relative,source in output_mounts.items():
+                subprocess.run(['/usr/bin/mount','--bind',str(source),str(Path('/workspace')/relative)],check=True)
             seed_build_cache(ci_target)
         else:
             seed_build_cache()

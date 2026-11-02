@@ -151,12 +151,25 @@ def execute(request,run=vm.run,progress=None):
     generation=None
     if request['operation']!='plan':
         progress['stage']='source_census'
-        source_inputs=cache_generation.source_census(workspace,Path(request['git_objects']),request['head'],generated_directories=['target'])
+        outputs=cache_generation.declared_outputs(workspace)
+        directories=['target',*[name for name,kind in outputs.items() if kind=='directory']]
+        files=[name for name,kind in outputs.items() if kind=='file']
+        source_inputs=cache_generation.source_census(workspace,Path(request['git_objects']),request['head'],
+            generated_directories=directories,generated_files=files)
         target=workspace/'target'
         target.mkdir(mode=0o700,exist_ok=True)
+        for name,kind in outputs.items():
+            path=workspace/name
+            if kind=='directory':path.mkdir(mode=0o700,exist_ok=True)
+            else:
+                try:
+                    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                    os.close(fd)
+                except FileExistsError:pass
         generation={'binding':{'generation':request['source_generation'],'head':request['head'],'tree':request['tree'],
             'contract_sha256':hashlib.sha256(contract).hexdigest(),'authority_sha256':request['controller_authority_sha256'],
-            'source_inputs_sha256':source_inputs},'command':request['command_id'],'predecessor':request['predecessor']}
+            'source_inputs_sha256':source_inputs},'command':request['command_id'],'predecessor':request['predecessor'],
+            'outputs':outputs}
     # The supplied snapshot has controller-generated Git metadata, never the
     # source worktree's config/hooks. Rebind only its private alternate file.
     progress['stage']='git_alternate'

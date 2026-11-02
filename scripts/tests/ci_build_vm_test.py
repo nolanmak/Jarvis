@@ -61,6 +61,36 @@ class AdapterTests(unittest.TestCase):
     result=adapter.execute(request,run=lambda *a,**k:{'exit_code':17,'stdout':'{"status":"passed"}','stderr':''})
    self.assertEqual(result['status'],'failed');self.assertEqual(result['exit_code'],17)
 
+ def test_declared_outputs_do_not_hide_tracked_or_unexplained_inputs(self):
+  for fault in ('none','tracked-output','unexplained-output'):
+   with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+    root=Path(directory);request=self.fixture(root);workspace=root/'workspace'
+    (workspace/'package.json').write_text('{}');(workspace/'public').mkdir()
+    (workspace/'public/original.css').write_text('original tracked CSS')
+    def git(*args):
+     return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false',
+      '-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-C',str(workspace),*args],text=True).strip()
+    if fault=='tracked-output':(workspace/'public/tailwind.css').write_text('must remain original')
+    git('add','.');git('commit','-qm','declared Node input')
+    request.update(head=git('rev-parse','HEAD'),base=git('rev-parse','HEAD'),tree=git('rev-parse','HEAD^{tree}'),
+     operation='repository',command='npm run build',build_cache=str(root/'registered-image'))
+    if fault=='unexplained-output':(workspace/'public/tailwind.css').write_text('unbound input')
+    seen=[]
+    def execute(*args,**options):
+     seen.append(options)
+     self.assertEqual(options['ci_context']['generation']['outputs'],
+      {'node_modules':'directory','dist':'directory','public/tailwind.css':'file'})
+     self.assertEqual((workspace/'public/tailwind.css').read_bytes(),b'')
+     return {'exit_code':0,'stdout':'build complete','stderr':''}
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+     side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+     if fault=='none':self.assertEqual(adapter.execute(request,run=execute)['status'],'passed')
+     else:
+      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+      self.assertEqual(seen,[])
+      self.assertFalse((workspace/'dist').exists())
+    self.assertEqual((workspace/'public/original.css').read_text(),'original tracked CSS')
+
  def test_cache_reuse_capacity_and_private_identity(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);image=root/'cache.img';capacity=64*1024*1024

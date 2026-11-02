@@ -85,7 +85,37 @@ def validate_binding(binding):
         raise FreshnessHold("input_census_unknown")
 
 
-def source_census(workspace, objects, head, *, generated_directories=()):
+def validate_outputs(outputs):
+    if not isinstance(outputs, dict) or len(outputs) > 64 or any(not isinstance(name, str) for name in outputs):
+        raise FreshnessHold("input_census_unknown")
+    for name, kind in outputs.items():
+        if (not isinstance(name, str) or name.startswith("/") or "\\" in name
+                or len(name) > 512 or kind not in ("directory", "file")
+                or any(part in ("", ".", "..", ".git") for part in name.split("/"))
+                or any(name.startswith(other + "/") for other in outputs if other != name)):
+            raise FreshnessHold("input_census_unknown")
+
+
+def declared_outputs(workspace):
+    """Pinned output namespaces for the existing declared Node CI commands.
+
+    This policy is part of the compiled controller authority. A package cannot
+    request another writable source path through its own configuration.
+    """
+    workspace = Path(workspace)
+    outputs = {}
+    for relative in ("", "sidecars/computer-use", "sidecars/discord-voice", "sidecars/fetch", "sidecars/renderer"):
+        package = workspace / relative / "package.json"
+        if package.is_file():
+            for name in ("node_modules", "dist"):
+                outputs[str(Path(relative) / name)] = "directory"
+    if (workspace / "package.json").is_file() and (workspace / "public").is_dir():
+        outputs["public/tailwind.css"] = "file"
+    validate_outputs(outputs)
+    return outputs
+
+
+def source_census(workspace, objects, head, *, generated_directories=(), generated_files=()):
     """Verify actual exported bytes against immutable Git, with no hooks/filters.
 
     Generated directories here are empty controller-created mount points. Their
@@ -98,6 +128,9 @@ def source_census(workspace, objects, head, *, generated_directories=()):
     if not isinstance(head, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None:
         raise FreshnessHold("input_census_unknown")
     generated = set()
+    output_files = set(generated_files)
+    validate_outputs({**{name: "directory" for name in generated_directories},
+                      **{name: "file" for name in generated_files}})
     for value in generated_directories:
         if (not isinstance(value, str) or value.startswith("/") or "\\" in value
                 or any(part in ("", ".", "..", ".git") for part in value.split("/"))):
@@ -125,6 +158,7 @@ def source_census(workspace, objects, head, *, generated_directories=()):
         relative = Path(name)
         if (mode not in (b"100644", b"100755") or kind != b"blob" or relative.is_absolute()
                 or any(part in (".", "..", ".git") for part in relative.parts)
+                or name in output_files
                 or any(name == prefix or name.startswith(prefix + "/") for prefix in generated)):
             raise FreshnessHold("input_census_unknown")
         path = workspace / relative
@@ -164,7 +198,13 @@ def source_census(workspace, objects, head, *, generated_directories=()):
             elif path.is_symlink() or name not in parents:
                 raise FreshnessHold("input_census_unknown")
         for filename in filenames:
-            if str((Path(base) / filename).relative_to(workspace)) not in files:
+            path = Path(base) / filename
+            name = str(path.relative_to(workspace))
+            if name in output_files:
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+                    raise FreshnessHold("input_census_unknown")
+            elif name not in files:
                 raise FreshnessHold("input_census_unknown")
     return census.hexdigest()
 
@@ -242,21 +282,14 @@ def prepare(cache, binding, command, worker_uid, worker_gid, *, predecessor=None
         raise FreshnessHold("invalidation_unsafe")
     _directory(cache, 0o700, create=False)
     root = cache / "ci-source-generations"
-    is_new = not root.exists() and not root.is_symlink()
-    if is_new and (cache / "target").exists():
-        raise FreshnessHold("legacy_format")
+    # This parent is only an allocation namespace, never a reusable-cache
+    # certificate. A legacy target or old/torn parent format receipt cannot
+    # authorize any artifact, and must not prevent the next admitted attempt
+    # from constructing a fresh, empty generation. Every reusable target is
+    # instead fenced by its own controller-owned versioned binding below.
+    # Retain old bytes/receipts here; reclamation requires the storage owner's
+    # checked quiescence and budget policy, not a metadata-triggered deletion.
     _directory(root, 0o711, create=True)
-    format_path = root / "format.json"
-    expected = {"version": FORMAT_VERSION, "authority_sha256": binding["authority_sha256"],
-                "cache_identity_sha256": binding["cache_identity_sha256"]}
-    if is_new:
-        _write_record(format_path, expected)
-    else:
-        actual = _read_record(format_path)
-        if actual.get("version") != FORMAT_VERSION:
-            raise FreshnessHold("legacy_format")
-        if actual != expected:
-            raise FreshnessHold("authority_changed")
     generation = root / binding["generation"]
     is_new = not generation.exists() and not generation.is_symlink()
     if is_new and predecessor is not None:
@@ -281,3 +314,43 @@ def prepare(cache, binding, command, worker_uid, worker_gid, *, predecessor=None
             raise FreshnessHold("invalidation_unsafe")
     _write_record(record, {"version": FORMAT_VERSION, "binding": binding, "active_command": command})
     return target
+
+
+def prepare_outputs(target, outputs, worker_uid, worker_gid):
+    """Allocate declared output mounts; they confer no generated-input proof.
+
+    Caller holds the existing exclusive image admission and verifies VM exit
+    before resuming a generation. The original source filesystem stays read-only.
+    """
+    validate_outputs(outputs)
+    target = Path(target)
+    if target.name != "target" or target.resolve() != target or not target.is_dir():
+        raise FreshnessHold("invalidation_unsafe")
+    if any(type(value) is not int or value <= 0 for value in (worker_uid, worker_gid)):
+        raise FreshnessHold("invalidation_unsafe")
+    _directory(target.parent, 0o711, create=False)
+    root = target.parent / "outputs"
+    _directory(root, 0o711, create=True)
+    mounts = {}
+    for name, kind in sorted(outputs.items()):
+        path = root / name
+        parent = root
+        for part in Path(name).parts[:-1]:
+            parent = parent / part
+            _directory(parent, 0o711, create=True)
+        try:
+            if kind == "directory":
+                path.mkdir(mode=0o700)
+            else:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                os.close(fd)
+            os.chown(path, worker_uid, worker_gid, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        info = path.lstat()
+        correct_kind = stat.S_ISDIR(info.st_mode) if kind == "directory" else stat.S_ISREG(info.st_mode)
+        if (not correct_kind or info.st_uid != worker_uid or info.st_gid != worker_gid
+                or info.st_mode & 0o077 or (kind == "file" and info.st_nlink != 1)):
+            raise FreshnessHold("invalidation_unsafe")
+        mounts[name] = path
+    return mounts

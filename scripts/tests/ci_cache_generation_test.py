@@ -65,11 +65,51 @@ class GenerationTests(unittest.TestCase):
                 cache.source_census(root, objects, head, generated_directories=["target"])
             with self.assertRaises(cache.FreshnessHold):
                 cache.source_census(root, objects, head, generated_directories=["source.rs"])
+            (root / "target/hidden.rs").unlink()
+            output = root / "result.css"
+            output.touch()
+            cache.source_census(root, objects, head, generated_directories=["target"], generated_files=["result.css"])
+            output.write_text("unexplained generated input")
+            with self.assertRaises(cache.FreshnessHold):
+                cache.source_census(root, objects, head, generated_directories=["target"], generated_files=["result.css"])
+            with self.assertRaises(cache.FreshnessHold):
+                cache.source_census(root, objects, head, generated_files=["source.rs"])
 
     def binding(self):
         return {"generation": str(uuid.uuid4()), "head": "a" * 40, "tree": "b" * 40,
                 "contract_sha256": "c" * 64, "authority_sha256": "d" * 64,
                 "cache_identity_sha256": "e" * 64, "source_inputs_sha256": "f" * 64}
+
+    def test_declared_generated_outputs_have_separate_writable_roots_in_one_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binding = self.binding()
+            target = self.prepare(root, binding, str(uuid.uuid4()))
+            mounts = cache.prepare_outputs(target, {"node_modules": "directory", "public/tailwind.css": "file"},
+                                          os.getuid(), os.getgid())
+            self.assertEqual(set(mounts), {"node_modules", "public/tailwind.css"})
+            (mounts["node_modules"] / "dependency").write_text("generated dependency")
+            mounts["public/tailwind.css"].write_text("generated CSS")
+            repeated = cache.prepare_outputs(target, {"node_modules": "directory", "public/tailwind.css": "file"},
+                                            os.getuid(), os.getgid())
+            self.assertEqual(repeated, mounts)
+            self.assertEqual(repeated["public/tailwind.css"].read_text(), "generated CSS")
+            other = self.prepare(root, binding | {"generation": str(uuid.uuid4())}, str(uuid.uuid4()))
+            fresh = cache.prepare_outputs(other, {"public/tailwind.css": "file"}, os.getuid(), os.getgid())
+            self.assertEqual(fresh["public/tailwind.css"].read_bytes(), b"")
+
+    def test_generated_output_policy_cannot_escape_overlap_or_replace_control_records(self):
+        for outputs in ({"../control.json": "file"}, {"/escape": "directory"},
+                        {"node_modules": "directory", "node_modules/child": "directory"},
+                        {"unknown": "symlink"}, {".git/config": "file"}):
+            with self.subTest(outputs=outputs), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binding = self.binding()
+                target = self.prepare(root, binding, str(uuid.uuid4()))
+                before = self.control(root, binding).read_bytes()
+                with self.assertRaises(cache.FreshnessHold):
+                    cache.prepare_outputs(target, outputs, os.getuid(), os.getgid())
+                self.assertEqual(self.control(root, binding).read_bytes(), before)
 
     def prepare(self, root, binding, command, **kwargs):
         return cache.prepare(root, binding, command, os.getuid(), os.getgid(), **kwargs)
@@ -128,17 +168,44 @@ class GenerationTests(unittest.TestCase):
                 self.assertEqual(self.control(root, binding).read_bytes(), before)
                 self.assertEqual(marker.read_text(), "original")
 
-    def test_legacy_artifacts_never_become_a_generation_or_get_deleted(self):
+    def test_legacy_artifacts_are_retained_but_cannot_block_fresh_generation_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy = root / "target"
             legacy.mkdir()
             (legacy / "keep").write_text("legacy")
-            with self.assertRaises(cache.FreshnessHold) as held:
-                self.prepare(root, self.binding(), str(uuid.uuid4()))
-            self.assertEqual(held.exception.reason, "legacy_format")
+            target = self.prepare(root, self.binding(), str(uuid.uuid4()))
+            self.assertEqual(list(target.iterdir()), [])
             self.assertEqual((legacy / "keep").read_text(), "legacy")
-            self.assertFalse((root / "ci-source-generations").exists())
+
+    def test_new_authority_recovers_in_new_generation_without_certifying_prior_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binding = self.binding()
+            old_target = self.prepare(root, binding, str(uuid.uuid4()))
+            (old_target / "untrusted-artifact").write_text("prior authority")
+            changed = binding | {"generation": str(uuid.uuid4()), "authority_sha256": "1" * 64}
+            target = self.prepare(root, changed, str(uuid.uuid4()))
+            self.assertEqual(list(target.iterdir()), [])
+            self.assertNotEqual(target, old_target)
+            self.assertEqual((old_target / "untrusted-artifact").read_text(), "prior authority")
+
+    def test_reconstruction_recovers_after_torn_generation_without_promoting_old_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binding = self.binding()
+            command = str(uuid.uuid4())
+            target = self.prepare(root, binding, command)
+            (target / "partial-output").write_text("incomplete")
+            record = self.control(root, binding)
+            record.write_bytes(b"{torn")
+            with self.assertRaises(cache.FreshnessHold):
+                self.prepare(root, binding, str(uuid.uuid4()), predecessor=command)
+            next_binding = binding | {"generation": str(uuid.uuid4())}
+            recovered = self.prepare(root, next_binding, str(uuid.uuid4()))
+            self.assertEqual(list(recovered.iterdir()), [])
+            self.assertEqual(record.read_bytes(), b"{torn")
+            self.assertEqual((target / "partial-output").read_text(), "incomplete")
 
     def test_torn_missing_unknown_and_linked_records_cannot_activate(self):
         for fault in ("missing", "torn", "duplicate", "unknown-version", "unknown-field", "hardlink", "symlink", "oversize"):
