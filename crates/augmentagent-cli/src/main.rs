@@ -5175,6 +5175,9 @@ async fn main() -> Result<()> {
         Cmd::WhatsappHistory { op: whatsapp_history::Op::PollOnce } => {
             whatsapp_history::poll_command(store).await
         }
+        Cmd::WhatsappHistory { op: whatsapp_history::Op::Card { jid } } => {
+            whatsapp_history::card_command(store, &jid, cli.wiki_dir.clone()).await
+        }
         Cmd::WhatsappHistory { op } => whatsapp_history::policy_command(&store, &op),
         Cmd::Messages { op } => messages_cmd::run(store, op, cli.wiki_dir.clone()).await,
         Cmd::Embeddings { op } => embeddings_cmd::run(store, op).await,
