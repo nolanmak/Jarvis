@@ -3,11 +3,53 @@
 //! still interprets every other request and retains its approval boundary.
 use async_trait::async_trait;
 use augmentagent_store::phone::PhoneOrigin;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::mpsc;
+
+/// One bounded missing-source update. It is progress, never a completed result.
+#[derive(Clone, Default)]
+pub struct AttentionProgress {
+    sender: Option<mpsc::Sender<String>>,
+    issued: Arc<AtomicBool>,
+}
+impl AttentionProgress {
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<String>) {
+        let (sender, receiver) = mpsc::channel(1);
+        (
+            Self {
+                sender: Some(sender),
+                issued: Arc::default(),
+            },
+            receiver,
+        )
+    }
+    pub fn source_gap(&self, notice: &str) {
+        if notice.trim().is_empty() || notice.len() > 1_000 {
+            return;
+        }
+        if self.issued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(notice.to_owned());
+        }
+    }
+}
 
 #[async_trait]
 pub trait AttentionProvider: Send + Sync {
     /// None means this origin has no configured attention data adapter.
     async fn check(&self, origin: &PhoneOrigin) -> anyhow::Result<Option<String>>;
+    async fn check_with_progress(
+        &self,
+        origin: &PhoneOrigin,
+        _progress: AttentionProgress,
+    ) -> anyhow::Result<Option<String>> {
+        self.check(origin).await
+    }
 }
 
 /// Read intent only from the new user fragments of the authenticated transcript.

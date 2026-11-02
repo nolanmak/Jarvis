@@ -243,10 +243,9 @@ impl LiveCall {
             .phone_pending_dispatches()
             .map_err(|_| LiveError::Unavailable)?;
         for (delegation, task, started, notified) in &mut self.notices {
-            if *notified || started.elapsed() < std::time::Duration::from_secs(10) {
+            if *notified {
                 continue;
             }
-            *notified = true;
             let Some(job) = jobs
                 .iter()
                 .find(|j| j.call_id == self.call_id && j.task_id == *task)
@@ -258,6 +257,18 @@ impl LiveCall {
                 "running" => "still running",
                 _ => continue,
             };
+            match self.service.store.phone_claim_attention_notice(&self.call_id, &self.session_id, task) {
+                Ok(Some(result)) => {
+                    *notified = true;
+                    return Ok(Some(PhoneLiveResult { delegation_id: delegation.clone(), result }));
+                }
+                Ok(None) => {}
+                Err(_) => tracing::warn!(call_id=%self.call_id, "phone source progress could not be claimed"),
+            }
+            if started.elapsed() < std::time::Duration::from_secs(10) {
+                continue;
+            }
+            *notified = true;
             return Ok(Some(PhoneLiveResult{delegation_id:delegation.clone(),result:format!("The task is {phase}; I don't have its verified findings yet. We can keep talking while it finishes.")}));
         }
         Ok(None)

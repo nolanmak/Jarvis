@@ -22,7 +22,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "live_session", 12),
     ("augmentagent-phone", "--test", "live_context", 4),
     ("augmentagent-phone", "--test", "live_dispatch", 5),
-    ("augmentagent-phone", "--test", "live_call", 9),
+    ("augmentagent-phone", "--test", "live_call", 17),
     ("augmentagent-phone", "--test", "live_history", 7),
     ("augmentagent-phone", "--test", "live_usage", 4),
     ("augmentagent-phone", "--test", "live_goodbye", 4),
@@ -43,7 +43,7 @@ SUITES = [
     ("augmentagent-phone", "--test", "proposals", 19),
     ("augmentagent-proactive", "--test", "no_dial_path", 3),
     ("augmentagent-store", "--test", "phone_calls", 17),
-    ("augmentagent-store", "--test", "phone_attention", 3),
+    ("augmentagent-store", "--test", "phone_attention", 6),
     ("augmentagent-store", "--test", "phone_migration", 2),
     ("augmentagent-store", "--test", "phone_turn_metrics", 4),
     ("augmentagent-store", "--test", "phone_memory", 3),
@@ -54,7 +54,7 @@ SUITES = [
     ("augmentagent-approval-discord", "--test", "phone_boundary", 2),
     ("augmentagent-approval-discord", "--test", "phone_delivery", 3),
     ("augmentagent-channel-core", "--test", "phone_agent", 24),
-    ("augmentagent-channel-core", "--test", "phone_call_reliability", 4),
+    ("augmentagent-channel-core", "--test", "phone_call_reliability", 6),
     ("augmentagent-channel-core", "--test", "capability_inventory", 9),
     ("augmentagent-channel-core", "--test", "surface_turn", 10),
     ("augmentagent-channel-slack", "--test", "interactive_surface", 20),
@@ -103,7 +103,7 @@ def main():
     # These required CLI modules share a binary with unrelated, environment-
     # dependent tests. Only unrelated tests may be filtered; zero/ignored cases
     # or fewer than the required number still fail.
-    for module, minimum in [("phone_attention::tests::", 5), ("wiki_question_stdin_tests::", 2), ("local_phone::tests::", 1), ("phone_metrics::tests::", 2), ("local_phone_transport::tests::", 5), ("notify_tests::", 17), ("phone_runtime::tests::", 4), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
+    for module, minimum in [("phone_attention::tests::", 14), ("wiki_question_stdin_tests::", 2), ("local_phone::tests::", 1), ("phone_metrics::tests::", 2), ("local_phone_transport::tests::", 5), ("notify_tests::", 17), ("phone_runtime::tests::", 4), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
         jobs.append(("augmentagent-cli-" + module.rstrip(":").replace("::", "-"),
                      ["cargo", "test", "--locked", "-p", "augmentagent-cli", "--bin", "augmentagent", module, "--", "--test-threads=1"], minimum, True))
     # Captured iMessage/Notes files remain readable across the voice migration.
