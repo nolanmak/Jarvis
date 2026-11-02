@@ -2,6 +2,73 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_EXEC_DENIAL_LIBRARY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_exec.so"));
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+const CARGO_EXEC_DENIAL_CASES:&[u8]=include_bytes!("ci_cargo_exec_cases.py");
+
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]
+fn native_exec_denial_is_process_local_and_covers_real_syscalls() {
+    let directory=tempfile::tempdir().unwrap();let library=directory.path().join("native.so");
+    std::fs::write(&library,CARGO_EXEC_DENIAL_LIBRARY).unwrap();
+    let tests=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tests/ci_cargo_native_test.py");
+    let output=std::process::Command::new("python3").arg("-I").arg(tests)
+        .env("AUGMENTAGENT_CARGO_BOUNDARY_LIBRARY",library).output().unwrap();
+    let diagnostics=String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(),"native syscall cases failed: {diagnostics}");
+    assert!(diagnostics.contains("Ran 4 tests") && !diagnostics.contains("skipped"),"native cases did not execute: {diagnostics}");
+    assert!(std::process::Command::new("/usr/bin/true").status().unwrap().success(),"child filter affected the Rust parent");
+}
+
+/// Exercise the controller-built primitive as an unprivileged guest process.
+/// This does not run Cargo under a new identity or establish metadata isolation.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_native_exec_denial()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-native-exec-denial",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("native-exec-denial-fixture-").tempdir_in(&target)?;
+    let root=fixture.path();std::fs::write(root.join("native.so"),CARGO_EXEC_DENIAL_LIBRARY)?;
+    std::fs::write(root.join("cases.py"),CARGO_EXEC_DENIAL_CASES)?;
+    git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","native exec denial fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let binding=binding(root).await?;let session=vm::Session::prepare(&owner,&target)?;
+    let source=snapshot(root,&binding,&target).await?;
+    let command=r#"python3 -I - <<'PY'
+import json,shutil,signal,subprocess,sys
+shutil.copyfile('/workspace/native.so','/workspace/target/native.so')
+results={}
+for mode in ('execve','execveat','fork','x32'):
+ result=subprocess.run([sys.executable,'-I','/workspace/cases.py','/workspace/target/native.so',mode],capture_output=True,text=True,timeout=15)
+ expected=-signal.SIGSYS if mode=='x32' else 0
+ results[mode]={'exit_code':result.returncode,'stdout':result.stdout,'stderr':result.stderr}
+ assert result.returncode==expected,results[mode]
+ if mode!='x32':assert 'DENIED\n' in result.stdout,results[mode]
+ if mode=='fork':assert 'REAPED\n' in result.stdout,results[mode]
+print(json.dumps(results))
+PY"#;
+    let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    let cases:serde_json::Value=serde_json::from_str(&result.stdout).unwrap_or(serde_json::Value::Null);
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "version":1,"kind":"real_shared_ci_native_exec_denial","head":head,"generation":source.generation(),
+        "status":result.status,"cases":cases,"actual_vm_commands":1,"cargo_metadata_isolation_established":false,
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
+    ensure!(result.status=="passed" && cases.as_object().is_some_and(|cases|cases.len()==4),
+        "native exec denial unavailable: {} {}",result.stdout,result.stderr);
+    Ok(())
+}
+
 /// Query the actual guest ABI without granting privileged execution. A
 /// successful capability observation is deliberately not an enforcement proof.
 #[tokio::test]

@@ -195,25 +195,28 @@ separate required work.
 
 ### Candidate protected Cargo planner (#1807, not enabled)
 
-This is a candidate mechanism under interrogation. The capability probe is
-implemented; privileged Cargo execution, artifact invalidation and the final
+This is a candidate mechanism under interrogation. The capability probe and an unprivileged native exec-denial primitive are
+implemented; protected Cargo execution, artifact invalidation and the final
 passing-proof producer are not. This section does not authorize a rollout or a
 consumer handoff. All #1807 D1–D8 requirements, including compatible-unit reuse,
 remain binding. C owns resolving the open threads below before implementation
 acceptance. An unsupported premise rejects the candidate; it is not permission
 to change the operator's toolchain channel, provider grant or VM restrictions.
 
-1. **Protect the planner's metadata.** The pinned Cargo executable would run as
-   a controller process inside the existing VM, with its fingerprint metadata
+1. **Protect the planner's metadata.** The pinned Cargo executable would run under
+   a dedicated non-root planner credential inside the existing VM, distinct from
+   both the controller and application credentials, with its fingerprint metadata
    inaccessible to application workers. Build scripts, procedural macros,
    wrappers, linkers, plugins and tests must execute without that privilege.
    An application-written Cargo fingerprint or dep-info file is not a reuse
    authority. Only independently protected producer records may support reuse.
-2. **Enforce every privileged executable transition.** A controller-embedded
-   native launcher and a kernel execution gate must make direct privileged
-   execution of an application binary impossible. A preload adapter may translate
-   the pinned Cargo/std-library spawn interfaces to that launcher; the kernel
-   gate remains mandatory if interposition misses a call. Unsupported ABI,
+2. **Prevent application execution under the planner credential.** The current
+   prototype direction is a controller-embedded native gate denying the planner's
+   direct exec calls, with tool execution delegated to a controller relay under a
+   separate unprivileged credential. A preload adapter may translate the pinned
+   Cargo/std-library spawn interfaces to that relay; the kernel denial remains
+   mandatory if interposition misses a call. The actual relay, credential
+   transition and loader protocol remain unimplemented and unaccepted. Unsupported ABI,
    missing listener, ambiguous caller identity or unknown executable must refuse.
    A capability observation establishes none of this enforcement. Application
    environment/arguments cannot select the launcher, credentials or gate policy.
