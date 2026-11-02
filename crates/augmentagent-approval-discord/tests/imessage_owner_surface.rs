@@ -514,3 +514,48 @@ async fn approval_files_keep_their_original_links_without_becoming_approval_targ
         "pending"
     );
 }
+
+fn bot_message(s: &Store, n: u64, content: &str) -> serenity::all::Message {
+    use serenity::all::{ChannelId, GuildId, Message, MessageId, UserId};
+    let b = s.imessage_owner_binding().unwrap().unwrap();
+    let mut m = Message::default();
+    m.id = MessageId::new(((b.activated_at_ms as u64 + 1000 - 1_420_070_400_000) << 22) + n);
+    m.channel_id = ChannelId::new(11);
+    m.guild_id = Some(GuildId::new(20));
+    m.author.id = UserId::new(99);
+    m.author.bot = true;
+    m.content = content.into();
+    m
+}
+
+#[test]
+fn repeated_flag_notices_for_one_thread_text_the_owner_once() {
+    // Every comment on a busy GitHub thread is its own "Important" email; the
+    // owner's phone must not get one text per comment.
+    let (s, surface, _, _, _) = fixture();
+    let notice = |subject: &str, reason: &str| {
+        format!("🚩 **Important** — from `dev <notifications@example.invalid>`\n**{subject}**\n_reason: {reason}_")
+    };
+    surface.mirror_discord(&bot_message(&s, 1, &notice("[org/app] Ship it (PR #7)", "review request")), None, None).unwrap();
+    surface.mirror_discord(&bot_message(&s, 2, &notice("Re: [org/app] Ship it (PR #7)", "new comment")), None, None).unwrap();
+    surface.mirror_discord(&bot_message(&s, 3, &notice("Re: [org/app] Ship it (PR #7)", "another")), None, None).unwrap();
+    assert_eq!(s.list_imessage_outbox(100).unwrap().len(), 1);
+    surface.mirror_discord(&bot_message(&s, 4, &notice("[org/app] Other thread", "review request")), None, None).unwrap();
+    assert_eq!(s.list_imessage_outbox(100).unwrap().len(), 2);
+}
+
+#[test]
+fn imessage_turn_echoed_to_discord_is_not_mirrored_back() {
+    let (s, surface, _, _, _) = fixture();
+    let echo = serde_json::to_value(
+        augmentagent_approval_discord::imessage_owner::imessage_echo_message("what's next?", "The launch review."),
+    )
+    .unwrap();
+    let mut m = bot_message(&s, 1, "");
+    m.channel_id = serenity::all::ChannelId::new(10);
+    m.embeds = serde_json::from_value(echo["embeds"].clone()).unwrap();
+    assert!(echo["embeds"][0]["description"].as_str().unwrap().contains("what's next?"));
+    assert!(echo["embeds"][0]["description"].as_str().unwrap().contains("The launch review."));
+    surface.mirror_discord(&m, None, None).unwrap();
+    assert!(s.list_imessage_outbox(100).unwrap().is_empty(), "the owner already has this on iMessage");
+}
