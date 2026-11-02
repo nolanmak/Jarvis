@@ -193,6 +193,94 @@ The current local-completion producer remains `preparation_only`, with
 does not authorize merge; final proof publication and merge enforcement remain
 separate required work.
 
+### Candidate protected Cargo planner (#1807, not enabled)
+
+This is a candidate mechanism under interrogation. The capability probe is
+implemented; privileged Cargo execution, artifact invalidation and the final
+passing-proof producer are not. This section does not authorize a rollout or a
+consumer handoff. All #1807 D1–D8 requirements, including compatible-unit reuse,
+remain binding. C owns resolving the open threads below before implementation
+acceptance. An unsupported premise rejects the candidate; it is not permission
+to change the operator's toolchain channel, provider grant or VM restrictions.
+
+1. **Protect the planner's metadata.** The pinned Cargo executable would run as
+   a controller process inside the existing VM, with its fingerprint metadata
+   inaccessible to application workers. Build scripts, procedural macros,
+   wrappers, linkers, plugins and tests must execute without that privilege.
+   An application-written Cargo fingerprint or dep-info file is not a reuse
+   authority. Only independently protected producer records may support reuse.
+2. **Enforce every privileged executable transition.** A controller-embedded
+   native launcher and a kernel execution gate must make direct privileged
+   execution of an application binary impossible. A preload adapter may translate
+   the pinned Cargo/std-library spawn interfaces to that launcher; the kernel
+   gate remains mandatory if interposition misses a call. Unsupported ABI,
+   missing listener, ambiguous caller identity or unknown executable must refuse.
+   A capability observation establishes none of this enforcement. Application
+   environment/arguments cannot select the launcher, credentials or gate policy.
+3. **Close each producer's inputs and outputs.** Before compilation, expose the
+   original read-only Git source, frozen declared generated inputs, trusted
+   dependency artifacts and the pinned runtime. Separate producer credentials
+   and private output paths must prevent other workers from modifying an active
+   producer or its result. Capture build-script outputs before dependent rustc
+   invocations. Publish and seal a unit only after its descendants are stopped
+   through the existing guest supervisor. Whole-VM host quiescence and managed
+   storage admission remain independently required; this is not a second host
+   storage fence.
+4. **Invalidate from protected content identities.** Bind a unit to package,
+   Rust target/build-script, target triple, profile, feature/cfg/test mode, flags,
+   runtime/toolchain and its complete input closure. Use protected Cargo graph
+   data and producer records to invalidate changed units and transitive outputs,
+   including build-script execution state. Pure compiler units need precise
+   inputs so unrelated generated files do not force recompilation. Native or
+   otherwise opaque producers need an explicit complete visible-input closure;
+   a candidate-supplied dependency hint cannot make it smaller. Unknown formats
+   or incomplete closure must return a typed prerequisite. Every unchanged
+   compatible unit must remain reusable, and cross-generation external reuse
+   still requires the existing independently produced, sealed seed.
+5. **Keep one evidence chain.** Private planner/unit records belong to the owned
+   source generation and physical managed image. They are inputs to C's existing
+   proof contract, not another workflow binding or CI verdict. Crashes cannot
+   promote incomplete records. Source-generation reconstruction, changed
+   authority and unknown ownership retain the existing refusal/recovery rules.
+   Final proof publication still requires complete local coverage, original
+   bindings, input provenance and guest/host cleanup evidence. V/M/baseline
+   integration and the D7 rollout/storage-enforcement requirements remain open.
+
+Load-bearing open threads (owner C; each blocks production privilege activation and final
+proof publication): the precise launcher/listener credential and loader protocol;
+the protected graph/unit record schema and opaque-input closure rule that meets
+D8; frozen generated-input and build-output provenance; and bounded/crash-safe
+artifact retention using R's existing admission/quiescence. None is an accepted
+weaker alternative or a new product requirement.
+
+The first fresh-reader audit identified six unresolved implementation choices:
+the trusted graph/input interface, execution/loader protocol, unit-scoped cleanup
+bindings, generated-output publication, unreleased-owner recovery, and exact
+unit-to-suite proof/API mapping. All remain blockers, not accepted guesses.
+Unit cleanup must have its own producer identity and evidence before dependent
+compilation; command cleanup and whole-VM cleanup cannot substitute for it.
+C must define those bindings using the existing supervisor, and coordinate
+durable owner recovery with R/#1676/#1803. The next safely admitted attempt must
+recover known interrupted state without manual fence deletion. C must also
+publish the exact unit-to-suite mapping with the single D7 schema/API before
+consumer handoff. This audit does not establish implementation readiness.
+
+Disposable boundary tests may exercise a specified gate under the existing VM
+admission before production activation. They must never fall back to unchecked
+privileged execution or create a reusable CI/merge proof. Unsupported capability
+observations remain observations; they cannot authorize those tests' privileged
+transitions. The credential/loader protocol and fail-closed gate must be resolved
+and verified before any experimental privileged Cargo invocation.
+
+Testable build order: query the real guest's kernel ABI and Cargo loader without
+granting execution authority; prove denial of direct/bypassed privileged exec,
+listener loss, loader/environment substitution and credential recovery; then
+prove metadata/artifact isolation against real build scripts/macros/tests. Run
+the existing generated-input `OLD`→`NEW`, compile-error/assertion, mutation/revert,
+feature/configuration and exact compiler-call reuse cases through the actual VM.
+Only then finalize and freshly audit the C mechanism/schema before consumer
+handoff. No step here is a passing CI or autonomous-merge claim.
+
 ### Host provisioning: KVM access that survives logout (operator step)
 
 On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`

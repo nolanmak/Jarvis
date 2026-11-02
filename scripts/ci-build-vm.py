@@ -17,6 +17,7 @@ input_boundary=importlib.util.module_from_spec(input_spec);input_spec.loader.exe
 dependency_spec=importlib.util.spec_from_file_location('ci_dependency_workspace',BASE/'ci-dependency-workspace.py')
 dependency_workspace=importlib.util.module_from_spec(dependency_spec);dependency_spec.loader.exec_module(dependency_workspace)
 DEPENDENCY_PROGRAMS={name:(BASE/name).read_bytes() for name in (
+ 'ci-cargo-boundary.py',
  'ci-cache-generation.py','ci-dependency-seed.py','ci-dependency-artifacts.py','ci-dependency-workspace.py',
  'ci-dependency-store.py','ci-dependency-driver.py','ci-dependency-guest.py')}
 

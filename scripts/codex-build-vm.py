@@ -472,7 +472,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         auxiliary_dependency=dependency is not None and dependency.get('kind') in ('produce','publish','lookup')
         if 'dependency_programs' in ci_context:
             programs=ci_context.get('dependency_programs')
-            expected={'ci-cache-generation.py','ci-dependency-seed.py','ci-dependency-artifacts.py','ci-dependency-workspace.py',
+            expected={'ci-cache-generation.py','ci-cargo-boundary.py','ci-dependency-seed.py','ci-dependency-artifacts.py','ci-dependency-workspace.py',
                       'ci-dependency-store.py','ci-dependency-driver.py','ci-dependency-guest.py'}
             if not isinstance(programs,dict) or set(programs)!=expected or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values()):
                 raise Unavailable('invalid dependency controller bundle')

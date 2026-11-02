@@ -12,7 +12,8 @@ const WORKER_SCOPE: &[u8] = include_bytes!("../../../scripts/ci-worker-scope.py"
 const INPUT_MANIFEST: &[u8] = include_bytes!("../../../scripts/ci-input-manifest.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
-const DEPENDENCY_PROGRAMS:[(&str,&[u8]);6]=[
+const DEPENDENCY_PROGRAMS:[(&str,&[u8]);7]=[
+    ("ci-cargo-boundary.py",include_bytes!("../../../scripts/ci-cargo-boundary.py")),
     ("ci-dependency-seed.py",include_bytes!("../../../scripts/ci-dependency-seed.py")),
     ("ci-dependency-artifacts.py",include_bytes!("../../../scripts/ci-dependency-artifacts.py")),
     ("ci-dependency-workspace.py",include_bytes!("../../../scripts/ci-dependency-workspace.py")),
