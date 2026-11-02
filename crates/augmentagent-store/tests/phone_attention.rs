@@ -136,3 +136,128 @@ fn a_replaced_native_session_cannot_receive_context_from_an_old_binding() {
         "discarded context cannot be resurrected"
     );
 }
+
+fn progress_fixture() -> (tempfile::TempDir, Store, String, PhoneOrigin, String) {
+    let (dir, store, id, origin) = fixture(false);
+    store.phone_claim_relay(&id, "CA-test").unwrap();
+    store
+        .phone_bind_live_session(&id, "progress-session")
+        .unwrap();
+    let task = store
+        .phone_enqueue_live_dispatch(
+            &id,
+            "progress-session",
+            "gap-delegation",
+            "Check attention sources",
+        )
+        .unwrap();
+    assert!(store.phone_start_dispatch(&id, &task).unwrap());
+    (dir, store, id, origin, task)
+}
+#[test]
+fn source_gap_claim_survives_restart_without_finishing_or_replaying_the_task() {
+    let (dir, store, id, _origin, task) = progress_fixture();
+    assert!(store
+        .phone_attention_notice(&id, &task, "Inbox is unavailable; still checking.")
+        .unwrap());
+    assert!(!store
+        .phone_attention_notice(&id, &task, "Do not replace the first notice.")
+        .unwrap());
+    assert!(store
+        .phone_live_results(&id, "progress-session")
+        .unwrap()
+        .is_empty());
+    drop(store);
+    let store = Store::open(dir.path().join("db")).unwrap();
+    assert_eq!(
+        store
+            .phone_claim_attention_notice(&id, "progress-session", &task)
+            .unwrap()
+            .as_deref(),
+        Some("Inbox is unavailable; still checking.")
+    );
+    assert!(store
+        .phone_pending_dispatches()
+        .unwrap()
+        .iter()
+        .any(|j| j.task_id == task && j.state == "running"));
+    drop(store);
+    let store = Store::open(dir.path().join("db")).unwrap();
+    assert!(store
+        .phone_claim_attention_notice(&id, "progress-session", &task)
+        .unwrap()
+        .is_none());
+    assert!(!store
+        .phone_attention_notice(&id, &task, "Must not replay after restart.")
+        .unwrap());
+    let retained: Option<String> = store
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT notice FROM phone_attention_notices WHERE call_id=?1 AND task_id=?2",
+                [&id, &task],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert!(
+        retained.is_none(),
+        "private progress text is erased before transport I/O"
+    );
+}
+#[test]
+fn completed_attention_result_supersedes_a_stale_gap_notice() {
+    let (_dir, store, id, _origin, task) = progress_fixture();
+    store
+        .phone_attention_notice(&id, &task, "Inbox is unavailable.")
+        .unwrap();
+    store
+        .phone_finish_attention_dispatch(
+            &id,
+            &task,
+            "Attention check",
+            "Synthetic deadline tomorrow at 5 PM.",
+        )
+        .unwrap();
+    assert!(store
+        .phone_claim_attention_notice(&id, "progress-session", &task)
+        .unwrap()
+        .is_none());
+    assert!(!store
+        .phone_attention_notice(&id, &task, "Too late.")
+        .unwrap());
+    let results = store.phone_live_results(&id, "progress-session").unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.contains("deadline tomorrow"));
+}
+#[test]
+fn revoked_authority_and_closed_calls_cannot_disclose_source_progress() {
+    let (_dir, store, id, origin, task) = progress_fixture();
+    store
+        .phone_attention_notice(&id, &task, "Private source name.")
+        .unwrap();
+    store.unbind_surface_owner(origin.owner.account()).unwrap();
+    assert!(store
+        .phone_claim_attention_notice(&id, "progress-session", &task)
+        .is_err());
+    assert!(store
+        .phone_attention_notice(&id, &task, "No new progress.")
+        .is_err());
+    store
+        .phone_end_live_session(&id, "progress-session")
+        .unwrap();
+    let retained: i64 = store
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT count(*) FROM phone_attention_notices WHERE call_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(retained, 0);
+    assert!(store
+        .phone_pending_dispatches()
+        .unwrap()
+        .iter()
+        .any(|j| j.task_id == task && j.state == "running"));
+}

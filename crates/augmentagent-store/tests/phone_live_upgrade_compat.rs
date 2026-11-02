@@ -36,6 +36,7 @@ const LIVE: &[&str] = &[
     "phone_live_transcripts",
     "phone_live_usage",
     "phone_live_summary_jobs",
+    "phone_attention_notices",
 ];
 fn seed_jobs(store: &Store, call: &str, prefix: &str) {
     for state in ["queued", "running", "ready"] {
@@ -123,6 +124,8 @@ fn upgrade_fixture() {
             db.execute("INSERT INTO phone_live_transcripts(call_id,event_id,fingerprint,user,text,batch_id) VALUES(?1,'event','fingerprint',1,'Private synthetic transcript','history-key')", [&call])?;
             db.execute("INSERT INTO phone_live_usage(call_id,phase,session_id,end_trigger,final_reason,seconds) VALUES(?1,'conversation','synthetic-live-session','twilio_stop','close_requested',2.5)", [&call])?;
             db.execute("INSERT INTO phone_live_summary_jobs(call_id,delegation_id,attempts,lease_token,next_ms) VALUES(?1,'live-ready',1,'synthetic-lease',10000)", [&call])?;
+            db.execute("INSERT INTO phone_attention_notices(call_id,task_id,notice,claimed) VALUES(?1,'live-running','Synthetic source temporarily unavailable',0)", [&call])?;
+            db.execute("INSERT INTO phone_attention_notices(call_id,task_id,notice,claimed) VALUES(?1,'relay-running',NULL,1)", [&call])?;
             Ok(())
         }).unwrap();
         std::fs::write(&live, serde_json::to_vec(&rows(&path, LIVE)).unwrap()).unwrap();
