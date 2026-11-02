@@ -32,7 +32,7 @@ fn startup_pins_audio_model_voice_and_client_delegation() {
         start["session"]["audio"]["format"],
         json!({"type":"audio/pcmu","rate":8000})
     );
-    assert_eq!(start["session"]["delegation"], json!({"type":"client"}));
+    assert_eq!(start["session"]["delegation"], json!({"type":"client","acknowledgement_delay_ms":800}));
     assert_eq!(s.state(), LiveState::Starting);
     assert_eq!(s.start().err(), Some(LiveError::State));
     assert_eq!(s.audio(&[255; 160]).err(), Some(LiveError::State));
@@ -227,5 +227,45 @@ fn invalid_timeline_and_nonclient_delegation_fail_closed() {
             Some(LiveError::Protocol)
         );
         assert_eq!(s.state(), LiveState::Failed);
+    }
+}
+
+#[test]
+fn probed_nonfatal_rejection_preserves_session_and_only_correlated_commands_can_repair() {
+    for mode in [
+        "recoverable",
+        "uncorrelated",
+        "unknown-code",
+        "wrong-param",
+        "auth",
+    ] {
+        let mut s = active();
+        s.receive(&json!({"type":"session.delegation.created","event_id":"delegated","offset_ms":1,"delegation":{"id":"del-synthetic","type":"delegation","target":"client"}}).to_string()).unwrap();
+        let sent = s
+            .commentary("del-synthetic", "Synthetic deadline Tuesday at 5 PM.")
+            .unwrap();
+        let mut error = json!({"type":"error","error":{"type":"invalid_request_error","code":null,"param":"delegation_id","client_event_id":sent["event_id"],"message":"Unknown client or Decision delegation."}});
+        match mode {
+            "uncorrelated" => error["error"]["client_event_id"] = json!("not-our-command"),
+            "unknown-code" => error["error"]["code"] = json!("private-unclassified-code"),
+            "wrong-param" => error["error"]["param"] = json!("private-secret-param"),
+            "auth" => error["error"]["type"] = json!("authentication_error"),
+            _ => {}
+        }
+        let result = s.receive(&error.to_string());
+        if matches!(mode, "recoverable" | "uncorrelated") {
+            assert!(
+                result.is_ok(),
+                "a definitively rejected reference must not destroy a usable session"
+            );
+            assert_eq!(s.state(), LiveState::Active);
+            if mode=="uncorrelated" {assert!(matches!(result.unwrap(),LiveInput::Ignored));}
+            else {assert!(matches!(result.unwrap(),LiveInput::CommentaryRejected{..}));}
+            assert!(s.audio(&[255; 160]).is_ok());
+        } else {
+            let e = result.err().expect("unproven recovery remains terminal");
+            assert_eq!(s.state(), LiveState::Failed);
+            assert!(!e.to_string().contains("private"));
+        }
     }
 }

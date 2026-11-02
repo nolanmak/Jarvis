@@ -128,7 +128,7 @@ async fn delegation_reaches_existing_durable_queue_without_a_new_agent_turn() {
     let f = fixture().await;
     let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
     call.event(&transcript()).unwrap();
-    let LiveAction::Queued { task_id } = call.event(&delegation()).unwrap() else {
+    let LiveAction::Queued { task_id, .. } = call.event(&delegation()).unwrap() else {
         panic!("queue expected")
     };
     let jobs = f.store.phone_pending_dispatches().unwrap();
@@ -199,7 +199,7 @@ async fn only_correlated_provider_ack_releases_live_result() {
     let f = fixture().await;
     let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
     call.event(&transcript()).unwrap();
-    let LiveAction::Queued { task_id } = call.event(&delegation()).unwrap() else {
+    let LiveAction::Queued { task_id, .. } = call.event(&delegation()).unwrap() else {
         panic!("queue expected")
     };
     f.store
@@ -210,7 +210,9 @@ async fn only_correlated_provider_ack_releases_live_result() {
         client_event_id: "unrelated".into(),
     })
     .unwrap();
-    assert_eq!(call.pending_results().unwrap().len(), 1);
+    assert!(call.reply_pending("del-test"));
+    assert_eq!(f.store.phone_live_result_disposition(&f.id,"del-test").unwrap().as_deref(),Some("sending"));
+    assert!(call.pending_results().unwrap().is_empty(), "in-flight material is not eligible for another send");
     call.event(&LiveInput::CommentaryAccepted {
         client_event_id: "evt-reply".into(),
     })
@@ -346,7 +348,7 @@ async fn long_result_reaches_voice_without_a_summary_model_and_full_chat_result_
     let mut f = fixture_with_agent(Some(Arc::new(Agent))).await;
     let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
     call.event(&transcript()).unwrap();
-    let LiveAction::Queued { task_id } = call.event(&delegation()).unwrap() else {
+    let LiveAction::Queued { task_id, .. } = call.event(&delegation()).unwrap() else {
         panic!("expected task");
     };
     let full = "Detailed result. ".repeat(100);
@@ -440,7 +442,7 @@ async fn unicode_result_parts_require_each_ack_and_preserve_failures() {
     let f = fixture().await;
     let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
     call.event(&transcript()).unwrap();
-    let LiveAction::Queued {task_id} = call.event(&delegation()).unwrap() else {panic!("task expected")};
+    let LiveAction::Queued {task_id,..} = call.event(&delegation()).unwrap() else {panic!("task expected")};
     let full = format!("{} The email was NOT sent. Approval is required.", "Résumé café 🐕. ".repeat(100));
     f.store.phone_finish_dispatch(&f.id,&task_id,&full).unwrap();
     let mut received = String::new();
@@ -454,7 +456,8 @@ async fn unicode_result_parts_require_each_ack_and_preserve_failures() {
         call.track_reply(&event,&part.delegation_id).unwrap();
         assert!(call.reply_pending(&part.delegation_id));
         call.event(&LiveInput::CommentaryAccepted {client_event_id:"wrong".into()}).unwrap();
-        assert_eq!(call.pending_results().unwrap()[0].result,part.result);
+        assert!(call.pending_results().unwrap().is_empty(), "wrong receipts cannot make in-flight material eligible to resend");
+        assert_eq!(f.store.phone_live_result_disposition(&f.id,&part.delegation_id).unwrap().as_deref(),Some("sending"));
         assert!(call.track_reply("overlap",&part.delegation_id).is_err());
         call.event(&LiveInput::CommentaryAccepted {client_event_id:event}).unwrap();
         assert!(!call.reply_pending(&part.delegation_id));
@@ -498,4 +501,87 @@ async fn late_word_fragments_settle_before_starting_a_task() {
     let jobs = f.store.phone_pending_dispatches().unwrap();
     assert_eq!(jobs.len(),1);
     assert!(jobs[0].description.contains("Check my calendar."));
+}
+
+/// A dropped provider receipt must end this publication, not lock the call's
+/// result cursor forever or replay an ambiguously transmitted piece.
+#[tokio::test(start_paused = true)]
+async fn missing_result_ack_expires_without_replay_and_next_question_still_dispatches() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    call.event(&transcript()).unwrap();
+    let LiveAction::Queued { task_id, .. } = call.event(&delegation()).unwrap() else {
+        panic!("queue expected")
+    };
+    f.store
+        .phone_finish_dispatch(
+            &f.id,
+            &task_id,
+            &"Synthetic deadline is Tuesday at 5 PM. ".repeat(45),
+        )
+        .unwrap();
+    call.track_reply("evt-result", "del-test").unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    call.poll_delegations().unwrap();
+    assert!(
+        !call.reply_pending("del-test"),
+        "missing acknowledgment must settle within five seconds"
+    );
+    assert!(
+        call.pending_results().unwrap().is_empty(),
+        "ambiguous publication cannot replay its first piece or send an orphan continuation"
+    );
+    call.event(&LiveInput::CommentaryAccepted {
+        client_event_id: "evt-result".into(),
+    })
+    .unwrap();
+    assert!(
+        call.pending_results().unwrap().is_empty(),
+        "late acknowledgment must not restart abandoned speech"
+    );
+    call.event(&LiveInput::Transcript {
+        event_id: "follow-up".into(),
+        user: true,
+        text: "Check tomorrow too.".into(),
+        start_ms: 200.,
+        end_ms: 300.,
+    })
+    .unwrap();
+    assert!(matches!(
+        call.event(&LiveInput::Delegation {
+            id: "del-follow-up".into(),
+            offset_ms: 310.
+        })
+        .unwrap(),
+        LiveAction::Queued { .. }
+    ));
+    assert_eq!(
+        f.store.phone_pending_dispatches().unwrap().len(),
+        2,
+        "the original job is not replayed"
+    );
+}
+
+#[tokio::test(start_paused=true)]
+async fn slow_live_task_gets_one_truthful_delay_notice_but_ready_work_does_not(){
+    let f=fixture().await;let mut call=LiveCall::new(f.service.clone(),&f.id,"session-test").unwrap();
+    call.event(&transcript()).unwrap();let LiveAction::Queued{task_id,..}=call.event(&delegation()).unwrap() else {panic!("task expected")};
+    assert!(call.delay_notice().unwrap().is_none());tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    let notice=call.delay_notice().unwrap().expect("a genuinely slow live task needs an honest delay update");assert_eq!(notice.delegation_id,"del-test");assert!(notice.result.contains("queued"));
+    assert!(call.delay_notice().unwrap().is_none(),"progress is bounded, not a repeated keepalive");
+    f.store.phone_finish_dispatch(&f.id,&task_id,"Synthetic deadline Tuesday at 5 PM.").unwrap();
+    assert!(call.delay_notice().unwrap().is_none());assert_eq!(call.pending_results().unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn a_long_result_does_not_starve_a_ready_followup_answer(){
+    let f=fixture().await;let mut call=LiveCall::new(f.service.clone(),&f.id,"session-test").unwrap();
+    call.event(&transcript()).unwrap();let LiveAction::Queued{task_id,..}=call.event(&delegation()).unwrap() else {panic!("task expected")};
+    f.store.phone_finish_dispatch(&f.id,&task_id,&"Synthetic deadline Tuesday at 5 PM. ".repeat(300)).unwrap();
+    call.event(&LiveInput::Transcript{event_id:"follow-up".into(),user:true,text:"Which day?".into(),start_ms:200.,end_ms:300.}).unwrap();
+    let LiveAction::Queued{task_id,..}=call.event(&LiveInput::Delegation{id:"del-next".into(),offset_ms:310.}).unwrap() else {panic!("follow-up expected")};
+    f.store.phone_finish_dispatch(&f.id,&task_id,"Tuesday.").unwrap();
+    assert_eq!(call.pending_results().unwrap()[0].delegation_id,"del-test");
+    call.track_reply("first-piece","del-test").unwrap();call.event(&LiveInput::CommentaryAccepted{client_event_id:"first-piece".into()}).unwrap();
+    assert_eq!(call.pending_results().unwrap()[0].delegation_id,"del-next","a completed follow-up must not wait for every chunk of a long answer");
 }

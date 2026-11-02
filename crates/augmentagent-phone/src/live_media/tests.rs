@@ -202,7 +202,7 @@ async fn unsigned_or_cross_call_stream_cannot_open_live() {
     let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-other")).await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws))
         .await
         .unwrap();
     assert!(
@@ -225,7 +225,7 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
     let backend = tokio::spawn(async move {
         let (tcp, _) = provider.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
-        let start = ws.next().await.unwrap().unwrap();
+        let start = next_non_progress(&mut ws).await.unwrap().unwrap();
         let start: serde_json::Value = serde_json::from_str(start.to_text().unwrap()).unwrap();
         assert_eq!(start["session"]["input"][0]["role"], "developer");
         assert!(start["session"]["input"][0]["content"][0]["text"]
@@ -241,7 +241,7 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
         .await
         .unwrap();
         loop {
-            let Some(Ok(Message::Text(text))) = ws.next().await else {
+            let Some(Ok(Message::Text(text))) = next_non_progress(&mut ws).await else {
                 break;
             };
             let value: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -259,7 +259,7 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
                 let expected = "Synthetic lookup result. ".repeat(35);
                 let mut received = String::new();
                 while received.len() < expected.len() {
-                    let reply = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+                    let reply = tokio::time::timeout(std::time::Duration::from_secs(3), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
                     let reply: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
                     assert_eq!(reply["type"], "session.commentary.append");
                     assert_eq!(reply["delegation_id"], "del-work");
@@ -285,14 +285,14 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
     // The first audible frame must arrive without any caller audio.
-    let greeting = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+    let greeting = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws))
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     let greeting: serde_json::Value = serde_json::from_str(greeting.to_text().unwrap()).unwrap();
     assert_eq!(greeting["media"]["payload"], STANDARD.encode([128; 160]));
-    let mark = ws.next().await.unwrap().unwrap();
+    let mark = next_non_progress(&mut ws).await.unwrap().unwrap();
     let mark: serde_json::Value = serde_json::from_str(mark.to_text().unwrap()).unwrap();
     ws.send(Message::Text(
         json!({"event":"mark","streamSid":"MZ-test","sequenceNumber":"2","mark":mark["mark"]})
@@ -302,7 +302,7 @@ async fn signed_media_round_trips_audio_and_replayed_relay_opens_no_second_provi
     .await
     .unwrap();
     ws.send(Message::Text(json!({"event":"media","sequenceNumber":"3","streamSid":"MZ-test","media":{"track":"inbound","chunk":"1","timestamp":"0","payload":STANDARD.encode([255;160])}}).to_string().into())).await.unwrap();
-    let text = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+    let text = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws))
         .await
         .unwrap()
         .unwrap()
@@ -395,7 +395,7 @@ async fn finalized_provider_failure_keeps_usage_and_is_not_an_owner_hangup() {
     let backend = tokio::spawn(async move {
         let (tcp, _) = provider.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
-        let _ = ws.next().await;
+        let _ = next_non_progress(&mut ws).await;
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         ws.send(Message::Text(json!({"type":"session.closed","event_id":"evt-close","reason":"connection_lost","session":{"id":"live-test"},"usage":{"seconds":0.25}}).to_string().into())).await.unwrap();
     });
@@ -403,7 +403,7 @@ async fn finalized_provider_failure_keeps_usage_and_is_not_an_owner_hangup() {
     let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws)).await.unwrap();
     backend.await.unwrap();
     let rows = f.service.store.phone_live_usage(1).unwrap();
     assert_eq!(rows.len(), 1);
@@ -422,7 +422,7 @@ async fn lost_provider_socket_has_unknown_usage_and_incomplete_finalization() {
     let backend = tokio::spawn(async move {
         let (tcp, _) = provider.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
-        let _ = ws.next().await;
+        let _ = next_non_progress(&mut ws).await;
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         // No session.closed: the wire closing must not imply zero usage.
         ws.close(None).await.unwrap();
@@ -431,7 +431,7 @@ async fn lost_provider_socket_has_unknown_usage_and_incomplete_finalization() {
     let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws)).await.unwrap();
     backend.await.unwrap();
     let rows = f.service.store.phone_live_usage(1).unwrap();
     assert_eq!(rows.len(), 1);
@@ -450,7 +450,7 @@ async fn owner_goodbye_closes_twilio_before_provider_finalization_and_keeps_task
     let backend=tokio::spawn(async move {
         let (tcp,_)=provider.accept().await.unwrap();
         let mut ws=accept_async(tcp).await.unwrap();
-        let _=ws.next().await;
+        let _=next_non_progress(&mut ws).await;
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([128;160])}).to_string().into())).await.unwrap();
         for event in [
@@ -459,7 +459,7 @@ async fn owner_goodbye_closes_twilio_before_provider_finalization_and_keeps_task
             json!({"type":"session.input_transcript.delta","event_id":"bye-one","delta":"That's all,","start_ms":2000,"end_ms":2300}),
             json!({"type":"session.input_transcript.delta","event_id":"bye-two","delta":" thanks.","start_ms":2300,"end_ms":2500}),
         ] { ws.send(Message::Text(event.to_string().into())).await.unwrap(); }
-        let close=ws.next().await.unwrap().unwrap();
+        let close=next_non_progress(&mut ws).await.unwrap().unwrap();
         let close:serde_json::Value=serde_json::from_str(close.to_text().unwrap()).unwrap();
         assert_eq!(close["type"],"session.close");
         finalize_rx.await.unwrap();
@@ -470,7 +470,7 @@ async fn owner_goodbye_closes_twilio_before_provider_finalization_and_keeps_task
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3),async {
-        loop { match ws.next().await {Some(Ok(Message::Close(_)))|None=>break,Some(Ok(_))=>{},other=>panic!("unexpected close: {other:?}") } }
+        loop { match next_non_progress(&mut ws).await {Some(Ok(Message::Close(_)))|None=>break,Some(Ok(_))=>{},other=>panic!("unexpected close: {other:?}") } }
     }).await.expect("goodbye must close Twilio without waiting for slow OpenAI finalization");
     assert!(f.service.store.phone_provider_call(&f.id).unwrap().stop_requested);
     assert_eq!(f.service.store.phone_end_reason(&f.id).unwrap().as_deref(),Some("owner_goodbye"));
@@ -503,19 +503,19 @@ async fn full_duplex_keeps_input_flowing_during_unacknowledged_output() {
     let backend=tokio::spawn(async move {
         let (tcp,_)=provider.accept().await.unwrap();
         let mut ws=accept_async(tcp).await.unwrap();
-        let _=ws.next().await;
+        let _=next_non_progress(&mut ws).await;
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         for (index,text) in ["mm-hmm","yeah","stop","Actually, use tomorrow instead"].iter().enumerate() {
             // This fixture models provider behavior, not speech recognition or
             // interruption quality. The bridge must keep both directions live.
-            let input=tokio::time::timeout(std::time::Duration::from_secs(1),ws.next()).await.unwrap().unwrap().unwrap();
+            let input=tokio::time::timeout(std::time::Duration::from_secs(1),next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
             let input:serde_json::Value=serde_json::from_str(input.to_text().unwrap()).unwrap();
             assert_eq!(input["type"],"session.input_audio.append");
             assert_eq!(input["audio"],STANDARD.encode([128+index as u8;160]));
             ws.send(Message::Text(json!({"type":"session.input_transcript.delta","event_id":format!("input-{index}"),"delta":text,"start_ms":index*1000,"end_ms":index*1000+100}).to_string().into())).await.unwrap();
             ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([132+index as u8;160])}).to_string().into())).await.unwrap();
         }
-        let close=ws.next().await.unwrap().unwrap();
+        let close=next_non_progress(&mut ws).await.unwrap().unwrap();
         let close:serde_json::Value=serde_json::from_str(close.to_text().unwrap()).unwrap();
         assert_eq!(close["type"],"session.close");
         ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","reason":"close_requested","session":{"id":"live-test"},"usage":{"seconds":4}}).to_string().into())).await.unwrap();
@@ -527,11 +527,11 @@ async fn full_duplex_keeps_input_flowing_during_unacknowledged_output() {
     let mut marks=Vec::new();
     for index in 0..4 {
         ws.send(Message::Text(json!({"event":"media","sequenceNumber":(index+2).to_string(),"streamSid":"MZ-test","media":{"track":"inbound","chunk":(index+1).to_string(),"timestamp":(index*20).to_string(),"payload":STANDARD.encode([128+index as u8;160])}}).to_string().into())).await.unwrap();
-        let output=tokio::time::timeout(std::time::Duration::from_secs(1),ws.next()).await.unwrap().unwrap().unwrap();
+        let output=tokio::time::timeout(std::time::Duration::from_secs(1),next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
         let output:serde_json::Value=serde_json::from_str(output.to_text().unwrap()).unwrap();
         assert_eq!(output["event"],"media","no local clear/truncate or hangup inferred from a transcript");
         assert_eq!(output["media"]["payload"],STANDARD.encode([132+index as u8;160]));
-        let mark=ws.next().await.unwrap().unwrap();
+        let mark=next_non_progress(&mut ws).await.unwrap().unwrap();
         let mark:serde_json::Value=serde_json::from_str(mark.to_text().unwrap()).unwrap();
         marks.push(mark["mark"].clone());
         // Deliberately defer all playback receipts while sending more input.
@@ -577,17 +577,17 @@ async fn saturated_task_queue_returns_refusal_commentary_and_keeps_audio_connect
     let backend = tokio::spawn(async move {
         let (tcp, _) = provider.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
-        ws.next().await.unwrap().unwrap();
+        next_non_progress(&mut ws).await.unwrap().unwrap();
         ws.send(Message::Text(json!({"type":"session.started","event_id":"evt-start","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         ws.send(Message::Text(json!({"type":"session.input_transcript.delta","event_id":"request","delta":"Check my calendar.","start_ms":0,"end_ms":20}).to_string().into())).await.unwrap();
         ws.send(Message::Text(json!({"type":"session.delegation.created","event_id":"work","offset_ms":20,"delegation":{"id":"del-full","type":"delegation","target":"client"}}).to_string().into())).await.unwrap();
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
         let reply: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
         assert_eq!(reply["type"], "session.commentary.append");
         assert_eq!(reply["delegation_id"], "del-full");
         assert!(reply["content"].as_str().unwrap().contains("No task was started"));
         ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([128;160])}).to_string().into())).await.unwrap();
-        let close = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+        let close = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
         let close: serde_json::Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
         assert_eq!(close["type"], "session.close");
         ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","session":{"id":"live-test"},"reason":"close_requested","usage":{"seconds":0.1}}).to_string().into())).await.unwrap();
@@ -595,7 +595,7 @@ async fn saturated_task_queue_returns_refusal_commentary_and_keeps_audio_connect
     let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
-    let audio = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+    let audio = tokio::time::timeout(std::time::Duration::from_secs(3), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
     let audio: serde_json::Value = serde_json::from_str(audio.to_text().unwrap()).unwrap();
     assert_eq!(audio["event"], "media", "refusal must leave the audio path alive");
     assert_eq!(f.service.store.phone_pending_dispatches().unwrap().len(), 128);
@@ -611,12 +611,12 @@ async fn provider_audio_burst_waits_for_playback_capacity_without_hanging_up() {
     let backend = tokio::spawn(async move {
         let (tcp, _) = provider.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
-        ws.next().await.unwrap().unwrap();
+        next_non_progress(&mut ws).await.unwrap().unwrap();
         ws.send(Message::Text(json!({"type":"session.started","event_id":"started","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         for byte in [128, 129] {
             ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode(vec![byte;16_000])}).to_string().into())).await.unwrap();
         }
-        let close = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+        let close = tokio::time::timeout(std::time::Duration::from_secs(3), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
         let close: serde_json::Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
         assert_eq!(close["type"], "session.close");
         ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","session":{"id":"live-test"},"reason":"close_requested","usage":{"seconds":0.5}}).to_string().into())).await.unwrap();
@@ -624,15 +624,15 @@ async fn provider_audio_burst_waits_for_playback_capacity_without_hanging_up() {
     let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
-    let first = ws.next().await.unwrap().unwrap();
+    let first = next_non_progress(&mut ws).await.unwrap().unwrap();
     let first: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
     assert_eq!(STANDARD.decode(first["media"]["payload"].as_str().unwrap()).unwrap(), vec![128;16_000]);
-    let mark = ws.next().await.unwrap().unwrap();
+    let mark = next_non_progress(&mut ws).await.unwrap().unwrap();
     let mark: serde_json::Value = serde_json::from_str(mark.to_text().unwrap()).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(!f.service.store.phone_provider_call(&f.id).unwrap().stop_requested, "temporary playback pressure must not stop the call");
     ws.send(Message::Text(json!({"event":"mark","sequenceNumber":"2","streamSid":"MZ-test","mark":mark["mark"]}).to_string().into())).await.unwrap();
-    let second = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
     let second: serde_json::Value = serde_json::from_str(second.to_text().unwrap()).unwrap();
     assert_eq!(STANDARD.decode(second["media"]["payload"].as_str().unwrap()).unwrap(), vec![129;16_000]);
     ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"3","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
@@ -646,15 +646,15 @@ async fn provider_audio_burst_keeps_caller_audio_and_stop_live() {
     let backend = tokio::spawn(async move {
         let (tcp, _) = provider.accept().await.unwrap();
         let mut ws = accept_async(tcp).await.unwrap();
-        ws.next().await.unwrap().unwrap();
+        next_non_progress(&mut ws).await.unwrap().unwrap();
         ws.send(Message::Text(json!({"type":"session.started","event_id":"started","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
         for byte in [128, 129] {
             ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode(vec![byte;16_000])}).to_string().into())).await.unwrap();
         }
-        let input = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+        let input = tokio::time::timeout(std::time::Duration::from_secs(3), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
         let input: serde_json::Value = serde_json::from_str(input.to_text().unwrap()).unwrap();
         assert_eq!(input["type"], "session.input_audio.append");
-        let close = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+        let close = tokio::time::timeout(std::time::Duration::from_secs(3), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
         let close: serde_json::Value = serde_json::from_str(close.to_text().unwrap()).unwrap();
         assert_eq!(close["type"], "session.close");
         ws.send(Message::Text(json!({"type":"session.closed","event_id":"closed","session":{"id":"live-test"},"reason":"close_requested","usage":{"seconds":0.5}}).to_string().into())).await.unwrap();
@@ -662,10 +662,10 @@ async fn provider_audio_burst_keeps_caller_audio_and_stop_live() {
     let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
     ws.send(connected()).await.unwrap();
     ws.send(start("CA-test")).await.unwrap();
-    let first = ws.next().await.unwrap().unwrap();
+    let first = next_non_progress(&mut ws).await.unwrap().unwrap();
     let first: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
     assert_eq!(STANDARD.decode(first["media"]["payload"].as_str().unwrap()).unwrap(), vec![128;16_000]);
-    let mark = ws.next().await.unwrap().unwrap();
+    let mark = next_non_progress(&mut ws).await.unwrap().unwrap();
     let mark: serde_json::Value = serde_json::from_str(mark.to_text().unwrap()).unwrap();
     assert_eq!(mark["event"], "mark");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -673,4 +673,120 @@ async fn provider_audio_burst_keeps_caller_audio_and_stop_live() {
     ws.send(Message::Text(json!({"event":"media","sequenceNumber":"2","streamSid":"MZ-test","media":{"track":"inbound","chunk":"1","timestamp":"0","payload":STANDARD.encode([255;160])}}).to_string().into())).await.unwrap();
     ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"3","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(3), backend).await.unwrap().unwrap();
+}
+
+/// Mirrors a real-provider synthetic probe: a commentary append with a lost
+/// delegation reference is rejected, but an explicit general-context append
+/// is accepted and produces audio on the same session. No native work retries.
+#[tokio::test]
+async fn completed_slow_result_survives_rejected_delegation_and_answers_followup() {
+    use std::time::Duration;
+    let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/", provider.local_addr().unwrap());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (follow_tx, follow_rx) = tokio::sync::oneshot::channel();
+    let mut follow_tx = Some(follow_tx);
+    let backend = tokio::spawn(async move {
+        let (tcp, _) = provider.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        let _ = next_non_progress(&mut ws).await.unwrap().unwrap();
+        ws.send(Message::Text(json!({"type":"session.started","session":{"id":"live-test","model":"gpt-live-1","audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":"gleam"}},"delegation":{"type":"client"}}}).to_string().into())).await.unwrap();
+        for event in [
+            json!({"type":"session.input_transcript.delta","event_id":"request-one","delta":"Research the synthetic project deadlines.","start_ms":0,"end_ms":100}),
+            json!({"type":"session.delegation.created","event_id":"delegate-one","offset_ms":110,"delegation":{"id":"del-slow","type":"delegation","target":"client"}}),
+        ] { ws.send(Message::Text(event.to_string().into())).await.unwrap(); }
+        ready_tx.send(()).unwrap();
+        let frame = next_non_progress(&mut ws).await.unwrap().unwrap();
+        let rejected: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(rejected["type"], "session.commentary.append");
+        assert_eq!(rejected["delegation_id"], "del-slow");
+        assert!(rejected["content"].as_str().unwrap().contains("Tuesday"));
+        ws.send(Message::Text(json!({"type":"error","error":{"type":"invalid_request_error","code":null,"param":"delegation_id","client_event_id":rejected["event_id"],"message":"Unknown client or Decision delegation."}}).to_string().into())).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
+        let repaired: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(repaired["type"], "session.commentary.append", "rejection must repair context instead of closing the call");
+        assert!(repaired["delegation_id"].is_null());
+        assert_ne!(repaired["event_id"], rejected["event_id"]);
+        assert_eq!(repaired["content"], rejected["content"]);
+        ws.send(Message::Text(json!({"type":"session.commentary.appended","client_event_id":repaired["event_id"]}).to_string().into())).await.unwrap();
+        ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([137;160])}).to_string().into())).await.unwrap();
+        // The test consumes useful result audio before allowing the next turn.
+        follow_rx.await.unwrap();
+        for event in [
+            json!({"type":"session.input_transcript.delta","event_id":"request-two","delta":"What about Wednesday?","start_ms":200,"end_ms":300}),
+            json!({"type":"session.delegation.created","event_id":"delegate-two","offset_ms":310,"delegation":{"id":"del-next","type":"delegation","target":"client"}}),
+        ] { ws.send(Message::Text(event.to_string().into())).await.unwrap(); }
+        loop {
+            let frame = next_non_progress(&mut ws).await.unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            if v["type"] == "session.close" {
+                ws.send(Message::Text(json!({"type":"session.closed","reason":"close_requested","session":{"id":"live-test"},"usage":{"seconds":94.5}}).to_string().into())).await.unwrap();
+                break;
+            }
+            assert_eq!(v["type"], "session.commentary.append");
+            ws.send(Message::Text(json!({"type":"session.commentary.appended","client_event_id":v["event_id"]}).to_string().into())).await.unwrap();
+            if v["delegation_id"] == "del-next" {
+                assert!(v["content"].as_str().unwrap().contains("Wednesday"));
+                ws.send(Message::Text(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([138;160])}).to_string().into())).await.unwrap();
+            }
+        }
+    });
+    let f = fixture(endpoint).await;
+    let (mut ws, _) = connect_async(request(&f, true)).await.unwrap();
+    ws.send(connected()).await.unwrap();
+    ws.send(start("CA-test")).await.unwrap();
+    ready_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while f.service.store.phone_pending_dispatches().unwrap().is_empty() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(94)).await;
+    tokio::time::resume();
+    assert!(!f.service.store.phone_provider_call(&f.id).unwrap().stop_requested);
+    let job = f.service.store.phone_pending_dispatches().unwrap().remove(0);
+    f.service.store.phone_start_dispatch(&f.id, &job.task_id).unwrap();
+    f.service.store.phone_finish_dispatch(&f.id, &job.task_id, &"Synthetic deadline is Tuesday at 5 PM. ".repeat(45)).unwrap();
+    f.service.store.phone_dispatch_delivered(&f.id, &job.task_id).unwrap();
+    for expected in [137,138] {
+        let audio = tokio::time::timeout(Duration::from_secs(3), next_non_progress(&mut ws)).await.unwrap().unwrap().unwrap();
+        assert!(matches!(audio, Message::Text(_)), "useful result audio must arrive before the application closes the call; got {audio:?}");
+        let audio: serde_json::Value = serde_json::from_str(audio.to_text().unwrap()).unwrap();
+        assert_eq!(audio["event"], "media", "useful audio must arrive before any app hangup");
+        assert_eq!(audio["media"]["payload"], STANDARD.encode([expected;160]));
+        let _mark = next_non_progress(&mut ws).await.unwrap().unwrap();
+        if expected == 137 {
+            // Drop-independent oneshot is consumed exactly once.
+            follow_tx.take().unwrap().send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while f.service.store.phone_pending_dispatches().unwrap().is_empty() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await.unwrap();
+            let next = f.service.store.phone_pending_dispatches().unwrap();
+            assert_eq!(next.len(),1,"completed work must not run again");
+            f.service.store.phone_start_dispatch(&f.id,&next[0].task_id).unwrap();
+            f.service.store.phone_finish_dispatch(&f.id,&next[0].task_id,"Wednesday has a synthetic review at noon.").unwrap();
+            f.service.store.phone_dispatch_delivered(&f.id,&next[0].task_id).unwrap();
+        }
+    }
+    assert!(!f.service.store.phone_provider_call(&f.id).unwrap().stop_requested);
+    ws.send(Message::Text(json!({"event":"stop","sequenceNumber":"2","streamSid":"MZ-test","stop":{"accountSid":"AC-test","callSid":"CA-test"}}).to_string().into())).await.unwrap();
+    backend.await.unwrap();
+}
+
+// Quiet delegation acknowledgments and bounded delay notices are control
+// traffic. They cannot count as the useful audio/result required by fixtures.
+async fn next_non_progress<S>(ws:&mut tokio_tungstenite::WebSocketStream<S>)->Option<Result<Message,tokio_tungstenite::tungstenite::Error>>
+where S:tokio::io::AsyncRead+tokio::io::AsyncWrite+Unpin {
+    loop {
+        let frame=ws.next().await?;
+        if let Ok(Message::Text(text))=&frame {
+            if let Ok(v)=serde_json::from_str::<serde_json::Value>(text) {
+                if v["type"]=="session.thinking.append" {assert_eq!(v["content"],"");continue;}
+                if v["type"]=="session.commentary.append" && v["content"].as_str().is_some_and(|s|s.contains("I don't have its verified findings yet")) {
+                    ws.send(Message::Text(json!({"type":"session.commentary.appended","client_event_id":v["event_id"]}).to_string().into())).await.unwrap();
+                    continue;
+                }
+            }
+        }
+        return Some(frame);
+    }
 }

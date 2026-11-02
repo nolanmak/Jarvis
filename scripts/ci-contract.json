@@ -410,7 +410,7 @@
       "shell": "bash"
     },
     "rust/agents/12": {
-      "body": "cargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --locked\n",
+      "body": "bash scripts/ci-hosted-space.sh\ncargo test -p augmentagent-cli --bin augmentagent --locked -- --test-threads=1\ncargo test -p augmentagent-cli --test autoship_commands_cli --test autoship_resolution_cli --test autoship_submit_cli --locked\n",
       "shell": "bash",
       "vm_provisioning": [
         "pdf-python-runtime"

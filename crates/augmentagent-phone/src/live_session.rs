@@ -3,7 +3,10 @@
 //! the peer sends no frames, and close its socket on any terminal state.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::time::Instant;
 
@@ -71,6 +74,10 @@ pub enum LiveInput {
     CommentaryAccepted {
         client_event_id: String,
     },
+    /// Confirmed nonfatal rejection of a locally tracked commentary command.
+    CommentaryRejected {
+        client_event_id: String,
+    },
     Started,
     Audio(Vec<u8>),
     Transcript {
@@ -89,6 +96,14 @@ pub enum LiveInput {
         seconds: Option<f64>,
     },
 }
+#[derive(Clone, Copy)]
+struct CommandMetadata {
+    kind: &'static str,
+    input_gap_ms: Option<u64>,
+    delegated: bool,
+    bytes: usize,
+    created: Instant,
+}
 pub struct LiveSession {
     state: LiveState,
     instructions: String,
@@ -97,6 +112,9 @@ pub struct LiveSession {
     id: Option<String>,
     deadline: Option<Instant>,
     delegations: HashMap<String, f64>,
+    commentary_commands: HashMap<String, CommandMetadata>,
+    audio_commands: VecDeque<(String, CommandMetadata)>,
+    last_audio: Option<Instant>,
 }
 impl LiveSession {
     pub fn new(instructions: &str) -> Result<Self, LiveError> {
@@ -122,6 +140,9 @@ impl LiveSession {
             id: None,
             deadline: None,
             delegations: HashMap::new(),
+            commentary_commands: HashMap::new(),
+            audio_commands: VecDeque::new(),
+            last_audio: None,
         })
     }
     /// Answered owner calls get a startup developer message. Readiness probes
@@ -176,7 +197,7 @@ impl LiveSession {
         let mut event = json!({"type":"session.start","session":{
             "model":MODEL,"instructions":self.instructions,
             "audio":{"format":{"type":"audio/pcmu","rate":8000},"output":{"voice":self.voice.wire()}},
-            "delegation":{"type":"client"}}});
+            "delegation":{"type":"client","acknowledgement_delay_ms":800}}});
         if self.greet {
             event["session"]["input"] = json!([{"role":"developer","content":[{
                 "type":"input_text","text":"Greet the caller now in English with one brief friendly sentence, then ask what they need. Use their saved first name only if it is present in the approved profile context. Do not recite profile details or wait for the caller to speak first."
@@ -193,12 +214,78 @@ impl LiveSession {
         if audio.is_empty() || audio.len() > MAX_AUDIO {
             return Err(LiveError::Capacity);
         }
-        Ok(json!({"type":"session.input_audio.append","audio":STANDARD.encode(audio)}))
+        let now = Instant::now();
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let command = CommandMetadata {
+            kind: "audio",
+            input_gap_ms: self
+                .last_audio
+                .map(|at| now.duration_since(at).as_millis() as u64),
+            delegated: false,
+            bytes: audio.len(),
+            created: now,
+        };
+        self.last_audio = Some(now);
+        if self.audio_commands.len() >= 128 {
+            self.audio_commands.pop_front();
+        }
+        self.audio_commands.push_back((event_id.clone(), command));
+        Ok(
+            json!({"type":"session.input_audio.append","event_id":event_id,"audio":STANDARD.encode(audio)}),
+        )
     }
     /// Cap UTF-8 bytes conservatively: byte-level tokenization cannot exceed
     /// this 500-byte bound. Larger results arrive as ordered, acknowledged
     /// pieces; no extra model call or silent truncation is required.
     pub fn commentary(&mut self, delegation_id: &str, content: &str) -> Result<Value, LiveError> {
+        if !self.delegations.contains_key(delegation_id) {
+            return Err(LiveError::Protocol);
+        }
+        self.commentary_context(Some(delegation_id), content)
+    }
+    /// Nullable delegation IDs are the documented general session context path.
+    /// Only a definitive rejected reference may move an existing task here.
+    pub(crate) fn commentary_context(
+        &mut self,
+        delegation_id: Option<&str>,
+        content: &str,
+    ) -> Result<Value, LiveError> {
+        self.check_deadline()?;
+        if self.state != LiveState::Active {
+            return Err(LiveError::State);
+        }
+        if content.trim().is_empty() || content.len() > 500 {
+            return Err(LiveError::Capacity);
+        }
+        self.commentary_commands
+            .retain(|_, command| command.created.elapsed() < Duration::from_secs(5));
+        if self.commentary_commands.len() >= 128 {
+            return Err(LiveError::Capacity);
+        }
+        let event_id = uuid::Uuid::new_v4().to_string();
+        self.commentary_commands.insert(
+            event_id.clone(),
+            CommandMetadata {
+                kind: "commentary",
+                input_gap_ms: None,
+                delegated: delegation_id.is_some(),
+                bytes: content.len(),
+                created: Instant::now(),
+            },
+        );
+        Ok(
+            json!({"type":"session.commentary.append", "event_id":event_id,
+            "delegation_id":delegation_id,"content":content}),
+        )
+    }
+    /// A missing acknowledgment is ambiguous. Forget correlation when the
+    /// bounded coordinator abandons it; never turn a later error into repair.
+    pub(crate) fn forget_commentary(&mut self, event_id: &str) {
+        self.commentary_commands.remove(event_id);
+    }
+    /// One queued silent update cancels pending provider auto-acknowledgments
+    /// using its documented contract; it does not guarantee audible silence.
+    pub(crate) fn thinking(&mut self, delegation_id: &str) -> Result<Value, LiveError> {
         self.check_deadline()?;
         if self.state != LiveState::Active {
             return Err(LiveError::State);
@@ -206,12 +293,8 @@ impl LiveSession {
         if !self.delegations.contains_key(delegation_id) {
             return Err(LiveError::Protocol);
         }
-        if content.trim().is_empty() || content.len() > 500 {
-            return Err(LiveError::Capacity);
-        }
         Ok(
-            json!({"type":"session.commentary.append", "event_id":uuid::Uuid::new_v4().to_string(),
-            "delegation_id":delegation_id,"content":content}),
+            json!({"type":"session.thinking.append","event_id":uuid::Uuid::new_v4().to_string(),"delegation_id":delegation_id,"content":""}),
         )
     }
     pub fn close(&mut self) -> Result<Value, LiveError> {
@@ -251,6 +334,77 @@ impl LiveSession {
             "error" => {
                 // Provider message/param/body must never escape into diagnostics.
                 let error = &v["error"];
+                let correlated = error["client_event_id"].as_str().and_then(|id| {
+                    self.commentary_commands
+                        .get(id)
+                        .or_else(|| {
+                            self.audio_commands
+                                .iter()
+                                .find(|(event, _)| event == id)
+                                .map(|(_, command)| command)
+                        })
+                        .map(|command| (id.to_owned(), *command))
+                });
+                // This exact nonfatal envelope and nullable-ID repair were
+                // verified against the real Live provider with synthetic data.
+                // Do not generalize invalid_request_error into blanket recovery.
+                let lost_reference = self.state == LiveState::Active
+                    && error["type"] == "invalid_request_error"
+                    && error["param"] == "delegation_id"
+                    && error["code"].is_null()
+                    && error["message"] == "Unknown client or Decision delegation.";
+                let safe_param = match error["param"].as_str() {
+                    Some("delegation_id") => "delegation_id",
+                    Some("content") => "content",
+                    Some("audio") => "audio",
+                    _ => "other_or_absent",
+                };
+                let safe_code=match error["code"].as_str() {
+                    Some("unknown_parameter")=>"unknown_parameter",
+                    Some("responses_validation_failed")=>"responses_validation_failed",
+                    None=>"absent",_=>"unclassified",
+                };
+                // Only locally generated IDs and allowlisted labels escape.
+                // Never log provider message/param/code or unknown peer IDs.
+                tracing::warn!(
+                    event_id = correlated
+                        .as_ref()
+                        .map(|(id, _)| id.as_str())
+                        .unwrap_or("uncorrelated"),
+                    command = correlated
+                        .as_ref()
+                        .map(|(_, command)| command.kind)
+                        .unwrap_or("unknown"),
+                    input_gap_ms = correlated
+                        .as_ref()
+                        .and_then(|(_, command)| command.input_gap_ms),
+                    param = safe_param,
+                    provider_code=safe_code,
+                    context_bytes = correlated.as_ref().map(|(_, command)| command.bytes),
+                    command_age_ms =
+                        correlated
+                            .as_ref()
+                            .map(|(_, command)| command.created.elapsed().as_millis() as u64),
+                    session_continues = lost_reference,
+                    repair_allowed = lost_reference
+                        && correlated
+                            .as_ref()
+                            .is_some_and(|(_, command)| command.delegated),
+                    "phone Live command rejected"
+                );
+                if lost_reference {
+                    if let Some((id, command)) = correlated {
+                        self.commentary_commands.remove(&id);
+                        if command.delegated {
+                            return Ok(LiveInput::CommentaryRejected {
+                                client_event_id: id,
+                            });
+                        }
+                    }
+                    // The probed error is nonfatal even when its command can
+                    // no longer be correlated. Never speculate about a resend.
+                    return Ok(LiveInput::Ignored);
+                }
                 Err(match error["type"].as_str() {
                     Some("invalid_request_error") => LiveError::Configuration,
                     Some("authentication_error") => LiveError::Authentication,
@@ -324,9 +478,9 @@ impl LiveSession {
                 let Some(client_id) = v.get("client_event_id") else {
                     return Ok(LiveInput::Ignored);
                 };
-                Ok(LiveInput::CommentaryAccepted {
-                    client_event_id: bounded_id(client_id)?,
-                })
+                let client_event_id = bounded_id(client_id)?;
+                self.commentary_commands.remove(&client_event_id);
+                Ok(LiveInput::CommentaryAccepted { client_event_id })
             }
             "session.input_transcript.delta" | "session.output_transcript.delta" => {
                 if self.state == LiveState::Closing {

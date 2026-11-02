@@ -145,6 +145,32 @@ impl LiveConnection {
         self.send(event).await?;
         Ok(id)
     }
+    pub(crate) async fn acknowledge_queued(
+        &mut self,
+        delegation_id: &str,
+    ) -> Result<(), LiveError> {
+        let event = self.session.thinking(delegation_id)?;
+        self.send(event).await
+    }
+    pub(crate) fn prepare_commentary(
+        &mut self,
+        delegation_id: Option<&str>,
+        content: &str,
+    ) -> Result<serde_json::Value, LiveError> {
+        match delegation_id {
+            Some(id) => self.session.commentary(id, content),
+            None => self.session.commentary_context(None, content),
+        }
+    }
+    pub(crate) async fn send_prepared(
+        &mut self,
+        event: serde_json::Value,
+    ) -> Result<(), LiveError> {
+        self.send(event).await
+    }
+    pub(crate) fn forget_commentary(&mut self, event_id: &str) {
+        self.session.forget_commentary(event_id)
+    }
     async fn send(&mut self, event: serde_json::Value) -> Result<(), LiveError> {
         let result = timeout(
             WRITE,

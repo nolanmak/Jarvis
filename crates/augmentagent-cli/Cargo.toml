@@ -11,6 +11,7 @@ name = "augmentagent"
 path = "src/main.rs"
 
 [dependencies]
+futures = { workspace = true }
 tempfile = "3"
 augmentagent-finance = { path = "../augmentagent-finance" }
 augmentagent-phone = { path = "../augmentagent-phone" }
@@ -116,7 +117,6 @@ mockito = "1"
 # #1287 — the serve end-to-end test plays Slack's Socket Mode WebSocket.
 # Same version the workspace already resolves (serenity, the Slack crate).
 tokio-tungstenite = "0.21"
-futures = { workspace = true }
 # Phone callback signatures in the offline daemon adapter test.
 hmac = "0.12"
 sha1 = "0.10"
