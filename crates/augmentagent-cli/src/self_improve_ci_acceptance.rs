@@ -53,8 +53,10 @@ RUSTC_WRAPPER=/workspace/target/rustc-probe cargo run --offline --locked --quiet
 python3 -c 'from pathlib import Path; print("UNITS="+str(sum("--crate-name freshness_fixture " in line for line in Path("target/compiler-calls").read_text().splitlines())))'
 "#;
     let timeout=std::time::Duration::from_secs(180);
+    let mut reclaimed=0;
     for _ in 0..2 {
         let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some(command),&storage,&target,&audit,timeout).await?;
+        reclaimed+=outcome.cache_reclaimed.len();
         ensure!(outcome.status=="passed" && outcome.stdout.trim()=="first\nUNITS=1",
             "same-generation output/reuse mismatch: {} {}",outcome.stdout,outcome.stderr);
     }
@@ -83,18 +85,22 @@ else: raise SystemExit("tracked source was writable")'"#;
     commit(repo,"fn main() {}\n#[test] fn regression() { assert_eq!(2+2,5); }\n").await?;
     let bad=binding(repo).await?;let source=snapshot(repo,&bad,&target).await?;
     let outcome=session.run("repository",&source,repo,&bad,None,&[],&[],&[],Some("cargo test --offline --locked --quiet"),&storage,&target,&audit,timeout).await?;
+    reclaimed+=outcome.cache_reclaimed.len();
     ensure!(outcome.status=="failed" && outcome.stdout.contains("1 failed"),"failing assertion was hidden by stale success");
     drop(source);
     git(repo,&["reset","--hard",&first]).await?;
     let restored=binding(repo).await?;let source=snapshot(repo,&restored,&target).await?;
     ensure!(source.generation()!=first_generation,"same-HEAD reconstruction inherited its generation");
     let outcome=session.run("repository",&source,repo,&restored,None,&[],&[],&[],Some(command),&storage,&target,&audit,timeout).await?;
+    reclaimed+=outcome.cache_reclaimed.len();
     ensure!(outcome.status=="passed" && outcome.stdout.trim()=="first\nUNITS=1","same-HEAD reconstruction inherited changed artifacts");
+    ensure!(reclaimed>0,"bounded reclamation did not retire any prior quiescent generation");
     audit.protected_health()?;
     let receipt=serde_json::json!({"version":1,"kind":"real_shared_ci_cache_freshness_replay",
         "adapter_authority":session.authority_sha256,"equal_old_timestamps":true,"changed_output":true,
         "compile_error_observed":"E0425","failing_assertion_observed":true,"same_head_reconstruction":true,
         "same_generation_compatible_units_recompiled":0,"tracked_source_read_only":true,
+        "reclaimed_generations_observed":reclaimed,"active_generation_preserved":true,
         "trusted_external_seed_tested":false,"full_ci_pass":false,"shipping_authority":false,
         "additional_model_calls":0,"autonomous_merges_claimed":0});
     audit.record_controller(receipt.clone())?;audit.protected_health()?;

@@ -163,10 +163,12 @@ def worker():
     os.setgroups([]); os.setgid(gid); os.setuid(uid)
     os.umask(0o022)
 try:
+    cache_reclaimed=[]
     if job.get('build_cache'):
         if job.get('ci_context'):
             if os.geteuid()!=0:raise OSError('CI cache preparation requires the guest controller')
             generation=job['ci_generation']
+            cache_reclaimed=ci_cache['reclaim']('/build-cache',generation['retained_generations'],uid,gid)
             ci_target=ci_cache['prepare']('/build-cache',generation['binding'],generation['command'],uid,gid,
                 predecessor=generation['predecessor'])
             subprocess.run(['/usr/bin/mount','--bind',str(ci_target),'/workspace/target'],check=True)
@@ -203,6 +205,7 @@ try:
         result={'error':'VM command exceeded output limit'}
     else:
         result={'exit_code':process.wait(),**{key:value.decode('utf-8','replace') for key,value in outputs.items()}}
+        if job.get('ci_context'):result['cache_reclaimed']=cache_reclaimed
         if len(result['stdout'].encode())+len(result['stderr'].encode())>8*1024*1024:
             result={'error':'VM command exceeded output limit'}
 except Exception as error:
@@ -467,8 +470,14 @@ poweroff -f
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
-                if set(result) != {'exit_code', 'stdout', 'stderr'} or type(result['exit_code']) is not int:
+                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed'} if ci_context is not None else set())
+                if set(result) != expected or type(result['exit_code']) is not int:
                     raise Unavailable('invalid VM result')
+                if ci_context is not None:
+                    reclaimed=result['cache_reclaimed']
+                    if (not isinstance(reclaimed,list) or len(reclaimed)>2
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',value) is None for value in reclaimed)):
+                        raise Unavailable('invalid CI cache cleanup receipt')
                 return result
             finally:
                 if process.poll() is None:

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -281,6 +282,9 @@ def prepare(cache, binding, command, worker_uid, worker_gid, *, predecessor=None
     if not cache.is_absolute() or cache.resolve() != cache:
         raise FreshnessHold("invalidation_unsafe")
     _directory(cache, 0o700, create=False)
+    retirement = cache / "ci-generation-retirements" / (binding["generation"] + ".json")
+    if retirement.exists() or retirement.is_symlink():
+        raise FreshnessHold("generation_mismatch")
     root = cache / "ci-source-generations"
     # This parent is only an allocation namespace, never a reusable-cache
     # certificate. A legacy target or old/torn parent format receipt cannot
@@ -302,7 +306,8 @@ def prepare(cache, binding, command, worker_uid, worker_gid, *, predecessor=None
         os.chown(target, worker_uid, worker_gid)
     else:
         prior = _read_record(record)
-        if set(prior) != {"version", "binding", "active_command"} or prior.get("version") != FORMAT_VERSION:
+        if (set(prior) != {"version", "binding", "active_command"}
+                or type(prior.get("version")) is not int or prior["version"] != FORMAT_VERSION):
             raise FreshnessHold("metadata_torn")
         if prior["binding"] != binding:
             raise FreshnessHold("generation_mismatch")
@@ -354,3 +359,117 @@ def prepare_outputs(target, outputs, worker_uid, worker_gid):
             raise FreshnessHold("invalidation_unsafe")
         mounts[name] = path
     return mounts
+
+
+def reclaim(cache, protected_generations, worker_uid, worker_gid, *, limit=2):
+    """Bounded cleanup inside the exclusively admitted, quiescent managed image.
+
+    Only the privileged guest controller calls this, before spawning workers.
+    Host storage admission has already reconciled durable cleanup holds and
+    verified original scope quiescence. Protected IDs come from the host's
+    live CI session, including its current generation. Unknown allocations
+    remain intact; this API cannot manufacture cleanup authority for them.
+    """
+    if (not isinstance(protected_generations, list) or len(protected_generations) > 4096
+            or any(not _uuid(value) for value in protected_generations)
+            or type(limit) is not int or not 1 <= limit <= 8
+            or any(type(value) is not int or value <= 0 for value in (worker_uid, worker_gid))
+            or not shutil.rmtree.avoids_symlink_attacks):
+        raise FreshnessHold("cleanup_uncertain")
+    cache = Path(cache)
+    if not cache.is_absolute() or cache.resolve() != cache:
+        raise FreshnessHold("invalidation_unsafe")
+    _directory(cache, 0o700, create=False)
+    root = cache / "ci-source-generations"
+    if not root.exists() and not root.is_symlink():
+        return []
+    _directory(root, 0o711, create=False)
+    retired = cache / "ci-generation-retirements"
+    _directory(retired, 0o700, create=True)
+    # Bound discovery as well as deletion count. Unknown names are never
+    # adopted as owned generations. Each deletion preserves its original
+    # binding/command record before any artifact can be removed.
+    import itertools
+    reclaimed = []
+    # A crash can remove the directory before committing the completion
+    # receipt. Reconcile that exact, already-persisted intent by observing
+    # absence under the same owned parent; never infer a reusable generation.
+    for receipt_path in itertools.islice(retired.iterdir(), 1024):
+        name = receipt_path.stem
+        if len(reclaimed) >= limit:
+            break
+        if receipt_path.suffix != ".json" or not _uuid(name) or name in protected_generations:
+            continue
+        generation = root / name
+        if generation.exists() or generation.is_symlink():
+            continue
+        try:
+            receipt = _read_record(receipt_path)
+            if (set(receipt) != {"version", "state", "original"} or type(receipt["version"]) is not int
+                    or receipt["version"] != 1 or receipt["state"] != "reclaiming"):
+                continue
+            original = receipt["original"]
+            if (not isinstance(original, dict) or set(original) != {"version", "binding", "active_command"}
+                    or type(original["version"]) is not int or original["version"] != FORMAT_VERSION
+                    or not _uuid(original["active_command"])):
+                continue
+            validate_binding(original["binding"])
+            if original["binding"]["generation"] != name:
+                continue
+        except (FreshnessHold, OSError, KeyError, TypeError, ValueError):
+            continue
+        _write_record(receipt_path, {"version": 1, "state": "reclaimed", "original": original})
+        reclaimed.append(name)
+    candidates = sorted(itertools.islice(root.iterdir(), 1024))
+    for generation in candidates:
+        if len(reclaimed) >= limit:
+            break
+        if not _uuid(generation.name) or generation.name in protected_generations:
+            continue
+        receipt_path = retired / (generation.name + ".json")
+        try:
+            _directory(generation, 0o711, create=False)
+            receipt = _read_record(receipt_path) if receipt_path.exists() or receipt_path.is_symlink() else None
+            if receipt is not None and (set(receipt) != {"version", "state", "original"}
+                    or type(receipt["version"]) is not int or receipt["version"] != 1
+                    or receipt["state"] != "reclaiming"):
+                raise FreshnessHold("cleanup_uncertain")
+            try:
+                original = _read_record(generation / "control.json")
+            except FreshnessHold as error:
+                if error.reason != "metadata_missing" or receipt is None:
+                    raise
+                original = receipt["original"]
+            if (not isinstance(original, dict) or set(original) != {"version", "binding", "active_command"}
+                    or type(original["version"]) is not int or original["version"] != FORMAT_VERSION
+                    or not _uuid(original["active_command"])):
+                raise FreshnessHold("metadata_torn")
+            validate_binding(original["binding"])
+            if original["binding"]["generation"] != generation.name or (receipt is not None and receipt["original"] != original):
+                raise FreshnessHold("generation_mismatch")
+            children = {child.name for child in generation.iterdir()}
+            if children - {"control.json", "target", "cargo-home", "outputs"}:
+                raise FreshnessHold("invalidation_unsafe")
+            for name in children - {"control.json"}:
+                info = (generation / name).lstat()
+                owner = os.geteuid() if name == "outputs" else worker_uid
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or info.st_mode & 0o022
+                        or info.st_dev != generation.stat().st_dev
+                        or (name != "outputs" and info.st_gid != worker_gid)):
+                    raise FreshnessHold("invalidation_unsafe")
+        except (FreshnessHold, OSError, KeyError, TypeError, ValueError):
+            continue
+        if receipt is None:
+            _write_record(receipt_path, {"version": 1, "state": "reclaiming", "original": original})
+        try:
+            shutil.rmtree(generation)
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            _write_record(receipt_path, {"version": 1, "state": "reclaimed", "original": original})
+        except OSError:
+            raise FreshnessHold("cleanup_uncertain") from None
+        reclaimed.append(generation.name)
+    return reclaimed

@@ -45,6 +45,8 @@ pub(super) struct Outcome {
     errno: Option<i64>,
     #[serde(default)]
     freshness_hold: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cache_reclaimed: Vec<String>,
 }
 impl Outcome {
     // This envelope is emitted before a guest exists and may not carry source
@@ -285,9 +287,12 @@ impl Session {
         let generation = source.generation().to_owned();
         let source = source.path();
         let command_id = uuid::Uuid::new_v4().to_string();
-        let predecessor = self.completed_generations.lock()
-            .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
-            .get(&generation).cloned();
+        let (predecessor, retained_generations) = {
+            let completed=self.completed_generations.lock()
+                .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
+            (completed.get(&generation).cloned(),completed.keys().cloned()
+                .chain(std::iter::once(generation.clone())).collect::<BTreeSet<_>>())
+        };
         let files = storage.inherited_files()?;
         let fd = files.first().context("CI storage lease unavailable")?;
         let meta = fd.metadata()?;
@@ -304,6 +309,7 @@ impl Session {
         .canonicalize()?;
         let request = serde_json::json!({"version":2,"operation":operation,
             "source_generation":generation,"command_id":command_id,"predecessor":predecessor,
+            "retained_generations":retained_generations,
             "tree":binding.index_tree,"controller_authority_sha256":self.authority_sha256,
             "runtime_config":self.directory.as_ref().expect("owned CI session").path().join("runtime.json"),"workspace":source,
             "state":self.directory.as_ref().expect("owned CI session").path().join("state"),"git_objects":objects,
@@ -391,6 +397,12 @@ impl Session {
             }))?;
         }
         outcome.validate(binding, operation)?;
+        if outcome.cache_reclaimed.len()>2 || outcome.cache_reclaimed.iter().any(|value|
+            uuid::Uuid::parse_str(value).is_err() || retained_generations.contains(value)) {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
+                "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
+                "evidence_sha256":digest(&serde_json::to_vec(&outcome.cache_reclaimed)?)})).into());
+        }
         ensure!(
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned"),
             "{PREREQUISITE}: VM process/receipt status mismatch"

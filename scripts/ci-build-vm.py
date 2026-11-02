@@ -132,10 +132,14 @@ def execute(request,run=vm.run,progress=None):
     progress={} if progress is None else progress
     progress["stage"]="request_schema"
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
-              'source_generation','command_id','predecessor','tree','controller_authority_sha256'}
+              'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations'}
     optional={'id','changed_files','cache_bytes','packages','filters','command'}
     if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository'):raise vm.Unavailable('invalid CI VM request')
     if not cache_generation._uuid(request['source_generation']) or not cache_generation._uuid(request['command_id']) or (request['predecessor'] is not None and not cache_generation._uuid(request['predecessor'])):raise cache_generation.FreshnessHold('generation_mismatch')
+    retained=request['retained_generations']
+    if (not isinstance(retained,list) or not 1<=len(retained)<=4096
+            or any(not cache_generation._uuid(value) for value in retained) or len(set(retained))!=len(retained)
+            or request['source_generation'] not in retained):raise cache_generation.FreshnessHold('cleanup_uncertain')
     if not cache_generation._digest(request['controller_authority_sha256']):raise cache_generation.FreshnessHold('authority_changed')
     if not all(isinstance(request[key],str) and re.fullmatch(r'[a-f0-9]{40,64}',request[key]) for key in ('head','base')):raise vm.Unavailable('CI candidate binding invalid')
     cargo=cargo_request(request)
@@ -169,7 +173,7 @@ def execute(request,run=vm.run,progress=None):
         generation={'binding':{'generation':request['source_generation'],'head':request['head'],'tree':request['tree'],
             'contract_sha256':hashlib.sha256(contract).hexdigest(),'authority_sha256':request['controller_authority_sha256'],
             'source_inputs_sha256':source_inputs},'command':request['command_id'],'predecessor':request['predecessor'],
-            'outputs':outputs}
+            'outputs':outputs,'retained_generations':retained}
     # The supplied snapshot has controller-generated Git metadata, never the
     # source worktree's config/hooks. Rebind only its private alternate file.
     progress['stage']='git_alternate'
@@ -213,7 +217,8 @@ def execute(request,run=vm.run,progress=None):
                             'cache_program':CACHE_PROGRAM,'generation':generation})
     progress['stage']='receipt_validate'
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),
-            'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr']}
+            'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
+            'cache_reclaimed':outcome.get('cache_reclaimed',[])}
     if outcome['exit_code']==0:
         if request['operation']=='plan':
             plan=json.loads(outcome['stdout'])

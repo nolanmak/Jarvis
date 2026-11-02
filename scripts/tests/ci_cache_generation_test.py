@@ -275,6 +275,77 @@ class GenerationTests(unittest.TestCase):
                         {"recovery": "not-a-code"}, {"evidence_sha256": "not-a-digest"}, {"extra": "private"}]:
             self.assertEqual(cache.validate_hold(valid | changed)["reason"], "freshness_unknown")
 
+    def test_reclamation_is_bounded_preserves_active_generations_and_original_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);generations=[]
+            for _ in range(4):
+                binding=self.binding();target=self.prepare(root,binding,str(uuid.uuid4()))
+                (target/'artifact').write_text('compiled source')
+                generations.append((binding,target,self.control(root,binding).read_bytes()))
+            protected=generations[0][0]['generation']
+            retired=cache.reclaim(root,[protected],os.getuid(),os.getgid(),limit=2)
+            self.assertEqual(len(retired),2)
+            self.assertEqual((generations[0][1]/'artifact').read_text(),'compiled source')
+            for binding,target,record in generations:
+                if binding['generation'] in retired:
+                    self.assertFalse(target.parent.exists())
+                    receipt=cache._read_record(root/'ci-generation-retirements'/(binding['generation']+'.json'))
+                    self.assertEqual(receipt['original'],json.loads(record))
+                    self.assertEqual(receipt['state'],'reclaimed')
+                    with self.assertRaises(cache.FreshnessHold):
+                        self.prepare(root,binding,str(uuid.uuid4()))
+            self.assertEqual(len(cache.reclaim(root,[protected],os.getuid(),os.getgid(),limit=2)),1)
+
+    def test_reclamation_never_deletes_unknown_linked_or_foreign_allocations(self):
+        for fault in ('torn','missing','extra-child','linked-target','foreign-target'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);binding=self.binding();target=self.prepare(root,binding,str(uuid.uuid4()))
+                outside=root/'external-data';outside.mkdir();(outside/'keep').write_text('preserve')
+                if fault=='torn':self.control(root,binding).write_text('{torn')
+                elif fault=='missing':self.control(root,binding).unlink()
+                elif fault=='extra-child':(target.parent/'unknown').write_text('preserve')
+                elif fault=='linked-target':target.rmdir();target.symlink_to(outside)
+                else:target.chmod(0o777)
+                self.assertEqual(cache.reclaim(root,[],os.getuid(),os.getgid()),[])
+                self.assertTrue(target.parent.exists())
+                self.assertEqual((outside/'keep').read_text(),'preserve')
+
+    def test_reclamation_crash_replays_the_same_original_receipt_without_reactivating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding=self.binding();target=self.prepare(root,binding,str(uuid.uuid4()))
+            (target/'artifact').write_text('compiled source');original=self.control(root,binding).read_bytes()
+            with patch.object(cache.shutil,'rmtree',side_effect=OSError('simulated deletion failure')):
+                with self.assertRaises(cache.FreshnessHold):cache.reclaim(root,[],os.getuid(),os.getgid())
+            receipt=root/'ci-generation-retirements'/(binding['generation']+'.json')
+            self.assertEqual(cache._read_record(receipt)['state'],'reclaiming')
+            self.assertEqual(self.control(root,binding).read_bytes(),original)
+            with self.assertRaises(cache.FreshnessHold):self.prepare(root,binding,str(uuid.uuid4()))
+            self.assertEqual(cache.reclaim(root,[],os.getuid(),os.getgid()),[binding['generation']])
+            self.assertEqual(cache._read_record(receipt)['original'],json.loads(original))
+            self.assertFalse(target.parent.exists())
+
+    def test_reclamation_recovers_partial_deletion_and_lost_completion_publication(self):
+        for fault in ('control-deleted','completion-not-published'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);binding=self.binding();target=self.prepare(root,binding,str(uuid.uuid4()))
+                original=self.control(root,binding).read_bytes()
+                receipt=root/'ci-generation-retirements'/(binding['generation']+'.json')
+                write=cache._write_record
+                def fail_completion(path,value):
+                    if value.get('state')=='reclaimed':raise OSError('publication interrupted')
+                    return write(path,value)
+                def partial_delete(path):
+                    self.control(root,binding).unlink()
+                    raise OSError('deletion interrupted')
+                with patch.object(cache.shutil,'rmtree',side_effect=partial_delete) if fault=='control-deleted' else patch.object(cache,'_write_record',side_effect=fail_completion):
+                    with self.assertRaises(cache.FreshnessHold):cache.reclaim(root,[],os.getuid(),os.getgid())
+                self.assertEqual(cache._read_record(receipt)['state'],'reclaiming')
+                self.assertEqual(cache.reclaim(root,[],os.getuid(),os.getgid()),[binding['generation']])
+                self.assertFalse(target.parent.exists())
+                final=cache._read_record(receipt)
+                self.assertEqual(final['state'],'reclaimed')
+                self.assertEqual(final['original'],json.loads(original))
+
 
 if __name__ == "__main__":
     unittest.main()

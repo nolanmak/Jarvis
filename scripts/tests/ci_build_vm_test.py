@@ -15,7 +15,8 @@ class AdapterTests(unittest.TestCase):
   def git(*args):
    return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-C',str(root/'workspace'),*args],text=True).strip()
   git('init','-q');(root/'workspace/source.rs').write_text('literal source');git('add','.');git('commit','-qm','source')
-  return {'version':2,'source_generation':str(uuid.uuid4()),'command_id':str(uuid.uuid4()),'predecessor':None,
+  generation=str(uuid.uuid4())
+  return {'version':2,'source_generation':generation,'retained_generations':[generation],'command_id':str(uuid.uuid4()),'predecessor':None,
    'tree':git('rev-parse','HEAD^{tree}'),'controller_authority_sha256':'d'*64,
    'operation':'plan','runtime_config':str(root/'runtime.json'),'workspace':str(root/'workspace'),
    'state':str(root/'state'),'scratch':str(root/'scratch'),'git_objects':str(root/'objects'),
