@@ -1019,6 +1019,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unsettled_prior_hold_blocks_same_lease_session_before_any_new_command() {
         crate::build_storage::ci_holds::with_test_registry(|root,_| {

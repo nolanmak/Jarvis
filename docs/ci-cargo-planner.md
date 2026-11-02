@@ -52,6 +52,24 @@ Device reads must never be converted into ordinary file-content fingerprints.
 The captured trace still belongs to the unprivileged fixture, and the original
 generated-input invalidation regression remains red.
 
+`scripts/ci-lookup-inputs.py` now selects content/mode facts from the existing
+input-census format for individual decoded lookups. It preserves symlink hops
+before parent traversal, distinguishes absent components from non-directories,
+and binds directory reads to membership only after the original EOF and complete
+entry set are present. Unobserved neighbors, unknown devices and writes remain
+prerequisites. Changing a selected file at the same old mtime or introducing a
+formerly absent candidate changes the selected identity; unrelated generated
+files do not. The detached census rejects inconsistent transport and does not
+borrow mutable caller lists.
+
+This is a content-selection primitive, not the final C API or a frozen execution
+view. It deliberately reports incomplete input closure and no shipping authority.
+The trusted collector still must establish the actual immutable unit view,
+process attribution, metadata/credential inputs, complete syscall coverage,
+producer/output provenance and original quiescence. A prior snapshot and a later
+trace cannot substitute for these obligations. No artifact-reuse path consumes
+this observation yet.
+
 ## Decisions and reasons
 
 1. **Separate the planner from application execution.** Cargo runs as non-root
