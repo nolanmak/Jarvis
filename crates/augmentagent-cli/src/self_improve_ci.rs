@@ -472,6 +472,7 @@ async fn verify_admitted(root: &Path, audit: &Arc<augmentagent_channel_core::Aud
     let dependency_seed=vm.dependency_seed(root,&binding_before,target,storage,audit).await?;
     let plan_receipt=audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_plan", "run_id":run_id,"binding":binding_before,
         "local_plan_complete":true,"quiescence_receipt_sha256":discovery_quiescence.payload_sha256(),
+        "guest_worker_quiescence":discovered.guest_worker_quiescence,
         "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
         "checks":plan.checks.iter().map(|check| serde_json::json!({"id":check.id,"status":check.status,"reason":check.reason,"workflow":check.workflow,"job":check.job,"matrix":check.matrix})).collect::<Vec<_>>()}))
         .context("shared CI prerequisite unavailable: plan receipt not committed")?;

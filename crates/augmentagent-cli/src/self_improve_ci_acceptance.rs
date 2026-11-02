@@ -37,6 +37,12 @@ async fn live_shared_ci_complete_coverage() -> Result<()> {
             let command=audit.controller_receipt(hash.as_str().context("command receipt hash missing")?)?;
             ensure!(command.value()["check"]==*id && command.value()["status"]=="passed",
                 "local coverage used another command's receipt");
+            ensure!(command.value()["guest_worker_quiescence"]["worker_free"]==true
+                && command.value()["guest_worker_quiescence"]["scopes"].as_array().is_some_and(|scopes|!scopes.is_empty())
+                && command.value()["input_write_observation"]["kind"]=="ci-input-write-observation"
+                && command.value()["guest_worker_quiescence"]["scopes"].as_array().unwrap()
+                    .contains(&command.value()["input_write_observation"]["guest_worker_quiescence"]),
+                "input observation did not follow its own positive guest worker cleanup");
         }
         for (field,kind) in [("started_receipt_sha256","shared_ci_started"),("plan_receipt_sha256","shared_ci_plan")] {
             let prior=audit.controller_receipt(record[field].as_str().context("coverage lineage missing")?)?;
@@ -65,6 +71,7 @@ async fn live_shared_ci_complete_coverage() -> Result<()> {
             "version":1,"kind":"real_shared_ci_complete_coverage","local_checks_covered":commands.len(),
             "protected_start_plan_and_command_lineage":true,"newer_failed_run_cannot_return_old_completion":true,
             "current_git_runtime_and_owned_generation_expectations":true,
+            "guest_worker_quiescence_precedes_bound_input_capture":true,
             "preparation_only_actual_producer_refused_final_ci_authority":true,
             "historical_completion_preserved":true,"full_ci_pass":false,"shipping_authority":false,
             "autonomous_merges_claimed":0}))?)?;

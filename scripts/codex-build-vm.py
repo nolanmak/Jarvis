@@ -117,9 +117,19 @@ from pathlib import Path
 job=json.loads(Path('/job.json').read_text())
 ci_cache={}
 ci_dependency=None
+ci_workers=None
+ci_inputs=None
+guest_worker_receipts=[]
+worker_control=Path('/root/ci-worker-control')
 guest_stage='load_dependency_controller'
 if job.get('ci_context'):
     exec(compile(Path('/ci-tools/cache-generation.py').read_bytes(),'/ci-tools/cache-generation.py','exec'),ci_cache)
+    import importlib.util
+    scope_spec=importlib.util.spec_from_file_location('ci_worker_scope','/ci-tools/ci-worker-scope.py')
+    ci_workers=importlib.util.module_from_spec(scope_spec);scope_spec.loader.exec_module(ci_workers)
+    input_spec=importlib.util.spec_from_file_location('ci_input_manifest','/ci-tools/ci-input-manifest.py')
+    ci_inputs=importlib.util.module_from_spec(input_spec);input_spec.loader.exec_module(ci_inputs)
+    worker_control.mkdir(mode=0o700,exist_ok=True)
     if job.get('ci_dependency'):
         try:
             import importlib.util
@@ -216,10 +226,11 @@ def hide_ci_cache():
     subprocess.run(['/usr/bin/mount','-o','remount,bind,ro,nosuid,nodev,noexec','/build-cache'],check=True)
     os.chmod('/dev/vda',0o600)
     return private
-def run_worker(argv):
+def _run_worker(argv,scope=None):
     process=subprocess.Popen(argv,cwd='/workspace',env=environment,
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-        start_new_session=True,preexec_fn=worker)
+        start_new_session=True,preexec_fn=worker if scope is None else None)
+    if scope is not None:scope.attach(process)
     outputs={'stdout':bytearray(),'stderr':bytearray()}
     size=0; exceeded=False
     with selectors.DefaultSelector() as streams:
@@ -237,7 +248,7 @@ def run_worker(argv):
     if exceeded:
         # The entire guest is shut down after this receipt, including detached
         # descendants. Kill the foreground group promptly to stop its output.
-        try: os.killpg(process.pid,signal.SIGKILL)
+        try: os.killpg(process.pid,signal.SIGTERM if scope is not None else signal.SIGKILL)
         except ProcessLookupError: pass
         process.wait()
         result={'error':'VM command exceeded output limit'}
@@ -245,6 +256,19 @@ def run_worker(argv):
         result={'exit_code':process.wait(),**{key:value.decode('utf-8','replace') for key,value in outputs.items()}}
         if len(result['stdout'].encode())+len(result['stderr'].encode())>8*1024*1024:
             result={'error':'VM command exceeded output limit'}
+    return result
+
+def run_worker(argv,input_roots=None):
+    if not job.get('ci_context'):return _run_worker(argv)
+    scope=ci_workers.WorkerScope(worker_control,uid,gid,argv)
+    journal=ci_inputs.ChangeJournal(input_roots,scope=scope) if input_roots is not None else None
+    try:
+        result=_run_worker(scope.argv,scope)
+        stopped=scope.verify()
+        if journal is not None:result['input_write_observation']=journal.finish(stopped)
+    finally:
+        if journal is not None:journal.close()
+    guest_worker_receipts.append(stopped.observation())
     return result
 
 def observe_phase(value):
@@ -295,14 +319,20 @@ try:
         else:
             seed_build_cache()
       guest_stage='execute_command'
-      result=run_worker(job['argv'])
-    if job.get('ci_context'):result['cache_reclaimed']=cache_reclaimed
+      roots=None
+      if job.get('ci_context') and job.get('ci_generation'):
+          roots={'output_'+str(index):Path('/workspace')/name for index,name in enumerate(sorted(job['ci_generation']['outputs']))}
+      result=run_worker(job['argv'],roots)
+    if job.get('ci_context'):
+        result['cache_reclaimed']=cache_reclaimed
+        result['guest_worker_quiescence']={'version':1,'kind':'ci-guest-command-quiescence',
+            'worker_free':True,'scopes':guest_worker_receipts,'shipping_authority':False}
     if dependency_result is not None:result['dependency_result']=dependency_result
     if cache_preparation is not None:result['cache_preparation']=cache_preparation
 except Exception as error:
     import errno
     # copytree aggregates per-file failures into shutil.Error without an errno.
-    hold_types=(ci_cache.get('FreshnessHold'),)+( (ci_dependency.FreshnessHold,) if ci_dependency is not None else () )
+    hold_types=(ci_cache.get('FreshnessHold'),)+( (ci_dependency.FreshnessHold,) if ci_dependency is not None else () )+( (ci_workers.FreshnessHold,) if ci_workers is not None else () )+( (ci_inputs.FreshnessHold,) if ci_inputs is not None else () )
     if job.get('ci_context') and isinstance(error,tuple(kind for kind in hold_types if kind is not None)):
         result={'error':'CI source/cache freshness unavailable','freshness_hold':error.diagnostic()}
     else:
@@ -424,10 +454,14 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             raise Unavailable('invalid read-only npm dependency directory')
     auxiliary_dependency=False
     if ci_context is not None:
-        base_keys={'state','git_objects','runner','contract','cache_program','generation'}
+        base_keys={'state','git_objects','runner','contract','cache_program','generation','worker_programs'}
         if set(ci_context) not in (base_keys,base_keys|{'dependency_programs','dependency_action'}):
             raise Unavailable('invalid controller CI context')
         dependency=ci_context.get('dependency_action')
+        programs=ci_context['worker_programs']
+        if (not isinstance(programs,dict) or set(programs)!={'provider-supervisor.py','ci-worker-scope.py','ci-input-manifest.py'}
+                or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values())):
+            raise Unavailable('invalid worker controller bundle')
         if dependency is not None and not isinstance(dependency,dict):raise Unavailable('invalid dependency action')
         auxiliary_dependency=dependency is not None and dependency.get('kind') in ('produce','publish','lookup')
         if 'dependency_programs' in ci_context:
@@ -492,8 +526,14 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             entries.extend((name,stat.S_IFDIR|0o755,b'',0,0) for name in ('ci-runtime','ci-git-objects','ci-tools'))
             entries.extend([('ci-tools/runner.py',stat.S_IFREG|0o444,ci_context['runner'],0,0),
                             ('ci-tools/contract.json',stat.S_IFREG|0o444,ci_context['contract'],0,0),
-                            ('ci-tools/cache-generation.py',stat.S_IFREG|0o444,ci_context['cache_program'],0,0)])
+                            ('ci-tools/cache-generation.py',stat.S_IFREG|0o444,ci_context['cache_program'],0,0),
+                            ('ci-tools/ci-cache-generation.py',stat.S_IFREG|0o444,ci_context['cache_program'],0,0)])
+            for name,data in ci_context['worker_programs'].items():
+                entries.append(('ci-tools/'+name,stat.S_IFREG|0o444,data,0,0))
             for name,data in ci_context.get('dependency_programs',{}).items():
+                if name=='ci-cache-generation.py':
+                    if data!=ci_context['cache_program']:raise Unavailable('contradictory cache controller bundle')
+                    continue
                 entries.append(('ci-tools/'+name,stat.S_IFREG|0o444,data,0,0))
             if not auxiliary_dependency:
                 shares.extend([('ci_runtime',Path(ci_context['state']),False),('ci_objects',Path(ci_context['git_objects']),True)])
@@ -582,9 +622,10 @@ poweroff -f
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
-                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed'} if ci_context is not None else set())
+                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
                 if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
                 if ci_context is not None and 'cache_preparation' in result:expected.add('cache_preparation')
+                if ci_context is not None and 'input_write_observation' in result:expected.add('input_write_observation')
                 if set(result) != expected or type(result['exit_code']) is not int:
                     raise Unavailable('invalid VM result')
                 if ci_context is not None:

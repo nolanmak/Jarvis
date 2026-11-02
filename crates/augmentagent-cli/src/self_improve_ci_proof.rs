@@ -271,6 +271,7 @@ struct Inputs {
     #[serde(deserialize_with = "required_nullable")]
     dependency_seed: Option<String>,
     quiescence_receipt_sha256: String,
+    guest_worker_quiescence: super::vm::GuestWorkerQuiescence,
     #[serde(deserialize_with = "required_nullable")]
     overlay_receipt_sha256: Option<String>,
     source_read_only: bool,
@@ -481,6 +482,7 @@ fn validate_inputs(
     expected: &InputExpectation,
 ) -> Result<()> {
     use crate::autoship_freshness::Reason;
+    inputs.guest_worker_quiescence.validate(true)?;
     validate_source(&expected.source)?;
     validate_source(&inputs.source)?;
     if inputs.source != expected.source
@@ -690,6 +692,7 @@ struct Planned {
     checks: Vec<DeclaredCheck>,
     local_plan_complete: bool,
     quiescence_receipt_sha256: String,
+    guest_worker_quiescence: super::vm::GuestWorkerQuiescence,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -703,6 +706,8 @@ struct Command {
     controller_authority_sha256: String,
     cache_preparation: super::vm::CachePreparation,
     quiescence_receipt_sha256: String,
+    guest_worker_quiescence: super::vm::GuestWorkerQuiescence,
+    input_write_observation: super::vm::NamespaceObservation,
     status: String,
     exit_code: Option<i32>,
     stdout_sha256: String,
@@ -816,6 +821,12 @@ fn validate_execution(
         ));
     }
     let mut all = BTreeSet::new();
+    plan.guest_worker_quiescence.validate(true)?;
+    let mut guest_scopes = plan
+        .guest_worker_quiescence
+        .scope_ids()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     let mut local = BTreeSet::new();
     let mut remote = BTreeSet::new();
     for check in &plan.checks {
@@ -864,6 +875,20 @@ fn validate_execution(
     let mut source_census = None;
     for check in plan.checks.iter().filter(|check| check.status == "ready") {
         let command: Command = read(audit, &execution.command_receipts[&check.id])?;
+        command.guest_worker_quiescence.validate(true)?;
+        command
+            .input_write_observation
+            .validate(&command.guest_worker_quiescence)?;
+        if command
+            .guest_worker_quiescence
+            .scope_ids()
+            .any(|scope| !guest_scopes.insert(scope.to_owned()))
+        {
+            return Err(hold(
+                Reason::CleanupUncertain,
+                "CI steps reused another command's guest worker cleanup",
+            ));
+        }
         let invocation = Invocation::Step {
             check: check.id.clone(),
         };
@@ -922,6 +947,7 @@ fn validate_execution(
             || inputs.inputs.outputs_policy_sha256 != prepared.outputs_sha256
             || inputs.inputs.dependency_seed != prepared.dependency_seed
             || inputs.inputs.quiescence_receipt_sha256 != command.quiescence_receipt_sha256
+            || inputs.inputs.guest_worker_quiescence != command.guest_worker_quiescence
             || inputs.inputs.generation == planned_quiescence.generation
         {
             return Err(hold(
@@ -1122,6 +1148,7 @@ mod tests {
             outputs_policy_sha256: "c".repeat(64),
             dependency_seed: None,
             quiescence_receipt_sha256: quiescent.payload_sha256().into(),
+            guest_worker_quiescence: serde_json::from_value(vm::stopped_workers_fixture()).unwrap(),
             overlay_receipt_sha256: None,
             source_read_only: true,
             complete: true,
@@ -1284,6 +1311,7 @@ mod tests {
             "quiescence_receipt_sha256":plan_q.payload_sha256(),"checks":[
                 {"id":check,"status":"ready","reason":"","workflow":"fixture.yml","job":"tests","matrix":{}},
                 {"id":"fixture/mac","status":"remote_required","reason":"mac required","workflow":"fixture.yml","job":"mac","matrix":{}}]});
+        plan["guest_worker_quiescence"] = vm::stopped_workers_fixture();
         if fault == "plan-run" {
             plan["run_id"] = uuid::Uuid::new_v4().to_string().into();
         }
@@ -1298,9 +1326,25 @@ mod tests {
                     "cache_identity_sha256":inputs.physical_cache_sha256,"source_inputs_sha256":inputs.git_census_sha256},
                 "command":inputs.command,"outputs_sha256":inputs.outputs_policy_sha256,"dependency_seed":null},
             "quiescence_receipt_sha256":inputs.quiescence_receipt_sha256,"status":"passed","exit_code":0,
+            "guest_worker_quiescence":inputs.guest_worker_quiescence,
             "stdout_sha256":"d".repeat(64),"stderr_sha256":"e".repeat(64),"shipping_authority":false,
             "invocation_sha256":inputs.invocation_sha256,"input_attestation_sha256":input_ref});
+        command["input_write_observation"] =
+            vm::input_observation_fixture(&command["guest_worker_quiescence"]);
         match fault {
+            "guest-reused" => {
+                command["guest_worker_quiescence"] = plan.value()["guest_worker_quiescence"].clone()
+            }
+            "guest-missing" => {
+                command
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("guest_worker_quiescence");
+            }
+            "guest-live" => command["guest_worker_quiescence"]["worker_free"] = false.into(),
+            "guest-input-mismatch" => {
+                command["guest_worker_quiescence"] = vm::stopped_workers_fixture()
+            }
             "source-red" => {
                 command["status"] = "failed".into();
                 command["exit_code"] = 1.into();
@@ -1395,6 +1439,10 @@ mod tests {
         }
         for fault in [
             "preparation-only",
+            "guest-reused",
+            "guest-missing",
+            "guest-live",
+            "guest-input-mismatch",
             "partial-coverage",
             "source-red",
             "targeted",

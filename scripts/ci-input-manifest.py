@@ -35,7 +35,7 @@ def _roots(roots):
     result={}
     for name,path in sorted(roots.items()):
         path=Path(path)
-        if not path.is_absolute() or path.resolve()!=path or not stat.S_ISDIR(path.lstat().st_mode):
+        if not path.is_absolute() or path.resolve()!=path or not (stat.S_ISDIR(path.lstat().st_mode) or stat.S_ISREG(path.lstat().st_mode)):
             raise FreshnessHold('input_census_unknown')
         if any(path==other or path.is_relative_to(other) or other.is_relative_to(path) for other in result.values()):
             raise FreshnessHold('input_census_unknown')
@@ -86,10 +86,14 @@ def snapshot(roots,*,max_files=100_000,max_bytes=8*1024**3):
 
 
 class ChangeJournal:
-    def __init__(self,roots):
+    def __init__(self,roots,*,scope=None):
         self.fd=-1;self.closed=False;self.watches={};self.count=0;self.changed=set();self.digest=hashlib.sha256()
+        self.scope=scope
         try:
             self.roots=_roots(roots)
+            if self.scope is not None:
+                try:self.scope.begin_observation()
+                except Exception:raise FreshnessHold('cleanup_uncertain') from None
             if sys.platform!='linux':raise FreshnessHold('input_census_unknown')
             libc=ctypes.CDLL(None,use_errno=True)
             libc.inotify_init1.argtypes=[ctypes.c_int];libc.inotify_init1.restype=ctypes.c_int
@@ -99,14 +103,15 @@ class ChangeJournal:
             if self.fd<0:raise FreshnessHold('input_census_unknown')
             # MODIFY, ATTRIB, CLOSE_WRITE, moves, creates/deletes, self moves/
             # deletion. Access/read events deliberately do not count as writes.
-            mask=0x00000fce|0x01000000|0x02000000  # ONLYDIR, DONT_FOLLOW
+            mask=0x00000fce|0x02000000  # DONT_FOLLOW; directories also require ONLYDIR
             def failed(_):raise FreshnessHold('input_census_unknown')
             for name,root in self.roots.items():
-                for directory,subdirs,_files in os.walk(root,followlinks=False,onerror=failed):
+                walk=os.walk(root,followlinks=False,onerror=failed) if root.is_dir() else [(root,[],[])]
+                for directory,subdirs,_files in walk:
                     directory=Path(directory)
                     if directory.is_symlink() or directory.resolve()!=directory or len(self.watches)>=100_000:
                         raise FreshnessHold('input_census_unknown')
-                    wd=libc.inotify_add_watch(self.fd,os.fsencode(directory),mask)
+                    wd=libc.inotify_add_watch(self.fd,os.fsencode(directory),mask|(0x01000000 if directory.is_dir() else 0))
                     if wd<0 or wd in self.watches:raise FreshnessHold('input_census_unknown')
                     self.watches[wd]=(name,directory.relative_to(root).as_posix())
                     if any((directory/child).is_symlink() for child in subdirs):
@@ -149,7 +154,7 @@ class ChangeJournal:
     def __del__(self):
         self.close()
 
-    def finish(self):
+    def finish(self,stopped=None):
         """Finish after the controller has independently excluded live writers.
 
         This proves whether any watched namespace changed, not the bytes of
@@ -159,12 +164,39 @@ class ChangeJournal:
         if self.closed or self.fd<0:raise FreshnessHold('input_census_unknown')
         self.closed=True
         try:
+            if self.scope is not None and (stopped is None or not callable(getattr(stopped,'matches',None)) or not stopped.matches(self.scope)):
+                raise FreshnessHold('cleanup_uncertain')
             self._drain();after=snapshot(self.roots);self._drain()
             changed=bool(self.changed) or self.before['sha256']!=after['sha256']
             return {'format_version':OBSERVATION_FORMAT,'kind':'ci-input-write-observation',
                     'changed':changed,'changed_roots':sorted(self.changed),'observed_events':self.count,
                     'events_sha256':self.digest.hexdigest(),'before_sha256':self.before['sha256'],
-                    'after_sha256':after['sha256'],'shipping_authority':False}
+                    'after_sha256':after['sha256'],'guest_worker_quiescence':stopped.observation() if self.scope is not None else None,
+                    'shipping_authority':False}
         except (OSError,ValueError,UnicodeError):
             raise FreshnessHold('input_census_unknown') from None
         finally:self.close()
+
+
+def validate_observation(value,guest_workers,outputs_count):
+    """Validate transport only. This is not complete artifact provenance."""
+    try:
+        fields={'format_version','kind','changed','changed_roots','observed_events','events_sha256',
+                'before_sha256','after_sha256','guest_worker_quiescence','shipping_authority'}
+        if (not isinstance(value,dict) or set(value)!=fields or type(value['format_version']) is not int
+                or value['format_version']!=OBSERVATION_FORMAT or value['kind']!='ci-input-write-observation'
+                or type(value['changed']) is not bool or value['shipping_authority'] is not False
+                or type(value['observed_events']) is not int or not 0<=value['observed_events']<=100_000
+                or not isinstance(value['changed_roots'],list) or len(value['changed_roots'])>64
+                or any(not isinstance(name,str) or name not in {'output_'+str(i) for i in range(outputs_count)} for name in value['changed_roots'])
+                or len(set(value['changed_roots']))!=len(value['changed_roots'])
+                or any(not _cache._digest(value[key]) for key in ('events_sha256','before_sha256','after_sha256'))):
+            raise FreshnessHold('input_census_unknown')
+        if value['guest_worker_quiescence'] not in guest_workers['scopes']:
+            raise FreshnessHold('cleanup_uncertain')
+        if (bool(value['changed_roots'])!=(value['observed_events']>0)
+                or value['changed']!=(value['observed_events']>0 or value['before_sha256']!=value['after_sha256'])
+                or value['observed_events']==0 and value['events_sha256']!=hashlib.sha256(b'').hexdigest()):
+            raise FreshnessHold('input_census_unknown')
+        return value
+    except (TypeError,ValueError,KeyError):raise FreshnessHold('input_census_unknown') from None

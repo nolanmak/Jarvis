@@ -12,6 +12,13 @@ manifest=importlib.util.module_from_spec(spec);spec.loader.exec_module(manifest)
 
 
 class InputManifestTests(unittest.TestCase):
+    def test_declared_single_file_output_is_watched_without_watching_its_neighbors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);output=root/'generated.css';output.write_text('original');other=root/'tracked.css';other.write_text('source')
+            journal=manifest.ChangeJournal({'css':output});other.read_text()
+            self.assertFalse(journal.finish()['changed'])
+            journal=manifest.ChangeJournal({'css':output});output.write_text('changed');output.write_text('original')
+            self.assertTrue(journal.finish()['changed'])
     def test_restored_generated_input_is_still_observed_as_a_write(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);generated=root/'generated.rs';generated.write_text('original input')

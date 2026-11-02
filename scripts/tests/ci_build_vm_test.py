@@ -5,9 +5,19 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('ci_vm',ROOT/'scripts/ci-build-vm.py');adapter=importlib.util.module_from_spec(spec);spec.loader.exec_module(adapter)
 vm=adapter.vm
+def stopped_workers():
+ return {'version':1,'kind':'ci-guest-command-quiescence','worker_free':True,'shipping_authority':False,
+  'scopes':[{'version':1,'kind':'ci-guest-workers-quiescent','state':'all_descendants_reaped',
+   'scope_id':str(uuid.uuid4()),'receipt_sha256':hashlib.sha256(b'all-descendants-reaped\n').hexdigest(),'shipping_authority':False}]}
+def observed_inputs(workers):
+ return {'format_version':1,'kind':'ci-input-write-observation','changed':False,'changed_roots':[],
+  'observed_events':0,'events_sha256':hashlib.sha256(b'').hexdigest(),'before_sha256':'f'*64,'after_sha256':'f'*64,
+  'guest_worker_quiescence':workers['scopes'][0],'shipping_authority':False}
 class AdapterTests(unittest.TestCase):
  def prepared_result(self,options,**result):
   generation=options['ci_context']['generation']
+  result['guest_worker_quiescence']=stopped_workers()
+  result['input_write_observation']=observed_inputs(result['guest_worker_quiescence'])
   result['cache_preparation']={'version':1,'binding':dict(generation['binding']),'command':generation['command'],
    'outputs_sha256':hashlib.sha256(json.dumps(generation['outputs'],sort_keys=True,separators=(',',':')).encode()).hexdigest(),
    'dependency_seed':None}
@@ -35,7 +45,7 @@ class AdapterTests(unittest.TestCase):
     seen.append((argv,options));self.assertIn('--probe-prerequisites',argv);self.assertEqual(environment,{})
     self.assertEqual(options['ci_context']['runner'],b'controller runner');self.assertIsNone(options['timeout'])
     plan={'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(b'{"version":1}').hexdigest(),'checks':[]}
-    return {'exit_code':0,'stdout':json.dumps(plan),'stderr':''}
+    return {'exit_code':0,'stdout':json.dumps(plan),'stderr':'','guest_worker_quiescence':stopped_workers()}
    with patch.object(vm.Runtime,'load',return_value=object()):result=adapter.execute(request,run=execute)
    self.assertEqual(result['status'],'planned');self.assertEqual(len(seen),1)
 
@@ -59,7 +69,7 @@ class AdapterTests(unittest.TestCase):
     seen.append(options)
     self.assertEqual(options['ci_context']['dependency_action']['kind'],'produce')
     self.assertIn('ci-dependency-store.py',options['ci_context']['dependency_programs'])
-    return {'exit_code':0,'stdout':'','stderr':'','cache_reclaimed':[],
+    return {'exit_code':0,'stdout':'','stderr':'','cache_reclaimed':[],'guest_worker_quiescence':stopped_workers(),
      'dependency_result':{'version':1,'kind':'produced','producer':dependency['producer'],
       'command':request['command_id'],'dependency_inputs_sha256':dependency['dependency_inputs_sha256'],
       'shipping_authority':False}}
@@ -74,7 +84,7 @@ class AdapterTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    request=self.fixture(Path(d))
    with patch.object(vm.Runtime,'load',return_value=object()),self.assertRaisesRegex(vm.Unavailable,'binding mismatch'):
-    adapter.execute(request,run=lambda *a,**k:{'exit_code':0,'stdout':'{}','stderr':''})
+    adapter.execute(request,run=lambda *a,**k:{'exit_code':0,'stdout':'{}','stderr':'','guest_worker_quiescence':stopped_workers()})
  def test_real_inherited_lock_not_proc_reopen_and_fd_identity_refusal(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);request=self.fixture(root);lease=adapter.InheritedStorage(request['storage'],root/'scratch');lease.check()
@@ -150,7 +160,8 @@ class AdapterTests(unittest.TestCase):
       if fault=='physical-cache':value['binding']['cache_identity_sha256']='2'*64
       if fault=='output-policy':value['outputs_sha256']='3'*64
       if fault=='seed':value['dependency_seed']='unknown'
-      result={'exit_code':status,'stdout':'source command output','stderr':''}
+      result={'exit_code':status,'stdout':'source command output','stderr':'','guest_worker_quiescence':stopped_workers()}
+      result['input_write_observation']=observed_inputs(result['guest_worker_quiescence'])
       if fault!='missing':result['cache_preparation']=value
       return result
      with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
@@ -161,6 +172,45 @@ class AdapterTests(unittest.TestCase):
        self.assertEqual(result['status'],'passed' if status==0 else 'failed')
       else:
        with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+
+ def test_missing_or_unknown_worker_cleanup_never_becomes_a_source_verdict(self):
+  for status in [0,17]:
+   for fault in ['missing','empty','still-live','duplicate','unknown-scope']:
+    with self.subTest(status=status,fault=fault),tempfile.TemporaryDirectory() as directory:
+     root=Path(directory);request=self.fixture(root)
+     request.update(operation='repository',command='true',build_cache=str(root/'registered-image'))
+     def execute(*args,**options):
+      result=self.prepared_result(options,exit_code=status,stdout='candidate output',stderr='')
+      if fault=='missing':result.pop('guest_worker_quiescence')
+      elif fault=='empty':result['guest_worker_quiescence']['scopes']=[]
+      elif fault=='still-live':result['guest_worker_quiescence']['worker_free']=False
+      elif fault=='duplicate':result['guest_worker_quiescence']['scopes']*=2
+      else:result['guest_worker_quiescence']['scopes'][0]['state']='unknown'
+      return result
+     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+      with self.assertRaises(adapter.cache_generation.FreshnessHold) as refused:adapter.execute(request,run=execute)
+      self.assertEqual(refused.exception.reason,'cleanup_uncertain')
+
+ def test_input_observation_must_be_complete_and_bound_to_the_same_worker(self):
+  for status in [0,17]:
+   for fault in ['missing','legacy','foreign-worker','extra-field','contradiction','unknown-root']:
+    with self.subTest(status=status,fault=fault),tempfile.TemporaryDirectory() as directory:
+     root=Path(directory);request=self.fixture(root)
+     request.update(operation='repository',command='true',build_cache=str(root/'registered-image'))
+     def execute(*args,**options):
+      result=self.prepared_result(options,exit_code=status,stdout='candidate output',stderr='')
+      observed=result['input_write_observation']
+      if fault=='missing':result.pop('input_write_observation')
+      elif fault=='legacy':observed['format_version']=0
+      elif fault=='foreign-worker':observed['guest_worker_quiescence']=stopped_workers()['scopes'][0]
+      elif fault=='extra-field':observed['unrecognized']=True
+      elif fault=='contradiction':observed['changed']=True
+      else:observed['changed_roots']=['output_99'];observed['observed_events']=1;observed['changed']=True
+      return result
+     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
 
  def test_cache_reuse_capacity_and_private_identity(self):
   with tempfile.TemporaryDirectory() as d:
@@ -238,7 +288,8 @@ class BuildVMExtensionTests(unittest.TestCase):
   runtime=vm.Runtime();runtime.config={key:str(artifact) for key in ['qemu','kernel','busybox','firmware','data_dir','library_dir','module_dir']};runtime.config.update(memory_mb=512,modules=[str(artifact)]);return runtime
  def setup(self,root):
   for name in ['workspace','state','objects','scratch']:(root/name).mkdir(mode=0o700)
-  return {'state':root/'state','git_objects':root/'objects','runner':b'pinned runner','contract':b'pinned contract','cache_program':adapter.CACHE_PROGRAM,'generation':None}
+  return {'state':root/'state','git_objects':root/'objects','runner':b'pinned runner','contract':b'pinned contract',
+   'cache_program':adapter.CACHE_PROGRAM,'generation':None,'worker_programs':adapter.WORKER_PROGRAMS}
  def openssl(self,argv,**kwargs):
   Path(argv[argv.index('-keyout')+1]).write_bytes(b'fixture-key');Path(argv[argv.index('-out')+1]).write_bytes(b'fixture-cert');return subprocess.CompletedProcess(argv,0)
  def test_ci_mounts_are_explicit_and_controller_bundle_is_readonly(self):
@@ -272,7 +323,8 @@ class BuildVMExtensionTests(unittest.TestCase):
     pid=999999
     def __init__(self,argv,**kwargs):
      self.calls=0;self.returncode=None;cleanup=Path(argv[3]);cleanup.write_text('all-descendants-reaped\n')
-     result=cleanup.parent/'control/outcome.json';result.write_text(json.dumps({'exit_code':0,'stdout':'finished','stderr':'','cache_reclaimed':receipt_reclaimed}));result.chmod(0o600)
+     result=cleanup.parent/'control/outcome.json';result.write_text(json.dumps({'exit_code':0,'stdout':'finished','stderr':'',
+      'cache_reclaimed':receipt_reclaimed,'guest_worker_quiescence':stopped_workers()}));result.chmod(0o600)
     def wait(self,timeout):
      self.calls+=1
      if self.calls<3:raise subprocess.TimeoutExpired('fixture',timeout)

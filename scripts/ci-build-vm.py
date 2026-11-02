@@ -9,6 +9,11 @@ vm=importlib.util.module_from_spec(spec);spec.loader.exec_module(vm)
 cache_spec=importlib.util.spec_from_file_location('ci_cache_generation',BASE/'ci-cache-generation.py')
 cache_generation=importlib.util.module_from_spec(cache_spec);cache_spec.loader.exec_module(cache_generation)
 CACHE_PROGRAM=(BASE/'ci-cache-generation.py').read_bytes()
+WORKER_PROGRAMS={name:(BASE/name).read_bytes() for name in ('provider-supervisor.py','ci-worker-scope.py','ci-input-manifest.py')}
+worker_spec=importlib.util.spec_from_file_location('ci_worker_boundary',BASE/'ci-worker-scope.py')
+worker_boundary=importlib.util.module_from_spec(worker_spec);worker_spec.loader.exec_module(worker_boundary)
+input_spec=importlib.util.spec_from_file_location('ci_input_boundary',BASE/'ci-input-manifest.py')
+input_boundary=importlib.util.module_from_spec(input_spec);input_spec.loader.exec_module(input_boundary)
 dependency_spec=importlib.util.spec_from_file_location('ci_dependency_workspace',BASE/'ci-dependency-workspace.py')
 dependency_workspace=importlib.util.module_from_spec(dependency_spec);dependency_spec.loader.exec_module(dependency_workspace)
 DEPENDENCY_PROGRAMS={name:(BASE/name).read_bytes() for name in (
@@ -260,14 +265,21 @@ def execute(request,run=vm.run,progress=None):
     progress['stage']='vm_launch'
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
                 ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract,
-                            'cache_program':CACHE_PROGRAM,'generation':generation,
+                            'cache_program':CACHE_PROGRAM,'generation':generation,'worker_programs':WORKER_PROGRAMS,
                             'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency})
     progress['stage']='receipt_validate'
+    try:guest_workers=worker_boundary.validate_quiescence(outcome.get('guest_worker_quiescence'),
+            require_worker=request['operation']!='dependency' or dependency['kind']=='produce')
+    except worker_boundary.FreshnessHold:raise cache_generation.FreshnessHold('cleanup_uncertain') from None
     result={'version':1,'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(contract).hexdigest(),
+            'guest_worker_quiescence':guest_workers,
             'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
             'cache_reclaimed':outcome.get('cache_reclaimed',[]),
             'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
     if request['operation'] not in ('plan','dependency'):
+        try:observed_inputs=input_boundary.validate_observation(outcome.get('input_write_observation'),guest_workers,len(outputs))
+        except input_boundary.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
+        result['input_write_observation']=observed_inputs
         prepared=cache_generation.validate_preparation(outcome.get('cache_preparation'),generation['binding'],generation['command'],generation['outputs'])
         if dependency is not None and prepared['dependency_seed']!=dependency['seed']:
             raise cache_generation.FreshnessHold('artifact_provenance_unknown')

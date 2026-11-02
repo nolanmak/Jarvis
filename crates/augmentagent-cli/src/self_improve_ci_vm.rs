@@ -8,6 +8,8 @@ const ADAPTER: &[u8] = include_bytes!("../../../scripts/ci-build-vm.py");
 const BUILD_VM: &[u8] = include_bytes!("../../../scripts/codex-build-vm.py");
 const PROXY: &[u8] = include_bytes!("../../../scripts/build-dependency-proxy.py");
 const SUPERVISOR: &[u8] = include_bytes!("../../../scripts/provider-supervisor.py");
+const WORKER_SCOPE: &[u8] = include_bytes!("../../../scripts/ci-worker-scope.py");
+const INPUT_MANIFEST: &[u8] = include_bytes!("../../../scripts/ci-input-manifest.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
 const DEPENDENCY_PROGRAMS:[(&str,&[u8]);6]=[
@@ -86,6 +88,76 @@ pub(super) struct CacheBinding {
     pub(super) cache_identity_sha256: String,
     pub(super) source_inputs_sha256: String,
 }
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GuestWorkerQuiescence {
+    version:u32,kind:String,worker_free:bool,scopes:Vec<GuestWorkerExit>,shipping_authority:bool,
+}
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+struct GuestWorkerExit {
+    version:u32,kind:String,state:String,scope_id:String,receipt_sha256:String,shipping_authority:bool,
+}
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NamespaceObservation {
+    format_version:u32,kind:String,changed:bool,changed_roots:Vec<String>,observed_events:u64,
+    events_sha256:String,before_sha256:String,after_sha256:String,
+    guest_worker_quiescence:GuestWorkerExit,shipping_authority:bool,
+}
+impl NamespaceObservation {
+    pub(super) fn validate(&self,workers:&GuestWorkerQuiescence)->Result<()> {
+        if !workers.scopes.contains(&self.guest_worker_quiescence) {
+            return Err(metadata_hold(crate::autoship_freshness::Reason::CleanupUncertain,"input capture borrowed another worker scope"));
+        }
+        let sha=|value:&str|value.len()==64 && value.bytes().all(|b|matches!(b,b'0'..=b'9'|b'a'..=b'f'));
+        let mut seen=BTreeSet::new();
+        if self.format_version!=1 || self.kind!="ci-input-write-observation" || self.shipping_authority
+            || self.observed_events>100_000 || self.changed_roots.len()>64
+            || self.changed_roots.iter().any(|name|!seen.insert(name) || !name.strip_prefix("output_")
+                .and_then(|index|index.parse::<usize>().ok()).is_some_and(|index|index<64 && *name==format!("output_{index}")))
+            || ![&self.events_sha256,&self.before_sha256,&self.after_sha256].into_iter().all(|value|sha(value))
+            || self.changed!= (self.observed_events>0 || self.before_sha256!=self.after_sha256)
+            || self.changed_roots.is_empty()!= (self.observed_events==0)
+            || self.observed_events==0 && self.events_sha256!=digest(b"") {
+            return Err(metadata_hold(crate::autoship_freshness::Reason::InputCensusUnknown,"generated namespace observation incomplete or contradictory"));
+        }
+        Ok(())
+    }
+}
+fn metadata_hold(reason:crate::autoship_freshness::Reason,detail:&str)->anyhow::Error {
+    crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,"reason":reason,
+        "recovery":reason.recovery(),"evidence_sha256":digest(detail.as_bytes())})).into()
+}
+impl GuestWorkerQuiescence {
+    pub(super) fn scope_ids(&self)->impl Iterator<Item=&str> {self.scopes.iter().map(|scope|scope.scope_id.as_str())}
+    pub(super) fn validate(&self,require_worker:bool)->Result<()> {
+        let mut seen=BTreeSet::new();
+        if self.version!=1 || self.kind!="ci-guest-command-quiescence" || !self.worker_free || self.shipping_authority
+            || self.scopes.len()>8 || require_worker && self.scopes.is_empty()
+            || self.scopes.iter().any(|scope|scope.version!=1 || scope.kind!="ci-guest-workers-quiescent"
+                || scope.state!="all_descendants_reaped" || scope.shipping_authority
+                || !uuid::Uuid::parse_str(&scope.scope_id).is_ok_and(|id|id.get_version_num()==4 && id.to_string()==scope.scope_id)
+                || !seen.insert(&scope.scope_id) || scope.receipt_sha256!=digest(b"all-descendants-reaped\n")) {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,
+                "reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
+                "evidence_sha256":digest(b"guest worker descendants are not positively quiescent")})).into());
+        }
+        Ok(())
+    }
+}
+#[cfg(test)]
+pub(super) fn stopped_workers_fixture()->serde_json::Value {
+    serde_json::json!({"version":1,"kind":"ci-guest-command-quiescence","worker_free":true,"shipping_authority":false,
+        "scopes":[{"version":1,"kind":"ci-guest-workers-quiescent","state":"all_descendants_reaped",
+            "scope_id":uuid::Uuid::new_v4().to_string(),"receipt_sha256":digest(b"all-descendants-reaped\n"),"shipping_authority":false}]})
+}
+#[cfg(test)]
+pub(super) fn input_observation_fixture(workers:&serde_json::Value)->serde_json::Value {
+    serde_json::json!({"format_version":1,"kind":"ci-input-write-observation","changed":false,"changed_roots":[],
+        "observed_events":0,"events_sha256":digest(b""),"before_sha256":"f".repeat(64),"after_sha256":"f".repeat(64),
+        "guest_worker_quiescence":workers["scopes"][0],"shipping_authority":false})
+}
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
     version: u32,
@@ -128,9 +200,29 @@ pub(super) struct Outcome {
     #[serde(skip)]
     pub quiescence_receipt: Option<augmentagent_channel_core::tool_audit::ProtectedControllerReceipt>,
     #[serde(default)]
+    pub guest_worker_quiescence:Option<serde_json::Value>,
+    #[serde(default)]
+    input_write_observation:Option<serde_json::Value>,
+    #[serde(default)]
     guest_diagnostic:Option<serde_json::Value>,
 }
 impl Outcome {
+    fn validated_guest_workers(&self,operation:&str)->Result<GuestWorkerQuiescence> {
+        let value=self.guest_worker_quiescence.as_ref().ok_or_else(||metadata_hold(
+            crate::autoship_freshness::Reason::CleanupUncertain,"guest worker cleanup evidence missing"))?;
+        let workers:GuestWorkerQuiescence=serde_json::from_value(value.clone()).map_err(|_|metadata_hold(
+            crate::autoship_freshness::Reason::MetadataTorn,"guest worker cleanup schema incomplete"))?;
+        workers.validate(operation!="dependency" || self.status=="seed_produced")?;
+        Ok(workers)
+    }
+    fn validated_input_observation(&self,operation:&str)->Result<NamespaceObservation> {
+        let value=self.input_write_observation.as_ref().ok_or_else(||metadata_hold(
+            crate::autoship_freshness::Reason::InputCensusUnknown,"generated namespace observation missing"))?;
+        let observation:NamespaceObservation=serde_json::from_value(value.clone()).map_err(|_|metadata_hold(
+            crate::autoship_freshness::Reason::MetadataTorn,"generated namespace observation schema incomplete"))?;
+        observation.validate(&self.validated_guest_workers(operation)?)?;
+        Ok(observation)
+    }
     fn validated_preparation(&self, binding: &Binding, generation: &str, command: &str,
         authority: &str, cache_identity: &str) -> Result<CachePreparation> {
         let hold = |reason: &str| crate::autoship_freshness::Hold::parse(&serde_json::json!({
@@ -247,6 +339,8 @@ impl Outcome {
                 && self.contract_sha256 == binding.contract_sha256,
             "{PREREQUISITE}: CI VM result has stale or mismatched source/contract binding"
         );
+        self.validated_guest_workers(operation)?;
+        if matches!(operation,"step"|"targeted"|"baseline"|"repository") {self.validated_input_observation(operation)?;}
         if operation=="dependency" {
             let value=self.dependency_result.as_ref().context("shared CI prerequisite unavailable: dependency phase receipt missing")?;
             ensure!(self.source_kind.as_deref()==Some("dependency_inputs") && self.exit_code==Some(0)
@@ -491,6 +585,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             ("codex-build-vm.py", BUILD_VM),
             ("build-dependency-proxy.py", PROXY),
             ("provider-supervisor.py", SUPERVISOR),
+            ("ci-worker-scope.py", WORKER_SCOPE),
+            ("ci-input-manifest.py", INPUT_MANIFEST),
             ("ci-cache-generation.py", CACHE_GENERATION),
             ("ci-runtime-identity.py", RUNTIME_IDENTITY),
             ("ci-contract.py", RUNNER.as_bytes()),
@@ -513,7 +609,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         let runtime_identity=runtime_identity(directory.path(),true)?;
         let authority_sha256 = digest(&serde_json::to_vec(&serde_json::json!({
             "runtime":digest(&runtime),"adapter":digest(ADAPTER),"build_vm":digest(BUILD_VM),"proxy":digest(PROXY),
-            "supervisor":digest(SUPERVISOR),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes,
+            "supervisor":digest(SUPERVISOR),"worker_scope":digest(WORKER_SCOPE),"input_manifest":digest(INPUT_MANIFEST),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes,
             "controller_executable_sha256":executable_sha256,"dependency_programs":dependency_programs,
             "runtime_identity_program":digest(RUNTIME_IDENTITY),"runtime_content_sha256":runtime_identity.content_sha256,
             "runtime_metadata_sha256":runtime_identity.metadata_sha256}))?);
@@ -715,6 +811,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
                 "check":check.map(|check|&check.id),"binding":binding,
                 "controller_authority_sha256":self.authority_sha256,"cache_preparation":prepared,
                 "quiescence_receipt_sha256":quiescence_sha256,"status":outcome.status,
+                "guest_worker_quiescence":outcome.guest_worker_quiescence,
+                "input_write_observation":outcome.validated_input_observation(operation)?,
                 "exit_code":outcome.exit_code,"stdout_sha256":digest(outcome.stdout.as_bytes()),
                 "stderr_sha256":digest(outcome.stderr.as_bytes()),"shipping_authority":false,
             })).context("shared CI prerequisite unavailable: command receipt not committed")?);
@@ -747,6 +845,32 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_or_foreign_input_capture_never_classifies_as_source_pass_or_failure() {
+        let binding=super::super::tests::binding_fixture();
+        for (status,exit) in [("passed",0),("failed",17)] {
+            for fault in ["none","missing-workers","missing-inputs","torn-workers","torn-inputs","live","foreign-inputs","contradiction"] {
+                let workers=stopped_workers_fixture();let observation=input_observation_fixture(&workers);
+                let mut value=serde_json::json!({"version":1,"boundary":"existing-build-vm","status":status,
+                    "head":"head","base":"base","contract_sha256":"contract","exit_code":exit,
+                    "guest_worker_quiescence":workers,"input_write_observation":observation});
+                match fault {
+                    "missing-workers"=>{value.as_object_mut().unwrap().remove("guest_worker_quiescence");},
+                    "missing-inputs"=>{value.as_object_mut().unwrap().remove("input_write_observation");},
+                    "torn-workers"=>value["guest_worker_quiescence"]["version"]="unknown".into(),
+                    "torn-inputs"=>value["input_write_observation"]["format_version"]="unknown".into(),
+                    "live"=>value["guest_worker_quiescence"]["worker_free"]=false.into(),
+                    "foreign-inputs"=>value["input_write_observation"]["guest_worker_quiescence"]=stopped_workers_fixture()["scopes"][0].clone(),
+                    "contradiction"=>value["input_write_observation"]["changed"]=true.into(),
+                    _=>{},
+                }
+                let outcome:Outcome=serde_json::from_value(value).unwrap();let validated=outcome.validate(&binding,"step");
+                if fault=="none" {validated.unwrap();}
+                else {assert!(validated.unwrap_err().downcast_ref::<crate::autoship_freshness::Hold>().is_some(),"{status}/{fault}");}
+            }
+        }
+    }
 
     #[test]
     fn current_cache_identity_refuses_replacement_aliases_and_shared_writes() {
@@ -917,8 +1041,10 @@ mod tests {
     #[test]
     fn vm_receipt_requires_exact_binding_and_observed_exit() {
         let binding = super::super::tests::binding_fixture();
-        let data = serde_json::json!({"version":1,"boundary":"existing-build-vm","status":"passed",
-            "head":"head","base":"base","contract_sha256":"contract","exit_code":0});
+        let mut data = serde_json::json!({"version":1,"boundary":"existing-build-vm","status":"passed",
+            "head":"head","base":"base","contract_sha256":"contract","exit_code":0,
+            "guest_worker_quiescence":stopped_workers_fixture()});
+        data["input_write_observation"]=input_observation_fixture(&data["guest_worker_quiescence"]);
         let receipt: Outcome = serde_json::from_value(data.clone()).unwrap();
         receipt.validate(&binding, "step").unwrap();
         for (field, value) in [
@@ -944,6 +1070,7 @@ mod tests {
         for (status,kind) in [("seed_produced","produced"),("seed_published","published")] {
             let data=serde_json::json!({"version":1,"boundary":"existing-build-vm","status":status,
                 "head":"head","base":"base","contract_sha256":"contract","exit_code":0,
+                "guest_worker_quiescence":stopped_workers_fixture(),
                 "source_kind":"dependency_inputs","dependency_result":{"version":1,"kind":kind,"shipping_authority":false}});
             let receipt:Outcome=serde_json::from_value(data.clone()).unwrap();
             receipt.validate(&binding,"dependency").unwrap();
