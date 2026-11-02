@@ -183,18 +183,21 @@ pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
 /// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
 pub fn strip_assumes_for_send(body: &str) -> String {
     let (mut clean, _) = split_assumes(body);
+    let mut touched = false;
     // A complete marker comment anywhere (the model sometimes writes a
     // one-line `<!--aa:assumes …-->` before the reply) is spliced out; only
     // an unclosed one truncates, since everything after it is marker text.
     while let Some(at) = [ASSUMES_OPEN_PREFIX, "<!--aa:needs-input"].iter()
         .filter_map(|marker| clean.find(marker)).min()
     {
+        touched = true;
         match clean[at..].find("-->") {
             Some(len) => clean.replace_range(at..at + len + 3, ""),
             None => clean.truncate(at),
         }
     }
-    clean.trim().to_string()
+    // A marker-free draft goes out byte-identical (Gmail keeps its CRLFs).
+    if touched { clean.trim().to_string() } else { clean }
 }
 
 /// Split a persisted draft into the human-facing draft and any needs-input
