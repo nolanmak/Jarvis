@@ -11,7 +11,8 @@ import sys
 import time
 
 
-def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=()):
+def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=(),
+              return_raw_status=False, on_spawn=None):
     libc = ctypes.CDLL(None, use_errno=True)
     stopping = False
 
@@ -97,6 +98,8 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=()):
         os.environ.pop('JARVIS_NATIVE_VM_READY', None)
         os.environ.pop('JARVIS_NATIVE_VM_CONTINUE', None)
     try:
+        if type(return_raw_status) is not bool or (on_spawn is not None and not callable(on_spawn)):
+            raise RuntimeError('invalid internal supervisor observer')
         # Trusted build broker carries the same flock open description through
         # supervisor and QEMU. A killed broker must not release build storage
         # before this subtree has actually exited.
@@ -139,6 +142,8 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=()):
         # Storage ownership remains held through the original cleanup path.
         for descriptor in close_after_spawn:
             os.close(descriptor)
+        if on_spawn is not None:
+            on_spawn(child)
         if vm_preflight:
             vm_ready = Path(receipt).with_name('vm-ready')
             deadline = time.monotonic() + 60
@@ -173,7 +178,7 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=()):
                     pass
             while True:
                 try:
-                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                    pid, waited_status = os.waitpid(-1, os.WNOHANG)
                 except ChildProcessError:
                     if scope:
                         observation = scope.observation()
@@ -184,6 +189,10 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=()):
                         stream.write('all-descendants-reaped\n')
                         stream.flush()
                         os.fsync(stream.fileno())
+                    # The relay needs the actual wait status; ordinary provider
+                    # callers retain their existing shell-style signal codes.
+                    if return_raw_status:
+                        return status if status is not None else 1
                     if stopping:
                         return 128 + signal.SIGTERM
                     if status is None:
@@ -195,6 +204,8 @@ def supervise(receipt, argv, *, forward_fds=(), close_after_spawn=()):
                     return status if status >= 0 else 128 - status
                 if pid == 0:
                     break
+                if return_raw_status and pid == child.pid and status is None:
+                    status = os.waitstatus_to_exitcode(waited_status)
             if time.monotonic() >= deadline:
                 raise RuntimeError('provider descendant cleanup did not complete')
             time.sleep(0.005)

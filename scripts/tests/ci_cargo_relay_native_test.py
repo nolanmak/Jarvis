@@ -94,6 +94,25 @@ class NativeRelayTests(unittest.TestCase):
             self.assertNotIn(b'RELAY_STD_COMPLETE', result.stdout)
             self.assertEqual(server.completed, [])
 
+    def signal_case(self, mode, marker):
+        with relay.Relay(self.root, library=self.library, timeout=10) as server:
+            fd = server.config_fd()
+            try: result = self.launch(fd, extra_env={'JARVIS_RELAY_TEST_MODE': mode})
+            finally: os.close(fd)
+            self.assertEqual(result.returncode, 0, (result.stdout+result.stderr).decode(errors='replace'))
+            self.assertIn(marker, result.stdout)
+            self.assertEqual(len(server.completed), 2 if mode == 'signal-exit' else 1)
+            self.assertTrue(all(item['cleanup'] == 'all-descendants-reaped' for item in server.completed))
+
+    def test_child_inherits_ignored_signals_and_blocked_mask(self):
+        self.signal_case('signal-state', b'RELAY_SIGNAL_STATE_COMPLETE')
+
+    def test_signal_termination_is_not_an_ordinary_exit_143(self):
+        self.signal_case('signal-exit', b'RELAY_SIGNAL_EXIT_COMPLETE')
+
+    def test_signal_to_child_pid_reaches_the_actual_tool_handler(self):
+        self.signal_case('signal-forward', b'RELAY_SIGNAL_FORWARD_COMPLETE')
+
 
 if __name__ == '__main__':
     unittest.main()

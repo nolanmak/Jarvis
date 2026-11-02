@@ -293,21 +293,38 @@ Other actions and non-default process-group/scheduling/credential attributes
 refuse. There is no unchecked native execution fallback.
 
 Prototype wire format (little-endian, not C's passing-proof schema): the sealed
-160-byte configuration contains `JARVCFG1`, UID/PID/timeout, a 32-byte nonce and
-a 108-byte socket path. A 300-byte `JARVREQ1` frame carries the nonce and at most
+160-byte configuration contains `JARVCFG2`, UID/PID/timeout, a 32-byte nonce and
+a 108-byte socket path. A 300-byte `JARVREQ2` frame carries the nonce and at most
 64 original descriptor numbers; SCM_RIGHTS carries a sealed argument memfd,
-stdio and inheritable FIFO descriptors. The `JARVARG1` memfd contains flags,
-argument/environment counts and length-prefixed file/cwd/search-path/argv/env
+stdio and inheritable FIFO descriptors. The `JARVARG2` memfd's 36-byte header contains flags,
+argument/environment counts and the original ignored-signal/blocked-mask bits,
+followed by length-prefixed file/cwd/search-path/argv/env
 bytes, bounded to 8 MiB, 4096 entries and 1 MiB per string. Unknown inheritable
-regular/socket descriptors refuse. `JARVRSP1` start/finish/error frames are
+regular/socket descriptors refuse. `JARVRSP2` start/finish/error/signaled frames are
 16 bytes. Each tool runs through the original supervisor. The endpoint bounds
 concurrency to four, requests to 4096 and each declared tool deadline to at most
 60 seconds; uncertain cleanup retains a failing state and never publishes a
 passing receipt. Tool environment bytes are applied only by the unprivileged
 exec bootstrap, after removing this experiment's preload/control selector.
 
-This is not the accepted planner execution protocol. In particular, signal and
-process-group semantics beyond the tested spawn cases, complete ABI/loader
+The original supervisor supplies a pidfd for its actual child through a private
+control socket, before the exec-start acknowledgement can complete. That socket
+is never inherited by the tool. Asynchronous `JARVSIG2` frames route signal
+numbers to that pidfd, with a 4096-message bound and strict descriptor refusal.
+The tool receives its requested initial mask and ignored dispositions. The proxy
+catches signals even when initially blocked or ignored, so a tool can later
+install a handler or change its own mask. Synchronous proxy faults fail rather
+than masquerading as tool signals. The supervisor's internal raw-status option
+returns the actual wait status only after descendant cleanup; ordinary provider
+callers retain their shell-style codes. A private status carrier checked against
+the supervisor exit distinguishes signal termination from ordinary exit 143.
+The native proxy reproduces a terminating signal after the original cleanup.
+Disconnect/timeout cancellation sends TERM once and waits, avoiding a second
+signal racing the supervisor's committed status during interpreter teardown.
+
+This is not the accepted planner execution protocol. In particular, queued
+signal-info payloads, complete job-control/process-group behavior and other
+semantics beyond the tested cases, complete ABI/loader
 coverage, separate credentials, immutable per-unit inputs/output publication,
 graph-based invalidation and final suite-proof binding remain open. The endpoint
 reports metadata isolation and shipping authority as false. No production

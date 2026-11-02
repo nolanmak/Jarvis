@@ -19,22 +19,36 @@ from pathlib import Path
 spec=importlib.util.spec_from_file_location('supervisor',sys.argv[1])
 supervisor=importlib.util.module_from_spec(spec);spec.loader.exec_module(supervisor)
 options=json.loads(sys.argv[3])
+raw_status=options.pop('raw_status',False)
+observer_fault=options.pop('observer_fault',False)
+def await_fixture():
+    ready=Path(sys.argv[2]).with_name('pids')
+    deadline=time.monotonic()+3
+    while not ready.exists() or not ready.stat().st_size:
+        if time.monotonic()>deadline:raise RuntimeError('fixture did not start')
+        time.sleep(.005)
 if options.pop('fault_after_spawn',False):
     original=os.close
     target=options['close_after_spawn'][0]
     def fail_close(fd):
         original(fd)
         if fd==target:
-            deadline=time.monotonic()+3
-            while not Path(sys.argv[2]).with_name('pids').exists():
-                if time.monotonic()>deadline:raise RuntimeError('fixture did not start')
-                time.sleep(.005)
+            await_fixture()
             raise OSError(5,'injected close failure')
     supervisor.os.close=fail_close
 try:
+    extra={'return_raw_status':True} if raw_status else {}
+    if observer_fault:
+        def observed(child):
+            await_fixture()
+            raise OSError(5,'injected observer failure')
+        extra['on_spawn']=observed
     result=supervisor.supervise(sys.argv[2],sys.argv[4:],
         forward_fds=tuple(options['forward_fds']),
-        close_after_spawn=tuple(options['close_after_spawn']))
+        close_after_spawn=tuple(options['close_after_spawn']),**extra)
+    if raw_status:
+        print('RAW_STATUS='+str(result),flush=True)
+        result=0
 except Exception:
     result=125
 raise SystemExit(result)
@@ -49,9 +63,9 @@ class SupervisorDescriptorTests(unittest.TestCase):
         # A faulty supervisor must not leave a fixture orphan or zombie behind.
         self.assertEqual(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0), 0)
 
-    def launch(self, code, forward=(), close=(), fault=False, storage=()):
+    def launch(self, code, forward=(), close=(), fault=False, storage=(), raw_status=False, observer_fault=False):
         options = {'forward_fds': forward, 'close_after_spawn': close,
-                   'fault_after_spawn': fault}
+                   'fault_after_spawn': fault, 'raw_status': raw_status, 'observer_fault': observer_fault}
         env = {'PATH': os.defpath}
         if storage:
             env['JARVIS_STORAGE_LEASE_FD'] = str(storage[0])
@@ -121,26 +135,30 @@ class SupervisorDescriptorTests(unittest.TestCase):
                 fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_post_spawn_close_failure_reaps_detached_descendants_before_receipt(self):
-        start_read, start_write = os.pipe()
-        self.addCleanup(os.close, start_read)
-        pids = self.root / 'pids'
-        code = ('import os,time; '
-                f'os.close({start_write}); '
-                'os.close(1); os.close(2); '
-                'pid=os.fork(); '
-                'os.setsid() if pid==0 else None; '
-                f'open({str(pids)!r},"w").write(str(os.getpid())+" "+str(pid)) if pid else None; '
-                'time.sleep(30)')
-        try:
-            child = self.launch(code, (start_write,), (start_write,), fault=True)
-        finally:
-            os.close(start_write)
-        _, error = child.communicate(timeout=8)
-        self.assertNotEqual(child.returncode, 0, error.decode())
-        self.assertTrue(pids.exists(), 'fault must occur after descendants start')
-        self.assertEqual(self.receipt.read_bytes(), b'all-descendants-reaped\n')
-        for pid in map(int, pids.read_text().split()):
-            self.assertFalse(Path(f'/proc/{pid}').exists(), 'receipt preceded descendant cleanup')
+        for fault in ('close', 'observer'):
+            with self.subTest(fault=fault):
+                start_read, start_write = os.pipe()
+                self.addCleanup(os.close, start_read)
+                pids = self.root / 'pids'
+                code = ('import os,time; '
+                        f'os.close({start_write}); '
+                        'os.close(1); os.close(2); '
+                        'pid=os.fork(); '
+                        'os.setsid() if pid==0 else None; '
+                        f'open({str(pids)!r},"w").write(str(os.getpid())+" "+str(pid)) if pid else None; '
+                        'time.sleep(30)')
+                try:
+                    child = self.launch(code, (start_write,), (start_write,), fault=fault=='close', observer_fault=fault=='observer')
+                finally:
+                    os.close(start_write)
+                _, error = child.communicate(timeout=8)
+                self.assertNotEqual(child.returncode, 0, error.decode())
+                self.assertTrue(pids.exists(), 'fault must occur after descendants start')
+                self.assertEqual(self.receipt.read_bytes(), b'all-descendants-reaped\n')
+                for pid in map(int, pids.read_text().split()):
+                    self.assertFalse(Path(f'/proc/{pid}').exists(), 'receipt preceded descendant cleanup')
+                self.receipt.unlink()
+                pids.unlink()
 
     def test_invalid_or_missing_descriptors_never_launch(self):
         for invalid in ((True,), (2,), (999999,), (3, 3)):
@@ -155,6 +173,17 @@ class SupervisorDescriptorTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(effect.exists())
                 if self.receipt.exists(): self.receipt.unlink()
+
+    def test_raw_status_distinguishes_sigterm_from_exit_143_after_original_cleanup(self):
+        for code, expected in [('raise SystemExit(143)', 143),
+                               ('import os,signal;os.kill(os.getpid(),signal.SIGTERM)', -15)]:
+            with self.subTest(expected=expected):
+                child = self.launch(code, raw_status=True)
+                output, error = child.communicate(timeout=5)
+                self.assertEqual(child.returncode, 0, error.decode())
+                self.assertEqual(output, f'RAW_STATUS={expected}\n'.encode())
+                self.assertEqual(self.receipt.read_bytes(), b'all-descendants-reaped\n')
+                self.receipt.unlink()
 
 
 if __name__ == '__main__':

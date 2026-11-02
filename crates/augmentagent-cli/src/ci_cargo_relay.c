@@ -53,6 +53,71 @@ _Static_assert(sizeof(struct request) == 300, "request ABI");
 _Static_assert(sizeof(struct response) == 16, "response ABI");
 static struct configuration config;
 static int initialized;
+static volatile sig_atomic_t proxy_connection = -1;
+static volatile sig_atomic_t proxy_signal_failure;
+struct signal_state { sigset_t mask; uint64_t ignored, blocked; };
+
+static int capture_signals(struct signal_state *state) {
+    state->ignored = state->blocked = 0;
+    if (sigprocmask(SIG_SETMASK, NULL, &state->mask) < 0) return -1;
+    for (int number=1; number<=64; ++number) {
+        if (sigismember(&state->mask, number)==1) state->blocked |= UINT64_C(1) << (number-1);
+        struct sigaction action;
+        if (sigaction(number, NULL, &action)<0) {
+            if (errno==EINVAL && (number==32 || number==33)) continue;
+            return -1;
+        }
+        if (action.sa_handler==SIG_IGN) state->ignored |= UINT64_C(1) << (number-1);
+    }
+    uint64_t unsupported=(UINT64_C(1)<<8)|(UINT64_C(1)<<18)|(UINT64_C(1)<<31)|(UINT64_C(1)<<32);
+    if ((state->ignored|state->blocked)&unsupported) {errno=ENOTSUP;return -1;}
+    return 0;
+}
+
+static void forward_signal(int number, siginfo_t *information, void *context) {
+    (void)context;
+    int saved_errno=errno;
+    /* A fault in this proxy is infrastructure failure, not a tool signal. */
+    if (information && information->si_code>0
+        && (number==SIGSEGV || number==SIGILL || number==SIGFPE || number==SIGBUS
+            || number==SIGTRAP || number==SIGSYS)) _exit(125);
+    struct response frame={.magic="JARVSIG2",.stage=(uint32_t)number,.value=0};
+    if (proxy_connection<0 || send(proxy_connection,&frame,sizeof(frame),MSG_DONTWAIT|MSG_NOSIGNAL)!=(ssize_t)sizeof(frame))
+        proxy_signal_failure=1;
+    errno=saved_errno;
+}
+
+static int install_signal_proxy(int connection) {
+    proxy_connection=connection;
+    proxy_signal_failure=0;
+    struct sigaction action={.sa_sigaction=forward_signal,.sa_flags=SA_SIGINFO};
+    sigfillset(&action.sa_mask);
+    for (int number=1;number<=64;++number) {
+        if (number==SIGKILL || number==SIGSTOP || number==32 || number==33) continue;
+        if (sigaction(number,&action,NULL)<0) return -1;
+    }
+    sigset_t unblocked;
+    sigemptyset(&unblocked);
+    /* The actual tool owns its requested mask/dispositions. The proxy must
+     * receive even initially ignored/blocked signals to route later changes. */
+    return sigprocmask(SIG_SETMASK,&unblocked,NULL);
+}
+
+static void exit_by_signal(uint32_t number) {
+    if (!number || number>64 || number==32 || number==33 || number==SIGSTOP
+        || number==SIGTSTP || number==SIGTTIN || number==SIGTTOU || number==SIGCONT
+        || number==SIGCHLD || number==SIGURG || number==SIGWINCH) _exit(125);
+    sigset_t blocked, selected;
+    sigfillset(&blocked);
+    if (sigprocmask(SIG_SETMASK,&blocked,NULL)<0) _exit(125);
+    struct sigaction action={.sa_handler=SIG_DFL};
+    sigemptyset(&action.sa_mask);
+    if (number!=SIGKILL && sigaction((int)number,&action,NULL)<0) _exit(125);
+    sigemptyset(&selected);sigaddset(&selected,(int)number);
+    if (sigprocmask(SIG_UNBLOCK,&selected,NULL)<0) _exit(125);
+    kill(getpid(),(int)number);
+    _exit(125);
+}
 
 static const char *environment_value(const char *name) {
     size_t length = strlen(name);
@@ -78,7 +143,7 @@ __attribute__((constructor)) static void initialize_relay(void) {
         || seals < 0 || (seals & SEALS) != SEALS
         || pread(fd, &config, sizeof(config), 0) != sizeof(config)) _exit(125);
     close(fd);
-    if (memcmp(config.magic, "JARVCFG1", 8) || config.uid != geteuid()
+    if (memcmp(config.magic, "JARVCFG2", 8) || config.uid != geteuid()
         || config.pid == 0 || config.pid > INT_MAX || config.timeout_ms < 1000
         || config.timeout_ms > 60000 || config.path[0] != '/'
         || !memchr(config.path, 0, sizeof(config.path))) _exit(125);
@@ -117,7 +182,8 @@ static int vector_length(char *const values[], uint32_t *result) {
     }
     return 0;
 }
-static int payload_fd(const char *file, char *const argv[], char *const envp[], int lookup) {
+static int payload_fd(const char *file, char *const argv[], char *const envp[], int lookup,
+                       const struct signal_state *signals) {
     uint32_t argc, envc;
     if (vector_length(argv, &argc) < 0 || vector_length(envp, &envc) < 0) return -1;
     if (!argc) { errno = EINVAL; return -1; }
@@ -128,8 +194,10 @@ static int payload_fd(const char *file, char *const argv[], char *const envp[], 
     uint32_t total = 0, header[3] = {(uint32_t)lookup, argc, envc};
     const char *path = lookup ? environment_value("PATH") : "";
     if (!path) path = "/bin:/usr/bin";
-    if (write_bytes(fd, "JARVARG1", 8, &total) < 0
+    uint64_t dispositions[2]={signals->ignored,signals->blocked};
+    if (write_bytes(fd, "JARVARG2", 8, &total) < 0
         || write_bytes(fd, header, sizeof(header), &total) < 0
+        || write_bytes(fd, dispositions, sizeof(dispositions), &total) < 0
         || write_string(fd, file, &total) < 0 || write_string(fd, cwd, &total) < 0
         || write_string(fd, path, &total) < 0) goto failed;
     for (uint32_t i = 0; i < argc; ++i)
@@ -207,6 +275,7 @@ static int64_t milliseconds(void) {
 }
 static int receive_response(int connection, int64_t deadline, struct response *response) {
     for (;;) {
+        if (proxy_signal_failure) {errno=EIO;return -1;}
         int64_t now = milliseconds();
         if (now < 0) return -1;
         if (now >= deadline) { errno = ETIMEDOUT; return -1; }
@@ -219,16 +288,23 @@ static int receive_response(int connection, int64_t deadline, struct response *r
         ssize_t length = recvmsg(connection, &message, 0);
         if (length < 0 && errno == EINTR) continue;
         if (length != sizeof(*response) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)
-            || memcmp(response->magic, "JARVRSP1", 8)) { errno = EIO; return -1; }
+            || memcmp(response->magic, "JARVRSP2", 8)) { errno = EIO; return -1; }
         return 0;
     }
 }
 static int delegate_exec(const char *file, char *const argv[], char *const envp[], int lookup) {
     if (!initialized) { errno = EPERM; return -1; }
-    int payload = payload_fd(file, argv, envp, lookup);
+    struct signal_state signals;
+    if (capture_signals(&signals)<0) return -1;
+    int payload = payload_fd(file, argv, envp, lookup, &signals);
     if (payload < 0) return -1;
     int connection = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (connection < 0) { int error=errno; close(payload); errno=error; return -1; }
+    int signals_blocked=0;
+    sigset_t blocked;
+    sigfillset(&blocked);
+    if (sigprocmask(SIG_SETMASK,&blocked,NULL)<0) goto failed;
+    signals_blocked=1;
     struct timeval timeout = {.tv_sec = config.timeout_ms/1000,
                               .tv_usec = (config.timeout_ms%1000)*1000};
     if (setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) goto failed;
@@ -241,7 +317,7 @@ static int delegate_exec(const char *file, char *const argv[], char *const envp[
     if (size != sizeof(peer) || peer.uid != config.uid || peer.pid != (pid_t)config.pid) {
         errno = EPERM; goto failed;
     }
-    struct request request = {.magic = "JARVREQ1", .count = 3, .numbers = {0,1,2}};
+    struct request request = {.magic = "JARVREQ2", .count = 3, .numbers = {0,1,2}};
     memcpy(request.token, config.token, sizeof(request.token));
     int passed[65] = {payload,0,1,2};
     if (walk_descriptors(0, connection, payload, &request, passed) < 0) goto failed;
@@ -265,8 +341,10 @@ static int delegate_exec(const char *file, char *const argv[], char *const envp[
         errno = (int)response.value; goto failed;
     }
     if (response.stage != 1 || response.value != 0) { errno = EIO; goto failed; }
+    if (install_signal_proxy(connection)<0) _exit(125);
     if (walk_descriptors(1, connection, -1, NULL, NULL) < 0) _exit(125);
     if (receive_response(connection, deadline, &response) < 0) _exit(125);
+    if (response.stage==4) {close(connection);exit_by_signal(response.value);}
     if (response.stage != 2 || response.value > 255) _exit(125);
     close(connection);
     _exit((int)response.value);
@@ -274,6 +352,7 @@ failed:;
     int error = errno;
     if (payload >= 0) close(payload);
     close(connection);
+    if (signals_blocked) sigprocmask(SIG_SETMASK,&signals.mask,NULL);
     errno = error;
     return -1;
 }
