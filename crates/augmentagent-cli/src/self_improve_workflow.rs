@@ -125,7 +125,9 @@ impl CapacityAccounting {
         let calls=self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
             .snapshot(&self.workflow)?.context("retry workflow missing")?.model_calls;
         let paid=calls.checked_sub(self.calls_before).context("durable admissions decreased")?;
-        Ok(RunReport{message,billed:paid>0,held:paid==0,resumed:self.resumed})
+        // Actual spend and productive progress are independent. A retry must
+        // remain deferred even if a builder ran earlier in the same attempt.
+        Ok(RunReport{message,billed:paid>0,held:true,resumed:self.resumed})
     }
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
         let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
@@ -2806,7 +2808,7 @@ mod tests {
                     assert_eq!(after.checkpoint.next.action, "retry_verification");
                     assert!(after.checkpoint.next.eligible_at_ms > millis());
                     assert_eq!(report.billed, already_paid);
-                    assert_eq!(report.is_idle(), !already_paid);
+                    assert!(report.is_idle(), "the command attempt must be deferred even when earlier work spent model calls");
                     assert!(report.resumed);
                     assert!(after.lease_until_ms <= millis(), "CI retry still waits for the abandoned ten-minute lease");
                     let eligible = after.checkpoint.next.eligible_at_ms;
