@@ -17,6 +17,41 @@ pub fn owner_chat_active() -> bool {
 }
 
 const HEALTH_FOOTER: &str = "iMessage delivery status";
+const ECHO_FOOTER: &str = "Sent from iMessage";
+/// A repeat "Important" notice for the same sender and thread inside this
+/// window is left on Discord: busy threads send one email per comment.
+const FLAG_REPEAT_WINDOW_MS: i64 = 4 * 60 * 60 * 1000;
+
+/// The owner's iMessage question and the agent's answer, posted to Discord so
+/// the conversation is visible there too. Never mirrored back to iMessage.
+pub fn imessage_echo_message(question: &str, answer: &str) -> serenity::all::CreateMessage {
+    let clip = |s: &str, n: usize| -> String {
+        if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
+    };
+    serenity::all::CreateMessage::new()
+        .embed(
+            serenity::all::CreateEmbed::new()
+                .description(format!("**You:** {}\n\n{}", clip(question.trim(), 1000), clip(answer.trim(), 2900)))
+                .footer(serenity::all::CreateEmbedFooter::new(ECHO_FOOTER)),
+        )
+        .allowed_mentions(serenity::all::CreateAllowedMentions::new())
+}
+
+/// `from` line plus subject without reply prefixes, for an "Important" notice.
+fn flag_notice_key(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let head = lines.next()?.trim();
+    if !head.starts_with("🚩 **Important**") {
+        return None;
+    }
+    let mut subject = lines.next()?.trim().trim_matches('*').trim();
+    loop {
+        let lower = subject.to_ascii_lowercase();
+        let Some(rest) = ["re:", "fwd:", "fw:"].iter().find_map(|p| lower.starts_with(p).then(|| subject[p.len()..].trim_start())) else { break };
+        subject = rest;
+    }
+    Some(format!("{head}\n{subject}"))
+}
 pub fn health_description(id: i64, status: &str) -> String {
     format!("Owner iMessage output {id}: {status}. Inspect `augmentagent imessage owner status` and the Mac sender before retrying. Uncertain deliveries are never automatically resent. Discord remains available.")
 }
@@ -339,7 +374,7 @@ impl OwnerSurface {
         if message
             .embeds
             .iter()
-            .any(|e| e.footer.as_ref().is_some_and(|f| f.text == HEALTH_FOOTER))
+            .any(|e| e.footer.as_ref().is_some_and(|f| f.text == HEALTH_FOOTER || f.text == ECHO_FOOTER))
         {
             return Ok(());
         }
@@ -460,6 +495,22 @@ impl OwnerSurface {
 
         if text.trim().is_empty() {
             return Ok(());
+        }
+        if let Some(key) = flag_notice_key(&text) {
+            let since = chrono::Utc::now().timestamp_millis() - FLAG_REPEAT_WINDOW_MS;
+            let recent: Vec<String> = self
+                .store
+                .with_conn(|c| {
+                    let mut stmt = c.prepare(
+                        "SELECT body FROM imessage_outbox WHERE created_at_ms > ?1 AND body LIKE '🚩 **Important**%'",
+                    )?;
+                    let rows = stmt.query_map([since], |r| r.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                })
+                .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+            if recent.iter().any(|body| flag_notice_key(body).as_deref() == Some(&*key)) {
+                return Ok(());
+            }
         }
         let revision = message
             .edited_timestamp
@@ -841,6 +892,16 @@ impl OwnerSurface {
                 &format!("result:{}:{}", event.binding_revision, event.guid),
                 &response,
             )?;
+            if ordinary_chat {
+                if let (Some(http), Some(channel)) = (context.http.as_ref(), context.channel_id) {
+                    if let Err(error) = channel
+                        .send_message(&**http, imessage_echo_message(&event.body, &response))
+                        .await
+                    {
+                        tracing::warn!(event=%event.guid, "owner iMessage turn not echoed to Discord: {error}");
+                    }
+                }
+            }
         }
         if uncertain {
             self.store
