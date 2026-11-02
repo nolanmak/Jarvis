@@ -7,6 +7,7 @@ pub(in crate::self_improve) const EXPORTER: &str = include_str!("../../../script
 pub(in crate::self_improve) struct OwnedCheckout {
     path: PathBuf,
     generation: String,
+    lifetime: std::sync::Arc<()>,
     owner: PathBuf,
     identity: Vec<u8>,
     _lock: std::fs::File,
@@ -18,6 +19,10 @@ impl OwnedCheckout {
 
     pub(in crate::self_improve) fn generation(&self) -> &str {
         &self.generation
+    }
+
+    pub(in crate::self_improve) fn lifetime(&self) -> std::sync::Weak<()> {
+        std::sync::Arc::downgrade(&self.lifetime)
     }
 }
 impl Drop for OwnedCheckout {
@@ -115,6 +120,7 @@ pub(in crate::self_improve) fn allocate(parent: &Path, head: &str, contract: &st
     Ok(OwnedCheckout {
         path,
         generation: uuid::Uuid::new_v4().to_string(),
+        lifetime: std::sync::Arc::new(()),
         owner,
         identity,
         _lock: lock,

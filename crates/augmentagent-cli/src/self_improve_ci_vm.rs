@@ -16,7 +16,11 @@ pub(super) struct Session {
     cache_bytes: u64,
     cache: PathBuf,
     pub authority_sha256: String,
-    completed_generations: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    completed_generations: std::sync::Mutex<std::collections::BTreeMap<String, Completion>>,
+}
+struct Completion {
+    command: String,
+    source: std::sync::Weak<()>,
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
@@ -195,6 +199,16 @@ impl Drop for Session {
     }
 }
 impl Session {
+    fn cache_state(&self,generation:&str)->Result<(Option<String>,BTreeSet<String>)> {
+        let mut completed=self.completed_generations.lock()
+            .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
+        // Dead source owners cannot pin completed job artifacts. Durable
+        // storage holds independently fence unknown live descendants.
+        completed.retain(|_,completion|completion.source.strong_count()>0);
+        Ok((completed.get(generation).map(|value|value.command.clone()),completed.keys().cloned()
+            .chain(std::iter::once(generation.to_owned())).collect()))
+    }
+
     pub(super) fn prepare(root: &Path, target: &Path) -> Result<Self> {
         use augmentagent_channel_core::codex_tools::{build_runner, BuildRunner};
         let BuildRunner::Vm(runtime_path) = build_runner() else {
@@ -285,14 +299,10 @@ impl Session {
         deadline: std::time::Duration,
     ) -> Result<Outcome> {
         let generation = source.generation().to_owned();
+        let source_lifetime=source.lifetime();
         let source = source.path();
         let command_id = uuid::Uuid::new_v4().to_string();
-        let (predecessor, retained_generations) = {
-            let completed=self.completed_generations.lock()
-                .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
-            (completed.get(&generation).cloned(),completed.keys().cloned()
-                .chain(std::iter::once(generation.clone())).collect::<BTreeSet<_>>())
-        };
+        let (predecessor,retained_generations)=self.cache_state(&generation)?;
         let files = storage.inherited_files()?;
         let fd = files.first().context("CI storage lease unavailable")?;
         let meta = fd.metadata()?;
@@ -412,7 +422,7 @@ impl Session {
             // receipt validation. A dropped/failed invocation cannot mint it.
             self.completed_generations.lock()
                 .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
-                .insert(generation, command_id);
+                .insert(generation, Completion {command:command_id,source:source_lifetime});
         }
         Ok(outcome)
     }
@@ -421,6 +431,23 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_job_sources_stop_pinning_cache_while_live_sources_keep_their_acknowledgement() {
+        let directory=tempfile::tempdir().unwrap();
+        let first=verifier_checkout::allocate(directory.path(),"head-a","contract").unwrap();
+        let second=verifier_checkout::allocate(directory.path(),"head-b","contract").unwrap();
+        let first_id=first.generation().to_owned();let second_id=second.generation().to_owned();
+        let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:directory.path().join("unused"),
+            authority_sha256:String::new(),completed_generations:Default::default()};
+        session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime()});
+        session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime()});
+        assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([first_id.clone(),second_id.clone()])));
+        drop(first);
+        assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([second_id.clone()])));
+        drop(second);
+        assert_eq!(session.cache_state("new-generation").unwrap(),(None,BTreeSet::from(["new-generation".into()])));
+    }
 
     #[test]
     fn freshness_hold_survives_transport_and_cannot_certify_success_or_code_failure() {
