@@ -163,8 +163,11 @@ fn calendar_facts(
         })
         .collect())
 }
+// active=1 is the operator-enabled source set, not a health claim. Every
+// enabled source remains required even when its read/sync fails; disabled
+// historical connections do not become spurious missing-source notices.
 fn accounts(store: &Store) -> Result<Vec<Account>> {
-    Ok(store.with_conn(|c|c.prepare("SELECT id,connectionId,entityId,COALESCE(email,''),active FROM gmail_accounts ORDER BY id")?
+    Ok(store.with_conn(|c|c.prepare("SELECT id,connectionId,entityId,COALESCE(email,''),active FROM gmail_accounts WHERE active=1 ORDER BY id")?
         .query_map([],|r|Ok(Account{id:r.get(0)?,connection_id:r.get(1)?,entity_id:r.get(2)?,email:r.get(3)?,active:r.get(4)?}))?
         .collect::<augmentagent_store::rusqlite::Result<Vec<_>>>())?)
 }
@@ -275,26 +278,19 @@ impl AttentionProvider for PhoneAttention {
         let accounts = accounts(&self.store)?;
         if accounts.is_empty() {
             return Ok(Some(
-                "No calendar or inbox accounts are configured, so I haven't checked them.".into(),
+                "No calendar or inbox accounts are enabled, so I haven't checked them.".into(),
             ));
         }
         anyhow::ensure!(accounts.len() <= 32, "too many attention sources");
         let mut checks = FuturesUnordered::new();
         for account in &accounts {
-            if !account.active {
-                continue;
-            }
             checks.push(Box::pin(async move { self.source(account, true).await })
                 as std::pin::Pin<
                     Box<dyn std::future::Future<Output = SourceView> + Send + '_>,
                 >);
             checks.push(Box::pin(async move { self.source(account, false).await }));
         }
-        let mut views = accounts
-            .iter()
-            .filter(|a| !a.active)
-            .map(|a| SourceView::unavailable(format!("{} disconnected calendar/inbox", a.email)))
-            .collect::<Vec<_>>();
+        let mut views = vec![];
         while let Some(view) = checks.next().await {
             views.push(view);
         }
@@ -305,15 +301,21 @@ impl AttentionProvider for PhoneAttention {
             "phone attention authorization changed during reads"
         );
         let current = self.store.with_conn(|c| {
-            c.prepare("SELECT id,active FROM gmail_accounts ORDER BY id")?
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?
+            c.prepare("SELECT id,entityId,active FROM gmail_accounts WHERE active=1 ORDER BY id")?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, bool>(2)?,
+                    ))
+                })?
                 .collect::<augmentagent_store::rusqlite::Result<Vec<_>>>()
         })?;
         anyhow::ensure!(
             current
                 == accounts
                     .iter()
-                    .map(|a| (a.id.clone(), a.active))
+                    .map(|a| (a.id.clone(), a.entity_id.clone(), a.active))
                     .collect::<Vec<_>>()
                 && self
                     .store
@@ -472,6 +474,17 @@ mod tests {
         store
             .upsert_google_gmail_account("owner@example.test")
             .unwrap();
+        store
+            .upsert_google_gmail_account("retired@example.test")
+            .unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE gmail_accounts SET active=0 WHERE email='retired@example.test'",
+                    [],
+                )
+            })
+            .unwrap();
         (
             dir,
             PhoneAttention {
@@ -496,7 +509,12 @@ mod tests {
         let start = tokio::time::Instant::now();
         let (a, b) = tokio::join!(provider.check(&origin), provider.check(&origin));
         assert!(start.elapsed() <= Duration::from_secs(2));
-        assert!(a.unwrap().unwrap().starts_with("Synthetic deadline"));
+        let answer = a.unwrap().unwrap();
+        assert!(answer.starts_with("Synthetic deadline"));
+        assert!(
+            !answer.contains("retired"),
+            "disabled historical accounts are outside this check's configured source set"
+        );
         assert!(b.unwrap().unwrap().starts_with("Synthetic deadline"));
         assert_eq!(
             reads
