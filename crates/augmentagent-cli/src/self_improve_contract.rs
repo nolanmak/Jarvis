@@ -1925,6 +1925,7 @@ pub(super) async fn verify_with_repair_for(
                         &[serde_json::to_string(&reference)?],
                     )
                     .await?;
+                workflow.verification_gate_passed(crate::autoship_workflow::VerificationDomain::Acceptance).await?;
                 return Ok(reference);
             }
             Err(error) => {
