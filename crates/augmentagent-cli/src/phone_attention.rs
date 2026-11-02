@@ -15,6 +15,7 @@ use std::{
 };
 use tokio::sync::OnceCell;
 const FRESH_MS: i64 = 300_000;
+const PENDING_TRIAGE_QUERY: &str = "SELECT count(*) FROM emails WHERE platform='gmail' AND accountEntityId=?1 AND triageResult IS NULL";
 #[derive(Clone)]
 struct SourceView {
     name: String,
@@ -63,7 +64,7 @@ impl Reads for ConnectedReads {
         let now = Utc::now().timestamp_millis();
         let (last_ok,poll_ok,pending,mut facts)=self.store.with_conn(|c|{
             let (last_ok,poll_ok):(Option<i64>,Option<bool>)=c.query_row("SELECT lastOkPolledAt,lastPollOk FROM gmail_accounts WHERE entityId=?1 AND active=1",[&account.entity_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            let pending:i64=c.query_row("SELECT count(*) FROM emails WHERE platform='gmail' AND accountEntityId=?1 AND triageResult IS NULL",[&account.entity_id],|r|r.get(0))?;
+            let pending:i64=c.query_row(PENDING_TRIAGE_QUERY,[&account.entity_id],|r|r.get(0))?;
             let facts=c.prepare("SELECT e.messageId,e.fromEmail,e.subject,a.status FROM actions a JOIN emails e ON e.messageId=a.messageId WHERE e.platform='gmail' AND e.accountEntityId=?1 AND a.status IN ('flagged','pending') ORDER BY CASE a.status WHEN 'flagged' THEN 0 ELSE 1 END,a.createdAt DESC LIMIT 3")?
                 .query_map([&account.entity_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<augmentagent_store::rusqlite::Result<Vec<_>>>()?;
             Ok((last_ok,poll_ok,pending,facts))
@@ -463,6 +464,29 @@ fn render(views: &[SourceView], now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_triage_lookup_work_is_bounded_to_the_selected_accounts_pending_rows() {
+        use augmentagent_store::rusqlite::StatementStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        store.with_conn(|c| {
+            c.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<5000)
+                INSERT INTO emails(messageId,fromEmail,subject,firstSeenAt,platform,accountEntityId,triageResult)
+                SELECT 'other-'||i,'sender@example.test','Synthetic',0,'gmail','other',NULL FROM n;
+                WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<5000)
+                INSERT INTO emails(messageId,fromEmail,subject,firstSeenAt,platform,accountEntityId,triageResult)
+                SELECT 'triaged-'||i,'sender@example.test','Synthetic',0,'gmail','selected','{}' FROM n;
+                INSERT INTO emails(messageId,fromEmail,subject,firstSeenAt,platform,accountEntityId)
+                VALUES('pending','sender@example.test','Synthetic',0,'gmail','selected'),
+                      ('different-platform','sender@example.test','Synthetic',0,'slack','selected');")?;
+            let mut query = c.prepare(PENDING_TRIAGE_QUERY)?;
+            let pending: i64 = query.query_row(["selected"], |r| r.get(0))?;
+            assert_eq!(pending, 1, "account and platform isolation must remain intact");
+            let steps = query.get_status(StatementStatus::VmStep);
+            assert!(steps < 100, "a phone source lookup must not scan unrelated or already triaged mail: {steps} SQLite VM steps");
+            Ok(())
+        }).unwrap();
+    }
     #[test]
     fn all_day_dates_are_not_shifted_into_the_previous_local_evening() {
         let event=serde_json::from_value(serde_json::json!({"id":"synthetic","summary":"Synthetic deadline","start":{"date":"2026-11-03"},"end":{"date":"2026-11-04"}})).unwrap();
