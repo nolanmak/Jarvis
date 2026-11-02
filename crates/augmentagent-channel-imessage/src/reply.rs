@@ -331,7 +331,7 @@ impl CardDrafter<'_> {
                 self.store, &email, self.config.wiki_root.as_deref(),
             )?.prompt()
         } else { String::new() };
-        let (group_policy, group_note) = group_notes(&email.platform);
+        let (group_policy, _) = group_notes(&email.platform);
         if group {
             baseline.push_str(&group_policy);
         }
@@ -360,7 +360,13 @@ impl CardDrafter<'_> {
                 return Ok(Handled::Skipped);
             }
         }
+        self.card(email, group, supersede_reason).await
+    }
 
+    /// Draft and post a card without triage: the caller (the owner, asking
+    /// for one) has already decided this message deserves a reply.
+    pub async fn card(&self, email: Email, group: bool, supersede_reason: &str) -> anyhow::Result<Handled> {
+        let (_, group_note) = group_notes(&email.platform);
         let skill = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
             .unwrap_or_default();
         let context = augmentagent_channel_core::draft_workflow::prepare(

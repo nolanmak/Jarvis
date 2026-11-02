@@ -36,6 +36,10 @@ pub enum Op {
     /// Approved replies still awaiting your paste, and ones never seen in the
     /// archive (marked error, never resent).
     Status,
+    /// Draft a reply card now for a chat you haven't answered (its JID),
+    /// skipping triage. Posts to Discord when the bot token is set; otherwise
+    /// the daemon's approval queue posts it.
+    Card { jid: String },
 }
 
 /// #1765 — Approve on a WhatsApp archive card. Nothing is sent: the action
@@ -118,6 +122,7 @@ pub fn policy_command(store: &Store, op: &Op) -> Result<()> {
             print!("{}", render_status(store)?);
             return Ok(());
         }
+        Op::Card { .. } => unreachable!("card is async; see card_command"),
     }
     print!("{}", render_policy(store)?);
     Ok(())
@@ -166,6 +171,38 @@ pub async fn poll_command(store: Arc<Store>) -> Result<()> {
     let config = Config::load()?.context("AUGMENTAGENT_WHATSAPP_HISTORY_DIR is required")?;
     let report = poll(&config, store).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// `whatsapp-history card <jid>`: one owner-requested reply card.
+pub async fn card_command(store: Arc<Store>, jid: &str, wiki_root: Option<PathBuf>) -> Result<()> {
+    let config = Config::load()?.context("AUGMENTAGENT_WHATSAPP_HISTORY_DIR is required")?;
+    let delta = history::conversation_delta(&config.directory, jid.trim(), 20)?;
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let broker: Arc<dyn augmentagent_approval_discord::ApprovalBroker> =
+        match (env("DISCORD_BOT_TOKEN"), env("DISCORD_CHANNEL_ID"), env("DISCORD_ALLOWED_USER_ID")) {
+            (Some(token), Some(channel), Some(owner)) => Arc::new(
+                augmentagent_approval_discord::DiscordApprovalBroker::post_only(
+                    &token,
+                    channel.parse().context("DISCORD_CHANNEL_ID must be numeric")?,
+                    owner.parse().context("DISCORD_ALLOWED_USER_ID must be numeric")?,
+                    Arc::clone(&store),
+                ),
+            ),
+            _ => anyhow::bail!("DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID and DISCORD_ALLOWED_USER_ID are required"),
+        };
+    let replier = history::reply::WhatsappReplier::new(
+        Arc::clone(&store),
+        augmentagent_channel_core::build_reasoner() as Arc<dyn Reasoner>,
+        broker,
+        wiki_root,
+    );
+    match replier.card_requested(&delta, chrono::Utc::now().timestamp_millis()).await? {
+        augmentagent_channel_imessage::Handled::Card { superseded } => {
+            println!("card posted for {} (superseded {superseded} older card(s))", delta.conversation.title)
+        }
+        other => println!("no card: {other:?}"),
+    }
     Ok(())
 }
 
