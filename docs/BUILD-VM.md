@@ -157,6 +157,30 @@ A `cargo`, `npm` or `npx` command with no explicit `timeout` gets
 call runs), passed as `build_timeout_secs` and capped at the tool maximum of
 900 s. Other commands default to 120 s. An explicit timeout is honoured.
 
+### Shared CI input capture (#1807)
+
+Shared CI runs each worker command through the existing descendant supervisor
+inside the guest. The controller retains its cleanup receipt under the guest's
+private `/root/ci-worker-control`, outside the worker's writable mounts. It
+requires a stopped supervisor and a valid receipt before capturing generated
+inputs. Detached children are stopped and reaped before capture. The host still
+requires its separate whole-VM quiescence and storage-settlement evidence.
+
+The controller starts a bounded write journal before launching that worker and
+records content/mode snapshots of declared generated directories and files.
+Restoring earlier bytes or timestamps does not hide an observed write. A bound
+journal cannot finish with another worker scope's cleanup receipt. Internal
+aliases may resolve only through declared namespaces; escaped, cyclic, special,
+lost-watch and overflowed observations remain typed prerequisites. Reads alone
+do not invalidate the observation.
+
+These observations are partial evidence. They do not establish complete compiler
+inputs inside build outputs, artifact provenance or compatible-unit invalidation.
+The current local-completion producer remains `preparation_only`, with
+`reusable_passing_proof: false`. A passing local command or input observation
+does not authorize merge; final proof publication and merge enforcement remain
+separate required work.
+
 ### Host provisioning: KVM access that survives logout (operator step)
 
 On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`
@@ -282,7 +306,7 @@ export JARVIS_TEST_VM_CONFIG="$HOME/.local/share/augmentagent/build-vm/runtime.j
 export JARVIS_TEST_BUILD_SCRATCH=/mnt/build/codex-vm   # an existing 0700 directory
 python3 scripts/tests/codex_build_vm_test.py
 python3 scripts/tests/codex_tool_bridge_test.py
-cargo test -p augmentagent-channel-core live_codex_builds_and_tests_with_the_vm_bridge --lib -- --ignored
+./scripts/cargo-managed.sh test -p augmentagent-channel-core live_codex_builds_and_tests_with_the_vm_bridge --lib -- --ignored
 ```
 
 The last command needs working Codex authentication and uses the daemon's default
