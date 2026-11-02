@@ -165,11 +165,15 @@ async fn conversation(
                         return Ok(());
                     }
                     send_action(&mut connection, coordinator.poll_delegations()?).await?;
+                    for event_id in coordinator.take_expired_replies() {connection.forget_commentary(&event_id);}
                     for result in coordinator.pending_results()? {
                         if coordinator.reply_pending(&result.delegation_id) {continue;}
                         let content=result.result.as_str();
-                        let event_id=connection.commentary(&result.delegation_id,content).await?;
-                        coordinator.track_reply(&event_id,&result.delegation_id)?;
+                        let delegation=(!coordinator.uses_session_context(&result.delegation_id)).then_some(result.delegation_id.as_str());
+                        let event=connection.prepare_commentary(delegation,content)?;
+                        let event_id=event["event_id"].as_str().ok_or(LiveError::Protocol)?;
+                        coordinator.track_reply(event_id,&result.delegation_id)?;
+                        connection.send_prepared(event).await?;
                         break; // Bound per-tick writes so result bursts cannot starve audio.
                     }
                 }
@@ -195,6 +199,14 @@ async fn conversation(
                         LiveInput::Audio(audio)=>{
                             playback.received_output(audio.len());
                             pending_audio = Some(audio.clone());
+                        }
+                        LiveInput::CommentaryRejected{client_event_id}=>{
+                            if let Some(result)=coordinator.rejected_delegation(client_event_id)? {
+                                let event=connection.prepare_commentary(None,&result.result)?;
+                                let event_id=event["event_id"].as_str().ok_or(LiveError::Protocol)?;
+                                coordinator.track_reply(event_id,&result.delegation_id)?;
+                                connection.send_prepared(event).await?;
+                            }
                         }
                         LiveInput::Closed{reason,seconds}=>{
                             trigger="provider_closed";

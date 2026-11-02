@@ -1931,6 +1931,9 @@ fn live_binding(tx: &Transaction<'_>, call_id: &str, session_id: &str) -> PhoneR
         _ => Err(PhoneError::Conflict),
     }
 }
+#[path = "phone_live_delivery.rs"]
+mod delivery;
+
 impl Store {
     /// Trusted ingress only, after callback verification and durable relay claim.
     pub fn phone_bind_live_session(&self, call_id: &str, session_id: &str) -> PhoneResult<()> {
@@ -2012,6 +2015,7 @@ impl Store {
                 "INSERT INTO phone_live_dispatches(call_id,delegation_id,task_id) VALUES(?1,?2,?3)",
                 params![call_id, delegation_id, task_id],
             )?;
+            tx.execute("INSERT INTO phone_live_result_receipts(call_id,delegation_id,disposition) VALUES(?1,?2,'pending')",params![call_id,delegation_id])?;
             Ok(task_id)
         })
     }
@@ -2024,7 +2028,7 @@ impl Store {
             if !live_binding(tx, call_id, session_id)? {
                 return Ok(Vec::new());
             }
-            let mut statement = tx.prepare("SELECT delegation_id,CASE WHEN length(CAST(result AS BLOB))>64000 THEN 'The task returned more detail than this voice session can carry. The full result is in our chat; ask for a specific part to discuss.' ELSE result END FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 AND result IS NOT NULL ORDER BY rowid LIMIT 128")?;
+            let mut statement = tx.prepare("SELECT delegation_id,CASE WHEN length(CAST(result AS BLOB))>64000 THEN 'The task returned more detail than this voice session can carry. The full result is in our chat; ask for a specific part to discuss.' ELSE result END FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 AND result IS NOT NULL AND NOT EXISTS(SELECT 1 FROM phone_live_result_receipts r WHERE r.call_id=phone_live_dispatches.call_id AND r.delegation_id=phone_live_dispatches.delegation_id AND r.disposition!='pending') ORDER BY rowid LIMIT 128")?;
             let rows = statement.query_map([call_id], |r| {
                 let mut result: String = r.get(1)?;
                 if result.trim().is_empty() { result = "The task returned no readable result.".into(); }
@@ -2046,6 +2050,7 @@ impl Store {
     ) -> PhoneResult<()> {
         transaction(self, |tx| {
             live_binding(tx, call_id, session_id)?;
+            tx.execute("INSERT INTO phone_live_result_receipts(call_id,delegation_id,disposition) VALUES(?1,?2,'accepted') ON CONFLICT(call_id,delegation_id) DO UPDATE SET disposition='accepted'",params![call_id,delegation_id])?;
             tx.execute("UPDATE phone_live_dispatches SET delivered=1,result=NULL WHERE call_id=?1 AND delegation_id=?2 AND result IS NOT NULL",params![call_id,delegation_id])?;
             Ok(())
         })
@@ -2057,6 +2062,8 @@ impl Store {
                 "UPDATE phone_live_sessions SET active=0 WHERE call_id=?1",
                 [call_id],
             )?;
+            tx.execute("INSERT INTO phone_live_result_receipts(call_id,delegation_id,disposition) SELECT call_id,delegation_id,'discarded' FROM phone_live_dispatches WHERE call_id=?1 AND delivered=0 ON CONFLICT(call_id,delegation_id) DO UPDATE SET disposition='discarded' WHERE disposition IN ('pending','sending')",[call_id])?;
+            tx.execute("UPDATE phone_live_reply_intents SET disposition='discarded' WHERE call_id=?1 AND disposition='sending'",[call_id])?;
             tx.execute(
                 "UPDATE phone_live_dispatches SET delivered=1,result=NULL WHERE call_id=?1",
                 [call_id],
@@ -2072,6 +2079,8 @@ impl Store {
     pub fn phone_reconcile_live_sessions(&self) -> PhoneResult<()> {
         transaction(self, |tx| {
             tx.execute("UPDATE phone_live_sessions SET active=0 WHERE active=1 AND call_id IN (SELECT id FROM phone_calls WHERE state!='connected' OR stop_requested=1 OR ended_ms IS NOT NULL)", [])?;
+            tx.execute("INSERT INTO phone_live_result_receipts(call_id,delegation_id,disposition) SELECT call_id,delegation_id,'discarded' FROM phone_live_dispatches WHERE delivered=0 AND call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0) ON CONFLICT(call_id,delegation_id) DO UPDATE SET disposition='discarded' WHERE disposition IN ('pending','sending')",[])?;
+            tx.execute("UPDATE phone_live_reply_intents SET disposition='discarded' WHERE disposition='sending' AND call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0)",[])?;
             tx.execute("UPDATE phone_live_dispatches SET delivered=1,result=NULL WHERE delivered=0 AND call_id IN (SELECT call_id FROM phone_live_sessions WHERE active=0)", [])?;
             Ok(())
         })

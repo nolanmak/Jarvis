@@ -264,3 +264,23 @@ CREATE TABLE IF NOT EXISTS phone_live_history_gaps (
 
 CREATE INDEX IF NOT EXISTS phone_live_transcripts_pending
 ON phone_live_transcripts(call_id) WHERE text IS NOT NULL;
+
+-- Voice publication evidence is independent from native completion and chat.
+-- Old delivered bits are deliberately not backfilled as provider acceptance.
+CREATE TABLE IF NOT EXISTS phone_live_result_receipts (
+    call_id TEXT NOT NULL,
+    delegation_id TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK(disposition IN ('pending','sending','accepted','timed_out','discarded')),
+    PRIMARY KEY(call_id,delegation_id),
+    FOREIGN KEY(call_id,delegation_id) REFERENCES phone_live_dispatches(call_id,delegation_id)
+);
+CREATE TABLE IF NOT EXISTS phone_live_reply_intents (
+    call_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    delegation_id TEXT NOT NULL,
+    end_offset INTEGER NOT NULL CHECK(end_offset>0),
+    complete INTEGER NOT NULL CHECK(complete IN (0,1)),
+    disposition TEXT NOT NULL CHECK(disposition IN ('sending','accepted','rejected','timed_out','discarded')),
+    PRIMARY KEY(call_id,event_id),
+    FOREIGN KEY(call_id,delegation_id) REFERENCES phone_live_dispatches(call_id,delegation_id)
+);

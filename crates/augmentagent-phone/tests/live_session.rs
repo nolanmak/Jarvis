@@ -229,3 +229,41 @@ fn invalid_timeline_and_nonclient_delegation_fail_closed() {
         assert_eq!(s.state(), LiveState::Failed);
     }
 }
+
+#[test]
+fn only_correlated_probed_delegation_rejection_can_keep_the_session_active() {
+    for mode in [
+        "recoverable",
+        "uncorrelated",
+        "unknown-code",
+        "wrong-param",
+        "auth",
+    ] {
+        let mut s = active();
+        s.receive(&json!({"type":"session.delegation.created","event_id":"delegated","offset_ms":1,"delegation":{"id":"del-synthetic","type":"delegation","target":"client"}}).to_string()).unwrap();
+        let sent = s
+            .commentary("del-synthetic", "Synthetic deadline Tuesday at 5 PM.")
+            .unwrap();
+        let mut error = json!({"type":"error","error":{"type":"invalid_request_error","code":null,"param":"delegation_id","client_event_id":sent["event_id"],"message":"Unknown client or Decision delegation."}});
+        match mode {
+            "uncorrelated" => error["error"]["client_event_id"] = json!("not-our-command"),
+            "unknown-code" => error["error"]["code"] = json!("private-unclassified-code"),
+            "wrong-param" => error["error"]["param"] = json!("private-secret-param"),
+            "auth" => error["error"]["type"] = json!("authentication_error"),
+            _ => {}
+        }
+        let result = s.receive(&error.to_string());
+        if matches!(mode, "recoverable" | "uncorrelated") {
+            assert!(
+                result.is_ok(),
+                "a definitively rejected reference must not destroy a usable session"
+            );
+            assert_eq!(s.state(), LiveState::Active);
+            assert!(s.audio(&[255; 160]).is_ok());
+        } else {
+            let e = result.err().expect("unproven recovery remains terminal");
+            assert_eq!(s.state(), LiveState::Failed);
+            assert!(!e.to_string().contains("private"));
+        }
+    }
+}

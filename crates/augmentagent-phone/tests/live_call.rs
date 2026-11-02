@@ -210,7 +210,9 @@ async fn only_correlated_provider_ack_releases_live_result() {
         client_event_id: "unrelated".into(),
     })
     .unwrap();
-    assert_eq!(call.pending_results().unwrap().len(), 1);
+    assert!(call.reply_pending("del-test"));
+    assert_eq!(f.store.phone_live_result_disposition(&f.id,"del-test").unwrap().as_deref(),Some("sending"));
+    assert!(call.pending_results().unwrap().is_empty(), "in-flight material is not eligible for another send");
     call.event(&LiveInput::CommentaryAccepted {
         client_event_id: "evt-reply".into(),
     })
@@ -454,7 +456,8 @@ async fn unicode_result_parts_require_each_ack_and_preserve_failures() {
         call.track_reply(&event,&part.delegation_id).unwrap();
         assert!(call.reply_pending(&part.delegation_id));
         call.event(&LiveInput::CommentaryAccepted {client_event_id:"wrong".into()}).unwrap();
-        assert_eq!(call.pending_results().unwrap()[0].result,part.result);
+        assert!(call.pending_results().unwrap().is_empty(), "wrong receipts cannot make in-flight material eligible to resend");
+        assert_eq!(f.store.phone_live_result_disposition(&f.id,&part.delegation_id).unwrap().as_deref(),Some("sending"));
         assert!(call.track_reply("overlap",&part.delegation_id).is_err());
         call.event(&LiveInput::CommentaryAccepted {client_event_id:event}).unwrap();
         assert!(!call.reply_pending(&part.delegation_id));
@@ -498,4 +501,63 @@ async fn late_word_fragments_settle_before_starting_a_task() {
     let jobs = f.store.phone_pending_dispatches().unwrap();
     assert_eq!(jobs.len(),1);
     assert!(jobs[0].description.contains("Check my calendar."));
+}
+
+/// A dropped provider receipt must end this publication, not lock the call's
+/// result cursor forever or replay an ambiguously transmitted piece.
+#[tokio::test(start_paused = true)]
+async fn missing_result_ack_expires_without_replay_and_next_question_still_dispatches() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    call.event(&transcript()).unwrap();
+    let LiveAction::Queued { task_id } = call.event(&delegation()).unwrap() else {
+        panic!("queue expected")
+    };
+    f.store
+        .phone_finish_dispatch(
+            &f.id,
+            &task_id,
+            &"Synthetic deadline is Tuesday at 5 PM. ".repeat(45),
+        )
+        .unwrap();
+    call.track_reply("evt-result", "del-test").unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    call.poll_delegations().unwrap();
+    assert!(
+        !call.reply_pending("del-test"),
+        "missing acknowledgment must settle within five seconds"
+    );
+    assert!(
+        call.pending_results().unwrap().is_empty(),
+        "ambiguous publication cannot replay its first piece or send an orphan continuation"
+    );
+    call.event(&LiveInput::CommentaryAccepted {
+        client_event_id: "evt-result".into(),
+    })
+    .unwrap();
+    assert!(
+        call.pending_results().unwrap().is_empty(),
+        "late acknowledgment must not restart abandoned speech"
+    );
+    call.event(&LiveInput::Transcript {
+        event_id: "follow-up".into(),
+        user: true,
+        text: "Check tomorrow too.".into(),
+        start_ms: 200.,
+        end_ms: 300.,
+    })
+    .unwrap();
+    assert!(matches!(
+        call.event(&LiveInput::Delegation {
+            id: "del-follow-up".into(),
+            offset_ms: 310.
+        })
+        .unwrap(),
+        LiveAction::Queued { .. }
+    ));
+    assert_eq!(
+        f.store.phone_pending_dispatches().unwrap().len(),
+        2,
+        "the original job is not replayed"
+    );
 }
