@@ -301,9 +301,11 @@ print(json.dumps({"cache":str(cache),"library_bytes":library.stat().st_size,"wri
     // not start a Rust build after failed confinement/dependency observation.
     let rust_build_attempted=onnx_probe_error.is_none();
     let observed=if let Some(error)=onnx_probe_error {Err(error)} else {async {
-        drop(source);let source=snapshot(&root,&before,&target).await?;
-        session.run("step",&source,&root,&before,Some(check),&[],&[],&[],None,
-            &storage,&target,&audit,check.remaining(std::time::Duration::ZERO)?).await
+        drop(source);
+        let seed=session.dependency_seed(&root,&before,&target,&storage,&audit).await?;
+        let source=snapshot(&root,&before,&target).await?;
+        session.run_with_dependency("step",&source,&root,&before,Some(check),&[],&[],&[],None,
+            &storage,&target,&audit,check.remaining(std::time::Duration::ZERO)?,seed.as_ref()).await
     }.await};
     let (status,stdout,stderr,error)=match observed {
         Ok(outcome)=>(outcome.status,outcome.stdout,outcome.stderr,None),
