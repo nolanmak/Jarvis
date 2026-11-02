@@ -11341,6 +11341,7 @@ impl AttemptRecord {
 /// charged; a failure `main` already has is handled by #931 instead.
 fn infra_failure_reason(text: &str) -> Option<&'static str> {
     const SIGNS: &[(&str, &str)] = &[
+        ("acceptance infrastructure unavailable", "acceptance verifier infrastructure"),
         ("shared ci prerequisite unavailable", "shared CI environment prerequisite"),
         ("storage busy:", "storage busy"),
         ("build storage busy; retry admission", "storage busy"),
