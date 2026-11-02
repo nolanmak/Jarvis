@@ -2659,6 +2659,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_emails_triage ON emails(triageResult);\
              CREATE INDEX IF NOT EXISTS idx_emails_seen ON emails(firstSeenAt);\
              CREATE INDEX IF NOT EXISTS idx_emails_platform ON emails(platform);\
+             CREATE INDEX IF NOT EXISTS idx_emails_pending_by_account ON emails(accountEntityId) WHERE platform='gmail' AND triageResult IS NULL;\
              CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode ON channel_subscriptions(active, mode);\
              CREATE INDEX IF NOT EXISTS idx_slack_workspaces_active ON slack_workspaces(active);\
              CREATE INDEX IF NOT EXISTS idx_drive_accounts_active ON drive_accounts(active);",

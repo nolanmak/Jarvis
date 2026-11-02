@@ -184,7 +184,11 @@ async fn conversation(
                     }
                     if !sent_result && pending_audio.is_none() && media.pending_bytes()==0 {
                         if let Some(notice)=coordinator.delay_notice()? {
-                            connection.commentary(&notice.delegation_id,&notice.result).await?;
+                            match connection.commentary(&notice.delegation_id,&notice.result).await {
+                                Ok(_) => {},
+                                Err(LiveError::Capacity) => tracing::warn!(call_id=%call.id,"phone progress skipped at context capacity; final result remains pending"),
+                                Err(error) => return Err(error),
+                            }
                         }
                     }
                 }
