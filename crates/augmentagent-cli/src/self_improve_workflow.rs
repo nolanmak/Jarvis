@@ -108,6 +108,19 @@ pub(super) struct CapacityAccounting {
     resumed: bool,
 }
 impl CapacityAccounting {
+    pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
+        let Err(error) = &outcome else { return outcome; };
+        let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
+        anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
+        let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
+            .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
+            && checkpoint.next.action == "retry_verification"
+            && checkpoint.next.eligible_at_ms == deferred.eligible_at_ms,
+            "CI deferral has no matching durable schedule");
+        self.retry_report(deferred.to_string())
+    }
+
     pub(super) fn retry_report(&self,message:String)->Result<RunReport> {
         let calls=self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
             .snapshot(&self.workflow)?.context("retry workflow missing")?.model_calls;
@@ -1494,6 +1507,19 @@ impl WorkflowGuard {
     /// Caller has waited for worker teardown. Stage/evidence must already be
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
+        if !self.released { self.release_after_teardown()?; }
+        Ok(())
+    }
+
+    pub(super) fn finish_ci_deferral(&mut self) -> Result<()> {
+        let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
+            .snapshot(self.id())?.context("retry workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
+            && checkpoint.next.action == "retry_verification", "no durable CI deferral to release");
+        self.release_after_teardown()
+    }
+
+    fn release_after_teardown(&mut self) -> Result<()> {
         self.audit.protected_health()?;
         self.healthy_lease()?;
         self.audit_event("workflow_released", serde_json::json!({}))?;
@@ -2732,6 +2758,69 @@ mod tests {
         }
         assert!(guard.bounded_native_calls("component".into(),2,async {guard.audit_logger().model_call_admitted("codex")}).await.is_err());
         assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,2);
+    }
+
+    #[tokio::test]
+    async fn ci_gate_consumption_defers_revisions_before_repair_and_preserves_paid_accounting() {
+        for stage in [Stage::Build, Stage::Review, Stage::Reconcile] {
+            for (infrastructure, already_paid) in [(true, false), (true, true), (false, false)] {
+                let dir = repo();
+                let state = control_dir();
+                let path = state.path().join("workflow.db");
+                let mut guard = WorkflowGuard::acquire_at(&path, Start {
+                    repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+                    source_issue: Some(77), pr: Some(88), branch: "fixture", contract: "C1",
+                    environment: "rust-a",
+                }, millis()).await.unwrap().unwrap();
+                guard.checkpoint(stage, "candidate_ready", "run_verifier", 0,
+                    &["protected-receipt".into()]).await.unwrap();
+                let accounting = guard.capacity_accounting(true).unwrap();
+                if already_paid { guard.audit_logger().model_call_admitted("codex").unwrap(); }
+                let before = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                let allowance = WorkflowStore::open(&path).unwrap().merge_allowance(millis(), 5).unwrap();
+                let mut repairs = 0;
+                let outcome: Result<RunReport> = async {
+                    let error = if infrastructure {
+                        anyhow::anyhow!("shared CI prerequisite unavailable: dependency network offline")
+                    } else {
+                        anyhow::anyhow!("error[E0308]: mismatched types")
+                    };
+                    if let Err(_code_error) = CiGateResult(Err(error)).for_workflow(&mut guard).await? {
+                        // This is the paid code-repair branch used after a gate.
+                        repairs += 1;
+                        guard.audit_logger().model_call_admitted("codex")?;
+                    }
+                    Ok(RunReport::built("code repaired".into()))
+                }.await;
+                let report = accounting.settle_ci(outcome).unwrap();
+                let after = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(repairs, usize::from(!infrastructure));
+                assert_eq!(after.model_calls, before.model_calls + u64::from(!infrastructure));
+                assert_eq!(after.checkpoint.stage, stage);
+                assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+                assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+                assert_eq!(after.progress_at_ms, before.progress_at_ms);
+                assert_eq!(after.attempts, before.attempts);
+                assert_eq!(WorkflowStore::open(&path).unwrap().merge_allowance(millis(), 5).unwrap(), allowance);
+                if infrastructure {
+                    assert_eq!(after.checkpoint.next.action, "retry_verification");
+                    assert!(after.checkpoint.next.eligible_at_ms > millis());
+                    assert_eq!(report.billed, already_paid);
+                    assert_eq!(report.is_idle(), !already_paid);
+                    assert!(report.resumed);
+                    assert!(after.lease_until_ms <= millis(), "CI retry still waits for the abandoned ten-minute lease");
+                    let eligible = after.checkpoint.next.eligible_at_ms;
+                    let mut store = WorkflowStore::open(&path).unwrap();
+                    assert!(store.claim_productive(guard.id(), "next-worker", eligible - 1, 60_000).unwrap().is_none());
+                    assert!(store.claim_productive(guard.id(), "next-worker", eligible, 60_000).unwrap().is_some(),
+                        "the persisted retry must run at five minutes, before the old ten-minute lease expires");
+                } else {
+                    assert_eq!(after.checkpoint.next, before.checkpoint.next);
+                    assert!(report.billed);
+                }
+                guard.finish().unwrap();
+            }
+        }
     }
 
     #[tokio::test]

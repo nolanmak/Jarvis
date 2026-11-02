@@ -238,6 +238,11 @@ pub(super) async fn resume(
     )
     .await;
     if let Some(report) = capacity_accounting.report()? { return Ok(report); }
+    if result.as_ref().is_err_and(|error| error.is::<CiInfrastructureDeferred>()) {
+        let report = capacity_accounting.settle_ci(result)?;
+        guard.finish()?;
+        return Ok(report);
+    }
     match result {
         Ok(report) => {
             guard.finish()?;
@@ -350,7 +355,7 @@ async fn execute(
             .iter()
             .map(|criterion| criterion.requirement.clone())
             .collect();
-        verification_gate(worktree, &guard.audit_logger()).await?;
+        verification_gate(worktree, &guard.audit_logger()).await.for_workflow(guard).await??;
         guard
             .transition(Stage::Review, "adopted_review", "collect_reviews", 0)
             .await?;
