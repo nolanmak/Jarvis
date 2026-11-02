@@ -288,6 +288,7 @@ print("SEALED")'"#;
         ensure!(tamper.status=="passed" && tamper.stdout.trim()=="SEALED","trusted seed confinement failed: {} {}",tamper.stdout,tamper.stderr);
     }
     ensure!(generations[0]!=generations[1],"source reconstruction reused generation");
+    drop(producer_source);
     // Leave one real external-only producer unpublished. A live source must
     // pin its payload; after that exact owner drops, ordinary admitted work
     // retires it without deleting the independent seed or installed links.
@@ -298,6 +299,7 @@ print("SEALED")'"#;
     let produced=session.run_with_dependency("dependency",&abandoned.source,repo,&binding,None,&[],&[],&[],None,
         &storage,&target,&audit,timeout,Some(&abandoned_action)).await?;
     ensure!(produced.status=="seed_produced","abandoned producer fixture did not execute");
+    ensure!(produced.producer_reclaimed.contains(&producer),"released published producer was not retired");
     let probe=snapshot(repo,&binding,&target).await?;
     let live=session.run("repository",&probe,repo,&binding,None,&[],&[],&[],Some("printf LIVE"),
         &storage,&target,&audit,timeout).await?;
@@ -311,6 +313,7 @@ print("SEALED")'"#;
         if outcome.producer_reclaimed.contains(&abandoned_id) {retired=true;break;}
     }
     ensure!(retired,"inactive producer payload was not retired through ordinary admitted work");
+    drop(probe);
     let after_retirement=session.dependency_seed(repo,&binding,&target,&storage,&audit).await?
         .context("producer retirement removed the independent published seed")?;
     ensure!(after_retirement==install,"producer retirement changed trusted seed lookup");
