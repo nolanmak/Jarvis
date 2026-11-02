@@ -735,7 +735,7 @@ mod tests {
     use super::*;
 
     fn item(name: &str, age_hours: f64) -> Item {
-        Item { name: name.into(), age_hours, bytes: 1 }
+        Item { name: name.into(), age_hours, bytes: 1, source: None }
     }
 
     #[test]
@@ -1179,14 +1179,394 @@ mod tests {
         assert!(text.contains("kept: pinned: snapshot"), "{text}");
     }
 
+    // ---------------------------------------------------------------------
+    // Budget eviction (budget beats age; protections beat budget; keep per
+    // source database).
+    // ---------------------------------------------------------------------
+
+    const MB: u64 = 1024 * 1024;
+
+    fn src(name: &str, age_hours: f64, bytes: u64, source: Option<&str>) -> Item {
+        Item { name: name.into(), age_hours, bytes, source: source.map(str::to_owned) }
+    }
+
+    fn no_protection(_: &str) -> Option<String> { None }
+
+    fn names(v: &[(String, u64)]) -> Vec<&str> { v.iter().map(|(n, _)| n.as_str()).collect() }
+
+    #[test]
+    fn planner_evicts_oldest_first_exactly_until_it_fits_ignoring_age() {
+        let items = [src("a", 30.0, 10, Some("/db")), src("b", 20.0, 10, Some("/db")),
+            src("c", 10.0, 10, Some("/db")), src("d", 5.0, 10, Some("/db")), src("e", 1.0, 10, Some("/db"))];
+        let slots = keep_slots(&items, 2, &|_| false);
+        // 50 retained, budget 35, nothing incoming: two oldest go, all < 48 h.
+        let plan = plan_budget(&items, &slots, &no_protection, &[], 35, 0);
+        assert!(plan.fits);
+        assert_eq!(names(&plan.evict), ["a", "b"]);
+        assert_eq!(plan.after, 30);
+        // With 10 incoming one more goes, never a keep slot.
+        let plan = plan_budget(&items, &slots, &no_protection, &[], 35, 10);
+        assert_eq!(names(&plan.evict), ["a", "b", "c"]);
+        // Under budget nothing is touched.
+        let plan = plan_budget(&items, &slots, &no_protection, &[], 50, 0);
+        assert!(plan.fits && plan.evict.is_empty() && plan.blockers.is_empty());
+    }
+
+    #[test]
+    fn planner_skips_protected_and_takes_the_next_oldest() {
+        let items = [src("pinned", 90.0, 10, Some("/db")), src("ref", 80.0, 10, Some("/db")),
+            src("free", 70.0, 10, Some("/db")), src("n1", 2.0, 10, Some("/db")), src("n2", 1.0, 10, Some("/db"))];
+        let slots = keep_slots(&items, 2, &|_| false);
+        let protect = |n: &str| match n { "pinned" => Some("pinned".into()), "ref" => Some("referenced".into()), _ => None };
+        let plan = plan_budget(&items, &slots, &protect, &[], 40, 0);
+        assert!(plan.fits);
+        assert_eq!(names(&plan.evict), ["free"]);
+    }
+
+    #[test]
+    fn planner_evicts_nothing_when_eviction_cannot_reach_the_budget_and_names_every_blocker() {
+        let items = [src("pinned", 90.0, 30, Some("/db")), src("free", 70.0, 5, Some("/db")),
+            src("n1", 2.0, 10, Some("/db")), src("n2", 1.0, 10, None)];
+        let slots = keep_slots(&items, 1, &|_| false);
+        let protect = |n: &str| (n == "pinned").then(|| "pinned".to_string());
+        let fixed = [("evidence".to_string(), "forensic evidence".to_string(), 1)];
+        let plan = plan_budget(&items, &slots, &protect, &fixed, 40, 0);
+        assert!(!plan.fits);
+        assert!(plan.evict.is_empty(), "no point deleting a rollback that cannot make room");
+        assert_eq!(plan.after, 56);
+        let blockers: Vec<(&str, &str)> = plan.blockers.iter().map(|(n, r, _)| (n.as_str(), r.as_str())).collect();
+        assert!(blockers.contains(&("pinned", "pinned")), "{blockers:?}");
+        assert!(blockers.contains(&("n1", "newest for its database")), "{blockers:?}");
+        assert!(blockers.contains(&("n2", "newest legacy snapshot")), "{blockers:?}");
+        assert!(blockers.contains(&("evidence", "forensic evidence")), "{blockers:?}");
+        assert!(!blockers.iter().any(|(n, _)| *n == "free"), "evictable items are not blockers");
+    }
+
+    #[test]
+    fn a_protected_keep_slot_is_labelled_by_its_protection() {
+        let items = [src("new", 1.0, 50, Some("/db"))];
+        let slots = keep_slots(&items, 2, &|_| false);
+        let plan = plan_budget(&items, &slots, &|_| Some("pinned".into()), &[], 10, 0);
+        assert_eq!(plan.blockers[0].1, "pinned");
+    }
+
+    #[test]
+    fn keep_zero_still_keeps_the_newest_of_each_database() {
+        let items = [src("old", 9.0, 10, Some("/db")), src("new", 1.0, 10, Some("/db"))];
+        let slots = keep_slots(&items, 0, &|_| false);
+        assert!(slots.contains("new") && !slots.contains("old"));
+    }
+
+    #[test]
+    fn a_small_database_never_takes_the_main_databases_keep_slots() {
+        let items = [src("main-old", 50.0, 10, Some("/data.db")), src("main", 10.0, 10, Some("/data.db")),
+            src("wf-1", 3.0, 1, Some("/wf.db")), src("wf-2", 2.0, 1, Some("/wf.db")), src("wf-3", 1.0, 1, Some("/wf.db"))];
+        let slots = keep_slots(&items, 2, &|_| false);
+        for n in ["main-old", "main", "wf-2", "wf-3"] { assert!(slots.contains(n), "{n}: {slots:?}"); }
+        assert!(!slots.contains("wf-1"));
+        // The age rule groups the same way.
+        let aged_items = [src("main-old", 500.0, 10, Some("/data.db")), src("main", 400.0, 10, Some("/data.db")),
+            src("wf-1", 300.0, 1, Some("/wf.db")), src("wf-2", 200.0, 1, Some("/wf.db")), src("wf-3", 100.0, 1, Some("/wf.db"))];
+        assert_eq!(select_expired(&aged_items, 2, 48.0), ["wf-1"]);
+    }
+
+    #[test]
+    fn the_legacy_group_retires_once_enough_newer_tagged_snapshots_exist() {
+        let legacy = [src("l-old", 30.0, 10, None), src("l-new", 20.0, 10, None)];
+        let one_tagged: Vec<Item> = legacy.iter().cloned().chain([src("t1", 2.0, 10, Some("/db"))]).collect();
+        let retired = legacy_retired(&one_tagged, 2);
+        assert!(!retired, "one tagged snapshot is not yet `keep` rollout anchors");
+        let two_tagged: Vec<Item> = one_tagged.iter().cloned().chain([src("t2", 1.0, 10, Some("/db"))]).collect();
+        assert!(legacy_retired(&two_tagged, 2));
+        let slots = keep_slots(&two_tagged, 2, &|g| g.is_none());
+        assert!(!slots.contains("l-new") && !slots.contains("l-old"));
+        // Tagged snapshots OLDER than the newest legacy one don't count.
+        let older_tagged = [src("t-old1", 40.0, 1, Some("/db")), src("t-old2", 35.0, 1, Some("/db")), src("l", 20.0, 1, None)];
+        assert!(!legacy_retired(&older_tagged, 2));
+    }
+
+    #[test]
+    fn a_group_whose_database_is_gone_retires() {
+        let t = tempfile::tempdir().unwrap();
+        let live = t.path().join("live.db"); std::fs::write(&live, b"x").unwrap();
+        let gone = t.path().join("gone.db");
+        let items = [src("live", 5.0, 1, Some(live.to_str().unwrap())), src("gone", 1.0, 1, Some(gone.to_str().unwrap()))];
+        let retired = group_retirement(&items, 2);
+        let slots = keep_slots(&items, 2, &retired);
+        assert!(slots.contains("live") && !slots.contains("gone"));
+    }
+
+    #[test]
+    fn rollback_binaries_keep_their_single_group_behaviour() {
+        let items = [item("augmentagent.a", 300.0), item("augmentagent.b", 200.0), item("augmentagent.c", 100.0)];
+        assert_eq!(select_expired(&items, 2, 48.0), ["augmentagent.a"]);
+    }
+
+    /// A rollback snapshot fixture: `bytes` of payload, a manifest with
+    /// `source_db` when given, aged by `hours`.
+    fn fixture(root: &Path, name: &str, hours: f64, bytes: usize, source: Option<&str>) -> PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join(DB_NAME), vec![7u8; bytes]).unwrap();
+        let mut m = serde_json::json!({"owner":"augmentagent-snapshot-v1","created_at":"2026-01-01T00:00:00Z",
+            "db_bytes": bytes * 3, "db_gz_bytes": bytes, "kind":"rollback","restorable":true});
+        if let Some(s) = source { m["source_db"] = s.into(); }
+        std::fs::write(p.join(MANIFEST_NAME), serde_json::to_vec(&m).unwrap()).unwrap();
+        aged(&p, hours);
+        p
+    }
+
+    fn reliable() -> crate::snapshot_refs::References {
+        crate::snapshot_refs::References { reliable: true, ..Default::default() }
+    }
+
+    fn budgeted(keep: usize, budget: u64, dry_run: bool) -> PruneOptions {
+        PruneOptions { keep, budget_bytes: Some(budget), dry_run, ..Default::default() }
+    }
+
+    #[test]
+    fn scheduled_prune_evicts_young_snapshots_oldest_first_down_to_the_budget() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path();
+        let db = root.join("source.db"); std::fs::write(&db, b"x").unwrap();
+        let s = db.to_str().unwrap();
+        for (n, h) in [("s1", 40.0), ("s2", 30.0), ("s3", 20.0), ("s4", 10.0), ("s5", 1.0)] { fixture(root, n, h, MB as usize, Some(s)); }
+        let total: u64 = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).sum();
+        let one = total / 5;
+        // Room for three: the two oldest go although every one is < 48 h.
+        let budget = 3 * one + one / 2;
+        let dry = prune_locked(root, None, &[], &budgeted(2, budget, true), SystemTime::now(), &reliable());
+        let real = prune_locked(root, None, &[], &budgeted(2, budget, false), SystemTime::now(), &reliable());
+        assert!(!root.join("s1").exists() && !root.join("s2").exists());
+        for n in ["s3", "s4", "s5"] { assert!(root.join(n).exists(), "{n}"); }
+        let reasons: Vec<&str> = real.iter().map(|r| r.reason.as_str()).collect();
+        assert_eq!(reasons, ["removed: over budget, oldest first"; 2], "{real:?}");
+        let dry_view: Vec<(String, String)> = dry.iter().map(|r| (r.path.clone(), r.reason.replacen("would remove", "removed", 1))).collect();
+        let real_view: Vec<(String, String)> = real.iter().map(|r| (r.path.clone(), r.reason.clone())).collect();
+        assert_eq!(dry_view, real_view, "dry-run plans exactly what the real run does");
+        let after: u64 = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).sum();
+        assert!(after <= budget);
+    }
+
+    #[test]
+    fn under_budget_nothing_young_is_removed() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path();
+        for (n, h) in [("a", 40.0), ("b", 30.0), ("c", 1.0)] { fixture(root, n, h, 1024, Some("/db")); }
+        let out = prune_locked(root, None, &[], &budgeted(1, u64::MAX, false), SystemTime::now(), &reliable());
+        assert!(out.is_empty(), "{out:?}");
+        for n in ["a", "b", "c"] { assert!(root.join(n).exists()); }
+    }
+
+    #[test]
+    fn dry_run_counts_age_rule_removals_as_gone_before_planning_the_budget() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path();
+        for (n, h) in [("ancient", 400.0), ("young-old", 30.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        let one: u64 = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).max().unwrap();
+        // After the age rule takes `ancient`, three remain; budget fits two
+        // plus slack, so exactly `young-old` goes for the budget.
+        let budget = 2 * one + one / 2;
+        let dry = prune_locked(root, None, &[], &budgeted(2, budget, true), SystemTime::now(), &reliable());
+        let view: Vec<(&str, &str)> = dry.iter().map(|r| (r.path.rsplit('/').next().unwrap(), r.reason.as_str())).collect();
+        assert_eq!(view, [("ancient", "would remove: past count and minimum age"), ("young-old", "would remove: over budget, oldest first")]);
+        assert!(root.join("ancient").exists() && root.join("young-old").exists());
+    }
+
+    #[test]
+    fn each_protection_survives_budget_eviction_and_the_next_oldest_goes() {
+        for class in ["pinned", "referenced", "unavailable"] {
+            let t = tempfile::tempdir().unwrap(); let root = t.path();
+            for (n, h) in [("guarded", 40.0), ("free", 30.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+            let one: u64 = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).max().unwrap();
+            let mut refs = reliable();
+            match class {
+                "pinned" => { std::fs::write(root.join("guarded/.pin"), "keep").unwrap(); aged(&root.join("guarded"), 40.0); }
+                "referenced" => refs.config = format!("ExecStart={}/augmentagent", root.join("guarded").display()),
+                _ => {}
+            }
+            if class == "unavailable" {
+                // An unreliable probe protects every unpinned snapshot: nothing is evictable.
+                refs = crate::snapshot_refs::References { reliable: false, unavailable: Some("pid 9 x: exe Other".into()), ..Default::default() };
+                let out = prune_locked(root, None, &[], &budgeted(2, 3 * one + one / 2, false), SystemTime::now(), &refs);
+                for n in ["guarded", "free", "n1", "n2"] { assert!(root.join(n).exists(), "{class} {n}"); }
+                assert!(out.iter().any(|r| r.kind == "budget"), "{out:?}");
+                continue;
+            }
+            prune_locked(root, None, &[], &budgeted(2, 3 * one + one / 2, false), SystemTime::now(), &refs);
+            assert!(root.join("guarded").exists(), "{class}");
+            assert!(!root.join("free").exists(), "{class}");
+        }
+    }
+
+    #[test]
+    fn when_nothing_can_make_room_prune_names_each_blocker_once_and_summarises() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path();
+        for (n, h) in [("pinned-old", 400.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        std::fs::write(root.join("pinned-old/.pin"), "keep").unwrap(); aged(&root.join("pinned-old"), 400.0);
+        let out = prune_locked(root, None, &[], &budgeted(2, MB, false), SystemTime::now(), &reliable());
+        for n in ["pinned-old", "n1", "n2"] { assert!(root.join(n).exists()); }
+        let kept: Vec<(&str, &str)> = out.iter().filter(|r| r.reason.starts_with("kept:"))
+            .map(|r| (r.path.rsplit('/').next().unwrap(), r.reason.as_str())).collect();
+        assert_eq!(kept.len(), 3, "one per blocker, no duplicate of the age-rule line: {out:?}");
+        assert!(kept.contains(&("pinned-old", "kept: pinned")));
+        assert!(kept.contains(&("n1", "kept: newest for its database")));
+        let summary: Vec<_> = out.iter().filter(|r| r.kind == "budget").collect();
+        assert_eq!(summary.len(), 1);
+        assert!(summary[0].reason.starts_with("over budget: ") && summary[0].reason.contains("nothing evictable"), "{}", summary[0].reason);
+        assert_eq!(summary[0].bytes, snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>());
+    }
+
+    #[test]
+    fn forensic_and_adopted_bytes_count_but_forensic_is_never_evicted() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path();
+        let ev = root.join("evidence"); std::fs::create_dir(&ev).unwrap();
+        std::fs::write(ev.join(FORENSIC_DB_NAME), vec![1u8; 2 * MB as usize]).unwrap();
+        std::fs::write(ev.join(MANIFEST_NAME), serde_json::to_vec(&serde_json::json!({"created_at":"2026-01-01T00:00:00Z","db_bytes":1,"kind":"forensic-page-image","restorable":false})).unwrap()).unwrap();
+        aged(&ev, 500.0);
+        for (n, h) in [("r-old", 30.0), ("n1", 2.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        // Unpinned evidence older than everything: the budget still must not take it.
+        let out = prune_locked(root, None, &[], &budgeted(1, 3 * MB + MB / 2, false), SystemTime::now(), &reliable());
+        assert!(ev.exists(), "{out:?}");
+        assert!(!root.join("r-old").exists(), "the rollback goes instead: {out:?}");
+    }
+
+    #[test]
+    fn creation_evicts_young_snapshots_instead_of_refusing() {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("data.db"); seeded_db(&db, 2000);
+        let root = t.path().join("snaps");
+        let canonical = std::fs::canonicalize(&db).unwrap().display().to_string();
+        let first = snapshot_with(&db, None, &root, "first", now(), SnapshotLimits { budget_bytes: u64::MAX, reserve_gb: 0.0 }, &reliable).unwrap();
+        let one = crate::disk::disk_bytes(&first);
+        for (n, h) in [("young-a", 20.0), ("young-b", 10.0)] { fixture(&root, n, h, one as usize, Some(&canonical)); }
+        aged(&first, 30.0);
+        // Room for three snapshots: the oldest (`first`, 30 h) must go.
+        let budget = 3 * one + one / 2;
+        let dir = snapshot_with(&db, None, &root, "new", now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, &reliable).unwrap();
+        assert!(dir.exists() && !first.exists());
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_NAME)).unwrap()).unwrap();
+        assert_eq!(m["source_db"], canonical.as_str());
+        let total: u64 = snapshot_items(&root, SystemTime::now()).iter().map(|i| i.bytes).sum();
+        assert!(total <= budget, "{total} > {budget}");
+    }
+
+    #[test]
+    fn creation_refuses_with_zero_deletions_when_history_says_it_cannot_fit() {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("data.db"); seeded_db(&db, 2000);
+        let root = t.path().join("snaps");
+        let canonical = std::fs::canonicalize(&db).unwrap().display().to_string();
+        let a = fixture(&root, "pinned", 20.0, 200_000, Some(&canonical));
+        std::fs::write(a.join(".pin"), "owner").unwrap(); aged(&a, 20.0);
+        fixture(&root, "newest", 1.0, 200_000, Some(&canonical));
+        let before: Vec<_> = { let mut v: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect(); v.sort(); v };
+        let err = snapshot_with(&db, None, &root, "x", now(), SnapshotLimits { budget_bytes: 450_000, reserve_gb: 0.0 }, &reliable).unwrap_err().to_string();
+        assert!(err.starts_with("snapshot storage budget exhausted"), "{err}");
+        let after: Vec<_> = { let mut v: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect(); v.sort(); v };
+        assert_eq!(before, after, "nothing deleted, nothing half-written");
+    }
+
+    #[test]
+    fn the_history_estimate_admits_what_the_raw_estimate_would_refuse() {
+        // Raw estimate (uncompressed db) exceeds the budget; the snapshot
+        // itself, like its predecessor, compresses far below it.
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("data.db"); seeded_db(&db, 4000);
+        let raw = std::fs::metadata(&db).unwrap().len();
+        let root = t.path().join("snaps");
+        let first = snapshot_with(&db, None, &root, "first", now(), SnapshotLimits { budget_bytes: u64::MAX, reserve_gb: 0.0 }, &reliable).unwrap();
+        let one = crate::disk::disk_bytes(&first);
+        assert!(raw > 3 * one, "fixture must compress well: raw {raw}, snapshot {one}");
+        let budget = 2 * one + one / 2;
+        assert!(one + raw > budget);
+        snapshot_with(&db, None, &root, "second", now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, &reliable).unwrap();
+        // A legacy snapshot of a same-size database also informs the estimate.
+        let t2 = tempfile::tempdir().unwrap();
+        let root2 = t2.path().join("snaps");
+        let legacy = root2.join("legacy"); std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(DB_NAME), vec![0u8; one as usize]).unwrap();
+        std::fs::write(legacy.join(MANIFEST_NAME), serde_json::to_vec(&serde_json::json!({"created_at":"2026-01-01T00:00:00Z","db_bytes": raw, "db_gz_bytes": one})).unwrap()).unwrap();
+        aged(&legacy, 1.0);
+        snapshot_with(&db, None, &root2, "after-legacy", now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, &reliable).unwrap();
+    }
+
+    #[test]
+    fn a_fallback_estimate_that_fits_once_compressed_still_succeeds() {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("data.db"); seeded_db(&db, 4000);
+        let raw = std::fs::metadata(&db).unwrap().len();
+        let root = t.path().join("snaps");
+        // No history at all: the raw estimate does not fit, the real one does.
+        let dir = snapshot_with(&db, None, &root, "only", now(), SnapshotLimits { budget_bytes: raw / 2, reserve_gb: 0.0 }, &reliable).unwrap();
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn an_impossible_exact_fit_removes_the_new_dir_and_deletes_nothing_else() {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("data.db"); seeded_db(&db, 4000);
+        let root = t.path().join("snaps");
+        let p = fixture(&root, "pinned", 5.0, 10, Some("/elsewhere"));
+        std::fs::write(p.join(".pin"), "owner").unwrap();
+        let err = snapshot_with(&db, None, &root, "x", now(), SnapshotLimits { budget_bytes: 1, reserve_gb: 0.0 }, &reliable).unwrap_err().to_string();
+        assert!(err.starts_with("snapshot storage budget exhausted"), "{err}");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(p.exists());
+    }
+
+    #[test]
+    fn forensic_capture_may_evict_old_rollbacks_but_records_no_source() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source.db"); drop(forensic_source(&source, false));
+        let root = t.path().join("snapshots");
+        for (n, h) in [("r-old", 30.0), ("r1", 2.0), ("r2", 1.0)] { fixture(&root, n, h, 200_000, Some("/db")); }
+        let budget = snapshot_items(&root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>() + 50_000;
+        let dir = snapshot_with_mode(&source, None, &root, "evidence", None, now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, true, None, &reliable).unwrap();
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_NAME)).unwrap()).unwrap();
+        assert!(m.get("source_db").is_none());
+        assert!(dir.join(".pin").exists());
+        assert!(!root.join("r-old").exists(), "evicted to make room for evidence");
+        assert!(root.join("r1").exists() && root.join("r2").exists(), "keep slots hold");
+    }
+
+    #[test]
+    fn the_refusal_names_blockers_hints_per_reason_and_never_names_the_cap() {
+        let plan = BudgetPlan { budget: 8 * MB, incoming: MB, before: 9 * MB, after: 9 * MB, fits: false, evict: vec![],
+            blockers: vec![("pre-1".into(), "pinned".into(), 4 * MB), ("n1".into(), "newest for its database".into(), 5 * MB)] };
+        let msg = budget_refusal(&plan, &reliable());
+        assert!(msg.starts_with("snapshot storage budget exhausted"), "{msg}");
+        assert!(msg.contains("pre-1 (pinned") && msg.contains("n1 (newest for its database"), "{msg}");
+        assert!(msg.contains("augmentagent deploy unpin NAME"), "{msg}");
+        assert!(msg.contains("age out of their slots"), "{msg}");
+        assert!(!msg.contains("running process"), "no hint for an absent reason: {msg}");
+        assert!(msg.ends_with("Agents: report this to the owner; do not unpin, delete snapshots, or override storage limits."), "{msg}");
+        assert!(!msg.contains("AUGMENTAGENT_DEPLOY_MAX_GB"), "{msg}");
+        let only_newest = BudgetPlan { blockers: vec![("n1".into(), "newest for its database".into(), 5 * MB)], ..plan.clone() };
+        assert!(!budget_refusal(&only_newest, &reliable()).contains("deploy unpin"));
+        let many = BudgetPlan { blockers: (0..8).map(|i| (format!("p{i}"), "pinned".into(), MB)).collect(), ..plan };
+        assert!(budget_refusal(&many, &reliable()).contains("+3 more"));
+    }
+
     #[test]
     fn budget_refusal_says_why_retention_was_blocked() {
-        let reliable = crate::snapshot_refs::References { reliable: true, ..Default::default() };
-        assert!(!budget_refusal(&reliable).contains("retention blocked"));
+        let plan = BudgetPlan { budget: 1, incoming: 1, before: 1, after: 1, fits: false, evict: vec![], blockers: vec![] };
+        assert!(!budget_refusal(&plan, &reliable()).contains("retention blocked"));
         let blocked = crate::snapshot_refs::References { reliable: false,
             unavailable: Some("systemctl --user cat augmentagent.service failed".into()), ..Default::default() };
-        let msg = budget_refusal(&blocked);
+        let msg = budget_refusal(&plan, &blocked);
         assert!(msg.starts_with("snapshot storage budget exhausted"), "{msg}");
         assert!(msg.contains("retention blocked: reference probe unavailable (systemctl --user cat augmentagent.service failed)"), "{msg}");
+    }
+
+    #[test]
+    fn budget_status_reports_only_a_root_that_cannot_be_brought_under_budget() {
+        let t = tempfile::tempdir().unwrap(); let root = t.path();
+        assert!(budget_status_with(&root.join("missing"), MB, &reliable()).is_none());
+        for (n, h) in [("old", 30.0), ("n1", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        // Evicting `old` fits: nothing to report.
+        assert!(budget_status_with(root, MB + MB / 2, &reliable()).is_none());
+        std::fs::write(root.join("old/.pin"), "owner").unwrap(); aged(&root.join("old"), 30.0);
+        let status = budget_status_with(root, MB + MB / 2, &reliable()).unwrap();
+        assert!(status.after_bytes > status.budget_bytes);
+        assert!(status.blockers.iter().any(|(n, r, _)| n == "old" && r == "pinned"), "{status:?}");
+        assert!(root.join("old").exists() && root.join("n1").exists(), "read-only");
     }
 }
