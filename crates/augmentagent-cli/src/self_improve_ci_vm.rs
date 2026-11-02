@@ -61,6 +61,12 @@ struct Completion {
     source: std::sync::Weak<()>,
     quiescence_sha256:String,
     producer:Option<String>,
+    retirement:Option<ProducerRetirement>,
+}
+#[derive(Clone,Serialize)]
+struct ProducerRetirement {
+    producer:String,
+    ack:serde_json::Value,
 }
 pub(super) struct DependencySource {
     pub source:verifier_checkout::OwnedCheckout,
@@ -188,6 +194,8 @@ pub(super) struct Outcome {
     #[serde(default)]
     pub cache_reclaimed: Vec<String>,
     #[serde(default)]
+    pub producer_reclaimed: Vec<String>,
+    #[serde(default)]
     pub dependency_result: Option<serde_json::Value>,
     #[serde(default)]
     source_kind:Option<String>,
@@ -303,7 +311,7 @@ impl Outcome {
                 .expect("bounded freshness protocol serializes");
         }
         if let Some(value)=&self.guest_diagnostic {
-            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command")).unwrap_or("unknown");
+            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command")).unwrap_or("unknown");
             let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
             diagnostic["guest"]=serde_json::json!({"stage":stage,"category":category,
                 "errno":value["errno"].as_i64().filter(|value|(0..=4096).contains(value))});
@@ -532,9 +540,28 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
         // Dead source owners cannot pin completed job artifacts. Durable
         // storage holds independently fence unknown live descendants.
-        completed.retain(|_,completion|completion.source.strong_count()>0);
-        Ok((completed.get(generation).map(|value|value.command.clone()),completed.keys().cloned()
+        completed.retain(|_,completion|completion.source.strong_count()>0 || completion.retirement.is_some());
+        Ok((completed.get(generation).filter(|value|value.source.strong_count()>0).map(|value|value.command.clone()),completed.iter()
+            .filter(|(_,value)|value.source.strong_count()>0).map(|(key,_)|key.clone())
             .chain(std::iter::once(generation.to_owned())).collect()))
+    }
+
+    fn retained_producers(&self,action:Option<&serde_json::Value>)->Result<BTreeSet<String>> {
+        let completed=self.completed_generations.lock()
+            .map_err(|_|anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
+        let mut retained:BTreeSet<String>=completed.values().filter(|record|record.source.strong_count()>0)
+            .filter_map(|record|record.retirement.as_ref().map(|value|value.producer.clone()).or_else(||record.producer.clone())).collect();
+        if let Some(action)=action.filter(|action|matches!(action["kind"].as_str(),Some("produce"|"publish"))) {
+            retained.insert(action["producer"].as_str().context("shared CI prerequisite unavailable: producer missing")?.to_owned());
+        }
+        Ok(retained)
+    }
+
+    fn producer_retirements(&self)->Result<Vec<ProducerRetirement>> {
+        let completed=self.completed_generations.lock()
+            .map_err(|_|anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
+        Ok(completed.values().filter(|value|value.source.strong_count()==0)
+            .filter_map(|value|value.retirement.clone()).collect())
     }
 
     pub(super) fn prepare(root: &Path, target: &Path) -> Result<Self> {
@@ -666,6 +693,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         let source = source.path();
         let command_id = uuid::Uuid::new_v4().to_string();
         let (predecessor,retained_generations)=self.cache_state(&generation)?;
+        let retained_producers=self.retained_producers(dependency)?;
+        let producer_retirements=self.producer_retirements()?;
         let files = storage.inherited_files()?;
         let fd = files.first().context("CI storage lease unavailable")?;
         let meta = fd.metadata()?;
@@ -683,6 +712,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         let request = serde_json::json!({"version":2,"operation":operation,
             "source_generation":generation,"command_id":command_id,"predecessor":predecessor,
             "retained_generations":retained_generations,
+            "retained_producers":retained_producers,
+            "producer_retirements":producer_retirements,
             "tree":binding.index_tree,"controller_authority_sha256":self.authority_sha256,
             "runtime_config":self.directory.as_ref().expect("owned CI session").path().join("runtime.json"),"workspace":source,
             "state":self.directory.as_ref().expect("owned CI session").path().join("state"),"git_objects":objects,
@@ -781,15 +812,28 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             self.validate_runtime(outcome.status=="failed")?;
         }
         if outcome.cache_reclaimed.len()>2 || outcome.cache_reclaimed.iter().any(|value|
-            uuid::Uuid::parse_str(value).is_err() || retained_generations.contains(value)) {
+            uuid::Uuid::parse_str(value).is_err() || retained_generations.contains(value))
+            || outcome.producer_reclaimed.len()>2 || outcome.producer_reclaimed.iter().any(|value|
+                uuid::Uuid::parse_str(value).is_err() || retained_producers.contains(value))
+            || outcome.producer_reclaimed.iter().collect::<BTreeSet<_>>().len()!=outcome.producer_reclaimed.len() {
             return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
                 "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
-                "evidence_sha256":digest(&serde_json::to_vec(&outcome.cache_reclaimed)?)})).into());
+                "evidence_sha256":digest(&serde_json::to_vec(&(&outcome.cache_reclaimed,&outcome.producer_reclaimed))?)})).into());
         }
         ensure!(
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published" | "seed_lookup"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
+        if !outcome.producer_reclaimed.is_empty() {
+            audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_producers_reclaimed","version":1,
+                "binding":binding,"command":command_id,"producer_ids":outcome.producer_reclaimed,
+                "protected_producers":retained_producers,"physical_cache_sha256":self.cache_identity()?,
+                "quiescence_receipt_sha256":quiescence_sha256,"shipping_authority":false}))?;
+            self.completed_generations.lock()
+                .map_err(|_|anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
+                .retain(|_,value|value.source.strong_count()>0 || !value.retirement.as_ref()
+                    .is_some_and(|record|outcome.producer_reclaimed.contains(&record.producer)));
+        }
         if matches!(operation,"step"|"targeted"|"baseline"|"repository") {
             let invocation=match operation {
                 "step"=>proof::Invocation::Step {check:check.context("shared CI prerequisite unavailable: check identity missing")?.id.clone()},
@@ -820,11 +864,15 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         if operation != "plan" && matches!(outcome.status.as_str(),"passed"|"seed_produced"|"seed_published") {
             // Published only after kernel quiescence, storage settlement and
             // receipt validation. A dropped/failed invocation cannot mint it.
-            self.completed_generations.lock()
-                .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
-                .insert(generation, Completion {command:command_id,source:source_lifetime,quiescence_sha256,
-                    producer:outcome.dependency_result.as_ref().filter(|value|value["kind"]=="produced")
-                        .and_then(|value|value["producer"].as_str()).map(str::to_owned)});
+            let producer=outcome.dependency_result.as_ref().filter(|value|value["kind"]=="produced")
+                .and_then(|value|value["producer"].as_str()).map(str::to_owned);
+            let produced=producer.as_ref().map(|producer|Ok::<_,anyhow::Error>(ProducerRetirement {producer:producer.clone(),
+                ack:serde_json::json!({"command":command_id,"authority_sha256":self.authority_sha256,
+                    "cache_identity_sha256":self.cache_identity()?,"quiescence_sha256":quiescence_sha256})})).transpose()?;
+            let mut completed=self.completed_generations.lock()
+                .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?;
+            let retirement=produced.or_else(||completed.get(&generation).and_then(|value|value.retirement.clone()));
+            completed.insert(generation, Completion {command:command_id,source:source_lifetime,quiescence_sha256,producer,retirement});
         }
         outcome.quiescence_receipt=Some(quiescence_receipt);
         Ok(outcome)
@@ -990,10 +1038,22 @@ mod tests {
         let first_id=first.generation().to_owned();let second_id=second.generation().to_owned();
         let session=Session {directory:None,memory_mb:0,cache_bytes:0,cache:directory.path().join("unused"),
             authority_sha256:String::new(),runtime_identity:None,completed_generations:Default::default(),execution:Default::default()};
-        session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime(),quiescence_sha256:"a".repeat(64),producer:None});
-        session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime(),quiescence_sha256:"b".repeat(64),producer:None});
+        let producer=uuid::Uuid::new_v4().to_string();let publishing=uuid::Uuid::new_v4().to_string();
+        let original_ack=serde_json::json!({"command":"ack-a","quiescence_sha256":"a".repeat(64)});
+        session.completed_generations.lock().unwrap().insert(first_id.clone(),Completion {command:"ack-a".into(),source:first.lifetime(),quiescence_sha256:"a".repeat(64),producer:Some(producer.clone()),
+            retirement:Some(ProducerRetirement {producer:producer.clone(),ack:original_ack.clone()})});
+        session.completed_generations.lock().unwrap().insert(second_id.clone(),Completion {command:"ack-b".into(),source:second.lifetime(),quiescence_sha256:"b".repeat(64),producer:None,retirement:None});
         assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([first_id.clone(),second_id.clone()])));
+        assert_eq!(session.retained_producers(None).unwrap(),BTreeSet::from([producer.clone()]));
+        assert!(session.producer_retirements().unwrap().is_empty());
+        assert_eq!(session.retained_producers(Some(&serde_json::json!({"kind":"publish","producer":publishing}))).unwrap(),
+            BTreeSet::from([producer,publishing.clone()]));
         drop(first);
+        let releases=session.producer_retirements().unwrap();
+        assert_eq!(releases.len(),1);assert_eq!(releases[0].ack,original_ack);
+        assert!(session.retained_producers(None).unwrap().is_empty());
+        assert_eq!(session.retained_producers(Some(&serde_json::json!({"kind":"produce","producer":publishing}))).unwrap(),
+            BTreeSet::from([publishing]));
         assert_eq!(session.cache_state(&second_id).unwrap(),(Some("ack-b".into()),BTreeSet::from([second_id.clone()])));
         drop(second);
         assert_eq!(session.cache_state("new-generation").unwrap(),(None,BTreeSet::from(["new-generation".into()])));

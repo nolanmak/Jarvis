@@ -175,7 +175,7 @@ def execute(request,run=vm.run,progress=None):
     progress={} if progress is None else progress
     progress["stage"]="request_schema"
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
-              'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations'}
+              'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations','retained_producers','producer_retirements'}
     optional={'id','changed_files','cache_bytes','packages','filters','command','dependency'}
     if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository','dependency'):raise vm.Unavailable('invalid CI VM request')
     dependency=dependency_action(request)
@@ -184,6 +184,24 @@ def execute(request,run=vm.run,progress=None):
     if (not isinstance(retained,list) or not 1<=len(retained)<=4096
             or any(not cache_generation._uuid(value) for value in retained) or len(set(retained))!=len(retained)
             or request['source_generation'] not in retained):raise cache_generation.FreshnessHold('cleanup_uncertain')
+    producers=request['retained_producers']
+    if (not isinstance(producers,list) or len(producers)>4096
+            or any(not cache_generation._uuid(value) for value in producers)
+            or len(set(producers))!=len(producers)):raise cache_generation.FreshnessHold('cleanup_uncertain')
+    if dependency and dependency.get('kind') in ('produce','publish') and dependency['producer'] not in producers:
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
+    retirements=request['producer_retirements']
+    if not isinstance(retirements,list) or len(retirements)>4096:raise cache_generation.FreshnessHold('cleanup_uncertain')
+    retired_ids=set()
+    for item in retirements:
+        if (not isinstance(item,dict) or set(item)!={'producer','ack'} or not cache_generation._uuid(item['producer'])
+                or item['producer'] in retired_ids or item['producer'] in producers):raise cache_generation.FreshnessHold('cleanup_uncertain')
+        ack=item['ack']
+        if (not isinstance(ack,dict) or set(ack)!={'command','authority_sha256','cache_identity_sha256','quiescence_sha256'}
+                or not cache_generation._uuid(ack['command']) or not all(cache_generation._digest(ack[key]) for key in
+                    ('authority_sha256','cache_identity_sha256','quiescence_sha256'))
+                or ack['authority_sha256']!=request['controller_authority_sha256']):raise cache_generation.FreshnessHold('cleanup_uncertain')
+        retired_ids.add(item['producer'])
     if not cache_generation._digest(request['controller_authority_sha256']):raise cache_generation.FreshnessHold('authority_changed')
     if not all(isinstance(request[key],str) and re.fullmatch(r'[a-f0-9]{40,64}',request[key]) for key in ('head','base')):raise vm.Unavailable('CI candidate binding invalid')
     cargo=cargo_request(request)
@@ -223,7 +241,7 @@ def execute(request,run=vm.run,progress=None):
         generation={'binding':{'generation':request['source_generation'],'head':request['head'],'tree':request['tree'],
             'contract_sha256':hashlib.sha256(contract).hexdigest(),'authority_sha256':request['controller_authority_sha256'],
             'source_inputs_sha256':source_inputs},'command':request['command_id'],'predecessor':request['predecessor'],
-            'outputs':outputs,'retained_generations':retained}
+            'outputs':outputs,'retained_generations':retained,'retained_producers':producers,'producer_retirements':retirements}
     # The supplied snapshot has controller-generated Git metadata, never the
     # source worktree's config/hooks. Rebind only its private alternate file.
     progress['stage']='git_alternate'
@@ -252,6 +270,8 @@ def execute(request,run=vm.run,progress=None):
         ensure_cache(request['build_cache'],request.get('cache_bytes'),lease)
         info=Path(request['build_cache']).stat()
         generation['binding']['cache_identity_sha256']=hashlib.sha256(json.dumps([info.st_dev,info.st_ino,info.st_size],separators=(',',':')).encode()).hexdigest()
+        if any(item['ack']['cache_identity_sha256']!=generation['binding']['cache_identity_sha256'] for item in retirements):
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
         cache_generation.validate_binding(generation['binding'])
         if request['operation']=='dependency':command=['/usr/bin/true']
         elif request['operation']=='step':
@@ -268,6 +288,11 @@ def execute(request,run=vm.run,progress=None):
                             'cache_program':CACHE_PROGRAM,'generation':generation,'worker_programs':WORKER_PROGRAMS,
                             'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency})
     progress['stage']='receipt_validate'
+    reclaimed_producers=outcome.get('producer_reclaimed',[])
+    if (not isinstance(reclaimed_producers,list) or len(reclaimed_producers)>2
+            or any(not cache_generation._uuid(value) or value in producers for value in reclaimed_producers)
+            or len(set(reclaimed_producers))!=len(reclaimed_producers)):
+        raise cache_generation.FreshnessHold('cleanup_uncertain')
     try:guest_workers=worker_boundary.validate_quiescence(outcome.get('guest_worker_quiescence'),
             require_worker=request['operation']!='dependency' or dependency['kind']=='produce')
     except worker_boundary.FreshnessHold:raise cache_generation.FreshnessHold('cleanup_uncertain') from None
@@ -275,6 +300,7 @@ def execute(request,run=vm.run,progress=None):
             'guest_worker_quiescence':guest_workers,
             'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
             'cache_reclaimed':outcome.get('cache_reclaimed',[]),
+            'producer_reclaimed':reclaimed_producers,
             'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
     if request['operation'] not in ('plan','dependency'):
         try:observed_inputs=input_boundary.validate_observation(outcome.get('input_write_observation'),guest_workers,len(outputs))

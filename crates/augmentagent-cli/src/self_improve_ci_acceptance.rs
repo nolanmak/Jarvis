@@ -288,12 +288,40 @@ print("SEALED")'"#;
         ensure!(tamper.status=="passed" && tamper.stdout.trim()=="SEALED","trusted seed confinement failed: {} {}",tamper.stdout,tamper.stderr);
     }
     ensure!(generations[0]!=generations[1],"source reconstruction reused generation");
+    // Leave one real external-only producer unpublished. A live source must
+    // pin its payload; after that exact owner drops, ordinary admitted work
+    // retires it without deleting the independent seed or installed links.
+    let abandoned=session.dependency_source(&metadata,&lock,&binding,&target).await?;
+    let abandoned_id=uuid::Uuid::new_v4().to_string();
+    let abandoned_action=serde_json::json!({"kind":"produce","producer":abandoned_id,
+        "source_sha256":abandoned.source_sha256,"dependency_inputs_sha256":abandoned.dependency_inputs_sha256});
+    let produced=session.run_with_dependency("dependency",&abandoned.source,repo,&binding,None,&[],&[],&[],None,
+        &storage,&target,&audit,timeout,Some(&abandoned_action)).await?;
+    ensure!(produced.status=="seed_produced","abandoned producer fixture did not execute");
+    let probe=snapshot(repo,&binding,&target).await?;
+    let live=session.run("repository",&probe,repo,&binding,None,&[],&[],&[],Some("printf LIVE"),
+        &storage,&target,&audit,timeout).await?;
+    ensure!(live.status=="passed" && !live.producer_reclaimed.contains(&abandoned_id),"live producer was reclaimed");
+    drop(abandoned);
+    let mut retired=false;
+    for _ in 0..4 {
+        let outcome=session.run("repository",&probe,repo,&binding,None,&[],&[],&[],Some("printf RETIRED"),
+            &storage,&target,&audit,timeout).await?;
+        ensure!(outcome.status=="passed","ordinary admitted producer retirement failed");
+        if outcome.producer_reclaimed.contains(&abandoned_id) {retired=true;break;}
+    }
+    ensure!(retired,"inactive producer payload was not retired through ordinary admitted work");
+    let after_retirement=session.dependency_seed(repo,&binding,&target,&storage,&audit).await?
+        .context("producer retirement removed the independent published seed")?;
+    ensure!(after_retirement==install,"producer retirement changed trusted seed lookup");
     let receipt=serde_json::json!({"version":1,"kind":"real_shared_ci_dependency_seed_replay","seed":published["seed"],
         "adapter_authority":session.authority_sha256,"generations":generations,
         "external_units_recompiled_across_generations":0,"same_job_compatible_units_recompiled":0,
         "seed_corruption_denied":true,"automatic_seed_lookup":true,"equivalent_controller_restart_reuses_seed":true,
         "bound_preparation_and_committed_quiescence_receipts":true,
         "declared_generated_namespace_aliases_observed":true,"unchanged_generated_inputs_preserve_compatible_reuse":true,
+        "live_producer_preserved":true,"inactive_producer_retired_after_source_drop":true,
+        "published_seed_survives_producer_retirement":true,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     audit.record_controller(receipt.clone())?;audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;

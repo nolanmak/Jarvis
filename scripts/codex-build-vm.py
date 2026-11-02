@@ -39,7 +39,7 @@ class FreshnessUnavailable(Unavailable):
 
 def guest_diagnostic(value):
     value=value if isinstance(value,dict) else {}
-    stages={'load_dependency_controller','prepare_producer','bind_producer_cache','hide_producer_cache',
+    stages={'load_dependency_controller','reclaim_producers','prepare_producer','bind_producer_cache','hide_producer_cache',
             'resolve_dependencies','freeze_resolution','compile_dependencies','record_producer',
             'publish_dependencies','prepare_generation','execute_command'}
     categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
@@ -130,7 +130,7 @@ if job.get('ci_context'):
     input_spec=importlib.util.spec_from_file_location('ci_input_manifest','/ci-tools/ci-input-manifest.py')
     ci_inputs=importlib.util.module_from_spec(input_spec);input_spec.loader.exec_module(ci_inputs)
     worker_control.mkdir(mode=0o700,exist_ok=True)
-    if job.get('ci_dependency'):
+    if job.get('ci_dependency') or (job.get('build_cache') and job.get('ci_generation')):
         try:
             import importlib.util
             spec=importlib.util.spec_from_file_location('ci_dependency_guest','/ci-tools/ci-dependency-guest.py')
@@ -277,9 +277,14 @@ def observe_phase(value):
 
 try:
     cache_reclaimed=[]
+    producer_reclaimed=[]
     dependency_result=None
     cache_preparation=None
     action=job.get('ci_dependency')
+    if job.get('ci_context') and job.get('build_cache'):
+        guest_stage='reclaim_producers'
+        producer_reclaimed=ci_dependency.store.reclaim_producers('/build-cache',job['ci_generation']['retained_producers'],
+            cache_identity=job['ci_generation']['binding']['cache_identity_sha256'],eligible=job['ci_generation']['producer_retirements'])
     if action:
         original=job['ci_generation']['binding']
         seed_binding={key:original[key] for key in ('authority_sha256','cache_identity_sha256','contract_sha256','source_inputs_sha256')}
@@ -325,6 +330,7 @@ try:
       result=run_worker(job['argv'],roots)
     if job.get('ci_context'):
         result['cache_reclaimed']=cache_reclaimed
+        result['producer_reclaimed']=producer_reclaimed
         result['guest_worker_quiescence']={'version':1,'kind':'ci-guest-command-quiescence',
             'worker_free':True,'scopes':guest_worker_receipts,'shipping_authority':False}
     if dependency_result is not None:result['dependency_result']=dependency_result
@@ -622,13 +628,19 @@ poweroff -f
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
-                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
+                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
                 if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
                 if ci_context is not None and 'cache_preparation' in result:expected.add('cache_preparation')
                 if ci_context is not None and 'input_write_observation' in result:expected.add('input_write_observation')
                 if set(result) != expected or type(result['exit_code']) is not int:
                     raise Unavailable('invalid VM result')
                 if ci_context is not None:
+                    producer_reclaimed=result['producer_reclaimed']
+                    protected=(ci_context.get('generation') or {}).get('retained_producers',[])
+                    if (not isinstance(producer_reclaimed,list) or len(producer_reclaimed)>2
+                            or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',value) is None or value in protected for value in producer_reclaimed)
+                            or len(set(producer_reclaimed))!=len(producer_reclaimed)):
+                        raise Unavailable('invalid CI producer cleanup receipt')
                     reclaimed=result['cache_reclaimed']
                     if (not isinstance(reclaimed,list) or len(reclaimed)>2
                             or any(not isinstance(value,str) or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',value) is None for value in reclaimed)

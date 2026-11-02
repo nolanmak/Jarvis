@@ -159,6 +159,18 @@ call runs), passed as `build_timeout_secs` and capped at the tool maximum of
 
 ### Shared CI input capture (#1807)
 
+Inactive external dependency producer payloads have a separate retirement path
+inside the admitted cache image. The original host session must release its
+source lifetime and supply its original verified producer acknowledgement.
+Another session's unprotected producer is not eligible merely because its ID is
+absent from the current session. Cleanup removes at most two eligible producers
+per command. It records original control/publication metadata and retirement
+authorization durably before deletion, and can resume a committed interrupted
+retirement under normal storage admission. The physical cache must still match.
+Published seeds and installed hard links remain intact. Unknown ownership is
+preserved; recovery of unreleased producers across process death and bounded
+trusted-seed retention remain unfinished.
+
 Shared CI runs each worker command through the existing descendant supervisor
 inside the guest. The controller retains its cleanup receipt under the guest's
 private `/root/ci-worker-control`, outside the worker's writable mounts. It

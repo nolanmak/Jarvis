@@ -32,12 +32,55 @@ class AdapterTests(unittest.TestCase):
    return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-C',str(root/'workspace'),*args],text=True).strip()
   git('init','-q');(root/'workspace/source.rs').write_text('literal source');git('add','.');git('commit','-qm','source')
   generation=str(uuid.uuid4())
-  return {'version':2,'source_generation':generation,'retained_generations':[generation],'command_id':str(uuid.uuid4()),'predecessor':None,
+  return {'version':2,'source_generation':generation,'retained_generations':[generation],'retained_producers':[],'producer_retirements':[],'command_id':str(uuid.uuid4()),'predecessor':None,
    'tree':git('rev-parse','HEAD^{tree}'),'controller_authority_sha256':'d'*64,
    'operation':'plan','runtime_config':str(root/'runtime.json'),'workspace':str(root/'workspace'),
    'state':str(root/'state'),'scratch':str(root/'scratch'),'git_objects':str(root/'objects'),
    'runner':str(root/'runner'),'contract':str(root/'contract'),'head':git('rev-parse','HEAD'),'base':git('rev-parse','HEAD'),'build_cache':None,
    'storage':{'fd':fd,'fds':[fd],'path':str(lock),'device':info.st_dev,'inode':info.st_ino,'floor_bytes':0}}
+ def test_producer_retention_cannot_be_omitted_or_contain_invalid_ownership(self):
+  with tempfile.TemporaryDirectory() as d:
+   request=self.fixture(Path(d))
+   for field in ('retained_producers','producer_retirements'):
+    missing=dict(request);missing.pop(field)
+    with patch.object(vm.Runtime,'load') as load:
+     with self.assertRaisesRegex(vm.Unavailable,'invalid CI VM request'):adapter.execute(missing)
+     load.assert_not_called()
+   producer=str(uuid.uuid4())
+   for bad in (None,'not-a-list',['bad'],[producer,producer]):
+    with self.assertRaises(adapter.cache_generation.FreshnessHold):
+     adapter.execute(request|{'retained_producers':bad})
+
+ def test_producer_retirement_requires_original_bound_execution_metadata(self):
+  with tempfile.TemporaryDirectory() as d:
+   request=self.fixture(Path(d));producer=str(uuid.uuid4())
+   release={'producer':producer,'ack':{'command':str(uuid.uuid4()),'authority_sha256':'d'*64,
+    'cache_identity_sha256':'b'*64,'quiescence_sha256':'a'*64}}
+   malformed=[None,{},'not-a-list',[{}],[release,release],
+    [release|{'ack':release['ack']|{'authority_sha256':'e'*64}}],
+    [release|{'ack':release['ack']|{'command':'unknown'}}],
+    [release|{'ack':release['ack']|{'quiescence_sha256':None}}]]
+   for bad in malformed:
+    with patch.object(vm.Runtime,'load') as load:
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|{'producer_retirements':bad})
+     load.assert_not_called()
+   with self.assertRaises(adapter.cache_generation.FreshnessHold):
+    adapter.execute(request|{'producer_retirements':[release],'retained_producers':[producer]})
+   request.update(operation='repository',command='true',build_cache=str(Path(d)/'cache'),producer_retirements=[release])
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)),patch.object(vm,'run') as run:
+    with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request)
+    run.assert_not_called()
+
+ def test_protected_producer_reaches_guest_and_cannot_be_reported_as_reclaimed(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);producer=str(uuid.uuid4());request=self.fixture(root)
+   request.update(operation='repository',command='true',build_cache=str(root/'cache'),retained_producers=[producer])
+   def run(runtime,workspace,argv,env,**options):
+    self.assertEqual(options['ci_context']['generation']['retained_producers'],[producer])
+    return self.prepared_result(options,exit_code=0,stdout='',stderr='',producer_reclaimed=[producer])
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+    with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=run)
+
  def test_plan_probe_is_only_dispatched_inside_vm_with_pinned_bundle(self):
   with tempfile.TemporaryDirectory() as d:
    request=self.fixture(Path(d));request.update(id=None,changed_files=[],packages=[],filters=[],command=None,cache_bytes=None);seen=[]
@@ -63,7 +106,7 @@ class AdapterTests(unittest.TestCase):
    files=workspace.source_files(metadata,lock);identity=workspace.write_source(source,files)
    dependency={'kind':'produce','producer':str(uuid.uuid4()),'source_sha256':identity,
     'dependency_inputs_sha256':hashlib.sha256(files['seed-inputs.json']).hexdigest()}
-   request.update(operation='dependency',workspace=str(source),dependency=dependency,build_cache=str(root/'registered-image'))
+   request.update(operation='dependency',workspace=str(source),dependency=dependency,build_cache=str(root/'registered-image'),retained_producers=[dependency['producer']])
    seen=[]
    def execute(*args,**options):
     seen.append(options)
@@ -324,7 +367,7 @@ class BuildVMExtensionTests(unittest.TestCase):
     def __init__(self,argv,**kwargs):
      self.calls=0;self.returncode=None;cleanup=Path(argv[3]);cleanup.write_text('all-descendants-reaped\n')
      result=cleanup.parent/'control/outcome.json';result.write_text(json.dumps({'exit_code':0,'stdout':'finished','stderr':'',
-      'cache_reclaimed':receipt_reclaimed,'guest_worker_quiescence':stopped_workers()}));result.chmod(0o600)
+      'cache_reclaimed':receipt_reclaimed,'producer_reclaimed':[],'guest_worker_quiescence':stopped_workers()}));result.chmod(0o600)
     def wait(self,timeout):
      self.calls+=1
      if self.calls<3:raise subprocess.TimeoutExpired('fixture',timeout)

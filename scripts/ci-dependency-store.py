@@ -102,14 +102,164 @@ def _producer(directory,producer):
     cache._directory(path.parent,0o700,create=False)
     cache._directory(path,0o700,create=False)
     control=_document(path/'control.json')
-    if (set(control)!={'version','kind','producer','command','binding','worker_uid','worker_gid','state'}
+    _producer_control(control,producer)
+    return path,control
+
+
+def _producer_control(control,producer):
+    if (not isinstance(control,dict) or set(control)!={'version','kind','producer','command','binding','worker_uid','worker_gid','state'}
             or type(control['version']) is not int or control['version']!=1
             or control['kind']!='isolated-external-dependency-producer' or control['producer']!=producer
             or not cache._uuid(control['command']) or control['state'] not in ('building','produced')
             or any(type(control[key]) is not int or control[key]<=0 for key in ('worker_uid','worker_gid'))):
         raise FreshnessHold('artifact_provenance_unknown')
     _binding(control['binding'])
-    return path,control
+
+
+def _producer_history(path,producer):
+    _,control=_producer(path.parent.parent,producer)
+    original={'control':control,'produced':None,'published':None}
+    for name in ('produced','published'):
+        child=path/(name+'.json')
+        if child.exists() or child.is_symlink():original[name]=_document(child)
+    _validate_producer_history(original,producer)
+    return original
+
+
+def _validate_producer_history(original,producer):
+    if not isinstance(original,dict) or set(original)!={'control','produced','published'}:
+        raise FreshnessHold('metadata_torn')
+    _producer_control(original['control'],producer)
+    produced=original['produced'];published=original['published']
+    command=original['control']['command']
+    if produced is not None and (not isinstance(produced,dict)
+            or set(produced)!={'version','command','units','source_trees'}
+            or type(produced['version']) is not int or produced['version']!=1
+            or produced['command']!=command or not isinstance(produced['units'],list)
+            or not isinstance(produced['source_trees'],list)):
+        raise FreshnessHold('metadata_torn')
+    if published is not None and (not isinstance(published,dict)
+            or set(published)!={'version','seed','ack'} or type(published['version']) is not int
+            or published['version']!=1 or not cache._digest(published['seed'])
+            or not isinstance(published['ack'],dict) or published['ack'].get('command')!=command):
+        raise FreshnessHold('metadata_torn')
+    if len(_encoded(original))>8*1024**2:raise FreshnessHold('metadata_torn')
+
+
+def _fsync_directory(path):
+    descriptor=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+
+
+def _retirement_ack(control,ack):
+    if (not isinstance(ack,dict) or set(ack)!={'command','authority_sha256','cache_identity_sha256','quiescence_sha256'}
+            or ack['command']!=control['command'] or not cache._digest(ack['quiescence_sha256'])
+            or any(ack[key]!=control['binding'][key] for key in ('authority_sha256','cache_identity_sha256'))):
+        raise FreshnessHold('cleanup_uncertain')
+
+
+def reclaim_producers(directory,protected_producers,*,cache_identity,eligible=None,limit=2):
+    """Retire known inactive payloads before workers, under existing admission.
+
+    Only the original host owner can release its source lifetime and provide
+    the original producer's verified host acknowledgement in ``eligible``.
+    Protected IDs alone never authorize deleting another session's producer.
+    Already committed retirement intents may recover under reconciled whole-VM
+    cleanup/storage admission. Preserve metadata durably before deletion; unknown
+    ownership and contradictory replay state are never adopted or removed.
+    Published seed inodes and installed hard links are independent of these
+    producer paths and are not reclaimed here.
+    """
+    import itertools
+    eligible=[] if eligible is None else eligible
+    if (not isinstance(protected_producers,list) or len(protected_producers)>4096
+            or not cache._digest(cache_identity)
+            or any(not cache._uuid(value) for value in protected_producers)
+            or len(set(protected_producers))!=len(protected_producers)
+            or type(limit) is not int or not 1<=limit<=2
+            or not isinstance(eligible,list) or len(eligible)>4096
+            or not shutil.rmtree.avoids_symlink_attacks):
+        raise FreshnessHold('cleanup_uncertain')
+    releases={}
+    for item in eligible:
+        if (not isinstance(item,dict) or set(item)!={'producer','ack'} or not cache._uuid(item['producer'])
+                or item['producer'] in releases or not isinstance(item['ack'],dict)):
+            raise FreshnessHold('cleanup_uncertain')
+        releases[item['producer']]=item['ack']
+    root=_root(directory);producers=root/'ci-dependency-producers'
+    if not producers.exists() and not producers.is_symlink():return []
+    cache._directory(producers,0o700,create=False)
+    history=root/'ci-producer-retirements';cache._directory(history,0o700,create=True)
+    pending=history/'pending';completed=history/'completed'
+    for path in (pending,completed):cache._directory(path,0o700,create=True)
+    # Completed history is outside the pending discovery window. Old receipts
+    # cannot starve interrupted retirement recovery as the archive grows.
+    candidates=[path.stem for path in itertools.islice(pending.iterdir(),1024) if path.suffix=='.json']
+    candidates.extend(releases)
+    reclaimed=[];seen=set()
+    for producer in candidates:
+        if len(reclaimed)>=limit:break
+        if not cache._uuid(producer) or producer in seen or producer in protected_producers:continue
+        seen.add(producer);path=producers/producer;receipt=pending/(producer+'.json')
+        try:
+            finished=completed/(producer+'.json')
+            if finished.exists() or finished.is_symlink():
+                prior=_document(finished)
+                if (set(prior)!={'version','state','original','authorization'} or prior['version']!=2
+                        or prior['state']!='reclaimed' or producer not in releases
+                        or prior['authorization']!=releases[producer]):continue
+                _validate_producer_history(prior['original'],producer)
+                _retirement_ack(prior['original']['control'],prior['authorization'])
+                if prior['original']['control']['binding']['cache_identity_sha256']!=cache_identity:continue
+                if path.exists() or path.is_symlink():continue
+                reclaimed.append(producer)
+                continue
+            intent=_document(receipt) if receipt.exists() or receipt.is_symlink() else None
+            if intent is not None:
+                if (set(intent)!={'version','state','original','authorization'} or type(intent['version']) is not int
+                        or intent['version']!=2 or intent['state'] not in ('reclaiming','reclaimed')):
+                    raise FreshnessHold('metadata_torn')
+                original=intent['original'];_validate_producer_history(original,producer)
+                authorization=intent['authorization']
+                if producer in releases and releases[producer]!=authorization:raise FreshnessHold('cleanup_uncertain')
+            else:
+                original=_producer_history(path,producer)
+                authorization=releases[producer]
+            _retirement_ack(original['control'],authorization)
+            if original['control']['binding']['cache_identity_sha256']!=cache_identity:
+                raise FreshnessHold('cleanup_uncertain')
+            if original['published'] is not None and original['published']['ack']!=authorization:
+                raise FreshnessHold('cleanup_uncertain')
+            if path.exists() or path.is_symlink():
+                if intent is not None and intent['state']=='reclaimed':raise FreshnessHold('cleanup_uncertain')
+                cache._directory(path,0o700,create=False)
+                children={child.name for child in path.iterdir()}
+                if children-{'control.json','produced.json','published.json','target','cargo-home'}:
+                    raise FreshnessHold('invalidation_unsafe')
+                for name in ('control','produced','published'):
+                    child=path/(name+'.json')
+                    if child.exists() or child.is_symlink():
+                        if _document(child)!=original[name]:raise FreshnessHold('metadata_torn')
+                    elif original[name] is not None and intent is None:raise FreshnessHold('metadata_missing')
+                control=original['control']
+                for name in children&{'target','cargo-home'}:
+                    info=(path/name).lstat()
+                    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                            or info.st_dev!=root.stat().st_dev or info.st_uid!=control['worker_uid']
+                            or info.st_gid!=control['worker_gid'] or info.st_mode&0o077):
+                        raise FreshnessHold('invalidation_unsafe')
+        except (FreshnessHold,OSError,ValueError,TypeError,KeyError):continue
+        if intent is None:cache._write_record(receipt,{'version':2,'state':'reclaiming','original':original,'authorization':authorization})
+        try:
+            if path.exists():shutil.rmtree(path)
+            _fsync_directory(producers)
+            cache._write_record(receipt,{'version':2,'state':'reclaimed','original':original,'authorization':authorization})
+            os.rename(receipt,completed/receipt.name)
+            _fsync_directory(completed);_fsync_directory(pending)
+        except OSError:raise FreshnessHold('cleanup_uncertain') from None
+        reclaimed.append(producer)
+    return reclaimed
 
 
 def prepare_isolated_producer(directory,binding,producer,command,worker_uid,worker_gid):
