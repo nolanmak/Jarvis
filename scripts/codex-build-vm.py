@@ -30,6 +30,12 @@ class Unavailable(ValueError):
     pass
 
 
+class FreshnessUnavailable(Unavailable):
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__('shared CI prerequisite unavailable: source/cache freshness')
+
+
 def private_json(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor) as stream:
@@ -90,6 +96,9 @@ GUEST_RUNNER = dependency_proxy.GUEST_PROXY + r'''
 import ctypes,json,os,re,selectors,signal,subprocess
 from pathlib import Path
 job=json.loads(Path('/job.json').read_text())
+ci_cache={}
+if job.get('ci_context'):
+    exec(compile(Path('/ci-tools/cache-generation.py').read_bytes(),'/ci-tools/cache-generation.py','exec'),ci_cache)
 uid=job['uid'];gid=job['gid']
 os.makedirs('/home/worker',mode=0o700,exist_ok=True)
 os.chown('/home/worker',uid,gid)
@@ -99,14 +108,19 @@ Path('/etc/group').write_text(f'root:x:0:\nworker:x:{gid}:\n')
 Path('/etc/hosts').write_text('127.0.0.1 localhost registry.npmjs.org index.crates.io static.crates.io\n::1 localhost\n')
 environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','USER':'worker','LOGNAME':'worker',
     'LANG':'C.UTF-8','TMPDIR':'/tmp','CARGO_HOME':'/cargo','CARGO_NET_OFFLINE':'true','CARGO_TARGET_DIR':'/workspace/target'}
-def seed_build_cache():
+def seed_build_cache(ci_target=None):
     # Session build cache (#1036): persistent target and Cargo home. Seed the
     # Cargo home once per image from the read-only operator caches.
     import shutil
     cache=Path('/build-cache')
-    for name in ('target','cargo-home'):
-        (cache/name).mkdir(exist_ok=True); os.chown(cache/name,uid,gid)
-    home=cache/'cargo-home'
+    if ci_target is None:
+        for name in ('target','cargo-home'):
+            (cache/name).mkdir(exist_ok=True); os.chown(cache/name,uid,gid)
+        home=cache/'cargo-home'
+    else:
+        home=ci_target.parent/'cargo-home'
+        home.mkdir(exist_ok=True);os.chown(home,uid,gid)
+        environment.update({'CARGO_HOME':str(home),'CARGO_TARGET_DIR':'/workspace/target'})
     if not (home/'.jarvis-seeded').exists():
         for source,destination in (('/cargo/registry/cache','registry/cache'),('/cargo/registry/index','registry/index'),('/cargo/git','git')):
             if Path(source).is_dir() and any(Path(source).iterdir()):
@@ -150,7 +164,15 @@ def worker():
     os.umask(0o022)
 try:
     if job.get('build_cache'):
-        seed_build_cache()
+        if job.get('ci_context'):
+            if os.geteuid()!=0:raise OSError('CI cache preparation requires the guest controller')
+            generation=job['ci_generation']
+            ci_target=ci_cache['prepare']('/build-cache',generation['binding'],generation['command'],uid,gid,
+                predecessor=generation['predecessor'])
+            subprocess.run(['/usr/bin/mount','--bind',str(ci_target),'/workspace/target'],check=True)
+            seed_build_cache(ci_target)
+        else:
+            seed_build_cache()
     process=subprocess.Popen(job['argv'],cwd='/workspace',env=environment,
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
         start_new_session=True,preexec_fn=worker)
@@ -180,11 +202,14 @@ try:
         result={'exit_code':process.wait(),**{key:value.decode('utf-8','replace') for key,value in outputs.items()}}
         if len(result['stdout'].encode())+len(result['stderr'].encode())>8*1024*1024:
             result={'error':'VM command exceeded output limit'}
-except OSError as error:
+except Exception as error:
     import errno
     # copytree aggregates per-file failures into shutil.Error without an errno.
-    full=error.errno in (errno.ENOSPC,errno.EDQUOT) or 'No space left on device' in str(error)
-    result={'error':'VM build cache is full' if full else 'VM command could not start'}
+    if job.get('ci_context') and isinstance(error,ci_cache['FreshnessHold']):
+        result={'error':'CI source/cache freshness unavailable','freshness_hold':error.diagnostic()}
+    else:
+        full=getattr(error,'errno',None) in (errno.ENOSPC,errno.EDQUOT) or 'No space left on device' in str(error)
+        result={'error':'VM build cache is full' if full else 'VM command could not start'}
 path=Path('/root/control/outcome.json')
 with path.open('w') as receipt:
     os.chmod(path,0o600);json.dump(result,receipt);receipt.flush();os.fsync(receipt.fileno())
@@ -299,7 +324,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if not source.is_absolute() or source.resolve() != source or not source.is_dir():
             raise Unavailable('invalid read-only npm dependency directory')
     if ci_context is not None:
-        if set(ci_context)!={'state','git_objects','runner','contract'}:
+        if set(ci_context)!={'state','git_objects','runner','contract','cache_program','generation'}:
             raise Unavailable('invalid controller CI context')
         for key in ('state','git_objects'):
             path=Path(ci_context[key]);info=path.lstat()
@@ -308,7 +333,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
                     or workspace.is_relative_to(path)):
                 raise Unavailable('CI state and Git objects require separate owned directories')
             if key=='state' and info.st_mode&0o077:raise Unavailable('CI state is not private')
-        for key in ('runner','contract'):
+        for key in ('runner','contract','cache_program'):
             if not isinstance(ci_context[key],bytes) or not 0<len(ci_context[key])<=2*1024*1024:
                 raise Unavailable('invalid controller CI bundle')
     config = runtime.config
@@ -352,11 +377,12 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
             entries.append((name, stat.S_IFREG | 0o600, Path(path).read_bytes(), 0, 0))
             module_commands.append(f'insmod /{name} || poweroff -f')
         dependency_mounts = []
-        shares = [('runtime', Path('/usr'), True), ('workspace', workspace, False), ('control', control, False)]
+        shares = [('runtime', Path('/usr'), True), ('workspace', workspace, ci_context is not None), ('control', control, False)]
         if ci_context is not None:
             entries.extend((name,stat.S_IFDIR|0o755,b'',0,0) for name in ('ci-runtime','ci-git-objects','ci-tools'))
             entries.extend([('ci-tools/runner.py',stat.S_IFREG|0o444,ci_context['runner'],0,0),
-                            ('ci-tools/contract.json',stat.S_IFREG|0o444,ci_context['contract'],0,0)])
+                            ('ci-tools/contract.json',stat.S_IFREG|0o444,ci_context['contract'],0,0),
+                            ('ci-tools/cache-generation.py',stat.S_IFREG|0o444,ci_context['cache_program'],0,0)])
             shares.extend([('ci_runtime',Path(ci_context['state']),False),('ci_objects',Path(ci_context['git_objects']),True)])
             dependency_mounts.extend([
                 'mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev ci_runtime /ci-runtime || poweroff -f',
@@ -382,7 +408,7 @@ mount -t sysfs sysfs /sys
 ip link set lo up
 ''' + '\n'.join(module_commands) + '''
 mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev runtime /usr || poweroff -f
-mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev workspace /workspace || poweroff -f
+mount -t 9p -o trans=virtio,version=9p2000.L,''' + ('ro,' if ci_context is not None else '') + '''nosuid,nodev workspace /workspace || poweroff -f
 mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev,noexec control /root/control || poweroff -f
 ''' + '\n'.join(dependency_mounts) + '''
 /usr/bin/python3 -I /guest.py
@@ -394,6 +420,7 @@ poweroff -f
             ('guest.py', stat.S_IFREG | 0o400, GUEST_RUNNER.encode(), 0, 0),
             ('job.json', stat.S_IFREG | 0o400, json.dumps({'argv': argv, 'environment': environment,
                 'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None,'ci_context':ci_context is not None,
+                'ci_generation':ci_context['generation'] if ci_context is not None else None,
                 'ort_cache':'ort_cache' in config}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
         command = qemu_command(config, image, shares, build_cache)
@@ -430,6 +457,10 @@ poweroff -f
                 except (OSError, ValueError) as exc:
                     raise Unavailable('VM did not produce a trusted command result') from exc
                 if 'error' in result:
+                    if ci_context is not None and set(result)=={'error','freshness_hold'}:
+                        # The CI adapter validates this bounded diagnostic.
+                        # Controller bundle programs execute only in the guest.
+                        raise FreshnessUnavailable(result['freshness_hold'])
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)

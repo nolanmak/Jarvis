@@ -23,7 +23,7 @@ async fn live_shared_ci_rust_build_diagnostic() -> Result<()> {
     let storage=crate::build_storage::admit_ci(&root,&target).await?;
     let session=vm::Session::prepare(&root,&target)?;
     let source=snapshot(&root,&before,&target).await?;
-    let discovered=session.run("plan",source.path(),&root,&before,None,&["Cargo.toml".into()],&[],&[],None,
+    let discovered=session.run("plan",&source,&root,&before,None,&["Cargo.toml".into()],&[],&[],None,
         &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
     ensure!(discovered.status=="planned","guest planning unavailable");
     let plan:Plan=serde_json::from_value(discovered.plan.context("guest plan missing")?)?;plan.validate(&before)?;
@@ -40,7 +40,7 @@ try:
  fd=os.open(library,os.O_WRONLY); os.close(fd); writable=True
 except OSError: pass
 print(json.dumps({"cache":str(cache),"library_bytes":library.stat().st_size,"writable":writable,"interfaces":sorted(p.name for p in Path("/sys/class/net").iterdir()),"home":os.environ["HOME"]}))'"#;
-        let probe=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some(command),
+        let probe=session.run("repository",&source,&root,&before,None,&[],&[],&[],Some(command),
             &storage,&target,&audit,std::time::Duration::from_secs(180)).await;
         let mut diagnostic=match &probe {
             Ok(outcome)=>serde_json::json!({"status":outcome.status,"stdout":outcome.stdout,"stderr":outcome.stderr}),
@@ -67,7 +67,7 @@ print(json.dumps({"cache":str(cache),"library_bytes":library.stat().st_size,"wri
     let rust_build_attempted=onnx_probe_error.is_none();
     let observed=if let Some(error)=onnx_probe_error {Err(error)} else {async {
         drop(source);let source=snapshot(&root,&before,&target).await?;
-        session.run("step",source.path(),&root,&before,Some(check),&[],&[],&[],None,
+        session.run("step",&source,&root,&before,Some(check),&[],&[],&[],None,
             &storage,&target,&audit,check.remaining(std::time::Duration::ZERO)?).await
     }.await};
     let (status,stdout,stderr,error)=match observed {
@@ -108,14 +108,14 @@ async fn live_shared_ci_internal_links() -> Result<()> {
     std::fs::write(fixture.join("addon.node"),"owned build artifact")?;
     std::fs::hard_link(fixture.join("addon.node"),fixture.join("alias.node"))?;
     let command=r#"python3 -c 'import json; from pathlib import Path; a=Path("autoship-internal-link-fixture/addon.node"); b=a.with_name("alias.node"); print(json.dumps({"same_inode":a.stat().st_ino==b.stat().st_ino,"link_count":a.stat().st_nlink,"value":b.read_text()}))'"#;
-    let outcome=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some(command),&storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    let outcome=session.run("repository",&source,&root,&before,None,&[],&[],&[],Some(command),&storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
     let observed:serde_json::Value=serde_json::from_str(outcome.stdout.trim())?;
     ensure!(observed==serde_json::json!({"same_inode":true,"link_count":2,"value":"owned build artifact"}),"guest did not observe the unchanged internal aliases");
     // POSIX hard links require one filesystem. Keep this external fixture in
     // the admitted target, outside the exported snapshot, rather than /tmp.
     let external=tempfile::NamedTempFile::new_in(&target)?;std::fs::write(external.path(),"private host fixture")?;
     std::fs::hard_link(external.path(),fixture.join("external-alias"))?;
-    let refused=session.run("repository",source.path(),&root,&before,None,&[],&[],&[],Some("touch autoship-internal-link-fixture/negative-dispatched"),&storage,&target,&audit,std::time::Duration::from_secs(180)).await;
+    let refused=session.run("repository",&source,&root,&before,None,&[],&[],&[],Some("touch autoship-internal-link-fixture/negative-dispatched"),&storage,&target,&audit,std::time::Duration::from_secs(180)).await;
     ensure!(refused.is_err(),"external host alias was admitted");
     ensure!(!fixture.join("negative-dispatched").exists() && std::fs::read_to_string(external.path())?=="private host fixture","negative probe reached execution or changed host data");
     ensure!(binding(&root).await?==before,"diagnostic changed source binding");audit.protected_health()?;
@@ -157,7 +157,7 @@ async fn live_shared_ci_vm_smoke() -> Result<()> {
     // This is explicit diagnostic selection, not a claim about actual changed
     // paths or complete applicability on this branch.
     let diagnostic_paths = vec!["scripts/tests/model_router_install_test.py".to_owned()];
-    let discovered = session.run("plan", source.path(), &root, &before, None,
+    let discovered = session.run("plan", &source, &root, &before, None,
         &diagnostic_paths, &[], &[], None, &storage, &target, &audit,
         std::time::Duration::from_secs(180)).await?;
     ensure!(discovered.status == "planned", "real guest planning did not succeed");
@@ -170,7 +170,7 @@ async fn live_shared_ci_vm_smoke() -> Result<()> {
     // Production recreates the snapshot after prerequisite probes, too.
     drop(source);
     let source = snapshot(&root, &before, &target).await?;
-    let outcome = session.run("step", source.path(), &root, &before, Some(check),
+    let outcome = session.run("step", &source, &root, &before, Some(check),
         &[], &[], &[], None, &storage, &target, &audit,
         check.remaining(std::time::Duration::ZERO)?).await?;
     ensure!(outcome.status == "passed", "real guest Python check failed: {}", outcome.stderr);

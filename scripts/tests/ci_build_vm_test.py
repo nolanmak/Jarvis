@@ -1,5 +1,5 @@
 """No VM/model calls: controller binding, real lock inheritance, and mocked launch boundary."""
-import fcntl,hashlib,importlib.util,json,os,stat,subprocess,tempfile,unittest
+import fcntl,hashlib,importlib.util,json,os,stat,subprocess,tempfile,unittest,uuid
 from pathlib import Path
 from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[2]
@@ -12,9 +12,14 @@ class AdapterTests(unittest.TestCase):
    (root/name).write_bytes(data);(root/name).chmod(0o600)
   lock=root/'disk-build.lock';fd=os.open(lock,os.O_RDWR|os.O_CREAT,0o600);fcntl.flock(fd,fcntl.LOCK_EX)
   self.addCleanup(os.close,fd);info=os.fstat(fd)
-  return {'version':1,'operation':'plan','runtime_config':str(root/'runtime.json'),'workspace':str(root/'workspace'),
+  def git(*args):
+   return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-C',str(root/'workspace'),*args],text=True).strip()
+  git('init','-q');(root/'workspace/source.rs').write_text('literal source');git('add','.');git('commit','-qm','source')
+  return {'version':2,'source_generation':str(uuid.uuid4()),'command_id':str(uuid.uuid4()),'predecessor':None,
+   'tree':git('rev-parse','HEAD^{tree}'),'controller_authority_sha256':'d'*64,
+   'operation':'plan','runtime_config':str(root/'runtime.json'),'workspace':str(root/'workspace'),
    'state':str(root/'state'),'scratch':str(root/'scratch'),'git_objects':str(root/'objects'),
-   'runner':str(root/'runner'),'contract':str(root/'contract'),'head':'a'*40,'base':'b'*40,'build_cache':None,
+   'runner':str(root/'runner'),'contract':str(root/'contract'),'head':git('rev-parse','HEAD'),'base':git('rev-parse','HEAD'),'build_cache':None,
    'storage':{'fd':fd,'fds':[fd],'path':str(lock),'device':info.st_dev,'inode':info.st_ino,'floor_bytes':0}}
  def test_plan_probe_is_only_dispatched_inside_vm_with_pinned_bundle(self):
   with tempfile.TemporaryDirectory() as d:
@@ -52,7 +57,7 @@ class AdapterTests(unittest.TestCase):
    with patch.object(vm.Runtime,'load',return_value=object()),self.assertRaisesRegex(vm.Unavailable,'cache image'):
     adapter.execute(request,run=lambda *a,**k:None)
    request['build_cache']=str(Path(d)/'registered-image')
-   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache'):
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
     result=adapter.execute(request,run=lambda *a,**k:{'exit_code':17,'stdout':'{"status":"passed"}','stderr':''})
    self.assertEqual(result['status'],'failed');self.assertEqual(result['exit_code'],17)
 
@@ -98,7 +103,7 @@ class AdapterTests(unittest.TestCase):
      with patch.object(adapter.subprocess,'run',side_effect=lambda command:seen.append(command) or subprocess.CompletedProcess(command,0)),patch.object(adapter.sys,'argv',['script',argv[4]]):
       exec(argv[3],{})
      return {'exit_code':0,'stdout':'','stderr':''}
-    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache'):
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      self.assertEqual(adapter.execute(request,run=run)['status'],'passed')
     self.assertEqual(seen,expected)
   for invalid in [dict(operation='targeted',packages=[]),dict(operation='targeted',packages=['--workspace']),dict(operation='baseline',filters=['x;touch bad']),dict(operation='step',packages=['cli'])]:
@@ -109,7 +114,7 @@ class AdapterTests(unittest.TestCase):
    def run(runtime,workspace,argv,env,**kwargs):
     self.assertEqual(argv,['/bin/bash','--noprofile','--norc','-o','pipefail','-c','printf owner-configured'])
     return {'exit_code':12,'stdout':'','stderr':'failed'}
-   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache'):
+   with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
     self.assertEqual(adapter.execute(request,run=run)['status'],'failed')
   with self.assertRaises(vm.Unavailable):adapter.cargo_request({'operation':'repository','command':'x'*65537})
 
@@ -132,7 +137,7 @@ class BuildVMExtensionTests(unittest.TestCase):
   runtime=vm.Runtime();runtime.config={key:str(artifact) for key in ['qemu','kernel','busybox','firmware','data_dir','library_dir','module_dir']};runtime.config.update(memory_mb=512,modules=[str(artifact)]);return runtime
  def setup(self,root):
   for name in ['workspace','state','objects','scratch']:(root/name).mkdir(mode=0o700)
-  return {'state':root/'state','git_objects':root/'objects','runner':b'pinned runner','contract':b'pinned contract'}
+  return {'state':root/'state','git_objects':root/'objects','runner':b'pinned runner','contract':b'pinned contract','cache_program':adapter.CACHE_PROGRAM,'generation':None}
  def openssl(self,argv,**kwargs):
   Path(argv[argv.index('-keyout')+1]).write_bytes(b'fixture-key');Path(argv[argv.index('-out')+1]).write_bytes(b'fixture-cert');return subprocess.CompletedProcess(argv,0)
  def test_ci_mounts_are_explicit_and_controller_bundle_is_readonly(self):
@@ -144,8 +149,11 @@ class BuildVMExtensionTests(unittest.TestCase):
    with patch.object(vm.subprocess,'run',side_effect=self.openssl),patch.object(vm,'initrd',side_effect=archive),patch.object(vm,'qemu_command',side_effect=qemu),self.assertRaises(Stop):
     vm.run(self.runtime(root),root/'workspace',['true'],{},scratch_dir=root/'scratch',ci_context=context)
    self.assertIn(('ci_objects',root/'objects',True),captured['shares']);self.assertIn(('ci_runtime',root/'state',False),captured['shares'])
+   self.assertIn(('workspace',root/'workspace',True),captured['shares'])
    entries={name:(mode,data) for name,mode,data,_,_ in captured['entries']};self.assertEqual(entries['ci-tools/runner.py'],(stat.S_IFREG|0o444,b'pinned runner'))
    self.assertIn(b'ro,nosuid,nodev ci_objects /ci-git-objects',entries['init'][1])
+   self.assertIn(b'ro,nosuid,nodev workspace /workspace',entries['init'][1])
+   self.assertEqual(entries['ci-tools/cache-generation.py'],(stat.S_IFREG|0o444,adapter.CACHE_PROGRAM))
    (root/'objects').chmod(0o777)
    with self.assertRaisesRegex(vm.Unavailable,'separate owned'):vm.run(self.runtime(root),root/'workspace',['true'],{},ci_context=context)
    (root/'objects').chmod(0o775)

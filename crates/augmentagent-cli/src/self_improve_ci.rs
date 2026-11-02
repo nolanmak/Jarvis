@@ -408,7 +408,7 @@ pub(super) async fn verify(
     let discovered = vm
         .run(
             "plan",
-            discovery_source.path(),
+            &discovery_source,
             root,
             &binding_before,
             None,
@@ -457,8 +457,7 @@ pub(super) async fn verify(
         }
         let source_root = source
             .as_ref()
-            .context("CI source snapshot unavailable")?
-            .path();
+            .context("CI source snapshot unavailable")?;
         info!(check = %check.id, "verification gate: isolated shared CI check");
         let outcome = vm
             .run(
@@ -544,7 +543,7 @@ async fn iteration(
     let outcome = vm
         .run(
             operation,
-            source.path(),
+            &source,
             root,
             &before,
             None,
@@ -615,7 +614,7 @@ pub(super) async fn repository(
     let outcome = vm
         .run(
             "repository",
-            source.path(),
+            &source,
             root,
             &before,
             None,

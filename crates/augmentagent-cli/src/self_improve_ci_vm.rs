@@ -8,6 +8,7 @@ const ADAPTER: &[u8] = include_bytes!("../../../scripts/ci-build-vm.py");
 const BUILD_VM: &[u8] = include_bytes!("../../../scripts/codex-build-vm.py");
 const PROXY: &[u8] = include_bytes!("../../../scripts/build-dependency-proxy.py");
 const SUPERVISOR: &[u8] = include_bytes!("../../../scripts/provider-supervisor.py");
+const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 
 pub(super) struct Session {
     directory: Option<tempfile::TempDir>,
@@ -15,6 +16,7 @@ pub(super) struct Session {
     cache_bytes: u64,
     cache: PathBuf,
     pub authority_sha256: String,
+    completed_generations: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
@@ -41,6 +43,8 @@ pub(super) struct Outcome {
     category: Option<String>,
     #[serde(default)]
     errno: Option<i64>,
+    #[serde(default)]
+    freshness_hold: Option<serde_json::Value>,
 }
 impl Outcome {
     // This envelope is emitted before a guest exists and may not carry source
@@ -60,6 +64,7 @@ impl Outcome {
                         | "storage_lease"
                         | "runtime_load"
                         | "cache_prepare"
+                        | "source_census"
                         | "command_prepare"
                         | "vm_launch"
                         | "receipt_validate"
@@ -73,6 +78,7 @@ impl Outcome {
                 matches!(
                     *value,
                     "Unavailable"
+                        | "FreshnessHold"
                         | "SetupError"
                         | "OSError"
                         | "ValueError"
@@ -89,8 +95,13 @@ impl Outcome {
                 )
             })
             .unwrap_or("unknown");
-        serde_json::json!({"stage":stage,"category":category,
-            "errno":self.errno.filter(|value| (0..=4096).contains(value))})
+        let mut diagnostic = serde_json::json!({"stage":stage,"category":category,
+            "errno":self.errno.filter(|value| (0..=4096).contains(value))});
+        if let Some(value) = &self.freshness_hold {
+            diagnostic["freshness_hold"] = serde_json::to_value(crate::autoship_freshness::Hold::parse(value))
+                .expect("bounded freshness protocol serializes");
+        }
+        diagnostic
     }
     fn validate(&self, binding: &Binding, operation: &str) -> Result<()> {
         ensure!(
@@ -104,6 +115,11 @@ impl Outcome {
             ),
             "{PREREQUISITE}: unknown VM disposition"
         );
+        if let Some(value) = &self.freshness_hold {
+            // Even a contradictory success/failed-code envelope cannot turn
+            // incomplete freshness into a source verdict.
+            return Err(crate::autoship_freshness::Hold::parse(value).into());
+        }
         if self.status == "prerequisite_hold" {
             bail!(
                 "{PREREQUISITE}: admitted CI VM requires environment/resource recovery; {}",
@@ -225,6 +241,7 @@ impl Session {
             ("codex-build-vm.py", BUILD_VM),
             ("build-dependency-proxy.py", PROXY),
             ("provider-supervisor.py", SUPERVISOR),
+            ("ci-cache-generation.py", CACHE_GENERATION),
             ("ci-contract.py", RUNNER.as_bytes()),
             ("ci-contract.json", contract.as_bytes()),
             ("runtime.json", runtime.as_slice()),
@@ -238,20 +255,21 @@ impl Session {
         private_directory(&cache_root)?;
         let authority_sha256 = digest(&serde_json::to_vec(&serde_json::json!({
             "runtime":digest(&runtime),"adapter":digest(ADAPTER),"build_vm":digest(BUILD_VM),"proxy":digest(PROXY),
-            "supervisor":digest(SUPERVISOR),"cache_bytes":limits.cache_bytes}))?);
+            "supervisor":digest(SUPERVISOR),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes}))?);
         Ok(Self {
             directory: Some(directory),
             memory_mb,
             cache_bytes: limits.cache_bytes,
             cache: cache_root.join("cache.img"),
             authority_sha256,
+            completed_generations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
     pub(super) async fn run(
         &self,
         operation: &str,
-        source: &Path,
+        source: &verifier_checkout::OwnedCheckout,
         root: &Path,
         binding: &Binding,
         check: Option<&Check>,
@@ -264,6 +282,12 @@ impl Session {
         audit: &Arc<augmentagent_channel_core::AuditLogger>,
         deadline: std::time::Duration,
     ) -> Result<Outcome> {
+        let generation = source.generation().to_owned();
+        let source = source.path();
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let predecessor = self.completed_generations.lock()
+            .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
+            .get(&generation).cloned();
         let files = storage.inherited_files()?;
         let fd = files.first().context("CI storage lease unavailable")?;
         let meta = fd.metadata()?;
@@ -278,7 +302,9 @@ impl Session {
             root.join(objects)
         }
         .canonicalize()?;
-        let request = serde_json::json!({"version":1,"operation":operation,
+        let request = serde_json::json!({"version":2,"operation":operation,
+            "source_generation":generation,"command_id":command_id,"predecessor":predecessor,
+            "tree":binding.index_tree,"controller_authority_sha256":self.authority_sha256,
             "runtime_config":self.directory.as_ref().expect("owned CI session").path().join("runtime.json"),"workspace":source,
             "state":self.directory.as_ref().expect("owned CI session").path().join("state"),"git_objects":objects,
             "runner":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.py"),"contract":self.directory.as_ref().expect("owned CI session").path().join("ci-contract.json"),
@@ -369,6 +395,13 @@ impl Session {
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
+        if operation != "plan" && outcome.status == "passed" {
+            // Published only after kernel quiescence, storage settlement and
+            // receipt validation. A dropped/failed invocation cannot mint it.
+            self.completed_generations.lock()
+                .map_err(|_| anyhow::anyhow!("shared CI prerequisite unavailable: cache completion state poisoned"))?
+                .insert(generation, command_id);
+        }
         Ok(outcome)
     }
 }
@@ -376,6 +409,21 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freshness_hold_survives_transport_and_cannot_certify_success_or_code_failure() {
+        let binding = super::super::tests::binding_fixture();
+        for status in ["passed", "failed", "prerequisite_hold"] {
+            let value = serde_json::json!({"version":1,"boundary":"existing-build-vm","status":status,
+                "head":"head","base":"base","contract_sha256":"contract","exit_code":0,
+                "freshness_hold":{"version":1,"reason":"input_census_unknown","recovery":"revalidate_inputs","evidence_sha256":"a".repeat(64)}});
+            let receipt: Outcome = serde_json::from_value(value).unwrap();
+            let error = receipt.validate(&binding, "step").unwrap_err();
+            let hold = error.downcast_ref::<crate::autoship_freshness::Hold>().expect("typed hold lost at VM boundary");
+            assert_eq!(hold.reason, crate::autoship_freshness::Reason::InputCensusUnknown);
+            assert_eq!(receipt.setup_diagnostic()["freshness_hold"]["reason"], "input_census_unknown");
+        }
+    }
 
     #[test]
     fn setup_failure_retains_safe_phase_without_exception_content() {

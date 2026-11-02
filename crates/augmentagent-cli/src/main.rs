@@ -108,6 +108,7 @@ mod autoship_cache_recovery;
 mod autoship_discord_command;
 mod autoship_deployment;
 mod autoship_contract;
+mod autoship_freshness;
 mod autoship_episode;
 mod autoship_metrics;
 mod autoship_review;
