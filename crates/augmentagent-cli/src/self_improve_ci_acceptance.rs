@@ -309,7 +309,7 @@ async fn live_shared_ci_cargo_execution_capabilities()->Result<()> {
 #[tokio::test]
 #[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
 async fn live_shared_ci_generated_input_mutation()->Result<()> {
-    generated_input_mutation(false).await
+    generated_input_mutation(false,false).await
 }
 
 /// Build-script rerun inputs need the same content-correctness boundary as
@@ -317,10 +317,18 @@ async fn live_shared_ci_generated_input_mutation()->Result<()> {
 #[tokio::test]
 #[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
 async fn live_shared_ci_generated_build_script_mutation()->Result<()> {
-    generated_input_mutation(true).await
+    generated_input_mutation(true,false).await
 }
 
-async fn generated_input_mutation(build_script:bool)->Result<()> {
+/// A newly introduced module candidate must invalidate reuse even though every
+/// previously read source file retains its exact bytes and old timestamp.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_generated_module_resolution_mutation()->Result<()> {
+    generated_input_mutation(false,true).await
+}
+
+async fn generated_input_mutation(build_script:bool,resolution:bool)->Result<()> {
     let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
     let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
     ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
@@ -334,7 +342,9 @@ async fn generated_input_mutation(build_script:bool)->Result<()> {
     std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n")?;
     std::fs::write(root.join("Cargo.lock"),"version=4\n[[package]]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\n")?;
     std::fs::write(root.join("package.json"),"{\"name\":\"generated-input-fixture\",\"private\":true}\n")?;
-    if build_script {
+    if resolution {
+        std::fs::write(root.join("src/main.rs"),"#[path=\"../node_modules/generated/mod.rs\"] mod generated;\nfn main(){println!(\"{}\",generated::value());}\n")?;
+    } else if build_script {
         std::fs::write(root.join("build.rs"),r#"fn main(){
     println!("cargo:rerun-if-changed=node_modules/generated.txt");
     let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
@@ -360,9 +370,35 @@ os.execvp(sys.argv[1],sys.argv[1:])
     let bound=binding(root).await?;let session=vm::Session::prepare(root,&target)?;
     let source=snapshot(root,&bound,&target).await?;
     let timeout=std::time::Duration::from_secs(180);
-    let generate_old="python3 -I -c 'import os;from pathlib import Path;p=Path(\"node_modules/generated.txt\");p.write_text(\"OLD\");os.utime(p,ns=(946684800000000000,946684800000000000))'";
-    let generate_new=generate_old.replace("OLD","NEW");
-    let compile="RUSTC_WRAPPER=/workspace/rustc-counter.py cargo build --offline --locked --message-format=json > target/messages.json && python3 -I -c 'from pathlib import Path;p=Path(\"/tmp/ci-fixture-rustc-count\");print(\"CALLS=\"+str(len(p.read_text().splitlines()) if p.exists() else 0))' && target/debug/generated-input-consumer";
+    let generate_old=if resolution {r#"python3 -I - <<'PY'
+import os
+from pathlib import Path
+root=Path('node_modules/generated');(root/'chosen').mkdir(parents=True)
+files={root/'mod.rs':"mod chosen;pub fn value()->&'static str{chosen::VALUE}\n",
+ root/'chosen/mod.rs':'pub const VALUE:&str="OLD";\n'}
+for path,source in files.items():
+ path.write_text(source);os.utime(path,ns=(946684800000000000,946684800000000000))
+PY"#} else {"python3 -I -c 'import os;from pathlib import Path;p=Path(\"node_modules/generated.txt\");p.write_text(\"OLD\");os.utime(p,ns=(946684800000000000,946684800000000000))'"};
+    let generate_new=if resolution {r#"python3 -I - <<'PY'
+import os
+from pathlib import Path
+path=Path('node_modules/generated/chosen.rs');path.write_text('pub const VALUE:&str="NEW";\n')
+os.utime(path,ns=(946684800000000000,946684800000000000))
+PY"#.to_owned()} else {generate_old.replace("OLD","NEW")};
+    let compile=if resolution {r#"python3 -I - <<'PY'
+import json,os,subprocess,sys
+from pathlib import Path
+environment=os.environ.copy();environment['RUSTC_WRAPPER']='/workspace/rustc-counter.py'
+result=subprocess.run(['cargo','build','--offline','--locked','--message-format=json'],env=environment,capture_output=True,text=True)
+counter=Path('/tmp/ci-fixture-rustc-count');print('CALLS='+str(len(counter.read_text().splitlines()) if counter.exists() else 0),flush=True)
+for line in result.stdout.splitlines():
+ try:message=json.loads(line)
+ except ValueError:continue
+ if message.get('reason')=='compiler-message' and isinstance(message.get('message',{}).get('code'),dict):
+  print('DIAG='+message['message']['code']['code'],flush=True)
+if result.returncode:raise SystemExit(result.returncode)
+raise SystemExit(subprocess.run(['target/debug/generated-input-consumer']).returncode)
+PY"#} else {"RUSTC_WRAPPER=/workspace/rustc-counter.py cargo build --offline --locked --message-format=json > target/messages.json && python3 -I -c 'from pathlib import Path;p=Path(\"/tmp/ci-fixture-rustc-count\");print(\"CALLS=\"+str(len(p.read_text().splitlines()) if p.exists() else 0))' && target/debug/generated-input-consumer"};
     let old=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(generate_old),&storage,&target,&audit,timeout).await?;
     ensure!(old.status=="passed","initial generator failed: {}",old.stderr);
     let first=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
@@ -373,15 +409,23 @@ os.execvp(sys.argv[1],sys.argv[1:])
     ensure!(changed.status=="passed" && changed.command_receipt.as_ref().is_some_and(|r|r.value()["input_write_observation"]["changed"]==true),
         "generated mutation was not observed");
     let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
+    let control=if resolution {Some(session.run("repository",&source,root,&bound,None,&[],&[],&[],
+        Some("rustc --edition=2021 --crate-name resolution_control src/main.rs -o target/resolution-control"),
+        &storage,&target,&audit,timeout).await?)} else {None};
+    let passed=if resolution {observed.status=="failed" && observed.stdout.contains("DIAG=E0761")
+        && control.as_ref().is_some_and(|value|value.status=="failed" && value.stderr.contains("E0761"))}
+        else {observed.status=="passed" && observed.stdout.trim()=="CALLS=1\nNEW"};
     let report=serde_json::json!({"version":1,"kind":"real_shared_ci_generated_input_mutation",
-        "head":head,"generation":source.generation(),"input_consumer":if build_script {"build_script"} else {"compiler_include"},
+        "head":head,"generation":source.generation(),"input_consumer":if resolution {"module_resolution"} else if build_script {"build_script"} else {"compiler_include"},
         "old_and_new_mtime_ns":946684800000000000_u64,
-        "expected":"CALLS=1\nNEW","actual":observed.stdout.trim(),"status":observed.status,
+        "expected":if resolution {"compile failure E0761 after introducing a conflicting module"} else {"CALLS=1\nNEW"},
+        "actual":observed.stdout.trim(),"status":observed.status,
+        "direct_compiler_control":control.as_ref().map(|value|serde_json::json!({"status":value.status,"stdout":value.stdout,"stderr":value.stderr})),
         "unchanged_compatible_unit_actual_rustc_calls":0,
-        "passed":observed.status=="passed" && observed.stdout.trim()=="CALLS=1\nNEW",
+        "passed":passed,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&report)?)?;
-    ensure!(report["passed"]==true,"generated-input invalidation missing: expected NEW, executed {}",observed.stdout.trim());
+    ensure!(report["passed"]==true,"generated-input invalidation missing: executed {}",observed.stdout.trim());
     Ok(())
 }
 
