@@ -16,6 +16,26 @@ spec.loader.exec_module(cache)
 
 
 class GenerationTests(unittest.TestCase):
+    def test_root_preparation_requires_original_command_and_ready_dependency_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binding, command = self.binding(), str(uuid.uuid4())
+            target = self.prepare(root, binding, command)
+            receipt = cache.preparation_receipt(target, binding, command, {})
+            self.assertEqual(receipt["binding"], binding)
+            self.assertEqual(receipt["command"], command)
+            self.assertIsNone(receipt["dependency_seed"])
+            with self.assertRaises(cache.FreshnessHold):
+                cache.preparation_receipt(target, binding, str(uuid.uuid4()), {})
+            with self.assertRaises(cache.FreshnessHold):
+                cache.preparation_receipt(target, binding | {"source_inputs_sha256": "8" * 64}, command, {})
+            seed = "9" * 64
+            cache.begin_seed_install(target, binding, seed)
+            with self.assertRaises(cache.FreshnessHold):
+                cache.preparation_receipt(target, binding, command, {})
+            cache.finish_seed_install(target, binding, seed)
+            self.assertEqual(cache.preparation_receipt(target, binding, command, {})["dependency_seed"], seed)
+
     def test_actual_source_census_rejects_changed_untracked_and_aliased_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

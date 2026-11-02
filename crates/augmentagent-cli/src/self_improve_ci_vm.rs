@@ -65,6 +65,26 @@ pub(super) struct DependencySource {
     pub source_sha256:String,
     pub dependency_inputs_sha256:String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CachePreparation {
+    version: u32,
+    binding: CacheBinding,
+    command: String,
+    outputs_sha256: String,
+    dependency_seed: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CacheBinding {
+    generation: String,
+    head: String,
+    tree: String,
+    contract_sha256: String,
+    authority_sha256: String,
+    cache_identity_sha256: String,
+    source_inputs_sha256: String,
+}
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
     version: u32,
@@ -99,9 +119,40 @@ pub(super) struct Outcome {
     #[serde(default)]
     source_kind:Option<String>,
     #[serde(default)]
+    cache_preparation: Option<serde_json::Value>,
+    /// Host-only capability, created after all result and kernel checks. A VM
+    /// JSON object cannot supply or deserialize a protected audit receipt.
+    #[serde(skip)]
+    pub command_receipt: Option<augmentagent_channel_core::tool_audit::ProtectedControllerReceipt>,
+    #[serde(default)]
     guest_diagnostic:Option<serde_json::Value>,
 }
 impl Outcome {
+    fn validated_preparation(&self, binding: &Binding, generation: &str, command: &str,
+        authority: &str, cache_identity: &str) -> Result<CachePreparation> {
+        let hold = |reason: &str| crate::autoship_freshness::Hold::parse(&serde_json::json!({
+            "version":1,"reason":reason,
+            "recovery":match reason {"legacy_format"=>"await_compatible_controller",
+                "metadata_torn"|"generation_mismatch"=>"rebuild_source_artifacts",_=>"revalidate_inputs"},
+            "evidence_sha256":digest(b"CI cache preparation cannot attest this original invocation")}));
+        let value = self.cache_preparation.as_ref().ok_or_else(|| hold("legacy_format"))?;
+        let prepared: CachePreparation = serde_json::from_value(value.clone()).map_err(|_| hold("metadata_torn"))?;
+        let sha = |value: &str| value.len()==64 && value.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f'));
+        let uuid = |value: &str| uuid::Uuid::parse_str(value).is_ok_and(|id|id.get_version_num()==4 && id.to_string()==value);
+        if self.source_kind.as_deref()!=Some("git") || prepared.version!=1
+            || !sha(&prepared.binding.source_inputs_sha256) || !sha(&prepared.outputs_sha256)
+            || prepared.dependency_seed.as_deref().is_some_and(|seed|!sha(seed)) {
+            return Err(hold("input_census_unknown").into());
+        }
+        if prepared.binding.generation!=generation || prepared.command!=command
+            || !uuid(generation) || !uuid(command)
+            || prepared.binding.head!=binding.verification_head || prepared.binding.tree!=binding.index_tree
+            || prepared.binding.contract_sha256!=binding.contract_sha256
+            || prepared.binding.authority_sha256!=authority || prepared.binding.cache_identity_sha256!=cache_identity {
+            return Err(hold("generation_mismatch").into());
+        }
+        Ok(prepared)
+    }
     // This envelope is emitted before a guest exists and may not carry source
     // bindings. Retain only protocol enums, never exception text or paths.
     fn setup_diagnostic(&self) -> serde_json::Value {
@@ -593,8 +644,9 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             "binding":binding,"controller_authority_sha256":self.authority_sha256,
             "command":command_id,"generation":generation,
             "proof":quiescence.evidence(),"shipping_authority":false});
-        audit.record_controller(quiescence_receipt.clone())?;
-        let quiescence_sha256=digest(&serde_json::to_vec(&quiescence_receipt)?);
+        let quiescence_receipt=audit.record_controller_receipt(quiescence_receipt)
+            .context("shared CI prerequisite unavailable: quiescence receipt not committed")?;
+        let quiescence_sha256=quiescence_receipt.payload_sha256().to_owned();
         // Keep the exact scope evidence and storage hold through settlement.
         hold.settle().context("shared CI prerequisite unavailable: storage cleanup settlement unavailable")?;
         let output = output.unwrap()?;
@@ -602,7 +654,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             output.stdout.len() <= 20 * 1024 * 1024,
             "{PREREQUISITE}: oversized VM receipt"
         );
-        let outcome: Outcome = serde_json::from_slice(&output.stdout)
+        let mut outcome: Outcome = serde_json::from_slice(&output.stdout)
             .context("shared CI prerequisite unavailable: missing valid supervised VM receipt")?;
         if outcome.status == "prerequisite_hold" {
             audit.record_controller(serde_json::json!({
@@ -628,6 +680,23 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published" | "seed_lookup"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
+        if matches!(operation,"step"|"targeted"|"baseline"|"repository") {
+            let cache=std::fs::metadata(&self.cache)
+                .context("shared CI prerequisite unavailable: physical cache identity missing")?;
+            let cache_identity=digest(&serde_json::to_vec(&(cache.dev(),cache.ino(),cache.len()))?);
+            let prepared=outcome.validated_preparation(binding,&generation,&command_id,&self.authority_sha256,&cache_identity)?;
+            // Preparation proves the original invocation/cache relationship.
+            // Generated-input attestation and full planned coverage must still
+            // be established before C can publish its final passing proof.
+            outcome.command_receipt=Some(audit.record_controller_receipt(serde_json::json!({
+                "kind":"shared_ci_command_complete","version":1,"operation":operation,
+                "check":check.map(|check|&check.id),"binding":binding,
+                "controller_authority_sha256":self.authority_sha256,"cache_preparation":prepared,
+                "quiescence_receipt_sha256":quiescence_sha256,"status":outcome.status,
+                "exit_code":outcome.exit_code,"stdout_sha256":digest(outcome.stdout.as_bytes()),
+                "stderr_sha256":digest(outcome.stderr.as_bytes()),"shipping_authority":false,
+            })).context("shared CI prerequisite unavailable: command receipt not committed")?);
+        }
         if operation != "plan" && matches!(outcome.status.as_str(),"passed"|"seed_produced"|"seed_published") {
             // Published only after kernel quiescence, storage settlement and
             // receipt validation. A dropped/failed invocation cannot mint it.
@@ -657,6 +726,40 @@ mod tests {
     use super::*;
 
     #[cfg(target_os="linux")]
+    #[test]
+    fn command_preparation_is_bound_to_original_source_invocation_and_cache() {
+        let mut binding=super::super::tests::binding_fixture();
+        binding.verification_head="1".repeat(40);binding.index_tree="2".repeat(40);binding.contract_sha256="3".repeat(64);
+        let generation=uuid::Uuid::new_v4().to_string();let command=uuid::Uuid::new_v4().to_string();
+        let authority="4".repeat(64);let cache="5".repeat(64);
+        let original=serde_json::json!({"version":1,"boundary":"existing-build-vm","status":"passed","source_kind":"git",
+            "cache_preparation":{"version":1,"binding":{"generation":generation,"head":binding.verification_head,
+                "tree":binding.index_tree,"contract_sha256":binding.contract_sha256,"authority_sha256":authority,
+                "cache_identity_sha256":cache,"source_inputs_sha256":"6".repeat(64)},
+                "command":command,"outputs_sha256":"7".repeat(64),"dependency_seed":null}});
+        for fault in ["none","legacy","tree","head","source","generation","command","authority","cache","unknown-field","forged-capability"] {
+            let mut value=original.clone();
+            match fault {
+                "legacy"=>{value.as_object_mut().unwrap().remove("cache_preparation");},
+                "tree"=>value["cache_preparation"]["binding"]["tree"]="8".repeat(40).into(),
+                "head"=>value["cache_preparation"]["binding"]["head"]="8".repeat(40).into(),
+                "source"=>value["cache_preparation"]["binding"]["source_inputs_sha256"]="unknown".into(),
+                "generation"=>value["cache_preparation"]["binding"]["generation"]=uuid::Uuid::new_v4().to_string().into(),
+                "command"=>value["cache_preparation"]["command"]=uuid::Uuid::new_v4().to_string().into(),
+                "authority"=>value["cache_preparation"]["binding"]["authority_sha256"]="8".repeat(64).into(),
+                "cache"=>value["cache_preparation"]["binding"]["cache_identity_sha256"]="8".repeat(64).into(),
+                "unknown-field"=>value["cache_preparation"]["unrecognized"]=true.into(),
+                "forged-capability"=>value["command_receipt"]=serde_json::json!({"actor":"controller","payload_sha256":"8".repeat(64)}),
+                _=>{}
+            }
+            let outcome:Outcome=serde_json::from_value(value).unwrap();
+            assert!(outcome.command_receipt.is_none(),"VM JSON created host authority");
+            let checked=outcome.validated_preparation(&binding,&generation,&command,&authority,&cache);
+            if matches!(fault,"none"|"forged-capability") {assert!(checked.is_ok(),"{fault}: {checked:?}");}
+            else {assert!(checked.unwrap_err().downcast_ref::<crate::autoship_freshness::Hold>().is_some(),"{fault}");}
+        }
+    }
+
     #[test]
     fn unsettled_prior_hold_blocks_same_lease_session_before_any_new_command() {
         crate::build_storage::ci_holds::with_test_registry(|root,_| {

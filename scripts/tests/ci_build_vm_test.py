@@ -6,6 +6,12 @@ ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('ci_vm',ROOT/'scripts/ci-build-vm.py');adapter=importlib.util.module_from_spec(spec);spec.loader.exec_module(adapter)
 vm=adapter.vm
 class AdapterTests(unittest.TestCase):
+ def prepared_result(self,options,**result):
+  generation=options['ci_context']['generation']
+  result['cache_preparation']={'version':1,'binding':dict(generation['binding']),'command':generation['command'],
+   'outputs_sha256':hashlib.sha256(json.dumps(generation['outputs'],sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+   'dependency_seed':None}
+  return result
  def fixture(self,root):
   for name in ['workspace','state','scratch','objects']:(root/name).mkdir(mode=0o700)
   for name,data in [('runner',b'controller runner'),('contract',b'{"version":1}')]:
@@ -91,7 +97,7 @@ class AdapterTests(unittest.TestCase):
     adapter.execute(request,run=lambda *a,**k:None)
    request['build_cache']=str(Path(d)/'registered-image')
    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
-    result=adapter.execute(request,run=lambda *a,**k:{'exit_code':17,'stdout':'{"status":"passed"}','stderr':''})
+    result=adapter.execute(request,run=lambda *a,**k:self.prepared_result(k,exit_code=17,stdout='{"status":"passed"}',stderr=''))
    self.assertEqual(result['status'],'failed');self.assertEqual(result['exit_code'],17)
 
  def test_declared_outputs_do_not_hide_tracked_or_unexplained_inputs(self):
@@ -114,7 +120,7 @@ class AdapterTests(unittest.TestCase):
      self.assertEqual(options['ci_context']['generation']['outputs'],
       {'node_modules':'directory','dist':'directory','public/tailwind.css':'file'})
      self.assertEqual((workspace/'public/tailwind.css').read_bytes(),b'')
-     return {'exit_code':0,'stdout':'build complete','stderr':''}
+     return self.prepared_result(options,exit_code=0,stdout='build complete',stderr='')
     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      if fault=='none':self.assertEqual(adapter.execute(request,run=execute)['status'],'passed')
@@ -123,6 +129,38 @@ class AdapterTests(unittest.TestCase):
       self.assertEqual(seen,[])
       self.assertFalse((workspace/'dist').exists())
     self.assertEqual((workspace/'public/original.css').read_text(),'original tracked CSS')
+
+ def test_source_verdict_requires_original_root_cache_preparation(self):
+  for status in (0,17):
+   for fault in ('none','missing','command','generation','source','physical-cache','output-policy','seed'):
+    with self.subTest(status=status,fault=fault),tempfile.TemporaryDirectory() as directory:
+     root=Path(directory);request=self.fixture(root)
+     request.update(operation='repository',command='true',build_cache=str(root/'registered-image'))
+     expected=[]
+     def execute(*args,**options):
+      generation=options['ci_context']['generation']
+      preparation={'version':1,'binding':dict(generation['binding']),'command':generation['command'],
+       'outputs_sha256':hashlib.sha256(json.dumps(generation['outputs'],sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+       'dependency_seed':None}
+      expected.append(preparation)
+      value=json.loads(json.dumps(preparation))
+      if fault=='command':value['command']=str(uuid.uuid4())
+      if fault=='generation':value['binding']['generation']=str(uuid.uuid4())
+      if fault=='source':value['binding']['source_inputs_sha256']='1'*64
+      if fault=='physical-cache':value['binding']['cache_identity_sha256']='2'*64
+      if fault=='output-policy':value['outputs_sha256']='3'*64
+      if fault=='seed':value['dependency_seed']='unknown'
+      result={'exit_code':status,'stdout':'source command output','stderr':''}
+      if fault!='missing':result['cache_preparation']=value
+      return result
+     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+      if fault=='none':
+       result=adapter.execute(request,run=execute)
+       self.assertEqual(result['cache_preparation'],expected[0])
+       self.assertEqual(result['status'],'passed' if status==0 else 'failed')
+      else:
+       with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
 
  def test_cache_reuse_capacity_and_private_identity(self):
   with tempfile.TemporaryDirectory() as d:
@@ -165,7 +203,7 @@ class AdapterTests(unittest.TestCase):
      self.assertEqual(argv[:3],['/usr/bin/python3','-I','-c'])
      with patch.object(adapter.subprocess,'run',side_effect=lambda command:seen.append(command) or subprocess.CompletedProcess(command,0)),patch.object(adapter.sys,'argv',['script',argv[4]]):
       exec(argv[3],{})
-     return {'exit_code':0,'stdout':'','stderr':''}
+     return self.prepared_result(kwargs,exit_code=0,stdout='',stderr='')
     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      self.assertEqual(adapter.execute(request,run=run)['status'],'passed')
     self.assertEqual(seen,expected)
@@ -176,7 +214,7 @@ class AdapterTests(unittest.TestCase):
    request=self.fixture(Path(d));request.update(operation='repository',command='printf owner-configured',build_cache=str(Path(d)/'cache'),cache_bytes=67108864)
    def run(runtime,workspace,argv,env,**kwargs):
     self.assertEqual(argv,['/bin/bash','--noprofile','--norc','-o','pipefail','-c','printf owner-configured'])
-    return {'exit_code':12,'stdout':'','stderr':'failed'}
+    return self.prepared_result(kwargs,exit_code=12,stdout='',stderr='failed')
    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
     self.assertEqual(adapter.execute(request,run=run)['status'],'failed')
   with self.assertRaises(vm.Unavailable):adapter.cargo_request({'operation':'repository','command':'x'*65537})

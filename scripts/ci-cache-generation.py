@@ -364,6 +364,38 @@ def prepare(cache, binding, command, worker_uid, worker_gid, *, predecessor=None
     return target
 
 
+def preparation_receipt(target, binding, command, outputs):
+    """Guest-root preparation only; never a compiled-input or passing-CI proof."""
+    validate_binding(binding)
+    validate_outputs(outputs)
+    target = Path(target)
+    record = _read_record(target.parent / "control.json")
+    if (type(record.get("version")) is not int
+            or record != {"version": FORMAT_VERSION, "binding": binding, "active_command": command} or not _uuid(command)):
+        raise FreshnessHold("generation_mismatch")
+    layout = seed_layout(target.parent, binding)
+    if layout is not None and layout["state"] != "ready":
+        raise FreshnessHold("artifact_provenance_unknown")
+    return {"version": 1, "binding": dict(binding), "command": command,
+            "outputs_sha256": hashlib.sha256(json.dumps(outputs, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "dependency_seed": layout["seed"] if layout else None}
+
+
+def validate_preparation(value, binding, command, outputs):
+    validate_binding(binding)
+    validate_outputs(outputs)
+    if value is None:
+        raise FreshnessHold("legacy_format")
+    if (not isinstance(value, dict) or set(value) != {"version", "binding", "command", "outputs_sha256", "dependency_seed"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or value["binding"] != binding or value["command"] != command or not _uuid(command)
+            or value["outputs_sha256"] != hashlib.sha256(json.dumps(outputs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()):
+        raise FreshnessHold("generation_mismatch")
+    if value["dependency_seed"] is not None and not _digest(value["dependency_seed"]):
+        raise FreshnessHold("artifact_provenance_unknown")
+    return value
+
+
 def prepare_outputs(target, outputs, worker_uid, worker_gid):
     """Allocate declared output mounts; they confer no generated-input proof.
 

@@ -267,6 +267,11 @@ def execute(request,run=vm.run,progress=None):
             'boundary':'existing-build-vm','exit_code':outcome['exit_code'],'stdout':outcome['stdout'],'stderr':outcome['stderr'],
             'cache_reclaimed':outcome.get('cache_reclaimed',[]),
             'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
+    if request['operation'] not in ('plan','dependency'):
+        prepared=cache_generation.validate_preparation(outcome.get('cache_preparation'),generation['binding'],generation['command'],generation['outputs'])
+        if dependency is not None and prepared['dependency_seed']!=dependency['seed']:
+            raise cache_generation.FreshnessHold('artifact_provenance_unknown')
+        result['cache_preparation']=prepared
     if dependency is not None:
         observed=outcome.get('dependency_result')
         if (not isinstance(observed,dict) or observed.get('version')!=1 or observed.get('shipping_authority') is not False

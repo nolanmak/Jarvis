@@ -77,9 +77,30 @@ target/debug/seed-consumer
             &storage,&target,&audit,timeout,Some(&install)).await?;
         ensure!(first.status=="passed" && first.stdout.trim()=="[\"seed-consumer\"]\n42",
             "external unit recompiled or consumer failed: {} {}",first.stdout,first.stderr);
+        let committed=first.command_receipt.as_ref().context("successful VM command lacks protected host receipt")?;
+        let record=committed.value();
+        ensure!(record["kind"]=="shared_ci_command_complete" && record["status"]=="passed"
+            && record["shipping_authority"]==false
+            && record["cache_preparation"]["binding"]["generation"]==source.generation()
+            && record["cache_preparation"]["binding"]["head"]==binding.verification_head
+            && record["cache_preparation"]["binding"]["tree"]==binding.index_tree
+            && record["cache_preparation"]["dependency_seed"]==published["seed"],
+            "protected command receipt lost its original source/cache/seed binding");
+        let quiescent=audit.controller_receipt(record["quiescence_receipt_sha256"].as_str()
+            .context("command receipt lacks protected quiescence reference")?)?;
+        ensure!(quiescent.value()["kind"]=="shared_ci_vm_quiescent"
+            && quiescent.value()["command"]==record["cache_preparation"]["command"]
+            && quiescent.value()["generation"]==source.generation(),
+            "command receipt refers to another invocation's teardown");
+        ensure!(audit.controller_receipt(committed.payload_sha256())?.value()==record,
+            "command receipt did not survive committed audit reload");
         let again=session.run("repository",&source,repo,&binding,None,&[],&[],&[],Some(build),
             &storage,&target,&audit,timeout).await?;
         ensure!(again.status=="passed" && again.stdout.trim()=="[]\n42","compatible same-job units recompiled: {} {}",again.stdout,again.stderr);
+        ensure!(again.command_receipt.as_ref().is_some_and(|receipt|
+            receipt.payload_sha256()!=committed.payload_sha256()
+                && receipt.value()["cache_preparation"]["binding"]["generation"]==source.generation()),
+            "repeated command reused an older invocation's protected completion");
         let tamper=r#"python3 -c 'import errno,os; from pathlib import Path
 p=next(Path("target/debug/deps").glob("libitoa-*.rlib"))
 for operation in (lambda:p.write_bytes(b"corrupt"),lambda:p.unlink(),lambda:p.parent.rename(p.parent.with_name("moved"))):
@@ -100,6 +121,7 @@ print("SEALED")'"#;
         "adapter_authority":session.authority_sha256,"generations":generations,
         "external_units_recompiled_across_generations":0,"same_job_compatible_units_recompiled":0,
         "seed_corruption_denied":true,"automatic_seed_lookup":true,"equivalent_controller_restart_reuses_seed":true,
+        "bound_preparation_and_committed_quiescence_receipts":true,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     audit.record_controller(receipt.clone())?;audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;

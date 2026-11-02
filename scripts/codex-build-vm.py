@@ -254,6 +254,7 @@ def observe_phase(value):
 try:
     cache_reclaimed=[]
     dependency_result=None
+    cache_preparation=None
     action=job.get('ci_dependency')
     if action:
         original=job['ci_generation']['binding']
@@ -289,6 +290,7 @@ try:
                 ci_cache['begin_seed_install'](ci_target,generation['binding'],action['seed'])
                 dependency_result=ci_dependency.install(action,seed_binding,ci_target,ci_target.parent/'cargo-home')
                 ci_cache['finish_seed_install'](ci_target,generation['binding'],action['seed'])
+            cache_preparation=ci_cache['preparation_receipt'](ci_target,generation['binding'],generation['command'],generation['outputs'])
             hide_ci_cache()
         else:
             seed_build_cache()
@@ -296,6 +298,7 @@ try:
       result=run_worker(job['argv'])
     if job.get('ci_context'):result['cache_reclaimed']=cache_reclaimed
     if dependency_result is not None:result['dependency_result']=dependency_result
+    if cache_preparation is not None:result['cache_preparation']=cache_preparation
 except Exception as error:
     import errno
     # copytree aggregates per-file failures into shutil.Error without an errno.
@@ -581,6 +584,7 @@ poweroff -f
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
                 expected={'exit_code','stdout','stderr'}|({'cache_reclaimed'} if ci_context is not None else set())
                 if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
+                if ci_context is not None and 'cache_preparation' in result:expected.add('cache_preparation')
                 if set(result) != expected or type(result['exit_code']) is not int:
                     raise Unavailable('invalid VM result')
                 if ci_context is not None:
