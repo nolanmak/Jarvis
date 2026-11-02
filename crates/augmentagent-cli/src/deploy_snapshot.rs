@@ -7,11 +7,19 @@
 //!
 //! * A snapshot is one dated dir: `data.db.gz` (taken with `VACUUM INTO`, so
 //!   it is consistent while the daemon runs), the binary, and a manifest.
-//! * Retention keeps the newest [`DEFAULT_KEEP`] and anything younger than
-//!   [`MIN_AGE_HOURS`]. The newest is never removed: it is what the running
-//!   binary would roll back to.
-//! * The same rule expires the `augmentagent.*` rollback binaries left next
-//!   to the release build.
+//! * Retention keeps the newest [`DEFAULT_KEEP`] snapshots *of each source
+//!   database* (manifest `source_db`) and, while under the storage budget,
+//!   anything younger than [`MIN_AGE_HOURS`]. A group whose database is gone,
+//!   and the legacy group once newer tagged snapshots exist, stop holding
+//!   keep slots.
+//! * Over budget, the budget beats the age rule and protections beat the
+//!   budget (#1815): unpinned, unreferenced snapshots outside the keep slots
+//!   go oldest first until the total fits — and only if it then fits.
+//!   Creation evicts only after the new snapshot is finished and its exact
+//!   size is known. Forensic evidence counts toward the budget but is never
+//!   evicted for it.
+//! * The age rule also expires the `augmentagent.*` rollback binaries left
+//!   next to the release build (one group, not budgeted).
 //! * Backups made by hand before this existed are only listed; removing them
 //!   takes `--strays --yes`.
 
@@ -72,20 +80,120 @@ pub struct Item {
     pub name: String,
     pub age_hours: f64,
     pub bytes: u64,
+    /// The database a rollback snapshot was taken of (manifest `source_db`).
+    /// `None` for snapshots written before it was recorded (the legacy
+    /// group), adopted rollouts, rollback binaries and hand-made backups.
+    pub source: Option<String>,
 }
 
-/// Names to remove: everything past the newest `keep` that is also at least
-/// `min_age_hours` old. `keep` is never below 1 — the newest item is the
-/// rollback target for whatever is running now.
-pub fn select_expired(items: &[Item], keep: usize, min_age_hours: f64) -> Vec<String> {
-    let mut newest_first: Vec<&Item> = items.iter().collect();
-    newest_first.sort_by(|a, b| a.age_hours.total_cmp(&b.age_hours));
-    newest_first
-        .into_iter()
-        .skip(keep.max(1))
-        .filter(|i| i.age_hours >= min_age_hours)
+fn newest_first(items: &[Item]) -> Vec<&Item> {
+    let mut v: Vec<&Item> = items.iter().collect();
+    v.sort_by(|a, b| a.age_hours.total_cmp(&b.age_hours).then_with(|| b.name.cmp(&a.name)));
+    v
+}
+
+/// The newest `keep` (at least one) of each source, unless that source's
+/// group has retired. These are the rollback points of whatever runs now.
+pub fn keep_slots(items: &[Item], keep: usize,
+    retired: &dyn Fn(&Option<String>) -> bool) -> std::collections::HashSet<String> {
+    let mut seen: std::collections::HashMap<&Option<String>, usize> = Default::default();
+    let mut slots = std::collections::HashSet::new();
+    for i in newest_first(items) {
+        let n = seen.entry(&i.source).or_default();
+        if *n < keep.max(1) && !retired(&i.source) {
+            slots.insert(i.name.clone());
+        }
+        *n += 1;
+    }
+    slots
+}
+
+/// The legacy group (no `source_db`) stops holding keep slots once `keep`
+/// snapshots that do record their source are newer than all of it: the
+/// rollback anchors taken since then exist.
+pub fn legacy_retired(items: &[Item], keep: usize) -> bool {
+    let Some(newest_legacy) = items.iter().filter(|i| i.source.is_none())
+        .map(|i| i.age_hours).min_by(f64::total_cmp) else { return false };
+    items.iter().filter(|i| i.source.is_some() && i.age_hours < newest_legacy).count() >= keep.max(1)
+}
+
+/// Which groups no longer hold keep slots: a source database that no longer
+/// exists (a removed worktree, a temp DB), and the superseded legacy group.
+pub fn group_retirement(items: &[Item], keep: usize) -> impl Fn(&Option<String>) -> bool {
+    let legacy = legacy_retired(items, keep);
+    move |source: &Option<String>| match source {
+        Some(path) => !Path::new(path).exists(),
+        None => legacy,
+    }
+}
+
+fn select_outside(items: &[Item], slots: &std::collections::HashSet<String>, min_age_hours: f64) -> Vec<String> {
+    newest_first(items).into_iter()
+        .filter(|i| !slots.contains(&i.name) && i.age_hours >= min_age_hours)
         .map(|i| i.name.clone())
         .collect()
+}
+
+/// Names to remove: everything past the newest `keep` of its source that is
+/// also at least `min_age_hours` old. `keep` is never below 1 — the newest
+/// item is the rollback target for whatever is running now.
+pub fn select_expired(items: &[Item], keep: usize, min_age_hours: f64) -> Vec<String> {
+    select_outside(items, &keep_slots(items, keep, &|_| false), min_age_hours)
+}
+
+/// What the budget pass decided (#1815). Sizes are allocated bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetPlan {
+    pub budget: u64,
+    pub incoming: u64,
+    /// Everything retained now, before any eviction.
+    pub before: u64,
+    /// Retained once `evict` is gone (equals `before` when nothing fits).
+    pub after: u64,
+    /// Whether `after + incoming <= budget`.
+    pub fits: bool,
+    /// Oldest first. Empty unless evicting them makes it fit.
+    pub evict: Vec<(String, u64)>,
+    /// When it cannot fit: every item that eviction may not touch, with why.
+    pub blockers: Vec<(String, String, u64)>,
+}
+
+/// Budget beats age; protections beat budget. Evict unprotected candidates
+/// outside the keep slots, oldest first, until `retained + incoming` fits —
+/// and only if it then fits: deleting rollback points that cannot make room
+/// loses them for nothing. `fixed` are items that count but are never
+/// candidates (forensic evidence), with the reason they are held.
+pub fn plan_budget(candidates: &[Item], slots: &std::collections::HashSet<String>,
+    protection: &dyn Fn(&str) -> Option<String>, fixed: &[(String, String, u64)],
+    budget: u64, incoming: u64) -> BudgetPlan {
+    let before = candidates.iter().map(|i| i.bytes).sum::<u64>()
+        .saturating_add(fixed.iter().map(|f| f.2).sum());
+    let mut plan = BudgetPlan { budget, incoming, before, after: before, fits: true, evict: vec![], blockers: vec![] };
+    if before.saturating_add(incoming) <= budget {
+        return plan;
+    }
+    let mut after = before;
+    let mut evict = Vec::new();
+    for i in newest_first(candidates).into_iter().rev() {
+        if after.saturating_add(incoming) <= budget { break; }
+        if slots.contains(&i.name) || protection(&i.name).is_some() { continue; }
+        after = after.saturating_sub(i.bytes);
+        evict.push((i.name.clone(), i.bytes));
+    }
+    if after.saturating_add(incoming) <= budget {
+        plan.after = after;
+        plan.evict = evict;
+        return plan;
+    }
+    plan.fits = false;
+    plan.blockers = fixed.to_vec();
+    for i in newest_first(candidates).into_iter().rev() {
+        let why = protection(&i.name).or_else(|| slots.contains(&i.name).then(|| {
+            if i.source.is_some() { "newest for its database" } else { "newest legacy snapshot" }.to_string()
+        }));
+        if let Some(why) = why { plan.blockers.push((i.name.clone(), why, i.bytes)); }
+    }
+    plan
 }
 
 /// A rollback binary beside the release build: `augmentagent.pre-440`,
@@ -135,7 +243,7 @@ fn items_in(dir: &Path, now: SystemTime, want: &dyn Fn(&str, bool) -> bool) -> V
             if meta.file_type().is_symlink() || !want(&name, meta.is_dir()) {
                 return None;
             }
-            Some(Item { bytes: crate::disk::disk_bytes(&path), age_hours: age_hours(&path, now), name })
+            Some(Item { bytes: crate::disk::disk_bytes(&path), age_hours: age_hours(&path, now), name, source: None })
         })
         .collect()
 }
@@ -172,16 +280,16 @@ pub fn snapshot_forensic(db:&Path,root:&Path,label:&str,now:chrono::DateTime<chr
 }
 fn forensic_snapshot_budgeted(db:&Path,root:&Path,label:&str,now:chrono::DateTime<chrono::Utc>,
     limits:SnapshotLimits)->Result<PathBuf> {
-    snapshot_budgeted_mode(db,None,root,label,None,now,limits,true,None)
+    snapshot_with_mode(db,None,root,label,None,now,limits,true,None,&crate::snapshot_refs::collect)
 }
 
 /// Capture through the maintenance connection so its exclusive database lock
 /// remains held from the preflight through the durable evidence capture.
 pub(crate) fn snapshot_forensic_connection(db: &Path, connection: &rusqlite::Connection,
     root: &Path, label: &str) -> Result<PathBuf> {
-    snapshot_budgeted_mode(db,None,root,label,None,chrono::Utc::now(),SnapshotLimits {
+    snapshot_with_mode(db,None,root,label,None,chrono::Utc::now(),SnapshotLimits {
         budget_bytes:budget_bytes(),reserve_gb:crate::disk::gate_min_free_gb(),
-    },true,Some(connection))
+    },true,Some(connection),&crate::snapshot_refs::collect)
 }
 
 struct SnapshotLimits {
@@ -191,7 +299,15 @@ struct SnapshotLimits {
 
 fn snapshot_budgeted(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
     git_sha: Option<&str>, now: chrono::DateTime<chrono::Utc>, limits: SnapshotLimits) -> Result<PathBuf> {
-    snapshot_budgeted_mode(db,binary,root,label,git_sha,now,limits,false,None)
+    snapshot_with_mode(db,binary,root,label,git_sha,now,limits,false,None,&crate::snapshot_refs::collect)
+}
+
+/// A rollback snapshot with the reference probe supplied (tests).
+#[cfg(test)]
+fn snapshot_with(db: &Path, binary: Option<&Path>, root: &Path, label: &str,
+    now: chrono::DateTime<chrono::Utc>, limits: SnapshotLimits,
+    collect: &dyn Fn() -> crate::snapshot_refs::References) -> Result<PathBuf> {
+    snapshot_with_mode(db, binary, root, label, None, now, limits, false, None, collect)
 }
 fn create_root_durable(root: &Path) -> Result<()> {
     let absolute=if root.is_absolute() {root.to_path_buf()}else{std::env::current_dir()?.join(root)};
@@ -210,9 +326,20 @@ fn create_root_durable(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
+/// Creation, under the retention lease (#1815):
+/// 1. scheduled retention (age rule, then the budget with nothing incoming);
+/// 2. refuse at once, deleting nothing, when even an empty snapshot could not
+///    fit beside what eviction may not touch;
+/// 3. the free-space check and reservation;
+/// 4. copy and compress;
+/// 5. with the exact size known and fresh reference evidence, evict oldest
+///    first to make room — or remove the new dir and refuse, deleting nothing.
+/// Eviction only ever follows a finished snapshot that is known to fit, so
+/// no rollback point is spent on a copy that then fails.
+#[allow(clippy::too_many_arguments)]
+fn snapshot_with_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
     git_sha:Option<&str>,now:chrono::DateTime<chrono::Utc>,limits:SnapshotLimits,forensic:bool,
-    source:Option<&rusqlite::Connection>)->Result<PathBuf> {
+    source:Option<&rusqlite::Connection>,collect:&dyn Fn()->crate::snapshot_refs::References)->Result<PathBuf> {
     let SnapshotLimits { budget_bytes: budget, reserve_gb } = limits;
     if !db.is_file() {
         bail!("no database at {}", db.display());
@@ -221,12 +348,17 @@ fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
     let db_bytes = std::fs::metadata(db)?.len().saturating_add(std::fs::metadata(wal).map_or(0, |m| m.len()));
     create_root_durable(root).with_context(|| format!("create {}", root.display()))?;
     let _lease = retention_lease(root)?.context("snapshot retention/creation busy; retry")?;
-    let refs = crate::snapshot_refs::collect();
-    prune_locked(root, None, &[], &PruneOptions { keep: keep_from_env(), ..Default::default() }, SystemTime::now(), &refs);
+    let source_db = if forensic { None } else {
+        Some(std::fs::canonicalize(db).with_context(|| format!("resolve {}", db.display()))?.display().to_string())
+    };
+    let keep = keep_from_env();
+    let opts = PruneOptions { keep, budget_bytes: Some(budget), ..Default::default() };
+    let refs = collect();
+    prune_locked(root, None, &[], &opts, SystemTime::now(), &refs);
     let binary_bytes = binary.and_then(|b| std::fs::metadata(b).ok()).map_or(0, |m| m.len());
-    let retained = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>();
-    if retained.saturating_add(db_bytes).saturating_add(binary_bytes) > budget {
-        bail!("{}", budget_refusal(&refs));
+    let floor = plan_root(root, keep, SystemTime::now(), &refs, budget, 1, &Default::default());
+    if !floor.fits {
+        bail!("{}", budget_refusal(&floor, &refs));
     }
     create_root_durable(root).with_context(|| format!("create {}", root.display()))?;
     // Plain and gzip copies coexist during compression. Include the binary,
@@ -305,10 +437,20 @@ fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
                 .with_context(|| format!("copy {}", bin.display()))?;
         }
         let gz_bytes = std::fs::metadata(&gz_path)?.len();
-        if retained.saturating_add(gz_bytes).saturating_add(binary_bytes) > budget {
-            bail!("compressed snapshot exceeds storage budget; incomplete snapshot removed");
+        // The manifest is not written yet, so the new dir is not an item: it
+        // takes no keep slot and cannot be chosen for eviction.
+        let fresh = collect();
+        let exact = crate::disk::disk_bytes(&dir).saturating_add(4096);
+        let plan = plan_root(root, keep, SystemTime::now(), &fresh, budget, exact, &Default::default());
+        if !plan.fits {
+            bail!("{}", budget_refusal(&plan, &fresh));
         }
-        let manifest = serde_json::json!({
+        for record in apply_evictions(root, &plan, false) {
+            if !record.removed {
+                bail!("could not evict {} to make room; incomplete snapshot removed", record.path);
+            }
+        }
+        let mut manifest = serde_json::json!({
             "owner": "augmentagent-snapshot-v1",
             "kind": if forensic {"forensic-page-image"} else {"rollback"},
             "restorable": !forensic,
@@ -320,6 +462,9 @@ fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
             "db_gz_bytes": gz_bytes,
             "has_binary": dir.join(BINARY_NAME).is_file(),
         });
+        // Rollbacks record which database they hold, so keep slots are per
+        // database (#1815). Forensic evidence has no keep group.
+        if let Some(source) = &source_db { manifest["source_db"] = source.clone().into(); }
         if forensic {
             std::fs::write(dir.join(".pin"),"Forensic recovery evidence: verify repair before unpinning; never restore as a rollback")?;
             std::fs::File::open(dir.join(".pin"))?.sync_all()?;
@@ -335,7 +480,7 @@ fn snapshot_budgeted_mode(db:&Path,binary:Option<&Path>,root:&Path,label:&str,
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    prune_locked(root, None, &[], &PruneOptions { keep: keep_from_env(), ..Default::default() }, SystemTime::now(), &refs);
+    prune_locked(root, None, &[], &opts, SystemTime::now(), &refs);
     Ok(dir)
 }
 
@@ -401,6 +546,9 @@ pub struct PruneOptions {
     /// Required to actually remove strays.
     pub yes: bool,
     pub keep: usize,
+    /// Snapshot storage budget in bytes; `None` reads
+    /// `AUGMENTAGENT_DEPLOY_MAX_GB` once, at the entry point.
+    pub budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -460,13 +608,34 @@ pub fn prune_with_refs(
     prune_locked(root, release_dir, strays, opts, now, refs)
 }
 
-/// The refusal when retained snapshots leave no room. When missing evidence
-/// is what kept them, say which, so the freeze is diagnosable from the error.
-fn budget_refusal(refs: &crate::snapshot_refs::References) -> String {
-    let mut msg = "snapshot storage budget exhausted (including protected snapshots); prune, unpin obsolete rollbacks, or increase AUGMENTAGENT_DEPLOY_MAX_GB".to_string();
+/// The refusal when eviction cannot make room. It is read by whoever ran
+/// `deploy snapshot` — often an agent — so it names what holds the space,
+/// says what each blocker means, and addresses agents directly. It never
+/// names the budget variable: raising it to get past this is how the cap was
+/// bypassed (#1815).
+fn budget_refusal(plan: &BudgetPlan, refs: &crate::snapshot_refs::References) -> String {
+    let mut msg = format!("snapshot storage budget exhausted: {} needed, {} budget",
+        fmt_size(plan.after.saturating_add(plan.incoming)), fmt_size(plan.budget));
+    if !plan.blockers.is_empty() {
+        let shown: Vec<String> = plan.blockers.iter().take(5)
+            .map(|(name, why, bytes)| format!("{name} ({why}, {})", fmt_size(*bytes))).collect();
+        msg.push_str(&format!("; non-evictable: {}", shown.join(", ")));
+        if plan.blockers.len() > 5 { msg.push_str(&format!(" +{} more", plan.blockers.len() - 5)); }
+    }
+    let has = |p: &str| plan.blockers.iter().any(|(_, why, _)| why.starts_with(p));
+    if has("pinned") {
+        msg.push_str("; pinned snapshots are released only by the owner (`augmentagent deploy list` shows them; forensic evidence and adopted rollouts need checking first)");
+    }
+    if has("referenced") {
+        msg.push_str("; a running process or unit uses a referenced snapshot, which becomes evictable when that stops");
+    }
+    if has("newest") {
+        msg.push_str("; newest rollback points age out of their slots as newer snapshots are taken");
+    }
     if !refs.reliable {
         msg.push_str(&format!("; retention blocked: reference probe unavailable ({})", refs.unavailable_summary()));
     }
+    msg.push_str(". Agents: report this to the owner; do not unpin, delete snapshots, or override storage limits.");
     msg
 }
 
@@ -509,15 +678,64 @@ fn snapshot_items(root: &Path, now: SystemTime) -> Vec<Item> {
         if m.get("external_path").is_some() {
             i.bytes += crate::disk::disk_bytes(&external_path(&p)?);
         }
+        i.source = m.get("source_db").and_then(|v| v.as_str()).map(str::to_owned);
         Some(i)
     }).collect()
 }
 
-fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opts: &PruneOptions,
-    now: SystemTime, refs: &crate::snapshot_refs::References) -> Vec<Removal> {
+fn is_forensic(root: &Path, name: &str) -> bool {
+    manifest(&root.join(name)).and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+        .as_deref() == Some("forensic-page-image")
+}
+
+/// Why `name` under `root` must stay, from the reference evidence on the
+/// snapshot dir or, for an adopted rollout, its external dir.
+fn protection_of(root: &Path, name: &str, refs: &crate::snapshot_refs::References) -> Option<String> {
+    let path = root.join(name);
+    refs.retention_reason(&path)
+        .or_else(|| external_path(&path).and_then(|p| refs.retention_reason(&p)))
+        .map(|p| p.to_string())
+}
+
+/// The budget plan for `root` as it stands, ignoring `gone` (already
+/// removed, or removed in this dry run). Rollback snapshots — including
+/// legacy manifests without a `kind`, and adopted rollouts — are the
+/// candidates; forensic evidence counts but is never evicted.
+fn plan_root(root: &Path, keep: usize, now: SystemTime, refs: &crate::snapshot_refs::References,
+    budget: u64, incoming: u64, gone: &std::collections::HashSet<String>) -> BudgetPlan {
+    let items: Vec<Item> = snapshot_items(root, now).into_iter().filter(|i| !gone.contains(&i.name)).collect();
+    let (forensic, candidates): (Vec<Item>, Vec<Item>) = items.into_iter().partition(|i| is_forensic(root, &i.name));
+    let slots = keep_slots(&candidates, keep, &group_retirement(&candidates, keep));
+    let fixed: Vec<(String, String, u64)> = forensic.iter().map(|i| {
+        (i.name.clone(), protection_of(root, &i.name, refs).unwrap_or_else(|| "forensic evidence".into()), i.bytes)
+    }).collect();
+    plan_budget(&candidates, &slots, &|n| protection_of(root, n, refs), &fixed, budget, incoming)
+}
+
+fn apply_evictions(root: &Path, plan: &BudgetPlan, dry_run: bool) -> Vec<Removal> {
+    plan.evict.iter().map(|(name, bytes)| {
+        let path = root.join(name);
+        let external = external_path(&path);
+        let removed = !dry_run && external.as_deref().is_none_or(remove) && remove(&path);
+        let reason = if dry_run { "would remove: over budget, oldest first" }
+            else if removed { "removed: over budget, oldest first" }
+            else { "failed to remove; no recovery claimed" };
+        Removal { kind: "snapshot", path: path.display().to_string(), bytes: *bytes, removed, reason: reason.into() }
+    }).collect()
+}
+
+/// Retention for the snapshot root, rollback binaries and (opt-in) hand-made
+/// backups. Order: the age rule; then the budget, oldest first, over what
+/// the age rule left (a dry run treats its picks as gone, so it plans what a
+/// real run does). Returns the records and the budget plan.
+fn prune_core(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opts: &PruneOptions,
+    now: SystemTime, refs: &crate::snapshot_refs::References) -> (Vec<Removal>, BudgetPlan) {
+    let budget = opts.budget_bytes.unwrap_or_else(budget_bytes);
     let mut out = Vec::new();
-    let mut expire = |kind: &'static str, dir: &Path, items: Vec<Item>, min_age: f64, act: bool| {
-        for name in select_expired(&items, opts.keep, min_age) {
+    let mut gone = std::collections::HashSet::new();
+    let mut expire = |kind: &'static str, dir: &Path, items: Vec<Item>, slots: std::collections::HashSet<String>,
+        min_age: f64, act: bool, gone: &mut std::collections::HashSet<String>| {
+        for name in select_outside(&items, &slots, min_age) {
             let path = dir.join(&name);
             let external = external_path(&path);
             let bytes = items.iter().find(|i| i.name == name).map_or(0, |i| i.bytes);
@@ -525,6 +743,7 @@ fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opt
                 .or_else(|| external.as_deref().and_then(|p| refs.retention_reason(p)));
             let removed = kept.is_none() && act && !opts.dry_run
                 && external.as_deref().is_none_or(remove) && remove(&path);
+            if removed || (kept.is_none() && act && opts.dry_run) { gone.insert(name.clone()); }
             let reason = if let Some(why) = &kept { format!("kept: {why}") }
                 else if !act || opts.dry_run { "would remove: past count and minimum age".into() }
                 else if removed { "removed: past count and minimum age".into() }
@@ -532,27 +751,75 @@ fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opt
             out.push(Removal { kind, path: path.display().to_string(), bytes, removed, reason });
         }
     };
-    let (forensic,rollbacks): (Vec<_>,Vec<_>)=snapshot_items(root,now).into_iter().partition(|item|
-        manifest(&root.join(&item.name)).and_then(|value|value.get("kind").and_then(|v|v.as_str()).map(str::to_owned))
-            .as_deref()==Some("forensic-page-image"));
+    let (forensic, rollbacks): (Vec<_>, Vec<_>) = snapshot_items(root, now).into_iter()
+        .partition(|item| is_forensic(root, &item.name));
     // Evidence has its own retention slots and is pinned on capture. It must
     // never evict one of the requested healthy rollback generations.
-    expire("snapshot", root, rollbacks, MIN_AGE_HOURS, true);
-    expire("forensic snapshot",root,forensic,MIN_AGE_HOURS,true);
+    let rollback_slots = keep_slots(&rollbacks, opts.keep, &group_retirement(&rollbacks, opts.keep));
+    let forensic_slots = keep_slots(&forensic, opts.keep, &|_| false);
+    expire("snapshot", root, rollbacks, rollback_slots, MIN_AGE_HOURS, true, &mut gone);
+    expire("forensic snapshot", root, forensic, forensic_slots, MIN_AGE_HOURS, true, &mut gone);
     if let Some(dir) = release_dir {
-        expire("rollback binary", dir, items_in(dir, now, &|name, is_dir| !is_dir && is_rollback_binary(name)), MIN_AGE_HOURS, true);
+        let items = items_in(dir, now, &|name, is_dir| !is_dir && is_rollback_binary(name));
+        let slots = keep_slots(&items, opts.keep, &|_| false);
+        expire("rollback binary", dir, items, slots, MIN_AGE_HOURS, true, &mut std::collections::HashSet::new());
     }
     if opts.strays {
         for dir in strays {
-            expire("hand-made backup", dir, items_in(dir, now, &|name, _| !name.ends_with(".json")), STRAY_DAYS * 24.0, opts.yes);
+            let items = items_in(dir, now, &|name, _| !name.ends_with(".json"));
+            let slots = keep_slots(&items, opts.keep, &|_| false);
+            expire("hand-made backup", dir, items, slots, STRAY_DAYS * 24.0, opts.yes, &mut std::collections::HashSet::new());
         }
     }
-    let total: u64 = snapshot_items(root, now).iter().map(|i| i.bytes).sum();
-    if total > budget_bytes() {
-        out.push(Removal { kind: "budget", path: root.display().to_string(), bytes: total, removed: false,
-            reason: "over budget: protected/newest snapshots retained; new snapshots refused until headroom restored".into() });
+    let mut plan = plan_root(root, opts.keep, now, refs, budget, 0, &gone);
+    if plan.fits {
+        let records = apply_evictions(root, &plan, opts.dry_run);
+        // A failed removal still holds its bytes.
+        plan.after += records.iter().filter(|r| !r.removed && !opts.dry_run).map(|r| r.bytes).sum::<u64>();
+        out.extend(records);
+    } else {
+        // One `kept:` record per item eviction may not touch, replacing any
+        // age-rule record for the same path, then the summary.
+        for (name, why, bytes) in &plan.blockers {
+            let path = root.join(name).display().to_string();
+            let kind = if is_forensic(root, name) { "forensic snapshot" } else { "snapshot" };
+            out.retain(|r| !(r.path == path && r.reason.starts_with("kept:")));
+            out.push(Removal { kind, path, bytes: *bytes, removed: false, reason: format!("kept: {why}") });
+        }
+        out.push(Removal { kind: "budget", path: root.display().to_string(), bytes: plan.after, removed: false,
+            reason: format!("over budget: {} retained, budget {}; nothing evictable (see kept: lines)",
+                fmt_size(plan.after), fmt_size(budget)) });
     }
-    out
+    (out, plan)
+}
+
+fn prune_locked(root: &Path, release_dir: Option<&Path>, strays: &[PathBuf], opts: &PruneOptions,
+    now: SystemTime, refs: &crate::snapshot_refs::References) -> Vec<Removal> {
+    prune_core(root, release_dir, strays, opts, now, refs).0
+}
+
+/// A snapshot root that retention cannot bring under its budget: only
+/// pinned, referenced, newest-per-database or evidence material remains.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetStatus {
+    pub after_bytes: u64,
+    pub budget_bytes: u64,
+    /// `(snapshot, why it is held, bytes)`.
+    pub blockers: Vec<(String, String, u64)>,
+}
+
+/// For `autopr-health`: the same pipeline as `deploy prune --dry-run`,
+/// read-only and without the lease. `None` when there is no root or the
+/// next prune brings it under budget.
+pub fn budget_status(root: &Path) -> Option<BudgetStatus> {
+    budget_status_with(root, keep_from_env(), budget_bytes(), &crate::snapshot_refs::collect())
+}
+
+fn budget_status_with(root: &Path, keep: usize, budget: u64, refs: &crate::snapshot_refs::References) -> Option<BudgetStatus> {
+    if !root.is_dir() { return None; }
+    let opts = PruneOptions { keep, budget_bytes: Some(budget), dry_run: true, ..Default::default() };
+    let (_, plan) = prune_core(root, None, &[], &opts, SystemTime::now(), refs);
+    (!plan.fits).then(|| BudgetStatus { after_bytes: plan.after, budget_bytes: budget, blockers: plan.blockers })
 }
 
 pub fn set_pin(root: &Path, name: &str, reason: Option<&str>) -> Result<()> {
@@ -1185,6 +1452,8 @@ mod tests {
     // ---------------------------------------------------------------------
 
     const MB: u64 = 1024 * 1024;
+    /// A source database path that exists, so its keep group is live.
+    const LIVE_DB: &str = env!("CARGO_MANIFEST_DIR");
 
     fn src(name: &str, age_hours: f64, bytes: u64, source: Option<&str>) -> Item {
         Item { name: name.into(), age_hours, bytes, source: source.map(str::to_owned) }
@@ -1350,7 +1619,7 @@ mod tests {
     #[test]
     fn under_budget_nothing_young_is_removed() {
         let t = tempfile::tempdir().unwrap(); let root = t.path();
-        for (n, h) in [("a", 40.0), ("b", 30.0), ("c", 1.0)] { fixture(root, n, h, 1024, Some("/db")); }
+        for (n, h) in [("a", 40.0), ("b", 30.0), ("c", 1.0)] { fixture(root, n, h, 1024, Some(LIVE_DB)); }
         let out = prune_locked(root, None, &[], &budgeted(1, u64::MAX, false), SystemTime::now(), &reliable());
         assert!(out.is_empty(), "{out:?}");
         for n in ["a", "b", "c"] { assert!(root.join(n).exists()); }
@@ -1359,7 +1628,7 @@ mod tests {
     #[test]
     fn dry_run_counts_age_rule_removals_as_gone_before_planning_the_budget() {
         let t = tempfile::tempdir().unwrap(); let root = t.path();
-        for (n, h) in [("ancient", 400.0), ("young-old", 30.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        for (n, h) in [("ancient", 400.0), ("young-old", 30.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some(LIVE_DB)); }
         let one: u64 = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).max().unwrap();
         // After the age rule takes `ancient`, three remain; budget fits two
         // plus slack, so exactly `young-old` goes for the budget.
@@ -1374,7 +1643,7 @@ mod tests {
     fn each_protection_survives_budget_eviction_and_the_next_oldest_goes() {
         for class in ["pinned", "referenced", "unavailable"] {
             let t = tempfile::tempdir().unwrap(); let root = t.path();
-            for (n, h) in [("guarded", 40.0), ("free", 30.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+            for (n, h) in [("guarded", 40.0), ("free", 30.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some(LIVE_DB)); }
             let one: u64 = snapshot_items(root, SystemTime::now()).iter().map(|i| i.bytes).max().unwrap();
             let mut refs = reliable();
             match class {
@@ -1399,7 +1668,7 @@ mod tests {
     #[test]
     fn when_nothing_can_make_room_prune_names_each_blocker_once_and_summarises() {
         let t = tempfile::tempdir().unwrap(); let root = t.path();
-        for (n, h) in [("pinned-old", 400.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        for (n, h) in [("pinned-old", 400.0), ("n1", 2.0), ("n2", 1.0)] { fixture(root, n, h, MB as usize, Some(LIVE_DB)); }
         std::fs::write(root.join("pinned-old/.pin"), "keep").unwrap(); aged(&root.join("pinned-old"), 400.0);
         let out = prune_locked(root, None, &[], &budgeted(2, MB, false), SystemTime::now(), &reliable());
         for n in ["pinned-old", "n1", "n2"] { assert!(root.join(n).exists()); }
@@ -1421,7 +1690,7 @@ mod tests {
         std::fs::write(ev.join(FORENSIC_DB_NAME), vec![1u8; 2 * MB as usize]).unwrap();
         std::fs::write(ev.join(MANIFEST_NAME), serde_json::to_vec(&serde_json::json!({"created_at":"2026-01-01T00:00:00Z","db_bytes":1,"kind":"forensic-page-image","restorable":false})).unwrap()).unwrap();
         aged(&ev, 500.0);
-        for (n, h) in [("r-old", 30.0), ("n1", 2.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        for (n, h) in [("r-old", 30.0), ("n1", 2.0)] { fixture(root, n, h, MB as usize, Some(LIVE_DB)); }
         // Unpinned evidence older than everything: the budget still must not take it.
         let out = prune_locked(root, None, &[], &budgeted(1, 3 * MB + MB / 2, false), SystemTime::now(), &reliable());
         assert!(ev.exists(), "{out:?}");
@@ -1438,8 +1707,10 @@ mod tests {
         let one = crate::disk::disk_bytes(&first);
         for (n, h) in [("young-a", 20.0), ("young-b", 10.0)] { fixture(&root, n, h, one as usize, Some(&canonical)); }
         aged(&first, 30.0);
-        // Room for three snapshots: the oldest (`first`, 30 h) must go.
-        let budget = 3 * one + one / 2;
+        // Room for the two young ones plus the new one (about `one`), not
+        // for `first` as well: the oldest (30 h) must go.
+        let held: u64 = snapshot_items(&root, SystemTime::now()).iter().map(|i| i.bytes).sum();
+        let budget = held - one + one + one / 2;
         let dir = snapshot_with(&db, None, &root, "new", now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, &reliable).unwrap();
         assert!(dir.exists() && !first.exists());
         let m: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_NAME)).unwrap()).unwrap();
@@ -1449,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn creation_refuses_with_zero_deletions_when_history_says_it_cannot_fit() {
+    fn creation_refuses_with_zero_deletions_when_eviction_cannot_make_room() {
         let t = tempfile::tempdir().unwrap();
         let db = t.path().join("data.db"); seeded_db(&db, 2000);
         let root = t.path().join("snaps");
@@ -1458,43 +1729,20 @@ mod tests {
         std::fs::write(a.join(".pin"), "owner").unwrap(); aged(&a, 20.0);
         fixture(&root, "newest", 1.0, 200_000, Some(&canonical));
         let before: Vec<_> = { let mut v: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect(); v.sort(); v };
-        let err = snapshot_with(&db, None, &root, "x", now(), SnapshotLimits { budget_bytes: 450_000, reserve_gb: 0.0 }, &reliable).unwrap_err().to_string();
+        let held: u64 = snapshot_items(&root, SystemTime::now()).iter().map(|i| i.bytes).sum();
+        let err = snapshot_with(&db, None, &root, "x", now(), SnapshotLimits { budget_bytes: held + 1000, reserve_gb: 0.0 }, &reliable).unwrap_err().to_string();
         assert!(err.starts_with("snapshot storage budget exhausted"), "{err}");
         let after: Vec<_> = { let mut v: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect(); v.sort(); v };
         assert_eq!(before, after, "nothing deleted, nothing half-written");
     }
 
     #[test]
-    fn the_history_estimate_admits_what_the_raw_estimate_would_refuse() {
-        // Raw estimate (uncompressed db) exceeds the budget; the snapshot
-        // itself, like its predecessor, compresses far below it.
+    fn a_database_larger_than_the_budget_still_snapshots_when_it_compresses_under_it() {
         let t = tempfile::tempdir().unwrap();
         let db = t.path().join("data.db"); seeded_db(&db, 4000);
         let raw = std::fs::metadata(&db).unwrap().len();
         let root = t.path().join("snaps");
-        let first = snapshot_with(&db, None, &root, "first", now(), SnapshotLimits { budget_bytes: u64::MAX, reserve_gb: 0.0 }, &reliable).unwrap();
-        let one = crate::disk::disk_bytes(&first);
-        assert!(raw > 3 * one, "fixture must compress well: raw {raw}, snapshot {one}");
-        let budget = 2 * one + one / 2;
-        assert!(one + raw > budget);
-        snapshot_with(&db, None, &root, "second", now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, &reliable).unwrap();
-        // A legacy snapshot of a same-size database also informs the estimate.
-        let t2 = tempfile::tempdir().unwrap();
-        let root2 = t2.path().join("snaps");
-        let legacy = root2.join("legacy"); std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join(DB_NAME), vec![0u8; one as usize]).unwrap();
-        std::fs::write(legacy.join(MANIFEST_NAME), serde_json::to_vec(&serde_json::json!({"created_at":"2026-01-01T00:00:00Z","db_bytes": raw, "db_gz_bytes": one})).unwrap()).unwrap();
-        aged(&legacy, 1.0);
-        snapshot_with(&db, None, &root2, "after-legacy", now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, &reliable).unwrap();
-    }
-
-    #[test]
-    fn a_fallback_estimate_that_fits_once_compressed_still_succeeds() {
-        let t = tempfile::tempdir().unwrap();
-        let db = t.path().join("data.db"); seeded_db(&db, 4000);
-        let raw = std::fs::metadata(&db).unwrap().len();
-        let root = t.path().join("snaps");
-        // No history at all: the raw estimate does not fit, the real one does.
+        // Admission no longer charges the uncompressed database (#1815).
         let dir = snapshot_with(&db, None, &root, "only", now(), SnapshotLimits { budget_bytes: raw / 2, reserve_gb: 0.0 }, &reliable).unwrap();
         assert!(dir.exists());
     }
@@ -1517,8 +1765,8 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let source = t.path().join("source.db"); drop(forensic_source(&source, false));
         let root = t.path().join("snapshots");
-        for (n, h) in [("r-old", 30.0), ("r1", 2.0), ("r2", 1.0)] { fixture(&root, n, h, 200_000, Some("/db")); }
-        let budget = snapshot_items(&root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>() + 50_000;
+        for (n, h) in [("r-old", 30.0), ("r1", 2.0), ("r2", 1.0)] { fixture(&root, n, h, 200_000, Some(LIVE_DB)); }
+        let budget = snapshot_items(&root, SystemTime::now()).iter().map(|i| i.bytes).sum::<u64>() + 1;
         let dir = snapshot_with_mode(&source, None, &root, "evidence", None, now(), SnapshotLimits { budget_bytes: budget, reserve_gb: 0.0 }, true, None, &reliable).unwrap();
         let m: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_NAME)).unwrap()).unwrap();
         assert!(m.get("source_db").is_none());
@@ -1534,13 +1782,14 @@ mod tests {
         let msg = budget_refusal(&plan, &reliable());
         assert!(msg.starts_with("snapshot storage budget exhausted"), "{msg}");
         assert!(msg.contains("pre-1 (pinned") && msg.contains("n1 (newest for its database"), "{msg}");
-        assert!(msg.contains("augmentagent deploy unpin NAME"), "{msg}");
+        assert!(msg.contains("released only by the owner"), "{msg}");
+        assert!(!msg.contains("deploy unpin"), "never hand agents the command: {msg}");
         assert!(msg.contains("age out of their slots"), "{msg}");
         assert!(!msg.contains("running process"), "no hint for an absent reason: {msg}");
         assert!(msg.ends_with("Agents: report this to the owner; do not unpin, delete snapshots, or override storage limits."), "{msg}");
         assert!(!msg.contains("AUGMENTAGENT_DEPLOY_MAX_GB"), "{msg}");
         let only_newest = BudgetPlan { blockers: vec![("n1".into(), "newest for its database".into(), 5 * MB)], ..plan.clone() };
-        assert!(!budget_refusal(&only_newest, &reliable()).contains("deploy unpin"));
+        assert!(!budget_refusal(&only_newest, &reliable()).contains("owner ("));
         let many = BudgetPlan { blockers: (0..8).map(|i| (format!("p{i}"), "pinned".into(), MB)).collect(), ..plan };
         assert!(budget_refusal(&many, &reliable()).contains("+3 more"));
     }
@@ -1559,12 +1808,12 @@ mod tests {
     #[test]
     fn budget_status_reports_only_a_root_that_cannot_be_brought_under_budget() {
         let t = tempfile::tempdir().unwrap(); let root = t.path();
-        assert!(budget_status_with(&root.join("missing"), MB, &reliable()).is_none());
-        for (n, h) in [("old", 30.0), ("n1", 1.0)] { fixture(root, n, h, MB as usize, Some("/db")); }
+        assert!(budget_status_with(&root.join("missing"), 1, MB, &reliable()).is_none());
+        for (n, h) in [("old", 30.0), ("n1", 1.0)] { fixture(root, n, h, MB as usize, Some(LIVE_DB)); }
         // Evicting `old` fits: nothing to report.
-        assert!(budget_status_with(root, MB + MB / 2, &reliable()).is_none());
+        assert!(budget_status_with(root, 1, MB + MB / 2, &reliable()).is_none());
         std::fs::write(root.join("old/.pin"), "owner").unwrap(); aged(&root.join("old"), 30.0);
-        let status = budget_status_with(root, MB + MB / 2, &reliable()).unwrap();
+        let status = budget_status_with(root, 1, MB + MB / 2, &reliable()).unwrap();
         assert!(status.after_bytes > status.budget_bytes);
         assert!(status.blockers.iter().any(|(n, r, _)| n == "old" && r == "pinned"), "{status:?}");
         assert!(root.join("old").exists() && root.join("n1").exists(), "read-only");
