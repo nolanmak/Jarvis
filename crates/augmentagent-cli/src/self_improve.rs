@@ -7670,7 +7670,10 @@ async fn run_selected(repo_root: &Path, dry_run: bool, selected: Option<targeted
             targeted::Resolved::Issue(issue)=>crate::autoship_workflow::submission::Target::Issue(issue.number),
             targeted::Resolved::Pr(pr)=>crate::autoship_workflow::submission::Target::Pr(pr.pr),
         });
-        targeted::execution_preflight(repo_root,target,mode).await?;
+        let selected_pr=selected.as_ref().and_then(|selected|match selected {
+            targeted::Resolved::Pr(pr)=>Some(pr),_=>None,
+        });
+        targeted::execution_preflight(repo_root,target,mode,selected_pr).await?;
     }
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
