@@ -79,14 +79,18 @@ impl ConversationIo for Io {
 struct Source {
     started: Arc<Notify>,
     reads: AtomicUsize,
+    recovering: bool,
 }
 #[async_trait]
 impl AttentionProvider for Source {
     async fn check(&self, origin: &PhoneOrigin) -> anyhow::Result<Option<String>> {
         assert_eq!(origin.conversation.conversation_id(), "owner-chat");
-        self.reads.fetch_add(1, Ordering::SeqCst);
+        let attempt = self.reads.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         tokio::time::sleep(Duration::from_secs(2)).await;
+        if self.recovering && attempt == 0 {
+            return Ok(Some("The synthetic inbox is unavailable; the attention check is incomplete.".into()));
+        }
         Ok(Some("The synthetic project deadline is Tuesday at 5 PM. Calendar and inbox checked just now; calendar covers the next three days.".into()))
     }
 }
@@ -144,7 +148,7 @@ fn signature(path: &str, fields: &[(String, String)]) -> String {
 fn wire(value: Value) -> Message {
     Message::Text(value.to_string().into())
 }
-async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
+async fn exercise_call(slow: bool, inbound: bool, busy: bool, recovering: bool) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("db")).unwrap());
     let account =
@@ -223,6 +227,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
     let source = Arc::new(Source {
         started: started.clone(),
         reads: AtomicUsize::new(0),
+        recovering,
     });
     let native = Arc::new(Native {
         slow,
@@ -255,6 +260,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
     )
     .await
     .unwrap();
+    let peer_store = store.clone();
     let peer_task = tokio::spawn(async move {
         if !inbound {
             let (tcp, _) = peer.accept().await.unwrap();
@@ -299,6 +305,14 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
                 continue;
             }
             let useful = v["content"].as_str().unwrap().contains("Tuesday at 5 PM");
+            if recovering && v["content"].as_str().unwrap().contains("inbox is unavailable") {
+                assert!(peer_store.phone_pending_dispatches().unwrap().iter().any(|j| j.state == "running"),
+                    "the missing-source notice must not finish the attention task");
+                // Deliberately omit the progress acknowledgment. It must not
+                // block the later verified answer or cause a source replay.
+                ws.send(wire(json!({"type":"session.output_audio.delta","delta":STANDARD.encode([139;160])}))).await.unwrap();
+                continue;
+            }
             if slow && useful && !rejected {
                 rejected = true;
                 ws.send(wire(json!({"type":"error","error":{"type":"invalid_request_error","code":null,"param":"delegation_id","client_event_id":v["event_id"],"message":"Unknown client or Decision delegation."}}))).await.unwrap();
@@ -428,6 +442,16 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
         native.release.notify_one();
     }
     tokio::time::resume();
+    if recovering {
+        let frame = tokio::time::timeout(Duration::from_secs(1), ws.next()).await
+            .expect("the caller must hear which source is still missing").unwrap().unwrap();
+        let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(v["media"]["payload"], STANDARD.encode([139; 160]));
+        let _ = ws.next().await.unwrap().unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+    }
     for expected in [140, 141] {
         let frame=tokio::time::timeout(Duration::from_secs(1),ws.next()).await.expect("useful attention facts must reach the call by three seconds without waiting for full native completion").unwrap().unwrap();
         assert!(
@@ -438,7 +462,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
         assert_eq!(v["media"]["payload"], STANDARD.encode([expected; 160]));
         let _ = ws.next().await.unwrap().unwrap();
         if expected == 140 && !slow {
-            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(start.elapsed() < Duration::from_secs(if recovering { 5 } else { 3 }));
             if busy {
                 busy_provider.release.notify_one();
             }
@@ -446,7 +470,7 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
     }
     assert_eq!(
         source.reads.load(Ordering::SeqCst),
-        if slow { 0 } else { 1 }
+        if slow { 0 } else if recovering { 2 } else { 1 }
     );
     assert_eq!(
         native.calls.load(Ordering::SeqCst),
@@ -480,18 +504,23 @@ async fn exercise_call(slow: bool, inbound: bool, busy: bool) {
 #[tokio::test]
 async fn incoming_attention_check_speaks_facts_before_slow_native_work_and_keeps_followup_context()
 {
-    exercise_call(false, true, false).await;
+    exercise_call(false, true, false, false).await;
 }
 #[tokio::test]
 async fn incoming_slow_native_result_recovers_rejected_context_and_answers_the_next_question() {
-    exercise_call(true, true, false).await;
+    exercise_call(true, true, false, false).await;
 }
 #[tokio::test]
 async fn outbound_attention_check_uses_the_same_result_and_native_followup_path() {
-    exercise_call(false, false, false).await;
+    exercise_call(false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn attention_facts_and_history_handoff_bypass_an_active_shared_native_turn() {
-    exercise_call(false, true, true).await;
+    exercise_call(false, true, true, false).await;
+}
+
+#[tokio::test]
+async fn incoming_incomplete_attention_check_reports_the_gap_then_speaks_late_facts() {
+    exercise_call(false, true, false, true).await;
 }

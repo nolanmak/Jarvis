@@ -459,6 +459,7 @@ mod tests {
         calendar_calls: std::sync::atomic::AtomicUsize,
         inbox_calls: std::sync::atomic::AtomicUsize,
         actionable: bool,
+        failures: usize,
     }
     #[async_trait]
     impl Reads for RecoveringReads {
@@ -471,7 +472,7 @@ mod tests {
             let attempt = self
                 .inbox_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if attempt == 0 {
+            if attempt < self.failures {
                 anyhow::bail!("synthetic temporary source outage");
             }
             Ok(SourceView {
@@ -493,6 +494,7 @@ mod tests {
             calendar_calls: 0.into(),
             inbox_calls: 0.into(),
             actionable,
+            failures: 1,
         });
         let (_dir, provider, origin) = fixture(reads.clone());
         let started = tokio::time::Instant::now();
@@ -524,6 +526,36 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn incomplete_check_retries_and_finishes_when_sources_are_verified_empty() {
         recovering_check(false).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn persistent_source_failure_has_bounded_retries_and_never_becomes_all_clear() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = Arc::new(RecoveringReads {
+            calendar_calls: 0.into(), inbox_calls: 0.into(),
+            actionable: false, failures: usize::MAX,
+        });
+        let (_dir, provider, origin) = fixture(reads.clone());
+        let started = tokio::time::Instant::now();
+        let answer = provider.check(&origin).await.unwrap().unwrap();
+        assert!(answer.contains("Still missing") && !answer.contains("I found no"));
+        assert!(started.elapsed() <= Duration::from_secs(36));
+        assert_eq!(reads.calendar_calls.load(SeqCst), 1);
+        assert_eq!(reads.inbox_calls.load(SeqCst), 3,
+            "make two bounded retries, then report the unresolved source honestly");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn healthy_verified_empty_check_finishes_without_background_retries() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = Arc::new(RecoveringReads {
+            calendar_calls: 0.into(), inbox_calls: 0.into(),
+            actionable: false, failures: 0,
+        });
+        let (_dir, provider, origin) = fixture(reads.clone());
+        let started = tokio::time::Instant::now();
+        assert!(provider.check(&origin).await.unwrap().unwrap().contains("I found no pending triaged inbox items"));
+        assert!(started.elapsed() <= Duration::from_secs(5));
+        assert_eq!(reads.calendar_calls.load(SeqCst), 1);
+        assert_eq!(reads.inbox_calls.load(SeqCst), 1);
     }
     fn fixture(reads: Arc<dyn Reads>) -> (tempfile::TempDir, PhoneAttention, PhoneOrigin) {
         use augmentagent_store::{
