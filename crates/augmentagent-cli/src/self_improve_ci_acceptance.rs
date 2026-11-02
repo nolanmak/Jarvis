@@ -2,6 +2,64 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// The original Git source remains fixed while a declared generated input
+/// changes between commands. Equal old timestamps must not resurrect old code.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_generated_input_mutation()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-generated-input-mutation",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("generated-input-fixture-").tempdir_in(&target)?;
+    let root=fixture.path();std::fs::create_dir(root.join("src"))?;
+    std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n")?;
+    std::fs::write(root.join("Cargo.lock"),"version=4\n[[package]]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\n")?;
+    std::fs::write(root.join("package.json"),"{\"name\":\"generated-input-fixture\",\"private\":true}\n")?;
+    std::fs::write(root.join("src/main.rs"),"fn main(){println!(\"{}\",include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"),\"/node_modules/generated.txt\")));}\n")?;
+    std::fs::write(root.join("rustc-counter.py"),r#"#!/usr/bin/python3
+import os,sys
+from pathlib import Path
+if '--crate-name' in sys.argv and sys.argv[sys.argv.index('--crate-name')+1]=='generated_input_consumer':
+    with Path('/tmp/ci-fixture-rustc-count').open('a') as stream:stream.write('compile\n')
+os.execv(sys.argv[1],sys.argv[1:])
+"#)?;
+    std::fs::set_permissions(root.join("rustc-counter.py"),std::fs::Permissions::from_mode(0o755))?;
+    git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","fixed generated-input consumer"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let bound=binding(root).await?;let session=vm::Session::prepare(root,&target)?;
+    let source=snapshot(root,&bound,&target).await?;
+    let timeout=std::time::Duration::from_secs(180);
+    let generate_old="python3 -I -c 'import os;from pathlib import Path;p=Path(\"node_modules/generated.txt\");p.write_text(\"OLD\");os.utime(p,ns=(946684800000000000,946684800000000000))'";
+    let generate_new=generate_old.replace("OLD","NEW");
+    let compile="RUSTC_WRAPPER=/workspace/rustc-counter.py cargo build --offline --locked --message-format=json > target/messages.json && python3 -I -c 'from pathlib import Path;p=Path(\"/tmp/ci-fixture-rustc-count\");print(\"CALLS=\"+str(len(p.read_text().splitlines()) if p.exists() else 0))' && target/debug/generated-input-consumer";
+    let old=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(generate_old),&storage,&target,&audit,timeout).await?;
+    ensure!(old.status=="passed","initial generator failed: {}",old.stderr);
+    let first=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
+    ensure!(first.status=="passed" && first.stdout.trim()=="CALLS=1\nOLD","initial generated input did not execute: {} {}",first.stdout,first.stderr);
+    let unchanged=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
+    ensure!(unchanged.status=="passed" && unchanged.stdout.trim()=="CALLS=0\nOLD","unchanged compatible unit recompiled or did not remain valid: {}",unchanged.stdout);
+    let changed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(&generate_new),&storage,&target,&audit,timeout).await?;
+    ensure!(changed.status=="passed" && changed.command_receipt.as_ref().is_some_and(|r|r.value()["input_write_observation"]["changed"]==true),
+        "generated mutation was not observed");
+    let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
+    let report=serde_json::json!({"version":1,"kind":"real_shared_ci_generated_input_mutation",
+        "head":head,"generation":source.generation(),"old_and_new_mtime_ns":946684800000000000_u64,
+        "expected":"CALLS=1\nNEW","actual":observed.stdout.trim(),"status":observed.status,
+        "unchanged_compatible_unit_actual_rustc_calls":0,
+        "passed":observed.status=="passed" && observed.stdout.trim()=="CALLS=1\nNEW",
+        "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&report)?)?;
+    ensure!(report["passed"]==true,"generated-input invalidation missing: expected NEW, executed {}",observed.stdout.trim());
+    Ok(())
+}
+
 /// Complete a real compiled fixture plan, then prove a newer failing run
 /// cannot return the previous run's protected local-completion capability.
 #[tokio::test]
