@@ -6545,7 +6545,7 @@ async fn resume_draft_pr(
         return Ok(RunReport::held(format!("PR #{pr}: another worker owns its worktree")));
     };
     let repository = workflow::canonical_repository(repo_root).await?;
-    let worktree = workflow::prepare_resume_worktree_at_head(repo_root, pr, branch, expected_head).await?;
+    let worktree = workflow::prepare_resume_candidate(repo_root, &repository, pr, branch, expected_head).await?;
     let contract = format!("{}\n{}\n{}", issue.title, issue.body, pr_body);
     let (toolchain_ok, toolchain, _) = run("rustc", &["--version", "--verbose"], &worktree).await?;
     anyhow::ensure!(toolchain_ok, "cannot identify verifier toolchain");
