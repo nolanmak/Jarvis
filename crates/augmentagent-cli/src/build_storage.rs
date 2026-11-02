@@ -1755,6 +1755,48 @@ mod inherited_ci_storage_tests {
         }
     }
 
+    /// Shared CI boots the build VM; it waits in line behind a managed build
+    /// instead of failing on the first busy attempt.
+    #[tokio::test]
+    async fn ci_leases_wait_in_line_until_build_lease_is_released() {
+        let state = tempfile::tempdir().unwrap();
+        let build = Lease::try_at(state.path()).unwrap().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(build);
+        });
+        let started = std::time::Instant::now();
+        let ci = wait_ci_leases(state.path(), Duration::from_secs(10)).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(400), "acquired while a build held the lease");
+        assert!(ci.ci_update_exclusion.is_some(), "CI must also exclude deployment builds");
+        assert!(Lease::try_at(state.path()).unwrap().is_none());
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ci_leases_wait_for_deployment_build_without_holding_build_lease() {
+        let state = tempfile::tempdir().unwrap();
+        let updater = Lease::try_kind_at(state.path(), true).unwrap().unwrap();
+        let path = state.path().to_path_buf();
+        let waiter = tokio::spawn(async move { wait_ci_leases(&path, Duration::from_secs(10)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // While waiting on the deploy, CI must not sit on the build lease.
+        assert!(Lease::try_at(state.path()).unwrap().is_some(), "waiting CI held the build lease");
+        drop(updater);
+        let ci = waiter.await.unwrap().unwrap();
+        assert!(ci.ci_update_exclusion.is_some());
+    }
+
+    #[tokio::test]
+    async fn ci_leases_time_out_busy_and_hold_nothing() {
+        let state = tempfile::tempdir().unwrap();
+        let _build = Lease::try_at(state.path()).unwrap().unwrap();
+        let error = wait_ci_leases(state.path(), Duration::from_millis(600)).await.unwrap_err();
+        assert!(error.downcast_ref::<crate::storage_reservations::Busy>().is_some(), "{error:#}");
+        assert!(error.to_string().contains("build lease is held; retry CI admission"), "{error:#}");
+        assert!(ci_update_exclusion(state.path()).is_ok(), "timed-out CI kept the update exclusion");
+    }
+
     #[test]
     fn ci_update_exclusion_rejects_symlinks_without_touching_target() {
         let state = tempfile::tempdir().unwrap();
