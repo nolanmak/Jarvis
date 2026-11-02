@@ -30,6 +30,7 @@ class EligibilityTests(unittest.TestCase):
         for package in value['packages']:
             prefix='/workspace/vendor' if package['id']=='vendor' else ('/workspace/crates' if package['source'] is None else '/ci-cargo-home/registry/src/pinned')
             package['manifest_path']=prefix+'/'+package['name']+'/Cargo.toml'
+            package['targets']=[{'kind':['lib'],'src_path':prefix+'/'+package['name']+'/src/lib.rs'}]
         return value
 
     def test_only_external_units_without_any_transitive_path_input_are_eligible(self):
@@ -48,6 +49,17 @@ class EligibilityTests(unittest.TestCase):
         value['packages'][3]['manifest_path']='/workspace/excluded/local/Cargo.toml'
         eligible=seed.eligible_packages(value)
         self.assertEqual(set(eligible),{'registry-b'})
+
+    def test_reusable_units_exclude_unconfined_build_scripts_macros_and_their_dependents(self):
+        self.assertEqual(set(seed.reusable_packages(self.metadata())),{'registry-a','registry-b','git'})
+        for kind in ('custom-build','proc-macro'):
+            with self.subTest(kind=kind):
+                value=self.metadata()
+                value['packages'][4]['targets'].append({'kind':[kind],
+                    'src_path':'/ci-cargo-home/registry/src/pinned/registry-b/build.rs'})
+                self.assertEqual(seed.reusable_packages(value),{})
+        value=self.metadata();value['packages'][4]['targets'][0]['src_path']='/workspace/hidden-input.rs'
+        self.assertEqual(seed.reusable_packages(value),{})
 
     def test_unsupported_missing_duplicate_and_cyclic_graphs_fail_closed(self):
         for fault in ('missing-resolve','missing-node','missing-package','duplicate-package','duplicate-node',

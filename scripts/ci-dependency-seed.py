@@ -109,3 +109,38 @@ def eligible_packages(metadata, *, source_root='/workspace'):
         raise InputsUnknown()
     return {key:{'name':packages[key]['name'],'source':packages[key]['source'],'features':features[key]}
             for key in sorted(packages) if compatible[key]}
+
+
+def reusable_packages(metadata, *, source_root='/workspace'):
+    """Units whose compilation has no unconfined dependency code execution.
+
+    Build scripts and procedural macros can read inputs absent from Cargo's
+    package graph. Until those inputs have a producer-side confinement proof,
+    their units and dependents compile fresh in each source generation. They
+    still reuse normal compatible outputs within that unchanged generation.
+    """
+    eligible=eligible_packages(metadata,source_root=source_root)
+    pure=set(eligible)
+    for package in metadata['packages']:
+        if package['id'] not in eligible:continue
+        targets=package.get('targets')
+        if not isinstance(targets,list) or not targets:raise InputsUnknown()
+        package_root=_path(package['manifest_path']).parent
+        for target in targets:
+            if (not isinstance(target,dict) or not isinstance(target.get('kind'),list)
+                    or not target['kind'] or any(not isinstance(kind,str) for kind in target['kind'])):
+                raise InputsUnknown()
+            if ('custom-build' in target['kind'] or 'proc-macro' in target['kind']
+                    or not _path(target.get('src_path')).is_relative_to(package_root)):
+                pure.discard(package['id'])
+    reverse={key:[] for key in eligible}
+    for node in metadata['resolve']['nodes']:
+        if node['id'] not in eligible:continue
+        for child in node['dependencies']:
+            reverse[child].append(node['id'])
+    refused=deque(set(eligible)-pure)
+    while refused:
+        for parent in reverse[refused.popleft()]:
+            if parent in pure:
+                pure.remove(parent);refused.append(parent)
+    return {key:eligible[key] for key in sorted(pure)}
