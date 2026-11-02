@@ -455,6 +455,76 @@ mod tests {
             })
         }
     }
+    struct RecoveringReads {
+        calendar_calls: std::sync::atomic::AtomicUsize,
+        inbox_calls: std::sync::atomic::AtomicUsize,
+        actionable: bool,
+    }
+    #[async_trait]
+    impl Reads for RecoveringReads {
+        async fn calendar(&self, _: &Account) -> Result<Vec<String>> {
+            self.calendar_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+        async fn inbox(&self, _: &Account) -> Result<SourceView> {
+            let attempt = self
+                .inbox_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                anyhow::bail!("synthetic temporary source outage");
+            }
+            Ok(SourceView {
+                name: "synthetic inbox".into(),
+                checked_ms: Some(Utc::now().timestamp_millis()),
+                complete: true,
+                facts: if self.actionable {
+                    vec!["Synthetic approval deadline tomorrow at 5 PM.".into()]
+                } else {
+                    vec![]
+                },
+                gap: None,
+            })
+        }
+    }
+    async fn recovering_check(actionable: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = Arc::new(RecoveringReads {
+            calendar_calls: 0.into(),
+            inbox_calls: 0.into(),
+            actionable,
+        });
+        let (_dir, provider, origin) = fixture(reads.clone());
+        let started = tokio::time::Instant::now();
+        let answer = provider.check(&origin).await.unwrap().unwrap();
+        assert!(
+            if actionable {
+                answer.contains("Synthetic approval deadline tomorrow at 5 PM.")
+            } else {
+                answer.contains("I found no pending triaged inbox items")
+            },
+            "an incomplete no-facts check must keep working until its required source recovers: {answer}"
+        );
+        assert!(started.elapsed() <= Duration::from_secs(36));
+        assert_eq!(
+            reads.calendar_calls.load(SeqCst),
+            1,
+            "do not refetch a healthy source just to create progress"
+        );
+        assert_eq!(
+            reads.inbox_calls.load(SeqCst),
+            2,
+            "retry the failed source once, then stop after a verified result"
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_check_retries_until_a_verified_fact_arrives() {
+        recovering_check(true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_check_retries_and_finishes_when_sources_are_verified_empty() {
+        recovering_check(false).await;
+    }
     fn fixture(reads: Arc<dyn Reads>) -> (tempfile::TempDir, PhoneAttention, PhoneOrigin) {
         use augmentagent_store::{
             owner::ControlConversationKind, SurfaceAccountRef, SurfaceConversationRef,
