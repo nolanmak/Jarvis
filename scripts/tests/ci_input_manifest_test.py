@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 import struct
+import mmap
 
 
 spec=importlib.util.spec_from_file_location('ci_input_manifest',Path(__file__).resolve().parents[1]/'ci-input-manifest.py')
@@ -12,6 +13,40 @@ manifest=importlib.util.module_from_spec(spec);spec.loader.exec_module(manifest)
 
 
 class InputManifestTests(unittest.TestCase):
+    def test_writable_memory_mapping_cannot_hide_a_restored_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);source=root/'input.bin';source.write_bytes(b'original')
+            journal=manifest.ChangeJournal({'generated':root})
+            with source.open('r+b') as stream:
+                with mmap.mmap(stream.fileno(),0) as mapping:
+                    mapping[:]=b'modified';mapping.flush();mapping[:]=b'original';mapping.flush()
+            self.assertTrue(journal.finish()['changed'])
+    def test_npm_executable_and_directory_aliases_stay_inside_declared_namespaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);modules=root/'node_modules';modules.mkdir();binaries=modules/'.bin';binaries.mkdir()
+            package=modules/'tool';package.mkdir();script=package/'cli.js';script.write_text('original')
+            (binaries/'tool').symlink_to('../tool/cli.js');(modules/'alias').symlink_to('tool',target_is_directory=True)
+            before=manifest.snapshot({'modules':modules});journal=manifest.ChangeJournal({'modules':modules})
+            script.read_text();self.assertFalse(journal.finish()['changed'])
+            journal=manifest.ChangeJournal({'modules':modules});script.write_text('changed');script.write_text('original')
+            observed=journal.finish();self.assertTrue(observed['changed'])
+            self.assertEqual(before['sha256'],manifest.snapshot({'modules':modules})['sha256'])
+
+    def test_alias_chains_may_not_leave_a_declared_root_and_return_through_an_external_link(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);declared=root/'declared';declared.mkdir();(declared/'input').write_text('original')
+            (root/'external').symlink_to(declared,target_is_directory=True)
+            (declared/'alias').symlink_to('../external/input')
+            with self.assertRaises(manifest.FreshnessHold):manifest.snapshot({'inputs':declared})
+
+    def test_cross_namespace_alias_and_cycles_have_explicit_bounded_behavior(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);modules=root/'modules';modules.mkdir();generated=root/'generated';generated.mkdir()
+            (generated/'input.js').write_text('generated input');(modules/'input.js').symlink_to('../generated/input.js')
+            before=manifest.snapshot({'modules':modules,'generated':generated})
+            self.assertTrue(any(entry[2]=='symlink' and entry[-2:]==['generated','input.js'] for entry in before['entries']))
+            (modules/'a').symlink_to('b');(modules/'b').symlink_to('a')
+            with self.assertRaises(manifest.FreshnessHold):manifest.snapshot({'modules':modules,'generated':generated})
     def test_declared_single_file_output_is_watched_without_watching_its_neighbors(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);output=root/'generated.css';output.write_text('original');other=root/'tracked.css';other.write_text('source')

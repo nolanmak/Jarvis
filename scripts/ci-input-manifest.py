@@ -43,11 +43,39 @@ def _roots(roots):
     return result
 
 
+def _declared_target(path,roots,hops=0):
+    """Resolve every link hop, refusing an excursion through unobserved data.
+
+    Common literal ancestors allow relative links between declared roots. They
+    were already checked by _roots; they are not additional input namespaces.
+    Directory aliases are recorded, never recursively expanded by the census.
+    """
+    path=Path(path)
+    if hops>64 or not path.is_absolute() or len(str(path).encode())>4096:
+        raise FreshnessHold('input_census_unknown')
+    current=Path(path.anchor);parts=path.parts[1:]
+    for index,part in enumerate(parts):
+        current=current.parent if part=='..' else current/part
+        if not any(current==root or current.is_relative_to(root) or root.is_relative_to(current) for root in roots.values()):
+            raise FreshnessHold('input_census_unknown')
+        info=current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            target=Path(os.readlink(current));target=target if target.is_absolute() else current.parent/target
+            return _declared_target(target.joinpath(*parts[index+1:]),roots,hops+1)
+        if index<len(parts)-1 and not stat.S_ISDIR(info.st_mode):raise FreshnessHold('input_census_unknown')
+    for name,root in roots.items():
+        if current==root or current.is_relative_to(root):
+            if not (current.is_dir() or current.is_file()):raise FreshnessHold('input_census_unknown')
+            return name,current.relative_to(root).as_posix()
+    raise FreshnessHold('input_census_unknown')
+
+
 def snapshot(roots,*,max_files=100_000,max_bytes=8*1024**3):
     """Content/mode identity, independent of wall clock and directory names.
 
-    Reject links/special files until an explicit producer/root policy can
-    establish their provenance. A file changing while read is unknown input.
+    Link targets must remain in declared namespaces at every resolution hop.
+    Special files and changes during capture remain unknown input. The caller
+    still owns the original-Git/producer provenance of the declared roots.
     """
     try:
         roots=_roots(roots);entries=[];files=total=0
@@ -61,6 +89,14 @@ def snapshot(roots,*,max_files=100_000,max_bytes=8*1024**3):
             if stat.S_ISDIR(info.st_mode):
                 entries.append([name,relative,'directory',stat.S_IMODE(info.st_mode)])
                 for child in sorted(path.iterdir()):visit(name,root,child)
+            elif stat.S_ISLNK(info.st_mode):
+                link=os.readlink(path);target=Path(link)
+                target=target if target.is_absolute() else path.parent/target
+                target_name,target_relative=_declared_target(target,roots)
+                after=path.lstat()
+                if (info.st_dev,info.st_ino,info.st_mtime_ns,info.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_mtime_ns,after.st_ctime_ns):
+                    raise FreshnessHold('input_census_unknown')
+                entries.append([name,relative,'symlink',link,target_name,target_relative])
             elif stat.S_ISREG(info.st_mode):
                 files+=1;total+=info.st_size
                 if files>max_files or total>max_bytes:raise FreshnessHold('input_census_unknown')
@@ -114,8 +150,7 @@ class ChangeJournal:
                     wd=libc.inotify_add_watch(self.fd,os.fsencode(directory),mask|(0x01000000 if directory.is_dir() else 0))
                     if wd<0 or wd in self.watches:raise FreshnessHold('input_census_unknown')
                     self.watches[wd]=(name,directory.relative_to(root).as_posix())
-                    if any((directory/child).is_symlink() for child in subdirs):
-                        raise FreshnessHold('input_census_unknown')
+                    subdirs[:]=[child for child in subdirs if not (directory/child).is_symlink()]
             self.before=snapshot(self.roots)
             self._drain()
         except FreshnessHold:

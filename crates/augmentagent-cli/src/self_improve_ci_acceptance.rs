@@ -102,6 +102,7 @@ async fn live_shared_ci_dependency_seed_replay()->Result<()> {
     std::fs::write(repo.join("Cargo.lock"),&lock)?;
     std::fs::write(repo.join("Cargo.toml"),"[package]\nname = \"seed-consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n[dependencies]\nitoa = \"=1.0.18\"\n")?;
     std::fs::write(repo.join("src/main.rs"),"fn main() { println!(\"{}\", itoa::Buffer::new().format(42)); }\n")?;
+    std::fs::write(repo.join("package.json"),"{\"name\":\"ci-generated-input-fixture\",\"private\":true}\n")?;
     git(repo,&["-c","init.templateDir=","init","-q"]).await?;
     git(repo,&["add","."]).await?;
     git(repo,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","-qm","seed consumer"]).await?;
@@ -142,6 +143,12 @@ async fn live_shared_ci_dependency_seed_replay()->Result<()> {
     ensure!(restored==install,"restart selected a different seed");
     drop(reopened);
     let build=r#"set -e
+python3 -I -c 'from pathlib import Path
+modules=Path("node_modules")
+if not (modules/"tool").exists():
+ (modules/"tool").mkdir();(modules/"tool/cli.js").write_text("console.log(42)\n")
+ (modules/".bin").mkdir();(modules/".bin/tool").symlink_to("../tool/cli.js")
+ (modules/"tool-alias").symlink_to("tool",target_is_directory=True)'
 cargo build --offline --locked --message-format=json > target/messages.json
 python3 -c 'import json; from pathlib import Path
 units=[json.loads(line) for line in Path("target/messages.json").read_text().splitlines()]
@@ -165,6 +172,9 @@ target/debug/seed-consumer
             && record["cache_preparation"]["binding"]["tree"]==binding.index_tree
             && record["cache_preparation"]["dependency_seed"]==published["seed"],
             "protected command receipt lost its original source/cache/seed binding");
+        ensure!(record["input_write_observation"]["changed"]==true
+            && record["input_write_observation"]["changed_roots"].as_array().is_some_and(|roots|!roots.is_empty()),
+            "declared generated input creation and npm-style aliases were not observed");
         let quiescent=audit.controller_receipt(record["quiescence_receipt_sha256"].as_str()
             .context("command receipt lacks protected quiescence reference")?)?;
         ensure!(quiescent.value()["kind"]=="shared_ci_vm_quiescent"
@@ -178,7 +188,8 @@ target/debug/seed-consumer
         ensure!(again.status=="passed" && again.stdout.trim()=="[]\n42","compatible same-job units recompiled: {} {}",again.stdout,again.stderr);
         ensure!(again.command_receipt.as_ref().is_some_and(|receipt|
             receipt.payload_sha256()!=committed.payload_sha256()
-                && receipt.value()["cache_preparation"]["binding"]["generation"]==source.generation()),
+                && receipt.value()["cache_preparation"]["binding"]["generation"]==source.generation()
+                && receipt.value()["input_write_observation"]["changed"]==false),
             "repeated command reused an older invocation's protected completion");
         let tamper=r#"python3 -c 'import errno,os; from pathlib import Path
 p=next(Path("target/debug/deps").glob("libitoa-*.rlib"))
@@ -201,6 +212,7 @@ print("SEALED")'"#;
         "external_units_recompiled_across_generations":0,"same_job_compatible_units_recompiled":0,
         "seed_corruption_denied":true,"automatic_seed_lookup":true,"equivalent_controller_restart_reuses_seed":true,
         "bound_preparation_and_committed_quiescence_receipts":true,
+        "declared_generated_namespace_aliases_observed":true,"unchanged_generated_inputs_preserve_compatible_reuse":true,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     audit.record_controller(receipt.clone())?;audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
