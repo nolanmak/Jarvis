@@ -446,8 +446,14 @@ spec=importlib.util.spec_from_file_location('lookups','/workspace/ci-input-looku
 lookups=importlib.util.module_from_spec(spec);spec.loader.exec_module(lookups)
 queries=lookups.failed_queries(trace.read_bytes())
 missing=[query for query in queries if query['path'].endswith(b'/chosen.rs') and query['errno']=='ENOENT']
+all_queries=lookups.path_queries(trace.read_bytes())
+opened_module=[query for query in all_queries if query.get('resolved_path')==b'/workspace/node_modules/generated/chosen/mod.rs' and query['intent']=='read']
+directory_reads=[query for query in all_queries if query['syscall']=='getdents64']
+device_reads=[query for query in all_queries if query.get('descriptor_kind') in ('character-device','block-device')]
 print(json.dumps({'trace':trace.read_text(),'dep_infos':dep_infos,'trusted_input_closure':False,
- 'missing_module_queries':len(missing),'lookup_observation':lookups.observation(queries)}),flush=True)
+ 'missing_module_queries':len(missing),'lookup_observation':lookups.observation(queries),
+ 'decoded_path_queries':len(all_queries),'opened_module_queries':len(opened_module),
+ 'directory_read_queries':len(directory_reads),'device_read_queries':len(device_reads)}),flush=True)
 result=subprocess.run(['rustc','--edition=2021','--crate-name','resolution_control','src/main.rs','-o','target/resolution-control'],capture_output=True,text=True)
 sys.stderr.write(result.stderr);sys.stdout.write(result.stdout);raise SystemExit(result.returncode)
 PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o target/resolution-control"};
@@ -460,6 +466,8 @@ PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o
     let lookup_observation=if read_trace {control.as_ref().and_then(|value|serde_json::from_str::<serde_json::Value>(value.stdout.trim()).ok())} else {None};
     let lookup_observed=lookup_observation.as_ref().is_some_and(|value|
         value["missing_module_queries"].as_u64().is_some_and(|count|count>0)
+        && value["opened_module_queries"].as_u64().is_some_and(|count|count>0)
+        && value["directory_read_queries"].as_u64().is_some_and(|count|count>0)
         && value["lookup_observation"]["input_closure_complete"]==false
         && value["lookup_observation"]["shipping_authority"]==false
         && value["dep_infos"].as_object().is_some_and(|files|!files.is_empty()
@@ -474,6 +482,10 @@ PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o
         "unchanged_compatible_unit_actual_rustc_calls":0,
         "passed":if read_trace {lookup_observed} else {passed},
         "input_behavior_fixed":passed,"negative_lookup_observed_but_absent_from_dep_info":lookup_observed,
+        "decoded_path_queries":lookup_observation.as_ref().map(|value|&value["decoded_path_queries"]),
+        "opened_module_queries":lookup_observation.as_ref().map(|value|&value["opened_module_queries"]),
+        "directory_read_queries":lookup_observation.as_ref().map(|value|&value["directory_read_queries"]),
+        "device_read_queries":lookup_observation.as_ref().map(|value|&value["device_read_queries"]),
         "trusted_input_closure":false,"cargo_metadata_isolation_established":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&report)?)?;

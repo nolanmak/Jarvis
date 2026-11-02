@@ -40,6 +40,18 @@ These are observations from an unprivileged fixture. Its Cargo metadata is
 writable by its worker and cannot supply trusted reuse or passing-CI evidence.
 Its selected environment trace is not a complete compiler-input closure.
 
+The real module-resolution trace at `ad850efc` additionally contains 1,535
+pathname operations: 1,144 failed queries, successful opens/stat/readlink
+operations, 18 directory reads and an explicit `/dev/urandom` character-device
+open. The decoder now retains successful file descriptor paths, lossless link
+bytes and every decoded directory entry, including the end-of-directory result.
+It rejects abbreviated entries, unresolved descriptors and inconsistent byte
+counts. These facts expose runtime/device and compiler temporary-output inputs;
+they do not make those inputs immutable or establish a complete input set.
+Device reads must never be converted into ordinary file-content fingerprints.
+The captured trace still belongs to the unprivileged fixture, and the original
+generated-input invalidation regression remains red.
+
 ## Decisions and reasons
 
 1. **Separate the planner from application execution.** Cargo runs as non-root
