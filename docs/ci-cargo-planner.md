@@ -7,6 +7,17 @@ requirements remain required. The blocking questions at the end must be closed
 before production activation; unsupported cases must not fall back to ordinary
 candidate-writable Cargo metadata.
 
+The authoritative requirements are [#1807 D1–D8](https://github.com/nolanmak/Jarvis/issues/1807)
+and [epic #1703](https://github.com/nolanmak/Jarvis/issues/1703), with physical
+ownership/recovery in [#1676](https://github.com/nolanmak/Jarvis/issues/1676).
+The existing internal proof types are in
+[`self_improve_ci_proof.rs`](../crates/augmentagent-cli/src/self_improve_ci_proof.rs),
+including `ObservedInputs`, `PassingCiProof` and the single `REQUIRED_VERSION`
+constant (currently 1). Coverage is in
+[`self_improve_ci_coverage.rs`](../crates/augmentagent-cli/src/self_improve_ci_coverage.rs).
+These links identify current groundwork, not a finalized contract or permission
+to construct either proof type from the experimental observations.
+
 ## Evidence
 
 The real guest relay fixture at `4e83a9e4` captured 21 direct tool requests,
@@ -72,9 +83,13 @@ Its selected environment trace is not a complete compiler-input closure.
    third-party seeds remain required across reconstructions.
 
 5. **Distinguish precise and opaque producers.** A pinned rustc invocation with
-   no untrusted native extension may use its compiler-generated dep-info together
-   with exact arguments, environment, configuration, runtime and referenced
-   artifacts. A build script, procedural macro, wrapper, custom linker/backend
+   no untrusted native extension still needs a proven precise input closure.
+   Compiler dep-info alone is insufficient: negative lookups and directory
+   membership may change source resolution without changing a previously listed
+   file. Do not authorize reuse from dep-info plus unchanged listed files. The
+   lookup/namespace rule below blocks this mode until it is proven alongside
+   exact arguments, environment, configuration, runtime and referenced artifacts.
+   A build script, procedural macro, wrapper, custom linker/backend
    or otherwise opaque producer requires its complete permitted visible input
    closure. Candidate-supplied rerun hints cannot reduce that closure. An opaque
    producer cannot attest its own dep-info as a precise closure. Unrelated
@@ -87,6 +102,31 @@ Its selected environment trace is not a complete compiler-input closure.
    adopting another mutable compiler-input namespace and reduces image growth.
    This is a proposal for the new authority, not a change to current daemon
    settings or permission to delete the existing image's incremental directories.
+
+## Complete replay outcomes and identity bytes
+
+A reusable success contains the entire sealed outcome consumed by Cargo:
+normal exit zero, stdout and stderr as exact per-stream byte sequences, compiler
+dep-info, generated files, auxiliary output files and their protected manifests.
+Build-script stdout includes Cargo directives (cfg, environment, linker settings
+and rerun declarations); replaying generated files without those directives is
+invalid. Failed, signaled, truncated or incompletely supervised executions remain
+historical observations and are not reusable successes. Tests always execute.
+Keep the existing combined 8 MiB output bound; exceeding it makes the unit
+unverified rather than accepting a truncated outcome. Commit the outcome only
+after original unit cleanup and output sealing. A replay must restore all of its
+declared outputs before reporting its original status and bytes to Cargo.
+
+Actual argv, source/artifact paths, output suffixes and code-generation flags
+remain semantic identity bytes. There is no artifact relocation or rewriting of
+`-C metadata`, `extra-filename` or embedded paths. The bookkeeping exception in
+Decision 3 concerns only Cargo's numeric dependency-fingerprint observations;
+it does not erase a changed argv or artifact identity. Stable `/workspace` and
+target aliases must keep an unchanged job's actual invocation stable. Unexpected
+allocation paths cannot be silently dropped from identity. Jobserver descriptor
+numbers are the one proposed transport normalization: duplicate the same bound
+pipe capabilities to fixed worker numbers and rewrite only their defined
+jobserver environment fields. Verify this separately before accepting reuse.
 
 ## Execution and loader protocol
 
@@ -117,6 +157,24 @@ acknowledgement must allow Cargo to finish writing a pipe; it cannot deadlock
 while Cargo waits for the exec-start pipe to close. Pending signal/cancellation
 handling must cover this staging interval as well as actual execution. Existing
 signal tests do not establish this complete protected-mode protocol.
+
+The proposed protected protocol therefore needs a new version, distinct from the
+same-UID version-2 experiment, with `staging_ready` and `tool_started` states.
+`staging_ready` means the original supervisor owns the trusted input stager; it
+closes Cargo's exec-start pipe so Cargo can write stdin, but attests no compiler
+execution. Capture at most 8 MiB of stdin, with a staging deadline of the lesser
+of 60 seconds and the remaining declared command deadline. Use bounded streaming
+backpressure; EOF is required before accepting the input identity. Seal the
+captured bytes, drop tool credentials, and only then emit `tool_started` using
+the actual supervised tool identity. The tool execution deadline remains the
+existing command deadline, not the 60-second staging limit.
+
+Staging timeout, excess bytes, disconnect or cancellation must tear down the
+original stager and planner scope and preserve an unverified attempt. No tool
+may start after staging cancellation. Pre-start signals cannot be dropped or
+reported as an executed tool's exit; the complete queue/termination behavior is
+part of the credential/I/O feasibility gate below. This is the selected state
+model, not an implemented protocol or authority to activate a privileged mode.
 
 ## Private unit records and cleanup
 
@@ -161,6 +219,15 @@ cleanup interfaces. None requests a new product decision from the owner.
   active inputs; worker copies of output artifacts must not become authoritative.
   Close how self-read build-script outputs participate in input identity without
   making every unchanged invocation incompatible. Blocks protected activation.
+* **Precise lookup closure:** select and prove collection of failed lookups,
+  successful opens and relevant directory queries for the pinned pure compiler.
+  A new generated module candidate is a required regression even when every
+  previously read file keeps identical bytes and timestamps. A conservative
+  whole-generated-tree hash cannot silently replace this work: D8 still requires
+  unrelated generated changes not to rebuild a compatible pure compiler unit.
+  Kernel syscall tracing is a candidate to test, not an accepted complete
+  collector; truncated traces, unsupported operations or incomplete namespace
+  resolution must refuse reuse. Blocks precise-mode implementation acceptance.
 * **Nested builders and rustdoc:** enumerate actual repository use and define how
   a nested Cargo build obtains complete frozen inputs while its parent producer
   is still running. Do not silently allow a nested unprotected cache or assume
