@@ -309,7 +309,7 @@ async fn live_shared_ci_cargo_execution_capabilities()->Result<()> {
 #[tokio::test]
 #[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
 async fn live_shared_ci_generated_input_mutation()->Result<()> {
-    generated_input_mutation(false,false).await
+    generated_input_mutation(false,false,false).await
 }
 
 /// Build-script rerun inputs need the same content-correctness boundary as
@@ -317,7 +317,7 @@ async fn live_shared_ci_generated_input_mutation()->Result<()> {
 #[tokio::test]
 #[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
 async fn live_shared_ci_generated_build_script_mutation()->Result<()> {
-    generated_input_mutation(true,false).await
+    generated_input_mutation(true,false,false).await
 }
 
 /// A newly introduced module candidate must invalidate reuse even though every
@@ -325,10 +325,18 @@ async fn live_shared_ci_generated_build_script_mutation()->Result<()> {
 #[tokio::test]
 #[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
 async fn live_shared_ci_generated_module_resolution_mutation()->Result<()> {
-    generated_input_mutation(false,true).await
+    generated_input_mutation(false,true,false).await
 }
 
-async fn generated_input_mutation(build_script:bool,resolution:bool)->Result<()> {
+/// Observation feasibility only. The original adapter regression above remains
+/// independent and must go green through actual adapter invalidation.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_generated_module_lookup_trace()->Result<()> {
+    generated_input_mutation(false,true,true).await
+}
+
+async fn generated_input_mutation(build_script:bool,resolution:bool,read_trace:bool)->Result<()> {
     let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
     let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
     ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
@@ -355,13 +363,27 @@ async fn generated_input_mutation(build_script:bool,resolution:bool)->Result<()>
     } else {
         std::fs::write(root.join("src/main.rs"),"fn main(){println!(\"{}\",include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"),\"/node_modules/generated.txt\")));}\n")?;
     }
-    std::fs::write(root.join("rustc-counter.py"),r#"#!/usr/bin/python3
+    let counter=if read_trace {r#"#!/usr/bin/python3
+import os,subprocess,sys
+from pathlib import Path
+tracked='--crate-name' in sys.argv and sys.argv[sys.argv.index('--crate-name')+1]=='generated_input_consumer'
+if tracked:
+    with Path('/tmp/ci-fixture-rustc-count').open('a') as stream:stream.write('compile\n')
+    # Observe lookup arguments and results only. Do not trace read buffers,
+    # exec environments, or treat this worker-owned log as trusted evidence.
+    result=subprocess.run(['/usr/bin/strace','-f','-qq','-s','4096','-v','-yy',
+        '-e','trace=openat,openat2,newfstatat,stat,statx,lstat,access,faccessat,faccessat2,readlink,readlinkat,getdents64',
+        '-o','/workspace/target/ci-fixture-read-trace.txt',*sys.argv[1:]])
+    raise SystemExit(result.returncode if result.returncode>=0 else 128-result.returncode)
+os.execvp(sys.argv[1],sys.argv[1:])
+"#} else {r#"#!/usr/bin/python3
 import os,sys
 from pathlib import Path
 if '--crate-name' in sys.argv and sys.argv[sys.argv.index('--crate-name')+1]=='generated_input_consumer':
     with Path('/tmp/ci-fixture-rustc-count').open('a') as stream:stream.write('compile\n')
 os.execvp(sys.argv[1],sys.argv[1:])
-"#)?;
+"#};
+    std::fs::write(root.join("rustc-counter.py"),counter)?;
     std::fs::set_permissions(root.join("rustc-counter.py"),std::fs::Permissions::from_mode(0o755))?;
     git(root,&["init","-q"]).await?;git(root,&["add","."]).await?;
     git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false","commit","-qm","fixed generated-input consumer"]).await?;
@@ -409,23 +431,44 @@ PY"#} else {"RUSTC_WRAPPER=/workspace/rustc-counter.py cargo build --offline --l
     ensure!(changed.status=="passed" && changed.command_receipt.as_ref().is_some_and(|r|r.value()["input_write_observation"]["changed"]==true),
         "generated mutation was not observed");
     let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
+    let control_command=if read_trace {r#"python3 -I - <<'PY'
+import json,subprocess,sys
+from pathlib import Path
+trace=Path('target/ci-fixture-read-trace.txt');assert trace.is_file() and trace.stat().st_size<=4*1024**2,'bounded trace required'
+dep_infos={}
+for path in Path('target/debug/deps').glob('generated_input_consumer-*.d'):
+ assert path.stat().st_size<=512*1024 and len(dep_infos)<8,'bounded dep-info required'
+ dep_infos[str(path)]=path.read_text()
+print(json.dumps({'trace':trace.read_text(),'dep_infos':dep_infos,'trusted_input_closure':False}),flush=True)
+result=subprocess.run(['rustc','--edition=2021','--crate-name','resolution_control','src/main.rs','-o','target/resolution-control'],capture_output=True,text=True)
+sys.stderr.write(result.stderr);sys.stdout.write(result.stdout);raise SystemExit(result.returncode)
+PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o target/resolution-control"};
     let control=if resolution {Some(session.run("repository",&source,root,&bound,None,&[],&[],&[],
-        Some("rustc --edition=2021 --crate-name resolution_control src/main.rs -o target/resolution-control"),
+        Some(control_command),
         &storage,&target,&audit,timeout).await?)} else {None};
     let passed=if resolution {observed.status=="failed" && observed.stdout.contains("DIAG=E0761")
         && control.as_ref().is_some_and(|value|value.status=="failed" && value.stderr.contains("E0761"))}
         else {observed.status=="passed" && observed.stdout.trim()=="CALLS=1\nNEW"};
-    let report=serde_json::json!({"version":1,"kind":"real_shared_ci_generated_input_mutation",
+    let lookup_observation=if read_trace {control.as_ref().and_then(|value|serde_json::from_str::<serde_json::Value>(value.stdout.trim()).ok())} else {None};
+    let lookup_observed=lookup_observation.as_ref().is_some_and(|value|
+        value["trace"].as_str().is_some_and(|trace|trace.lines().any(|line|
+            line.contains("chosen.rs") && line.contains("ENOENT")))
+        && value["dep_infos"].as_object().is_some_and(|files|!files.is_empty()
+            && files.values().all(|value|value.as_str().is_some_and(|text|!text.contains("chosen.rs")))))
+        && control.as_ref().is_some_and(|value|value.status=="failed" && value.stderr.contains("E0761"));
+    let report=serde_json::json!({"version":1,"kind":if read_trace {"real_shared_ci_negative_lookup_trace"} else {"real_shared_ci_generated_input_mutation"},
         "head":head,"generation":source.generation(),"input_consumer":if resolution {"module_resolution"} else if build_script {"build_script"} else {"compiler_include"},
         "old_and_new_mtime_ns":946684800000000000_u64,
         "expected":if resolution {"compile failure E0761 after introducing a conflicting module"} else {"CALLS=1\nNEW"},
         "actual":observed.stdout.trim(),"status":observed.status,
         "direct_compiler_control":control.as_ref().map(|value|serde_json::json!({"status":value.status,"stdout":value.stdout,"stderr":value.stderr})),
         "unchanged_compatible_unit_actual_rustc_calls":0,
-        "passed":passed,
+        "passed":if read_trace {lookup_observed} else {passed},
+        "input_behavior_fixed":passed,"negative_lookup_observed_but_absent_from_dep_info":lookup_observed,
+        "trusted_input_closure":false,"cargo_metadata_isolation_established":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&report)?)?;
-    ensure!(report["passed"]==true,"generated-input invalidation missing: executed {}",observed.stdout.trim());
+    ensure!(report["passed"]==true,"generated-input observation or invalidation missing: executed {}",observed.stdout.trim());
     Ok(())
 }
 
