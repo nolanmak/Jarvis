@@ -14,6 +14,7 @@ unregistered target directory to work around a busy cache.
 
 Take rollout backups through `augmentagent deploy snapshot`; do not create raw
 database copies or ad hoc rollback directories outside its retention policy.
+If deploy snapshot refuses for storage, report it to the owner. Do not unpin snapshots, delete snapshot directories, or override storage limits (AUGMENTAGENT_DEPLOY_MAX_GB, AUGMENTAGENT_DEPLOY_KEEP, free-space floors) to get past it.
 
 See `docs/disk-storage.md` for ownership, budgets, rollback protection, and rollout
 verification. Follow `CLAUDE.md` for other repository conventions when present.

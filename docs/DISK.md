@@ -16,7 +16,7 @@ the logs.
 | action-body compaction | hourly, inside the daemon | Drops action bodies that only repeat the stored email |
 | gate cache trim | every updater tick, lanes idle | Brings the gate cache back under `AUGMENTAGENT_GATE_CACHE_MAX_MB` in tiers |
 | gate free-space floor | before every gate | Refuses to start below `AUGMENTAGENT_GATE_MIN_FREE_GB` |
-| `autopr-health` | every 2 h | Alerts on any watched filesystem under the floor, or shrinking fast |
+| `autopr-health` | every 2 h | Alerts on any watched filesystem under the floor, or shrinking fast; warns (`snapshot-budget`) when protected deploy snapshots fill their budget |
 
 `augmentagent disk status` prints free space per filesystem and what lives
 there. `augmentagent disk prune --dry-run` prints what a pass would remove.
@@ -115,10 +115,17 @@ before a manual deploy. It writes one dated dir under
 `deploy list` shows them. `deploy restore-db <name> --to <path>` writes the
 database back; stop the daemon first, and pass `--force` to replace a file.
 
-`deploy prune` keeps the newest `AUGMENTAGENT_DEPLOY_KEEP` (default 2) and
-anything younger than 48 hours, and applies the same rule to the
-`augmentagent.*` rollback binaries beside the release build. The newest is
-never removed. It runs after every verified update and with the daily timer.
+`deploy prune` keeps the newest `AUGMENTAGENT_DEPLOY_KEEP` (default 2) of
+each source database and, while the snapshots fit `AUGMENTAGENT_DEPLOY_MAX_GB`
+(default 8 GiB), anything younger than 48 hours. Over budget, the budget wins
+over the 48-hour rule (#1815): unpinned, unreferenced snapshots outside those
+keep slots are removed oldest first until the total fits, and only if it then
+fits. `deploy snapshot` does the same once its own exact size is known, so a
+rollout makes room instead of being refused. Pins, references and forensic
+evidence are never evicted; when only they remain, the refusal and
+`autopr-health` (`snapshot-budget`) name them for the owner. The 48-hour rule
+alone also applies to the `augmentagent.*` rollback binaries beside the
+release build. It runs after every verified update and with the daily timer.
 
 Backups made by hand before this existed (`deploy-backups/`,
 `deploy-artifacts/`, the state dir's `rollbacks/`) are left alone unless asked:

@@ -316,6 +316,33 @@ from the process supervising the exact test, plus its one-test passing summary.
 An interrupted run without that receipt is failed/incomplete, even if systemd
 reports success. Retain the transcript, result, and completion receipt together.
 
+Before that memory check, the wrapper takes the host build lease: the same
+`disk-build.lock` managed builds hold plus the `disk-update.lock` deployment
+builds hold, in the host state directory resolved from the wrapper's own
+environment (#1816). Every probe takes it, reviewer and replay probes included.
+While it is held no managed or deployment build can start, so the memory
+reading is no longer a race against the next build. While a build holds either
+lock the wrapper waits (`--lease-wait-secs`, default 1800) and prints
+`waiting in line for host build lease (<lock> held by pid <pid> <comm>)`,
+a progress line each minute, and the wait it took. Each attempt takes both
+locks or neither, so a waiting probe never blocks deploys. Waiters poll; there
+is no ordering guarantee, and a bridge build command already holding the update
+lock wins the handoff. On timeout the wrapper exits 75 (storage busy) without
+starting the unit. With the lease held it re-reads `MemAvailable` for up to
+`--capacity-settle-secs` (default 120) before refusing, and releases the lease
+on every exit. The unit's `RuntimeMaxSec` (`--max-run-secs`, default 4 h)
+bounds how long the lease can be held. `result.json` records
+`host_build_lease.waited_seconds` and `resource_preflight.settle_seconds`.
+
+Consequences while a probe runs: managed builds give up after their 300 s
+admission wait (exit 75; rerun them), bridge build commands fail
+`build_storage_busy`, shared CI defers after its own 300 s wait, and the updater
+defers ("another deployment build is active"). The unit is started by the
+systemd user manager, not as the wrapper's child, so it cannot inherit the
+lock descriptors: if the wrapper is killed, the unit keeps running without host
+exclusion and only RunScope's checks remain. The unit's own builds use its
+isolated state directory, so the host lease never deadlocks them.
+
 
 Probe budgets follow reachable capabilities: `issue` and `adoption` include the
 configured build guest because they exercise builders/repairs. `writer` and
