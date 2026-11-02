@@ -2869,6 +2869,16 @@ impl Store {
     /// now, so downstream freshness rendering ("facts as of …") reflects
     /// when the message was actually sent. Existing rows update like
     /// [`upsert_email`] and keep their original `firstSeenAt`.
+    /// Persist `email`'s recipients as the reply context a later reload
+    /// restores, for importers that store rows via [`Store::upsert_email_backfill`].
+    pub fn record_reply_recipients(&self, email: &Email) -> StoreResult<()> {
+        let context = serde_json::to_string(&(email.to.clone(), email.cc.clone(), email.attachments.clone()))
+            .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute("UPDATE emails SET retryGuardContext = ?2 WHERE messageId = ?1", params![email.message_id, context])?;
+        Ok(())
+    }
+
     pub fn upsert_email_backfill(&self, email: &Email, first_seen_ms: i64) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let existed: Option<i64> = guard
