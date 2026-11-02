@@ -164,7 +164,15 @@ def supervise(receipt, argv):
                         stream.write('all-descendants-reaped\n')
                         stream.flush()
                         os.fsync(stream.fileno())
-                    return 128 + signal.SIGTERM if stopping else (status if status is not None and status >= 0 else 1)
+                    if stopping:
+                        return 128 + signal.SIGTERM
+                    if status is None:
+                        return 1
+                    # #1779: a provider killed by a signal while we live (OOM
+                    # SIGKILL, `pkill claude`) is forwarded the shell's way,
+                    # 128+n, so the daemon reads it as an interruption rather
+                    # than a provider failure.
+                    return status if status >= 0 else 128 - status
                 if pid == 0:
                     break
             if time.monotonic() >= deadline:

@@ -5375,6 +5375,15 @@ exit 1
                 "{name}: {err:#}"
             );
         }
+        // #1779 D2 — the CLI alone killed (OOM, `pkill claude`) while the
+        // supervisor lives: forwarded as 128+9, so Interrupted, not Unavailable.
+        let bin = stub_cli(&dir, "fake-claude-child-sigkilled", "cat >/dev/null\nkill -KILL $$\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+        assert!(
+            matches!(ReasonerError::find_in(&err), Some(ReasonerError::Interrupted { signal: 9, .. })),
+            "child SIGKILL: {err:#}"
+        );
         let bin = stub_cli(&dir, "fake-claude-exit-1", "cat >/dev/null\nexit 1\n");
         let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
         let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
