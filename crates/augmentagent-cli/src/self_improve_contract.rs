@@ -2005,7 +2005,7 @@ pub(super) async fn verify_with_repair_for(
                 recovery::commit_candidate_named(worktree, &format!("fix: {title} ({source})")).await?;
                 // A repair can affect code outside the selected regression test.
                 // It must re-earn the normal gate before any review sees it.
-                verification_gate(worktree, &workflow.audit_logger()).await?;
+                verification_gate(worktree, &workflow.audit_logger()).await.for_workflow(workflow).await??;
             }
         }
     }

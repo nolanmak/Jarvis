@@ -315,3 +315,35 @@ fn private_phone_setup_is_excluded_from_search_and_wiki_capture_across_restart()
     assert_eq!(next.inserted, 1);
     assert!(capture_email(&next.deltas[0]).body.contains("New ordinary message"));
 }
+
+#[test]
+fn polled_group_row_reloads_with_every_member_as_recipients() {
+    // #1764 — a reposted group card (Revise, nudge) reloads the stored row,
+    // so the poller itself must persist the members it shows on the card.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("conversations/Ski")).unwrap();
+    fs::write(
+        root.join("conversations/index.json"),
+        json!({
+            "120363000000000001@g.us": {
+                "identifier": "120363000000000001@g.us", "dir": "Ski", "title": "Ski Trip",
+                "service": "WhatsApp", "participants": ["+15550000001", "111@lid"],
+                "participant_names": {"111@lid": "Ana"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(root.join("conversations/Ski/messages.md"),
+        "---\ntype: WhatsApp Conversation\n---\n\n### [2026-08-26T12:00:00+00:00] 111@lid\ncan you drive?\n").unwrap();
+    let store = Store::open(root.join("data.db")).unwrap();
+    assert_eq!(poll_once(root, &store).unwrap().inserted, 1);
+    let id = "whatsapp-history:120363000000000001@g.us:0";
+    let action = store
+        .log_action(id, Some("whatsapp-history:120363000000000001@g.us"), "Ana", "WhatsApp group: Ski Trip",
+                    None, Some("yes"), augmentagent_store::ActionStatus::Pending)
+        .unwrap();
+    let row = store.get_action_with_email(&action).unwrap().unwrap();
+    assert_eq!(row.email.to, "+15550000001, Ana <111@lid>");
+}

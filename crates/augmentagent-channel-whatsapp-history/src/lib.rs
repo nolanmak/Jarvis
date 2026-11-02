@@ -224,7 +224,12 @@ pub fn poll_once(root: &Path, store: &Store) -> Result<Report> {
                 Err(_) => continue,
             };
             let item = email(&delta.conversation, idx, entry);
-            if store.upsert_email_backfill(&item, ts)? {
+            let inserted = store.upsert_email_backfill(&item, ts)?;
+            // A reposted group card reloads this row; keep its members (#1764).
+            if !item.to.is_empty() {
+                store.record_reply_recipients(&item)?;
+            }
+            if inserted {
                 report.inserted += 1;
                 delta.entries.push((idx, entry.clone()));
             }
