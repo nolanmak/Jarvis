@@ -618,6 +618,27 @@ impl AuditLogger {
         anyhow::bail!("protected controller receipt missing")
     }
 
+    /// Return the newest committed controller record of this kind. This is a
+    /// freshness fence, so a newer unfinished attempt supersedes an older pass.
+    /// Model records and uncommitted or corrupted suffixes cannot supply it.
+    pub fn latest_controller_receipt(&self,kind:&str)->anyhow::Result<Option<ProtectedControllerReceipt>> {
+        anyhow::ensure!(!kind.is_empty() && kind.len()<=128
+            && kind.bytes().all(|byte|byte.is_ascii_alphanumeric() || matches!(byte,b'_'|b'-')),
+            "invalid protected receipt kind");
+        self.protected_health()?;
+        let sink=self.anchored.as_ref().ok_or_else(||anyhow::anyhow!("protected audit required"))?;
+        for mut row in sink.committed_records()?.into_iter().rev() {
+            if row["actor"]!="controller" || row["kind"]!=kind {continue;}
+            let payload_sha256=row["audit_chain"]["payload_sha256"].as_str()
+                .ok_or_else(||anyhow::anyhow!("protected receipt identity missing"))?.to_owned();
+            anyhow::ensure!(payload_sha256.len()==64 && payload_sha256.bytes()
+                .all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f')),"invalid protected receipt identity");
+            row.as_object_mut().ok_or_else(||anyhow::anyhow!("invalid controller receipt"))?.remove("audit_chain");
+            return Ok(Some(ProtectedControllerReceipt {payload_sha256,value:row}));
+        }
+        Ok(None)
+    }
+
     async fn record_value_checked(&self, value: serde_json::Value) -> anyhow::Result<()> {
         let sink = self
             .anchored
@@ -1445,6 +1466,26 @@ mod tests {
         use std::io::Write;
         file.write_all(b"{\"actor\":\"controller\",\"kind\":\"fake-ci-proof\"}\n").unwrap();
         assert!(logger.controller_receipt(receipt.payload_sha256()).is_err());
+    }
+
+    #[test]
+    fn latest_controller_receipt_ignores_spoofs_and_refuses_uncommitted_suffixes() {
+        let (dir,logger,log,_anchor)=protected_fixture();
+        assert!(AuditLogger::new(dir.path().join("plain.log")).latest_controller_receipt("ci-start").is_err());
+        assert!(logger.latest_controller_receipt("").is_err());
+        assert!(logger.latest_controller_receipt("ci-start").unwrap().is_none());
+        let first=logger.record_controller_receipt(serde_json::json!({"kind":"ci-start","attempt":1})).unwrap();
+        logger.record_controller(serde_json::json!({"actor":"model","kind":"ci-start","attempt":99})).unwrap();
+        assert_eq!(logger.latest_controller_receipt("ci-start").unwrap().unwrap().payload_sha256(),first.payload_sha256());
+        let second=logger.record_controller_receipt(serde_json::json!({"kind":"ci-start","attempt":2})).unwrap();
+        logger.record_controller_receipt(serde_json::json!({"kind":"ci-complete","attempt":1})).unwrap();
+        let latest=logger.latest_controller_receipt("ci-start").unwrap().unwrap();
+        assert_eq!(latest.payload_sha256(),second.payload_sha256());
+        assert_eq!(latest.value(),second.value());
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(log).unwrap()
+            .write_all(b"{\"actor\":\"controller\",\"kind\":\"ci-start\",\"attempt\":3}\n").unwrap();
+        assert!(logger.latest_controller_receipt("ci-start").is_err());
     }
 
     #[test]

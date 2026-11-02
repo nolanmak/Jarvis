@@ -67,23 +67,24 @@ pub(super) struct DependencySource {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct CachePreparation {
-    version: u32,
-    binding: CacheBinding,
-    command: String,
-    outputs_sha256: String,
-    dependency_seed: Option<String>,
+pub(super) struct CachePreparation {
+    pub(super) version: u32,
+    pub(super) binding: CacheBinding,
+    pub(super) command: String,
+    pub(super) outputs_sha256: String,
+    #[serde(deserialize_with = "proof::required_nullable")]
+    pub(super) dependency_seed: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct CacheBinding {
-    generation: String,
-    head: String,
-    tree: String,
-    contract_sha256: String,
-    authority_sha256: String,
-    cache_identity_sha256: String,
-    source_inputs_sha256: String,
+pub(super) struct CacheBinding {
+    pub(super) generation: String,
+    pub(super) head: String,
+    pub(super) tree: String,
+    pub(super) contract_sha256: String,
+    pub(super) authority_sha256: String,
+    pub(super) cache_identity_sha256: String,
+    pub(super) source_inputs_sha256: String,
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
@@ -124,6 +125,8 @@ pub(super) struct Outcome {
     /// JSON object cannot supply or deserialize a protected audit receipt.
     #[serde(skip)]
     pub command_receipt: Option<augmentagent_channel_core::tool_audit::ProtectedControllerReceipt>,
+    #[serde(skip)]
+    pub quiescence_receipt: Option<augmentagent_channel_core::tool_audit::ProtectedControllerReceipt>,
     #[serde(default)]
     guest_diagnostic:Option<serde_json::Value>,
 }
@@ -681,6 +684,15 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
         if matches!(operation,"step"|"targeted"|"baseline"|"repository") {
+            let invocation=match operation {
+                "step"=>proof::Invocation::Step {check:check.context("shared CI prerequisite unavailable: check identity missing")?.id.clone()},
+                "targeted"=>proof::Invocation::Targeted {packages:packages.to_vec()},
+                "baseline"=>proof::Invocation::Baseline {packages:packages.to_vec(),filters:filters.to_vec()},
+                "repository"=>proof::Invocation::Repository {command_sha256:digest(owner_command
+                    .context("shared CI prerequisite unavailable: owner verification command missing")?.as_bytes())},
+                _=>unreachable!(),
+            };
+            let invocation_sha256=invocation.digest()?;
             let cache=std::fs::metadata(&self.cache)
                 .context("shared CI prerequisite unavailable: physical cache identity missing")?;
             let cache_identity=digest(&serde_json::to_vec(&(cache.dev(),cache.ino(),cache.len()))?);
@@ -690,6 +702,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             // be established before C can publish its final passing proof.
             outcome.command_receipt=Some(audit.record_controller_receipt(serde_json::json!({
                 "kind":"shared_ci_command_complete","version":1,"operation":operation,
+                "invocation_sha256":invocation_sha256,
                 "check":check.map(|check|&check.id),"binding":binding,
                 "controller_authority_sha256":self.authority_sha256,"cache_preparation":prepared,
                 "quiescence_receipt_sha256":quiescence_sha256,"status":outcome.status,
@@ -706,6 +719,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
                     producer:outcome.dependency_result.as_ref().filter(|value|value["kind"]=="produced")
                         .and_then(|value|value["producer"].as_str()).map(str::to_owned)});
         }
+        outcome.quiescence_receipt=Some(quiescence_receipt);
         Ok(outcome)
     }
 
@@ -737,7 +751,7 @@ mod tests {
                 "tree":binding.index_tree,"contract_sha256":binding.contract_sha256,"authority_sha256":authority,
                 "cache_identity_sha256":cache,"source_inputs_sha256":"6".repeat(64)},
                 "command":command,"outputs_sha256":"7".repeat(64),"dependency_seed":null}});
-        for fault in ["none","legacy","tree","head","source","generation","command","authority","cache","unknown-field","forged-capability"] {
+        for fault in ["none","legacy","tree","head","source","generation","command","authority","cache","unknown-field","missing-seed","forged-capability"] {
             let mut value=original.clone();
             match fault {
                 "legacy"=>{value.as_object_mut().unwrap().remove("cache_preparation");},
@@ -749,6 +763,7 @@ mod tests {
                 "authority"=>value["cache_preparation"]["binding"]["authority_sha256"]="8".repeat(64).into(),
                 "cache"=>value["cache_preparation"]["binding"]["cache_identity_sha256"]="8".repeat(64).into(),
                 "unknown-field"=>value["cache_preparation"]["unrecognized"]=true.into(),
+                "missing-seed"=>{value["cache_preparation"].as_object_mut().unwrap().remove("dependency_seed");},
                 "forged-capability"=>value["command_receipt"]=serde_json::json!({"actor":"controller","payload_sha256":"8".repeat(64)}),
                 _=>{}
             }

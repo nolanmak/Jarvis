@@ -41,7 +41,7 @@ use tracing::{info, warn};
 use augmentagent_channel_core::{build_workflow_reasoner as build_reasoner, FallbackReasoner, Reasoner};
 
 #[path = "self_improve_ci.rs"]
-mod shared_ci;
+pub(crate) mod shared_ci;
 #[path = "self_improve_baseline_priority.rs"]
 mod baseline_priority;
 

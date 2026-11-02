@@ -9,6 +9,8 @@ pub(in crate::self_improve) mod fixture;
 mod vm;
 #[path = "self_improve_ci_coverage.rs"]
 mod coverage;
+#[path = "self_improve_ci_proof.rs"]
+pub(crate) mod proof;
 
 /// Protected completion of the local plan. This is not the final reusable
 /// freshness proof: generated inputs and the current workflow binding remain
@@ -40,16 +42,17 @@ fn contract_for(root: &Path) -> Result<String> {
 
 const PREREQUISITE: &str = "shared CI prerequisite unavailable";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct Binding {
-    head: String,
-    verification_head: String,
-    base: String,
-    base_ref: String,
-    index_tree: String,
-    status: String,
-    contract_sha256: String,
-    runner_sha256: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Binding {
+    pub(crate) head: String,
+    pub(crate) verification_head: String,
+    pub(crate) base: String,
+    pub(crate) base_ref: String,
+    pub(crate) index_tree: String,
+    pub(crate) status: String,
+    pub(crate) contract_sha256: String,
+    pub(crate) runner_sha256: String,
 }
 #[derive(Debug, Deserialize)]
 struct Plan {
@@ -457,6 +460,8 @@ async fn verify_admitted(root: &Path, audit: &Arc<augmentagent_channel_core::Aud
     )?;
     plan.validate(&binding_before)
         .context("shared CI prerequisite unavailable: invalid isolated CI plan")?;
+    let discovery_quiescence=discovered.quiescence_receipt.as_ref()
+        .context("shared CI prerequisite unavailable: original plan teardown receipt missing")?;
     ensure!(
         binding(root).await? == binding_before,
         "{PREREQUISITE}: source changed during CI discovery"
@@ -466,6 +471,7 @@ async fn verify_admitted(root: &Path, audit: &Arc<augmentagent_channel_core::Aud
     drop(discovery_source);
     let dependency_seed=vm.dependency_seed(root,&binding_before,target,storage,audit).await?;
     let plan_receipt=audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_plan", "run_id":run_id,"binding":binding_before,
+        "local_plan_complete":true,"quiescence_receipt_sha256":discovery_quiescence.payload_sha256(),
         "execution_boundary":"existing-build-vm", "vm_authority_sha256":vm.authority_sha256,
         "checks":plan.checks.iter().map(|check| serde_json::json!({"id":check.id,"status":check.status,"reason":check.reason,"workflow":check.workflow,"job":check.job,"matrix":check.matrix})).collect::<Vec<_>>()}))
         .context("shared CI prerequisite unavailable: plan receipt not committed")?;

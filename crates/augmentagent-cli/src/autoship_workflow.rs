@@ -82,7 +82,7 @@ pub struct Binding {
     pub evidence_hash: String,
 }
 impl Binding {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             !self.head.trim().is_empty() && self.head.len() <= 256,
             "bounded head is required"
