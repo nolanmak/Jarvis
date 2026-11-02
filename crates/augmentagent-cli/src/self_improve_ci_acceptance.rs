@@ -118,23 +118,46 @@ async fn live_shared_ci_same_uid_cargo_relay()->Result<()> {
     let binding=binding(root).await?;let session=vm::Session::prepare(&owner,&target)?;
     let source=snapshot(root,&binding,&target).await?;
     let command=r#"python3 -I - <<'PY'
-import importlib.util,json,os,shutil,subprocess,tempfile
+import importlib.util,json,os,shutil,subprocess,tempfile,threading
 from pathlib import Path
 control=Path(tempfile.mkdtemp(prefix='jcr-',dir='/tmp'));control.chmod(0o700)
 library=Path('/workspace/target/relay-experiment.so');shutil.copyfile('/workspace/relay.so',library)
 for name in ('ci-cargo-relay.py','provider-supervisor.py'):shutil.copyfile('/workspace/'+name,control/name)
 spec=importlib.util.spec_from_file_location('relay',control/'ci-cargo-relay.py');relay=importlib.util.module_from_spec(spec);spec.loader.exec_module(relay)
-results=[];signal_result=None
-with relay.Relay(control,library=library,timeout=30) as server:
+results=[];signal_result=None;requests=[];fingerprints=[];phase='initializing';observations_lock=threading.Lock()
+identity_environment={b'CARGO_CRATE_NAME',b'CARGO_MANIFEST_DIR',b'CARGO_MANIFEST_PATH',b'CARGO_PKG_NAME',
+ b'CARGO_PKG_VERSION',b'CARGO_PRIMARY_PACKAGE',b'CARGO_HOME',b'OUT_DIR',b'HOST',b'TARGET',b'PROFILE',
+ b'OPT_LEVEL',b'DEBUG',b'RUSTFLAGS',b'CARGO_ENCODED_RUSTFLAGS',b'CARGO_MAKEFLAGS',b'MAKEFLAGS'}
+server=relay.Relay(control,library=library,timeout=30)
+receive=server._receive
+def observe(connection,descriptors):
+ numbers=receive(connection,descriptors)
+ file,argv,environment,cwd,search,ignored,blocked=relay._payload(descriptors[0])
+ # Synthetic fixture only: preserve exact argv and selected build variables,
+ # never the complete inherited environment. This trace grants no authority.
+ value={'phase':phase,'file':os.fsdecode(file),'argv':[os.fsdecode(arg) for arg in argv],
+  'cwd':os.fsdecode(cwd),'environment':{os.fsdecode(k):os.fsdecode(v) for k,v in environment.items() if k in identity_environment},
+  'inherited_pipe_numbers':numbers[3:]}
+ with observations_lock:requests.append(value)
+ return numbers
+server._receive=observe
+with server:
  for attempt in range(2):
+  phase='cargo-'+str(attempt)
   fd=server.config_fd()
   try:
    environment=os.environ.copy();environment.update(LD_PRELOAD=str(library),JARVIS_CARGO_RELAY_FD=str(fd))
    result=subprocess.run(['/toolchain/bin/cargo','test','--workspace','--offline','--locked'],cwd='/workspace',env=environment,pass_fds=(fd,),capture_output=True,text=True,timeout=120)
   finally:os.close(fd)
   results.append({'exit_code':result.returncode,'stdout':result.stdout[-6000:],'stderr':result.stderr[-6000:]})
+  snapshot={}
+  for path in Path('/workspace/target/debug/.fingerprint').glob('*/*.json'):
+   assert len(snapshot)<128 and path.stat().st_size<=65536,'bounded Cargo metadata observation required'
+   snapshot[str(path.relative_to('/workspace/target'))]=json.loads(path.read_bytes())
+  fingerprints.append({'phase':phase,'records':snapshot})
   if result.returncode:break
  if len(results)==2 and all(result['exit_code']==0 for result in results):
+  phase='signal-probe'
   probes=list(Path('/workspace/target/debug/build').glob('relay-app-*/out/relay-signal-probe'))
   assert len(probes)==1,probes
   fd=server.config_fd()
@@ -144,10 +167,21 @@ with relay.Relay(control,library=library,timeout=30) as server:
   finally:os.close(fd)
   signal_result={'exit_code':checked.returncode,'stdout':checked.stdout[-2000:],'stderr':checked.stderr[-2000:]}
  completed=list(server.completed);errors=list(server.errors)
-print(json.dumps({'cargo_runs':results,'signal_probe':signal_result,'supervised_tools':len(completed),'cleanup_verified':all(r['cleanup']=='all-descendants-reaped' for r in completed),'relay_errors':errors,'cargo_metadata_isolation_established':False,'shipping_authority':False}))
+compilations=[value for value in requests if Path(value['file']).name=='rustc' and '--crate-name' in value['argv']
+ and value['argv'][value['argv'].index('--crate-name')+1] in ('relay_app','relay_macros','build_script_build')]
+print(json.dumps({'cargo_runs':results,'signal_probe':signal_result,'supervised_tools':len(completed),
+ 'cargo_requests':requests,'cargo_fingerprints':fingerprints,'compiler_units_first_run':sum(v['phase']=='cargo-0' for v in compilations),
+ 'compiler_units_second_run':sum(v['phase']=='cargo-1' for v in compilations),
+ 'cleanup_verified':all(r['cleanup']=='all-descendants-reaped' for r in completed),'relay_errors':errors,
+ 'cargo_metadata_isolation_established':False,'shipping_authority':False}))
 assert len(results)==2 and all(r['exit_code']==0 for r in results),results
 assert signal_result and signal_result['exit_code']==0 and 'RELAY_GUEST_SIGNALS_COMPLETE' in signal_result['stdout'],signal_result
 assert len(completed)>=4 and not errors
+assert compilations and not any(value['phase']=='cargo-1' for value in compilations),'unchanged Cargo units recompiled'
+assert any('--crate-type' in value['argv'] and 'proc-macro' in value['argv'] for value in compilations),'proc macro unit missing'
+assert any('--test' in value['argv'] for value in compilations),'test unit missing'
+assert any(Path(value['file']).name=='build-script-build' for value in requests),'build script execution missing'
+assert len(fingerprints)==2 and all(value['records'] for value in fingerprints),'protected graph candidate needs actual Cargo metadata'
 PY"#;
     let result=session.run("repository",&source,root,&binding,None,&[],&[],&[],Some(command),
         &storage,&target,&audit,std::time::Duration::from_secs(300)).await?;
