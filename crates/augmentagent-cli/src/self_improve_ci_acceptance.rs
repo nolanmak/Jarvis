@@ -7,6 +7,18 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[tokio::test]
 #[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
 async fn live_shared_ci_generated_input_mutation()->Result<()> {
+    generated_input_mutation(false).await
+}
+
+/// Build-script rerun inputs need the same content-correctness boundary as
+/// include_str! inputs; Cargo's compiler checksum mode alone does not cover it.
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_generated_build_script_mutation()->Result<()> {
+    generated_input_mutation(true).await
+}
+
+async fn generated_input_mutation(build_script:bool)->Result<()> {
     let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
     let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
     ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence required");
@@ -20,7 +32,17 @@ async fn live_shared_ci_generated_input_mutation()->Result<()> {
     std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n")?;
     std::fs::write(root.join("Cargo.lock"),"version=4\n[[package]]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\n")?;
     std::fs::write(root.join("package.json"),"{\"name\":\"generated-input-fixture\",\"private\":true}\n")?;
-    std::fs::write(root.join("src/main.rs"),"fn main(){println!(\"{}\",include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"),\"/node_modules/generated.txt\")));}\n")?;
+    if build_script {
+        std::fs::write(root.join("build.rs"),r#"fn main(){
+    println!("cargo:rerun-if-changed=node_modules/generated.txt");
+    let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::copy("node_modules/generated.txt",out.join("generated.txt")).unwrap();
+}
+"#)?;
+        std::fs::write(root.join("src/main.rs"),"fn main(){println!(\"{}\",include_str!(concat!(env!(\"OUT_DIR\"),\"/generated.txt\")));}\n")?;
+    } else {
+        std::fs::write(root.join("src/main.rs"),"fn main(){println!(\"{}\",include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"),\"/node_modules/generated.txt\")));}\n")?;
+    }
     std::fs::write(root.join("rustc-counter.py"),r#"#!/usr/bin/python3
 import os,sys
 from pathlib import Path
@@ -50,7 +72,8 @@ os.execvp(sys.argv[1],sys.argv[1:])
         "generated mutation was not observed");
     let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
     let report=serde_json::json!({"version":1,"kind":"real_shared_ci_generated_input_mutation",
-        "head":head,"generation":source.generation(),"old_and_new_mtime_ns":946684800000000000_u64,
+        "head":head,"generation":source.generation(),"input_consumer":if build_script {"build_script"} else {"compiler_include"},
+        "old_and_new_mtime_ns":946684800000000000_u64,
         "expected":"CALLS=1\nNEW","actual":observed.stdout.trim(),"status":observed.status,
         "unchanged_compatible_unit_actual_rustc_calls":0,
         "passed":observed.status=="passed" && observed.stdout.trim()=="CALLS=1\nNEW",
