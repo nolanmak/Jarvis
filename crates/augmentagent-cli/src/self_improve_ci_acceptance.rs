@@ -347,6 +347,9 @@ async fn generated_input_mutation(build_script:bool,resolution:bool,read_trace:b
     let storage=crate::build_storage::admit_ci(&owner,&target).await?;
     let fixture=tempfile::Builder::new().prefix("generated-input-fixture-").tempdir_in(&target)?;
     let root=fixture.path();std::fs::create_dir(root.join("src"))?;
+    if read_trace {
+        std::fs::write(root.join("ci-input-lookups.py"),include_bytes!("../../../scripts/ci-input-lookups.py"))?;
+    }
     std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[workspace]\n")?;
     std::fs::write(root.join("Cargo.lock"),"version=4\n[[package]]\nname=\"generated-input-consumer\"\nversion=\"0.0.0\"\n")?;
     std::fs::write(root.join("package.json"),"{\"name\":\"generated-input-fixture\",\"private\":true}\n")?;
@@ -371,7 +374,7 @@ if tracked:
     with Path('/tmp/ci-fixture-rustc-count').open('a') as stream:stream.write('compile\n')
     # Observe lookup arguments and results only. Do not trace read buffers,
     # exec environments, or treat this worker-owned log as trusted evidence.
-    result=subprocess.run(['/usr/bin/strace','-f','-qq','-s','4096','-v','-yy',
+    result=subprocess.run(['/usr/bin/strace','-f','-qq','-s','4096','-v','-yy','-xx',
         '-e','trace=openat,openat2,newfstatat,stat,statx,lstat,access,faccessat,faccessat2,readlink,readlinkat,getdents64',
         '-o','/workspace/target/ci-fixture-read-trace.txt',*sys.argv[1:]])
     raise SystemExit(result.returncode if result.returncode>=0 else 128-result.returncode)
@@ -432,14 +435,19 @@ PY"#} else {"RUSTC_WRAPPER=/workspace/rustc-counter.py cargo build --offline --l
         "generated mutation was not observed");
     let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
     let control_command=if read_trace {r#"python3 -I - <<'PY'
-import json,subprocess,sys
+import importlib.util,json,subprocess,sys
 from pathlib import Path
 trace=Path('target/ci-fixture-read-trace.txt');assert trace.is_file() and trace.stat().st_size<=4*1024**2,'bounded trace required'
 dep_infos={}
 for path in Path('target/debug/deps').glob('generated_input_consumer-*.d'):
  assert path.stat().st_size<=512*1024 and len(dep_infos)<8,'bounded dep-info required'
  dep_infos[str(path)]=path.read_text()
-print(json.dumps({'trace':trace.read_text(),'dep_infos':dep_infos,'trusted_input_closure':False}),flush=True)
+spec=importlib.util.spec_from_file_location('lookups','/workspace/ci-input-lookups.py')
+lookups=importlib.util.module_from_spec(spec);spec.loader.exec_module(lookups)
+queries=lookups.failed_queries(trace.read_bytes())
+missing=[query for query in queries if query['path'].endswith(b'/chosen.rs') and query['errno']=='ENOENT']
+print(json.dumps({'trace':trace.read_text(),'dep_infos':dep_infos,'trusted_input_closure':False,
+ 'missing_module_queries':len(missing),'lookup_observation':lookups.observation(queries)}),flush=True)
 result=subprocess.run(['rustc','--edition=2021','--crate-name','resolution_control','src/main.rs','-o','target/resolution-control'],capture_output=True,text=True)
 sys.stderr.write(result.stderr);sys.stdout.write(result.stdout);raise SystemExit(result.returncode)
 PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o target/resolution-control"};
@@ -451,8 +459,9 @@ PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o
         else {observed.status=="passed" && observed.stdout.trim()=="CALLS=1\nNEW"};
     let lookup_observation=if read_trace {control.as_ref().and_then(|value|serde_json::from_str::<serde_json::Value>(value.stdout.trim()).ok())} else {None};
     let lookup_observed=lookup_observation.as_ref().is_some_and(|value|
-        value["trace"].as_str().is_some_and(|trace|trace.lines().any(|line|
-            line.contains("chosen.rs") && line.contains("ENOENT")))
+        value["missing_module_queries"].as_u64().is_some_and(|count|count>0)
+        && value["lookup_observation"]["input_closure_complete"]==false
+        && value["lookup_observation"]["shipping_authority"]==false
         && value["dep_infos"].as_object().is_some_and(|files|!files.is_empty()
             && files.values().all(|value|value.as_str().is_some_and(|text|!text.contains("chosen.rs")))))
         && control.as_ref().is_some_and(|value|value.status=="failed" && value.stderr.contains("E0761"));
