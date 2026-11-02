@@ -81,6 +81,17 @@ except OSError as error:
 else: raise SystemExit("tracked source was writable")'"#;
     let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some(tamper),&storage,&target,&audit,timeout).await?;
     ensure!(outcome.status=="passed" && outcome.stdout.trim()=="TRACKED_READ_ONLY","tracked-source substitution was possible");
+    let private_cache=r#"python3 -c 'import os; from pathlib import Path
+assert os.environ["CARGO_HOME"]=="/ci-cargo-home"
+try: list(Path("/build-cache").iterdir())
+except PermissionError: pass
+else: raise SystemExit("worker can inspect shared cache generations")
+try: open("/dev/vda","rb")
+except PermissionError: pass
+else: raise SystemExit("worker can read the underlying cache block device")
+print("CACHE_ROOT_PRIVATE")'"#;
+    let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some(private_cache),&storage,&target,&audit,timeout).await?;
+    ensure!(outcome.status=="passed" && outcome.stdout.trim()=="CACHE_ROOT_PRIVATE","shared cache was visible outside the job mounts");
     let outcome=session.run("repository",&source,repo,&a,None,&[],&[],&[],Some("cargo test --offline --locked --quiet"),&storage,&target,&audit,timeout).await?;
     ensure!(outcome.status=="passed" && outcome.stdout.contains("1 passed"),"original assertion did not execute");
     drop(source);
@@ -113,6 +124,7 @@ else: raise SystemExit("tracked source was writable")'"#;
         "adapter_authority":session.authority_sha256,"equal_old_timestamps":true,"changed_output":true,
         "compile_error_observed":"E0425","failing_assertion_observed":true,"same_head_reconstruction":true,
         "same_generation_compatible_units_recompiled":0,"tracked_source_read_only":true,
+        "shared_cache_root_private":true,"stable_cargo_home":true,
         "reclaimed_generations_observed":reclaimed,"active_generation_preserved":true,
         "trusted_external_seed_tested":false,"full_ci_pass":false,"shipping_authority":false,
         "additional_model_calls":0,"autonomous_merges_claimed":0});

@@ -121,7 +121,9 @@ def seed_build_cache(ci_target=None):
     else:
         home=ci_target.parent/'cargo-home'
         home.mkdir(exist_ok=True);os.chown(home,uid,gid)
-        environment.update({'CARGO_HOME':str(home),'CARGO_TARGET_DIR':'/workspace/target'})
+        Path('/ci-cargo-home').mkdir(mode=0o755,exist_ok=True)
+        subprocess.run(['/usr/bin/mount','--bind',str(home),'/ci-cargo-home'],check=True)
+        environment.update({'CARGO_HOME':'/ci-cargo-home','CARGO_TARGET_DIR':'/workspace/target'})
     if not (home/'.jarvis-seeded').exists():
         for source,destination in (('/cargo/registry/cache','registry/cache'),('/cargo/registry/index','registry/index'),('/cargo/git','git')):
             if Path(source).is_dir() and any(Path(source).iterdir()):
@@ -177,6 +179,13 @@ try:
             for relative,source in output_mounts.items():
                 subprocess.run(['/usr/bin/mount','--bind',str(source),str(Path('/workspace')/relative)],check=True)
             seed_build_cache(ci_target)
+            # Expose only this job's bound target, Cargo home and declared
+            # outputs. A worker cannot inspect old candidate generations or
+            # controller metadata through the underlying shared image.
+            hidden=Path('/root/hidden-build-cache');hidden.mkdir(mode=0o700,exist_ok=True)
+            subprocess.run(['/usr/bin/mount','--bind',str(hidden),'/build-cache'],check=True)
+            subprocess.run(['/usr/bin/mount','-o','remount,bind,ro,nosuid,nodev,noexec','/build-cache'],check=True)
+            os.chmod('/dev/vda',0o600)
         else:
             seed_build_cache()
     process=subprocess.Popen(job['argv'],cwd='/workspace',env=environment,
