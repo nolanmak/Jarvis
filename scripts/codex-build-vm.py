@@ -207,8 +207,14 @@ def bind_ci_cache(target):
     seed_build_cache(target)
 def hide_ci_cache():
     private=Path('/root/managed-ci-cache');private.mkdir(mode=0o700,exist_ok=True)
-    subprocess.run(['/usr/bin/mount','--move','/build-cache',str(private)],check=True)
-    Path('/build-cache').chmod(0o700);os.chmod('/dev/vda',0o600)
+    # The runtime's mount topology does not support moving this mount. Keep a
+    # controller-only bind, then cover the original path with a read-only empty
+    # directory. The worker has neither /root traversal nor raw device access.
+    subprocess.run(['/usr/bin/mount','--bind','/build-cache',str(private)],check=True)
+    hidden=Path('/root/hidden-build-cache');hidden.mkdir(mode=0o700,exist_ok=True)
+    subprocess.run(['/usr/bin/mount','--bind',str(hidden),'/build-cache'],check=True)
+    subprocess.run(['/usr/bin/mount','-o','remount,bind,ro,nosuid,nodev,noexec','/build-cache'],check=True)
+    os.chmod('/dev/vda',0o600)
     return private
 def run_worker(argv):
     process=subprocess.Popen(argv,cwd='/workspace',env=environment,
