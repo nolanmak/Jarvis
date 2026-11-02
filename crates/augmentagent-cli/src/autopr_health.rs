@@ -19,6 +19,7 @@
 //! | `refusal-loop`   | 2026-09-13/14: PR #987 re-refused daily on Cargo.lock|
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `deploy-pinned`  | 2026-10-20→24: a drop-in pinned the unit to a frozen binary; 4 days of merges never ran (#1571) |
+//! | `snapshot-budget`| 2026-11-01: protected snapshots filled the budget; rollouts were refused, then bypassed the cap (#1815) |
 //! | `no-progress`    | the catch-all: nothing merged in N days             |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
 //! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
@@ -100,6 +101,9 @@ pub struct HealthInputs {
     pub free_gb_elsewhere: Vec<(String, f64)>,
     /// #1409 — filesystems that lost space fast since the previous check.
     pub disk_drops: Vec<crate::disk::FsDrop>,
+    /// #1815 — the deploy snapshot root that the next prune still cannot
+    /// bring under its budget. `None` when it can, or there is no root.
+    pub snapshot_budget: Option<crate::deploy_snapshot::BudgetStatus>,
     /// When the cached red-`main` verdict was written, if `main` is currently
     /// recorded red.
     pub red_main_since: Option<DateTime<Utc>>,
@@ -294,6 +298,31 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                     .into(),
             });
         }
+    }
+
+    // #1815 — only pinned, referenced, newest-per-database or evidence
+    // material is left, so `deploy snapshot` refuses new rollback points.
+    // Deploys still work; this needs an owner decision, not an agent.
+    if let Some(b) = &i.snapshot_budget {
+        let gib = |v: u64| v as f64 / (1024.0 * 1024.0 * 1024.0);
+        let shown: Vec<String> = b.blockers.iter().take(5)
+            .map(|(name, why, bytes)| format!("{name} ({why}, {:.1} GiB)", gib(*bytes))).collect();
+        let more = b.blockers.len().saturating_sub(5);
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "snapshot-budget",
+            detail: format!(
+                "deploy snapshots hold {:.1} GiB against a {:.1} GiB budget and nothing more can be evicted, \
+                 so new rollback snapshots are refused; held by: {}{}",
+                gib(b.after_bytes), gib(b.budget_bytes), shown.join(", "),
+                if more > 0 { format!(" +{more} more") } else { String::new() }
+            ),
+            fix: "Owner: release an obsolete pin with `augmentagent deploy unpin NAME` \
+                  (`augmentagent deploy list` shows pins; check forensic evidence and adopted \
+                  rollouts first). Referenced snapshots free up when their process stops. \
+                  Do not raise the budget to get past it."
+                .into(),
+        });
     }
 
     if let Some(since) = i.red_main_since {
@@ -938,6 +967,8 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         free_gb_root: free_gb(Path::new("/")),
         free_gb_elsewhere,
         disk_drops,
+        snapshot_budget: crate::deploy_snapshot::snapshot_root()
+            .and_then(|root| crate::deploy_snapshot::budget_status(&root)),
         free_gb_gate: gate_dir
             .exists()
             .then(|| free_gb(&gate_dir))
@@ -1129,6 +1160,7 @@ mod tests {
             free_gb_gate: Some(53.0),
             free_gb_elsewhere: vec![("the debug target".into(), 51.0)],
             disk_drops: Vec::new(),
+            snapshot_budget: None,
             red_main_since: None,
             repeated_refusals: vec![],
             open_prs: None,
@@ -1799,5 +1831,28 @@ mod deployment_tests {
         report.status="platform-unverified".into();assert!(super::deployment_finding(&report).is_none());
         report.expected_active=true;report.matches=true;report.status="configuration-matched".into();
         assert!(super::deployment_finding(&report).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_root_that_cannot_be_brought_under_budget_is_a_warning() {
+        use super::*;
+        let now = Utc::now();
+        let mut input = HealthInputs { now_or_epoch: Some(now), daemon_active: true, ..Default::default() };
+        let quiet = analyze(&input, &Thresholds::default());
+        assert!(!quiet.iter().any(|f| f.code == "snapshot-budget"));
+        input.snapshot_budget = Some(crate::deploy_snapshot::BudgetStatus {
+            after_bytes: 9 * 1024 * 1024 * 1024,
+            budget_bytes: 8 * 1024 * 1024 * 1024,
+            blockers: vec![("pre-1609".into(), "pinned".into(), 1 << 30),
+                ("probe".into(), "reference probe unavailable (pid 7)".into(), 1 << 30)],
+        });
+        let found: Vec<_> = analyze(&input, &Thresholds::default()).into_iter()
+            .filter(|f| f.code == "snapshot-budget").collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].severity, Severity::Warn);
+        assert!(found[0].detail.contains("pre-1609 (pinned"), "{}", found[0].detail);
+        assert!(found[0].detail.contains("reference probe unavailable"), "{}", found[0].detail);
+        assert!(!found[0].fix.contains("AUGMENTAGENT_DEPLOY_MAX_GB"));
+        assert!(found[0].fix.contains("Do not raise the budget"));
     }
 }

@@ -3254,6 +3254,7 @@ async fn main() -> Result<()> {
                     strays: *strays,
                     yes: *yes,
                     keep: deploy_snapshot::keep_from_env(),
+                    budget_bytes: None,
                 },
                 *json,
                 &mut out,
