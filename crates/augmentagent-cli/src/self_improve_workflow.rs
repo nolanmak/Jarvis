@@ -108,11 +108,26 @@ pub(super) struct CapacityAccounting {
     resumed: bool,
 }
 impl CapacityAccounting {
+    pub(super) fn settle_ci(&self, outcome: Result<RunReport>) -> Result<RunReport> {
+        let Err(error) = &outcome else { return outcome; };
+        let Some(deferred) = error.downcast_ref::<CiInfrastructureDeferred>() else { return outcome; };
+        anyhow::ensure!(deferred.workflow == self.workflow, "CI deferral belongs to another workflow");
+        let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
+            .snapshot(&self.workflow)?.context("retry workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
+            && checkpoint.next.action == "retry_verification"
+            && checkpoint.next.eligible_at_ms == deferred.eligible_at_ms,
+            "CI deferral has no matching durable schedule");
+        self.retry_report(deferred.to_string())
+    }
+
     pub(super) fn retry_report(&self,message:String)->Result<RunReport> {
         let calls=self.store.lock().map_err(|_|anyhow::anyhow!("retry accounting store poisoned"))?
             .snapshot(&self.workflow)?.context("retry workflow missing")?.model_calls;
         let paid=calls.checked_sub(self.calls_before).context("durable admissions decreased")?;
-        Ok(RunReport{message,billed:paid>0,held:paid==0,resumed:self.resumed})
+        // Actual spend and productive progress are independent. A retry must
+        // remain deferred even if a builder ran earlier in the same attempt.
+        Ok(RunReport{message,billed:paid>0,held:true,resumed:self.resumed})
     }
     pub(super) fn report(&self) -> Result<Option<RunReport>> {
         let store=self.store.lock().map_err(|_|anyhow::anyhow!("workflow store lock poisoned"))?;
@@ -1494,6 +1509,19 @@ impl WorkflowGuard {
     /// Caller has waited for worker teardown. Stage/evidence must already be
     /// checkpointed; releasing here never deletes the durable worktree.
     pub(super) fn finish(mut self) -> Result<()> {
+        if !self.released { self.release_after_teardown()?; }
+        Ok(())
+    }
+
+    pub(super) fn finish_ci_deferral(&mut self) -> Result<()> {
+        let checkpoint = self.store.lock().map_err(|_|anyhow::anyhow!("workflow retry store poisoned"))?
+            .snapshot(self.id())?.context("retry workflow missing")?.checkpoint;
+        anyhow::ensure!(checkpoint.next.reason == "verification_infrastructure_retry"
+            && checkpoint.next.action == "retry_verification", "no durable CI deferral to release");
+        self.release_after_teardown()
+    }
+
+    fn release_after_teardown(&mut self) -> Result<()> {
         self.audit.protected_health()?;
         self.healthy_lease()?;
         self.audit_event("workflow_released", serde_json::json!({}))?;
@@ -1710,8 +1738,10 @@ pub(super) async fn prepare_resume_worktree_at_head(
         anyhow::ensure!(matches!(expected.len(),40|64) && expected.bytes().all(|b|b.is_ascii_hexdigit())
             && fetched.eq_ignore_ascii_case(expected),"resolved PR head changed before execution; candidate preserved");
         if exists {
-            anyhow::ensure!(git_evidence(&path,&["rev-parse","HEAD"]).await?.eq_ignore_ascii_case(expected),
-                "resumed candidate differs from authorized PR head; candidate preserved");
+            let actual = git_evidence(&path, &["rev-parse", "HEAD"]).await?;
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(RetainedHeadMismatch { path, actual, published: fetched }.into());
+            }
         }
     }
     if exists {
@@ -1732,6 +1762,40 @@ pub(super) async fn prepare_resume_worktree_at_head(
     anyhow::ensure!(ok, "cannot create resumed PR worktree: {error}");
     Ok(path)
 }
+
+/// Prepare retained execution for fresh verification. Merge admission continues
+/// to use the strict exact-head helper above.
+pub(super) async fn prepare_resume_candidate(
+    repo_root: &Path, repository: &str, pr: u64, branch: &str, expected_head: Option<&str>,
+) -> Result<PathBuf> {
+    prepare_resume_candidate_at(&path(), repo_root, repository, pr, branch, expected_head).await
+}
+
+async fn prepare_resume_candidate_at(
+    state: &Path, repo_root: &Path, repository: &str, pr: u64, branch: &str, expected_head: Option<&str>,
+) -> Result<PathBuf> {
+    let error = match prepare_resume_worktree_at_head(repo_root, pr, branch, expected_head).await {
+        Ok(path) => return Ok(path),
+        Err(error) => error,
+    };
+    let Some(mismatch) = error.downcast_ref::<RetainedHeadMismatch>() else { return Err(error); };
+    let Some(store) = WorkflowStore::open_read_only(state)? else { return Err(error); };
+    let Some(recorded) = store.retained_candidate_head(repository, pr, branch,
+        &mismatch.published, &mismatch.actual, millis())? else { return Err(error); };
+    let (descendant, _, _) = run("git", &["merge-base", "--is-ancestor", &mismatch.published, &recorded], &mismatch.path).await?;
+    anyhow::ensure!(descendant && git_evidence(&mismatch.path, &["rev-parse", "HEAD"]).await? == recorded,
+        "retained candidate does not extend its recorded publication; candidate preserved");
+    Ok(mismatch.path.clone())
+}
+
+#[derive(Debug)]
+struct RetainedHeadMismatch { path: PathBuf, actual: String, published: String }
+impl std::fmt::Display for RetainedHeadMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("resumed candidate differs from authorized PR head; candidate preserved")
+    }
+}
+impl std::error::Error for RetainedHeadMismatch {}
 
 async fn git_evidence(worktree: &Path, args: &[&str]) -> Result<String> {
     let (ok, out, _) = run("git", args, worktree).await?;
@@ -1780,6 +1844,63 @@ mod tests {
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         dir
     }
+    #[tokio::test]
+    async fn retained_recorded_candidate_resumes_after_unpublished_integration() {
+        let dir = repo();
+        let state = control_dir();
+        let database = state.path().join("workflow.db");
+        let remote = state.path().join("remote.git");
+        assert!(run("git", &["init", "--bare", "-q", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["remote", "add", "origin", remote.to_str().unwrap()], dir.path()).await.unwrap().0);
+        assert!(run("git", &["push", "origin", "HEAD:fixture"], dir.path()).await.unwrap().0);
+        let published = git_evidence(dir.path(), &["rev-parse", "HEAD"]).await.unwrap();
+        let candidate = prepare_resume_worktree_at_head(dir.path(), 42, "fixture", Some(&published)).await.unwrap();
+        let original = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut store = WorkflowStore::open(&database).unwrap();
+        store.register("owner/repo#77", "fixture", original.clone(), 10).unwrap();
+        let lease = store.claim("owner/repo#77", "original-worker", 20, 60_000).unwrap().unwrap();
+        store.attach_pr_in_repo(&lease, "owner/repo", 42, 21).unwrap();
+        let pushed = store.begin_operation(&lease, OperationKind::Push, &original, 22).unwrap();
+        store.complete_operation(&lease, &pushed.id, &format!("git-head:{published}"), 23).unwrap();
+        std::fs::write(candidate.join("code.txt"), "retained repair\n").unwrap();
+        assert!(run("git", &["add", "code.txt"], &candidate).await.unwrap().0);
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "retained candidate"], &candidate).await.unwrap().0);
+        let retained = git_binding(&candidate, "C1", "rust-a", &[]).await.unwrap();
+        let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+        checkpoint.binding = retained.clone();
+        checkpoint.stage = Stage::Verify;
+        checkpoint.next = NextAction { reason: "verification_infrastructure_retry".into(), action: "retry_verification".into(), eligible_at_ms: 30 };
+        store.checkpoint(&lease, &checkpoint, 24).unwrap();
+        store.release(&lease, 25).unwrap();
+        let before = store.snapshot(&lease.workflow).unwrap().unwrap();
+        let events = store.events(&lease.workflow).unwrap();
+        let recovered = prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await
+            .expect("recorded unpublished candidate must remain executable for fresh verification");
+        assert_eq!(recovered, candidate);
+        assert_eq!(git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap(), retained.head);
+        assert_eq!(std::fs::read_to_string(candidate.join("code.txt")).unwrap(), "retained repair\n");
+        assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(), before);
+        assert_eq!(store.events(&lease.workflow).unwrap(), events);
+        assert_eq!(git_evidence(dir.path(), &["ls-remote", "origin", "refs/heads/fixture"]).await.unwrap(),
+            format!("{published}\trefs/heads/fixture"), "recovery must not publish the retained candidate");
+        assert!(prepare_resume_worktree_at_head(dir.path(), 42, "fixture", Some(&published)).await.is_err(),
+            "the exact-head merge helper must keep rejecting the unpublished head");
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&"f".repeat(40))).await.is_err(),
+            "a changed remote resolution must not use retained-candidate recovery");
+        assert!(run("git", &["checkout", "--orphan", "unrelated-fixture"], &candidate).await.unwrap().0);
+        assert!(run("git", &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "unrelated root"], &candidate).await.unwrap().0);
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+            "an unrecorded local head cannot inherit the old recovery authority");
+        let mut unrelated = retained;
+        unrelated.head = git_evidence(&candidate, &["rev-parse", "HEAD"]).await.unwrap();
+        let next_lease = store.claim(&lease.workflow, "fixture-authority", 40, 60_000).unwrap().unwrap();
+        checkpoint.binding = unrelated;
+        store.checkpoint(&next_lease, &checkpoint, 41).unwrap();
+        store.release(&next_lease, 42).unwrap();
+        assert!(prepare_resume_candidate_at(&database, dir.path(), "owner/repo", 42, "fixture", Some(&published)).await.is_err(),
+            "matching protected metadata cannot replace publication ancestry");
+    }
+
     #[tokio::test]
     async fn claimed_owner_guard_admits_native_work_without_granting_shipping() {
         let dir=repo();let state=control_dir();let path=state.path().join("workflow.db");let now=millis();
@@ -2732,6 +2853,69 @@ mod tests {
         }
         assert!(guard.bounded_native_calls("component".into(),2,async {guard.audit_logger().model_call_admitted("codex")}).await.is_err());
         assert_eq!(WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap().model_calls,2);
+    }
+
+    #[tokio::test]
+    async fn ci_gate_consumption_defers_revisions_before_repair_and_preserves_paid_accounting() {
+        for stage in [Stage::Build, Stage::Review, Stage::Reconcile] {
+            for (infrastructure, already_paid) in [(true, false), (true, true), (false, false)] {
+                let dir = repo();
+                let state = control_dir();
+                let path = state.path().join("workflow.db");
+                let mut guard = WorkflowGuard::acquire_at(&path, Start {
+                    repo_root: dir.path(), worktree: dir.path(), repository: "owner/repo",
+                    source_issue: Some(77), pr: Some(88), branch: "fixture", contract: "C1",
+                    environment: "rust-a",
+                }, millis()).await.unwrap().unwrap();
+                guard.checkpoint(stage, "candidate_ready", "run_verifier", 0,
+                    &["protected-receipt".into()]).await.unwrap();
+                let accounting = guard.capacity_accounting(true).unwrap();
+                if already_paid { guard.audit_logger().model_call_admitted("codex").unwrap(); }
+                let before = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                let allowance = WorkflowStore::open(&path).unwrap().merge_allowance(millis(), 5).unwrap();
+                let mut repairs = 0;
+                let outcome: Result<RunReport> = async {
+                    let error = if infrastructure {
+                        anyhow::anyhow!("shared CI prerequisite unavailable: dependency network offline")
+                    } else {
+                        anyhow::anyhow!("error[E0308]: mismatched types")
+                    };
+                    if let Err(_code_error) = CiGateResult(Err(error)).for_workflow(&mut guard).await? {
+                        // This is the paid code-repair branch used after a gate.
+                        repairs += 1;
+                        guard.audit_logger().model_call_admitted("codex")?;
+                    }
+                    Ok(RunReport::built("code repaired".into()))
+                }.await;
+                let report = accounting.settle_ci(outcome).unwrap();
+                let after = WorkflowStore::open(&path).unwrap().snapshot(guard.id()).unwrap().unwrap();
+                assert_eq!(repairs, usize::from(!infrastructure));
+                assert_eq!(after.model_calls, before.model_calls + u64::from(!infrastructure));
+                assert_eq!(after.checkpoint.stage, stage);
+                assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+                assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+                assert_eq!(after.progress_at_ms, before.progress_at_ms);
+                assert_eq!(after.attempts, before.attempts);
+                assert_eq!(WorkflowStore::open(&path).unwrap().merge_allowance(millis(), 5).unwrap(), allowance);
+                if infrastructure {
+                    assert_eq!(after.checkpoint.next.action, "retry_verification");
+                    assert!(after.checkpoint.next.eligible_at_ms > millis());
+                    assert_eq!(report.billed, already_paid);
+                    assert!(report.is_idle(), "the command attempt must be deferred even when earlier work spent model calls");
+                    assert!(report.resumed);
+                    assert!(after.lease_until_ms <= millis(), "CI retry still waits for the abandoned ten-minute lease");
+                    let eligible = after.checkpoint.next.eligible_at_ms;
+                    let mut store = WorkflowStore::open(&path).unwrap();
+                    assert!(store.claim_productive(guard.id(), "next-worker", eligible - 1, 60_000).unwrap().is_none());
+                    assert!(store.claim_productive(guard.id(), "next-worker", eligible, 60_000).unwrap().is_some(),
+                        "the persisted retry must run at five minutes, before the old ten-minute lease expires");
+                } else {
+                    assert_eq!(after.checkpoint.next, before.checkpoint.next);
+                    assert!(report.billed);
+                }
+                guard.finish().unwrap();
+            }
+        }
     }
 
     #[tokio::test]

@@ -159,7 +159,7 @@ async fn live_native_disposable_scope_build_verify_review_and_seed() -> Result<(
     assert_eq!(std::fs::read_to_string(root.join("rules.rs"))?,"pub fn checks_complete(done: usize, total: usize) -> bool { total > 0 && done == total }\n");
     git(&root, &["add", "."]).await?;
     git(&root, &["commit", "-qm", "native builder candidate"]).await?;
-    shared_ci::fixture::scope(&root, verification_gate(&root, &guard.audit_logger())).await??;
+    shared_ci::fixture::scope(&root, verification_gate(&root, &guard.audit_logger())).await?.for_workflow(&mut guard).await??;
     let mut reference =
         acceptance::verify_and_persist_candidate(&root, &prepared, &control, &[root.clone()], &guard.audit_logger())
             .await?;

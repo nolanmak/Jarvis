@@ -5,6 +5,8 @@ use super::*;
 #[serde(deny_unknown_fields)]
 struct Retry {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage: Option<Stage>,
     binding: Binding,
     failure_code: String,
     dependency_sha256: String,
@@ -14,10 +16,15 @@ struct Retry {
     eligible_at_ms: i64,
 }
 impl Retry {
+    fn stage(&self) -> Stage {
+        self.stage.unwrap_or(Stage::Verify)
+    }
     fn validate(&self) -> Result<()> {
         self.binding.validate()?;
         ensure!(
-            self.version == 1
+            ((self.version == 1 && self.stage.is_none())
+                || (self.version == 2 && self.stage.is_some()))
+                && retryable_stage(self.stage())
                 && self.generation > 0
                 && self.failures > 0
                 && self.failed_at_ms >= 0
@@ -52,6 +59,18 @@ impl Retry {
     }
 }
 
+fn retryable_stage(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::Scope
+            | Stage::Build
+            | Stage::Verify
+            | Stage::Review
+            | Stage::Reconcile
+            | Stage::AwaitChecks
+    )
+}
+
 impl WorkflowStore {
     pub fn defer_verification_infrastructure(
         &mut self,
@@ -73,8 +92,8 @@ impl WorkflowStore {
         )?;
         let mut checkpoint: Checkpoint = serde_json::from_str(&raw)?;
         ensure!(
-            checkpoint.stage == Stage::Verify,
-            "only active verification can be deferred"
+            retryable_stage(checkpoint.stage),
+            "only an active pre-merge CI stage can be deferred"
         );
         let previous: Option<String> = tx.query_row(
             "SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' ORDER BY seq DESC LIMIT 1",
@@ -101,6 +120,7 @@ impl WorkflowStore {
             .transpose()?;
         let same = |prior: &Retry| {
             prior.binding == *binding
+                && prior.stage() == checkpoint.stage
                 && prior.failure_code == failure_code
                 && prior.dependency_sha256 == dependency_sha256
         };
@@ -125,7 +145,8 @@ impl WorkflowStore {
             .saturating_mul(1 << (failures - 1).min(4))
             .min(3_600_000);
         let retry = Retry {
-            version: 1,
+            version: 2,
+            stage: Some(checkpoint.stage),
             binding: binding.clone(),
             failure_code: failure_code.into(),
             dependency_sha256: dependency_sha256.into(),
@@ -191,6 +212,117 @@ mod tests {
         store.checkpoint(&lease, &checkpoint, 21).unwrap();
         (store, lease, binding)
     }
+    #[test]
+    fn ci_infrastructure_retry_preserves_build_and_review_stages_without_new_spend() {
+        for stage in [
+            Stage::Scope,
+            Stage::Build,
+            Stage::Verify,
+            Stage::Review,
+            Stage::Reconcile,
+            Stage::AwaitChecks,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, lease, binding) = setup(&dir.path().join("workflow.db"));
+            let mut checkpoint = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            checkpoint.stage = stage;
+            store.checkpoint(&lease, &checkpoint, 22).unwrap();
+            store
+                .charge(
+                    &lease,
+                    "prior-builder",
+                    ResourceCharge {
+                        model_calls: 2,
+                        ..Default::default()
+                    },
+                    23,
+                )
+                .unwrap();
+            let before = store.snapshot(&lease.workflow).unwrap().unwrap();
+            let allowance = store.merge_allowance(30, 5).unwrap();
+            let eligible = store.defer_verification_infrastructure(&lease, &binding, "network", &"a".repeat(64), 30)
+                .expect("infrastructure during a revision must defer without inventing a Verify transition");
+            let after = store.snapshot(&lease.workflow).unwrap().unwrap();
+            assert_eq!(eligible, 300_030);
+            assert_eq!(after.checkpoint.stage, stage);
+            assert_eq!(after.checkpoint.binding, before.checkpoint.binding);
+            assert_eq!(after.checkpoint.evidence, before.checkpoint.evidence);
+            assert_eq!(after.progress_at_ms, before.progress_at_ms);
+            assert_eq!(after.model_calls, before.model_calls);
+            assert_eq!(after.attempts, before.attempts);
+            assert_eq!(store.merge_allowance(30, 5).unwrap(), allowance);
+        }
+    }
+    #[test]
+    fn ci_retry_rejects_non_ci_stages_without_mutation() {
+        for stage in [
+            Stage::Intake,
+            Stage::Publish,
+            Stage::Merge,
+            Stage::Held,
+            Stage::Retired,
+            Stage::Merged,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, lease, binding) = setup(&dir.path().join("workflow.db"));
+            let mut cp = store.snapshot(&lease.workflow).unwrap().unwrap().checkpoint;
+            cp.stage = stage;
+            store.checkpoint(&lease, &cp, 22).unwrap();
+            let before = store.snapshot(&lease.workflow).unwrap().unwrap();
+            let events = store.events(&lease.workflow).unwrap();
+            assert!(store
+                .defer_verification_infrastructure(&lease, &binding, "network", &"a".repeat(64), 30)
+                .is_err());
+            assert_eq!(store.snapshot(&lease.workflow).unwrap().unwrap(), before);
+            assert_eq!(store.events(&lease.workflow).unwrap(), events);
+        }
+    }
+
+    #[test]
+    fn legacy_verify_retry_keeps_its_backoff_after_stage_aware_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, lease, binding) = setup(&dir.path().join("workflow.db"));
+        let due = store
+            .defer_verification_infrastructure(&lease, &binding, "network", &"a".repeat(64), 30)
+            .unwrap();
+        let legacy = Retry {
+            version: 1,
+            stage: None,
+            binding: binding.clone(),
+            failure_code: "network".into(),
+            dependency_sha256: "a".repeat(64),
+            generation: lease.generation,
+            failures: 1,
+            failed_at_ms: 30,
+            eligible_at_ms: due,
+        };
+        store.conn.execute("UPDATE workflow_event SET payload=?2 WHERE workflow=?1 AND kind='verification_infrastructure_retry'",
+            params![lease.workflow, serde_json::to_string(&legacy).unwrap()]).unwrap();
+        assert_eq!(
+            store
+                .defer_verification_infrastructure(&lease, &binding, "network", &"a".repeat(64), 31)
+                .unwrap(),
+            due
+        );
+        store.release(&lease, 32).unwrap();
+        let resumed = store
+            .claim(&lease.workflow, "b", due, 60_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .defer_verification_infrastructure(
+                    &resumed,
+                    &binding,
+                    "network",
+                    &"a".repeat(64),
+                    due + 1
+                )
+                .unwrap(),
+            due + 1 + 600_000
+        );
+    }
+
     #[test]
     fn verification_infrastructure_retry_persists_backoff_and_idempotent_replay() {
         let dir = tempfile::tempdir().unwrap();
@@ -286,6 +418,9 @@ mod tests {
             "future-generation",
             "future-clock",
             "changed-replay",
+            "wrong-stage",
+            "version-stage",
+            "unknown-field",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (mut store, mut lease, mut binding) = setup(&dir.path().join("workflow.db"));
@@ -302,10 +437,34 @@ mod tests {
                 }
                 "stale" => lease.generation += 1,
                 "binding" => binding.head = "another-head".into(),
+                "wrong-stage" | "version-stage" | "unknown-field" => {
+                    store
+                        .defer_verification_infrastructure(
+                            &lease,
+                            &binding,
+                            "network",
+                            &"a".repeat(64),
+                            22,
+                        )
+                        .unwrap();
+                    let raw: String = store.conn.query_row("SELECT payload FROM workflow_event WHERE workflow=?1 AND kind='verification_infrastructure_retry' ORDER BY seq DESC LIMIT 1",
+                        [&lease.workflow], |row| row.get(0)).unwrap();
+                    let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    match fault {
+                        "wrong-stage" => {
+                            value["stage"] = serde_json::to_value(Stage::Build).unwrap()
+                        }
+                        "version-stage" => value["version"] = 1.into(),
+                        _ => value["unexpected"] = true.into(),
+                    }
+                    store.conn.execute("UPDATE workflow_event SET payload=?2 WHERE workflow=?1 AND kind='verification_infrastructure_retry'",
+                        params![lease.workflow, value.to_string()]).unwrap();
+                }
                 "future-generation" | "future-clock" => {
                     let failed_at = if fault == "future-clock" { 50 } else { 22 };
                     let retry = Retry {
                         version: 1,
+                        stage: None,
                         binding: binding.clone(),
                         failure_code: "network".into(),
                         dependency_sha256: "a".repeat(64),
