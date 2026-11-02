@@ -433,11 +433,35 @@ impl FastBridge {
             native_selection(&self.store,&self.selection,&origin.conversation)?;
             if !self.store.phone_start_dispatch(&call.id,task_id)? {return Ok(());}
             let started=tokio::time::Instant::now();
-            let checked=tokio::time::timeout(Duration::from_secs(6),self.attention.as_ref().unwrap().check(&origin).instrument(tracing::info_span!("phone_attention",call_id=%call.id,task_id))).await;
+            let (progress, mut gaps) = crate::phone_attention::AttentionProgress::channel();
+            let check = self.attention.as_ref().unwrap().check_with_progress(&origin, progress)
+                .instrument(tracing::info_span!("phone_attention",call_id=%call.id,task_id));
+            tokio::pin!(check);
+            // Leave room for authorization/store work around the provider's
+            // five-second source reads without changing those source bounds.
+            let deadline = tokio::time::sleep(Duration::from_secs(7));
+            tokio::pin!(deadline);
+            let mut continuing = false;
+            let checked = loop {
+                tokio::select! {
+                    answer = &mut check => break Some(answer),
+                    _ = &mut deadline => break None,
+                    Some(notice) = gaps.recv(), if !continuing => {
+                        self.service.authorize_call_origin(call)?;
+                        continuing = true;
+                        // Extend once for bounded source retries. Repeated or
+                        // unacknowledged progress cannot keep a job alive.
+                        deadline.as_mut().reset(started + Duration::from_secs(40));
+                        if self.store.phone_attention_notice(&call.id, task_id, &notice).is_err() {
+                            tracing::warn!(call_id=%call.id, task_id, "phone source progress unavailable; final answer remains independent");
+                        }
+                    }
+                }
+            };
             self.service.authorize_call_origin(call)?;
             let answer=match checked {
-                Ok(Ok(Some(answer))) if !answer.trim().is_empty() && answer.len()<=8_000=>answer,
-                Ok(Ok(None))=>"No attention sources are configured for this conversation, so I haven't checked your calendar or inbox.".into(),
+                Some(Ok(Some(answer))) if !answer.trim().is_empty() && answer.len()<=8_000=>answer,
+                Some(Ok(None))=>"No attention sources are configured for this conversation, so I haven't checked your calendar or inbox.".into(),
                 _=>"I couldn't finish checking your attention sources. I can't confirm whether anything important is missing; we can keep talking.".into(),
             };
             tracing::info!(call_id=%call.id,task_id,source_ms=started.elapsed().as_millis() as u64,"phone attention facts ready without native queue wait");

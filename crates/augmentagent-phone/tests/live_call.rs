@@ -585,3 +585,26 @@ async fn a_long_result_does_not_starve_a_ready_followup_answer(){
     call.track_reply("first-piece","del-test").unwrap();call.event(&LiveInput::CommentaryAccepted{client_event_id:"first-piece".into()}).unwrap();
     assert_eq!(call.pending_results().unwrap()[0].delegation_id,"del-next","a completed follow-up must not wait for every chunk of a long answer");
 }
+
+#[tokio::test(start_paused = true)]
+async fn source_gap_is_one_progress_notice_and_cannot_block_the_final_result() {
+    let f = fixture().await;
+    let mut call = LiveCall::new(f.service.clone(), &f.id, "session-test").unwrap();
+    call.event(&transcript()).unwrap();
+    let LiveAction::Queued { task_id, .. } = call.event(&delegation()).unwrap() else { panic!("task expected") };
+    assert!(f.store.phone_start_dispatch(&f.id, &task_id).unwrap());
+    f.store.phone_attention_notice(&f.id, &task_id, "Calendar is unavailable; checking again.").unwrap();
+    let notice = call.delay_notice().unwrap().expect("name the missing source promptly");
+    assert!(notice.result.contains("Calendar is unavailable"));
+    assert_eq!(notice.delegation_id, "del-test");
+    assert!(!call.reply_pending("del-test"), "progress does not acquire the final result's acknowledgment cursor");
+    assert!(call.pending_results().unwrap().is_empty());
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    assert!(call.delay_notice().unwrap().is_none(), "do not add a generic delay notice after the specific source notice");
+    f.store.phone_finish_dispatch(&f.id, &task_id, "Synthetic deadline tomorrow at 5 PM.").unwrap();
+    assert!(call.delay_notice().unwrap().is_none());
+    assert_eq!(call.pending_results().unwrap().len(), 1);
+    call.track_reply("final-result", "del-test").unwrap();
+    call.event(&LiveInput::CommentaryAccepted { client_event_id: "final-result".into() }).unwrap();
+    assert!(call.pending_results().unwrap().is_empty());
+}

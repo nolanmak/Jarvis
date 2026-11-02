@@ -194,6 +194,11 @@ restart_agent com.nolanmak.augmentagent >/dev/null 2>&1
 check "launchd: reports failure when the agent is not running afterwards" "$?" "1"
 teardown_stub
 
+# #1779 — keep the owner-turn deferral hermetic for every other case: never
+# read the checkout's real data.db.
+export AUGMENTAGENT_RESTART_TURN_DB=/nonexistent/data.db
+RESTART_TURN_DEFER_STAMP=$(mktemp -u)
+
 echo "maybe_defer_restart (#844):"
 
 DEFER_DIR=$(mktemp -d)
@@ -247,6 +252,75 @@ check "proceeds again once the run has finished" "$?" "1"
   || ok "clears stale deferral state when the lock is free"
 rm -rf "$DEFER_DIR"
 unset AUGMENTAGENT_SELFIMPROVE_LOCK AUGMENTAGENT_RESTART_DEFER_STAMP
+
+echo "owner_turn_defer (#1779):"
+
+TURN_DIR=$(mktemp -d)
+TURN_DB="$TURN_DIR/data.db"
+export AUGMENTAGENT_RESTART_TURN_DB="$TURN_DB"
+RESTART_TURN_DEFER_STAMP="$TURN_DIR/turn-deferred-since"
+DEFER_LOG="$TURN_DIR/log"
+log() { printf '%s\n' "$*" >> "$DEFER_LOG"; }  # _sr_log routes here
+sqlite3 "$TURN_DB" "CREATE TABLE surface_native_turns (platform TEXT, account_id TEXT,
+  conversation_id TEXT, thread_id TEXT, turn_id TEXT, status TEXT,
+  created_at_ms INTEGER, finished_at_ms INTEGER);
+  INSERT INTO surface_native_turns VALUES ('discord','g','c','','t1','complete',1,2);"
+
+maybe_defer_restart >/dev/null 2>&1
+check "proceeds when no owner turn is pending" "$?" "1"
+
+sqlite3 "$TURN_DB" "INSERT INTO surface_native_turns VALUES ('discord','g','c','','t2','pending',3,NULL);"
+maybe_defer_restart >/dev/null 2>&1
+check "defers while an owner turn is pending" "$?" "0"
+[ -s "$RESTART_TURN_DEFER_STAMP" ] && ok "records when the turn deferral began" \
+  || bad "records when the turn deferral began" "stamp file empty/absent"
+grep -q "restart deferred: owner turn in flight" "$DEFER_LOG" \
+  && ok "logs the turn deferral" || bad "logs the turn deferral" "$(cat "$DEFER_LOG")"
+
+maybe_defer_restart >/dev/null 2>&1
+check "keeps deferring inside the cap" "$?" "0"
+
+( AUGMENTAGENT_RESTART_FORCE=1; maybe_defer_restart >/dev/null 2>&1 )
+check "AUGMENTAGENT_RESTART_FORCE=1 bypasses the turn deferral" "$?" "1"
+
+printf '%s\n' "$(( $(date +%s) - 601 ))" > "$RESTART_TURN_DEFER_STAMP"
+: > "$DEFER_LOG"
+maybe_defer_restart >/dev/null 2>&1
+check "proceeds once the turn deferral passes the cap" "$?" "1"
+grep -q "restarting anyway" "$DEFER_LOG" \
+  && ok "logs the capped deploy" || bad "logs the capped deploy" "$(cat "$DEFER_LOG")"
+maybe_defer_restart >/dev/null 2>&1
+check "a later tick for the same long turn does not restart the window" "$?" "1"
+
+sqlite3 "$TURN_DB" "UPDATE surface_native_turns SET status='complete' WHERE turn_id='t2';"
+printf '9\n' > "$RESTART_TURN_DEFER_STAMP"
+maybe_defer_restart >/dev/null 2>&1
+check "proceeds once the turn finishes" "$?" "1"
+[ ! -e "$RESTART_TURN_DEFER_STAMP" ] && ok "clears the turn stamp when nothing is pending" \
+  || bad "clears the turn stamp when nothing is pending" "stamp survived"
+
+# Fail open: unreadable DB, missing table, no sqlite3.
+sqlite3 "$TURN_DB" "UPDATE surface_native_turns SET status='pending' WHERE turn_id='t2';"
+chmod 000 "$TURN_DB"
+if [ -r "$TURN_DB" ]; then ok "unreadable DB (skipped: running as root)"; else
+  maybe_defer_restart >/dev/null 2>&1; check "proceeds when the DB is unreadable" "$?" "1"; fi
+chmod 600 "$TURN_DB"
+( AUGMENTAGENT_RESTART_TURN_DB="$TURN_DIR/empty.db"; : > "$TURN_DIR/empty.db"
+  maybe_defer_restart >/dev/null 2>&1 )
+check "proceeds when the table is missing" "$?" "1"
+( AUGMENTAGENT_RESTART_TURN_DB="$TURN_DIR/absent.db"; maybe_defer_restart >/dev/null 2>&1 )
+check "proceeds when the DB does not exist" "$?" "1"
+[ ! -e "$TURN_DIR/absent.db" ] && ok "never creates a missing DB" || bad "never creates a missing DB"
+( NOSQL="$TURN_DIR/nosql"; mkdir -p "$NOSQL"
+  for t in cat date rm head tr mkdir dirname printf flock; do
+    p=$(command -v "$t") && [ -x "$p" ] && ln -sf "$p" "$NOSQL/$t"; done
+  PATH="$NOSQL"; maybe_defer_restart >/dev/null 2>&1 )
+check "proceeds when sqlite3 is not installed" "$?" "1"
+
+unset -f log
+rm -rf "$TURN_DIR"
+export AUGMENTAGENT_RESTART_TURN_DB=/nonexistent/data.db
+RESTART_TURN_DEFER_STAMP=$(mktemp -u)
 
 echo "trim_gate_cache_if_idle (#891):"
 # Capacity cases must not inherit the CI runner's changing free-space floor.

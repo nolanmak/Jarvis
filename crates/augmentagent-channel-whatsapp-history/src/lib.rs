@@ -136,6 +136,23 @@ fn read_entries(root: &Path, conv: &Conversation) -> Result<Vec<MessageEntry>> {
     Ok(parse_entries(&std::fs::read_to_string(path)?))
 }
 
+/// The latest `tail` entries of one chat, for a card the owner asked for.
+pub fn conversation_delta(root: &Path, jid: &str, tail: usize) -> Result<Delta> {
+    let index: BTreeMap<String, Conversation> = serde_json::from_str(&std::fs::read_to_string(
+        root.join("conversations/index.json"),
+    )?)
+    .context("invalid WhatsApp conversation index")?;
+    let conversation = index
+        .get(jid)
+        .filter(|c| c.identifier == jid && c.service == "WhatsApp")
+        .cloned()
+        .with_context(|| format!("no WhatsApp chat {jid:?} in the archive"))?;
+    let entries = read_entries(root, &conversation)?;
+    let start = entries.len().saturating_sub(tail);
+    let entries = entries.into_iter().enumerate().skip(start).collect();
+    Ok(Delta { conversation, entries, first_run: false })
+}
+
 pub fn email(conv: &Conversation, idx: usize, entry: &MessageEntry) -> Email {
     let mut email = augmentagent_channel_imessage::synthetic_imessage_email(conv, idx, entry);
     email.message_id = format!("{THREAD_PREFIX}{}:{idx}", conv.identifier);

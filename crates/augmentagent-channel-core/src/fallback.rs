@@ -2273,7 +2273,9 @@ exit 1
     /// without summary" verdict. A codex killed mid-turn after a write is an
     /// unrecognised ending: the request did not finish, so no verdict is
     /// recorded and a caller retry is dispatched again (resuming from the
-    /// receipts, which stop the completed operation repeating).
+    /// receipts, which stop the completed operation repeating). #1779: the
+    /// stub crashes (SIGSEGV); a host-signal kill is typed `Interrupted`
+    /// instead and has the same no-verdict, re-dispatchable outcome.
     #[tokio::test]
     async fn killed_mid_write_turn_is_not_marked_completed() {
         struct EffectThenKilled {
@@ -2293,7 +2295,7 @@ exit 1
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let (bin, count) = counting_stub(&dir, "fake-codex-killed", "echo '{\"type\":\"turn.started\"}'\nkill -9 $$\n");
+        let (bin, count) = counting_stub(&dir, "fake-codex-killed", "echo '{\"type\":\"turn.started\"}'\nkill -SEGV $$\n");
         let primary = Arc::new(EffectThenKilled { inner: crate::codex::CodexCliReasoner::with_bin(bin), calls: AtomicUsize::new(0) });
         let mut chain = FallbackReasoner::for_tests(vec![
             (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
