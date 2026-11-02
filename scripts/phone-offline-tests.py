@@ -103,7 +103,7 @@ def main():
     # These required CLI modules share a binary with unrelated, environment-
     # dependent tests. Only unrelated tests may be filtered; zero/ignored cases
     # or fewer than the required number still fail.
-    for module, minimum in [("phone_attention::tests::", 13), ("wiki_question_stdin_tests::", 2), ("local_phone::tests::", 1), ("phone_metrics::tests::", 2), ("local_phone_transport::tests::", 5), ("notify_tests::", 17), ("phone_runtime::tests::", 4), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
+    for module, minimum in [("phone_attention::tests::", 14), ("wiki_question_stdin_tests::", 2), ("local_phone::tests::", 1), ("phone_metrics::tests::", 2), ("local_phone_transport::tests::", 5), ("notify_tests::", 17), ("phone_runtime::tests::", 4), ("surface_conformance_tests::", 2), ("discord_voice_session_tests::", 6), ("discord_phone_session_tests::", 1), ("whatsapp_phone_session_tests::", 1), ("whatsapp_phone::tests::", 3), ("discord_phone::tests::", 2), ("discord_phone::installation_tests::", 1)]:
         jobs.append(("augmentagent-cli-" + module.rstrip(":").replace("::", "-"),
                      ["cargo", "test", "--locked", "-p", "augmentagent-cli", "--bin", "augmentagent", module, "--", "--test-threads=1"], minimum, True))
     # Captured iMessage/Notes files remain readable across the voice migration.

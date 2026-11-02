@@ -59,6 +59,8 @@ fn upgrade_fixture() {
             )
             .unwrap();
         assert_eq!(count, 0, "baseline already has phone schema");
+        conn.execute("INSERT INTO emails(messageId,fromEmail,subject,firstSeenAt,platform,accountEntityId)
+            VALUES('attention-pending','sender@example.test','Synthetic',1000,'gmail','synthetic-account')", []).unwrap();
         drop(conn);
         for platform in ["discord", "slack", "whatsapp"] {
             for provider in ["claude", "codex"] {
@@ -154,9 +156,28 @@ fn upgrade_fixture() {
         tables, 1,
         "upgrade did not install phone schema or rollback removed it"
     );
+    let indexes: i64 = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_emails_pending_by_account'", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        indexes, 1,
+        "rollback must preserve the bounded phone inbox lookup"
+    );
+    let pending: i64 = conn.query_row("SELECT count(*) FROM emails WHERE platform='gmail' AND accountEntityId='synthetic-account' AND triageResult IS NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        pending,
+        if phase == "reupgrade" { 0 } else { 1 },
+        "an old writer must maintain the new partial index"
+    );
     drop(conn);
     if phase == "rollback" {
         let store = Store::open(&path).unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE emails SET triageResult='{}' WHERE messageId='attention-pending'",
+                    [],
+                )
+            })
+            .unwrap();
         store
             .log_action(
                 "rollback-proposal",
