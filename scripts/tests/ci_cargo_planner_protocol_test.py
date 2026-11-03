@@ -69,6 +69,62 @@ class PlannerProtocolTests(unittest.TestCase):
             self.assertNotEqual(changed[0][1],old[1]);self.assertNotEqual(changed[0][2][4],old[2][4])
             self.assertEqual(Path(old[1]).read_bytes(),b'compiler artifact')
 
+    def test_revalidation_detects_directory_only_change_and_keeps_legacy_coverage_unknown(self):
+        fixtures=planner._load('directory_revalidation_census','tests/ci_cargo_observer_test.py')
+        sample=fixtures.census_sample('all');census={'before':sample,'after':copy.deepcopy(sample)}
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);units=root/'units';units.mkdir(mode=0o700)
+            binding=self.publication_binding();command=str(uuid.uuid4())
+            store=planner.PublicationStore(root/'publications',binding=binding,command=command,unit_root=units)
+            self.library_publication(store)
+            source=root/'source';source.mkdir();(source/'lib.rs').write_bytes(b'unchanged compiler source')
+            (source/'lib.rs').chmod(0o444);source.chmod(0o555)
+            forests=[]
+            for name,changed in (('old',False),('added',True)):
+                forest=root/name;forest.mkdir()
+                if changed:(forest/'added').write_bytes(b'new member');(forest/'added').chmod(0o444)
+                forest.chmod(0o555);raw=b'node_modules/generated'.hex()
+                forests.append([[raw,str(forest),[raw,'tree',planner.unit_views.inventory(forest,owner=os.getuid(),sealed=True)]]])
+            old,new=forests;scope={'ordinal':0,'pid':101,'uid':2000,'root_identity':{'device':12,'inode':3456789,'mode':0o40755},
+                'mapping':{'kind':'compile','fingerprint':'debug/.fingerprint/consumer-aaaaaaaaaaaaaaaa'},
+                'artifact_bindings':[],'unbound_read_opens':[],'unbound_metadata_queries':[],'unbound_directory_reads':[]}
+            index=planner.frozen_input_index(source,old,scope)
+            empty,_=index.select_read_subset([],pid=101,uid=2000,user_namespace=100,mount_namespace=50)
+            scope.update(selected_reads=empty.record(),selected_metadata=empty.record())
+            info=Path(old[0][1]).stat();entries=[]
+            for offset,(name,inode) in enumerate(((b'.',info.st_ino),(b'..',root.stat().st_ino))):
+                entries.append({'name':name,'inode':inode,'type':4,'raw_type':4,'offset':offset,
+                    'returned_offset':offset+1,'record_length':24,'accepted':True})
+            scan={'uid':2000,'pid':101,'tid':102,'syscall':217,'sequence':1,'fd':3,'capacity':288,
+                'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),'inode':info.st_ino,'mode':info.st_mode,
+                'user_namespace':100,'mount_namespace':50,'iterator_result':0,'start_position':0,'position':2,
+                'result':48,'entries':entries,'attempts':copy.deepcopy(entries)}
+            selected,unbound=index.select_directory_subset([scan,dict(scan,sequence=2,start_position=2,result=0,entries=[],attempts=[])],
+                pid=101,uid=2000,user_namespace=100,mount_namespace=50)
+            self.assertEqual(unbound,[]);scope['selected_directories']=selected.record()
+            captures=root/'input-observations';captures.mkdir(mode=0o700)
+            record={'version':3,'kind':'ci-command-kernel-record','binding':binding,'command':command,'scopes':[scope],
+                'original_observer_cleanup':True,'probe_census':census,'input_closure_complete':False,'shipping_authority':False}
+            path=captures/(command+'.json');planner.cache._write_record(path,record)
+            checkpoint={'command':command,'forests':['original-producer']};outputs={'node_modules/generated':'directory'}
+            for legacy in (False,True):
+                if legacy:
+                    record['scopes'][0].pop('selected_directories');record['scopes'][0].pop('unbound_directory_reads')
+                    planner.cache._write_record(path,record)
+                lease=SimpleNamespace(binding=binding,command=str(uuid.uuid4()),target=root/'target')
+                with patch.object(planner.GeneratedForests,'load',return_value=(old,{})):
+                    report=planner.record_selected_revalidation(root,source,lease,checkpoint,new,outputs,['new-producer'])
+                observation=report['observations'][0]
+                self.assertEqual(report['affected_fingerprints'],[] if legacy else [scope['mapping']['fingerprint']])
+                self.assertFalse(observation['read_relevance_changed']);self.assertFalse(observation['metadata_relevance_changed'])
+                self.assertEqual(observation['directory_relevance_changed'],not legacy)
+                self.assertEqual(observation['relevance_changed'],not legacy)
+                self.assertEqual(observation['unbound_directory_reads'],None if legacy else 0)
+                self.assertEqual(observation['previous_sha256']==observation['current_sha256'],legacy)
+                self.assertEqual(planner.cache._read_record(root/'selected-revalidation'/(lease.command+'.json'),max_bytes=16*1024**2),report)
+                self.assertEqual(report['action'],'hold_for_complete_input_revalidation')
+                self.assertFalse(report['input_closure_complete']);self.assertFalse(report['shipping_authority'])
+
     def test_generated_artifact_tree_retargets_only_to_retained_current_producer(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);units=root/'units';units.mkdir(mode=0o700)

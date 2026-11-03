@@ -2089,3 +2089,33 @@ disabled. Runtime/toolchain, direct descriptor and full metadata inputs,
 publication-time invalidation/restart, trusted dependency seed integration,
 the unchanged opaque-wrapper/in-command fixture and final proof/API/audit and
 merge enforcement remain required.
+
+
+The original five-command generated-negative adapter replay at `0ba63f7a`
+passed in **164.29 seconds**. Read-only inspection under its managed lease
+verified the original record SHA, new per-call namespace identities, persisted
+selection fields and directory relevance fields in the durable changed-input
+report. Unchanged cross-VM compiler calls remained zero and the changed generated
+input still held. Its two compiler scopes each recorded ten actual directory
+calls, all unbound; this adapter establishes capture/recovery integration rather
+than positive directory-selector coverage. The preceding native protocol gate
+provides that positive coverage. Receipt:
+`/tmp/augmentagent-ci-directory-adapter-20261103233628/receipt.json`; inspection:
+`/tmp/autoship-1703-directory-adapter-inspection-1.json`.
+
+A further real-filesystem revalidation regression isolates a directory-only
+change: reads and pathname-metadata selections remain unchanged while an added
+generated member changes the aggregate digest, marks the consumer fingerprint
+and persists the mandatory hold. Running it against the original `bf7c3842`
+revalidation function fails because the affected set is empty. The current
+function passes and preserves unknown directory coverage for older captures.
+The Python suite now has **377 passing tests without skips**; executable helpers
+are unchanged from the two successful native runs.
+
+Inspection also identified the remaining actual read classes rather than
+inferring completeness from the source-only subset: toolchain libraries and
+metadata, loader searches through opaque target directories, generated compiler
+scratch outputs, `/proc/self/maps`, `/proc/self/statm`, the VM overcommit setting
+and rejected `/dev/fd` opens. These require an explicit trusted runtime/output/
+descriptor policy. They are still unbound and grant no compatibility or shipping
+authority.
