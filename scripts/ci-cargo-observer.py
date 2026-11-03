@@ -266,7 +266,7 @@ def directory_queries(records,*,complete=True):
             continue
         descriptor,capacity=pair['B'];device,inode,mode=pair['I']
         status,position=pair['T'];result,=pair['G']
-        if (descriptor>=2**31 or capacity>=2**32 or device>=2**64 or inode>=2**64
+        if (descriptor>=2**31 or capacity>=2**32 or device>=2**32 or inode>=2**64
                 or mode>65535 or not stat.S_ISDIR(mode) or not -2**31<=status<2**31
                 or not -2**63<=position<2**63 or not -4095<=result<=capacity
                 or set(attempts)!=set(range(1,len(attempts)+1))):
@@ -295,8 +295,15 @@ def directory_queries(records,*,complete=True):
 def directory_witness(queries,pid,uid,path,members):
     """Check one controlled, immutable tree against original kernel records."""
     info=path.stat()
+    # Linux internal dev_t uses 12 major/20 minor bits (kdev_t.h). stat's
+    # userspace dev_t has a different encoding. Retain raw captured values and
+    # translate the expected identity explicitly rather than dropping it.
+    major,minor=os.major(info.st_dev),os.minor(info.st_dev)
+    if not 0<=major<2**12 or not 0<=minor<2**20:
+        raise ObservationUnavailable('unsupported directory device identity')
+    kernel_device=(major<<20)|minor
     selected=[q for q in queries if (q['pid'],q['tid'],q['uid'],q['device'],q['inode'])
-        ==(pid,pid,uid,info.st_dev,info.st_ino)]
+        ==(pid,pid,uid,kernel_device,info.st_ino)]
     selected.sort(key=lambda q:q['sequence'])
     if (not selected or any(q['iterator_result']!=0 or q['result']<0 for q in selected)
             or selected[-1]['result']!=0 or any(q['result']==0 for q in selected[:-1])

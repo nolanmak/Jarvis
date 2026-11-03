@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
 
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('kernel_observer',ROOT/'ci-cargo-observer.py')
@@ -35,6 +36,24 @@ def census_sample():
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_directory_identity_compares_linux_kernel_device_encoding_to_stat(self):
+        rows=['B 2004 101 101 1 3 64','I 2004 101 101 1 265289728 900 16749',
+            'D 2004 101 101 1 1 900 4 0 0 1 2e','A 2004 101 101 1 1 1',
+            'D 2004 101 101 1 2 901 4 1 0 2 2e 2e','A 2004 101 101 1 2 1',
+            'T 2004 101 101 1 0 2','G 2004 101 101 1 48',
+            'B 2004 101 101 2 3 64','I 2004 101 101 2 265289728 900 16749',
+            'T 2004 101 101 2 0 2','G 2004 101 101 2 0']
+        queries=observer.directory_queries(rows)
+        path=SimpleNamespace(stat=lambda:SimpleNamespace(st_dev=os.makedev(253,0),st_ino=900),
+            parent=SimpleNamespace(stat=lambda:SimpleNamespace(st_ino=901)))
+        self.assertEqual(observer.directory_witness(queries,101,2004,path,{}),
+            {'reads':2,'entries':2,'rejected_attempts':0})
+        self.assertEqual(queries[0]['device'],265289728)  # Keep the raw kernel value.
+        for bad in (queries[:-1],queries+queries,queries[1:],
+                [{**q,'device':os.makedev(253,0)} for q in queries]):
+            with self.subTest(queries=bad),self.assertRaises(observer.ObservationUnavailable):
+                observer.directory_witness(bad,101,2004,path,{})
+
     def test_directory_capture_reconciles_kernel_entries_short_reads_and_eof(self):
         rows=['B 2004 101 101 50 3 64','I 2004 101 101 50 7 900 16749',
             'D 2004 101 101 50 1 900 4 0 0 1 2e','A 2004 101 101 50 1 1',
