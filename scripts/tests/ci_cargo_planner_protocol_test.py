@@ -23,6 +23,52 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def mapped_request(self,*,source=b'src/lib.rs',name=b'consumer',kind=b'lib',emit=b'dep-info,metadata,link',extra=(),cwd=b'/workspace/member',out=b'/workspace/target/debug/deps'):
+        argv=[b'/toolchain/bin/rustc',b'--crate-name',name,b'--edition=2021',source,
+            *([b'--crate-type',kind] if kind is not None else []),b'--emit='+emit,
+            b'-C',b'metadata=0123456789abcdef',b'-C',b'extra-filename=-0123456789abcdef',
+            b'--out-dir',out,b'-L',b'dependency=/workspace/target/debug/deps',*extra]
+        return argv[0],argv,{},cwd,None,0,0
+
+    def test_shared_rustc_mapping_keeps_workspace_sources_cfgs_and_multiple_dependencies(self):
+        extra=[b'--cfg',b'feature="one"',b'--cfg',b'custom_cfg',b'--check-cfg',b'cfg(feature, values("one"))',
+            b'--extern',b'first=/workspace/target/debug/deps/libfirst-aaaaaaaaaaaaaaaa.rlib',
+            b'--extern',b'second=/workspace/target/debug/deps/libsecond-bbbbbbbbbbbbbbbb.rmeta']
+        request=self.mapped_request(extra=extra)
+        mapped=planner.rustc_unit(request,package=b'consumer-package',host_triple=b'x86_64-unknown-linux-gnu')
+        self.assertEqual(mapped['source'],b'/workspace/member/src/lib.rs')
+        self.assertEqual(mapped['action'],'library')
+        self.assertEqual(mapped['cfgs'],[b'feature="one"',b'custom_cfg'])
+        self.assertEqual(mapped['dependencies'],['debug/deps/libfirst-aaaaaaaaaaaaaaaa.rlib','debug/deps/libsecond-bbbbbbbbbbbbbbbb.rmeta'])
+        self.assertEqual(mapped['outputs'],['debug/deps/libconsumer-0123456789abcdef.rlib',
+            'debug/deps/libconsumer-0123456789abcdef.rmeta','debug/deps/consumer-0123456789abcdef.d'])
+        self.assertEqual(mapped['fingerprint'],'debug/.fingerprint/consumer-package-0123456789abcdef')
+        changed=planner.rustc_unit(self.mapped_request(extra=extra+[b'--cfg',b'feature="two"']),
+            package=b'consumer-package',host_triple=b'x86_64-unknown-linux-gnu')
+        self.assertNotEqual(mapped['request_sha256'],changed['request_sha256'])
+        self.assertFalse(mapped['input_closure_complete']);self.assertFalse(mapped['shipping_authority'])
+
+    def test_shared_rustc_mapping_distinguishes_check_tests_profiles_and_target_paths(self):
+        cases=[(self.mapped_request(emit=b'dep-info,metadata'),'check',['debug/deps/libconsumer-0123456789abcdef.rmeta','debug/deps/consumer-0123456789abcdef.d']),
+            (self.mapped_request(kind=None,emit=b'dep-info,link',extra=[b'--test']),'test',
+                ['debug/deps/consumer-0123456789abcdef','debug/deps/consumer-0123456789abcdef.d']),
+            (self.mapped_request(source=b'bin/tool.rs',name=b'tool',kind=b'bin',emit=b'dep-info,link',
+                out=b'/workspace/target/aarch64-unknown-linux-gnu/release/deps',extra=[b'--target',b'aarch64-unknown-linux-gnu',b'-C',b'opt-level=3']),
+                'binary',['aarch64-unknown-linux-gnu/release/deps/tool-0123456789abcdef','aarch64-unknown-linux-gnu/release/deps/tool-0123456789abcdef.d'])]
+        for request,action,outputs in cases:
+            with self.subTest(action=action):
+                mapped=planner.rustc_unit(request,package=b'consumer-package',host_triple=b'x86_64-unknown-linux-gnu')
+                self.assertEqual(mapped['action'],action);self.assertEqual(mapped['outputs'],outputs)
+
+    def test_shared_rustc_mapping_refuses_escaping_or_unmodeled_requests(self):
+        for request in (self.mapped_request(source=b'../../outside.rs'),self.mapped_request(out=b'/tmp/out'),
+                self.mapped_request(extra=[b'-o',b'/tmp/out']),self.mapped_request(extra=[b'@/tmp/args']),
+                self.mapped_request(extra=[b'-C',b'incremental=/tmp/cache']),self.mapped_request(kind=b'proc-macro'),
+                self.mapped_request(extra=[b'--extern',b'evil=/tmp/evil.rlib']),
+                self.mapped_request(extra=[b'--crate-name',b'duplicate'])):
+            with self.subTest(request=request),self.assertRaises(planner.FreshnessHold):
+                planner.rustc_unit(request,package=b'consumer-package',host_triple=b'x86_64-unknown-linux-gnu')
+
     def test_planner_drain_requires_joined_threads_and_no_original_children(self):
         relay=object.__new__(planner.RootRelay)
         relay._threads=[];relay._children=set();relay._lock=threading.Lock();relay.errors=[]

@@ -198,6 +198,134 @@ def fixture_out_dir(environment):
     return os.fsdecode(value.removeprefix(b'/workspace/target/'))
 
 
+def rustc_unit(request,*,package,host_triple):
+    """Decode a bounded direct-rustc request without granting artifact authority.
+
+    The controller must separately admit the package/source graph, runtime and
+    every referenced publication. The request hash binds execution syntax; it
+    is not a compatible-unit key or complete input proof. Opaque tools hold.
+    """
+    def hold():raise FreshnessHold('input_census_unknown')
+    def path(value,prefix):
+        if (type(value) is not bytes or not value.startswith(prefix+b'/')
+                or any(p in (b'',b'.',b'..') for p in value.split(b'/')[1:])):hold()
+        return value[len(prefix)+1:]
+    try:
+        file,argv,environment,cwd,search,ignored,blocked=request
+        triples=(b'x86_64-unknown-linux-gnu',b'aarch64-unknown-linux-gnu')
+        if (type(package) is not bytes or re.fullmatch(rb'[A-Za-z0-9][A-Za-z0-9_-]{0,127}',package) is None
+                or host_triple not in triples or type(argv) is not list or not 1<=len(argv)<=4096
+                or type(environment) is not dict or len(environment)>4096
+                or any(type(n) is not int or not 0<=n<2**64 for n in (ignored,blocked))):hold()
+        strings=[file,cwd,*argv,*environment.keys(),*environment.values(),*([search] if search is not None else [])]
+        if (any(type(s) is not bytes or len(s)>legacy.STRING_LIMIT or b'\0' in s for s in strings)
+                or sum(len(s)+4 for s in strings)>legacy.LIMIT
+                or any(not key or b'=' in key for key in environment)
+                or file!=b'/toolchain/bin/rustc' or argv[0]!=file):hold()
+        if cwd!=b'/workspace':path(cwd,b'/workspace')
+        if cwd==b'/workspace/target' or cwd.startswith(b'/workspace/target/'):hold()
+        if environment.get(b'CARGO_PKG_NAME',package)!=package:hold()
+        args=argv[1:]
+        if args in ([b'-vV'],[b'--version']):return {'kind':'information'}
+        if args and args[0]==b'-':
+            words={b'-',b'--crate-name',b'___',b'--crate-type',b'bin',b'rlib',b'dylib',b'cdylib',b'staticlib',
+                b'proc-macro',b'-Wwarnings',b'--print=file-names',b'--print=sysroot',b'--print=split-debuginfo',b'--print=crate-name',b'--print=cfg'}
+            if all(arg in words for arg in args) and any(arg.startswith(b'--print=') for arg in args):return {'kind':'information'}
+            hold()
+        fields={};codegen={};cfgs=[];checks=[];externs=[];searches=[];source=None;index=0
+        single={b'--crate-name',b'--crate-type',b'--edition',b'--emit',b'--out-dir',b'--target',b'--error-format',b'--json',b'--cap-lints'}
+        repeated={b'--cfg':cfgs,b'--check-cfg':checks,b'--extern':externs,b'-L':searches}
+        while index<len(args):
+            arg=args[index];index+=1
+            if arg==b'--test':
+                if arg in fields:hold()
+                fields[arg]=True;continue
+            key,separator,value=arg.partition(b'=')
+            if key in single or key in repeated or arg==b'-C':
+                if arg==b'-C':key=arg;separator=b''
+                if not separator:
+                    if index>=len(args):hold()
+                    value=args[index];index+=1
+                if not value:hold()
+                if key==b'-C':
+                    option,equals,setting=value.partition(b'=')
+                    allowed={b'embed-bitcode',b'debuginfo',b'metadata',b'extra-filename',b'strip',b'opt-level',
+                        b'debug-assertions',b'overflow-checks',b'panic',b'codegen-units'}
+                    if not equals or option not in allowed or option in codegen:hold()
+                    if (option==b'extra-filename' and re.fullmatch(rb'-[0-9a-f]{16}',setting) is None
+                            or option==b'metadata' and re.fullmatch(rb'[0-9a-f]{16}',setting) is None
+                            or option==b'embed-bitcode' and setting not in (b'yes',b'no')
+                            or option==b'debuginfo' and setting not in (b'0',b'1',b'2')
+                            or option==b'strip' and setting not in (b'none',b'debuginfo',b'symbols')
+                            or option==b'opt-level' and setting not in (b'0',b'1',b'2',b'3',b's',b'z')
+                            or option in (b'debug-assertions',b'overflow-checks') and setting not in (b'yes',b'no',b'on',b'off')
+                            or option==b'panic' and setting not in (b'abort',b'unwind')
+                            or option==b'codegen-units' and (not setting.isdigit() or not 1<=int(setting)<=256)):hold()
+                    codegen[option]=setting
+                elif key in repeated:repeated[key].append(value)
+                else:
+                    if key in fields:hold()
+                    fields[key]=value
+                continue
+            if arg.startswith((b'-',b'@')) or source is not None:hold()
+            source=arg
+        if source is None or not {b'metadata',b'extra-filename'}<=codegen.keys():hold()
+        if not source.startswith(b'/'):source=cwd+b'/'+source
+        path(source,b'/workspace')
+        if source.startswith(b'/workspace/target/') or b'.git' in source.split(b'/'):hold()
+        name=fields.get(b'--crate-name',b'');kind=fields.get(b'--crate-type')
+        if (re.fullmatch(rb'[A-Za-z_][A-Za-z0-9_]{0,127}',name) is None
+                or fields.get(b'--edition') not in (b'2015',b'2018',b'2021',b'2024')
+                or fields.get(b'--error-format',b'json')!=b'json'):hold()
+        test=fields.get(b'--test',False)
+        if kind not in ((None,b'lib',b'rlib',b'bin') if test else (b'lib',b'rlib',b'bin')):hold()
+        emit=fields.get(b'--emit',b'').split(b',')
+        if len(set(emit))!=len(emit) or set(emit) not in ({b'dep-info',b'link'},{b'dep-info',b'metadata'},{b'dep-info',b'metadata',b'link'}):hold()
+        library=kind in (b'lib',b'rlib') and not test
+        if not library and set(emit)!={b'dep-info',b'link'}:hold()
+        target=fields.get(b'--target',host_triple)
+        if target not in triples:hold()
+        out=fields.get(b'--out-dir',b'');relative=path(out,b'/workspace/target');parts=relative.split(b'/')
+        target_prefix=[]
+        if b'--target' in fields:
+            if not parts or parts[0]!=target:hold()
+            target_prefix=[parts.pop(0)]
+        if not parts or re.fullmatch(rb'[A-Za-z0-9][A-Za-z0-9_-]{0,63}',parts[0]) is None:hold()
+        profile=parts[0];suffix=codegen[b'extra-filename']
+        build=name==b'build_script_build' and not test and kind==b'bin'
+        if parts!=([profile,b'build',package+suffix] if build else [profile,b'deps']):hold()
+        action='build-script' if build else 'test' if test else 'library' if library and b'link' in emit else 'check' if library else 'binary'
+        prefix=os.fsdecode(relative)+ '/';base=os.fsdecode(name+suffix);outputs=[]
+        if b'link' in emit:outputs.append(prefix+('lib'+base+'.rlib' if library else base))
+        if b'metadata' in emit:outputs.append(prefix+'lib'+base+'.rmeta')
+        outputs.append(prefix+base+'.d')
+        dependencies=[];seen=set()
+        for item in externs:
+            alias,equals,original=item.partition(b'=')
+            if not equals or re.fullmatch(rb'[A-Za-z_][A-Za-z0-9_]*',alias) is None or alias in seen:hold()
+            seen.add(alias);dep=path(original,b'/workspace/target')
+            if not original.endswith((b'.rlib',b'.rmeta')) or b'deps' not in dep.split(b'/'):hold()
+            dependencies.append(os.fsdecode(dep))
+        for item in searches:
+            if not item.startswith(b'dependency='):hold()
+            directory=path(item[len(b'dependency='):],b'/workspace/target')
+            if directory.split(b'/')[-1]!=b'deps':hold()
+        generated=environment.get(b'OUT_DIR')
+        if generated is not None:
+            generated=path(generated,b'/workspace/target');tail=generated.split(b'/')
+            if (len(tail)<4 or tail[-3]!=b'build' or tail[-1]!=b'out'
+                    or re.fullmatch(re.escape(package)+rb'-[0-9a-f]{16}',tail[-2]) is None):hold()
+            generated=os.fsdecode(generated)
+        context=lookup_inputs._wire([file,argv,sorted(environment.items()),cwd,search,ignored,blocked])
+        return {'kind':'compile','action':action,'source':source,'crate_name':name,'crate_type':kind,
+            'target':target,'profile':profile,'out_dir':out,'outputs':outputs,'dependencies':dependencies,
+            'generated_root':generated,'fingerprint':os.fsdecode(b'/'.join([*target_prefix,profile,b'.fingerprint',package+suffix])),
+            'cfgs':cfgs,'check_cfgs':checks,'externs':externs,'searches':searches,'fields':fields,'codegen':codegen,
+            'request_sha256':hashlib.sha256(json.dumps(context,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+            'input_closure_complete':False,'shipping_authority':False}
+    except (ValueError,TypeError,KeyError,AttributeError,IndexError,UnicodeError):hold()
+
+
 def fixture_request(request):
     """Map the pinned Cargo build-script/library/binary graph; unknown work holds.
 
@@ -219,78 +347,37 @@ def fixture_request(request):
         return {'kind':'build_script','alias':os.fsdecode(file.removeprefix(b'/workspace/target/')),
             'generated_root':generated}
     if file!=b'/toolchain/bin/rustc':raise FreshnessHold('input_census_unknown')
-    args=argv[1:]
-    if args in ([b'-vV'],[b'--version']):return {'kind':'information'}
-    if args and args[0]==b'-':
-        # Cargo's target-information probe consumes stdin and emits no artifacts.
-        words={b'-',b'--crate-name',b'___',b'--crate-type',b'bin',b'rlib',b'dylib',
-            b'cdylib',b'staticlib',b'proc-macro',b'-Wwarnings',b'--print=file-names',
-            b'--print=sysroot',b'--print=split-debuginfo',b'--print=crate-name',b'--print=cfg'}
-        if all(arg in words for arg in args) and any(arg.startswith(b'--print=') for arg in args):
-            return {'kind':'information'}
-        raise FreshnessHold('input_census_unknown')
-    fields={};codegen={};source=None;index=0
-    while index<len(args):
-        arg=args[index];index+=1
-        if arg.startswith((b'--error-format=',b'--json=')):
-            key,_,value=arg.partition(b'=')
-            if key in fields:raise FreshnessHold('input_census_unknown')
-            fields[key]=value;continue
-        if arg in (b'src/main.rs',b'src/lib.rs',b'build.rs') and source is None:source=arg;continue
-        if arg in (b'--edition=2021',b'--emit=dep-info,link',b'--emit=dep-info,metadata,link'):
-            if arg in fields:raise FreshnessHold('input_census_unknown')
-            fields[arg]=True;continue
-        if arg in (b'--crate-name',b'--crate-type',b'--out-dir',b'-L',b'-C',b'--check-cfg',b'--error-format',b'--json',b'--extern'):
-            if index>=len(args):raise FreshnessHold('input_census_unknown')
-            value=args[index];index+=1
-            if arg==b'-C':
-                key,separator,number=value.partition(b'=')
-                if (not separator or key in codegen or key not in (b'embed-bitcode',b'debuginfo',b'metadata',b'extra-filename',b'incremental',b'strip')
-                        or key==b'incremental'):
-                    raise FreshnessHold('input_census_unknown')
-                if (key==b'embed-bitcode' and number!=b'no' or key==b'debuginfo' and number!=b'0'
-                        or key==b'strip' and number!=b'debuginfo'
-                        or key==b'metadata' and re.fullmatch(b'[0-9a-f]{16}',number) is None
-                        or key==b'extra-filename' and re.fullmatch(b'-[0-9a-f]{16}',number) is None):
-                    raise FreshnessHold('input_census_unknown')
-                codegen[key]=number
-            elif arg==b'--check-cfg':
-                if value not in (b'cfg(docsrs,test)',b'cfg(feature, values())'):
-                    raise FreshnessHold('input_census_unknown')
-            else:
-                if arg in fields:raise FreshnessHold('input_census_unknown')
-                fields[arg]=value
-            continue
-        raise FreshnessHold('input_census_unknown')
-    if source not in (b'src/main.rs',b'src/lib.rs',b'build.rs'):raise FreshnessHold('input_census_unknown')
-    role={b'src/main.rs':'binary',b'src/lib.rs':'library',b'build.rs':'build-script'}[source]
-    if b'extra-filename' not in codegen or b'metadata' not in codegen:raise FreshnessHold('input_census_unknown')
+    mapped=rustc_unit(request,package=b'private-cargo-probe',host_triple=b'x86_64-unknown-linux-gnu')
+    if mapped['kind']=='information':return mapped
+    fields=mapped['fields'];codegen=mapped['codegen']
+    role={b'/workspace/src/main.rs':'binary',b'/workspace/src/lib.rs':'library',b'/workspace/build.rs':'build-script'}.get(mapped['source'])
+    if role is None:raise FreshnessHold('input_census_unknown')
     suffix=codegen[b'extra-filename']
     out=(b'/workspace/target/debug/build/private-cargo-probe'+suffix
         if role=='build-script' else b'/workspace/target/debug/deps')
-    emit=b'--emit=dep-info,metadata,link' if role=='library' else b'--emit=dep-info,link'
     required={b'--crate-name':b'build_script_build' if role=='build-script' else b'private_cargo_probe',
-        b'--crate-type':b'lib' if role=='library' else b'bin',
-        b'--out-dir':out,b'-L':b'dependency=/workspace/target/debug/deps',b'--edition=2021':True,emit:True}
-    if (not source or any(fields.get(key)!=value for key,value in required.items())
-            or (b'--emit=dep-info,link' in fields and b'--emit=dep-info,metadata,link' in fields)
+        b'--crate-type':b'lib' if role=='library' else b'bin',b'--out-dir':out,b'--edition':b'2021',
+        b'--emit':b'dep-info,metadata,link' if role=='library' else b'dep-info,link'}
+    if (any(fields.get(key)!=value for key,value in required.items())
+            or set(fields)-set(required)-{b'--error-format',b'--json'}
             or fields.get(b'--error-format',b'json')!=b'json'
-            or fields.get(b'--json',b'diagnostic-rendered-ansi,artifacts,future-incompat')!=b'diagnostic-rendered-ansi,artifacts,future-incompat'):
+            or fields.get(b'--json',b'diagnostic-rendered-ansi,artifacts,future-incompat')!=b'diagnostic-rendered-ansi,artifacts,future-incompat'
+            or set(codegen)-{b'embed-bitcode',b'debuginfo',b'metadata',b'extra-filename',b'strip'}
+            or codegen.get(b'embed-bitcode',b'no')!=b'no' or codegen.get(b'debuginfo',b'0')!=b'0'
+            or codegen.get(b'strip',b'debuginfo')!=b'debuginfo' or mapped['cfgs']
+            or any(value not in (b'cfg(docsrs,test)',b'cfg(feature, values())') for value in mapped['check_cfgs'])
+            or mapped['searches']!=[b'dependency=/workspace/target/debug/deps']):
         raise FreshnessHold('input_census_unknown')
-    prefix=os.fsdecode(out.removeprefix(b'/workspace/target/'))+'/'
-    name=os.fsdecode(required[b'--crate-name']+suffix);base=prefix+name
-    outputs=([prefix+'lib'+name+'.rlib',prefix+'lib'+name+'.rmeta',base+'.d']
-        if role=='library' else [base,base+'.d'])
-    dependencies=[]
-    if b'--extern' in fields:
-        if role!='binary' or re.fullmatch(rb'private_cargo_probe=/workspace/target/debug/deps/libprivate_cargo_probe-[0-9a-f]{16}\.rlib',fields[b'--extern']) is None:
+    if mapped['externs']:
+        if (role!='binary' or len(mapped['externs'])!=1
+                or re.fullmatch(rb'private_cargo_probe=/workspace/target/debug/deps/libprivate_cargo_probe-[0-9a-f]{16}\.rlib',mapped['externs'][0]) is None):
             raise FreshnessHold('input_census_unknown')
-        dependencies=[os.fsdecode(fields[b'--extern'].split(b'=',1)[1].removeprefix(b'/workspace/target/'))]
     generated=fixture_out_dir(environment)
     if role=='library' and generated is None or role=='build-script' and generated is not None:
         raise FreshnessHold('input_census_unknown')
-    return {'kind':'compile','role':role,'outputs':outputs,'dependencies':dependencies,'generated_root':generated,
-        'fingerprint':'debug/.fingerprint/private-cargo-probe'+os.fsdecode(suffix)}
+    return {'kind':'compile','role':role,'outputs':mapped['outputs'],'dependencies':mapped['dependencies'],
+        'generated_root':generated,'fingerprint':mapped['fingerprint']}
+
 
 
 class RootRelay:

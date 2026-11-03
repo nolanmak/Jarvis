@@ -1162,3 +1162,17 @@ Rust boundary tests require those stages and errno while discarding private
 payload fields. The 281-test Python CI suite and 31 focused managed Rust tests
 pass after this diagnostic-only follow-up; the separate VM transport suite
 passes 14 cases with its six preexisting provisioned-runtime cases excluded.
+
+Direct rustc request parsing is now shared by the pinned replay and a bounded
+unit mapper. It keeps workspace-member source paths, repeated cfg/check-cfg and
+extern arguments, check/test action differences, profile and explicit Linux
+target paths, generated roots and exact request-context identity. Output paths
+are derived only for supported library, metadata-check, binary, test and
+build-script compilation forms. Response files, escaped paths, incremental
+state, unmodeled native/opaque tools and ambiguous singleton options hold.
+The pinned replay still applies its original exact package/flag/source/output
+restrictions after shared parsing; this does not widen its execution admission.
+The mapper's request digest is not a compatible-unit key or input proof. The
+caller must still admit the package graph, toolchain and every publication.
+Proc macros, rustdoc, registry-source mounts, wrappers and general execution
+dispatch remain unfinished. Native validation of the parser refactor is pending.
