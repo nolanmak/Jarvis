@@ -1031,7 +1031,14 @@ if is_view:
  binary=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),
   ctypes.c_char_p(b'/workspace/target/deps/raw-\xff'),ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
  assert binary>=0
- try:assert os.read(binary,64)==b'entry\n'
+ try:
+  metadata=ctypes.create_string_buffer(144)
+  assert libc.syscall(ctypes.c_long(5),ctypes.c_long(binary),metadata)==0
+  assert libc.syscall(ctypes.c_long(5),ctypes.c_long(binary),ctypes.c_void_p(0))==-1
+  assert ctypes.get_errno()==errno.EFAULT
+  assert libc.syscall(ctypes.c_long(5),ctypes.c_long(-1),metadata)==-1
+  assert ctypes.get_errno()==errno.EBADF
+  assert os.read(binary,64)==b'entry\n'
  finally:os.close(binary)
  binary_missing=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),
   ctypes.c_char_p(b'/workspace/target/deps/missing-\xff\n '),ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
@@ -1238,7 +1245,8 @@ def _probe(arguments):
         (view_probe.original_pid,2004,view_probe.inputs/'deps/empty',{})]
     directories.extend((item['pid'],2000+ordinal,empty,{}) for ordinal,item in cargo_probe.units.items()
         if item['mapping']['kind']=='application')
-    kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor')
+    kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor',
+        view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'))
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],

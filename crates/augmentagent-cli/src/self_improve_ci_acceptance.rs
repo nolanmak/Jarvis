@@ -87,8 +87,12 @@ pub fn value()->u8{GENERATED}
         && probe["kernel_observation"]["max_path_query_observed"]==true
         && probe["kernel_observation"]["binary_path_query_observed"]==true
         && probe["kernel_observation"]["missed_probe_census_complete"]==true
-        && probe["kernel_observation"]["probe_census"]["before"]["links"].as_array().is_some_and(|values|values.len()==8)
-        && probe["kernel_observation"]["probe_census"]["after"]["programs"].as_array().is_some_and(|values|values.len()==8)
+        && probe["kernel_observation"]["probe_census"]["before"]["links"].as_array().is_some_and(|values|values.len()==10)
+        && probe["kernel_observation"]["probe_census"]["after"]["programs"].as_array().is_some_and(|values|values.len()==10)
+        && probe["kernel_observation"]["fstat_query_observed"]==true
+        && probe["kernel_observation"]["fstat_invalid_fd_observed"]==true
+        && probe["kernel_observation"]["fstat_failed_copy_observed"]==true
+        && probe["kernel_observation"]["metadata_queries"].as_u64().is_some_and(|value|value>=4)
         && probe["kernel_observation"]["directory_witness_observed"]==true
         && probe["kernel_observation"]["binary_directory_name_observed"]==true
         && probe["kernel_observation"]["directory_short_read_observed"]==true

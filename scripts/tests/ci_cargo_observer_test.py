@@ -25,18 +25,53 @@ def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
 
 
 def census_sample():
-    programs=[{'id':i,'type':17 if i in (1,4) else 2,'tag':str(i)*16,'recursion_misses':0} for i in range(1,5)]
+    programs=[{'id':i,'type':17 if i in (1,4) else 2,'tag':f'{i:016x}','recursion_misses':0} for i in range(1,5)]
     links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
-        'prog_id':i,'tag':str(i)*16,**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
+        'prog_id':i,'tag':f'{i:016x}',**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
             else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]
-    for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1)),5):
-        programs.append({'id':i,'type':2,'tag':str(i)*16,'recursion_misses':0})
+    for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1),('vfs_fstat',0),('vfs_fstat',1)),5):
+        programs.append({'id':i,'type':2,'tag':f'{i:016x}','recursion_misses':0})
         links.append({'id':10+i,'type':'kretprobe_multi' if flags else 'kprobe_multi',
-            'prog_id':i,'tag':str(i)*16,'function':function,'count':1,'flags':flags,'missed':0})
+            'prog_id':i,'tag':f'{i:016x}','function':function,'count':1,'flags':flags,'missed':0})
     return {'pid':42,'birth':1000,'programs':programs,'links':links}
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_fstat_keeps_original_descriptor_metadata_namespace_and_delivery_outcome(self):
+        rows=['F 2004 101 101 1 3 3','H 2004 101 101 1 3 100',
+            'J 2004 101 101 1 7 900 33060 1 0 0 0 6 4096 8 2047',
+            'K 2004 101 101 1 -1 999999999 2 3 4 5','L 2004 101 101 1 0','Z 2004 101 101 1 0',
+            'F 2004 101 101 2 18446744073709551615 -1','H 2004 101 101 2 -1 100',
+            'L 2004 101 101 2 -9','Z 2004 101 101 2 -9']
+        queries=observer.metadata_queries(rows[::-1])
+        queries.sort(key=lambda q:q['sequence'])
+        self.assertEqual([q['fd'] for q in queries],[3,-1])
+        self.assertEqual(queries[0]['stat']['atime_sec'],-1)
+        self.assertEqual(queries[0]['stat']['atime_nsec'],999999999)
+        self.assertEqual(queries[0]['user_namespace'],100)
+        self.assertTrue(queries[0]['delivered']);self.assertIsNone(queries[1]['stat'])
+        fault=observer.metadata_queries([r.replace('1 0','1 -14') if r.startswith('Z ') else r for r in rows])
+        self.assertFalse(next(q for q in fault if q['sequence']==1)['delivered'])
+        path=SimpleNamespace(stat=lambda:SimpleNamespace(st_dev=os.makedev(0,7),st_ino=900,
+            st_mode=33060,st_nlink=1,st_uid=0,st_gid=0,st_rdev=0,st_size=6,st_blksize=4096,
+            st_blocks=8,st_atime_ns=-1,st_mtime_ns=2000000003,st_ctime_ns=4000000005))
+        observer.metadata_witness(queries,101,2004,path,100)
+        for bad,namespace in ((fault,100),(queries,101)):
+            with self.subTest(namespace=namespace),self.assertRaises(observer.ObservationUnavailable):
+                observer.metadata_witness(bad,101,2004,path,namespace)
+        framed=b''.join(frame('printf',row+'\n') for row in rows)+frame('map',{'@emitted':len(rows)})
+        paths,dirs,stats=observer.decode(framed,with_metadata=True)
+        self.assertEqual((paths,dirs),([],[]));self.assertEqual(stats,queries)
+        with self.assertRaises(observer.ObservationUnavailable):
+            observer.decode(framed.replace(b'"@emitted": 10',b'"@emitted": 9'))
+        self.assertEqual(observer.metadata_queries(rows[:1],complete=False),[])
+        for bad in (rows[:-1],rows+rows[:1],rows[:2]+rows[3:],
+                [r.replace('1 3 100','1 4 100') for r in rows],
+                [r.replace('999999999','1000000000') for r in rows],
+                [r.replace('1 7 900','1 -1 900') for r in rows],
+                [r.replace('1 0','1 -9') if r.startswith('L ') else r for r in rows]):
+            with self.subTest(rows=bad),self.assertRaises(observer.ObservationUnavailable):observer.metadata_queries(bad)
+
     def test_original_directory_cursor_records_rewind_and_refuses_a_false_continuous_scan(self):
         rows=['B 2004 101 101 1 3 24','I 2004 101 101 1 265289728 900 16749 0',
             'D 2004 101 101 1 1 900 4 0 0 1 2e','A 2004 101 101 1 1 1',
@@ -144,7 +179,7 @@ class KernelObserverTests(unittest.TestCase):
                 data+b'0\t getname_flags+0x0/0x20\n',data.split(b'cookie')[0],data+b'missed:\t0\n'):
             with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer._fdinfo(bad)
 
-    def test_only_the_same_eight_original_links_and_programs_with_zero_misses_have_a_census(self):
+    def test_only_the_same_ten_original_links_and_programs_with_zero_misses_have_a_census(self):
         sample=census_sample();value={'before':sample,'after':copy.deepcopy(sample)}
         observer.validate_census(value)
         for fault in ('missed-before','missed-after','recursion','missing-link','duplicate-program',

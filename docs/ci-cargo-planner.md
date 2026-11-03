@@ -904,4 +904,32 @@ The root collector must observe the nonzero first cookie, reset to zero and
 subsequent continuous complete read. Both Python validation and the original
 Rust VM acceptance require this witness. This tests actual file-position
 capture and does not supply generic descriptor-lifecycle or pathname-resolution
-authority. Native replay of this extension is pending.
+authority. At `85ae1b96`, the admitted original replay passed in **103.60 seconds**,
+capturing **540 path queries, 153 directory reads and 3,889 entries**. The
+read/rewind/full-read/EOF witness and every prior pathname/directory/Cargo
+assertion passed with the same eight zero-loss attachments. Compiler calls
+stayed `[3, 0]`, build scripts `[1, 0]`, two applications ran, and original
+metadata/cleanup/allocation checks passed. The 267-test Python CI suite passed
+without skips; 18 observer tests and 31 focused Rust tests passed, with 15
+opt-in Rust cases excluded. This remains a bounded observer experiment.
+
+
+The next private extension observes direct x86-64 `fstat` (syscall 5) through
+entry/return probes on the original `vfs_fstat`, plus its original syscall
+entry/exit. It records original register/descriptor values, the user namespace,
+raw kernel `kstat` fields (device/inode/mode/link count/ownership/rdev/size/block
+size/blocks/result mask and signed second/nanosecond timestamps), VFS status
+and actual syscall status. Kernel metadata is read before the original kernel
+object leaves scope. A successful VFS query followed by a failed copy to the
+caller remains undelivered metadata, not a successful stat input. Failed VFS
+queries never read an uninitialized result structure. This follows the pinned
+[Linux v7.0 fstat path](https://github.com/torvalds/linux/blob/v7.0/fs/stat.c).
+
+Both original `vfs_fstat` attachments must join the same stable zero-loss
+census, for ten original programs/links total. Startup must observe fstat on
+the original directory witness. The isolated unit must issue direct valid-fd,
+invalid-fd and null-output-pointer calls; root validation compares the delivered
+metadata with the original sealed inode, and requires EBADF and EFAULT to
+retain their distinct outcomes. The original Rust VM test requires all three.
+This is not statx/general pathname metadata coverage, FD-lifecycle authority,
+a complete input closure or a passing-CI producer. Native replay is pending.
