@@ -1847,5 +1847,21 @@ artifacts for reuse, or advance an autoship workflow.
 Unit regressions cover missing-image refusal, snapshot/paused launch policy,
 real kernel read-only versus writable descriptor checks, protected artifact
 changes, no-atime source hashing and malformed/authority-bearing outcomes.
-Actual VM validation is still required; the preview must not be reported as
-production recovery or substituted for the original source/proof/merge gates.
+The actual production-image rehearsal at executable `6bf753bc` passed in
+158.46 seconds, with ten embedded helper payloads verified. Its temporary view
+retired four sessions and increased worker-available space from 20,738,048 to
+53,387,264 bytes. The protected inventory remained identical: 45,834 files and
+4,167,370,136 unique logical content bytes. The original raw image's full SHA-256
+and recorded identity also remained identical. Receipt:
+`/tmp/augmentagent-ci-recovery-preview-20261103210041/receipt.json`.
+
+This is an insufficient capacity result, not production recovery. The strict
+single-link policy leaves shared incremental objects retained. An independently
+admitted read-only census found 192 matching sessions, including sampled object
+link counts of 2 and 52; those samples do not establish a complete safe link
+closure or a physical reclaim estimate. A bounded closed-link policy still
+requires implementation, fault validation and independent review. The latest
+routine validation passed 343 Python CI tests without skips and 31 focused Rust
+tests, with 20 opt-in native cases excluded from that routine Rust run. The
+preview was explicitly executed separately. Original source/proof/merge gates
+remain open, and no production cache change or autonomous merge is claimed.
