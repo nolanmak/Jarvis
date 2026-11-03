@@ -1062,4 +1062,14 @@ limits remain unchanged. The original Rust VM acceptance requires the bound
 selector and both content-identity comparisons. Complete input coverage,
 metadata/runtime compatibility, generic Cargo mapping, invalidation/restart,
 passing-CI publication and merge authority remain unfinished. Native replay
-of this bridge is pending.
+of this bridge passed at `b75f9da1` in **106.18 seconds** on
+`7.0.0-31-generic`. The protected receipt records two actual bound queries:
+the original content digest equals the unread-change digest and differs from
+the introduced-module digest. The original sixteen attachments/programs stayed
+unchanged with zero missed/recursion counts, and all prior path/directory,
+metadata, Cargo reuse and original cleanup checks passed. The 272-test CI
+Python suite passed with native helpers and no skips; 10 lookup-input tests,
+21 observer tests and 31 focused Rust tests passed (15 opt-in Rust cases
+excluded). All 99 updater rebuild checks passed. The input-closure and shipping
+flags remain false; the content comparison does not establish metadata/runtime
+compatibility or schedule a Cargo invalidation/restart yet.
