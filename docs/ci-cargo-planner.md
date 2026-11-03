@@ -285,6 +285,12 @@ real guest replay passed at `f1b4397f`. Its original unit receipts record two
 zero exits and an unstarted SIGKILL cancellation, with outer original-scope
 quiescence. The pinned test binary SHA-256 is
 `cf8610685e7d72fd971d4b72c225a27692897d723c1bddb9f19ded42f4f2d3c1`.
+The expanded replay at `e773b37b` passed in 89.93 seconds. A fourth unit under
+UID 2003 emits readiness after exec and stdin validation, receives SIGUSR1 through
+the original proxy/pidfd, and records raw signal 10 in both tool and proxy status.
+The receipt requires that unit to have started and rejects mismatched signal or
+exit observations. Its pinned binary SHA-256 is
+`c1f350df948561d5a73b2cf35d875a10177d31c27b477f05e4082fa800e19343`.
 The probe does not run arbitrary protected Cargo, freeze unit namespaces, seal
 reusable outputs, establish a complete input collector or create a CI proof.
 Those activation blockers, including race/cancellation and nested-builder
@@ -381,7 +387,8 @@ cleanup interfaces. None requests a new product decision from the owner.
   protocol, stable jobserver mapping, bounded stdin staging, unsupported spawn
   handling, and original supervisor ownership in the real guest. The fixed V3
   replay now proves normal credential transitions, stdin/jobserver transport and
-  pre-exec SIGUSR1 cancellation. Complete signal/race, original-parent death and
+  pre-exec SIGUSR1 cancellation plus post-exec signal/status forwarding. Complete
+  signal/race, original-parent death and
   unsupported-spawn fault coverage remain required. Same-UID evidence cannot
   substitute for those guest cases. Blocks protected activation.
 * **Final unit schema and suite mapping:** turn the fields above into exact
