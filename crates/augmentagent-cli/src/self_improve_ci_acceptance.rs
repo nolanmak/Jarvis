@@ -1825,3 +1825,43 @@ print('RECOVERED_ORIGINAL_EXECUTOR',flush=True)
         "input_closure_complete":false,"full_ci":false,"shipping_authority":false}))?)?;
     Ok(())
 }
+
+/// Rehearse actual legacy-image cleanup while the original raw image is held
+/// read-only behind a temporary-write view. This cannot authorize CI or merge.
+#[tokio::test]
+#[ignore = "requires an existing registered legacy image, delegated VM policy and exclusive managed storage"]
+async fn live_shared_ci_legacy_recovery_preview()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let target=PathBuf::from(std::env::var("AUTOSHIP_CI_PREVIEW_TARGET")?);
+    ensure!(target.is_absolute() && target.canonicalize()?==target
+        && target.join(".augmentagent-target.json").is_file() && target.join("ci-vm/cache.img").is_file(),
+        "existing registered image required for read-only rehearsal");
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private evidence directory required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"legacy-recovery-preview",None)?;
+    audit.require_run_resources()?;
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("recovery-preview-context-").tempdir_in(&target)?;
+    let root=fixture.path();
+    // This repository identifies the diagnostic input, not application CI.
+    std::fs::write(root.join("context.json"),serde_json::to_vec(&serde_json::json!({
+        "kind":"legacy-cache-recovery-rehearsal","image":target.join("ci-vm/cache.img"),"shipping_authority":false}))?)?;
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;
+    git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","core.hooksPath=/dev/null",
+        "-c","commit.gpgsign=false","commit","-qm","identify actual legacy recovery input"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let before=binding(root).await?;let source=snapshot(root,&before,&target).await?;
+    let session=vm::Session::prepare(root,&target)?;
+    let receipt=session.preview_legacy_recovery(&source,root,&before,&target,&storage,&audit).await?;
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&receipt)?)?;
+    let outcome=&receipt["outcome"];
+    ensure!(outcome["retired"].as_array().is_some_and(|rows|!rows.is_empty()),"preview did not exercise real legacy retirement");
+    ensure!(outcome["available_after"].as_u64()>outcome["available_before"].as_u64(),"preview did not recover worker capacity");
+    ensure!(outcome["protected_before"]==outcome["protected_after"],"protected artifacts changed during recovery");
+    ensure!(binding(root).await?==before,"diagnostic source changed");
+    audit.protected_health()?;
+    Ok(())
+}

@@ -147,10 +147,10 @@ class InheritedStorage:
         if space.f_bavail*space.f_frsize<self.floor:raise vm.Unavailable('managed storage floor unavailable')
 
 
-def ensure_cache(path, capacity, lease):
+def ensure_cache(path, capacity, lease, *, allow_create=True):
     """Provision only inside the controller's registered, already leased target."""
     path=Path(path)
-    if type(capacity) is not int or capacity<64*1024*1024 or capacity%4096:
+    if type(allow_create) is not bool or type(capacity) is not int or capacity<64*1024*1024 or capacity%4096:
         raise vm.Unavailable('invalid managed CI cache capacity')
     parent=path.parent
     if not path.is_absolute() or parent.resolve()!=parent:
@@ -179,6 +179,7 @@ def ensure_cache(path, capacity, lease):
             growth=max(0,capacity-info.st_blocks*512)
         if free<lease.floor+growth:raise vm.Unavailable('managed CI cache growth reserve unavailable')
         return
+    if not allow_create:raise vm.Unavailable('existing managed CI cache required')
     if free<lease.floor+capacity:raise vm.Unavailable('managed CI cache growth reserve unavailable')
     fd,name=tempfile.mkstemp(prefix='.ci-cache-',dir=parent)
     try:

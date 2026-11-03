@@ -1807,3 +1807,45 @@ Only this registered test image was changed. No recovery was applied to the
 production image. Production capacity recovery, independent audit and the
 remaining source/provenance/merge gates remain open; this evidence cannot
 authorize an autonomous merge.
+
+
+### Read-only recovery rehearsal on an existing image
+
+The opt-in `live_shared_ci_legacy_recovery_preview` exercises recovery against
+an existing registered image without changing that image. It uses the ordinary
+managed CI admission, inherited global and exact target leases, original VM
+resource policy, cleanup hold and verified descendant teardown. A small Git
+repository identifies the diagnostic context; it is not application CI.
+
+The dedicated preview controller uses the pinned QEMU runtime with per-drive
+`snapshot=on`, which redirects writes to temporary storage ([QEMU invocation
+reference](https://www.qemu.org/docs/master/system/qemu-manpage.html)). QEMU starts
+with its virtual CPUs paused. Before `cont`, the controller verifies actual
+kernel descriptors for the base image are read-only and identifies the writable
+temporary overlay in registered scratch storage. The ordinary human monitor is
+disabled; QMP is confined to an owner-private runtime socket. The result records
+this temporary-view lineage, rather than claiming it is an ordinary physical
+cache or passing-CI proof.
+
+Inside that view, the trusted guest inventories and hashes all protected cache
+namespaces before and after real legacy incremental retirement. Only the legacy
+incremental and retirement-metadata namespaces are excluded. File bytes,
+identities, modes, ownership, regular-file links/timestamps, symlink targets and extended attributes remain
+part of the protected inventory; directory times and link counts are excluded
+because namespace retirement legitimately changes them. Hard-linked contents
+are hashed once with each path still represented. Entry/byte bounds and the
+existing command deadline fence unsupported inventories.
+
+The controller hashes the entire original raw image before and after the
+rehearsal and verifies its identity. Read-only cache validation cannot format
+or create a missing image. Unknown descendants retain control state under the
+existing cleanup-hold rules. The preview reports hypothetical worker-available
+space and cleanup acknowledgements, with completeness, full-CI and shipping
+authority false. It does not execute application tests, validate legacy
+artifacts for reuse, or advance an autoship workflow.
+
+Unit regressions cover missing-image refusal, snapshot/paused launch policy,
+real kernel read-only versus writable descriptor checks, protected artifact
+changes, no-atime source hashing and malformed/authority-bearing outcomes.
+Actual VM validation is still required; the preview must not be reported as
+production recovery or substituted for the original source/proof/merge gates.

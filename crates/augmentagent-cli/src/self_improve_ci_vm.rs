@@ -11,6 +11,7 @@ const SUPERVISOR: &[u8] = include_bytes!("../../../scripts/provider-supervisor.p
 const WORKER_SCOPE: &[u8] = include_bytes!("../../../scripts/ci-worker-scope.py");
 const INPUT_MANIFEST: &[u8] = include_bytes!("../../../scripts/ci-input-manifest.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
+const LEGACY_PREVIEW: &[u8] = include_bytes!("../../../scripts/ci-legacy-recovery-preview.py");
 const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
 const PLANNER_PROGRAMS:[(&str,&[u8]);7]=[
     ("ci-cargo-planner.py",include_bytes!("../../../scripts/ci-cargo-planner.py")),
@@ -685,6 +686,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             ("ci-worker-scope.py", WORKER_SCOPE),
             ("ci-input-manifest.py", INPUT_MANIFEST),
             ("ci-cache-generation.py", CACHE_GENERATION),
+            ("ci-legacy-recovery-preview.py", LEGACY_PREVIEW),
             ("ci-runtime-identity.py", RUNTIME_IDENTITY),
             ("ci-contract.py", RUNNER.as_bytes()),
             ("ci-contract.json", contract.as_bytes()),
@@ -1315,5 +1317,73 @@ mod tests {
             assert!(receipt.validate(&binding,"dependency").is_err());
             assert!(receipt.validate(&binding,"step").is_err());
         }
+    }
+}
+
+/// A maintenance rehearsal has a temporary-write view and cannot yield an
+/// ordinary local-check receipt or enter the passing-CI proof path.
+#[cfg(test)]
+impl Session {
+    pub(super) async fn preview_legacy_recovery(&self,source:&verifier_checkout::OwnedCheckout,root:&Path,binding:&Binding,
+        target:&Path,storage:&crate::build_storage::Lease,audit:&Arc<augmentagent_channel_core::AuditLogger>)
+        ->Result<serde_json::Value> {
+        use std::os::fd::AsRawFd;
+        let _execution=self.execution.lock().await;
+        if !crate::build_storage::ci_holds::may_cleanup_after_reconcile(target).unwrap_or(false) {
+            return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({"version":1,
+                "reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
+                "evidence_sha256":digest(b"prior shared CI teardown remains unverified")})).into());
+        }
+        let generation=source.generation().to_owned();let source=source.path();
+        let bundle=self.directory.as_ref().context("preview controller bundle missing")?.path();
+        let files=storage.inherited_files()?;let first=files.first().context("preview storage unavailable")?;
+        let info=first.metadata()?;let lock=std::fs::read_link(format!("/proc/self/fd/{}",first.as_raw_fd()))?;
+        let objects=PathBuf::from(git(root,&["rev-parse","--git-path","objects"]).await?.trim());
+        let objects=if objects.is_absolute(){objects}else{root.join(objects)}.canonicalize()?;
+        let command_id=uuid::Uuid::new_v4().to_string();
+        let specification=serde_json::json!({"version":1,"build_cache":self.cache,"cache_bytes":self.cache_bytes,
+            "scratch":bundle.join("scratch"),"runtime_config":bundle.join("runtime.json"),
+            "workspace":source,"git_objects":objects,"head":binding.verification_head,"tree":binding.index_tree,
+            "contract_sha256":binding.contract_sha256,"authority_sha256":self.authority_sha256,
+            "generation":generation,"command":command_id,
+            "storage":{"fd":first.as_raw_fd(),"fds":files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+                "path":lock,"device":info.dev(),"inode":info.ino(),
+                "floor_bytes":(crate::disk::gate_min_free_gb()*1024.0_f64.powi(3)) as u64}});
+        let request=bundle.join("legacy-recovery-preview-request.json");let result=bundle.join("legacy-recovery-preview-result.json");
+        private_write(&request,&serde_json::to_vec(&specification)?)?;
+        let mut command=Command::new("/usr/bin/python3");
+        command.arg("-I").arg(bundle.join("ci-legacy-recovery-preview.py")).arg(&request).arg(&result)
+            .current_dir(bundle).env_clear().env("PATH","/usr/bin:/bin")
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut hold=crate::build_storage::ci_holds::Hold::begin(root,source,bundle,target,
+            &digest(&serde_json::to_vec(binding)?))?;
+        let (mut child,resources)=match augmentagent_channel_core::run_resources::spawn_command_with_storage_at(
+            &command,Some(audit),&files,self.memory_mb,hold.supervisor()) {
+            Ok(value)=>value,
+            Err(error)=>{hold.not_spawned()?;return Err(error);}
+        };
+        resources.admit_with_observer("shared_ci_vm",Some(audit),|admission|hold.bind(admission)).await?;
+        drop(child.stdin.take());
+        let output=tokio::time::timeout(std::time::Duration::from_secs(180),
+            crate::build_storage::watch_reserve_roots(Some(target),Some(bundle),async {Ok(child.wait_with_output().await?)})).await
+            .context("legacy recovery preview exceeded its admitted deadline")??;
+        resources.record_outcome("shared_ci_vm",Some(audit))?;
+        let quiescence=resources.verified_quiescence()?;
+        let stopped=audit.record_controller_receipt(serde_json::json!({"version":1,"kind":"legacy_recovery_preview_quiescent",
+            "binding":binding,"command":command_id,"proof":quiescence.evidence(),"shipping_authority":false}))?;
+        hold.settle()?;
+        ensure!(output.status.success(),"legacy recovery preview failed: {}",String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(8192)]));
+        let raw=std::fs::read(&result)?;ensure!(raw.len()<=1024*1024,"oversized recovery preview");
+        let value:serde_json::Value=serde_json::from_slice(&raw)?;
+        ensure!(value["kind"]=="ci-legacy-recovery-preview-receipt" && value["command"]==command_id
+            && value["base_before"]==value["base_after"]
+            && value["view"]["base_read_only_verified_before_guest"]==true
+            && ["input_closure_complete","full_ci","shipping_authority"].iter().all(|key|value[*key]==false),
+            "invalid recovery preview evidence");
+        audit.record_controller(serde_json::json!({"version":1,"kind":"legacy_recovery_preview_completed",
+            "binding":binding,"command":command_id,"receipt_sha256":digest(&raw),
+            "quiescence_receipt_sha256":stopped.payload_sha256(),"shipping_authority":false}))?;
+        audit.protected_health()?;
+        Ok(value)
     }
 }

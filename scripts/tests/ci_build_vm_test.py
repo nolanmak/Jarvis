@@ -31,6 +31,16 @@ def kernel_observation(binding,command):
   'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 
 class AdapterTests(unittest.TestCase):
+ def test_read_only_cache_validation_cannot_format_a_missing_image(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);request=self.fixture(root);target=root/'target';(target/'ci-vm').mkdir(parents=True,mode=0o700)
+   self.hold_cache_target(request,target);lease=adapter.InheritedStorage(request['storage'],root/'scratch')
+   image=target/'ci-vm/cache.img'
+   with patch.object(adapter.subprocess,'run') as formatter:
+    with self.assertRaisesRegex(vm.Unavailable,'existing'):adapter.ensure_cache(image,64*1024*1024,lease,allow_create=False)
+    formatter.assert_not_called()
+   self.assertFalse(image.exists())
+
  def test_reopened_lock_descriptions_cannot_borrow_global_or_target_ownership(self):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);request=self.fixture(root)
