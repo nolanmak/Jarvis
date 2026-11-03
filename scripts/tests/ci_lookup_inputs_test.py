@@ -17,6 +17,63 @@ def load(name):
 
 
 class LookupInputTests(unittest.TestCase):
+    def test_descriptor_selection_binds_exact_delivered_stat_without_reading_file_contents(self):
+        import copy
+        views=load('ci_cargo_views');observer=load('ci_cargo_observer')
+        root=self.root/'descriptor';root.mkdir();path=root/'input';path.write_bytes(b'original')
+        path.chmod(0o444);root.chmod(0o555)
+        def index():return self.inputs.FrozenLookupIndex({'generated':('/workspace/generated',root,
+            views.inventory(root,owner=os.getuid(),sealed=True))},owner=os.getuid())
+        original=index();metadata=observer._expected_metadata(path)
+        record={'uid':2004,'pid':101,'tid':102,'syscall':5,'sequence':1,'fd':3,'raw_fd':3,
+            'user_namespace':100,'mount_namespace':50,'vfs_result':0,'result':0,'delivered':True,
+            'stat':dict(metadata,result_mask=2047)}
+        args={'pid':101,'uid':2004,'user_namespace':100,'mount_namespace':50}
+        selected,unbound=original.select_descriptor_subset([record],**args)
+        self.assertEqual(unbound,[]);self.assertEqual(len(selected.record()['queries']),1)
+        query=self.inputs._unwire(selected.record()['queries'])[0]
+        self.assertEqual(query['path'],b'/workspace/generated/input');self.assertEqual(query['metadata'],metadata)
+        restored=self.inputs._ContentSelection.restore(json.loads(json.dumps(selected.record())),original)
+        self.assertEqual(restored.observation,selected.observation)
+        # Unobserved neighbors cannot change a descriptor's delivered fields.
+        root.chmod(0o755);(root/'unread').write_bytes(b'other');(root/'unread').chmod(0o444);root.chmod(0o555)
+        self.assertEqual(restored.refresh(index())['sha256'],selected.observation['sha256'])
+        original=index()
+        kernel_only=copy.deepcopy(record);kernel_only['stat']['result_mask']=4095
+        mask_selected,unsupported=original.select_descriptor_subset([kernel_only],**args)
+        self.assertEqual(unsupported,[]);self.assertEqual(mask_selected.observation,selected.observation)
+        for field in metadata:
+            forged=copy.deepcopy(record);forged['stat'][field]+=1
+            with self.subTest(field=field):
+                refused,unsupported=original.select_descriptor_subset([forged],**args)
+                self.assertEqual(refused.record()['queries'],[]);self.assertEqual(len(unsupported),1)
+        for fault in ('namespace','user-namespace','pid','uid','legacy','failed-copy','failed-vfs','not-delivered','fd','raw-fd'):
+            forged=copy.deepcopy(record)
+            if fault=='namespace':forged['mount_namespace']=51
+            elif fault=='user-namespace':forged['user_namespace']=101
+            elif fault=='pid':forged['pid']=103
+            elif fault=='uid':forged['uid']=2005
+            elif fault=='legacy':forged.pop('mount_namespace')
+            elif fault=='failed-copy':forged.update(result=-14,delivered=False)
+            elif fault=='failed-vfs':forged.update(vfs_result=-9,result=-9,stat=None,delivered=False)
+            elif fault=='not-delivered':forged['delivered']=False
+            elif fault=='fd':forged['fd']=-1
+            else:forged['raw_fd']=4
+            with self.subTest(fault=fault):
+                refused,unsupported=original.select_descriptor_subset([forged],**args)
+                self.assertEqual(refused.record()['queries'],[]);self.assertEqual(len(unsupported),1)
+        with self.assertRaises(self.inputs.FreshnessHold):original.select_descriptor_subset([record,record],**args)
+        aliased=self.inputs.FrozenLookupIndex({name:('/workspace/'+name,path,
+            [['2e','file',*views._read(path,os.getuid(),True)]]) for name in ('one','two')},owner=os.getuid())
+        refused,unsupported=aliased.select_descriptor_subset([record],**args)
+        self.assertEqual(refused.record()['queries'],[]);self.assertEqual(len(unsupported),1)
+        # A newly sealed replacement has different delivered inode/timestamps,
+        # even if its bytes match. Exact metadata relevance must detect that.
+        replacement=self.root/'replacement';replacement.write_bytes(b'original');replacement.chmod(0o444)
+        root.chmod(0o755);os.replace(replacement,path);root.chmod(0o555)
+        self.assertNotEqual(restored.refresh(index())['sha256'],selected.observation['sha256'])
+        self.assertFalse(selected.record()['input_closure_complete']);self.assertFalse(selected.record()['shipping_authority'])
+
     def test_directory_selection_binds_full_original_scan_and_refreshes_membership(self):
         import copy
         views=load('ci_cargo_views')

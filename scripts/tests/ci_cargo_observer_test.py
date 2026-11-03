@@ -200,6 +200,16 @@ class KernelObserverTests(unittest.TestCase):
                 [r.replace('1 0','1 -9') if r.startswith('L ') else r for r in rows]):
             with self.subTest(rows=bad),self.assertRaises(observer.ObservationUnavailable):observer.metadata_queries(bad)
 
+    def test_fstat_namespace_record_keeps_original_mount_namespace_and_legacy_absence(self):
+        rows=['F 2004 101 102 1 3 3','H 2004 101 102 1 3 100 50',
+            'J 2004 101 102 1 7 900 33060 1 0 0 0 6 4096 8 2047',
+            'K 2004 101 102 1 1 2 3 4 5 6','L 2004 101 102 1 0','Z 2004 101 102 1 0']
+        self.assertEqual(observer.metadata_queries(rows)[0]['mount_namespace'],50)
+        self.assertIsNone(observer.metadata_queries([r.replace('3 100 50','3 100') for r in rows])[0]['mount_namespace'])
+        for namespace in ('0','-1','4294967296','50 1'):
+            with self.subTest(namespace=namespace),self.assertRaises(observer.ObservationUnavailable):
+                observer.metadata_queries([r.replace('3 100 50','3 100 '+namespace) for r in rows])
+
     def test_original_directory_cursor_records_rewind_and_refuses_a_false_continuous_scan(self):
         rows=['B 2004 101 101 1 3 24','I 2004 101 101 1 265289728 900 16749 0',
             'D 2004 101 101 1 1 900 4 0 0 1 2e','A 2004 101 101 1 1 1',

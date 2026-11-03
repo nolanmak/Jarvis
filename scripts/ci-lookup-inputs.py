@@ -316,6 +316,16 @@ class LookupCensus:
             for query in queries:
                 if not isinstance(query,dict) or query.get('intent') not in ('read','metadata','directory') or 'device' in query or query.get('descriptor_kind','path')!='path':_hold()
                 syscall=query.get('syscall')
+                if syscall=='fstat':
+                    path=_path(query.get('path'),absolute=True)
+                    resolved,node,error,_selected=self._resolve(path,None)
+                    fields=getattr(self,'_descriptor_metadata',{}).get(resolved) if error is None else None
+                    if error is None and fields is None:_hold()
+                    if require_original_results and (query.get('outcome')!='success' or query.get('result')!=0
+                            or query.get('errno') is not None or error is not None or query.get('metadata')!=fields
+                            or any(type(value) is not int for value in query['metadata'].values())):_hold()
+                    facts.add(('descriptor-metadata',path,error,tuple(sorted(fields.items())) if fields is not None else None))
+                    continue
                 if syscall in ('getdents','getdents64'):
                     path=_path(query.get('directory'),absolute=True)
                     if query.get('outcome')!='success' or not isinstance(query.get('entries'),list) or type(query.get('result')) is not int:_hold()
@@ -403,7 +413,7 @@ class FrozenLookupIndex:
     def __init__(self,namespaces,*,anchors=None,kernel_roots=None,owner,overlays=False,opaque=()):
         spec=importlib.util.spec_from_file_location('lookup_views',Path(__file__).with_name('ci-cargo-views.py'))
         self.views=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.views)
-        self.owner=owner;self._trees=[];self._identities=[];self._bases={};self._objects={}
+        self.owner=owner;self._trees=[];self._identities=[];self._bases={};self._objects={};self._descriptor_objects={};self._object_paths={}
         try:
             if type(owner) is not int or not 0<=owner<2**32 or type(namespaces) is not dict or not 0<len(namespaces)<=64 or type(overlays) is not bool:_hold()
             if type(opaque) not in (list,tuple) or len(opaque)>64:_hold()
@@ -427,6 +437,8 @@ class FrozenLookupIndex:
                     visible.append(row)
                     info=physical.lstat();self._remember(physical,info)
                     self._objects[virtual]=self._object(info)
+                    self._descriptor_objects[virtual]=self._stat_fields(info)
+                    self._object_paths.setdefault(self._object(info),set()).add(virtual)
                     if stat.S_ISDIR(info.st_mode):self._anchor(virtual,physical,info)
                 content[name]=(prefix.decode(),visible)
             anchors={} if anchors is None else anchors
@@ -452,6 +464,7 @@ class FrozenLookupIndex:
                 if key in self._bases and self._bases[key]!=b'/':_hold()
                 self._bases[key]=b'/'
             self.census=LookupCensus.from_inventory(content)
+            self.census._descriptor_metadata=copy.deepcopy(self._descriptor_objects)
             # A mounted subtree can hide otherwise complete source inventory.
             # Route to explicitly frozen descendants, but never infer absence,
             # contents or directory membership from hidden source placeholders.
@@ -468,12 +481,24 @@ class FrozenLookupIndex:
     @staticmethod
     def _object(info):return ((os.major(info.st_dev)<<20)|os.minor(info.st_dev),info.st_ino,info.st_mode)
 
+    @staticmethod
+    def _stat_fields(info):
+        # These are the delivered x86-64 newstat fields in the original initial
+        # user namespace. Kernel-only result_mask is not part of that ABI.
+        result={'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),'inode':info.st_ino,
+            'mode':info.st_mode,'nlink':info.st_nlink,'owner_uid':info.st_uid,'owner_gid':info.st_gid,
+            'rdev':(os.major(info.st_rdev)<<20)|os.minor(info.st_rdev),'size':info.st_size,
+            'blksize':info.st_blksize,'blocks':info.st_blocks}
+        for name,value in (('atime',info.st_atime_ns),('mtime',info.st_mtime_ns),('ctime',info.st_ctime_ns)):
+            result[name+'_sec'],result[name+'_nsec']=divmod(value,10**9)
+        return result
+
     def _inventory(self,root):
         if root.is_file():return [['2e','file',*self.views._read(root,self.owner,True)]]
         return self.views.inventory(root,owner=self.owner,sealed=True)
 
     def _remember(self,path,info):
-        self._identities.append((path,(*self.views._key(info),info.st_nlink,info.st_atime_ns)))
+        self._identities.append((path,(*self.views._key(info),info.st_nlink,info.st_atime_ns),self._stat_fields(info)))
 
     def _anchor(self,virtual,path,info):
         key=self._object(info)
@@ -483,9 +508,10 @@ class FrozenLookupIndex:
     def _verify(self):
         try:
             if any(self._inventory(root)!=rows for root,rows in self._trees):_hold()
-            for path,identity in self._identities:
+            for path,identity,metadata in self._identities:
                 info=path.lstat()
-                if (*self.views._key(info),info.st_nlink,info.st_atime_ns)!=identity:_hold()
+                if ((*self.views._key(info),info.st_nlink,info.st_atime_ns)!=identity
+                        or self._stat_fields(info)!=metadata):_hold()
         except (OSError,ValueError,self.views.FreshnessHold):_hold()
 
     def _metadata_table(self,metadata):
@@ -684,5 +710,38 @@ class FrozenLookupIndex:
             try:following=self._directory_scan(ordered,pid=pid,uid=uid,user_namespace=user_namespace,mount_namespace=mount_namespace)
             except FreshnessHold:unbound.extend({key:event[key] for key in keys} for event in ordered)
             else:queries.extend(following);selected.extend(ordered)
+        self._verify()
+        return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(selected))).hexdigest(),self._layout),unbound
+
+    def _descriptor_query(self,event,*,pid,uid,user_namespace,mount_namespace):
+        try:
+            if (event['pid']!=pid or event['uid']!=uid or event['syscall']!=5
+                    or type(event['tid']) is not int or not 0<event['tid']<2**31
+                    or event['user_namespace']!=user_namespace or event.get('mount_namespace')!=mount_namespace
+                    or type(event['fd']) is not int or not 0<=event['fd']<2**31 or event['raw_fd']!=event['fd']
+                    or event['vfs_result']!=0 or event['result']!=0 or event['delivered'] is not True
+                    or type(event['stat']) is not dict):_hold()
+            fields=event['stat'];identity=tuple(fields[key] for key in ('device','inode','mode'))
+            candidates=self._object_paths.get(identity,set())
+            if len(candidates)!=1:_hold()
+            path=next(iter(candidates));expected=self._descriptor_objects[path]
+            if (set(fields)!=set(expected)|{'result_mask'} or type(fields['result_mask']) is not int
+                    or not 0<=fields['result_mask']<2**32 or any(type(fields[key]) is not int or fields[key]!=value
+                    for key,value in expected.items())):_hold()
+            return {'syscall':'fstat','pid':pid,'path':path,'intent':'metadata','result':0,
+                'outcome':'success','errno':None,'metadata':copy.deepcopy(expected)}
+        except (ValueError,TypeError,KeyError,AttributeError):_hold()
+
+    def select_descriptor_subset(self,events,*,pid,uid,user_namespace,mount_namespace):
+        """Bind successful delivered fstats; failed/unknown descriptors stay explicit."""
+        self._verify()
+        if (type(events) is not list or len(events)>200000
+                or any(type(value) is not int or value<=0 for value in (pid,uid,user_namespace,mount_namespace))):_hold()
+        self._metadata_table(events)  # Repeated original call identities refuse the whole capture.
+        queries=[];selected=[];unbound=[]
+        for event in events:
+            try:query=self._descriptor_query(event,pid=pid,uid=uid,user_namespace=user_namespace,mount_namespace=mount_namespace)
+            except FreshnessHold:unbound.append({key:event[key] for key in ('pid','tid','uid','syscall','sequence')})
+            else:queries.append(query);selected.append(event)
         self._verify()
         return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(selected))).hexdigest(),self._layout),unbound

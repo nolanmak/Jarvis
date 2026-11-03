@@ -1813,6 +1813,29 @@ class _ViewProbe:
             'kernel_namespaces_bound':True,'rewound_scan_unbound':True,'membership_changed_identity':True,
             'input_closure_complete':False,'shipping_authority':False}
 
+    def observe_descriptors(self,events,pid,user_namespace,mount_namespace):
+        if self.owner!=os.getpid() or self.receipt is None:raise FreshnessHold('cleanup_uncertain')
+        original=[event for event in events if event['syscall']==5 and event['uid']==2004 and event['pid']==pid]
+        selected,unbound=self.input_index.select_descriptor_subset(original,pid=pid,uid=2004,
+            user_namespace=user_namespace,mount_namespace=mount_namespace)
+        paths={query['path'] for query in lookup_inputs._unwire(selected.record()['queries'])}
+        if not {b'/workspace/target/deps',b'/workspace/target/deps/raw-\xff'}<=paths:
+            raise FreshnessHold('input_census_unknown')
+        failed=[event for event in original if event['result'] in (-errno.EFAULT,-errno.EBADF)]
+        if (not {-errno.EFAULT,-errno.EBADF}<={event['result'] for event in failed}
+                or not all({key:event[key] for key in ('pid','tid','uid','syscall','sequence')} in unbound for event in failed)):
+            raise FreshnessHold('input_census_unknown')
+        restored=lookup_inputs._ContentSelection.restore(selected.record(),self.input_index)
+        if restored.observation!=selected.observation:raise FreshnessHold('input_census_unknown')
+        replacement=self.root/'selector-descriptor-replacement';self._inputs(replacement,b'OLD')
+        refreshed=selected.refresh(self.lookup_index(replacement))['sha256']
+        if refreshed==selected.observation['sha256']:raise FreshnessHold('input_census_unknown')
+        return {'queries':len(selected.record()['queries']),'unbound_calls':len(unbound),
+            'binding_sha256':selected.binding_sha256,'metadata_sha256':selected.observation['sha256'],
+            'replacement_metadata_sha256':refreshed,'kernel_namespaces_bound':True,
+            'failed_calls_unbound':True,'replacement_metadata_changed':True,
+            'input_closure_complete':False,'shipping_authority':False}
+
     def prepare(self,ordinal,request=None):
         if self.owner!=os.getpid() or ordinal!=4:raise FreshnessHold('invalidation_unsafe')
         self.slot=self.root/'unit';self.slot.mkdir(mode=0o700)
@@ -2080,20 +2103,29 @@ def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,r
                 directories=lookup_inputs._ContentSelection([],before.census.observe([]),
                     hashlib.sha256(lookup_inputs._encoded([])).hexdigest(),before._layout)
             else:directories=lookup_inputs._ContentSelection.restore(directory_record,before)
+            descriptor_record=scope.get('selected_descriptors')
+            if descriptor_record is None:
+                descriptors=lookup_inputs._ContentSelection([],before.census.observe([]),
+                    hashlib.sha256(lookup_inputs._encoded([])).hexdigest(),before._layout)
+            else:descriptors=lookup_inputs._ContentSelection.restore(descriptor_record,before)
             refreshed=selected.refresh(following);refreshed_metadata=metadata.refresh(following)
             refreshed_directories=directories.refresh(following)
+            refreshed_descriptors=descriptors.refresh(following)
             read_changed=refreshed['sha256']!=selected.observation['sha256']
             metadata_changed=refreshed_metadata['sha256']!=metadata.observation['sha256']
             directory_changed=refreshed_directories['sha256']!=directories.observation['sha256']
-            changed=read_changed or metadata_changed or directory_changed
+            descriptor_changed=refreshed_descriptors['sha256']!=descriptors.observation['sha256']
+            changed=read_changed or metadata_changed or directory_changed or descriptor_changed
             fingerprint=scope['mapping']['fingerprint']
             if changed:affected.add(fingerprint)
             observations.append({'source_command':record['command'],'ordinal':scope['ordinal'],
                 'capture_sha256':record_sha,'binding_sha256':selected.binding_sha256,'fingerprint':fingerprint,
-                'previous_sha256':hashlib.sha256(lookup_inputs._encoded([selected.observation['sha256'],metadata.observation['sha256'],directories.observation['sha256']])).hexdigest(),
-                'current_sha256':hashlib.sha256(lookup_inputs._encoded([refreshed['sha256'],refreshed_metadata['sha256'],refreshed_directories['sha256']])).hexdigest(),
+                'previous_sha256':hashlib.sha256(lookup_inputs._encoded([selected.observation['sha256'],metadata.observation['sha256'],directories.observation['sha256'],descriptors.observation['sha256']])).hexdigest(),
+                'current_sha256':hashlib.sha256(lookup_inputs._encoded([refreshed['sha256'],refreshed_metadata['sha256'],refreshed_directories['sha256'],refreshed_descriptors['sha256']])).hexdigest(),
                 'read_relevance_changed':read_changed,'metadata_relevance_changed':metadata_changed,
                 'directory_relevance_changed':directory_changed,
+                'descriptor_relevance_changed':descriptor_changed,'descriptor_binding_sha256':descriptors.binding_sha256,
+                'previous_descriptor_sha256':descriptors.observation['sha256'],'current_descriptor_sha256':refreshed_descriptors['sha256'],
                 'directory_binding_sha256':directories.binding_sha256,
                 'previous_directory_sha256':directories.observation['sha256'],'current_directory_sha256':refreshed_directories['sha256'],
                 'metadata_binding_sha256':metadata.binding_sha256,
@@ -2101,6 +2133,7 @@ def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,r
                 'relevance_changed':changed,'unbound_read_opens':len(scope['unbound_read_opens']),
                 'unbound_metadata_queries':len(scope['unbound_metadata_queries']),
                 'unbound_directory_reads':None if directory_record is None else len(scope['unbound_directory_reads']),
+                'unbound_descriptor_queries':None if descriptor_record is None else len(scope['unbound_descriptor_queries']),
                 'input_closure_complete':False,'shipping_authority':False})
     report={'version':2,'kind':'ci-selected-input-revalidation','binding':lease.binding,'command':lease.command,
         'checkpoint_command':checkpoint['command'],'previous_forests':checkpoint['forests'],'current_forests':refs,
@@ -2155,7 +2188,7 @@ class CommandObservation:
             units.append({'ordinal':ordinal,'pid':pid,'uid':uid,'kind':mapping['kind'],
                 'queries':len(queries),'directory_reads':len(reads),'metadata_queries':len(stats),
                 'source_open_observed':observed})
-            selected=None;unbound=[];selected_metadata=None;unbound_metadata=[];selected_directories=None;unbound_directories=[]
+            selected=None;unbound=[];selected_metadata=None;unbound_metadata=[];selected_directories=None;unbound_directories=[];selected_descriptors=None;unbound_descriptors=[]
             if mapping['kind']=='compile':
                 index=frozen_input_index(executor.source,executor.source_bindings,dict(item,artifact_bindings=mounted[ordinal]))
                 selected,unbound=index.select_read_subset([event for event in queries if event['syscall'] in (2,257,437)
@@ -2169,6 +2202,9 @@ class CommandObservation:
                 selected_directories,unbound_directories=index.select_directory_subset([event for event in reads
                     if event['pid']==pid],pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
                     mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
+                selected_descriptors,unbound_descriptors=index.select_descriptor_subset([event for event in stats
+                    if event['pid']==pid and event['syscall']==5],pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
+                    mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
             scopes.append({'ordinal':ordinal,'pid':pid,'uid':uid,'mapping':{key:mapping[key] for key in ('kind','role','source','fingerprint','request_sha256','dependencies','generated_root') if key in mapping},
                 'artifact_bindings':mounted.get(ordinal,[]),
                 'selected_reads':None if selected is None else selected.record(),'unbound_read_opens':unbound,
@@ -2176,6 +2212,8 @@ class CommandObservation:
                 'unbound_metadata_queries':unbound_metadata,
                 'selected_directories':None if selected_directories is None else selected_directories.record(),
                 'unbound_directory_reads':unbound_directories,
+                'selected_descriptors':None if selected_descriptors is None else selected_descriptors.record(),
+                'unbound_descriptor_queries':unbound_descriptors,
                 'scope_evidence':item['scope_evidence'],'namespaces':item['namespaces'],'root_identity':item['root_identity'],'returncode':item['returncode']})
         if any(event['uid']!=1999 and event['uid'] not in known
                 for event in [*events,*directories,*metadata]):

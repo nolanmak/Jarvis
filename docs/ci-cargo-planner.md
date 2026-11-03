@@ -2119,3 +2119,50 @@ scratch outputs, `/proc/self/maps`, `/proc/self/statm`, the VM overcommit settin
 and rejected `/dev/fd` opens. These require an explicit trusted runtime/output/
 descriptor policy. They are still unbound and grant no compatibility or shipping
 authority.
+
+
+### Original descriptor metadata selections
+
+Successful original `fstat` calls now select their delivered x86-64 newstat
+fields against the exact immutable input object. The existing kernel record
+adds the executing task's mount namespace to its user namespace and descriptor
+identity. Older records retain an explicitly absent mount namespace; they cannot
+be selected as newly bound descriptor evidence.
+
+The frozen index records each visible file/directory's exact mode, inode,
+internal device identity, link count, owner/group, special-device value, size,
+block size/count and nanosecond timestamps. A descriptor call must belong to the
+original supervised process and unit UID, match both original namespaces,
+report a successful VFS lookup and successful syscall delivery, and match every
+one of those fields. Ambiguous input aliases, unknown objects, invalid or failed
+descriptors, failed copies and changed metadata remain unbound. The kernel-only
+`result_mask` is preserved in the raw record but excluded from delivered newstat
+relevance. Descriptor queries do not select file bytes merely because they
+queried metadata.
+
+Original calls and selections persist together in the command capture. Restore
+rechecks the original metadata against the original retained trees; refresh uses
+the corresponding current visible inputs and contributes exact descriptor
+metadata relevance to the existing aggregate digest and affected-fingerprint
+report. A replacement inode with the same bytes is therefore a relevant metadata
+change. This does not establish a metadata-normalization policy or permission to
+reuse across differing delivered fields. Older captures have unknown descriptor
+coverage, rather than zero unresolved descriptor calls. All refresh results keep
+the mandatory incomplete-input hold.
+
+The real-filesystem regression fails against `174c2b7d` because a descriptor-only
+change leaves the affected set empty; it passes with the current implementation
+and preserves the hold and legacy unknown-coverage state. Refusal tests change
+every delivered field, credentials, namespaces, descriptor numbers and copy
+outcomes, and cover duplicate call identities and ambiguous aliases. The existing
+native probe has additional assertions for its unchanged binary-name file and
+directory descriptor calls, retained EFAULT/EBADF calls, selection restoration
+and changed replacement metadata. Its original executable body, argv, streams,
+counters, cleanup and resource limits are unchanged.
+
+**380 Python CI tests pass without skips and 32 focused managed Rust tests
+pass** (20 native opt-ins excluded). Actual native validation of this revision
+is pending. Full runtime/toolchain/output and
+metadata input coverage, opaque producers and bounded publication restart,
+trusted dependency reuse, final C proof/API/audit and consumer/merge enforcement
+remain open. Complete-input/full-CI/shipping flags remain false.

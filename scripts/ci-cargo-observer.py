@@ -488,7 +488,8 @@ def metadata_queries(records,*,complete=True):
         kind=match[1];uid,pid,tid,sequence=map(int,match.groups()[1:5])
         if (not (uid==1999 or 2000<=uid<6096) or pid>=2**31 or tid>=2**31 or sequence>=2**64):
             raise ObservationUnavailable('foreign metadata observation')
-        if re.fullmatch(r'-?[0-9]{1,20}(?: -?[0-9]{1,20}){'+str(counts[kind]-1)+'}',match[6]) is None:
+        count=3 if kind=='H' and len(match[6].split())==3 else counts[kind]
+        if re.fullmatch(r'-?[0-9]{1,20}(?: -?[0-9]{1,20}){'+str(count-1)+'}',match[6]) is None:
             raise ObservationUnavailable('unknown metadata fields')
         values=tuple(map(int,match[6].split()))
         if any(not -2**63<=v<2**64 for v in values):raise ObservationUnavailable('metadata value overflow')
@@ -529,12 +530,15 @@ def metadata_queries(records,*,complete=True):
         if not {'F','H','L','Z'}<=set(pair):
             if complete:raise ObservationUnavailable('incomplete metadata observation')
             continue
-        raw_fd,fd=pair['F'];original_fd,user_namespace=pair['H'];vfs_result,=pair['L'];result,=pair['Z']
+        raw_fd,fd=pair['F'];original_fd,user_namespace=pair['H'][:2];vfs_result,=pair['L'];result,=pair['Z']
+        mount_namespace=pair['H'][2] if len(pair['H'])==3 else None
         if (not 0<=raw_fd<2**64 or not -2**31<=fd<2**31 or fd!=original_fd
                 or fd!=((raw_fd+2**31)%2**32)-2**31 or not 0<user_namespace<2**32
                 or not -4095<=vfs_result<=0 or not -4095<=result<=0
                 or vfs_result<0 and result!=vfs_result):
             raise ObservationUnavailable('metadata syscall binding differs')
+        if mount_namespace is not None and not 0<mount_namespace<2**32:
+            raise ObservationUnavailable('invalid descriptor mount namespace')
         expected={'F','H','J','K','L','Z'} if vfs_result==0 else {'F','H','L','Z'}
         if set(pair)!=expected:
             if complete:raise ObservationUnavailable('metadata result fields unavailable')
@@ -543,7 +547,7 @@ def metadata_queries(records,*,complete=True):
         if vfs_result==0:
             fields=_metadata_fields(pair)
         queries.append({'uid':uid,'pid':pid,'tid':tid,'sequence':sequence,'syscall':5,
-            'raw_fd':raw_fd,'fd':fd,'user_namespace':user_namespace,'vfs_result':vfs_result,
+            'raw_fd':raw_fd,'fd':fd,'user_namespace':user_namespace,'mount_namespace':mount_namespace,'vfs_result':vfs_result,
             'result':result,'stat':fields,'delivered':result==0})
     return queries
 
@@ -836,7 +840,8 @@ kretprobe:filldir6*4 / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[t
 kprobe:vfs*_fstat / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[tid]==5 / {
  @fstat_active[tid]=@sequence[tid]; @fstat_stat[tid]=arg1;
  $task=(struct task_struct *)curtask;
- printf("H %u %u %u %llu %lld %llu\n",uid,pid,tid,@sequence[tid],(int64)(int32)arg0,(uint64)$task->cred->user_ns->ns.inum);
+ printf("H %u %u %u %llu %lld %llu %llu\n",uid,pid,tid,@sequence[tid],(int64)(int32)arg0,
+  (uint64)$task->cred->user_ns->ns.inum,(uint64)$task->nsproxy->mnt_ns->ns.inum);
  @emitted=sum(1);
 }
 kretprobe:vfs*_fstat / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[tid]==5 / {
@@ -1312,6 +1317,7 @@ class Observer:
             raise ObservationUnavailable('original generated input lookup missing')
         content=content_probe.observe_content(events,metadata,unit_pid,self.user_namespace,mount_namespace)
         directory_selection=content_probe.observe_directories(queries,unit_pid,self.user_namespace,mount_namespace)
+        descriptor_selection=content_probe.observe_descriptors(metadata,unit_pid,self.user_namespace,mount_namespace)
         compiler_probe.record_invalidations(events,metadata,self.user_namespace)
         self.report={**self.control,'kernel_release':os.uname().release,'unit_pid':unit_pid,'unit_uid':2004,
             'program_sha256':hashlib.sha256(self.program.encode()).hexdigest(),'binary_sha256':self.binary_sha256,
@@ -1331,6 +1337,7 @@ class Observer:
             'lookup_base_query_observed':True,'lookup_changed_cwd_observed':True,'lookup_invalid_base_observed':True,
             'content_selection':content,
             'directory_selection':directory_selection,
+            'descriptor_selection':descriptor_selection,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'probe_census':census,
             'input_closure_complete':False,'allocation_removed':False}
         if cache._read_record(self.root/'control.json')!=self.control:
@@ -1346,7 +1353,7 @@ def validate(value,binding,command):
         'after_kernel_copy','events','original_observer_cleanup','filesystem_coverage_complete',
         'missed_probe_census_complete','input_closure_complete','allocation_removed',
         'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','probe_census',
-        'binary_path_query_observed','content_selection','directory_selection'}
+        'binary_path_query_observed','content_selection','directory_selection','descriptor_selection'}
     keys|={'directory_reads','directory_entries','directory_witness_observed','binary_directory_name_observed',
         'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed','directory_cursor_query_observed'}
     keys|={'metadata_queries','fstat_query_observed','fstat_invalid_fd_observed','fstat_failed_copy_observed'}
@@ -1395,4 +1402,15 @@ def validate(value,binding,command):
             or any(directories[key] is not True for key in ('kernel_namespaces_bound','rewound_scan_unbound','membership_changed_identity'))
             or directories['input_closure_complete'] is not False or directories['shipping_authority'] is not False):
         raise ObservationUnavailable('bound directory selection unavailable')
+    descriptors=value['descriptor_selection']
+    if (type(descriptors) is not dict or set(descriptors)!={'queries','unbound_calls','binding_sha256','metadata_sha256',
+            'replacement_metadata_sha256','kernel_namespaces_bound','failed_calls_unbound','replacement_metadata_changed',
+            'input_closure_complete','shipping_authority'}
+            or type(descriptors['queries']) is not int or not 2<=descriptors['queries']<=40000
+            or type(descriptors['unbound_calls']) is not int or not 2<=descriptors['unbound_calls']<=40000
+            or any(not cache._digest(descriptors[key]) for key in ('binding_sha256','metadata_sha256','replacement_metadata_sha256'))
+            or descriptors['metadata_sha256']==descriptors['replacement_metadata_sha256']
+            or any(descriptors[key] is not True for key in ('kernel_namespaces_bound','failed_calls_unbound','replacement_metadata_changed'))
+            or descriptors['input_closure_complete'] is not False or descriptors['shipping_authority'] is not False):
+        raise ObservationUnavailable('bound descriptor selection unavailable')
     return value

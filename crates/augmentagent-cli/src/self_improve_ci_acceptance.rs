@@ -137,6 +137,12 @@ pub fn value()->u8{GENERATED}
         && probe["kernel_observation"]["directory_selection"]["queries"].as_u64().is_some_and(|value|value>=5)
         && probe["kernel_observation"]["directory_selection"]["input_closure_complete"]==false
         && probe["kernel_observation"]["directory_selection"]["shipping_authority"]==false
+        && probe["kernel_observation"]["descriptor_selection"]["kernel_namespaces_bound"]==true
+        && probe["kernel_observation"]["descriptor_selection"]["failed_calls_unbound"]==true
+        && probe["kernel_observation"]["descriptor_selection"]["replacement_metadata_changed"]==true
+        && probe["kernel_observation"]["descriptor_selection"]["queries"].as_u64().is_some_and(|value|value>=2)
+        && probe["kernel_observation"]["descriptor_selection"]["input_closure_complete"]==false
+        && probe["kernel_observation"]["descriptor_selection"]["shipping_authority"]==false
         && probe["kernel_observation"]["path_metadata_query_observed"]==true
         && probe["kernel_observation"]["statx_copy_verified"]==true
         && probe["kernel_observation"]["path_metadata_failed_copy_observed"]==true

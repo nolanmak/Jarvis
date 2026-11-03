@@ -70,6 +70,12 @@ class PlannerProtocolTests(unittest.TestCase):
             self.assertEqual(Path(old[1]).read_bytes(),b'compiler artifact')
 
     def test_revalidation_detects_directory_only_change_and_keeps_legacy_coverage_unknown(self):
+        self.assert_selected_revalidation('directory')
+
+    def test_revalidation_detects_descriptor_only_change_and_keeps_legacy_coverage_unknown(self):
+        self.assert_selected_revalidation('descriptor')
+
+    def assert_selected_revalidation(self,kind):
         fixtures=planner._load('directory_revalidation_census','tests/ci_cargo_observer_test.py')
         sample=fixtures.census_sample('all');census={'before':sample,'after':copy.deepcopy(sample)}
         with tempfile.TemporaryDirectory() as directory:
@@ -80,14 +86,15 @@ class PlannerProtocolTests(unittest.TestCase):
             source=root/'source';source.mkdir();(source/'lib.rs').write_bytes(b'unchanged compiler source')
             (source/'lib.rs').chmod(0o444);source.chmod(0o555)
             forests=[]
-            for name,changed in (('old',False),('added',True)):
+            for name,changed in (('old',False),('added',kind=='directory')):
                 forest=root/name;forest.mkdir()
                 if changed:(forest/'added').write_bytes(b'new member');(forest/'added').chmod(0o444)
                 forest.chmod(0o555);raw=b'node_modules/generated'.hex()
                 forests.append([[raw,str(forest),[raw,'tree',planner.unit_views.inventory(forest,owner=os.getuid(),sealed=True)]]])
             old,new=forests;scope={'ordinal':0,'pid':101,'uid':2000,'root_identity':{'device':12,'inode':3456789,'mode':0o40755},
                 'mapping':{'kind':'compile','fingerprint':'debug/.fingerprint/consumer-aaaaaaaaaaaaaaaa'},
-                'artifact_bindings':[],'unbound_read_opens':[],'unbound_metadata_queries':[],'unbound_directory_reads':[]}
+                'artifact_bindings':[],'unbound_read_opens':[],'unbound_metadata_queries':[],
+                'unbound_directory_reads':[],'unbound_descriptor_queries':[]}
             index=planner.frozen_input_index(source,old,scope)
             empty,_=index.select_read_subset([],pid=101,uid=2000,user_namespace=100,mount_namespace=50)
             scope.update(selected_reads=empty.record(),selected_metadata=empty.record())
@@ -101,7 +108,16 @@ class PlannerProtocolTests(unittest.TestCase):
                 'result':48,'entries':entries,'attempts':copy.deepcopy(entries)}
             selected,unbound=index.select_directory_subset([scan,dict(scan,sequence=2,start_position=2,result=0,entries=[],attempts=[])],
                 pid=101,uid=2000,user_namespace=100,mount_namespace=50)
-            self.assertEqual(unbound,[]);scope['selected_directories']=selected.record()
+            self.assertEqual(unbound,[])
+            if kind=='directory':field,unknown,changed_key='selected_directories','unbound_directory_reads','directory_relevance_changed'
+            else:
+                field,unknown,changed_key='selected_descriptors','unbound_descriptor_queries','descriptor_relevance_changed'
+                descriptor={'uid':2000,'pid':101,'tid':102,'syscall':5,'sequence':3,'fd':3,'raw_fd':3,
+                    'user_namespace':100,'mount_namespace':50,'vfs_result':0,'result':0,'delivered':True,
+                    'stat':dict(index._stat_fields(info),result_mask=2047)}
+                selected,unbound=index.select_descriptor_subset([descriptor],pid=101,uid=2000,user_namespace=100,mount_namespace=50)
+                self.assertEqual(unbound,[])
+            scope[field]=selected.record()
             captures=root/'input-observations';captures.mkdir(mode=0o700)
             record={'version':3,'kind':'ci-command-kernel-record','binding':binding,'command':command,'scopes':[scope],
                 'original_observer_cleanup':True,'probe_census':census,'input_closure_complete':False,'shipping_authority':False}
@@ -109,7 +125,7 @@ class PlannerProtocolTests(unittest.TestCase):
             checkpoint={'command':command,'forests':['original-producer']};outputs={'node_modules/generated':'directory'}
             for legacy in (False,True):
                 if legacy:
-                    record['scopes'][0].pop('selected_directories');record['scopes'][0].pop('unbound_directory_reads')
+                    record['scopes'][0].pop(field);record['scopes'][0].pop(unknown)
                     planner.cache._write_record(path,record)
                 lease=SimpleNamespace(binding=binding,command=str(uuid.uuid4()),target=root/'target')
                 with patch.object(planner.GeneratedForests,'load',return_value=(old,{})):
@@ -117,9 +133,9 @@ class PlannerProtocolTests(unittest.TestCase):
                 observation=report['observations'][0]
                 self.assertEqual(report['affected_fingerprints'],[] if legacy else [scope['mapping']['fingerprint']])
                 self.assertFalse(observation['read_relevance_changed']);self.assertFalse(observation['metadata_relevance_changed'])
-                self.assertEqual(observation['directory_relevance_changed'],not legacy)
+                self.assertEqual(observation[changed_key],not legacy)
                 self.assertEqual(observation['relevance_changed'],not legacy)
-                self.assertEqual(observation['unbound_directory_reads'],None if legacy else 0)
+                self.assertEqual(observation[unknown],None if legacy else 0)
                 self.assertEqual(observation['previous_sha256']==observation['current_sha256'],legacy)
                 self.assertEqual(planner.cache._read_record(root/'selected-revalidation'/(lease.command+'.json'),max_bytes=16*1024**2),report)
                 self.assertEqual(report['action'],'hold_for_complete_input_revalidation')
@@ -245,9 +261,16 @@ class PlannerProtocolTests(unittest.TestCase):
             directories=[scan,dict(scan,sequence=6,start_position=3,result=0,entries=[],attempts=[])]
             unknown=copy.deepcopy(scan);unknown.update(sequence=7,fd=8,inode=scan['inode']+1000)
             directories.append(unknown)
+            descriptor={'uid':2000,'pid':101,'tid':102,'syscall':5,'sequence':8,'fd':9,'raw_fd':9,
+                'user_namespace':100,'mount_namespace':50,'vfs_result':0,'result':0,'delivered':True,
+                'stat':dict(planner.lookup_inputs.FrozenLookupIndex._stat_fields(Path(entry[1]).stat()),result_mask=2047)}
+            foreign_descriptor=copy.deepcopy(descriptor);foreign_descriptor.update(sequence=9,fd=10,raw_fd=10)
+            foreign_descriptor['stat']['inode']+=1000
+            failed_copy=copy.deepcopy(descriptor);failed_copy.update(sequence=10,fd=11,raw_fd=11,result=-14,delivered=False)
+            metadata=[descriptor,foreign_descriptor,failed_copy]
             observation=object.__new__(planner.CommandObservation)
             observation.admission=SimpleNamespace(binding=binding,command=command)
-            observation.observer=SimpleNamespace(capture=lambda:(events,directories,[],census),root=root,
+            observation.observer=SimpleNamespace(capture=lambda:(events,directories,metadata,census),root=root,
                 program=planner.kernel_observer.observation_program('all'),binary_sha256='1'*64,user_namespace=100)
             unit={'finished':True,'pid':101,'mapping':{'kind':'compile','role':'library','source':b'/workspace/src/lib.rs',
                 'request_sha256':'2'*64},'namespaces':{'mnt':{'unit':'mnt:[50]'}},
@@ -268,6 +291,10 @@ class PlannerProtocolTests(unittest.TestCase):
             self.assertEqual(record['scopes'][0]['unbound_directory_reads'],[
                 {key:unknown[key] for key in ('pid','tid','uid','syscall','sequence')}])
             self.assertEqual(record['directories'],planner.lookup_inputs._wire(directories))
+            self.assertEqual(summary['units'][0]['metadata_queries'],3)
+            self.assertEqual(len(record['scopes'][0]['selected_descriptors']['queries']),1)
+            self.assertEqual(record['scopes'][0]['unbound_descriptor_queries'],[
+                {key:event[key] for key in ('pid','tid','uid','syscall','sequence')} for event in (foreign_descriptor,failed_copy)])
             self.assertFalse(record['input_closure_complete']);self.assertFalse(record['shipping_authority'])
 
     def test_original_command_capture_persists_unit_scope_and_rejects_foreign_or_missing_source(self):
@@ -1146,6 +1173,9 @@ class PlannerProtocolTests(unittest.TestCase):
             'content_sha256':'2'*64,'unrelated_sha256':'2'*64,'introduced_sha256':'3'*64,
             'kernel_namespaces_bound':True,'rewound_scan_unbound':True,'membership_changed_identity':True,
             'input_closure_complete':False,'shipping_authority':False}
+        value['kernel_observation']['descriptor_selection']={'queries':2,'unbound_calls':2,'binding_sha256':'1'*64,
+            'metadata_sha256':'2'*64,'replacement_metadata_sha256':'3'*64,'kernel_namespaces_bound':True,
+            'failed_calls_unbound':True,'replacement_metadata_changed':True,'input_closure_complete':False,'shipping_authority':False}
         census={'pid':100,'birth':1000,
             'programs':[{'id':i,'type':17 if i in (1,4) else 2,'tag':f'{i:016x}','recursion_misses':0} for i in range(1,5)],
             'links':[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
@@ -1167,7 +1197,9 @@ class PlannerProtocolTests(unittest.TestCase):
                 'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
                 'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat','kernel-statx','kernel-base','kernel-content',
                 'directory-selection-missing','directory-selection-namespace','directory-selection-membership',
-                'directory-selection-rewind','directory-selection-count','directory-selection-authority'):
+                'directory-selection-rewind','directory-selection-count','directory-selection-authority',
+                'descriptor-selection-missing','descriptor-selection-count','descriptor-selection-namespace',
+                'descriptor-selection-replacement','descriptor-selection-failed-copy','descriptor-selection-authority'):
             value=copy.deepcopy(original)
             if fault=='role-credential-missing':value.pop('credential_roles')
             elif fault=='role-credential-false':value['credential_roles']['worker_rejects_planner']=False
@@ -1217,6 +1249,12 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='directory-selection-rewind':value['kernel_observation']['directory_selection']['rewound_scan_unbound']=False
             elif fault=='directory-selection-count':value['kernel_observation']['directory_selection']['queries']=True
             elif fault=='directory-selection-authority':value['kernel_observation']['directory_selection']['shipping_authority']=True
+            elif fault=='descriptor-selection-missing':value['kernel_observation'].pop('descriptor_selection')
+            elif fault=='descriptor-selection-count':value['kernel_observation']['descriptor_selection']['queries']=True
+            elif fault=='descriptor-selection-namespace':value['kernel_observation']['descriptor_selection']['kernel_namespaces_bound']=False
+            elif fault=='descriptor-selection-replacement':value['kernel_observation']['descriptor_selection']['replacement_metadata_sha256']='2'*64
+            elif fault=='descriptor-selection-failed-copy':value['kernel_observation']['descriptor_selection']['failed_calls_unbound']=False
+            elif fault=='descriptor-selection-authority':value['kernel_observation']['descriptor_selection']['shipping_authority']=True
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 
