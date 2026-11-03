@@ -25,7 +25,8 @@ cache=importlib.util.module_from_spec(spec);spec.loader.exec_module(cache)
 MAX_BYTES=4*1024**2
 # Name and result records use separate probes to avoid copying map strings on
 # the BPF exit probe stack. The terminator slot never proves a complete name.
-PATH_BYTES=128
+PATH_BYTES=4096
+CHUNK_BYTES=63
 SYSCALLS={2,4,6,21,89,257,262,267,269,332,439}
 
 
@@ -67,35 +68,49 @@ def decode(data,*,complete=True):
         if record['type']!='printf' or type(record['data']) is not str or not record['data'].endswith('\n'):
             raise ObservationUnavailable('unknown kernel event')
         line=record['data'][:-1]  # Preserve embedded newlines; never reinterpret them as events.
-        match=re.fullmatch(r'([NE]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([0-9]{1,4}) ([1-9][0-9]{0,19}) ([-A-Za-z0-9/._]+)',line)
+        match=re.fullmatch(r'([NE]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([0-9]{1,4}) ([1-9][0-9]{0,19}) (.*)',line)
         if match is None:raise ObservationUnavailable('unknown observation record')
         kind=match[1];uid,pid,tid,call,sequence=map(int,match.groups()[1:6])
         if (pid>=2**31 or tid>=2**31 or call not in SYSCALLS or sequence>=2**64
                 or not (uid==1999 or 2000<=uid<6096)):
             raise ObservationUnavailable('foreign kernel observation')
         pair=pairs.setdefault((uid,pid,tid,call,sequence),{})
-        if kind in pair:raise ObservationUnavailable('duplicate kernel observation')
         if kind=='N':
-            path=match[7].encode()
-            parts=path.split(b'/')
-            if parts[-1]==b'':parts=parts[:-1]
-            if (len(path)>=PATH_BYTES-1 or any(part in (b'',b'.',b'..') for part in parts[1:])
-                    or not (uid==1999 and re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path)
-                        or 2000<=uid<6096 and (path.startswith(b'/workspace/')
-                            or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
-                raise ObservationUnavailable('foreign kernel pathname')
-            pair[kind]=path
+            chunk=re.fullmatch(r'([0-9]{1,4}) ([1-9][0-9]{0,3}) ([A-Za-z0-9/._-]+)',match[7])
+            if chunk is None:raise ObservationUnavailable('unknown pathname chunk')
+            offset,total=int(chunk[1]),int(chunk[2]);data=chunk[3].encode()
+            chunks=pair.setdefault('N',{})
+            if (not 0<=offset<total<PATH_BYTES or offset%CHUNK_BYTES
+                    or len(data)!=min(CHUNK_BYTES,total-offset)
+                    or offset in chunks or pair.get('length',total)!=total):
+                raise ObservationUnavailable('incomplete pathname chunk')
+            pair['length']=total;chunks[offset]=data
         else:
+            if kind in pair:raise ObservationUnavailable('duplicate kernel observation')
             if re.fullmatch(r'-?[0-9]{1,20}',match[7]) is None:raise ObservationUnavailable('unknown syscall result')
             result=int(match[7])
             if not -4095<=result<2**31:raise ObservationUnavailable('unknown syscall result')
             pair[kind]=result
         records+=1
         if len(pairs)>20000 or records>40000:raise ObservationUnavailable('observation limit exceeded')
-    if complete and (count is None or count!=records or not pairs or any(set(pair)!={'N','E'} for pair in pairs.values())):
+    if complete and (count is None or count!=records or not pairs):
         raise ObservationUnavailable('event count unavailable')
-    return [{'uid':uid,'pid':pid,'tid':tid,'syscall':call,'result':pair['E'],'path':pair['N']}
-        for (uid,pid,tid,call,sequence),pair in pairs.items() if set(pair)=={'N','E'}]
+    events=[]
+    for (uid,pid,tid,call,sequence),pair in pairs.items():
+        if (set(pair)!={'N','E','length'}
+                or set(pair['N'])!=set(range(0,pair['length'],CHUNK_BYTES))):
+            if complete:raise ObservationUnavailable('incomplete lookup observation')
+            continue
+        path=b''.join(pair['N'][offset] for offset in range(0,pair['length'],CHUNK_BYTES))
+        parts=path.split(b'/')
+        if parts[-1]==b'':parts=parts[:-1]
+        if (any(part in (b'',b'.',b'..') for part in parts[1:])
+                or not (uid==1999 and re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path)
+                    or 2000<=uid<6096 and (path.startswith(b'/workspace/')
+                        or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
+            raise ObservationUnavailable('foreign kernel pathname')
+        events.append({'uid':uid,'pid':pid,'tid':tid,'syscall':call,'result':pair['E'],'path':path})
+    return events
 
 
 _PROGRAM=r'''
@@ -117,8 +132,15 @@ kretprobe:getname_flags
       ($prefix==0x2e62696c2f637273 && *(uint16 *)($name+8)==0x7372 && *(uint8 *)($name+10)==0) ||
       ($prefix==0x6e69616d2f637273 && *(uint16 *)($name+8)==0x722e && *(uint16 *)($name+10)==0x73) ||
       ($prefix==0x73722e646c697562 && *(uint8 *)($name+8)==0))) {
-  printf("N %u %u %u %lld %llu %s\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],str($name,128));
-  @emitted = count(); @seen[tid] = 1;
+  $length=(uint64)0;
+  while ($length<4096 && *(uint8 *)($name+$length)!=0) { $length=$length+1; }
+  $offset=(uint64)0;
+  while ($offset<$length) {
+   printf("N %u %u %u %lld %llu %llu %llu %s\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],
+    $offset,$length,str($name+$offset,64));
+   @emitted=count(); $offset=$offset+63;
+  }
+  @seen[tid] = 1;
  }
 }
 rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
@@ -128,7 +150,7 @@ rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  }
  delete(@seen[tid]); delete(@number[tid]);
 }
-END { clear(@seen); clear(@sequence); clear(@number); print(@emitted); clear(@emitted); }
+END { clear(@seen); clear(@sequence); clear(@number); }
 '''
 _WITNESS=r'''
 import ctypes,errno,os,sys
@@ -153,7 +175,7 @@ class Observer:
         self.control={'version':1,'kind':'kernel-copied-filename-probe','binding':admission.binding,
             'command':admission.command,'shipping_authority':False}
         cache._write_record(self.root/'control.json',self.control)
-        self.witness='/ci-observer-witness-'+str(uuid.uuid4());self.witness_pid=None
+        self.witness='/ci-observer-witness-'+str(uuid.uuid4())+'-'+'x'*192;self.witness_pid=None
         self.program=_PROGRAM
         self.stdout=self.root/'stdout';self.stderr=self.root/'stderr';self.output=None;self.error=None
         self.report=None
@@ -195,9 +217,9 @@ class Observer:
         finally:os.close(descriptor)
         self.output=self.stdout.open('xb');self.error=self.stderr.open('xb')
         os.chmod(self.stdout,0o600);os.chmod(self.stderr,0o600)
-        self.child=subprocess.Popen([str(binary),'-q','-B','none','-f','json','-e',self.program],
+        self.child=subprocess.Popen([str(binary),'-kk','-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
-            env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':str(PATH_BYTES),'HOME':'/tmp'})
+            env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'','HOME':'/tmp'})
         deadline=min(self.deadline,time.monotonic()+10);origin=os.getpid()
         def drop():
             libc=ctypes.CDLL(None,use_errno=True)

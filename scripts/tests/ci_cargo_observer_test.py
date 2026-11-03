@@ -15,7 +15,8 @@ def frame(kind,data):return (json.dumps({'type':kind,'data':data})+'\n').encode(
 
 
 def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
-    name=frame('printf',f'N {uid} {pid} {tid} {call} {sequence} {path}\n')
+    name=b''.join(frame('printf',f'N {uid} {pid} {tid} {call} {sequence} {offset} {len(path)} {path[offset:offset+63]}\n')
+        for offset in range(0,len(path),63))
     outcome=frame('printf',f'E {uid} {pid} {tid} {call} {sequence} {result}\n')
     return outcome+name if reverse else name+outcome
 
@@ -77,12 +78,23 @@ class KernelObserverTests(unittest.TestCase):
 
     def test_path_at_capture_capacity_cannot_authorize_a_truncated_lookup(self):
         prefix='/workspace/'
-        path=prefix+'x'*(127-len(prefix))
-        data=lookup(2004,101,101,257,1,3,path)+frame('map',{'@emitted':2})
+        path=prefix+'x'*(4096-len(prefix))
+        records=lookup(2004,101,101,257,1,3,path)
+        data=records+frame('map',{'@emitted':len(records.splitlines())})
         with self.assertRaises(observer.ObservationUnavailable):observer.decode(data)
         shorter=path[:-1]
-        self.assertEqual(observer.decode(lookup(2004,101,101,257,1,3,shorter)
-            +frame('map',{'@emitted':2}))[0]['path'],shorter.encode())
+        records=lookup(2004,101,101,257,1,3,shorter)
+        self.assertEqual(observer.decode(records+frame('map',{'@emitted':len(records.splitlines())}))[0]['path'],shorter.encode())
+
+    def test_long_copied_names_require_all_exact_offset_chunks_and_one_result(self):
+        path='/workspace/'+('long-component/'*16)+'generated.rs'
+        records=lookup(2004,101,101,257,100,3,path).splitlines(keepends=True)
+        count=lambda rows: b''.join(rows)+frame('map',{'@emitted':len(rows)})
+        self.assertEqual(observer.decode(count(records[::-1]))[0]['path'],path.encode())
+        for rows in (records[1:],records+records[:1],
+                [records[0].replace(b' 0 ',b' 1 ')]+records[1:],
+                [records[0].replace(path[:63].encode(),path[:62].encode())]+records[1:]):
+            with self.subTest(rows=rows),self.assertRaises(observer.ObservationUnavailable):observer.decode(count(rows))
 
     @unittest.skipIf(os.geteuid()==0,'non-root refusal is exercised by a non-root caller')
     def test_no_host_caller_can_start_the_privileged_kernel_probe(self):
