@@ -848,5 +848,15 @@ actor, multiple reads and EOF. Both original Cargo application runs also
 enumerate their sealed generated empty directory. Original input metadata,
 compiler calls `[3, 0]`, build-script calls `[1, 0]`, distinct unit credentials,
 and original descendant cleanup remain required. Full filesystem coverage,
-input closure, passing CI and shipping authority remain false. Native replay of
-this extension is pending; host decoding checks do not replace it.
+input closure, passing CI and shipping authority remain false. At `c6e542cf`, the real admitted replay passed in **101.82 seconds** on
+`7.0.0-31-generic`. It captured **537 path queries, 150 directory reads and
+3,885 accepted directory entries**, with all eight original attachments and
+programs unchanged and every missed/recursion counter zero. The original
+short-read, binary/255-byte names, EOF and both Cargo application directory
+witnesses passed. Compiler calls remained `[3, 0]`, build scripts `[1, 0]`,
+with two application runs, preserved metadata and original cleanup/allocation
+removal. Sixteen observer tests and 265 CI Python tests (native helpers, no
+skips) passed at `4c0db70b`; 31 focused Rust tests passed at `c6e542cf` with
+15 opt-in cases excluded. Full input closure, passing CI and shipping authority
+remain false. This receipt supersedes the four-attachment evidence for directory
+coverage only; it does not resolve the original invalidation regressions.
