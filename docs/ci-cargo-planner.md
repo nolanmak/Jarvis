@@ -871,5 +871,20 @@ The isolated original unit must open the sealed `raw-\xff` input and query a
 missing pathname containing non-UTF-8, newline and space bytes. The report and
 original Rust VM test require both original syscall outcomes. The captured
 namespace and syscall set remain partial, so complete input coverage and reuse
-or shipping authority remain false. Native validation of this pathname-wire
-extension is pending; the preceding directory receipt validates its own program.
+or shipping authority remain false. At `eff9f4f5`, the admitted VM replay passed in **100.88 seconds** on
+`7.0.0-31-generic`, capturing **539 path queries, 150 directory reads and
+3,885 entries**. Both binary pathname outcomes, the full 4,095-byte lookup, all
+directory witnesses and the unchanged original eight-probe zero-loss census
+passed. Compilers remained `[3, 0]`, build scripts `[1, 0]`, with two application
+runs, preserved metadata and original cleanup/allocation removal. The full
+266-test CI Python suite passed at `8cc37dc2` with native helpers and no skips;
+17 observer tests and 31 focused Rust tests passed at `eff9f4f5` (15 opt-in Rust
+cases excluded).
+
+The initial variable-size buffer inside every pathname-loop iteration exceeded
+the kernel verifier's original 1,000,000-instruction limit. The passing program
+uses fixed 63-byte full chunks and only one bounded variable-size tail. It keeps
+the original capacity, resource limits, strict helper-error handling and final
+counter reconciliation. This proves the bounded binary transport on the pinned
+runtime; descriptor resolution, metadata, complete input closure and actual
+invalidation/reuse authority still require implementation.
