@@ -1019,4 +1019,19 @@ VM, storage, memory and deadline limits remain unchanged.
 This establishes selected original starting-object context only. Generic FD
 lifecycle, arbitrary symlink/mount traversal and complete input closure remain
 unproved; selectors still cannot grant invalidation/reuse, CI or shipping
-authority. Native replay of the lookup-base extension is pending.
+authority.
+
+At `9c7571bf`, the admitted real VM replay passed in **104.14 seconds** on
+`7.0.0-31-generic`. Its protected receipt records **553 copied-name queries
+and 553 original lookup-initialization attempts**, plus 153 directory reads,
+3,890 entries and 748 metadata observations. The same relative pathname
+succeeded from the source root and failed after cwd changed to the dependency
+tree; descriptor-relative and invalid-descriptor cases also matched their
+original kernel bases/outcomes. All sixteen original programs/links and their
+IDs/tags remained unchanged with zero missed/recursion counts. Prior binary
+paths, full length, directory cursor/EOF, metadata copies, compiler `[3, 0]`,
+build scripts `[1, 0]`, two applications, metadata preservation and original
+cleanup/allocation removal passed. The 270-test CI Python suite passed with
+native helpers and no skips; 21 observer tests and 31 focused Rust tests passed
+(15 opt-in Rust cases excluded). Full filesystem/input closure, invalidation,
+passing CI and shipping authority remain false.
