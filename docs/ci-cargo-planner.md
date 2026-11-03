@@ -932,4 +932,17 @@ invalid-fd and null-output-pointer calls; root validation compares the delivered
 metadata with the original sealed inode, and requires EBADF and EFAULT to
 retain their distinct outcomes. The original Rust VM test requires all three.
 This is not statx/general pathname metadata coverage, FD-lifecycle authority,
-a complete input closure or a passing-CI producer. Native replay is pending.
+a complete input closure or a passing-CI producer.
+
+At `54a6b897`, the admitted original VM replay passed in **105.92 seconds** on
+`7.0.0-31-generic`. Its protected receipt records **539 path queries,
+153 directory reads, 3,889 directory entries and 653 fstat observations**.
+The valid-file metadata comparison, invalid descriptor and failed copy all
+passed. All ten original attachments/programs remained unchanged, with every
+missed/recursion counter zero. Every prior binary-path, full-length, directory
+cursor/EOF, real Cargo reuse, metadata and original cleanup assertion passed;
+compiler calls stayed `[3, 0]`, build scripts `[1, 0]`, two applications ran,
+and allocations were removed. The 268-test CI Python suite passed with native
+helpers and no skips; 19 observer tests and 31 focused Rust tests passed
+(15 opt-in Rust cases excluded). Full-filesystem coverage, complete input
+closure, passing CI and shipping authority remain false.
