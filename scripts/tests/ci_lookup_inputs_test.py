@@ -29,6 +29,59 @@ class LookupInputTests(unittest.TestCase):
             'outcome':outcome,'errno':errno,'intent':'read' if syscall=='openat' else 'metadata',
             'arguments':'','result':3 if syscall=='openat' else 0}
 
+    def test_frozen_kernel_base_selects_negative_content_and_refreshes_only_relevant_paths(self):
+        views=load('ci_cargo_views')
+        def tree(name,*,introduced=False,unread=b'one'):
+            root=self.root/name;root.mkdir();(root/'src').mkdir()
+            (root/'src/lib.rs').write_bytes(b'old');(root/'unread').write_bytes(unread)
+            if introduced:(root/'src/main.rs').write_bytes(b'new')
+            for path in root.rglob('*'):path.chmod(0o555 if path.is_dir() else 0o444)
+            root.chmod(0o555);return root
+        original=tree('original');unrelated=tree('unrelated',unread=b'two');changed=tree('changed',introduced=True)
+        def index(root):
+            return self.inputs.FrozenLookupIndex({'generated':('/workspace/target/deps',root,
+                views.inventory(root,owner=os.geteuid(),sealed=True))},owner=os.geteuid())
+        info=original.stat();base={'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),
+            'inode':info.st_ino,'mode':info.st_mode,'flags':256,'path_seq':2,'dentry_seq':2}
+        event={'uid':2004,'pid':101,'tid':101,'syscall':262,'sequence':1,'path':b'src/main.rs','result':-2,
+            'lookup_attempts':[{'dfd':-100,'user_namespace':100,'mount_namespace':50,'init_result':0,'base':base}]}
+        metadata={'uid':2004,'pid':101,'tid':101,'syscall':262,'sequence':1,'path':b'src/main.rs',
+            'fd':-100,'flags':256,'mask':0,'user_namespace':100,'result':-2,'stat':None,'copy_result':None}
+        selected=index(original).select([event],[metadata],pid=101,uid=2004,user_namespace=100,mount_namespace=50)
+        self.assertEqual(selected.observation['sha256'],selected.refresh(index(unrelated))['sha256'])
+        self.assertNotEqual(selected.observation['sha256'],selected.refresh(index(changed))['sha256'])
+        self.assertFalse(selected.observation['input_closure_complete']);self.assertFalse(selected.observation['shipping_authority'])
+        for fault in ('base','namespace','outcome','flags','duplicate'):
+            import copy
+            e=copy.deepcopy(event);m=copy.deepcopy(metadata)
+            if fault=='base':e['lookup_attempts'][0]['base']['inode']+=1<<48
+            elif fault=='namespace':e['lookup_attempts'][0]['mount_namespace']+=1
+            elif fault=='outcome':m['result']=0
+            elif fault=='flags':m['flags']=4096
+            with self.subTest(fault=fault),self.assertRaises(self.inputs.FreshnessHold):
+                index(original).select([e],[m,m] if fault=='duplicate' else [m],pid=101,uid=2004,user_namespace=100,mount_namespace=50)
+
+    def test_frozen_index_keeps_binary_names_detached_records_and_refuses_aliases(self):
+        views=load('ci_cargo_views');root=self.root/'tree';root.mkdir()
+        raw=root/os.fsdecode(b'raw-\xff');raw.write_bytes(b'content');raw.chmod(0o444);root.chmod(0o555)
+        rows=views.inventory(root,owner=os.geteuid(),sealed=True)
+        index=self.inputs.FrozenLookupIndex({'tree':('/workspace/tree',root,rows)},owner=os.geteuid())
+        rows.clear()  # Caller mutation does not replace the captured inventory.
+        info=root.stat();item=raw.stat()
+        event={'uid':2004,'pid':101,'tid':101,'syscall':262,'sequence':1,'path':b'raw-\xff','result':0,
+            'lookup_attempts':[{'dfd':3,'user_namespace':100,'mount_namespace':50,'init_result':0,
+                'base':{'device':(os.major(info.st_dev)<<20)|os.minor(info.st_dev),'inode':info.st_ino,
+                    'mode':info.st_mode,'flags':256,'path_seq':2,'dentry_seq':2}}]}
+        metadata={'uid':2004,'pid':101,'tid':101,'syscall':262,'sequence':1,'path':b'raw-\xff','fd':3,
+            'flags':256,'mask':0,'user_namespace':100,'result':0,'copy_result':0,
+            'stat':{'device':(os.major(item.st_dev)<<20)|os.minor(item.st_dev),'inode':item.st_ino,'mode':item.st_mode}}
+        selected=index.select([event],[metadata],pid=101,uid=2004,user_namespace=100,mount_namespace=50)
+        observed=selected.observation;observed['facts'].clear()
+        self.assertTrue(selected.observation['facts']);self.assertEqual(len(selected.binding_sha256),64)
+        with self.assertRaises(self.inputs.FreshnessHold):
+            self.inputs.FrozenLookupIndex({'tree':('/workspace/tree',root,views.inventory(root,owner=os.geteuid(),sealed=True))},
+                anchors={'/different':root},owner=os.geteuid())
+
     def test_content_change_at_identical_old_mtime_changes_only_a_relevant_identity(self):
         used=self.root/'used.rs';other=self.root/'other.rs'
         used.write_bytes(b'OLD');other.write_bytes(b'other');os.utime(used,ns=(1,1))

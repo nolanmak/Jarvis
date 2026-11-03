@@ -182,6 +182,10 @@ class PlannerProtocolTests(unittest.TestCase):
             directory_cursor_query_observed=True,
             directory_witness_observed=True,binary_directory_name_observed=True,
             directory_short_read_observed=True,directory_eof_observed=True,cargo_directory_queries_observed=True)
+        value['kernel_observation']['content_selection']={'queries':2,'binding_sha256':'1'*64,
+            'content_sha256':'2'*64,'unrelated_sha256':'2'*64,'introduced_sha256':'3'*64,
+            'kernel_bases_bound':True,'unrelated_content_unchanged':True,'negative_lookup_changed_identity':True,
+            'input_closure_complete':False,'shipping_authority':False}
         census={'pid':100,'birth':1000,
             'programs':[{'id':i,'type':17 if i in (1,4) else 2,'tag':f'{i:016x}','recursion_misses':0} for i in range(1,5)],
             'links':[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
@@ -201,7 +205,7 @@ class PlannerProtocolTests(unittest.TestCase):
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
                 'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
                 'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
-                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat','kernel-statx','kernel-base'):
+                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat','kernel-statx','kernel-base','kernel-content'):
             value=copy.deepcopy(original)
             if fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
@@ -241,6 +245,7 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='kernel-fstat':value['kernel_observation']['fstat_failed_copy_observed']=False
             elif fault=='kernel-statx':value['kernel_observation']['statx_copy_verified']=False
             elif fault=='kernel-base':value['kernel_observation']['lookup_changed_cwd_observed']=False
+            elif fault=='kernel-content':value['kernel_observation']['content_selection']['introduced_sha256']='2'*64
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 

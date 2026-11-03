@@ -570,7 +570,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if probe:
             programs=ci_context['planner_programs']
             if (not isinstance(programs,dict) or set(programs)!={'ci-cargo-planner.py','ci-cargo-relay.py',
-                    'ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-cargo-planner.so'}
+                    'ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so'}
                     or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values())):
                 raise Unavailable('invalid measured planner probe bundle')
         dependency=ci_context.get('dependency_action')

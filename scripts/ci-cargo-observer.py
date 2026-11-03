@@ -1125,7 +1125,7 @@ class Observer:
         for stream in (self.output,self.error):
             if stream is not None and not stream.closed:stream.close()
 
-    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest,source_root,mount_namespace):
+    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest,source_root,mount_namespace,content_probe):
         self.stop()
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
@@ -1193,6 +1193,7 @@ class Observer:
         if not any(e['pid']==library_pid and e['uid']==library_uid and e['syscall']==257
                 and e['result']>=0 and e['path'].endswith(b'/out/generated.rs') for e in events):
             raise ObservationUnavailable('original generated input lookup missing')
+        content=content_probe.observe_content(events,metadata,unit_pid,self.user_namespace,mount_namespace)
         self.report={**self.control,'kernel_release':os.uname().release,'unit_pid':unit_pid,'unit_uid':2004,
             'program_sha256':hashlib.sha256(self.program.encode()).hexdigest(),'binary_sha256':self.binary_sha256,
             'witness_observed':True,'positive_query_observed':True,'negative_query_observed':True,'max_path_query_observed':True,
@@ -1209,6 +1210,7 @@ class Observer:
             'path_metadata_failed_copy_observed':True,'path_metadata_lookup_failure_observed':True,
             'lookup_base_attempts':sum(len(e['lookup_attempts']) for e in events),
             'lookup_base_query_observed':True,'lookup_changed_cwd_observed':True,'lookup_invalid_base_observed':True,
+            'content_selection':content,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'probe_census':census,
             'input_closure_complete':False,'allocation_removed':False}
         if cache._read_record(self.root/'control.json')!=self.control:
@@ -1224,7 +1226,7 @@ def validate(value,binding,command):
         'after_kernel_copy','events','original_observer_cleanup','filesystem_coverage_complete',
         'missed_probe_census_complete','input_closure_complete','allocation_removed',
         'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','probe_census',
-        'binary_path_query_observed'}
+        'binary_path_query_observed','content_selection'}
     keys|={'directory_reads','directory_entries','directory_witness_observed','binary_directory_name_observed',
         'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed','directory_cursor_query_observed'}
     keys|={'metadata_queries','fstat_query_observed','fstat_invalid_fd_observed','fstat_failed_copy_observed'}
@@ -1252,4 +1254,13 @@ def validate(value,binding,command):
             or any(value[key] is not False for key in ('shipping_authority','filesystem_coverage_complete','input_closure_complete'))):
         raise ObservationUnavailable('kernel observation is incomplete or foreign')
     validate_census(value['probe_census'])
+    content=value['content_selection']
+    if (type(content) is not dict or set(content)!={'queries','binding_sha256','content_sha256','unrelated_sha256',
+            'introduced_sha256','kernel_bases_bound','unrelated_content_unchanged','negative_lookup_changed_identity',
+            'input_closure_complete','shipping_authority'} or type(content['queries']) is not int or content['queries']!=2
+            or any(not cache._digest(content[key]) for key in ('binding_sha256','content_sha256','unrelated_sha256','introduced_sha256'))
+            or content['content_sha256']!=content['unrelated_sha256'] or content['content_sha256']==content['introduced_sha256']
+            or any(content[key] is not True for key in ('kernel_bases_bound','unrelated_content_unchanged','negative_lookup_changed_identity'))
+            or content['input_closure_complete'] is not False or content['shipping_authority'] is not False):
+        raise ObservationUnavailable('bound content selection unavailable')
     return value

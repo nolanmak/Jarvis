@@ -12,12 +12,13 @@ const WORKER_SCOPE: &[u8] = include_bytes!("../../../scripts/ci-worker-scope.py"
 const INPUT_MANIFEST: &[u8] = include_bytes!("../../../scripts/ci-input-manifest.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
-const PLANNER_PROGRAMS:[(&str,&[u8]);6]=[
+const PLANNER_PROGRAMS:[(&str,&[u8]);7]=[
     ("ci-cargo-planner.py",include_bytes!("../../../scripts/ci-cargo-planner.py")),
     ("ci-cargo-relay.py",include_bytes!("../../../scripts/ci-cargo-relay.py")),
     ("ci-cargo-staging.py",include_bytes!("../../../scripts/ci-cargo-staging.py")),
     ("ci-cargo-views.py",include_bytes!("../../../scripts/ci-cargo-views.py")),
     ("ci-cargo-observer.py",include_bytes!("../../../scripts/ci-cargo-observer.py")),
+    ("ci-lookup-inputs.py",include_bytes!("../../../scripts/ci-lookup-inputs.py")),
     ("ci-cargo-planner.so",include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_planner.so"))),
 ];
 const DEPENDENCY_PROGRAMS:[(&str,&[u8]);7]=[

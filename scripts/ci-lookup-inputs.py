@@ -11,7 +11,10 @@ import base64
 import hashlib
 import importlib.util
 import json
+import copy
+import os
 from pathlib import Path
+import stat
 
 
 _spec=importlib.util.spec_from_file_location('lookup_cache',Path(__file__).with_name('ci-cache-generation.py'))
@@ -36,7 +39,8 @@ def _path(value,*,absolute=False):
 
 def _wire(value):
     if isinstance(value,bytes):return {'bytes_b64':base64.b64encode(value).decode('ascii')}
-    if isinstance(value,tuple):return [_wire(item) for item in value]
+    if isinstance(value,(tuple,list)):return [_wire(item) for item in value]
+    if isinstance(value,dict):return {key:_wire(item) for key,item in value.items()}
     return value
 
 
@@ -84,16 +88,48 @@ class LookupCensus:
                     if path in self._nodes and (kind!='directory' or self._nodes[path]!=node):_hold()
                     self._nodes[path]=node
                 if prefix not in seen or type(snapshot['files']) is not int or type(snapshot['bytes']) is not int or (files,total)!=(snapshot['files'],snapshot['bytes']):_hold()
-            for path in self._nodes:
-                parent=path
-                while parent!=b'/':
-                    parent=parent.rpartition(b'/')[0] or b'/'
-                    if parent not in self._nodes:self._routes.add(parent)
-            for path in self._nodes:
-                parent=path.rpartition(b'/')[0] or b'/'
-                if path not in self._roots and self._nodes.get(parent,('unknown',))[0]!='directory':_hold()
-            if len(self._nodes)>200064:_hold()
+            self._finish_routes()
         except (ValueError,TypeError,UnicodeError,KeyError):_hold()
+
+    @classmethod
+    def from_inventory(cls,namespaces):
+        """Consume bounded detached byte-path inventories, without authority."""
+        value=cls.__new__(cls);value._nodes={};value._roots=set();value._routes=set()
+        try:
+            if type(namespaces) is not dict or not 0<len(namespaces)<=64:_hold()
+            for name,(prefix,rows) in namespaces.items():
+                prefix=_path(prefix.encode(),absolute=True).rstrip(b'/') or b'/'
+                if prefix in value._roots or type(rows) is not list or not 0<len(rows)<=200064 or rows[0][0]!='2e':_hold()
+                value._roots.add(prefix);seen=set()
+                for row in rows:
+                    if type(row) is not list or len(row) not in (3,5) or type(row[0]) is not str:_hold()
+                    relative=bytes.fromhex(row[0])
+                    if relative.hex()!=row[0] or (relative!=b'.' and (relative.startswith(b'/')
+                            or any(part in (b'',b'.',b'..') for part in relative.split(b'/')))):_hold()
+                    path=prefix if relative==b'.' else prefix.rstrip(b'/')+b'/'+relative
+                    _path(path,absolute=True)
+                    if path in seen or type(row[2]) is not int or not 0<=row[2]<=0o7777:_hold()
+                    seen.add(path)
+                    if row[1]=='directory' and len(row)==3:node=('directory',row[2])
+                    elif row[1]=='file' and len(row)==5 and type(row[3]) is int and row[3]>=0 and _cache._digest(row[4]):
+                        node=('file',row[2],row[3],row[4])
+                    else:_hold()
+                    if path in value._nodes and value._nodes[path]!=node:_hold()
+                    value._nodes[path]=node
+                    if len(value._nodes)>200064:_hold()
+            value._finish_routes();return value
+        except (ValueError,TypeError,UnicodeError,KeyError,IndexError,AttributeError):_hold()
+
+    def _finish_routes(self):
+        for path in self._nodes:
+            parent=path
+            while parent!=b'/':
+                parent=parent.rpartition(b'/')[0] or b'/'
+                if parent not in self._nodes:self._routes.add(parent)
+        for path in self._nodes:
+            parent=path.rpartition(b'/')[0] or b'/'
+            if path not in self._roots and self._nodes.get(parent,('unknown',))[0]!='directory':_hold()
+        if len(self._nodes)>200064:_hold()
 
     def _anchor(self,path):
         _path(path)
@@ -196,4 +232,118 @@ class LookupCensus:
             return {'version':1,'kind':'ci-unit-lookup-content-observation',
                 'sha256':hashlib.sha256(_encoded(encoded)).hexdigest(),'facts':encoded,
                 'input_closure_complete':False,'shipping_authority':False}
+        except (ValueError,TypeError,KeyError,AttributeError,UnicodeError):_hold()
+
+
+class _ContentSelection:
+    def __init__(self,queries,observation,binding,layout):
+        self._queries=copy.deepcopy(queries);self._observation=copy.deepcopy(observation)
+        self.binding_sha256=binding;self._layout=layout
+
+    @property
+    def observation(self):return copy.deepcopy(self._observation)
+
+    def refresh(self,index):
+        if type(index) is not FrozenLookupIndex or index._layout!=self._layout:_hold()
+        index._verify()
+        return index.census.observe(self._queries,require_original_results=False)
+
+
+class FrozenLookupIndex:
+    """Bind a selected query subset to controller-frozen literal inventories.
+
+    The caller still establishes original collector/producer authority and
+    quiescence. Neither a root-owned tree nor this index proves complete inputs
+    or grants artifact reuse. Unknown bases and mount aliases are refused.
+    """
+    def __init__(self,namespaces,*,anchors=None,owner):
+        spec=importlib.util.spec_from_file_location('lookup_views',Path(__file__).with_name('ci-cargo-views.py'))
+        self.views=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.views)
+        self.owner=owner;self._trees=[];self._identities=[];self._bases={};self._objects={}
+        try:
+            if type(owner) is not int or not 0<=owner<2**32 or type(namespaces) is not dict or not 0<len(namespaces)<=64:_hold()
+            content={}
+            for name,(prefix,root,rows) in namespaces.items():
+                root=self.views.literal(root);rows=copy.deepcopy(rows)
+                if self.views.inventory(root,owner=owner,sealed=True)!=rows:_hold()
+                prefix=_path(prefix.encode(),absolute=True).rstrip(b'/') or b'/'
+                self._trees.append((root,rows));content[name]=(prefix.decode(),rows)
+                for row in rows:
+                    relative=bytes.fromhex(row[0]);physical=root if relative==b'.' else root/os.fsdecode(relative)
+                    virtual=prefix if relative==b'.' else prefix.rstrip(b'/')+b'/'+relative
+                    info=physical.lstat();self._remember(physical,info)
+                    self._objects[virtual]=self._object(info)
+                    if stat.S_ISDIR(info.st_mode):self._anchor(virtual,physical,info)
+            anchors={} if anchors is None else anchors
+            if type(anchors) is not dict or len(anchors)>64:_hold()
+            for prefix,root in anchors.items():
+                virtual=_path(prefix.encode(),absolute=True).rstrip(b'/') or b'/'
+                root=self.views.literal(root);info=root.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner or stat.S_IMODE(info.st_mode)!=0o555:_hold()
+                self._remember(root,info);self._anchor(virtual,root,info)
+            self.census=LookupCensus.from_inventory(content)
+            if any(virtual not in self.census._nodes and virtual not in self.census._routes for virtual in self._bases.values()):_hold()
+            self._layout=tuple(sorted(self.census._roots));self._verify()
+        except (OSError,ValueError,TypeError,KeyError,UnicodeError,IndexError,AttributeError,self.views.FreshnessHold):_hold()
+
+    @staticmethod
+    def _object(info):return ((os.major(info.st_dev)<<20)|os.minor(info.st_dev),info.st_ino,info.st_mode)
+
+    def _remember(self,path,info):
+        self._identities.append((path,(*self.views._key(info),info.st_nlink,info.st_atime_ns)))
+
+    def _anchor(self,virtual,path,info):
+        key=self._object(info)
+        if key in self._bases and self._bases[key]!=virtual:_hold()
+        self._bases[key]=virtual
+
+    def _verify(self):
+        try:
+            if any(self.views.inventory(root,owner=self.owner,sealed=True)!=rows for root,rows in self._trees):_hold()
+            for path,identity in self._identities:
+                info=path.lstat()
+                if (*self.views._key(info),info.st_nlink,info.st_atime_ns)!=identity:_hold()
+        except (OSError,ValueError,self.views.FreshnessHold):_hold()
+
+    def select(self,events,metadata,*,pid,uid,user_namespace,mount_namespace):
+        self._verify();queries=[];contexts=[]
+        try:
+            if type(events) is not list or not 0<len(events)<=200000 or type(metadata) is not list or len(metadata)>200000:_hold()
+            keys=('uid','pid','tid','syscall','sequence');observed={}
+            for record in metadata:
+                key=tuple(record[k] for k in keys)
+                if key in observed:_hold()
+                observed[key]=record
+            for event in events:
+                if (event['pid']!=event['tid'] or event['pid']!=pid or event['uid']!=uid
+                        or event['syscall'] not in (262,332)):_hold()
+                record=observed.get(tuple(event[k] for k in keys))
+                if (record is None or record['user_namespace']!=user_namespace or record['path']!=event['path']
+                        or record['result']!=event['result'] or type(record['flags']) is not int
+                        or record['flags']&~0x900 or event['result'] not in (0,-2,-20,-40)):_hold()
+                bases=[]
+                for attempt in event['lookup_attempts']:
+                    base=attempt['base']
+                    if (attempt['init_result']!=0 or attempt['user_namespace']!=user_namespace
+                            or attempt['mount_namespace']!=mount_namespace or attempt['dfd']!=record['fd']
+                            or base is None or base['flags']&0x18000000
+                            or base['flags']&256 and (base['path_seq']!=base['dentry_seq'] or base['path_seq']&1)):_hold()
+                    virtual=self._bases.get(tuple(base[k] for k in ('device','inode','mode')))
+                    if virtual is None:_hold()
+                    bases.append(virtual)
+                if not bases or len(set(bases))!=1:_hold()
+                path=_path(event['path']);directory=bases[0]
+                if path.startswith(b'/') and directory!=b'/':_hold()
+                if event['result']==0:
+                    resolved,node,error,_facts=self.census._resolve(path,directory,follow=not record['flags']&256)
+                    if error is not None or record['stat'] is None or self._objects.get(resolved)!=tuple(record['stat'][k] for k in ('device','inode','mode')):_hold()
+                elif record['stat'] is not None or record['copy_result'] is not None:_hold()
+                queries.append({'pid':pid,'syscall':'newfstatat' if event['syscall']==262 else 'statx',
+                    'path':path,'directory':directory,'intent':'metadata','outcome':'success' if event['result']==0 else 'failure',
+                    'errno':{0:None,-2:'ENOENT',-20:'ENOTDIR',-40:'ELOOP'}[event['result']],
+                    'arguments':'AT_SYMLINK_NOFOLLOW' if record['flags']&256 else '', 'result':event['result']})
+                contexts.append((event,record))
+            observation=self.census.observe(queries)
+            binding=hashlib.sha256(_encoded(_wire(contexts))).hexdigest()
+            return _ContentSelection(queries,observation,binding,self._layout)
         except (ValueError,TypeError,KeyError,AttributeError,UnicodeError):_hold()

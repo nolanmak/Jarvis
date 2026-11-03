@@ -93,6 +93,10 @@ pub fn value()->u8{GENERATED}
         && probe["kernel_observation"]["lookup_changed_cwd_observed"]==true
         && probe["kernel_observation"]["lookup_invalid_base_observed"]==true
         && probe["kernel_observation"]["lookup_base_attempts"].as_u64().is_some_and(|value|value>=4)
+        && probe["kernel_observation"]["content_selection"]["kernel_bases_bound"]==true
+        && probe["kernel_observation"]["content_selection"]["unrelated_content_unchanged"]==true
+        && probe["kernel_observation"]["content_selection"]["negative_lookup_changed_identity"]==true
+        && probe["kernel_observation"]["content_selection"]["input_closure_complete"]==false
         && probe["kernel_observation"]["path_metadata_query_observed"]==true
         && probe["kernel_observation"]["statx_copy_verified"]==true
         && probe["kernel_observation"]["path_metadata_failed_copy_observed"]==true

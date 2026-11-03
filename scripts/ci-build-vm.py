@@ -294,7 +294,7 @@ def execute(request,run=vm.run,progress=None):
     if type(probe) is not bool or probe and request['operation']!='repository':raise cache_generation.FreshnessHold('invalidation_unsafe')
     if probe:
         context.update(planner_protocol_probe=True,planner_programs={name:private_bytes(BASE/name) for name in (
-            'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-cargo-planner.so')})
+            'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so')})
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
                 ci_context=context)
     progress['stage']='receipt_validate'

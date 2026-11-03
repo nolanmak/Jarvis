@@ -38,6 +38,8 @@ staging=_load('planner_stdin','ci-cargo-staging.py')
 cache=_load('planner_cache','ci-cache-generation.py')
 unit_views=_load('planner_views','ci-cargo-views.py')
 kernel_observer=_load('planner_kernel_observer','ci-cargo-observer.py')
+lookup_inputs=_load('planner_lookup_inputs','ci-lookup-inputs.py')
+lookup_inputs.FreshnessHold=cache.FreshnessHold
 unit_views.FreshnessHold=cache.FreshnessHold
 import shutil
 FreshnessHold=cache.FreshnessHold
@@ -595,6 +597,7 @@ class _ViewProbe:
         if projected['state']!='sealed' or cache._projection_inventory(self.source,sealed=True)!=projected['entries']:
             raise FreshnessHold('input_census_unknown')
         self.inputs=self.root/'inputs-v1';self._inputs(self.inputs,b'OLD')
+        self.input_index=self.lookup_index(self.inputs)
         self.before=unit_views.inventory(self.inputs,owner=0,sealed=True)
         self.input_stat=(self.inputs/'deps/input').stat()
         self.directory_stats={p:_CargoProbe._stat(p) for p in (self.inputs/'deps',self.inputs/'deps/empty',self.inputs/'deps/cursor',self.inputs/'deps/src')}
@@ -605,16 +608,44 @@ class _ViewProbe:
         if Path('/tmp/ci-unit-probe-private-marker').exists():raise FreshnessHold('invalidation_unsafe')
 
     @staticmethod
-    def _inputs(root,data):
+    def _inputs(root,data,*,unread=b'entry\n',new_module=False):
         root.mkdir(mode=0o700);(root/'deps').mkdir(mode=0o700)
         (root/'deps/input').write_bytes(data);(root/'deps/input').chmod(0o444)
         for name in ('one.rs',os.fsdecode(b'raw-\xff'),'l'*255):
-            (root/'deps'/name).write_bytes(b'entry\n');(root/'deps'/name).chmod(0o444)
+            (root/'deps'/name).write_bytes(unread if name=='one.rs' else b'entry\n');(root/'deps'/name).chmod(0o444)
         (root/'deps/empty').mkdir(mode=0o555)
         (root/'deps/cursor').mkdir(mode=0o555)
         (root/'deps/src').mkdir(mode=0o700);(root/'deps/src/lib.rs').write_bytes(b'entry\n')
+        if new_module:
+            (root/'deps/src/main.rs').write_bytes(b'introduced module\n')
+            (root/'deps/src/main.rs').chmod(0o444);os.utime(root/'deps/src/main.rs',ns=(1,1))
         (root/'deps/src/lib.rs').chmod(0o444);(root/'deps/src').chmod(0o555)
         (root/'deps').chmod(0o555);root.chmod(0o555)
+
+    def lookup_index(self,inputs):
+        source=self.source/'src';generated=inputs/'deps'
+        return lookup_inputs.FrozenLookupIndex({
+            'source':('/workspace/src',source,unit_views.inventory(source,owner=0,sealed=True)),
+            'generated':('/workspace/target/deps',generated,unit_views.inventory(generated,owner=0,sealed=True))},
+            anchors={'/workspace':self.source},owner=0)
+
+    def observe_content(self,events,metadata,pid,user_namespace,mount_namespace):
+        if self.owner!=os.getpid() or self.receipt is None:raise FreshnessHold('cleanup_uncertain')
+        selected=[e for e in events if e['uid']==2004 and e['pid']==e['tid']==pid
+            and e['syscall']==262 and e['path']==b'src/main.rs' and e['result'] in (0,-errno.ENOENT)]
+        if len(selected)!=2:raise FreshnessHold('input_census_unknown')
+        observation=self.input_index.select(selected,metadata,pid=pid,uid=2004,
+            user_namespace=user_namespace,mount_namespace=mount_namespace)
+        unrelated=self.root/'selector-unrelated';self._inputs(unrelated,b'OLD',unread=b'other\n')
+        introduced=self.root/'selector-introduced';self._inputs(introduced,b'OLD',new_module=True)
+        same=observation.refresh(self.lookup_index(unrelated));changed=observation.refresh(self.lookup_index(introduced))
+        original=observation.observation
+        if original['sha256']!=same['sha256'] or original['sha256']==changed['sha256']:
+            raise FreshnessHold('input_census_unknown')
+        return {'queries':len(selected),'binding_sha256':observation.binding_sha256,
+            'content_sha256':original['sha256'],'unrelated_sha256':same['sha256'],'introduced_sha256':changed['sha256'],
+            'kernel_bases_bound':True,'unrelated_content_unchanged':True,'negative_lookup_changed_identity':True,
+            'input_closure_complete':False,'shipping_authority':False}
 
     def prepare(self,ordinal,request=None):
         if self.owner!=os.getpid() or ordinal!=4:raise FreshnessHold('invalidation_unsafe')
@@ -1272,7 +1303,7 @@ def _probe(arguments):
         if item['mapping']['kind']=='application')
     kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor',
         view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'),results[4]['statx_sha256'],view_probe.source,
-        int(view_probe.receipt['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
+        int(view_probe.receipt['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),view_probe)
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],

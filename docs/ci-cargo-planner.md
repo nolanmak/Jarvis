@@ -1035,3 +1035,31 @@ cleanup/allocation removal passed. The 270-test CI Python suite passed with
 native helpers and no skips; 21 observer tests and 31 focused Rust tests passed
 (15 opt-in Rust cases excluded). Full filesystem/input closure, invalidation,
 passing CI and shipping authority remain false.
+
+
+The frozen-view/content bridge connects selected original kernel query records
+to `ci-lookup-inputs.py`. Root creates the index before target execution from
+sealed byte-path inventories, retaining original inode identities and explicit
+virtual prefixes. Routing-only ancestors do not attest unknown neighbors.
+Ambiguous aliases, changed inventories/inodes, foreign namespaces, unsupported
+query flags, unresolved bases and contradictory syscall outcomes remain typed
+input-census prerequisites. Records are detached from caller mutation; binary
+filenames remain byte data. This is not the final shared C input-proof API.
+
+The controlled bridge consumes both original `src/main.rs` queries: success
+from the source root and ENOENT after cwd changes to the dependency tree. It
+requires their actual kernel base, metadata and namespaces rather than a caller
+cwd fallback. The selected content digest is separate from its execution-context
+binding. Root then refreshes the original virtual selectors against two new
+sealed views: changing an unread file must keep the selected content identity,
+while introducing the missing module at an old timestamp must change it. The
+original frozen inputs remain intact. Refresh is a relevance observation, not a
+new execution receipt or permission to replay an artifact.
+
+`ci-lookup-inputs.py` joins the measured private planner bundle and rebuild
+triggers. The original sixteen kernel attachments and all resource/storage
+limits remain unchanged. The original Rust VM acceptance requires the bound
+selector and both content-identity comparisons. Complete input coverage,
+metadata/runtime compatibility, generic Cargo mapping, invalidation/restart,
+passing-CI publication and merge authority remain unfinished. Native replay
+of this bridge is pending.
