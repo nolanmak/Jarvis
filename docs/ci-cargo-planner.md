@@ -230,7 +230,7 @@ descriptors or conflicting flags, and rewrites only the defined descriptor
 numbers to worker FDs 3 and 4. Other environment bytes remain literal. The pipe's
 kernel identity is separate transport evidence, not a semantic compiler input.
 
-Eighteen real pipe/filesystem tests cover these components. The version-3
+Twenty-one real pipe/filesystem tests cover these components. The version-3
 staging-ready/tool-started handshake, pre-start signal handling, root listener,
 credential transition and frozen unit views remain unimplemented. This helper
 does not execute tools, provide a complete input closure or publish CI authority;

@@ -70,6 +70,28 @@ class CargoStagingTests(unittest.TestCase):
                     with self.assertRaises(staging.StagingUnavailable) as seen:self.capture(source.fileno())
                     self.assertEqual(seen.exception.stage_reason,'stdin_limit')
 
+    def test_full_pipe_is_drained_with_backpressure_before_publication(self):
+        reader,writer=os.pipe2(os.O_CLOEXEC);os.set_blocking(writer,False)
+        stopped=threading.Event();errors=[];remaining_bytes=staging.MAX_BYTES
+        def produce():
+            remaining=remaining_bytes
+            try:
+                while remaining and not stopped.is_set():
+                    try:remaining-=os.write(writer,b'\xff'*min(65536,remaining))
+                    except BlockingIOError:stopped.wait(.001)
+            except OSError as error:
+                if not stopped.is_set():errors.append(error)
+            finally:os.close(writer)
+        thread=threading.Thread(target=produce);thread.start()
+        try:
+            with self.capture(reader,seconds=3) as captured:
+                self.assertEqual(captured.observation()['size_bytes'],remaining_bytes)
+                self.assertEqual(captured.observation()['sha256'],hashlib.sha256(b'\xff'*remaining_bytes).hexdigest())
+            self.assertTrue(os.get_blocking(reader))
+        finally:
+            stopped.set();os.close(reader);thread.join(timeout=2)
+        self.assertFalse(thread.is_alive());self.assertEqual(errors,[])
+
     def test_no_eof_cannot_publish_an_input_identity(self):
         with self.assertRaises(staging.StagingUnavailable) as seen:self.capture(self.pipe(b'partial',eof=False),seconds=.04)
         self.assertEqual(seen.exception.stage_reason,'stdin_deadline')
@@ -132,6 +154,21 @@ class CargoStagingTests(unittest.TestCase):
                 staging.capture(reader,self.cancel,command_deadline=value)
         with self.assertRaises(staging.StagingUnavailable):
             staging.capture(reader,reader,command_deadline=time.monotonic()+1)
+        duplicate=os.dup(reader)
+        try:
+            with self.assertRaises(staging.StagingUnavailable):
+                staging.capture(reader,duplicate,command_deadline=time.monotonic()+1)
+        finally:os.close(duplicate)
+
+    def test_replaced_captured_descriptor_cannot_close_an_unrelated_controller_descriptor(self):
+        captured=self.capture(self.pipe(b'bytes'));number=captured.fileno();os.close(number)
+        replacement=os.open('/dev/null',os.O_RDONLY|os.O_CLOEXEC)
+        try:
+            self.assertEqual(replacement,number,'fixture must replace the same descriptor number')
+            with self.assertRaises(staging.StagingUnavailable):captured.fileno()
+            with self.assertRaises(staging.StagingUnavailable):captured.close()
+            self.assertEqual(os.read(replacement,1),b'')
+        finally:os.close(replacement)
 
     def test_already_expired_original_command_cannot_start_staging(self):
         with self.assertRaises(staging.StagingUnavailable) as seen:
@@ -186,6 +223,13 @@ class CargoStagingTests(unittest.TestCase):
                 staging.normalize_jobserver(flags,mapping)
         with tempfile.TemporaryFile() as regular,self.assertRaises(staging.StagingUnavailable):
             staging.normalize_jobserver(flags,{71:first[71],72:regular.fileno()})
+
+    def test_received_jobserver_copies_must_be_cloexec_until_the_controlled_tool_handoff(self):
+        descriptors=self.jobserver();os.set_inheritable(descriptors[71],True)
+        try:
+            with self.assertRaises(staging.StagingUnavailable):
+                staging.normalize_jobserver({b'CARGO_MAKEFLAGS':b'--jobserver-auth=71,72'},descriptors)
+        finally:os.set_inheritable(descriptors[71],False)
 
     def test_no_jobserver_does_not_add_or_reinterpret_any_environment_bytes(self):
         environment={b'RAW':b'\xff\0data',b'MAKEFLAGS':b'-j4'}
