@@ -100,7 +100,7 @@ def preview_command(config,initrd,shares,image,qmp):
 
 
 def validate_guest_result(value):
-    keys={'version','kind','view','protected_before','protected_after','available_before','available_after','retired',
+    keys={'version','kind','view','protected_before','protected_after','available_before','available_after','retired','diagnostic',
         'input_closure_complete','full_ci','shipping_authority'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['kind']!='ci-legacy-recovery-preview' or value['view']!='temporary-writes'
@@ -125,12 +125,13 @@ try:
     cache={};exec(compile(Path('/ci-tools/cache-generation.py').read_bytes(),'/ci-tools/cache-generation.py','exec'),cache)
     job=json.loads(Path('/job.json').read_text());root=Path('/build-cache')
     before=protected_inventory(root);space=os.statvfs(root);available=space.f_bavail*space.f_frsize
+    diagnostic={}
     retired=cache['reclaim_legacy_incremental'](root,job['binding'],job['command'],job['uid'],job['gid'],
-        allow_closed_links=job['allow_closed_links'])
+        allow_closed_links=job['allow_closed_links'],diagnostic=diagnostic)
     after=protected_inventory(root);space=os.statvfs(root)
     result={'version':1,'kind':'ci-legacy-recovery-preview','view':'temporary-writes',
         'protected_before':before,'protected_after':after,'available_before':available,
-        'available_after':space.f_bavail*space.f_frsize,'retired':retired,
+        'available_after':space.f_bavail*space.f_frsize,'retired':retired,'diagnostic':diagnostic,
         'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
 except Exception as error:
     result={'error':'recovery-preview-unavailable','category':type(error).__name__}
@@ -265,6 +266,9 @@ poweroff -f
                     time.sleep(.1)
                 if process.returncode!=0 or cleanup.read_bytes()!=b'all-descendants-reaped\n':raise PreviewUnavailable('preview cleanup not verified')
                 result=validate_guest_result(json.loads((control/'outcome.json').read_bytes()))
+                adapter.cache_generation.validate_legacy_diagnostic(result['diagnostic'],binding,command_id,result['retired'])
+                if result['diagnostic']['policy']!=('closed-links' if allow_closed_links else 'strict-single-link'):
+                    raise PreviewUnavailable('recovery diagnostic policy mismatch')
             finally:
                 if process.poll() is None:process.terminate();process.wait()
                 cleanup_state['safe_to_remove']=cleanup.is_file() and cleanup.read_bytes()==b'all-descendants-reaped\n'

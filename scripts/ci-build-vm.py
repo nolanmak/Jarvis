@@ -371,6 +371,13 @@ def execute(request,run=vm.run,progress=None):
             or any(not cache_generation._uuid(value) for value in reclaimed_legacy)
             or len(set(reclaimed_legacy))!=len(reclaimed_legacy)):
         raise cache_generation.FreshnessHold('cleanup_uncertain')
+    legacy_diagnostic=outcome.get('legacy_incremental_diagnostic')
+    if generation is None:
+        if 'legacy_incremental_diagnostic' not in outcome or legacy_diagnostic is not None:
+            raise cache_generation.FreshnessHold('cleanup_uncertain')
+    else:
+        cache_generation.validate_legacy_diagnostic(legacy_diagnostic,generation['binding'],generation['command'],reclaimed_legacy)
+        if legacy_diagnostic['policy']!='closed-links':raise cache_generation.FreshnessHold('cleanup_uncertain')
     reclaimed_seeds=outcome.get('seed_reclaimed')
     protected_seed=dependency.get('seed') if dependency and dependency.get('kind')=='install' else None
     if (not isinstance(reclaimed_seeds,list) or len(reclaimed_seeds)>2
@@ -392,6 +399,7 @@ def execute(request,run=vm.run,progress=None):
             'producer_reclaimed':reclaimed_producers,
             'seed_reclaimed':reclaimed_seeds,
             'legacy_incremental_reclaimed':reclaimed_legacy,
+            'legacy_incremental_diagnostic':legacy_diagnostic,
             'source_kind':'dependency_inputs' if request['operation']=='dependency' else 'git'}
     if request['operation'] not in ('plan','dependency'):
         try:observed_inputs=input_boundary.validate_observation(outcome.get('input_write_observation'),guest_workers,len(outputs))

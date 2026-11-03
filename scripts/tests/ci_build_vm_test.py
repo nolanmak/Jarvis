@@ -95,6 +95,29 @@ class AdapterTests(unittest.TestCase):
       side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
 
+ def test_legacy_diagnostic_survives_adapter_with_original_binding_and_rejects_forgery(self):
+  for fault in ('none','missing','command','count','authority','unknown'):
+   with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+    root=Path(directory);request=self.fixture(root)
+    request.update(operation='repository',command='true',build_cache=str(root/'registered-image'))
+    sent=[]
+    def execute(*args,**options):
+     result=self.prepared_result(options,exit_code=0,stdout='',stderr='')
+     report=result['legacy_incremental_diagnostic']
+     if fault=='missing':result.pop('legacy_incremental_diagnostic')
+     elif fault=='command':report['command']=str(uuid.uuid4())
+     elif fault=='count':report['inspected_sessions']=True
+     elif fault=='authority':report['shipping_authority']=True
+     elif fault=='unknown':report['private']='unknown contents'
+     sent.append(report.copy());return result
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+     if fault=='none':
+      result=adapter.execute(request,run=execute)
+      self.assertEqual(result['legacy_incremental_diagnostic'],sent[0])
+     else:
+      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+
  def test_internal_probe_flag_is_typed_and_cannot_select_a_root_probe_from_other_operations(self):
   with tempfile.TemporaryDirectory() as directory:
    request=self.fixture(Path(directory))
@@ -232,6 +255,8 @@ class AdapterTests(unittest.TestCase):
   result.setdefault('seed_reclaimed',[])
   result.setdefault('legacy_incremental_reclaimed',[])
   generation=options['ci_context']['generation']
+  result.setdefault('legacy_incremental_diagnostic',adapter.cache_generation.legacy_diagnostic(
+   generation['binding'],generation['command'],allow_closed_links=True))
   result['guest_worker_quiescence']=stopped_workers()
   result['input_write_observation']=observed_inputs(result['guest_worker_quiescence'])
   result['cache_preparation']={'version':1,'binding':dict(generation['binding']),'command':generation['command'],
@@ -308,7 +333,7 @@ class AdapterTests(unittest.TestCase):
     seen.append((argv,options));self.assertIn('--probe-prerequisites',argv);self.assertEqual(environment,{})
     self.assertEqual(options['ci_context']['runner'],b'controller runner');self.assertIsNone(options['timeout'])
     plan={'head':request['head'],'base':request['base'],'contract_sha256':hashlib.sha256(b'{"version":1}').hexdigest(),'checks':[]}
-    return {'exit_code':0,'stdout':json.dumps(plan),'stderr':'','seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers()}
+    return {'exit_code':0,'stdout':json.dumps(plan),'stderr':'','seed_reclaimed':[],'legacy_incremental_reclaimed':[],'legacy_incremental_diagnostic':None,'guest_worker_quiescence':stopped_workers()}
    with patch.object(vm.Runtime,'load',return_value=object()):result=adapter.execute(request,run=execute)
    self.assertEqual(result['status'],'planned');self.assertEqual(len(seen),1)
 
@@ -332,7 +357,9 @@ class AdapterTests(unittest.TestCase):
     seen.append(options)
     self.assertEqual(options['ci_context']['dependency_action']['kind'],'produce')
     self.assertIn('ci-dependency-store.py',options['ci_context']['dependency_programs'])
-    return {'exit_code':0,'stdout':'','stderr':'','cache_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers(),
+    return {'exit_code':0,'stdout':'','stderr':'','cache_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],
+     'legacy_incremental_diagnostic':adapter.cache_generation.legacy_diagnostic(options['ci_context']['generation']['binding'],options['ci_context']['generation']['command'],allow_closed_links=True),
+     'guest_worker_quiescence':stopped_workers(),
      'dependency_result':{'version':1,'kind':'produced','producer':dependency['producer'],
       'command':request['command_id'],'dependency_inputs_sha256':dependency['dependency_inputs_sha256'],
       'shipping_authority':False}}
@@ -347,7 +374,7 @@ class AdapterTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    request=self.fixture(Path(d))
    with patch.object(vm.Runtime,'load',return_value=object()),self.assertRaisesRegex(vm.Unavailable,'binding mismatch'):
-    adapter.execute(request,run=lambda *a,**k:{'exit_code':0,'stdout':'{}','stderr':'','seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers()})
+    adapter.execute(request,run=lambda *a,**k:{'exit_code':0,'stdout':'{}','stderr':'','seed_reclaimed':[],'legacy_incremental_reclaimed':[],'legacy_incremental_diagnostic':None,'guest_worker_quiescence':stopped_workers()})
  def test_real_inherited_lock_not_proc_reopen_and_fd_identity_refusal(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);request=self.fixture(root);lease=adapter.InheritedStorage(request['storage'],root/'scratch');lease.check()
@@ -587,7 +614,7 @@ class BuildVMExtensionTests(unittest.TestCase):
     def __init__(self,argv,**kwargs):
      self.calls=0;self.returncode=None;cleanup=Path(argv[3]);cleanup.write_text('all-descendants-reaped\n')
      result=cleanup.parent/'control/outcome.json';result.write_text(json.dumps({'exit_code':0,'stdout':'finished','stderr':'',
-      'cache_reclaimed':receipt_reclaimed,'producer_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],'guest_worker_quiescence':stopped_workers()}));result.chmod(0o600)
+      'cache_reclaimed':receipt_reclaimed,'producer_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],'legacy_incremental_diagnostic':None,'guest_worker_quiescence':stopped_workers()}));result.chmod(0o600)
     def wait(self,timeout):
      self.calls+=1
      if self.calls<3:raise subprocess.TimeoutExpired('fixture',timeout)

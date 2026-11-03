@@ -80,7 +80,7 @@ sys.stdin.buffer.read(1)
         valid={'version':1,'kind':'ci-legacy-recovery-preview','view':'temporary-writes',
             'protected_before':{'sha256':'a'*64,'files':1,'bytes':3},
             'protected_after':{'sha256':'a'*64,'files':1,'bytes':3},
-            'available_before':1,'available_after':2,'retired':[],
+            'available_before':1,'available_after':2,'retired':[],'diagnostic':{},
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
         preview.validate_guest_result(valid)
         for change in ({'shipping_authority':True},{'full_ci':True},{'input_closure_complete':True},

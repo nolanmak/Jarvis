@@ -1937,3 +1937,38 @@ recovery to production, validate legacy compiled units as current inputs, prove
 the intended application check plan fits, or authorize a merge. The retained-
 scope reporting carrier and ordinary pre-worker opt-in remain unfinished;
 source/proof/merge enforcement and the normal rollout/acceptance gates remain.
+
+### Recovery reporting carrier and worker integration
+
+The normal pre-worker caller now explicitly selects the closed-link policy.
+Cleanup returns its original bounded retirement IDs and fills a cleanup-only
+diagnostic in the same trusted result. The report binds the original command and
+physical cache; it counts inspected/retired/replayed/retained selections, fixed
+retention categories, encountered unknown/unsafe namespaces and reached bounds.
+It neither estimates total retained capacity nor grants reuse/CI authority.
+Planning without a generation/cache carries an explicit null diagnostic.
+
+The existing VM shape and Python adapter carry the report; Python and Rust
+independently reject foreign command/cache bindings, unknown fields, booleans as
+counts, inconsistent accounting, unknown/duplicate bounds and shipping authority.
+After verified command quiescence, Rust records it through the existing protected
+controller audit with the source binding, physical cache and original teardown
+receipt. The preview uses the same report with its explicitly chosen reference
+or closed-link policy. No new cleanup journal, allocator or shipping proof exists.
+
+Review also closed two reporting blind spots: a full *valid completed* history
+retains new selections and reports `history_records`, while malformed/oversized
+history or unfinished replay still hold; unknown/unsafe namespace observations
+trigger a separate admitted diagnosis without following or deleting those data.
+Removed unpublished envelopes release their history slots in the same attempt,
+and completed replay does not consume a second slot for an existing record.
+Real-filesystem red/green tests cover both slot calculations and report limits.
+The updated independent review of S26/S42/S46 found no remaining quoted seam
+defects at source/test-review level. Routine validation for this carrier revision
+passes **370 Python CI tests without skips and 32 focused managed Rust tests**
+(20 opt-in native cases excluded). The separate VM shape suite passes 14 cases
+with six VM/runtime cases excluded. Native carrier validation remains pending.
+The earlier native capacity result at
+`c88829e3` is not presented as a run of this later executable. Production remains
+unchanged; final C proof, real-plan sufficiency, M enforcement and rollout gates
+remain open.

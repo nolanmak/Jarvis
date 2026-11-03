@@ -250,6 +250,8 @@ pub(super) struct Outcome {
     #[serde(default)]
     pub legacy_incremental_reclaimed: Vec<String>,
     #[serde(default)]
+    legacy_incremental_diagnostic:Option<serde_json::Value>,
+    #[serde(default)]
     pub dependency_result: Option<serde_json::Value>,
     #[serde(default)]
     source_kind:Option<String>,
@@ -925,6 +927,21 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             output.status.success() == matches!(outcome.status.as_str(), "passed" | "planned" | "seed_produced" | "seed_published" | "seed_lookup"),
             "{PREREQUISITE}: VM process/receipt status mismatch"
         );
+        if operation=="plan" {
+            ensure!(outcome.legacy_incremental_diagnostic.is_none(),"{PREREQUISITE}: planner reported cache cleanup");
+        } else {
+            let cache_identity=self.cache_identity()?;
+            if !legacy_diagnostic_matches(outcome.legacy_incremental_diagnostic.as_ref(),&command_id,
+                &cache_identity,outcome.legacy_incremental_reclaimed.len(),true) {
+                return Err(crate::autoship_freshness::Hold::parse(&serde_json::json!({
+                    "version":1,"reason":"cleanup_uncertain","recovery":"await_verified_cleanup",
+                    "evidence_sha256":digest(&serde_json::to_vec(&outcome.legacy_incremental_diagnostic)?)})).into());
+            }
+            audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_legacy_incremental_diagnostic","version":1,
+                "binding":binding,"command":command_id,"diagnostic":outcome.legacy_incremental_diagnostic,
+                "physical_cache_sha256":cache_identity,"quiescence_receipt_sha256":quiescence_sha256,
+                "shipping_authority":false}))?;
+        }
         if !outcome.legacy_incremental_reclaimed.is_empty() {
             audit.record_controller_receipt(serde_json::json!({"kind":"shared_ci_legacy_incremental_reclaimed","version":1,
                 "binding":binding,"command":command_id,"retirement_ids":outcome.legacy_incremental_reclaimed,
@@ -1005,9 +1022,69 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
     }
 }
 
+fn legacy_diagnostic_matches(value:Option<&serde_json::Value>,command:&str,cache:&str,retired:usize,closed:bool)->bool {
+    let Some(value)=value else{return false;};
+    let Some(object)=value.as_object() else{return false;};
+    let keys=["version","kind","command","cache_identity_sha256","policy","inspected_sessions","retained_sessions",
+        "retired_sessions","replayed_sessions","unrecognized_entries","unsafe_namespaces","retention","bounds","shipping_authority"];
+    if object.len()!=keys.len() || keys.iter().any(|key|!object.contains_key(*key))
+        || value["version"].as_u64()!=Some(1) || value["kind"]!="ci-legacy-incremental-diagnostic"
+        || value["command"]!=command || value["cache_identity_sha256"]!=cache || value["policy"]!=if closed {"closed-links"}else{"strict-single-link"}
+        || value["shipping_authority"]!=false {return false;}
+    let mut counts=[0_u64;4];
+    for (index,(name,limit)) in [("inspected_sessions",256),("retained_sessions",256),("retired_sessions",32),("replayed_sessions",32)].iter().enumerate() {
+        let Some(count)=value[*name].as_u64() else{return false;};
+        if count>*limit {return false;} counts[index]=count;
+    }
+    let [inspected,retained,completed,replayed]=counts;
+    if completed!=retired as u64 || replayed>completed || inspected!=retained+completed-replayed {return false;}
+    if !value["unrecognized_entries"].as_u64().is_some_and(|count|count<=1<<22)
+        || !value["unsafe_namespaces"].as_u64().is_some_and(|count|count<=4096) {return false;}
+    let Some(reasons)=value["retention"].as_object() else{return false;};
+    let mut total=0;
+    for name in ["unsafe_session","unclosed_links","lock_unavailable","bounded"] {
+        let Some(count)=reasons.get(name).and_then(serde_json::Value::as_u64) else{return false;};
+        if count>256 {return false;} total+=count;
+    }
+    if reasons.len()!=4 || total!=retained {return false;}
+    let Some(bounds)=value["bounds"].as_array() else{return false;};
+    let mut previous=None;
+    for bound in bounds {
+        let Some(bound)=bound.as_str() else{return false;};
+        if !["session_candidates","session_files","census_entries","record_bytes","attempt_retirements","unit_entries","unit_directories","history_records"].contains(&bound)
+            || previous.is_some_and(|prior|prior>=bound) {return false;}
+        previous=Some(bound);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_cleanup_diagnostic_requires_original_binding_bounded_counts_and_no_authority() {
+        let command=uuid::Uuid::new_v4().to_string();let cache="a".repeat(64);
+        let valid=serde_json::json!({"version":1,"kind":"ci-legacy-incremental-diagnostic","command":command,
+            "cache_identity_sha256":cache,"policy":"closed-links","inspected_sessions":3,
+            "retained_sessions":2,"retired_sessions":1,"replayed_sessions":0,
+            "unrecognized_entries":0,"unsafe_namespaces":0,
+            "retention":{"unsafe_session":1,"unclosed_links":1,"lock_unavailable":0,"bounded":0},
+            "bounds":[],"shipping_authority":false});
+        assert!(legacy_diagnostic_matches(Some(&valid),&command,&cache,1,true));
+        assert!(!legacy_diagnostic_matches(None,&command,&cache,1,true));
+        for (name,value) in [("command",serde_json::json!(uuid::Uuid::new_v4().to_string())),
+            ("cache_identity_sha256",serde_json::json!("b".repeat(64))),("version",serde_json::json!(true)),
+            ("inspected_sessions",serde_json::json!(true)),("retained_sessions",serde_json::json!(257)),
+            ("retired_sessions",serde_json::json!(0)),("replayed_sessions",serde_json::json!(2)),
+            ("unrecognized_entries",serde_json::json!(true)),("unsafe_namespaces",serde_json::json!(4097)),
+            ("shipping_authority",serde_json::json!(true)),("policy",serde_json::json!("strict-single-link")),
+            ("bounds",serde_json::json!(["unknown"])),("bounds",serde_json::json!(["record_bytes","record_bytes"])),
+            ("private",serde_json::json!("unknown fields"))] {
+            let mut forged=valid.clone();forged[name]=value;
+            assert!(!legacy_diagnostic_matches(Some(&forged),&command,&cache,1,true),"{name}");
+        }
+    }
 
     #[test]
     fn incomplete_or_foreign_input_capture_never_classifies_as_source_pass_or_failure() {
@@ -1383,6 +1460,9 @@ impl Session {
             && value["view"]["base_read_only_verified_before_guest"]==true
             && ["input_closure_complete","full_ci","shipping_authority"].iter().all(|key|value[*key]==false),
             "invalid recovery preview evidence");
+        let retired=value["outcome"]["retired"].as_array().context("missing preview retirement IDs")?;
+        ensure!(legacy_diagnostic_matches(value["outcome"].get("diagnostic"),&command_id,
+            &self.cache_identity()?,retired.len(),allow_closed_links),"invalid preview cleanup diagnostic");
         audit.record_controller(serde_json::json!({"version":1,"kind":"legacy_recovery_preview_completed",
             "binding":binding,"command":command_id,"receipt_sha256":digest(&raw),
             "quiescence_receipt_sha256":stopped.payload_sha256(),"shipping_authority":false}))?;

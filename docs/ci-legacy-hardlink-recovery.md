@@ -8,9 +8,10 @@ admission/dispatch, normal main/updater rollout, original workflows, Discord
 commands/sessions/updates, and the full unattended/soak/merge acceptance remain open.
 
 Current implementation: opt-in mechanism and same-base native capacity comparison
-passed at `c88829e3`; normal-worker opt-in and the retained-scope reporting carrier
-are unfinished. The 57-seam review is complete with the reporting gate explicitly
-open. This component is not ready for production handoff.
+passed at `c88829e3`. The normal-worker opt-in and retained-scope reporting carrier
+are implemented locally and awaiting managed Rust/native validation and review.
+The prior 57-seam review is complete; the changed reporting interfaces require
+review against this revision. This component is not ready for production handoff.
 
 ## Evidence and premise
 
@@ -172,6 +173,59 @@ Python adapter and Rust audit. One ID still represents one session. No duplicate
 allocator, parallel journal or new shipping proof is introduced. Original
 accounting, reservations, owner holds, image capacity and resource policy remain.
 
+The existing guest result carries `legacy_incremental_diagnostic`: `null` only
+for planning that has no generation/cache, otherwise a strict version-1
+`ci-legacy-incremental-diagnostic` object. Its fields are `version`, `kind`,
+`command` (the original v4 UUID), `cache_identity_sha256` (the original physical
+cache binding), `policy` (`strict-single-link` or `closed-links`),
+`inspected_sessions`, `retained_sessions`, `retired_sessions`,
+`replayed_sessions`, `unrecognized_entries`, `unsafe_namespaces`, `retention`,
+`bounds`, and `shipping_authority:false`.
+The counters describe observed selection attempts in the recognized cleanup
+scope, not a total inventory of unknown cache data or a free-space estimate.
+
+`inspected_sessions` counts new session selections attempted, excluding replay;
+`retired_sessions` equals the returned ID count, including completed replay;
+`replayed_sessions` counts IDs completed from original pending intent. The
+`retention` object has exactly four counters: `unsafe_session`, `unclosed_links`,
+`lock_unavailable`, `bounded`. Each unsuccessful attempted selection increments
+one counter. Their sum equals `retained_sessions`, and
+`inspected_sessions = retained_sessions + retired_sessions - replayed_sessions`.
+Selection/retention counters are integers 0–256; retirement/replay counters are
+0–32. Booleans are not integers. `bounds` is a sorted unique list drawn from
+`session_candidates`, `session_files`, `census_entries`, `record_bytes`,
+`attempt_retirements`, `unit_entries`, `unit_directories`, `history_records`. A reached bound can
+leave uninspected scope; the report does not estimate its size.
+After all existing history has been validated/settled, a full valid 512-record
+history retains new selections and reports `history_records`; it does not invent
+new history slots or reset completed records. Malformed/over-bound existing
+history and unfinished replay remain typed holds with no successful result.
+
+`unrecognized_entries` counts encountered names outside supported unit/session
+or session-lock patterns within the bounded lists already read. It is an integer
+0–2^22, derived from the two profile lists and at most 1,024 units/profile with
+at most 1,025 observed entries/unit. `unsafe_namespaces` counts encountered known
+target/profile/unit namespaces whose ownership/type/mode/xattr validation or
+enumeration fails, except absent optional profiles; it is an integer 0–4,096.
+Neither counter follows or deletes unknown objects. A positive value in either
+counter triggers R's separately admitted read-only diagnosis; their values are
+observed entry/namespace counts, not distinct inodes, total retained bytes or
+proof that uninspected namespaces are safe.
+
+The Python adapter requires and validates this object against the original
+generation/command and retirement IDs, then forwards it in its existing result.
+The ordinary pre-worker caller explicitly selects `closed-links`; its adapter and
+Rust consumer reject a different policy. Rust independently validates the exact
+shape, enum/count constraints, command and physical cache binding, then records
+the diagnostic through the existing protected controller audit with the original
+source binding and verified command-quiescence receipt. ID acknowledgement and
+diagnostic are separate fields of one result, not competing cleanup journals.
+The preview carries the same diagnostic, allowing its explicit strict reference
+policy; both its Python controller and Rust boundary validate the actual selected
+policy. A malformed/missing normal diagnostic is a cleanup infrastructure hold.
+Error/unknown-teardown paths retain their existing typed hold and durable intent;
+they do not emit a successful diagnostic or authorize workers.
+
 D9. Repeat strict-single-link and closed-link policies on the same immutable
 production base under one original storage admission, in separate temporary-write
 views. Both use the current trusted controller; do not call the strict selection
@@ -249,13 +303,9 @@ reviewed extension can handle them; their carrying cost is explicit lost capacit
 not an implicit authorization to prune. Final C API/audit and M/rollout ownership
 remain as defined by #1807 and are not discharged by this amendment.
 
-R also owns the still-open retained-scope reporting handoff (S26/S46). Before
-production activation, define and carry bounded inspected/retained counts,
-categorized exclusions and reached bounds through the trusted command/audit
-result, with the original command/base binding. Current ID-only acknowledgements
-and available-byte observations do not provide that diagnostic. A capacity
-rehearsal with low gain or a reached bound triggers this work; until its consumer
-is implemented, use a separately admitted read-only R diagnostic and keep the
-reporting/activation gate open. Do not infer retained scope from logical bytes or
-retirement count. This open thread blocks production handoff, not opt-in mechanism
-testing.
+R owns validation and review of the D8 retained-scope reporting carrier (S26/S46).
+The local implementation is not yet native-validated or independently reviewed.
+That gate blocks production handoff. Low capacity gain, a reached bound or unsafe
+unknown namespaces trigger a separately admitted read-only R diagnostic when the
+bounded selection counters cannot explain all retained data. Do not infer total
+retained scope from logical bytes, selection counters or retirement count.

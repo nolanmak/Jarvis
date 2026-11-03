@@ -18,6 +18,7 @@ class SnapshotValidationTests(unittest.TestCase):
         ordinary={'exit_code':0,'stdout':'','stderr':''}
         projection={'version':1,'kind':'ci-git-source-projection'}
         result={**ordinary,'cache_reclaimed':[],'producer_reclaimed':[],'seed_reclaimed':[],'legacy_incremental_reclaimed':[],
+            'legacy_incremental_diagnostic':{},
             'guest_worker_quiescence':{},'cache_preparation':{},'input_write_observation':{},
             'source_projection':projection}
         vm.validate_result_shape(result,{})

@@ -101,6 +101,81 @@ class LegacyIncrementalTests(unittest.TestCase):
     def test_closed_link_policy_requires_boolean(self):
         with self.assertRaises(cache.FreshnessHold):self.reclaim(allow_closed_links=1)
 
+    def test_diagnostic_binds_observed_selection_and_retention_to_original_command(self):
+        peer,_=self.linked_peer();report={}
+        os.link(self.session/'0123456789abcdef.o',self.artifact.parent/'foreign.o')
+        self.assertEqual(self.reclaim(allow_closed_links=True,diagnostic=report),[])
+        self.assertEqual(report['command'],self.command)
+        self.assertEqual(report['cache_identity_sha256'],self.binding['cache_identity_sha256'])
+        self.assertEqual(report['inspected_sessions'],2);self.assertEqual(report['retained_sessions'],2)
+        self.assertEqual(report['retention']['unclosed_links'],2);self.assertEqual(report['retired_sessions'],0)
+        (self.artifact.parent/'foreign.o').unlink()
+        ids=self.reclaim(allow_closed_links=True,diagnostic=report)
+        self.assertEqual(len(ids),2);self.assertEqual(report['retired_sessions'],2)
+        self.assertEqual(report['retained_sessions'],0);self.assertEqual(report['bounds'],[])
+        cache.validate_legacy_diagnostic(report,self.binding,self.command,ids)
+
+    def test_recovery_diagnostic_reports_record_bound_without_retiring_anything(self):
+        self.linked_peer();report={}
+        with patch.object(cache,'_LEGACY_MAX_RECORD',1):
+            self.assertEqual(self.reclaim(allow_closed_links=True,diagnostic=report),[])
+        self.assertEqual(report['bounds'],['record_bytes'])
+        self.assertEqual(report['retention']['bounded'],2)
+        self.assertEqual(report['retained_sessions'],2)
+
+    def test_recovery_diagnostic_reports_file_limit_and_busy_peer_without_losing_closure(self):
+        peer,lock=self.linked_peer();report={}
+        with patch.object(cache,'_LEGACY_MAX_FILES',1):
+            self.assertEqual(self.reclaim(allow_closed_links=True,diagnostic=report),[])
+        self.assertEqual(report['bounds'],['session_files'])
+        self.assertEqual(report['retention']['bounded'],1)
+        self.assertEqual(report['retention']['unclosed_links'],1)
+        descriptor=os.open(lock,os.O_RDONLY);fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:self.assertEqual(self.reclaim(allow_closed_links=True,diagnostic=report),[])
+        finally:os.close(descriptor)
+        self.assertEqual(report['retention']['lock_unavailable'],1)
+        self.assertEqual(report['retention']['unclosed_links'],1)
+        self.assertTrue(self.session.exists());self.assertTrue(peer.exists())
+
+    def test_full_valid_history_retains_new_selection_and_reports_capacity_limit(self):
+        peer,_=self.linked_peer();report={}
+        with patch.object(cache,'_LEGACY_MAX_RETIREMENTS',1):
+            self.assertEqual(len(self.reclaim(allow_closed_links=True,limit=1)),1)
+            self.assertEqual(self.reclaim(allow_closed_links=True,diagnostic=report),[])
+        self.assertTrue(peer.exists());self.assertEqual(report['bounds'],['history_records'])
+        self.assertEqual(report['retention']['bounded'],1)
+
+    def test_reconciled_empty_envelope_releases_its_history_slot_in_same_attempt(self):
+        with patch.object(cache,'_LEGACY_MAX_RETIREMENTS',1):
+            with patch.object(cache,'_write_record',side_effect=OSError(errno.ENOSPC,'full')):
+                with self.assertRaises(OSError):self.reclaim(allow_closed_links=True)
+            self.assertEqual(len(self.reclaim(allow_closed_links=True)),1)
+
+    def test_replayed_existing_record_is_not_charged_as_an_additional_history_slot(self):
+        peer,_,_,_=self.linked_intent();report={}
+        with patch.object(cache,'_LEGACY_MAX_RETIREMENTS',2):
+            ids=self.reclaim(allow_closed_links=True,diagnostic=report)
+        self.assertEqual(len(ids),2);self.assertFalse(peer.exists())
+        self.assertEqual(report['replayed_sessions'],1);self.assertEqual(report['retired_sessions'],2)
+        self.assertEqual(report['inspected_sessions'],1);self.assertEqual(report['bounds'],[])
+
+    def test_unrecognized_entries_and_unsafe_namespaces_are_observed_without_deletion(self):
+        unknown=self.incremental/'alien';unknown.mkdir(mode=0o755)
+        nested=self.unit/'unknown-subtree';nested.mkdir(mode=0o755)
+        unsafe=self.incremental/'unsafe-abcdef';unsafe.mkdir();unsafe.chmod(0o777)
+        report={};self.assertEqual(len(self.reclaim(allow_closed_links=True,diagnostic=report)),1)
+        self.assertEqual(report['unrecognized_entries'],2);self.assertEqual(report['unsafe_namespaces'],1)
+        self.assertTrue(unknown.exists());self.assertTrue(nested.exists());self.assertTrue(unsafe.exists())
+
+    def test_diagnostic_validator_rejects_wrong_binding_counts_and_authority(self):
+        report={};ids=self.reclaim(diagnostic=report)
+        cache.validate_legacy_diagnostic(report,self.binding,self.command,ids)
+        for change in ({'command':str(uuid.uuid4())},{'cache_identity_sha256':'f'*64},
+                {'retired_sessions':True},{'retired_sessions':0},{'shipping_authority':True},
+                {'bounds':['unknown']},{'private':'unbounded contents'}):
+            with self.subTest(change=change),self.assertRaises(cache.FreshnessHold):
+                cache.validate_legacy_diagnostic(report|change,self.binding,self.command,ids)
+
     def test_strict_selection_retains_its_original_lock_through_intent(self):
         original=cache._write_record
         def inspect(path,record):
@@ -183,7 +258,10 @@ class LegacyIncrementalTests(unittest.TestCase):
             session=self.unit/('s-abcdef-p'+str(index)+'-0123456789');session.mkdir(mode=0o755)
             (self.unit/('s-abcdef-p'+str(index)+'.lock')).touch(mode=0o600)
             os.link(self.session/'0123456789abcdef.o',session/'0123456789abcdef.o')
-        self.assertEqual(len(self.reclaim(allow_closed_links=True)),32)
+        report={}
+        self.assertEqual(len(self.reclaim(allow_closed_links=True,diagnostic=report)),32)
+        self.assertEqual(report['inspected_sessions'],32);self.assertEqual(report['retired_sessions'],32)
+        self.assertEqual(report['retained_sessions'],0);self.assertEqual(report['bounds'],['attempt_retirements'])
         self.assertEqual(len(self.reclaim(allow_closed_links=True)),9)
         self.assertEqual(self.artifact.read_bytes(),b'compatible compiled artifact')
 

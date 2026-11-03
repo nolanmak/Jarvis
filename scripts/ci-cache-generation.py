@@ -944,11 +944,17 @@ def _legacy_directory(path,worker,device):
     return _legacy_identity(info)
 
 
+class _LegacyFileLimit(FreshnessHold):
+    def __init__(self):
+        super().__init__('invalidation_unsafe');self.legacy_bound='session_files'
+
+
 def _legacy_files(path,worker,device,*,allow_links=False):
     import itertools
     rows=[]
     for child in itertools.islice(path.iterdir(),_LEGACY_MAX_FILES+1):
-        if (len(rows)>=_LEGACY_MAX_FILES or child.name not in ('dep-graph.bin','query-cache.bin','work-products.bin','metadata.rmeta')
+        if len(rows)>=_LEGACY_MAX_FILES:raise _LegacyFileLimit()
+        if (child.name not in ('dep-graph.bin','query-cache.bin','work-products.bin','metadata.rmeta')
                 and re.fullmatch(r'[a-z0-9]{1,64}\.o',child.name) is None):
             raise FreshnessHold('invalidation_unsafe')
         info=child.lstat()
@@ -1215,10 +1221,58 @@ def _finish_linked_legacy_retirement(cache,allocation,record,*,held_locks=None):
         raise FreshnessHold('cleanup_uncertain') from None
 
 
-def _reclaim_closed_legacy_unit(cache,unit,sessions,binding,command,worker,root_identity,chain,retired,limit,record_slots):
+_LEGACY_DIAGNOSTIC_BOUNDS={'session_candidates','session_files','census_entries','record_bytes','attempt_retirements',
+    'unit_entries','unit_directories','history_records'}
+_LEGACY_RETENTION_REASONS={'unsafe_session','unclosed_links','lock_unavailable','bounded'}
+
+
+def legacy_diagnostic(binding,command,*,allow_closed_links):
+    validate_binding(binding)
+    if not _uuid(command) or type(allow_closed_links) is not bool:raise FreshnessHold('cleanup_uncertain')
+    return {'version':1,'kind':'ci-legacy-incremental-diagnostic','command':command,
+        'cache_identity_sha256':binding['cache_identity_sha256'],
+        'policy':'closed-links' if allow_closed_links else 'strict-single-link',
+        'inspected_sessions':0,'retained_sessions':0,'retired_sessions':0,'replayed_sessions':0,
+        'unrecognized_entries':0,'unsafe_namespaces':0,
+        'retention':{name:0 for name in sorted(_LEGACY_RETENTION_REASONS)},'bounds':[],
+        'shipping_authority':False}
+
+
+def validate_legacy_diagnostic(value,binding,command,retired):
+    try:
+        expected=set(legacy_diagnostic(binding,command,allow_closed_links=False))
+        if (type(value) is not dict or set(value)!=expected or type(value['version']) is not int or value['version']!=1
+                or value['kind']!='ci-legacy-incremental-diagnostic' or value['command']!=command
+                or value['cache_identity_sha256']!=binding['cache_identity_sha256']
+                or value['policy'] not in ('strict-single-link','closed-links') or value['shipping_authority'] is not False):raise ValueError()
+        for name,limit in (('inspected_sessions',256),('retained_sessions',256),('retired_sessions',32),('replayed_sessions',32),
+                ('unrecognized_entries',2**22),('unsafe_namespaces',4096)):
+            if type(value[name]) is not int or not 0<=value[name]<=limit:raise ValueError()
+        if (type(value['retention']) is not dict or set(value['retention'])!=_LEGACY_RETENTION_REASONS
+                or any(type(v) is not int or not 0<=v<=256 for v in value['retention'].values())
+                or sum(value['retention'].values())!=value['retained_sessions']
+                or value['replayed_sessions']>value['retired_sessions']
+                or value['retired_sessions']!=len(retired)
+                or value['inspected_sessions']!=value['retained_sessions']+value['retired_sessions']-value['replayed_sessions']
+                or type(value['bounds']) is not list or any(type(v) is not str or v not in _LEGACY_DIAGNOSTIC_BOUNDS for v in value['bounds'])
+                or value['bounds']!=sorted(set(value['bounds']))):raise ValueError()
+    except (KeyError,TypeError,ValueError):raise FreshnessHold('cleanup_uncertain') from None
+    return value
+
+
+def _legacy_bound(diagnostic,name):
+    diagnostic['bounds']=sorted(set(diagnostic['bounds'])|{name})
+
+
+def _legacy_retained(diagnostic,reason,*,bound=None):
+    diagnostic['retained_sessions']+=1;diagnostic['retention'][reason]+=1
+    if bound is not None:_legacy_bound(diagnostic,bound)
+
+
+def _reclaim_closed_legacy_unit(cache,unit,sessions,binding,command,worker,root_identity,chain,retired,limit,record_slots,diagnostic):
     import contextlib
     candidates=[p for p in sessions if re.fullmatch(_LEGACY_SESSION,p.name)]
-    if len(candidates)>256:return []
+    if len(candidates)>256:_legacy_bound(diagnostic,'session_candidates');return []
     reclaimed=[];device=root_identity[0]
     with contextlib.ExitStack() as owned:
         locks={}
@@ -1229,8 +1283,9 @@ def _reclaim_closed_legacy_unit(cache,unit,sessions,binding,command,worker,root_
             except (OSError,FreshnessHold):continue
             owned.callback(os.close,descriptor);locks[lock]=descriptor
         for session in candidates:
-            if len(reclaimed)>=limit:break
-            inventory={};total=0
+            if len(reclaimed)>=limit:_legacy_bound(diagnostic,'attempt_retirements');break
+            diagnostic['inspected_sessions']+=1
+            inventory={};unavailable={};total=0
             for peer in candidates:
                 if not peer.exists():continue
                 lock=_legacy_lock_path(peer)
@@ -1239,15 +1294,22 @@ def _reclaim_closed_legacy_unit(cache,unit,sessions,binding,command,worker,root_
                     if _legacy_lock_identity(os.fstat(locks[lock]))!=_legacy_lock_identity(lock.lstat()):continue
                     _legacy_directory(peer,worker,device)
                     rows=_legacy_files(peer,worker,device,allow_links=True)
-                except (OSError,FreshnessHold):continue
+                except (OSError,FreshnessHold) as error:
+                    if getattr(error,'legacy_bound',None)=='session_files':
+                        _legacy_bound(diagnostic,'session_files');unavailable[peer]='bounded'
+                    continue
                 total+=len(rows)
-                if total>65536:return reclaimed
+                if total>65536:
+                    _legacy_retained(diagnostic,'bounded',bound='census_entries');return reclaimed
                 inventory[peer]=rows
-            if session not in inventory:continue
+            if session not in inventory:
+                reason='lock_unavailable' if _legacy_lock_path(session) not in locks else unavailable.get(session,'unsafe_session')
+                _legacy_retained(diagnostic,reason);continue
             try:links=_legacy_link_scope(cache,session,inventory,worker,device)
-            except (OSError,FreshnessHold):continue
-            if links is None:continue
-            if len(reclaimed)>=record_slots:raise FreshnessHold('cleanup_uncertain')
+            except (OSError,FreshnessHold):_legacy_retained(diagnostic,'unsafe_session');continue
+            if links is None:_legacy_retained(diagnostic,'unclosed_links');continue
+            if len(reclaimed)>=record_slots:
+                _legacy_retained(diagnostic,'bounded',bound='history_records');continue
             files=inventory[session]
             record={'version':2 if links else 1,'kind':'ci-legacy-incremental-retirement','state':'retiring',
                 'binding':binding,'command':command,'relative':str(session.relative_to(cache)),
@@ -1255,7 +1317,8 @@ def _reclaim_closed_legacy_unit(cache,unit,sessions,binding,command,worker,root_
                 'session':_legacy_directory(session,worker,device),'files':files,
                 'bytes':sum(row[7] for row in files),'shipping_authority':False}
             if links:record['links']=links
-            if len(json.dumps(record).encode())>_LEGACY_MAX_RECORD:continue
+            if len(json.dumps(record).encode())>_LEGACY_MAX_RECORD:
+                _legacy_retained(diagnostic,'bounded',bound='record_bytes');continue
             _validate_legacy_retirement(record,binding)
             _directory(retired,0o700,create=True)
             identity=str(uuid.uuid4());allocation=retired/identity;allocation.mkdir(mode=0o700)
@@ -1296,7 +1359,18 @@ def _legacy_settle_envelope(allocation,*,unpublished=False):
     finally:os.close(fd)
 
 
-def reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,limit=32,allow_closed_links=False):
+def reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,limit=32,allow_closed_links=False,diagnostic=None):
+    if diagnostic is not None and type(diagnostic) is not dict:raise FreshnessHold('cleanup_uncertain')
+    if diagnostic is None:diagnostic={}
+    diagnostic.clear();diagnostic.update(legacy_diagnostic(binding,command,allow_closed_links=allow_closed_links))
+    retired=_reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,
+        limit=limit,allow_closed_links=allow_closed_links,diagnostic=diagnostic)
+    diagnostic['retired_sessions']=len(retired)
+    validate_legacy_diagnostic(diagnostic,binding,command,retired)
+    return retired
+
+
+def _reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,limit,allow_closed_links,diagnostic):
     """Retire recognized derived sessions under original exclusive admission.
 
     The privileged guest caller must already hold the original registered image
@@ -1333,6 +1407,7 @@ def reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,lim
             _legacy_settle_envelope(allocation)
             if record['state']=='retiring':
                 _finish_legacy_retirement(cache,allocation,record);reclaimed.append(allocation.name)
+                diagnostic['replayed_sessions']+=1
                 if len(reclaimed)>=limit:
                     for pending in sorted(allocations)[ordinal+1:]:
                         if not _uuid(pending.name):raise FreshnessHold('cleanup_uncertain')
@@ -1342,49 +1417,65 @@ def reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,lim
                         if later['state']=='retiring':raise FreshnessHold('cleanup_uncertain')
                     return reclaimed
     else:allocations=[]
+    # Reconciled unpublished envelopes no longer consume persisted history.
+    allocations=[allocation for allocation in allocations if allocation.exists()]
     target=cache/'target'
     if not target.exists() and not target.is_symlink():return reclaimed
     try:target_identity=_legacy_directory(target,worker,root_identity[0])
-    except (OSError,FreshnessHold):return reclaimed
+    except (OSError,FreshnessHold):diagnostic['unsafe_namespaces']+=1;return reclaimed
     inspected=0
     for profile in ('debug','release'):
         incremental=target/profile/'incremental'
         try:
             chain=[target_identity,*[_legacy_directory(path,worker,root_identity[0]) for path in (target/profile,incremental)]]
-            units=sorted(itertools.islice(incremental.iterdir(),1024))
-        except (OSError,FreshnessHold):continue
+            units=sorted(itertools.islice(incremental.iterdir(),1025))
+        except FileNotFoundError:continue
+        except (OSError,FreshnessHold):diagnostic['unsafe_namespaces']+=1;continue
+        if len(units)>1024:_legacy_bound(diagnostic,'unit_directories');units=units[:1024]
         for unit in units:
-            if re.fullmatch(_LEGACY_UNIT,unit.name) is None:continue
+            if re.fullmatch(_LEGACY_UNIT,unit.name) is None:diagnostic['unrecognized_entries']+=1;continue
             try:
                 unit_identity=_legacy_directory(unit,worker,root_identity[0])
                 sessions=sorted(itertools.islice(unit.iterdir(),1025))
-            except (OSError,FreshnessHold):continue
+            except (OSError,FreshnessHold):diagnostic['unsafe_namespaces']+=1;continue
+            diagnostic['unrecognized_entries']+=sum(re.fullmatch(_LEGACY_SESSION,p.name) is None
+                and re.fullmatch(r's-[a-z0-9]{1,32}-[a-z0-9]{1,32}\.lock',p.name) is None for p in sessions)
             if allow_closed_links:
                 candidates=sum(re.fullmatch(_LEGACY_SESSION,p.name) is not None for p in sessions)
-                if len(sessions)>1024 or candidates>256:continue
-                if inspected+candidates>256 or len(reclaimed)>=limit:return reclaimed
+                if len(sessions)>1024:_legacy_bound(diagnostic,'unit_entries');continue
+                if candidates>256:_legacy_bound(diagnostic,'session_candidates');continue
+                if inspected+candidates>256:_legacy_bound(diagnostic,'session_candidates');return reclaimed
+                if len(reclaimed)>=limit:_legacy_bound(diagnostic,'attempt_retirements');return reclaimed
                 inspected+=candidates
                 reclaimed.extend(_reclaim_closed_legacy_unit(cache,unit,sessions,binding,command,worker,root_identity,
-                    [*chain,unit_identity],retired,limit-len(reclaimed),_LEGACY_MAX_RETIREMENTS-len(allocations)-len(reclaimed)))
+                    [*chain,unit_identity],retired,limit-len(reclaimed),
+                    _LEGACY_MAX_RETIREMENTS-len(allocations)-(len(reclaimed)-diagnostic['replayed_sessions']),diagnostic))
                 continue
             for session in sessions:
                 if re.fullmatch(_LEGACY_SESSION,session.name) is None:continue
-                if inspected>=256:return reclaimed
+                if inspected>=256:_legacy_bound(diagnostic,'session_candidates');return reclaimed
+                if len(reclaimed)>=limit:_legacy_bound(diagnostic,'attempt_retirements');return reclaimed
                 inspected+=1
-                if len(reclaimed)>=limit:return reclaimed
-                if len(allocations)+len(reclaimed)>=_LEGACY_MAX_RETIREMENTS:raise FreshnessHold('cleanup_uncertain')
+                diagnostic['inspected_sessions']+=1
+                if len(allocations)+len(reclaimed)-diagnostic['replayed_sessions']>=_LEGACY_MAX_RETIREMENTS:
+                    _legacy_retained(diagnostic,'bounded',bound='history_records');continue
                 lock=_legacy_lock_path(session)
                 try:descriptor=_legacy_lock(lock,worker,root_identity[0])
-                except (OSError,FreshnessHold):continue
+                except (OSError,FreshnessHold):_legacy_retained(diagnostic,'lock_unavailable');continue
                 try:
                     try:
                         session_identity=_legacy_directory(session,worker,root_identity[0]);files=_legacy_files(session,worker,root_identity[0])
-                    except (OSError,FreshnessHold):continue
+                    except (OSError,FreshnessHold) as error:
+                        if getattr(error,'legacy_bound',None)=='session_files':
+                            _legacy_retained(diagnostic,'bounded',bound='session_files')
+                        else:_legacy_retained(diagnostic,'unsafe_session')
+                        continue
                     record={'version':1,'kind':'ci-legacy-incremental-retirement','state':'retiring','binding':binding,
                         'command':command,'relative':str(session.relative_to(cache)),'worker':worker,'root':root_identity,
                         'chain':[*chain,unit_identity],'session':session_identity,'files':files,
                         'bytes':sum(row[7] for row in files),'shipping_authority':False}
-                    if len(json.dumps(record).encode())>_LEGACY_MAX_RECORD:continue
+                    if len(json.dumps(record).encode())>_LEGACY_MAX_RECORD:
+                        _legacy_retained(diagnostic,'bounded',bound='record_bytes');continue
                     _directory(retired,0o700,create=True)
                     identity=str(uuid.uuid4());allocation=retired/identity;allocation.mkdir(mode=0o700)
                     # Persist both namespace ancestors before committing intent.

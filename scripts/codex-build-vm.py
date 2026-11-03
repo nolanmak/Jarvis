@@ -396,6 +396,8 @@ try:
     producer_reclaimed=[]
     seed_reclaimed=[]
     legacy_incremental_reclaimed=[]
+    legacy_incremental_diagnostic=(ci_cache['legacy_diagnostic'](job['ci_generation']['binding'],
+        job['ci_generation']['command'],allow_closed_links=True) if job.get('ci_generation') else None)
     dependency_result=None
     cache_preparation=None
     source_projection=None
@@ -405,7 +407,8 @@ try:
         guest_stage='reclaim_legacy_incremental'
         if os.geteuid()!=0 or guest_worker_receipts:raise ci_cache['FreshnessHold']('cleanup_uncertain')
         legacy_incremental_reclaimed=ci_cache['reclaim_legacy_incremental']('/build-cache',
-            job['ci_generation']['binding'],job['ci_generation']['command'],uid,gid)
+            job['ci_generation']['binding'],job['ci_generation']['command'],uid,gid,
+            allow_closed_links=True,diagnostic=legacy_incremental_diagnostic)
         guest_stage='reclaim_producers'
         producer_reclaimed=ci_dependency.store.reclaim_producers('/build-cache',job['ci_generation']['retained_producers'],
             cache_identity=job['ci_generation']['binding']['cache_identity_sha256'],eligible=job['ci_generation']['producer_retirements'])
@@ -496,6 +499,7 @@ try:
         result['producer_reclaimed']=producer_reclaimed
         result['seed_reclaimed']=seed_reclaimed
         result['legacy_incremental_reclaimed']=legacy_incremental_reclaimed
+        result['legacy_incremental_diagnostic']=legacy_incremental_diagnostic
         result['guest_worker_quiescence']={'version':1,'kind':'ci-guest-command-quiescence',
             'worker_free':True,'scopes':guest_worker_receipts,'shipping_authority':False}
     if dependency_result is not None:result['dependency_result']=dependency_result
@@ -527,7 +531,7 @@ BUILD_CACHE_MOUNT = '/build-cache'
 
 
 def validate_result_shape(result,ci_context):
-    expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','legacy_incremental_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
+    expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','legacy_incremental_reclaimed','legacy_incremental_diagnostic','guest_worker_quiescence'} if ci_context is not None else set())
     if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
     if ci_context is not None:
         for field in ('cache_preparation','input_write_observation','source_projection'):
