@@ -14,10 +14,8 @@
 //! - `autonomous_plans` / `autonomous_steps` — exactly the D11 columns.
 //! - `email_sender_auth` — D12 carrier for Gmail-direct inbound mail.
 
-#[allow(unused_imports)] // stub phase
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
-#[allow(unused_imports)] // stub phase
 use crate::{Store, StoreError, StoreResult};
 
 /// Rolling window for the per-contact daily cap (D9).
@@ -265,90 +263,252 @@ pub struct StepRow {
     pub updated_at: i64,
 }
 
+const PLAN_COLS: &str = "id, idem_key, contact_slug, tier, inbound_message_id, thread_key, action_id, \
+     plan_json, status, notice_status, notice_message_id, created_at, updated_at";
+const STEP_COLS: &str = "id, plan_id, seq, kind, target_handle, account, event_ref, payload_json, \
+     status, undo_json, created_at, updated_at";
+
+fn bad_text(col: usize, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        col,
+        rusqlite::types::Type::Text,
+        format!("unknown status `{value}`").into(),
+    )
+}
+
+fn plan_row(r: &rusqlite::Row) -> rusqlite::Result<PlanRow> {
+    let status: String = r.get(8)?;
+    let notice: String = r.get(9)?;
+    Ok(PlanRow {
+        id: r.get(0)?,
+        idem_key: r.get(1)?,
+        contact_slug: r.get(2)?,
+        tier: r.get(3)?,
+        inbound_message_id: r.get(4)?,
+        thread_key: r.get(5)?,
+        action_id: r.get(6)?,
+        plan_json: r.get(7)?,
+        status: PlanStatus::parse(&status).ok_or_else(|| bad_text(8, &status))?,
+        notice_status: NoticeStatus::parse(&notice).ok_or_else(|| bad_text(9, &notice))?,
+        notice_message_id: r.get(10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+    })
+}
+
+fn step_row(r: &rusqlite::Row) -> rusqlite::Result<StepRow> {
+    let status: String = r.get(8)?;
+    Ok(StepRow {
+        id: r.get(0)?,
+        plan_id: r.get(1)?,
+        seq: r.get(2)?,
+        kind: r.get(3)?,
+        target_handle: r.get(4)?,
+        account: r.get(5)?,
+        event_ref: r.get(6)?,
+        payload_json: r.get(7)?,
+        status: StepStatus::parse(&status).ok_or_else(|| bad_text(8, &status))?,
+        undo_json: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+    })
+}
+
+fn plans_where(c: &Connection, clause: &str, args: impl rusqlite::Params) -> rusqlite::Result<Vec<PlanRow>> {
+    let mut stmt = c.prepare(&format!("SELECT {PLAN_COLS} FROM autonomous_plans WHERE {clause}"))?;
+    let rows = stmt.query_map(args, plan_row)?;
+    rows.collect()
+}
+
+/// `IN (...)` list of the cap-counted statuses, as SQL literals (fixed
+/// strings from [`PlanStatus::as_str`], never user input).
+fn cap_status_sql() -> String {
+    CAP_COUNTED_PLAN_STATUSES
+        .iter()
+        .map(|s| format!("'{}'", s.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn cap_count(c: &Connection, contact_slug: &str, now_ms: i64) -> rusqlite::Result<i64> {
+    c.query_row(
+        &format!(
+            "SELECT count(*) FROM autonomous_plans
+              WHERE contact_slug = ?1 AND created_at > ?2 AND status IN ({})",
+            cap_status_sql()
+        ),
+        params![contact_slug, now_ms - DAILY_CAP_WINDOW_MS],
+        |r| r.get(0),
+    )
+}
+
 impl Store {
     // ----- config hash ---------------------------------------------------
 
     /// `sha256(trusted-contacts.toml)` recorded at the last load; `None`
     /// before the first load or when the file was absent.
     pub fn autonomy_config_hash(&self) -> StoreResult<Option<String>> {
-        todo!()
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT file_hash FROM autonomy_config_hash WHERE singleton = 1", [], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
+        })
     }
 
     pub fn set_autonomy_config_hash(&self, file_hash: Option<&str>, now_ms: i64) -> StoreResult<()> {
-        let _ = (file_hash, now_ms);
-        todo!()
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO autonomy_config_hash(singleton, file_hash, updated_at_ms) VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET file_hash = excluded.file_hash,
+                                                      updated_at_ms = excluded.updated_at_ms",
+                params![file_hash, now_ms],
+            )
+        })?;
+        Ok(())
     }
 
     // ----- trust state ---------------------------------------------------
 
     pub fn trust_state(&self, slug: &str, entry_hash: &str) -> StoreResult<Option<TrustState>> {
-        let _ = (slug, entry_hash);
-        todo!()
+        let state: Option<String> = self.with_conn(|c| {
+            c.query_row(
+                "SELECT state FROM autonomy_trust_state WHERE slug = ?1 AND entry_hash = ?2",
+                params![slug, entry_hash],
+                |r| r.get(0),
+            )
+            .optional()
+        })?;
+        match state {
+            None => Ok(None),
+            Some(s) => TrustState::parse(&s)
+                .map(Some)
+                .ok_or_else(|| StoreError::InvalidInput(format!("unknown trust state `{s}`"))),
+        }
     }
 
     /// Record `(slug, entry_hash)` as pending unless a row already exists.
     /// Returns true when the row is new.
     pub fn ensure_trust_pending(&self, slug: &str, entry_hash: &str, now_ms: i64) -> StoreResult<bool> {
-        let _ = (slug, entry_hash, now_ms);
-        todo!()
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO autonomy_trust_state(slug, entry_hash, state, created_at_ms)
+                 VALUES (?1, ?2, 'pending', ?3)",
+                params![slug, entry_hash, now_ms],
+            )
+        })? == 1)
     }
 
     /// Mark `(slug, entry_hash)` active and drop the slug's rows for any
     /// other hash. Returns true when it was not already active.
     pub fn confirm_trust(&self, slug: &str, entry_hash: &str, now_ms: i64) -> StoreResult<bool> {
-        let _ = (slug, entry_hash, now_ms);
-        todo!()
+        self.with_conn(|c| {
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            let was: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM autonomy_trust_state WHERE slug = ?1 AND entry_hash = ?2",
+                    params![slug, entry_hash],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            tx.execute(
+                "DELETE FROM autonomy_trust_state WHERE slug = ?1 AND entry_hash != ?2",
+                params![slug, entry_hash],
+            )?;
+            tx.execute(
+                "INSERT INTO autonomy_trust_state(slug, entry_hash, state, created_at_ms, confirmed_at_ms)
+                 VALUES (?1, ?2, 'active', ?3, ?3)
+                 ON CONFLICT(slug, entry_hash) DO UPDATE SET state = 'active',
+                     confirmed_at_ms = COALESCE(autonomy_trust_state.confirmed_at_ms, excluded.confirmed_at_ms)",
+                params![slug, entry_hash, now_ms],
+            )?;
+            tx.commit()?;
+            Ok(was.as_deref() != Some("active"))
+        })
     }
 
     /// Drop every trust row for `slug` (after `trust remove`).
     pub fn forget_trust(&self, slug: &str) -> StoreResult<usize> {
-        let _ = slug;
-        todo!()
+        self.with_conn(|c| c.execute("DELETE FROM autonomy_trust_state WHERE slug = ?1", [slug]))
     }
 
     /// One-time "slug missing" notice latch for `(slug, entry_hash)`.
     /// Returns true only the first time it is called while the page is
     /// missing; [`Store::clear_slug_missing_notice`] re-arms it.
     pub fn mark_slug_missing_noticed(&self, slug: &str, entry_hash: &str, now_ms: i64) -> StoreResult<bool> {
-        let _ = (slug, entry_hash, now_ms);
-        todo!()
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE autonomy_trust_state SET slug_missing_noticed_ms = ?3
+                  WHERE slug = ?1 AND entry_hash = ?2 AND slug_missing_noticed_ms IS NULL",
+                params![slug, entry_hash, now_ms],
+            )
+        })? == 1)
     }
 
     pub fn clear_slug_missing_notice(&self, slug: &str) -> StoreResult<()> {
-        let _ = slug;
-        todo!()
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE autonomy_trust_state SET slug_missing_noticed_ms = NULL WHERE slug = ?1",
+                [slug],
+            )
+        })?;
+        Ok(())
     }
 
     // ----- pauses --------------------------------------------------------
 
     /// Returns true when the contact was not already paused.
     pub fn pause_contact(&self, slug: &str, now_ms: i64) -> StoreResult<bool> {
-        let _ = (slug, now_ms);
-        todo!()
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO autonomy_pauses(slug, paused_at_ms) VALUES (?1, ?2)",
+                params![slug, now_ms],
+            )
+        })? == 1)
     }
 
     /// Returns true when a pause was cleared.
     pub fn resume_contact(&self, slug: &str) -> StoreResult<bool> {
-        let _ = slug;
-        todo!()
+        Ok(self.with_conn(|c| c.execute("DELETE FROM autonomy_pauses WHERE slug = ?1", [slug]))? == 1)
     }
 
     pub fn contact_paused(&self, slug: &str) -> StoreResult<bool> {
-        let _ = slug;
-        todo!()
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT 1 FROM autonomy_pauses WHERE slug = ?1", [slug], |_| Ok(()))
+                .optional()?
+                .is_some())
+        })
     }
 
     pub fn paused_contacts(&self) -> StoreResult<Vec<String>> {
-        todo!()
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT slug FROM autonomy_pauses ORDER BY slug")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect()
+        })
     }
 
     pub fn set_autonomy_global_pause(&self, paused: bool, now_ms: i64) -> StoreResult<()> {
-        let _ = (paused, now_ms);
-        todo!()
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO autonomy_global_pause(singleton, paused, updated_at_ms) VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET paused = excluded.paused,
+                                                      updated_at_ms = excluded.updated_at_ms",
+                params![paused as i64, now_ms],
+            )
+        })?;
+        Ok(())
     }
 
     pub fn autonomy_global_pause(&self) -> StoreResult<bool> {
-        todo!()
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT paused FROM autonomy_global_pause WHERE singleton = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .is_some_and(|p| p != 0))
+        })
     }
 
     // ----- plans and steps -----------------------------------------------
@@ -357,91 +517,219 @@ impl Store {
     /// IMMEDIATE` transaction, so two channels cannot both pass the cap or
     /// both insert the same idempotency key.
     pub fn insert_autonomous_plan(&self, plan: &NewPlan, daily_cap: u32, now_ms: i64) -> StoreResult<PlanInsert> {
-        let _ = (plan, daily_cap, now_ms);
-        todo!()
+        self.with_conn(|c| {
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM autonomous_plans WHERE idem_key = ?1",
+                    [&plan.idem_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(existing_plan_id) = existing {
+                return Ok(PlanInsert::Duplicate { existing_plan_id });
+            }
+            let count = cap_count(&tx, &plan.contact_slug, now_ms)?;
+            if count >= i64::from(daily_cap) {
+                return Ok(PlanInsert::CapReached { count });
+            }
+            tx.execute(
+                "INSERT INTO autonomous_plans(idem_key, contact_slug, tier, inbound_message_id, thread_key,
+                     action_id, plan_json, status, notice_status, notice_message_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10)",
+                params![
+                    plan.idem_key,
+                    plan.contact_slug,
+                    plan.tier,
+                    plan.inbound_message_id,
+                    plan.thread_key,
+                    plan.action_id,
+                    plan.plan_json,
+                    PlanStatus::Planned.as_str(),
+                    NoticeStatus::Pending.as_str(),
+                    now_ms,
+                ],
+            )?;
+            let plan_id = tx.last_insert_rowid();
+            let mut step_ids = Vec::with_capacity(plan.steps.len());
+            for step in &plan.steps {
+                tx.execute(
+                    "INSERT INTO autonomous_steps(plan_id, seq, kind, target_handle, account, event_ref,
+                         payload_json, status, undo_json, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9)",
+                    params![
+                        plan_id,
+                        step.seq,
+                        step.kind,
+                        step.target_handle,
+                        step.account,
+                        step.event_ref,
+                        step.payload_json,
+                        StepStatus::Planned.as_str(),
+                        now_ms,
+                    ],
+                )?;
+                step_ids.push(tx.last_insert_rowid());
+            }
+            tx.commit()?;
+            Ok(PlanInsert::Inserted { plan_id, step_ids })
+        })
     }
 
     pub fn autonomous_plan(&self, id: i64) -> StoreResult<Option<PlanRow>> {
-        let _ = id;
-        todo!()
+        self.with_conn(|c| Ok(plans_where(c, "id = ?1", [id])?.into_iter().next()))
     }
 
     pub fn autonomous_plan_by_idem_key(&self, idem_key: &str) -> StoreResult<Option<PlanRow>> {
-        let _ = idem_key;
-        todo!()
+        self.with_conn(|c| Ok(plans_where(c, "idem_key = ?1", [idem_key])?.into_iter().next()))
     }
 
     pub fn autonomous_steps(&self, plan_id: i64) -> StoreResult<Vec<StepRow>> {
-        let _ = plan_id;
-        todo!()
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {STEP_COLS} FROM autonomous_steps WHERE plan_id = ?1 ORDER BY seq"
+            ))?;
+            let rows = stmt.query_map([plan_id], step_row)?;
+            rows.collect()
+        })
     }
 
     /// Returns true when the row exists (and was updated).
     pub fn set_autonomous_plan_status(&self, id: i64, status: PlanStatus, now_ms: i64) -> StoreResult<bool> {
-        let _ = (id, status, now_ms);
-        todo!()
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE autonomous_plans SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, status.as_str(), now_ms],
+            )
+        })? == 1)
     }
 
     /// Compare-and-set: only moves the plan when it is currently `from`.
     pub fn transition_autonomous_plan(&self, id: i64, from: PlanStatus, to: PlanStatus, now_ms: i64) -> StoreResult<bool> {
-        let _ = (id, from, to, now_ms);
-        todo!()
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE autonomous_plans SET status = ?3, updated_at = ?4 WHERE id = ?1 AND status = ?2",
+                params![id, from.as_str(), to.as_str(), now_ms],
+            )
+        })? == 1)
     }
 
     /// `undo_json` is replaced only when `Some`.
     pub fn set_autonomous_step_status(&self, step_id: i64, status: StepStatus, undo_json: Option<&str>, now_ms: i64) -> StoreResult<bool> {
-        let _ = (step_id, status, undo_json, now_ms);
-        todo!()
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE autonomous_steps SET status = ?2, undo_json = COALESCE(?3, undo_json), updated_at = ?4
+                  WHERE id = ?1",
+                params![step_id, status.as_str(), undo_json, now_ms],
+            )
+        })? == 1)
     }
 
     pub fn set_autonomous_plan_notice(&self, id: i64, status: NoticeStatus, message_id: Option<&str>, now_ms: i64) -> StoreResult<bool> {
-        let _ = (id, status, message_id, now_ms);
-        todo!()
+        Ok(self.with_conn(|c| {
+            c.execute(
+                "UPDATE autonomous_plans SET notice_status = ?2,
+                        notice_message_id = COALESCE(?3, notice_message_id), updated_at = ?4
+                  WHERE id = ?1",
+                params![id, status.as_str(), message_id, now_ms],
+            )
+        })? == 1)
     }
 
-    /// Plans whose notice is still `pending`, oldest first (D10 sweep).
+    /// Plans with the given notice status, oldest first (D10 sweep).
     pub fn autonomous_plans_with_notice(&self, status: NoticeStatus) -> StoreResult<Vec<PlanRow>> {
-        let _ = status;
-        todo!()
+        self.with_conn(|c| plans_where(c, "notice_status = ?1 ORDER BY created_at, id", [status.as_str()]))
     }
 
     /// D11 crash recovery — plans in `planned` or `executing` not updated
     /// since `updated_before_ms`, oldest first.
     pub fn stale_autonomous_plans(&self, updated_before_ms: i64) -> StoreResult<Vec<PlanRow>> {
-        let _ = updated_before_ms;
-        todo!()
+        self.with_conn(|c| {
+            plans_where(
+                c,
+                "status IN ('planned', 'executing') AND updated_at < ?1 ORDER BY updated_at, id",
+                [updated_before_ms],
+            )
+        })
     }
 
     /// D11 crash recovery — move every stale `planned`/`executing` plan to
-    /// `unknown` in one statement and return the plans that moved (so two
+    /// `unknown` in one transaction and return the plans that moved (so two
     /// sweepers can't both claim one).
     pub fn mark_stale_autonomous_plans_unknown(&self, updated_before_ms: i64, now_ms: i64) -> StoreResult<Vec<PlanRow>> {
-        let _ = (updated_before_ms, now_ms);
-        todo!()
+        self.with_conn(|c| {
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            let stale = plans_where(
+                &tx,
+                "status IN ('planned', 'executing') AND updated_at < ?1 ORDER BY updated_at, id",
+                [updated_before_ms],
+            )?;
+            let mut moved = Vec::with_capacity(stale.len());
+            for mut p in stale {
+                tx.execute(
+                    "UPDATE autonomous_plans SET status = 'unknown', updated_at = ?2 WHERE id = ?1",
+                    params![p.id, now_ms],
+                )?;
+                p.status = PlanStatus::Unknown;
+                p.updated_at = now_ms;
+                moved.push(p);
+            }
+            tx.commit()?;
+            Ok(moved)
+        })
     }
 
     /// D11 retention — drop plans (and their steps) created before the cutoff.
     pub fn prune_autonomous_records(&self, created_before_ms: i64) -> StoreResult<usize> {
-        let _ = created_before_ms;
-        todo!()
+        self.with_conn(|c| {
+            let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM autonomous_steps WHERE plan_id IN
+                     (SELECT id FROM autonomous_plans WHERE created_at < ?1)",
+                [created_before_ms],
+            )?;
+            let n = tx.execute("DELETE FROM autonomous_plans WHERE created_at < ?1", [created_before_ms])?;
+            tx.commit()?;
+            Ok(n)
+        })
     }
 
     /// Counted plans (see [`CAP_COUNTED_PLAN_STATUSES`]) for the contact
     /// created within the last [`DAILY_CAP_WINDOW_MS`].
     pub fn autonomous_plans_in_cap_window(&self, contact_slug: &str, now_ms: i64) -> StoreResult<i64> {
-        let _ = (contact_slug, now_ms);
-        todo!()
+        self.with_conn(|c| cap_count(c, contact_slug, now_ms))
     }
 
     // ----- D12 sender authentication -------------------------------------
 
     pub fn record_email_sender_auth(&self, message_id: &str, auth: SenderAuth, now_ms: i64) -> StoreResult<()> {
-        let _ = (message_id, auth, now_ms);
-        todo!()
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO email_sender_auth(message_id, dmarc_pass, dkim_aligned, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(message_id) DO UPDATE SET dmarc_pass = excluded.dmarc_pass,
+                     dkim_aligned = excluded.dkim_aligned, recorded_at_ms = excluded.recorded_at_ms",
+                params![message_id, auth.dmarc_pass as i64, auth.dkim_aligned as i64, now_ms],
+            )
+        })?;
+        Ok(())
     }
 
+    /// `None` when nothing was recorded (Composio-backed or header-less
+    /// mail): the gate treats that as unauthenticated.
     pub fn email_sender_auth(&self, message_id: &str) -> StoreResult<Option<SenderAuth>> {
-        let _ = message_id;
-        todo!()
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT dmarc_pass, dkim_aligned FROM email_sender_auth WHERE message_id = ?1",
+                [message_id],
+                |r| {
+                    Ok(SenderAuth {
+                        dmarc_pass: r.get::<_, i64>(0)? != 0,
+                        dkim_aligned: r.get::<_, i64>(1)? != 0,
+                    })
+                },
+            )
+            .optional()
+        })
     }
 }
