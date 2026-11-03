@@ -597,9 +597,9 @@ class _ViewProbe:
         self.inputs=self.root/'inputs-v1';self._inputs(self.inputs,b'OLD')
         self.before=unit_views.inventory(self.inputs,owner=0,sealed=True)
         self.input_stat=(self.inputs/'deps/input').stat()
-        self.directory_stats={p:_CargoProbe._stat(p) for p in (self.inputs/'deps',self.inputs/'deps/empty')}
+        self.directory_stats={p:_CargoProbe._stat(p) for p in (self.inputs/'deps',self.inputs/'deps/empty',self.inputs/'deps/cursor')}
         self.directory_members={os.fsencode(name):((self.inputs/'deps'/name).stat().st_ino,
-            4 if name=='empty' else 8) for name in ('input','one.rs','empty',os.fsdecode(b'raw-\xff'),'l'*255)}
+            4 if name in ('empty','cursor') else 8) for name in ('input','one.rs','empty','cursor',os.fsdecode(b'raw-\xff'),'l'*255)}
         self.abstract=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM|socket.SOCK_CLOEXEC)
         self.abstract.bind(b'\0jarvis-unit-view-probe');self.abstract.listen(1)
         if Path('/tmp/ci-unit-probe-private-marker').exists():raise FreshnessHold('invalidation_unsafe')
@@ -611,6 +611,7 @@ class _ViewProbe:
         for name in ('one.rs',os.fsdecode(b'raw-\xff'),'l'*255):
             (root/'deps'/name).write_bytes(b'entry\n');(root/'deps'/name).chmod(0o444)
         (root/'deps/empty').mkdir(mode=0o555)
+        (root/'deps/cursor').mkdir(mode=0o555)
         (root/'deps').chmod(0o555);root.chmod(0o555)
 
     def prepare(self,ordinal,request=None):
@@ -1060,10 +1061,23 @@ if is_view:
    raise AssertionError('directory EOF missing')
   finally:os.close(descriptor)
  names,reads=directory_names('/workspace/target/deps')
- assert len(names)==7 and set(names)=={b'.',b'..',b'input',b'one.rs',b'empty',b'raw-\xff',b'l'*255}
+ assert len(names)==8 and set(names)=={b'.',b'..',b'input',b'one.rs',b'empty',b'cursor',b'raw-\xff',b'l'*255}
  assert reads>=3
  names,reads=directory_names('/workspace/target/deps/empty')
  assert len(names)==2 and set(names)=={b'.',b'..'} and reads==2
+ descriptor=os.open('/workspace/target/deps/cursor',os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+ try:
+  buffer=ctypes.create_string_buffer(288)
+  amount=libc.syscall(ctypes.c_long(217),ctypes.c_long(descriptor),buffer,ctypes.c_uint(24))
+  assert amount==24
+  first_cookie=struct.unpack_from('=q',buffer.raw,8)[0]
+  assert first_cookie!=0
+  assert os.lseek(descriptor,0,os.SEEK_SET)==0
+  amount=libc.syscall(ctypes.c_long(217),ctypes.c_long(descriptor),buffer,ctypes.c_uint(288))
+  assert amount==48
+  amount=libc.syscall(ctypes.c_long(217),ctypes.c_long(descriptor),buffer,ctypes.c_uint(288))
+  assert amount==0
+ finally:os.close(descriptor)
  for operation in (lambda:input.open('wb'),lambda:input.unlink(),
      lambda:Path('/workspace/target/deps/forbidden').mkdir()):
   try:operation()
@@ -1224,7 +1238,7 @@ def _probe(arguments):
         (view_probe.original_pid,2004,view_probe.inputs/'deps/empty',{})]
     directories.extend((item['pid'],2000+ordinal,empty,{}) for ordinal,item in cargo_probe.units.items()
         if item['mapping']['kind']=='application')
-    kernel=observer.finish(view_probe.original_pid,compilers,directories)
+    kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor')
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],

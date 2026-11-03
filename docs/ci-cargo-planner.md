@@ -888,3 +888,20 @@ the original capacity, resource limits, strict helper-error handling and final
 counter reconciliation. This proves the bounded binary transport on the pinned
 runtime; descriptor resolution, metadata, complete input closure and actual
 invalidation/reuse authority still require implementation.
+
+
+The directory query extension also retains the original file's signed `f_pos`
+at `iterate_dir` entry, alongside the iterator's final `ctx.pos`. A complete
+controlled enumeration must start at zero and each subsequent read must start
+at the preceding final position. Same inode/descriptor numbers and an eventual
+EOF alone cannot claim a continuous scan. Raw cookies remain signed 64-bit
+values; they are not normalized or assumed monotonic byte offsets.
+
+The original isolated unit now has an additional empty `cursor` directory. It
+reads exactly one entry with a 24-byte buffer, calls `lseek(fd, 0, SEEK_SET)` on
+the same descriptor, then reads both dot entries and EOF with 288-byte buffers.
+The root collector must observe the nonzero first cookie, reset to zero and
+subsequent continuous complete read. Both Python validation and the original
+Rust VM acceptance require this witness. This tests actual file-position
+capture and does not supply generic descriptor-lifecycle or pathname-resolution
+authority. Native replay of this extension is pending.

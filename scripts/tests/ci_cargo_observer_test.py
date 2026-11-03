@@ -37,6 +37,31 @@ def census_sample():
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_original_directory_cursor_records_rewind_and_refuses_a_false_continuous_scan(self):
+        rows=['B 2004 101 101 1 3 24','I 2004 101 101 1 265289728 900 16749 0',
+            'D 2004 101 101 1 1 900 4 0 0 1 2e','A 2004 101 101 1 1 1',
+            'D 2004 101 101 1 2 901 4 1 0 2 2e 2e','A 2004 101 101 1 2 0',
+            'T 2004 101 101 1 0 1','G 2004 101 101 1 24',
+            'B 2004 101 101 2 3 288','I 2004 101 101 2 265289728 900 16749 0',
+            'D 2004 101 101 2 1 900 4 0 0 1 2e','A 2004 101 101 2 1 1',
+            'D 2004 101 101 2 2 901 4 1 0 2 2e 2e','A 2004 101 101 2 2 1',
+            'T 2004 101 101 2 0 2','G 2004 101 101 2 48',
+            'B 2004 101 101 3 3 288','I 2004 101 101 3 265289728 900 16749 2',
+            'T 2004 101 101 3 0 2','G 2004 101 101 3 0']
+        queries=observer.directory_queries(rows)
+        path=SimpleNamespace(stat=lambda:SimpleNamespace(st_dev=os.makedev(253,0),st_ino=900),
+            parent=SimpleNamespace(stat=lambda:SimpleNamespace(st_ino=901)))
+        self.assertEqual([q['start_position'] for q in queries],[0,0,2])
+        with self.assertRaises(observer.ObservationUnavailable):observer.directory_witness(queries,101,2004,path,{})
+        self.assertEqual(observer.directory_cursor_witness(queries,101,2004,path),
+            {'reads':3,'rewind_from':1,'rewind_to':0})
+        for index,field,value in ((0,'start_position',1),(1,'start_position',1),
+                (2,'start_position',99),(0,'position',0),(1,'fd',9)):
+            bad=copy.deepcopy(queries);bad[index][field]=value
+            with self.subTest(field=field,index=index),self.assertRaises(observer.ObservationUnavailable):
+                observer.directory_cursor_witness(bad,101,2004,path)
+        with self.assertRaises(observer.ObservationUnavailable):observer.directory_cursor_witness(queries[:-1],101,2004,path)
+
     def test_kernel_path_chunks_keep_binary_whitespace_and_control_bytes(self):
         path=b'/workspace/raw-\xff \n\x01'
         data=(frame('printf',f'N 2004 101 101 257 1 0 {len(path)} '+path.hex(' ')+'\n')
@@ -47,11 +72,11 @@ class KernelObserverTests(unittest.TestCase):
             with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer.decode(bad)
 
     def test_directory_identity_compares_linux_kernel_device_encoding_to_stat(self):
-        rows=['B 2004 101 101 1 3 64','I 2004 101 101 1 265289728 900 16749',
+        rows=['B 2004 101 101 1 3 64','I 2004 101 101 1 265289728 900 16749 0',
             'D 2004 101 101 1 1 900 4 0 0 1 2e','A 2004 101 101 1 1 1',
             'D 2004 101 101 1 2 901 4 1 0 2 2e 2e','A 2004 101 101 1 2 1',
             'T 2004 101 101 1 0 2','G 2004 101 101 1 48',
-            'B 2004 101 101 2 3 64','I 2004 101 101 2 265289728 900 16749',
+            'B 2004 101 101 2 3 64','I 2004 101 101 2 265289728 900 16749 2',
             'T 2004 101 101 2 0 2','G 2004 101 101 2 0']
         queries=observer.directory_queries(rows)
         path=SimpleNamespace(stat=lambda:SimpleNamespace(st_dev=os.makedev(253,0),st_ino=900),
@@ -65,12 +90,12 @@ class KernelObserverTests(unittest.TestCase):
                 observer.directory_witness(bad,101,2004,path,{})
 
     def test_directory_capture_reconciles_kernel_entries_short_reads_and_eof(self):
-        rows=['B 2004 101 101 50 3 64','I 2004 101 101 50 7 900 16749',
+        rows=['B 2004 101 101 50 3 64','I 2004 101 101 50 7 900 16749 0',
             'D 2004 101 101 50 1 900 4 0 0 1 2e','A 2004 101 101 50 1 1',
             'D 2004 101 101 50 2 901 4104 1 0 2 ff 61','A 2004 101 101 50 2 1',
             'D 2004 101 101 50 3 902 8 2 0 1 62','A 2004 101 101 50 3 0',
             'T 2004 101 101 50 0 2','G 2004 101 101 50 48',
-            'B 2004 101 101 51 3 64','I 2004 101 101 51 7 900 16749',
+            'B 2004 101 101 51 3 64','I 2004 101 101 51 7 900 16749 2',
             'T 2004 101 101 51 0 2','G 2004 101 101 51 0']
         queries=observer.directory_queries(rows)
         self.assertEqual([q['result'] for q in queries],[48,0])
@@ -96,7 +121,7 @@ class KernelObserverTests(unittest.TestCase):
 
     def test_directory_binary_name_chunks_require_exact_coverage_even_when_reordered(self):
         name=b'\xff'*255
-        rows=['B 2004 101 101 1 3 288','I 2004 101 101 1 7 900 16749',
+        rows=['B 2004 101 101 1 3 288','I 2004 101 101 1 7 900 16749 0',
             'A 2004 101 101 1 1 1','T 2004 101 101 1 0 99','G 2004 101 101 1 280']
         chunks=[f'D 2004 101 101 1 1 901 8 0 {start} 255 '+name[start:start+63].hex(' ')
             for start in range(0,len(name),63)]

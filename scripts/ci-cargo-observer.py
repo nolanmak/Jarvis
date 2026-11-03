@@ -216,7 +216,7 @@ def directory_queries(records,*,complete=True):
     pairs={}
     if type(records) is not list or len(records)>40000:
         raise ObservationUnavailable('unbounded directory observation')
-    layouts={'B':(2,False),'I':(3,False),'A':(2,False),'T':(2,True),'G':(1,True)}
+    layouts={'B':(2,False),'I':(4,True),'A':(2,False),'T':(2,True),'G':(1,True)}
     for line in records:
         if type(line) is not str or len(line)>1024:
             raise ObservationUnavailable('unbounded directory record')
@@ -265,10 +265,11 @@ def directory_queries(records,*,complete=True):
         if not ready:
             if complete:raise ObservationUnavailable('incomplete directory observation')
             continue
-        descriptor,capacity=pair['B'];device,inode,mode=pair['I']
+        descriptor,capacity=pair['B'];device,inode,mode,start_position=pair['I']
         status,position=pair['T'];result,=pair['G']
-        if (descriptor>=2**31 or capacity>=2**32 or device>=2**32 or inode>=2**64
-                or mode>65535 or not stat.S_ISDIR(mode) or not -2**31<=status<2**31
+        if (descriptor>=2**31 or capacity>=2**32 or not 0<=device<2**32 or not 0<=inode<2**64
+                or not 0<=mode<=65535 or not stat.S_ISDIR(mode) or not -2**31<=status<2**31
+                or not -2**63<=start_position<2**63
                 or not -2**63<=position<2**63 or not -4095<=result<=capacity
                 or set(attempts)!=set(range(1,len(attempts)+1))):
             raise ObservationUnavailable('inconsistent directory call')
@@ -289,12 +290,12 @@ def directory_queries(records,*,complete=True):
             entry['returned_offset']=entries[index+1]['offset'] if index+1<len(entries) else position
         queries.append({'uid':uid,'pid':pid,'tid':tid,'sequence':sequence,'syscall':217,
             'fd':descriptor,'capacity':capacity,'device':device,'inode':inode,'mode':mode,
+            'start_position':start_position,
             'iterator_result':status,'position':position,'result':result,'attempts':ordered,'entries':entries})
     return queries
 
 
-def directory_witness(queries,pid,uid,path,members):
-    """Check one controlled, immutable tree against original kernel records."""
+def _directory_calls(queries,pid,uid,path):
     info=path.stat()
     # Linux internal dev_t uses 12 major/20 minor bits (kdev_t.h). stat's
     # userspace dev_t has a different encoding. Retain raw captured values and
@@ -306,7 +307,15 @@ def directory_witness(queries,pid,uid,path,members):
     selected=[q for q in queries if (q['pid'],q['tid'],q['uid'],q['device'],q['inode'])
         ==(pid,pid,uid,kernel_device,info.st_ino)]
     selected.sort(key=lambda q:q['sequence'])
+    return selected
+
+
+def directory_witness(queries,pid,uid,path,members):
+    """Check one controlled, immutable tree against original kernel records."""
+    selected=_directory_calls(queries,pid,uid,path);info=path.stat()
     if (not selected or any(q['iterator_result']!=0 or q['result']<0 for q in selected)
+            or selected[0]['start_position']!=0
+            or any(b['start_position']!=a['position'] for a,b in zip(selected,selected[1:]))
             or selected[-1]['result']!=0 or any(q['result']==0 for q in selected[:-1])
             or len({q['fd'] for q in selected})!=1):
         raise ObservationUnavailable('original directory EOF witness missing')
@@ -316,6 +325,22 @@ def directory_witness(queries,pid,uid,path,members):
         raise ObservationUnavailable('original directory membership witness differs')
     return {'reads':len(selected),'entries':len(entries),
         'rejected_attempts':sum(not a['accepted'] for q in selected for a in q['attempts'])}
+
+
+def directory_cursor_witness(queries,pid,uid,path):
+    """Require the fixed original read/rewind/full-read/EOF experiment."""
+    selected=_directory_calls(queries,pid,uid,path)
+    if (len(selected)!=3 or len({q['fd'] for q in selected})!=1
+            or any(q['iterator_result']!=0 for q in selected)
+            or selected[0]['start_position']!=0 or selected[0]['position']==0
+            or selected[0]['capacity']!=24 or selected[0]['result']!=24
+            or len(selected[0]['entries'])!=1 or selected[1]['start_position']!=0):
+        raise ObservationUnavailable('original directory rewind witness missing')
+    directory_witness(selected[1:],pid,uid,path,{})
+    first=selected[0]['entries'][0]
+    if not any(all(first[k]==entry[k] for k in ('name','inode','type')) for entry in selected[1]['entries']):
+        raise ObservationUnavailable('rewound directory membership differs')
+    return {'reads':3,'rewind_from':selected[0]['position'],'rewind_to':selected[1]['start_position']}
 
 
 def decode(data,*,complete=True,with_directories=False):
@@ -431,8 +456,8 @@ kprobe:iterate_di*r / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[ti
  $inode=$file->f_inode;
  @directory_context[tid]=arg1;
  @directory_active[tid]=@sequence[tid];
- printf("I %u %u %u %llu %llu %llu %llu\n",uid,pid,tid,@sequence[tid],
-  (uint64)$inode->i_sb->s_dev,(uint64)$inode->i_ino,(uint64)$inode->i_mode);
+ printf("I %u %u %u %llu %llu %llu %llu %lld\n",uid,pid,tid,@sequence[tid],
+  (uint64)$inode->i_sb->s_dev,(uint64)$inode->i_ino,(uint64)$inode->i_mode,(int64)$file->f_pos);
  @emitted=sum(1);
 }
 kretprobe:iterate_di*r / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[tid]==217 / {
@@ -689,7 +714,7 @@ class Observer:
         for stream in (self.output,self.error):
             if stream is not None and not stream.closed:stream.close()
 
-    def finish(self,unit_pid,compilers,directories):
+    def finish(self,unit_pid,compilers,directories,cursor_directory):
         self.stop()
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
@@ -700,6 +725,7 @@ class Observer:
         directory_witness(queries,self.witness_pid,1999,self.directory_path,self.directory_members)
         if len(directories)!=4:raise ObservationUnavailable('original directory scopes missing')
         summaries=[directory_witness(queries,*scope) for scope in directories]
+        directory_cursor_witness(queries,unit_pid,2004,cursor_directory)
         if summaries[0]['reads']<3 or summaries[0]['rejected_attempts']<1:
             raise ObservationUnavailable('original directory short-read witness missing')
         selected=[e for e in events if e['uid']==2004 and e['pid']==unit_pid and e['tid']==unit_pid]
@@ -734,6 +760,7 @@ class Observer:
             'directory_reads':len(queries),'directory_entries':sum(len(q['entries']) for q in queries),
             'directory_witness_observed':True,'binary_directory_name_observed':True,
             'directory_short_read_observed':True,'directory_eof_observed':True,'cargo_directory_queries_observed':True,
+            'directory_cursor_query_observed':True,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'probe_census':census,
             'input_closure_complete':False,'allocation_removed':False}
         if cache._read_record(self.root/'control.json')!=self.control:
@@ -751,7 +778,7 @@ def validate(value,binding,command):
         'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','probe_census',
         'binary_path_query_observed'}
     keys|={'directory_reads','directory_entries','directory_witness_observed','binary_directory_name_observed',
-        'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed'}
+        'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed','directory_cursor_query_observed'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['kind']!='kernel-copied-filename-probe' or value['binding']!=binding or value['command']!=command
             or type(value['unit_pid']) is not int or not 0<value['unit_pid']<2**31
@@ -766,6 +793,7 @@ def validate(value,binding,command):
                 'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','missed_probe_census_complete',
                 'directory_witness_observed','binary_directory_name_observed','directory_short_read_observed',
                 'directory_eof_observed','cargo_directory_queries_observed'))
+            or value['directory_cursor_query_observed'] is not True
             or any(value[key] is not False for key in ('shipping_authority','filesystem_coverage_complete','input_closure_complete'))):
         raise ObservationUnavailable('kernel observation is incomplete or foreign')
     validate_census(value['probe_census'])
