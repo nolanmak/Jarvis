@@ -326,6 +326,111 @@ def rustc_unit(request,*,package,host_triple):
     except (ValueError,TypeError,KeyError,AttributeError,IndexError,UnicodeError):hold()
 
 
+class CargoGraph:
+    """Bind controller-captured Cargo metadata to frozen workspace targets.
+
+    The caller must establish the pinned Cargo invocation and original cleanup.
+    This object does not authenticate arbitrary metadata, resolve dependencies,
+    admit opaque tools, or issue input/reuse/CI authority.
+    """
+    def __init__(self,source,metadata,*,owner):
+        self.root=unit_views.literal(source);self.owner=owner;self._files={};self._directories={};self.packages={}
+        try:
+            if (type(owner) is not int or not 0<=owner<2**32
+                    or type(metadata) is not bytes or not 0<len(metadata)<=2*1024**2):raise ValueError()
+            data=json.loads(metadata,object_pairs_hook=cache._unique_object)
+            if (type(data) is not dict or type(data.get('version')) is not int or data['version']!=1
+                    or data.get('workspace_root')!='/workspace' or data.get('target_directory')!='/workspace/target'
+                    or type(data.get('packages')) is not list or not 0<len(data['packages'])<=1024
+                    or type(data.get('workspace_members')) is not list):raise ValueError()
+            self.metadata_sha256=hashlib.sha256(metadata).hexdigest();self._remember(self.root/'Cargo.lock')
+            ids=set();targets=0
+            for package in data['packages']:
+                identity=package['id'];name=package['name'];version=package['version'];manifest=package['manifest_path']
+                if (type(identity) is not str or not 0<len(identity)<=4096 or identity in ids
+                        or type(name) is not str or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}',name) is None
+                        or type(version) is not str or not 0<len(version)<=128 or package.get('source') is not None
+                        or type(package.get('targets')) is not list or not 0<len(package['targets'])<=128):raise ValueError()
+                physical=self._virtual(manifest)
+                if physical.name!='Cargo.toml':raise ValueError()
+                manifest_digest=self._remember(physical);directory=manifest.rsplit('/',1)[0]
+                if directory in self.packages:raise ValueError()
+                admitted=[];seen=set()
+                for target in package['targets']:
+                    path=target['src_path'];target_name=target['name'];kinds=target['kind'];types=target['crate_types'];edition=target['edition']
+                    if (type(target_name) is not str or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,127}',target_name) is None
+                            or type(kinds) is not list or not 0<len(kinds)<=8 or any(type(v) is not str for v in kinds)
+                            or type(types) is not list or not 0<len(types)<=8 or any(type(v) is not str for v in types)
+                            or edition not in ('2015','2018','2021','2024')):raise ValueError()
+                    key=(path,target_name,tuple(kinds),tuple(types))
+                    if key in seen:raise ValueError()
+                    seen.add(key);digest=self._remember(self._virtual(path));targets+=1
+                    if targets>4096:raise ValueError()
+                    admitted.append({'source':path,'name':target_name,'kinds':tuple(kinds),'types':tuple(types),
+                        'edition':edition,'source_sha256':digest})
+                self.packages[directory]={'id':identity,'name':name,'version':version,'manifest':manifest,
+                    'manifest_sha256':manifest_digest,'targets':admitted};ids.add(identity)
+            members=data['workspace_members']
+            if any(type(value) is not str for value in members) or len(members)!=len(set(members)) or set(members)!=ids:raise ValueError()
+            self.target_count=targets;self._verify()
+        except (OSError,ValueError,KeyError,TypeError,AttributeError,UnicodeError):
+            raise FreshnessHold('input_census_unknown') from None
+
+    def _virtual(self,value):
+        if (type(value) is not str or not value.startswith('/workspace/') or len(value)>4096
+                or any(part in ('','..','.','.git') for part in value.split('/')[1:])
+                or value.startswith('/workspace/target/')):raise FreshnessHold('input_census_unknown')
+        return unit_views.literal(self.root/value[len('/workspace/'):])
+
+    def _remember(self,path):
+        for parent in [path.parent,*path.parent.parents]:
+            if parent==self.root.parent:break
+            info=parent.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=self.owner
+                    or stat.S_IMODE(info.st_mode)!=0o555):raise FreshnessHold('input_census_unknown')
+            identity=unit_views._key(info)
+            if parent in self._directories and self._directories[parent]!=identity:raise FreshnessHold('input_census_unknown')
+            self._directories[parent]=identity
+        mode,size,digest=unit_views._read(path,self.owner,True)
+        identity=unit_views._key(path.lstat())
+        if path in self._files and self._files[path]!=(identity,(mode,size,digest)):raise FreshnessHold('input_census_unknown')
+        self._files[path]=(identity,(mode,size,digest));return digest
+
+    def _verify(self):
+        for path,identity in self._directories.items():
+            if unit_views._key(path.lstat())!=identity:raise FreshnessHold('input_census_unknown')
+        for path,(identity,content) in list(self._files.items()):
+            if unit_views._key(path.lstat())!=identity or unit_views._read(path,self.owner,True)!=content:
+                raise FreshnessHold('input_census_unknown')
+
+    def admit(self,request,*,host_triple):
+        try:
+            self._verify();environment=request[2]
+            directory=environment[b'CARGO_MANIFEST_DIR'].decode();package=self.packages.get(directory)
+            if (package is None or environment.get(b'CARGO_PKG_NAME')!=package['name'].encode()
+                    or environment.get(b'CARGO_PKG_VERSION')!=package['version'].encode()
+                    or environment.get(b'CARGO_MANIFEST_PATH',package['manifest'].encode())!=package['manifest'].encode()):raise ValueError()
+            mapped=rustc_unit(request,package=package['name'].encode(),host_triple=host_triple)
+            if mapped['kind']!='compile' or environment.get(b'CARGO_CRATE_NAME',mapped['crate_name'])!=mapped['crate_name']:raise ValueError()
+            matches=[]
+            for target in package['targets']:
+                if (mapped['source']!=target['source'].encode() or mapped['crate_name']!=target['name'].replace('-','_').encode()
+                        or mapped['fields'][b'--edition']!=target['edition'].encode()):continue
+                action=mapped['action'];kinds=set(target['kinds'])
+                if (action in ('library','check') and kinds.intersection(('lib','rlib')) and mapped['crate_type'].decode() in target['types']
+                        or action=='build-script' and kinds=={'custom-build'} and target['types']==('bin',)
+                        or action=='binary' and kinds.intersection(('bin','example','test','bench')) and 'bin' in target['types']
+                        or action=='test' and kinds.intersection(('lib','rlib','bin','example','test','bench'))):matches.append(target)
+            if len(matches)!=1:raise ValueError()
+            target=matches[0]
+            return mapped|{'cargo_target':{'package_id':package['id'],'package_name':package['name'],'version':package['version'],
+                'manifest_path':package['manifest'],'manifest_sha256':package['manifest_sha256'],
+                'target_name':target['name'],'target_kind':list(target['kinds']),'source_path':target['source'],
+                'source_sha256':target['source_sha256'],'metadata_sha256':self.metadata_sha256}}
+        except (OSError,ValueError,KeyError,TypeError,AttributeError,UnicodeError):
+            raise FreshnessHold('input_census_unknown') from None
+
+
 def fixture_request(request):
     """Map the pinned Cargo build-script/library/binary graph; unknown work holds.
 
@@ -866,6 +971,7 @@ class _CargoProbe:
         self.admission=admission;self.owner=os.getpid();self.units={};self.publications={};self.files={};self.report=None
         self.generated_stats={};self.library_used=False;self.commands=[]
         self.retry_active=False;self.retry_publication=None;self.journal=None;self.fingerprints=None
+        self.graph=None;self.preparing_graph=False
         self.source=admission.target.parent/'source-projection'
         for name,body in (('Cargo.toml',CARGO_FIXTURE_MANIFEST),('src/main.rs',CARGO_FIXTURE_SOURCE),
                 ('src/lib.rs',CARGO_FIXTURE_LIB),('build.rs',CARGO_FIXTURE_BUILD)):
@@ -942,6 +1048,12 @@ class _CargoProbe:
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
         try:mapped=fixture_request(request)
         except FreshnessHold as error:error.unit_view_stage='planner_cargo_request';raise
+        admission=None
+        if self.preparing_graph:
+            if mapped['kind']!='information':raise cargo_hold('planner_cargo_request')
+        elif mapped['kind']=='compile':
+            if self.graph is None:raise cargo_hold('planner_cargo_request')
+            admission=self.graph.admit(request,host_triple=b'x86_64-unknown-linux-gnu')['cargo_target']
         slot=self.root/('unit-'+str(ordinal));slot.mkdir(mode=0o700)
         unit=2000+ordinal;artifacts=slot/'artifacts';artifacts.mkdir(mode=0o700);os.chown(artifacts,unit,unit)
         for name in ('debug','debug/deps'):
@@ -969,7 +1081,7 @@ class _CargoProbe:
             'command':self.admission.command,'ordinal':ordinal,'entries':entries})
         view={'root':str(root),'artifacts':str(artifacts),'source':str(self.source),
             'mounts':str(mounts),'ordinal':ordinal}
-        self.units[ordinal]={'view':view,'mapping':mapped,'finished':False}
+        self.units[ordinal]={'view':view,'mapping':mapped,'finished':False,'cargo_target':admission}
         return view
 
     def running(self,view):pass
@@ -1096,17 +1208,18 @@ class _CargoProbe:
             if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
                 raise FreshnessHold('invalidation_unsafe')
 
-    def _command(self,value,relay):
+    def _command(self,value,relay,*,operation='run'):
         global _PHASE,_CHILD_DIAGNOSTIC
         _PHASE='planner_cargo_supervisor'
-        if self.owner!=os.getpid() or len(self.commands)>=3:raise FreshnessHold('invalidation_unsafe')
+        if self.owner!=os.getpid() or len(self.commands)>=4 or operation not in ('run','metadata'):raise FreshnessHold('invalidation_unsafe')
         invocation=len(self.commands);directory=self.root/('command-'+str(invocation));directory.mkdir(mode=0o700)
-        control={'version':1,'binding':self.admission.binding,'command':self.admission.command,'invocation':invocation}
+        control={'version':1,'binding':self.admission.binding,'command':self.admission.command,
+            'invocation':invocation,'operation':operation}
         cache._write_record(directory/'control.json',control)
         client=relay.config_fd();bootstrap=None;child=None
         try:
             config=dict(value,kind='cargo-supervisor',parent=os.getpid(),invocation=invocation,
-                command_directory=str(directory),cargo_root=str(self.root),source=str(self.source))
+                command_directory=str(directory),cargo_operation=operation,cargo_root=str(self.root),source=str(self.source))
             bootstrap=_sealed(config)
             child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--cargo-supervisor',str(bootstrap),str(client)],
                 pass_fds=(bootstrap,client),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
@@ -1134,6 +1247,11 @@ class _CargoProbe:
 
     def run(self,value,relay):
         first=len(relay.completed);counts=[];script_counts=[];fingerprint=None
+        self.preparing_graph=True
+        try:status,output,error=self._command(value,relay,operation='metadata')
+        finally:self.preparing_graph=False
+        if status!=0:raise cargo_hold('planner_cargo_request')
+        self.graph=CargoGraph(self.source,output,owner=0)
         for iteration in range(2):
             before=len(relay.completed);status,output,error=self._command(value,relay)
             if status!=0 or output!=b'ISOLATED\n':
@@ -1170,7 +1288,7 @@ class _CargoProbe:
     def retry_invalidated(self,value,relay):
         global _PHASE
         _PHASE='planner_cargo_retire'
-        if (self.owner!=os.getpid() or self.report is None or len(self.commands)!=2
+        if (self.owner!=os.getpid() or self.report is None or len(self.commands)!=3
                 or self.journal is None or self.retry_publication is None
                 or any(command['returncode']!=0 for command in self.commands)
                 or any(not unit['finished'] for unit in self.units.values())):raise FreshnessHold('cleanup_uncertain')
@@ -1215,6 +1333,15 @@ class _CargoProbe:
             'rounds':1,'original_planner_cleanup':True,'original_unit_cleanup':True,
             'unaffected_fingerprints_preserved':True,'original_generated_preserved':True,
             'failed_outputs_unpublished':True,'pending':restored.pending(),'units':completed,
+            'input_closure_complete':False,'shipping_authority':False}
+        admissions=[]
+        for ordinal,unit in sorted(self.units.items()):
+            if unit['mapping']['kind']=='compile':
+                if not unit['finished'] or unit['cargo_target'] is None:raise cargo_hold('planner_cargo_request')
+                admissions.append({'ordinal':ordinal,'target':unit['cargo_target']})
+        self.report['cargo_graph']={'version':1,'metadata_sha256':self.graph.metadata_sha256,
+            'packages':len(self.graph.packages),'targets':self.graph.target_count,
+            'original_metadata_cleanup':True,'admissions':admissions,
             'input_closure_complete':False,'shipping_authority':False}
 
     def cleanup(self):
@@ -1291,7 +1418,7 @@ def _cargo_supervisor(arguments):
     if (directory.parent!=root or re.fullmatch(r'command-[0-9]{1,3}',directory.name) is None
             or stat.S_IMODE(directory.stat().st_mode)!=0o700 or directory.stat().st_uid!=0
             or cache._read_record(directory/'control.json')!={'version':1,'binding':value['binding'],
-                'command':value['command'],'invocation':value['invocation']}):
+                'command':value['command'],'invocation':value['invocation'],'operation':value['cargo_operation']}):
         raise FreshnessHold('cleanup_uncertain')
     child_bootstrap=_sealed(dict(value,kind='cargo',parent=os.getpid()))
     supervisor=_load('original_cargo_supervisor','provider-supervisor.py')
@@ -1330,7 +1457,11 @@ def _cargo(arguments):
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1001);os.setuid(1001);os.umask(0o077);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_cargo_execute'
-    os.execve('/toolchain/bin/cargo',['/toolchain/bin/cargo','run','--offline','--locked','--quiet'],environment)
+    operation=value.get('cargo_operation')
+    if operation=='metadata':argv=['/toolchain/bin/cargo','metadata','--offline','--locked','--no-deps','--format-version','1']
+    elif operation=='run':argv=['/toolchain/bin/cargo','run','--offline','--locked','--quiet']
+    else:raise FreshnessHold('invalidation_unsafe')
+    os.execve('/toolchain/bin/cargo',argv,environment)
 
 
 _TOOL_PROBE=r'''
@@ -1711,10 +1842,44 @@ def validate_cargo_retry(value,*,start):
     return value
 
 
+def validate_cargo_graph(value,*,initial_units,retry_units,selected_uid):
+    keys={'version','metadata_sha256','packages','targets','original_metadata_cleanup','admissions',
+        'input_closure_complete','shipping_authority'}
+    if (type(value) is not dict or set(value)!=keys
+            or any(type(value[key]) is not int or value[key]!=count for key,count in (('version',1),('packages',1),('targets',3)))
+            or not cache._digest(value['metadata_sha256']) or value['original_metadata_cleanup'] is not True
+            or value['input_closure_complete'] is not False or value['shipping_authority'] is not False
+            or type(value['admissions']) is not list or len(value['admissions'])!=4):raise FreshnessHold('input_census_unknown')
+    target_keys={'package_id','package_name','version','manifest_path','manifest_sha256','target_name','target_kind',
+        'source_path','source_sha256','metadata_sha256'}
+    expected={'/workspace/build.rs':('build-script-build',['custom-build']),
+        '/workspace/src/main.rs':('private-cargo-probe',['bin']),'/workspace/src/lib.rs':('private_cargo_probe',['lib'])}
+    initial={unit['ordinal'] for unit in initial_units};failed={unit['ordinal'] for unit in retry_units if unit['returncode']==1}
+    ordinals=[];sources=[];library=[]
+    for admission in value['admissions']:
+        if type(admission) is not dict or set(admission)!={'ordinal','target'} or type(admission['ordinal']) is not int:
+            raise FreshnessHold('input_census_unknown')
+        target=admission['target'];ordinal=admission['ordinal']
+        if (type(target) is not dict or set(target)!=target_keys
+                or any(type(target[key]) is not str for key in target_keys-{'target_kind'})
+                or not 0<len(target['package_id'])<=4096 or target['package_name']!='private-cargo-probe'
+                or target['version']!='0.0.0' or target['manifest_path']!='/workspace/Cargo.toml'
+                or any(not cache._digest(target[key]) for key in ('manifest_sha256','source_sha256','metadata_sha256'))
+                or target['metadata_sha256']!=value['metadata_sha256']
+                or (target['target_name'],target['target_kind'])!=expected.get(target['source_path'])
+                or ordinal not in initial|failed):raise FreshnessHold('input_census_unknown')
+        ordinals.append(ordinal);sources.append(target['source_path'])
+        if target['source_path']=='/workspace/src/lib.rs':library.append(ordinal)
+    if (ordinals!=sorted(set(ordinals)) or sorted(sources)!=sorted([*expected,'/workspace/src/lib.rs'])
+            or len(library)!=2 or library[0]+2000!=selected_uid or {library[1]}!=failed
+            or any(ordinal not in initial for ordinal in ordinals[:-1])):raise FreshnessHold('input_census_unknown')
+    return value
+
+
 def validate_cargo_probe(value):
     keys={'version','compiler_calls','application_runs','actual_metadata_preserved','sealed_artifact_detached',
         'units','allocation_removed','trusted_input_closure','shipping_authority','build_script_calls',
-        'generated_tree_preserved','library_input_mounted','invalidation','retry'}
+        'generated_tree_preserved','library_input_mounted','invalidation','retry','cargo_graph'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['compiler_calls']!=[3,0] or any(type(count) is not int for count in value['compiler_calls'])
             or value['build_script_calls']!=[1,0] or any(type(count) is not int for count in value['build_script_calls'])
@@ -1737,6 +1902,8 @@ def validate_cargo_probe(value):
                 or unit['original_cleanup'] is not True or unit['input_closure_complete'] is not False
                 or unit['shipping_authority'] is not False):raise FreshnessHold('cleanup_uncertain')
     validate_cargo_retry(value['retry'],start=value['units'][-1]['ordinal']+1)
+    validate_cargo_graph(value['cargo_graph'],initial_units=value['units'],retry_units=value['retry']['units'],
+        selected_uid=value['invalidation']['unit_uid'])
     return value
 
 

@@ -101,6 +101,11 @@ pub fn value()->u8{GENERATED}
         && probe["cargo"]["retry"]["failed_outputs_unpublished"]==true
         && probe["cargo"]["retry"]["pending"]==serde_json::json!(["binary","library"])
         && probe["cargo"]["retry"]["shipping_authority"]==false
+        && probe["cargo"]["cargo_graph"]["packages"]==1 && probe["cargo"]["cargo_graph"]["targets"]==3
+        && probe["cargo"]["cargo_graph"]["original_metadata_cleanup"]==true
+        && probe["cargo"]["cargo_graph"]["admissions"].as_array().is_some_and(|values|values.len()==4)
+        && probe["cargo"]["cargo_graph"]["input_closure_complete"]==false
+        && probe["cargo"]["cargo_graph"]["shipping_authority"]==false
         && probe["kernel_observation"]["witness_observed"]==true
         && probe["kernel_observation"]["positive_query_observed"]==true
         && probe["kernel_observation"]["negative_query_observed"]==true

@@ -23,6 +23,68 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def frozen_graph(self,directory):
+        root=Path(directory);member=root/'member';(member/'src').mkdir(parents=True)
+        (root/'Cargo.lock').write_text('version=4\n')
+        (member/'Cargo.toml').write_text('[package]\nname="consumer-package"\nversion="0.1.0"\nedition="2021"\n[lib]\nname="consumer"\n')
+        (member/'src/lib.rs').write_bytes(b'pub fn value()->u8{7}\n')
+        for path in root.rglob('*'):path.chmod(0o555 if path.is_dir() else 0o444)
+        root.chmod(0o555)
+        target={'kind':['lib'],'crate_types':['lib'],'name':'consumer','src_path':'/workspace/member/src/lib.rs','edition':'2021'}
+        package={'id':'path+file:///workspace/member#consumer-package@0.1.0','name':'consumer-package','version':'0.1.0',
+            'manifest_path':'/workspace/member/Cargo.toml','source':None,'targets':[target]}
+        metadata={'version':1,'workspace_root':'/workspace','target_directory':'/workspace/target',
+            'packages':[package],'workspace_members':[package['id']]}
+        return root,metadata
+
+    def graph_request(self):
+        request=self.mapped_request();request[2].update({b'CARGO_MANIFEST_DIR':b'/workspace/member',
+            b'CARGO_PKG_NAME':b'consumer-package',b'CARGO_PKG_VERSION':b'0.1.0',b'CARGO_CRATE_NAME':b'consumer'})
+        return request
+
+    def test_cargo_graph_binds_actual_manifest_target_source_and_package_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root,metadata=self.frozen_graph(directory)
+            graph=planner.CargoGraph(root,json.dumps(metadata).encode(),owner=os.geteuid())
+            admitted=graph.admit(self.graph_request(),host_triple=b'x86_64-unknown-linux-gnu')
+            self.assertEqual(admitted['cargo_target']['package_name'],'consumer-package')
+            self.assertEqual(admitted['cargo_target']['target_name'],'consumer')
+            self.assertEqual(admitted['cargo_target']['manifest_path'],'/workspace/member/Cargo.toml')
+            self.assertFalse(admitted['shipping_authority'])
+            for key,value in ((b'CARGO_PKG_NAME',b'other'),(b'CARGO_PKG_VERSION',b'9.0.0'),
+                    (b'CARGO_MANIFEST_DIR',b'/workspace/other'),(b'CARGO_CRATE_NAME',b'other')):
+                request=self.graph_request();request[2][key]=value
+                with self.subTest(key=key),self.assertRaises(planner.FreshnessHold):
+                    graph.admit(request,host_triple=b'x86_64-unknown-linux-gnu')
+            request=self.graph_request();request[1][request[1].index(b'src/lib.rs')]=b'Cargo.toml'
+            with self.assertRaises(planner.FreshnessHold):graph.admit(request,host_triple=b'x86_64-unknown-linux-gnu')
+
+    def test_cargo_graph_refuses_ambiguous_or_foreign_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root,original=self.frozen_graph(directory)
+            for fault in ('duplicate-package','duplicate-target','escape','foreign-root','missing-member'):
+                metadata=copy.deepcopy(original)
+                if fault=='duplicate-package':metadata['packages']*=2
+                elif fault=='duplicate-target':metadata['packages'][0]['targets']*=2
+                elif fault=='escape':metadata['packages'][0]['targets'][0]['src_path']='/workspace/member/../../outside.rs'
+                elif fault=='foreign-root':metadata['workspace_root']='/tmp'
+                else:metadata['workspace_members']=[]
+                with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
+                    planner.CargoGraph(root,json.dumps(metadata).encode(),owner=os.geteuid())
+
+    def test_cargo_graph_refuses_changed_frozen_source_even_with_old_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root,metadata=self.frozen_graph(directory)
+            graph=planner.CargoGraph(root,json.dumps(metadata).encode(),owner=os.geteuid())
+            source=root/'member/src/lib.rs';original=source.stat();source.chmod(0o600);source.write_bytes(b'pub fn value()->u8{9}\n')
+            source.chmod(0o444);os.utime(source,ns=(original.st_atime_ns,original.st_mtime_ns))
+            with self.assertRaises(planner.FreshnessHold):graph.admit(self.graph_request(),host_triple=b'x86_64-unknown-linux-gnu')
+        with tempfile.TemporaryDirectory() as directory:
+            root,metadata=self.frozen_graph(directory)
+            graph=planner.CargoGraph(root,json.dumps(metadata).encode(),owner=os.geteuid())
+            (root/'member/src').chmod(0o777)
+            with self.assertRaises(planner.FreshnessHold):graph.admit(self.graph_request(),host_triple=b'x86_64-unknown-linux-gnu')
+
     def mapped_request(self,*,source=b'src/lib.rs',name=b'consumer',kind=b'lib',emit=b'dep-info,metadata,link',extra=(),cwd=b'/workspace/member',out=b'/workspace/target/debug/deps'):
         argv=[b'/toolchain/bin/rustc',b'--crate-name',name,b'--edition=2021',source,
             *([b'--crate-type',kind] if kind is not None else []),b'--emit='+emit,
@@ -213,7 +275,7 @@ class PlannerProtocolTests(unittest.TestCase):
         value={'version':1,'compiler_calls':[3,0],'build_script_calls':[1,0],'generated_tree_preserved':True,'library_input_mounted':True,'application_runs':2,'actual_metadata_preserved':True,
             'sealed_artifact_detached':True,'units':units,'allocation_removed':True,
             'trusted_input_closure':False,'shipping_authority':False,'invalidation':self.compiler_invalidation(),
-            'retry':self.cargo_retry()}
+            'retry':self.cargo_retry(),'cargo_graph':self.cargo_graph()}
         self.assertEqual(planner.validate_cargo_probe(value),value)
         for field,replacement in (('compiler_calls',[True,0]),('compiler_calls',[3,1]),
                 ('build_script_calls',[True,0]),('build_script_calls',[1,1]),('generated_tree_preserved',False),('library_input_mounted',False),
@@ -239,6 +301,31 @@ class PlannerProtocolTests(unittest.TestCase):
             'units':[{'ordinal':14,'uid':2014,'started':True,'cancelled':False,'returncode':1,
                 'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False}],
             'input_closure_complete':False,'shipping_authority':False}
+
+    def cargo_graph(self):
+        admissions=[]
+        for ordinal,name,kind,source in ((7,'build-script-build','custom-build','build.rs'),
+                (8,'private_cargo_probe','lib','src/lib.rs'),(9,'private-cargo-probe','bin','src/main.rs'),
+                (14,'private_cargo_probe','lib','src/lib.rs')):
+            admissions.append({'ordinal':ordinal,'target':{'package_id':'fixed-package','package_name':'private-cargo-probe',
+                'version':'0.0.0','manifest_path':'/workspace/Cargo.toml','manifest_sha256':'1'*64,
+                'target_name':name,'target_kind':[kind],'source_path':'/workspace/'+source,
+                'source_sha256':'2'*64,'metadata_sha256':'3'*64}})
+        return {'version':1,'metadata_sha256':'3'*64,'packages':1,'targets':3,'original_metadata_cleanup':True,
+            'admissions':admissions,'input_closure_complete':False,'shipping_authority':False}
+
+    def test_cargo_graph_receipt_requires_every_compiler_binding_and_original_metadata_cleanup(self):
+        value=self.cargo_graph();initial=[{'ordinal':i,'uid':2000+i} for i in range(5,14)];retry=[{'ordinal':14,'returncode':1}]
+        self.assertEqual(planner.validate_cargo_graph(value,initial_units=initial,retry_units=retry,selected_uid=2008),value)
+        for field,replacement in (('original_metadata_cleanup',False),('packages',True),('targets',0),
+                ('admissions',value['admissions'][:-1]),('input_closure_complete',True),('shipping_authority',True)):
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):
+                planner.validate_cargo_graph(value|{field:replacement},initial_units=initial,retry_units=retry,selected_uid=2008)
+        for field,replacement in (('metadata_sha256','4'*64),('manifest_path','/tmp/Cargo.toml'),
+                ('source_path','/workspace/other.rs'),('target_name','other')):
+            bad=copy.deepcopy(value);bad['admissions'][0]['target'][field]=replacement
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):
+                planner.validate_cargo_graph(bad,initial_units=initial,retry_units=retry,selected_uid=2008)
 
     def test_actual_retry_requires_compiler_failure_and_original_planner_drain(self):
         value=self.cargo_retry()

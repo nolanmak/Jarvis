@@ -1187,3 +1187,23 @@ cases excluded). This native evidence exercises the original pinned graph;
 the new check/test/target mapping cases have host parser tests, not general
 execution admission or complete input/reuse proof. The original in-command
 fixture and production activation remain unfinished.
+
+Workspace target admission now consumes actual pinned Cargo metadata rather
+than inferring package identity from filenames. The private controller runs
+`cargo metadata --offline --locked --no-deps --format-version 1` under its own
+original supervisor and permits only information probes during that operation.
+It binds metadata package IDs, versions, manifest paths, target names/kinds,
+editions and source paths to sealed owner-checked files and parent directories.
+Each subsequent compiler request must match the package environment and exactly
+one declared target. Changed bytes at an old timestamp, writable/replaced
+parents, duplicate/ambiguous targets, foreign workspace paths and mismatched
+versions hold. Metadata and request hashes remain observations, not an input
+closure or reuse proof; original Cargo execution/cleanup provenance is required
+from the caller.
+
+The existing pinned replay now requires graph admission for all three initial
+compilers and the failed library retry. Its original cold/warm and error
+criteria remain unchanged. `--no-deps` does not admit registry dependencies;
+opaque tools, complete input closure, general graph execution dispatch,
+publication-time restart and the original in-command fixture remain unfinished.
+Native validation of this extension is pending.
