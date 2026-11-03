@@ -416,17 +416,23 @@ async fn live_shared_ci_in_command_generated_publication()->Result<()> {
     ensure!(seeded.status=="passed","fixture initial generator failed");
     let warm=session.run("repository",&source,root,&bound,None,&[],&[],&[],
         Some("python3 -I publication_fixture.py warm"),&storage,&target,&audit,timeout).await?;
-    let first:serde_json::Value=serde_json::from_str(warm.stdout.trim())?;
+    std::fs::write(evidence.join("warm.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "status":&warm.status,"stdout":&warm.stdout,"stderr":&warm.stderr,"shipping_authority":false}))?)?;
+    let first:serde_json::Value=serde_json::from_str(warm.stdout.trim()).context("warm fixture result missing; inspect private warm.json")?;
     ensure!(warm.status=="passed" && first["cargo_exit"]==0 && first["consumer_actual_rustc_calls"]==1
         && first["binary_output"]=="OLD","initial consumer did not compile and execute");
     let unchanged=session.run("repository",&source,root,&bound,None,&[],&[],&[],
         Some("python3 -I publication_fixture.py warm"),&storage,&target,&audit,timeout).await?;
-    let compatible:serde_json::Value=serde_json::from_str(unchanged.stdout.trim())?;
+    std::fs::write(evidence.join("unchanged.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "status":&unchanged.status,"stdout":&unchanged.stdout,"stderr":&unchanged.stderr,"shipping_authority":false}))?)?;
+    let compatible:serde_json::Value=serde_json::from_str(unchanged.stdout.trim()).context("unchanged fixture result missing; inspect private unchanged.json")?;
     ensure!(unchanged.status=="passed" && compatible["cargo_exit"]==0 && compatible["consumer_actual_rustc_calls"]==0
         && compatible["binary_output"]=="OLD","unchanged consumer failed minimum reuse");
     let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],
         Some("python3 -I publication_fixture.py publish"),&storage,&target,&audit,timeout).await?;
-    let actual:serde_json::Value=serde_json::from_str(observed.stdout.trim())?;
+    std::fs::write(evidence.join("publish.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "status":&observed.status,"stdout":&observed.stdout,"stderr":&observed.stderr,"shipping_authority":false}))?)?;
+    let actual:serde_json::Value=serde_json::from_str(observed.stdout.trim()).context("publication fixture result missing; inspect private publish.json")?;
     ensure!(actual["publication_after_fresh_decision"]==true && actual["original_read_file_mtimes_unchanged"]==true
         && actual["original_read_file_bytes_unchanged"]==true && actual["conflict_mtime_ns"]==946684800000000000_u64,
         "fixture did not establish its in-command old-mtime publication order");
