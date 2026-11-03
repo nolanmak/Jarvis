@@ -293,7 +293,7 @@ def run_cargo_commands(commands,input_roots):
         writes=journal.finish(stopped)
     finally:journal.close()
     guest_worker_receipts.append(stopped.observation())
-    if observed.get('exit_code')!=0:raise ci_cache['FreshnessHold']('input_census_unknown')
+    if observed.get('exit_code')!=0:raise ci_cache['FreshnessHold']('input_census_unknown',observed.get('stderr','').encode()[:8192])
     try:
         result=json.loads(observed['stdout'])
         if (type(result) is not dict or set(result)!={'exit_code','stdout','stderr','cargo_execution'}

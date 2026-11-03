@@ -1366,8 +1366,20 @@ class _CargoExecutor:
 
 
     def _mapping(self,request,publications,files):
-        return dispatch_request(request,graph=self.graph,planner_target=self.target,
-            publications=publications,files=files)
+        try:
+            return dispatch_request(request,graph=self.graph,planner_target=self.target,
+                publications=publications,files=files)
+        except FreshnessHold:
+            # Keep one bounded root-owned diagnostic, without environment
+            # values or granting any input/reuse capability.
+            file,argv,environment,cwd,search,*_=request
+            diagnostic={'version':1,'binding':self.admission.binding,'command':self.admission.command,
+                'file_hex':file[:4096].hex(),'argv_hex':[arg[:2048].hex() for arg in argv[:32]],
+                'cwd_hex':cwd[:4096].hex(),'search_hex':None if search is None else search[:4096].hex(),
+                'path_hex':environment.get(b'PATH',b'')[:4096].hex(),'shipping_authority':False}
+            cache._write_record(self.root/'held-request.json',diagnostic)
+            raise
+
 
     def _library_input(self):pass
     def _failed(self,mapping,raw):pass
@@ -1501,6 +1513,9 @@ class _CargoExecutor:
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             output,error=capture_command(child,value['deadline'])
             cleanup=original_cargo_cleanup(directory/'cleanup')
+            cache._write_record(directory/'result.json',{'version':1,'binding':self.admission.binding,
+                'command':self.admission.command,'returncode':child.returncode,
+                'diagnostics':relay.errors,'original_cleanup':True,'shipping_authority':False})
             if relay.errors:
                 _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
                 raise FreshnessHold('cleanup_uncertain')
