@@ -1175,4 +1175,15 @@ restrictions after shared parsing; this does not widen its execution admission.
 The mapper's request digest is not a compatible-unit key or input proof. The
 caller must still admit the package graph, toolchain and every publication.
 Proc macros, rustdoc, registry-source mounts, wrappers and general execution
-dispatch remain unfinished. Native validation of the parser refactor is pending.
+dispatch remain unfinished.
+
+The shared-parser refactor at `025b8b48` passed the original protected VM replay
+in **110.42 seconds**. It preserved cold/warm compiler counts `[3,0]`, build
+script counts `[1,0]`, two application runs, durable selected invalidation and
+the actual one-compiler E0761 retry. Original scopes, sealed bytes/metadata,
+unrelated fingerprints and all sixteen kernel programs/links remained intact.
+All 284 Python CI tests and 31 focused managed Rust tests passed (15 opt-in
+cases excluded). This native evidence exercises the original pinned graph;
+the new check/test/target mapping cases have host parser tests, not general
+execution admission or complete input/reuse proof. The original in-command
+fixture and production activation remain unfinished.
