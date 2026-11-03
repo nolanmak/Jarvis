@@ -42,6 +42,7 @@ def startup_errno(error):
     errors=b'\n'.join(line for line in error.lower().splitlines()
         if not line.startswith(b'stdin:') and b'warning:' not in line)
     if b'bpf stack limit is exceeded' in errors:return errno.E2BIG
+    if b'bpf program is too large' in errors:return errno.E2BIG
     if b'operation not permitted' in errors:return errno.EPERM
     if b'not found' in errors or b'no such file or directory' in errors:return errno.ENOENT
     return errno.EINVAL
@@ -479,12 +480,18 @@ kretprobe:getname_flags*
   $offset=(uint64)0;
   $chunks=(uint64)0;
   if ($length>0 && $length<=4096) {
-   while ($offset<$length) {
-    $size=$length-$offset;
-    if ($size>63) { $size=63; }
+   while ($offset+63<=$length) {
     printf("N %u %u %u %lld %llu %llu %llu %rh\n",$owner_uid,$owner_pid,$owner_tid,(int64)$call,$entry,
-     $offset,$length,buf($name+$offset,$size));
+     $offset,$length,buf($name+$offset,63));
     $chunks=$chunks+1; $offset=$offset+63;
+   }
+   if ($offset<$length) {
+    $size=$length-$offset;
+    if ($size>0 && $size<63) {
+     printf("N %u %u %u %lld %llu %llu %llu %rh\n",$owner_uid,$owner_pid,$owner_tid,(int64)$call,$entry,
+      $offset,$length,buf($name+$offset,$size));
+     $chunks=$chunks+1;
+    } else { printf("invalid kernel pathname tail\n"); $chunks=$chunks+1; }
    }
   } else {
    printf("invalid kernel pathname length\n"); $chunks=1;

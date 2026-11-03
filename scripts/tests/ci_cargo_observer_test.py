@@ -168,6 +168,7 @@ class KernelObserverTests(unittest.TestCase):
         data=(b'stdin:6-7: WARNING: getname_flags is not traceable; attaching will likely fail\n'
             b'error: in function rawtracepoint:sys_exit: Looks like the BPF stack limit is exceeded.\n')
         self.assertEqual(observer.startup_errno(data),errno.E2BIG)
+        self.assertEqual(observer.startup_errno(b'BPF program is too large. Processed 1000001 insn\nERROR: Error loading program'),errno.E2BIG)
         self.assertEqual(observer.startup_errno(b'ERROR: No such file or directory'),errno.ENOENT)
         self.assertEqual(observer.startup_errno(b'WARNING: not found\nERROR: invalid argument'),errno.EINVAL)
 
