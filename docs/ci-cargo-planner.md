@@ -1123,3 +1123,21 @@ reads. All 277 Python CI tests and 31 focused managed Rust tests passed (15
 opt-in Rust cases excluded); the updater checks remain 99/99. Full input closure,
 passing-CI and shipping authority remain false, and this result does not prove
 fingerprint invalidation, command restart, or the in-command regression.
+
+The next private replay step runs each Cargo invocation under its own original
+root supervisor. The controller validates the bound private cleanup receipt and
+joins all relay handlers before acting on pending work. It persists an exact
+fingerprint-retirement intent, compares the current owned metadata inventory,
+and removes only the library/binary directories named by that journal. Unknown
+paths, changed inventories, aliases and missing cleanup evidence refuse the
+operation. Unaffected fingerprint contents and historical sealed publications
+must remain intact.
+
+The same fixed Cargo command then runs a third time against the introduced
+generated publication. Acceptance requires one actual library compile, rustc
+exit 1 with E0761, Cargo exit 101, no build-script/application execution, and
+original cleanup for the failed compiler and planner. Failed compiler outputs
+are not published and pending state is never cleared. The existing successful
+cold/warm counts and exact-byte assertions remain unchanged. This is a private
+between-command invalidation diagnostic, not the original in-command restart
+exit or a passing-CI producer. Native validation of this new step is pending.

@@ -92,6 +92,15 @@ pub fn value()->u8{GENERATED}
         && probe["cargo"]["invalidation"]["original_sha256"]!=probe["cargo"]["invalidation"]["refreshed_sha256"]
         && probe["cargo"]["invalidation"]["input_closure_complete"]==false
         && probe["cargo"]["invalidation"]["shipping_authority"]==false
+        && probe["cargo"]["retry"]["cargo_exit"]==101 && probe["cargo"]["retry"]["library_exit"]==1
+        && probe["cargo"]["retry"]["compiler_calls"]==1 && probe["cargo"]["retry"]["diagnostic"]=="E0761"
+        && probe["cargo"]["retry"]["rounds"]==1 && probe["cargo"]["retry"]["original_planner_cleanup"]==true
+        && probe["cargo"]["retry"]["original_unit_cleanup"]==true
+        && probe["cargo"]["retry"]["unaffected_fingerprints_preserved"]==true
+        && probe["cargo"]["retry"]["original_generated_preserved"]==true
+        && probe["cargo"]["retry"]["failed_outputs_unpublished"]==true
+        && probe["cargo"]["retry"]["pending"]==serde_json::json!(["binary","library"])
+        && probe["cargo"]["retry"]["shipping_authority"]==false
         && probe["kernel_observation"]["witness_observed"]==true
         && probe["kernel_observation"]["positive_query_observed"]==true
         && probe["kernel_observation"]["negative_query_observed"]==true

@@ -53,7 +53,7 @@ def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
         'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute','planner_cargo_compile','planner_cargo_build_script','planner_cargo_application','planner_kernel_observer'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute','planner_cargo_compile','planner_cargo_build_script','planner_cargo_application','planner_cargo_supervisor','planner_cargo_retire','planner_cargo_retry','planner_kernel_observer'}
     categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','CalledProcessError','Unavailable'}
     value=value if type(value) is dict else {}
     return {'stage':value.get('stage') if value.get('stage') in phases else 'planner_startup',
@@ -322,6 +322,16 @@ class RootRelay:
         if self.thread.is_alive() or any(thread.is_alive() for thread in self._threads) or self._children:
             raise FreshnessHold('cleanup_uncertain')
         self.path.unlink()
+
+    def drain(self):
+        # Call only after the original planner supervisor has reaped its tree.
+        # A result can reach Cargo just before its handler releases descriptors.
+        deadline=time.monotonic()+6
+        threads=list(self._threads)
+        for thread in threads:thread.join(timeout=max(0,deadline-time.monotonic()))
+        with self._lock:
+            if (threads!=self._threads or any(thread.is_alive() for thread in threads)
+                    or self._children or self.errors):raise FreshnessHold('cleanup_uncertain')
 
     def config_fd(self):
         fd=os.memfd_create('ci-planner-client',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
@@ -767,7 +777,8 @@ class _CargoProbe:
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
         self.admission=admission;self.owner=os.getpid();self.units={};self.publications={};self.files={};self.report=None
-        self.generated_stats={};self.library_used=False
+        self.generated_stats={};self.library_used=False;self.commands=[]
+        self.retry_active=False;self.retry_publication=None;self.journal=None;self.fingerprints=None
         self.source=admission.target.parent/'source-projection'
         for name,body in (('Cargo.toml',CARGO_FIXTURE_MANIFEST),('src/main.rs',CARGO_FIXTURE_SOURCE),
                 ('src/lib.rs',CARGO_FIXTURE_LIB),('build.rs',CARGO_FIXTURE_BUILD)):
@@ -831,7 +842,7 @@ class _CargoProbe:
         return [raw,str(original),[raw,*row[1:]]]
 
     def _generated_input(self,artifacts,unit,name):
-        publication=self.publications.get('generated')
+        publication=self.retry_publication if self.retry_active else self.publications.get('generated')
         if publication is None or publication['roots']!=[name]:raise cargo_hold('planner_cargo_artifact')
         if unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']:
             raise cargo_hold('planner_cargo_artifact')
@@ -920,6 +931,9 @@ class _CargoProbe:
         pending=journal.changed({'library':after})
         restored=lookup_inputs.UnitInvalidations(ledger/'units.json',**args)
         if pending!=['binary','library'] or restored.pending()!=pending:raise FreshnessHold('metadata_torn')
+        self.journal=restored
+        self.retry_publication={'root':variant,'manifest':unit_views.inventory(variant,owner=0,sealed=True),
+            'roots':[mapping['generated_root']]}
         if (any(self._stat(path)!=prior for path,prior in self.generated_stats.items())
                 or unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']):
             raise FreshnessHold('input_census_unknown')
@@ -931,16 +945,24 @@ class _CargoProbe:
 
     def finish(self,view,directory,raw):
         ordinal=view['ordinal'];record=self.units[ordinal];mapping=record['mapping']
-        if raw!=0:
-            stage={'compile':'planner_cargo_compile','build_script':'planner_cargo_build_script',
-                'application':'planner_cargo_application'}.get(mapping['kind'],'planner_cargo_compile')
-            raise cargo_hold(stage)
         observed=cache._read_record(directory/'view-namespace.json')
         if (observed.get('binding')!=self.admission.binding or observed.get('command')!=self.admission.command
                 or observed.get('ordinal')!=ordinal
                 or set(observed['namespaces'])!={'mnt','ipc','net'}
                 or any(row['controller']==row['unit'] for row in observed['namespaces'].values())):
             raise FreshnessHold('invalidation_unsafe')
+        pid=observed.get('pid')
+        if type(pid) is not int or pid<=0:raise FreshnessHold('cleanup_uncertain')
+        record.update(finished=True,namespaces=observed['namespaces'],pid=pid,
+            root_identity=observed['root_identity'],returncode=raw)
+        if raw!=0:
+            if self.retry_active and mapping['kind']=='compile' and mapping['role']=='library' and raw==1:
+                # RootRelay has already checked the original cleanup receipt.
+                # Preserve the historical publication; expose no failed output.
+                return
+            stage={'compile':'planner_cargo_compile','build_script':'planner_cargo_build_script',
+                'application':'planner_cargo_application'}.get(mapping['kind'],'planner_cargo_compile')
+            raise cargo_hold(stage)
         if mapping['kind'] in ('compile','build_script'):
             label=mapping['role'] if mapping['kind']=='compile' else 'generated'
             if label in self.publications:raise FreshnessHold('input_census_unknown')
@@ -986,30 +1008,51 @@ class _CargoProbe:
             forged=Path(view['artifacts'])/'debug/.fingerprint/unit-forged'
             if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
                 raise FreshnessHold('invalidation_unsafe')
-        pid=observed.get('pid')
-        if type(pid) is not int or pid<=0:raise FreshnessHold('cleanup_uncertain')
-        record.update(finished=True,namespaces=observed['namespaces'],pid=pid,root_identity=observed['root_identity'])
+
+    def _command(self,value,relay):
+        global _PHASE,_CHILD_DIAGNOSTIC
+        _PHASE='planner_cargo_supervisor'
+        if self.owner!=os.getpid() or len(self.commands)>=3:raise FreshnessHold('invalidation_unsafe')
+        invocation=len(self.commands);directory=self.root/('command-'+str(invocation));directory.mkdir(mode=0o700)
+        control={'version':1,'binding':self.admission.binding,'command':self.admission.command,'invocation':invocation}
+        cache._write_record(directory/'control.json',control)
+        client=relay.config_fd();bootstrap=None;child=None
+        try:
+            config=dict(value,kind='cargo-supervisor',parent=os.getpid(),invocation=invocation,
+                command_directory=str(directory),cargo_root=str(self.root),source=str(self.source))
+            bootstrap=_sealed(config)
+            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--cargo-supervisor',str(bootstrap),str(client)],
+                pass_fds=(bootstrap,client),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            output,error=child.communicate(timeout=max(.001,value['deadline']-time.monotonic()))
+            cleanup=original_cargo_cleanup(directory/'cleanup')
+            if relay.errors:
+                _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
+                raise FreshnessHold('cleanup_uncertain')
+            relay.drain()
+            if len(error)>8192:raise FreshnessHold('metadata_torn')
+            self.commands.append({'directory':directory,'control':control,'cleanup':cleanup,'returncode':child.returncode})
+            return child.returncode,output,error
+        finally:
+            try:
+                if child is not None and child.poll() is None:
+                    child.terminate()
+                    try:child.wait(timeout=6)
+                    except subprocess.TimeoutExpired:
+                        child.kill();child.wait(timeout=2)
+                        raise FreshnessHold('cleanup_uncertain') from None
+            finally:
+                os.close(client)
+                if bootstrap is not None:os.close(bootstrap)
 
     def run(self,value,relay):
         first=len(relay.completed);counts=[];script_counts=[];fingerprint=None
         for iteration in range(2):
-            client=relay.config_fd();bootstrap=None;child=None;before=len(relay.completed)
-            try:
-                config=dict(value,kind='cargo',parent=os.getpid(),
-                    cargo_root=str(self.root),source=str(self.source))
-                bootstrap=_sealed(config)
-                child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--cargo',str(bootstrap),str(client)],
-                    pass_fds=(bootstrap,client),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-                output,error=child.communicate(timeout=max(.001,value['deadline']-time.monotonic()))
-                if child.returncode!=0 or output!=b'ISOLATED\n' or len(error)>8192 or relay.errors:
-                    global _CHILD_DIAGNOSTIC
-                    _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
-                    raise FreshnessHold('invalidation_unsafe')
-            finally:
-                if child is not None and child.poll() is None:child.kill();child.wait(timeout=5)
-                os.close(client)
-                if bootstrap is not None:os.close(bootstrap)
+            before=len(relay.completed);status,output,error=self._command(value,relay)
+            if status!=0 or output!=b'ISOLATED\n':
+                global _CHILD_DIAGNOSTIC
+                _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
+                raise FreshnessHold('invalidation_unsafe')
             completed=relay.completed[before:]
             count=sum(self.units[unit['ordinal']]['mapping']['kind']=='compile' for unit in completed)
             if count!=(3 if iteration==0 else 0):raise FreshnessHold('input_census_unknown')
@@ -1025,6 +1068,7 @@ class _CargoProbe:
                     or fingerprint is not None and current!=fingerprint):
                 raise FreshnessHold('invalidation_unsafe')
             fingerprint=current
+        self.fingerprints=fingerprint
         if (set(self.publications)!={'build-script','generated','library','binary'} or not self.library_used
                 or not self.generated_stats or any(not unit['finished'] for unit in self.units.values())
                 or any(unit_views.inventory(pub['root'],owner=0,sealed=True)!=pub['manifest'] for pub in self.publications.values())
@@ -1036,6 +1080,56 @@ class _CargoProbe:
             'units':relay.completed[first:],'allocation_removed':False,
             'trusted_input_closure':False,'shipping_authority':False}
 
+    def retry_invalidated(self,value,relay):
+        global _PHASE
+        _PHASE='planner_cargo_retire'
+        if (self.owner!=os.getpid() or self.report is None or len(self.commands)!=2
+                or self.journal is None or self.retry_publication is None
+                or any(command['returncode']!=0 for command in self.commands)
+                or any(not unit['finished'] for unit in self.units.values())):raise FreshnessHold('cleanup_uncertain')
+        _source(self.admission.target,self.admission.binding,self.admission.command)
+        for command in self.commands:
+            if (cache._read_record(command['directory']/'control.json')!=command['control']
+                    or original_cargo_cleanup(command['directory']/'cleanup')!=command['cleanup']):
+                raise FreshnessHold('cleanup_uncertain')
+        relay.drain()
+        restored=lookup_inputs.UnitInvalidations(self.journal.path,
+            binding=self.admission.binding,command=self.admission.command)
+        if restored.state()!=self.journal.state() or restored.pending()!=['binary','library']:
+            raise FreshnessHold('metadata_torn')
+        state=restored.state();paths=[path for name in restored.pending() for path in state['units'][name]['fingerprints']]
+        intent={'version':1,'binding':self.admission.binding,'command':self.admission.command,
+            'paths':paths,'fingerprints':self.fingerprints,'pending':restored.pending(),'state':'prepared'}
+        cache._write_record(self.root/'invalidations/retirement.json',intent)
+        retained=retire_unit_fingerprints(self.target,self.fingerprints,paths)
+        cache._write_record(self.root/'invalidations/retirement.json',intent|{'state':'retired'})
+        before=len(relay.completed);old_publications=copy_publications(self.publications)
+        self.retry_active=True;_PHASE='planner_cargo_retry'
+        try:status,output,error=self._command(value,relay)
+        finally:self.retry_active=False
+        completed=relay.completed[before:]
+        compilers=[unit for unit in completed if self.units[unit['ordinal']]['mapping']['kind']=='compile']
+        if (status!=101 or output or b'E0761' not in error or len(compilers)!=1
+                or self.units[compilers[0]['ordinal']]['mapping']['role']!='library'
+                or compilers[0]['returncode']!=1
+                or any(self.units[unit['ordinal']]['mapping']['kind'] in ('application','build_script') for unit in completed)
+                or copy_publications(self.publications)!=old_publications
+                or any(self._stat(path)!=prior for path,prior in self.generated_stats.items())):
+            raise cargo_hold('planner_cargo_compile')
+        current=unit_views.inventory(self.target/'debug/.fingerprint',owner=1001,sealed=False)
+        selected=[os.fsencode(Path(path).name) for path in paths]
+        unaffected=[row for row in current if not any(bytes.fromhex(row[0])==prefix
+            or bytes.fromhex(row[0]).startswith(prefix+b'/') for prefix in selected)]
+        if unaffected!=retained:raise FreshnessHold('invalidation_unsafe')
+        restored=lookup_inputs.UnitInvalidations(self.journal.path,
+            binding=self.admission.binding,command=self.admission.command)
+        if restored.state()!=self.journal.state():raise FreshnessHold('metadata_torn')
+        self.report['retry']={'version':1,'cargo_exit':status,'library_exit':1,'compiler_calls':1,'diagnostic':'E0761',
+            'rounds':1,'original_planner_cleanup':True,'original_unit_cleanup':True,
+            'unaffected_fingerprints_preserved':True,'original_generated_preserved':True,
+            'failed_outputs_unpublished':True,'pending':restored.pending(),'units':completed,
+            'input_closure_complete':False,'shipping_authority':False}
+
     def cleanup(self):
         if self.owner!=os.getpid() or self.report is None:raise FreshnessHold('cleanup_uncertain')
         _source(self.admission.target,self.admission.binding,self.admission.command)
@@ -1046,6 +1140,77 @@ class _CargoProbe:
 
 def cargo_hold(stage):
     error=FreshnessHold('artifact_provenance_unknown');error.unit_view_stage=stage;return error
+
+
+def copy_publications(publications):
+    result={}
+    for label,publication in publications.items():
+        actual=unit_views.inventory(publication['root'],owner=0,sealed=True)
+        if actual!=publication['manifest']:raise FreshnessHold('artifact_provenance_unknown')
+        result[label]=(str(publication['root']),actual,tuple(publication['files']),tuple(publication['roots']))
+    return result
+
+
+def original_cargo_cleanup(path,*,owner=0):
+    try:
+        path=unit_views.literal(path)
+        expected=b'all-descendants-reaped\n'
+        if unit_views._read(path,owner,False)!=(0o600,len(expected),hashlib.sha256(expected).hexdigest()):
+            raise FreshnessHold('cleanup_uncertain')
+        return _CargoProbe._stat(path)
+    except (OSError,unit_views.FreshnessHold):raise FreshnessHold('cleanup_uncertain') from None
+
+
+def retire_unit_fingerprints(target,expected,paths,*,owner=1001):
+    """Remove exact inventoried directories after caller-proved scope drainage.
+
+    This is not an ownership/quiescence capability. The admitted root planner
+    must persist invalidation intent and authenticate these paths beforehand.
+    """
+    try:
+        target=unit_views.literal(target);metadata=unit_views.literal(target/'debug/.fingerprint')
+        if (target.stat().st_uid!=owner or type(paths) is not list or not 0<len(paths)<=64
+                or any(type(path) is not str for path in paths) or len(set(paths))!=len(paths)
+                or not shutil.rmtree.avoids_symlink_attacks):raise FreshnessHold('invalidation_unsafe')
+        names=[]
+        for path in paths:
+            parts=unit_views.relative(path).parts
+            if len(parts)!=3 or parts[:2]!=('debug','.fingerprint'):raise FreshnessHold('invalidation_unsafe')
+            names.append(parts[2])
+        current=unit_views.inventory(metadata,owner=owner,sealed=False)
+        if current!=expected:raise FreshnessHold('invalidation_unsafe')
+        roots={bytes.fromhex(row[0]) for row in current if row[1]=='directory'}
+        prefixes=[os.fsencode(name) for name in names]
+        if any(prefix not in roots for prefix in prefixes):raise FreshnessHold('invalidation_unsafe')
+        retained=[row for row in current if not any(bytes.fromhex(row[0])==prefix
+            or bytes.fromhex(row[0]).startswith(prefix+b'/') for prefix in prefixes)]
+        descriptor=os.open(metadata,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW)
+        try:
+            for name in names:shutil.rmtree(name,dir_fd=descriptor)
+            os.fsync(descriptor)
+        finally:os.close(descriptor)
+        if unit_views.inventory(metadata,owner=owner,sealed=False)!=retained:raise FreshnessHold('invalidation_unsafe')
+        return retained
+    except OSError:raise FreshnessHold('invalidation_unsafe') from None
+
+
+def _cargo_supervisor(arguments):
+    """Original root supervisor for exactly one sealed Cargo invocation."""
+    global _PHASE
+    _PHASE='planner_cargo_supervisor'
+    bootstrap,configuration=map(int,arguments)
+    value=_bootstrap(bootstrap,'cargo-supervisor');_parent_guard(value['parent']);os.close(bootstrap)
+    root=unit_views.literal(value['cargo_root']);directory=unit_views.literal(value['command_directory'])
+    if (directory.parent!=root or re.fullmatch(r'command-[0-9]{1,3}',directory.name) is None
+            or stat.S_IMODE(directory.stat().st_mode)!=0o700 or directory.stat().st_uid!=0
+            or cache._read_record(directory/'control.json')!={'version':1,'binding':value['binding'],
+                'command':value['command'],'invocation':value['invocation']}):
+        raise FreshnessHold('cleanup_uncertain')
+    child_bootstrap=_sealed(dict(value,kind='cargo',parent=os.getpid()))
+    supervisor=_load('original_cargo_supervisor','provider-supervisor.py')
+    return supervisor.supervise(directory/'cleanup',
+        [sys.executable,'-I',str(Path(__file__).resolve()),'--cargo',str(child_bootstrap),str(configuration)],
+        forward_fds=(child_bootstrap,configuration),close_after_spawn=(child_bootstrap,))
 
 
 def _cargo(arguments):
@@ -1355,18 +1520,20 @@ def _probe(arguments):
                     or completed['original_cleanup'] is not True):raise FreshnessHold('cleanup_uncertain')
         original_units=list(relay.completed)
         cargo_probe=_CargoProbe(admission);relay.views=cargo_probe;cargo_probe.run(value,relay)
-    _PHASE='planner_kernel_observer'
-    compilers={item['mapping']['role']:(item['pid'],2000+ordinal)
-        for ordinal,item in cargo_probe.units.items() if item['mapping']['kind']=='compile'}
-    generated=cargo_probe.publications['generated']
-    empty=generated['root']/generated['roots'][0]/'empty'
-    directories=[(view_probe.original_pid,2004,view_probe.inputs/'deps',view_probe.directory_members),
-        (view_probe.original_pid,2004,view_probe.inputs/'deps/empty',{})]
-    directories.extend((item['pid'],2000+ordinal,empty,{}) for ordinal,item in cargo_probe.units.items()
-        if item['mapping']['kind']=='application')
-    kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor',
-        view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'),results[4]['statx_sha256'],view_probe.source,
-        int(view_probe.receipt['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),view_probe,cargo_probe)
+        relay.drain()
+        _PHASE='planner_kernel_observer'
+        compilers={item['mapping']['role']:(item['pid'],2000+ordinal)
+            for ordinal,item in cargo_probe.units.items() if item['mapping']['kind']=='compile'}
+        generated=cargo_probe.publications['generated']
+        empty=generated['root']/generated['roots'][0]/'empty'
+        directories=[(view_probe.original_pid,2004,view_probe.inputs/'deps',view_probe.directory_members),
+            (view_probe.original_pid,2004,view_probe.inputs/'deps/empty',{})]
+        directories.extend((item['pid'],2000+ordinal,empty,{}) for ordinal,item in cargo_probe.units.items()
+            if item['mapping']['kind']=='application')
+        kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor',
+            view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'),results[4]['statx_sha256'],view_probe.source,
+            int(view_probe.receipt['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),view_probe,cargo_probe)
+        cargo_probe.retry_invalidated(value,relay)
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],
@@ -1432,10 +1599,35 @@ def validate_compiler_invalidation(value):
     return value
 
 
+def validate_cargo_retry(value,*,start):
+    flags={'original_planner_cleanup','original_unit_cleanup','unaffected_fingerprints_preserved',
+        'original_generated_preserved','failed_outputs_unpublished'}
+    keys=flags|{'version','cargo_exit','library_exit','compiler_calls','diagnostic','rounds','pending','units',
+        'input_closure_complete','shipping_authority'}
+    integers={'version':1,'cargo_exit':101,'library_exit':1,'compiler_calls':1,'rounds':1}
+    if (type(value) is not dict or set(value)!=keys or type(start) is not int or not 5<=start<4096
+            or any(type(value[key]) is not int or value[key]!=expected for key,expected in integers.items())
+            or value['diagnostic']!='E0761' or value['pending']!=['binary','library']
+            or any(value[key] is not True for key in flags) or value['input_closure_complete'] is not False
+            or value['shipping_authority'] is not False or type(value['units']) is not list or not 0<len(value['units'])<=32):
+        raise FreshnessHold('input_census_unknown')
+    for ordinal,unit in enumerate(value['units'],start=start):
+        if (type(unit) is not dict or set(unit)!={'ordinal','uid','started','cancelled','returncode',
+                'original_cleanup','input_closure_complete','shipping_authority'}
+                or type(unit['ordinal']) is not int or unit['ordinal']!=ordinal or ordinal>=4096
+                or type(unit['uid']) is not int or unit['uid']!=2000+ordinal
+                or type(unit['returncode']) is not int or unit['returncode'] not in (0,1)
+                or unit['started'] is not True or unit['cancelled'] is not False or unit['original_cleanup'] is not True
+                or unit['input_closure_complete'] is not False or unit['shipping_authority'] is not False):
+            raise FreshnessHold('cleanup_uncertain')
+    if sum(unit['returncode']==1 for unit in value['units'])!=1:raise FreshnessHold('input_census_unknown')
+    return value
+
+
 def validate_cargo_probe(value):
     keys={'version','compiler_calls','application_runs','actual_metadata_preserved','sealed_artifact_detached',
         'units','allocation_removed','trusted_input_closure','shipping_authority','build_script_calls',
-        'generated_tree_preserved','library_input_mounted','invalidation'}
+        'generated_tree_preserved','library_input_mounted','invalidation','retry'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['compiler_calls']!=[3,0] or any(type(count) is not int for count in value['compiler_calls'])
             or value['build_script_calls']!=[1,0] or any(type(count) is not int for count in value['build_script_calls'])
@@ -1457,6 +1649,7 @@ def validate_cargo_probe(value):
                 or type(unit['returncode']) is not int or unit['returncode']!=0
                 or unit['original_cleanup'] is not True or unit['input_closure_complete'] is not False
                 or unit['shipping_authority'] is not False):raise FreshnessHold('cleanup_uncertain')
+    validate_cargo_retry(value['retry'],start=value['units'][-1]['ordinal']+1)
     return value
 
 
@@ -1514,6 +1707,7 @@ if __name__=='__main__':
         elif sys.argv[1:2]==['--stage']:result=_stage(sys.argv[2:])
         elif sys.argv[1:2]==['--planner']:result=_planner(sys.argv[2:])
         elif sys.argv[1:2]==['--cargo']:result=_cargo(sys.argv[2:])
+        elif sys.argv[1:2]==['--cargo-supervisor']:result=_cargo_supervisor(sys.argv[2:])
         elif sys.argv[1:2]==['--probe']:result=_probe(sys.argv[2:])
         elif sys.argv[1:2]==['--probe-supervisor']:result=_probe_supervisor(sys.argv[2:])
         else:raise FreshnessHold('invalidation_unsafe')

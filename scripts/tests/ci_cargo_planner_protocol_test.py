@@ -13,6 +13,7 @@ import hashlib
 import json
 import socket
 import array
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -22,6 +23,59 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_planner_drain_requires_joined_threads_and_no_original_children(self):
+        relay=object.__new__(planner.RootRelay)
+        relay._threads=[];relay._children=set();relay._lock=threading.Lock();relay.errors=[]
+        relay.drain()
+        relay._children.add(object())
+        with self.assertRaises(planner.FreshnessHold):relay.drain()
+        relay._children.clear();relay.errors.append({'stage':'planner_unit'})
+        with self.assertRaises(planner.FreshnessHold):relay.drain()
+        relay.errors.clear()
+        class StillRunning:
+            def join(self,timeout):pass
+            def is_alive(self):return True
+        relay._threads=[StillRunning()]
+        with self.assertRaises(planner.FreshnessHold):relay.drain()
+
+    def test_original_cargo_cleanup_refuses_missing_torn_public_and_linked_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);path=root/'cleanup';body=b'all-descendants-reaped\n'
+            with self.assertRaises(planner.FreshnessHold):planner.original_cargo_cleanup(path,owner=os.geteuid())
+            path.write_bytes(body);path.chmod(0o600)
+            self.assertIsNotNone(planner.original_cargo_cleanup(path,owner=os.geteuid()))
+            for fault in ('torn','public','hardlink','symlink'):
+                path.write_bytes(body);path.chmod(0o600)
+                if fault=='torn':path.write_bytes(b'parent exited\n')
+                elif fault=='public':path.chmod(0o644)
+                elif fault=='hardlink':os.link(path,root/'alias')
+                else:
+                    path.rename(root/'backing');path.symlink_to(root/'backing')
+                with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
+                    planner.original_cargo_cleanup(path,owner=os.geteuid())
+                if fault=='hardlink':(root/'alias').unlink()
+                if fault=='symlink':path.unlink()
+
+    def test_fingerprint_retirement_preserves_unrelated_units_and_refuses_unknown_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);metadata=root/'debug/.fingerprint';metadata.mkdir(parents=True)
+            for name in ('library-abcd','binary-abcd','unrelated-abcd'):
+                (metadata/name).mkdir();(metadata/name/'record').write_bytes(name.encode())
+            expected=planner.unit_views.inventory(metadata,owner=os.geteuid(),sealed=False)
+            for paths in (['debug/.fingerprint/missing'],['debug/.fingerprint/../source'],['debug/.fingerprint/library-abcd']*2):
+                with self.subTest(paths=paths),self.assertRaises(planner.FreshnessHold):
+                    planner.retire_unit_fingerprints(root,expected,paths,owner=os.geteuid())
+                self.assertEqual(planner.unit_views.inventory(metadata,owner=os.geteuid(),sealed=False),expected)
+            (metadata/'library-abcd/record').write_bytes(b'changed')
+            with self.assertRaises(planner.FreshnessHold):
+                planner.retire_unit_fingerprints(root,expected,['debug/.fingerprint/library-abcd'],owner=os.geteuid())
+            (metadata/'library-abcd/record').write_bytes(b'library-abcd')
+            result=planner.retire_unit_fingerprints(root,expected,
+                ['debug/.fingerprint/library-abcd','debug/.fingerprint/binary-abcd'],owner=os.geteuid())
+            self.assertEqual((metadata/'unrelated-abcd/record').read_bytes(),b'unrelated-abcd')
+            self.assertFalse((metadata/'library-abcd').exists());self.assertFalse((metadata/'binary-abcd').exists())
+            self.assertEqual(result,planner.unit_views.inventory(metadata,owner=os.geteuid(),sealed=False))
+
     def test_actual_library_and_build_script_graph_requests_keep_original_paths(self):
         generated=b'/workspace/target/debug/build/private-cargo-probe-bbbbbbbbbbbbbbbb/out'
         def compile(source,name,kind,out,emit,extra=None):
@@ -112,7 +166,8 @@ class PlannerProtocolTests(unittest.TestCase):
             'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5,14)]
         value={'version':1,'compiler_calls':[3,0],'build_script_calls':[1,0],'generated_tree_preserved':True,'library_input_mounted':True,'application_runs':2,'actual_metadata_preserved':True,
             'sealed_artifact_detached':True,'units':units,'allocation_removed':True,
-            'trusted_input_closure':False,'shipping_authority':False,'invalidation':self.compiler_invalidation()}
+            'trusted_input_closure':False,'shipping_authority':False,'invalidation':self.compiler_invalidation(),
+            'retry':self.cargo_retry()}
         self.assertEqual(planner.validate_cargo_probe(value),value)
         for field,replacement in (('compiler_calls',[True,0]),('compiler_calls',[3,1]),
                 ('build_script_calls',[True,0]),('build_script_calls',[1,1]),('generated_tree_preserved',False),('library_input_mounted',False),
@@ -129,6 +184,28 @@ class PlannerProtocolTests(unittest.TestCase):
         return {'version':1,'unit_pid':42,'unit_uid':2008,'queries':1,'binding_sha256':'1'*64,
             'original_sha256':'2'*64,'refreshed_sha256':'3'*64,'pending':['binary','library'],
             'durable':True,'original_generated_preserved':True,'input_closure_complete':False,'shipping_authority':False}
+
+    def cargo_retry(self):
+        return {'version':1,'cargo_exit':101,'library_exit':1,'compiler_calls':1,'diagnostic':'E0761',
+            'rounds':1,'original_planner_cleanup':True,'original_unit_cleanup':True,
+            'unaffected_fingerprints_preserved':True,'original_generated_preserved':True,
+            'failed_outputs_unpublished':True,'pending':['binary','library'],
+            'units':[{'ordinal':14,'uid':2014,'started':True,'cancelled':False,'returncode':1,
+                'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False}],
+            'input_closure_complete':False,'shipping_authority':False}
+
+    def test_actual_retry_requires_compiler_failure_and_original_planner_drain(self):
+        value=self.cargo_retry()
+        self.assertEqual(planner.validate_cargo_retry(value,start=14),value)
+        for field,replacement in (('cargo_exit',0),('compiler_calls',True),('compiler_calls',0),('diagnostic','OLD'),
+                ('rounds',True),('original_planner_cleanup',False),('original_unit_cleanup',False),
+                ('unaffected_fingerprints_preserved',False),('original_generated_preserved',False),
+                ('failed_outputs_unpublished',False),('pending',[]),('input_closure_complete',True),('shipping_authority',True)):
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):
+                planner.validate_cargo_retry(value|{field:replacement},start=14)
+        for field,replacement in (('returncode',0),('original_cleanup',False),('started',False),('ordinal',13),('uid',1001)):
+            bad=copy.deepcopy(value);bad['units'][0][field]=replacement
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):planner.validate_cargo_retry(bad,start=14)
 
     def test_compiler_invalidation_report_requires_changed_content_and_durable_dependents(self):
         value=self.compiler_invalidation()
