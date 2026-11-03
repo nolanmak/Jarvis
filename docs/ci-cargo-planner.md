@@ -175,7 +175,7 @@ generated inputs or enable protected Cargo execution or passing-CI publication.
    atime: those are observable inputs even when bytes stay identical. The host
    regression reproduces those changes; input inventory reads and unit mounts
    now use no-atime semantics. New publications get new immutable inodes and
-   index entries. Keep an old publication unchanged and linked until every
+   index entries. Keep an old publication's original directory entry unchanged until every
    original consumer scope is stopped, not merely until its producer stops.
    Unknown consumer ownership blocks retirement. Directory namespaces are
    private, so a later publication cannot introduce a missing candidate into
@@ -221,8 +221,11 @@ actual distinct mount/IPC/network namespaces, generated-file byte and inode
 metadata stability, isolation negatives, stopped output publication and original
 allocation removal. Its binary SHA-256 is
 `e1febea9300eb3664c46e11340db57ca1568d03d280557e7d43780203a034666`.
-The later extended-attribute and external-alias refusal guards require their
-current-build replay. Host filesystem tests and strict receipt validation are
+The guarded replay at `167bc570` passed in 88.15 seconds after adding explicit
+extended-attribute and external-inode-alias refusals. Its binary SHA-256 is
+`cfb6c7ae6f87b88beb805462327f17cc1749cfdd835c150e669d5152612bb6a3`.
+Ten host filesystem tests pass; the integrated harness passes 235 CI Python tests
+without skips, 31 focused Rust tests and 96 updater tests. These observations are
 mechanics evidence; neither is a trusted input closure or a reusable producer proof.
 
 The prototype uses only a pinned literal artifact and output slot. The actual
