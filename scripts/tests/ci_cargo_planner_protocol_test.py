@@ -24,6 +24,20 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_dispatch_admits_pinned_rustc_path_search_without_rewriting_actual_request(self):
+        path=b'/toolchain/bin:/usr/bin:/bin'
+        request=(b'rustc',[b'rustc',b'-vV'],{b'PATH':path},b'/workspace',path,0,0)
+        original=copy.deepcopy(request)
+        self.assertEqual(planner.dispatch_request(request,graph=None,planner_target=None,publications={},files={}),{'kind':'information'})
+        self.assertEqual(request,original)
+        for search in (None,b'/tmp:/toolchain/bin',b':/toolchain/bin',b'/usr/bin:/toolchain/bin',b'./bin:/toolchain/bin'):
+            with self.subTest(search=search),self.assertRaises(planner.FreshnessHold):
+                planner.dispatch_request((request[0],request[1],request[2],request[3],search,0,0),
+                    graph=None,planner_target=None,publications={},files={})
+        with self.assertRaises(planner.FreshnessHold):
+            planner.dispatch_request((request[0],request[1],{b'PATH':b'/tmp'},request[3],path,0,0),
+                graph=None,planner_target=None,publications={},files={})
+
     def test_original_invocation_preserves_flags_environment_and_rejects_transport_injection(self):
         environment={'CARGO_TARGET_DIR':'/workspace/target','CARGO_HOME':'/ci-cargo-home',
             'RUSTFLAGS':'--cfg original_flag','CUSTOM':'value with spaces\nand newline'}

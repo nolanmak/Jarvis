@@ -665,13 +665,25 @@ def dispatch_request(request,*,graph,planner_target,publications,files,host_trip
     grants neither compatibility/reuse nor complete input or CI authority.
     """
     try:
+        original=request
         file,argv,environment,cwd,search,ignored,blocked=request
         if not argv or argv[0]!=file:raise ValueError()
+        if file==b'rustc':
+            # The admitted runtime's immutable first PATH entry contains the
+            # pinned compiler. Normalize only for decoding/graph admission;
+            # the sealed original request still executes unchanged in its view.
+            if (search not in (b'/toolchain/bin',b'/toolchain/bin:/usr/bin:/bin')
+                    or environment.get(b'PATH')!=search):raise ValueError()
+            file=b'/toolchain/bin/rustc'
+            request=(file,[file,*argv[1:]],environment,cwd,search,ignored,blocked)
         if file==b'/toolchain/bin/rustc':
             candidate=rustc_unit(request,package=environment.get(b'CARGO_PKG_NAME',b'cargo-information'),host_triple=host_triple)
             if candidate['kind']=='information':return candidate
             if type(graph) is not CargoGraph:raise ValueError()
             admitted=graph.admit(request,host_triple=host_triple)
+            if request is not original:
+                context=lookup_inputs._wire([original[0],original[1],sorted(environment.items()),cwd,search,ignored,blocked])
+                admitted['request_sha256']=hashlib.sha256(json.dumps(context,sort_keys=True,separators=(',',':')).encode()).hexdigest()
             for name in admitted['dependencies']:
                 key,row=files[name];publication=publications[key]
                 if publication['action'] not in ('library','check') or row[1]!='file':raise ValueError()
