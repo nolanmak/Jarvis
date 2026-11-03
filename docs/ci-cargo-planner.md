@@ -1491,7 +1491,7 @@ coverage, compatible reuse authority, or passing-CI evidence.
 
 The generated-forest replay now uses `arbitrary/source.rs` and requires original
 compiler source opens plus unchanged-unit reuse, covering paths outside the old
-fixture allowlist. Its native validation with the general collector is pending.
+fixture allowlist. Native validation with the general collector is recorded below.
 Durable selector revalidation, opaque wrapper execution and the original
 in-command publication regression remain unfinished; production is disabled.
 
@@ -1525,3 +1525,14 @@ cases excluded; these three VM cases were explicitly executed. Durable selected
 input revalidation, opaque producer/wrapper mediation, complete input closure,
 the original in-command regression, final proof API/audit and production merge
 enforcement remain unfinished. Production remains disabled.
+
+
+A subsequent read-only inspection of the stopped image under the managed lease
+verified both original observation-record SHA-256 values across recovery. The
+first record retained 1,932 pathname queries, 32 directory reads and 554 metadata
+observations, including the literal generated lookup
+`arbitrary/../node_modules/generated.rs`. The recovered record retained 33
+pathname queries, 10 directory reads and 48 metadata observations for the actual
+application, with no invented compiler executions. The original raw names and
+scope evidence are inputs to the next selector step; they are not normalized
+into a compatibility or passing-CI verdict.
