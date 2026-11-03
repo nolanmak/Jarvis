@@ -361,7 +361,7 @@ class FrozenLookupIndex:
     quiescence. Neither a root-owned tree nor this index proves complete inputs
     or grants artifact reuse. Unknown bases and mount aliases are refused.
     """
-    def __init__(self,namespaces,*,anchors=None,owner):
+    def __init__(self,namespaces,*,anchors=None,kernel_roots=None,owner):
         spec=importlib.util.spec_from_file_location('lookup_views',Path(__file__).with_name('ci-cargo-views.py'))
         self.views=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.views)
         self.owner=owner;self._trees=[];self._identities=[];self._bases={};self._objects={}
@@ -386,6 +386,21 @@ class FrozenLookupIndex:
                 root=self.views.literal(root);info=root.lstat()
                 if not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner or stat.S_IMODE(info.st_mode)!=0o555:_hold()
                 self._remember(root,info);self._anchor(virtual,root,info)
+            # A departed private mount namespace cannot be inspected here.
+            # Only the admitted controller may supply its original root object,
+            # captured at the supervised exec stop before releasing user code.
+            # This anchor routes absolute names; the census still refuses facts
+            # outside the explicitly frozen input trees.
+            kernel_roots={} if kernel_roots is None else copy.deepcopy(kernel_roots)
+            if type(kernel_roots) is not dict or set(kernel_roots)-{'/'}:_hold()
+            for prefix,identity in kernel_roots.items():
+                if type(identity) is not dict or set(identity)!={'device','inode','mode'}:_hold()
+                if (any(type(identity[key]) is not int for key in identity)
+                        or not 0<=identity['device']<2**32 or not 0<identity['inode']<2**64
+                        or not 0<=identity['mode']<2**16 or not stat.S_ISDIR(identity['mode'])):_hold()
+                key=tuple(identity[name] for name in ('device','inode','mode'))
+                if key in self._bases and self._bases[key]!=b'/':_hold()
+                self._bases[key]=b'/'
             self.census=LookupCensus.from_inventory(content)
             if any(virtual not in self.census._nodes and virtual not in self.census._routes for virtual in self._bases.values()):_hold()
             self._layout=tuple(sorted(self.census._roots));self._verify()

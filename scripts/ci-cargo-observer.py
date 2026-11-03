@@ -1125,7 +1125,7 @@ class Observer:
         for stream in (self.output,self.error):
             if stream is not None and not stream.closed:stream.close()
 
-    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest,source_root,mount_namespace,content_probe):
+    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest,source_root,mount_namespace,content_probe,compiler_probe):
         self.stop()
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
@@ -1194,6 +1194,7 @@ class Observer:
                 and e['result']>=0 and e['path'].endswith(b'/out/generated.rs') for e in events):
             raise ObservationUnavailable('original generated input lookup missing')
         content=content_probe.observe_content(events,metadata,unit_pid,self.user_namespace,mount_namespace)
+        compiler_probe.record_invalidations(events,metadata,self.user_namespace)
         self.report={**self.control,'kernel_release':os.uname().release,'unit_pid':unit_pid,'unit_uid':2004,
             'program_sha256':hashlib.sha256(self.program.encode()).hexdigest(),'binary_sha256':self.binary_sha256,
             'witness_observed':True,'positive_query_observed':True,'negative_query_observed':True,'max_path_query_observed':True,

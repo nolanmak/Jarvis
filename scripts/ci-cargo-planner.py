@@ -289,7 +289,8 @@ def fixture_request(request):
     generated=fixture_out_dir(environment)
     if role=='library' and generated is None or role=='build-script' and generated is not None:
         raise FreshnessHold('input_census_unknown')
-    return {'kind':'compile','role':role,'outputs':outputs,'dependencies':dependencies,'generated_root':generated}
+    return {'kind':'compile','role':role,'outputs':outputs,'dependencies':dependencies,'generated_root':generated,
+        'fingerprint':'debug/.fingerprint/private-cargo-probe'+os.fsdecode(suffix)}
 
 
 class RootRelay:
@@ -504,9 +505,13 @@ def _unit(arguments):
             namespaces={name:{'controller':os.readlink('/proc/self/ns/'+name),
                 'unit':os.readlink(f'/proc/{child.pid}/ns/'+name)} for name in ('mnt','ipc','net')}
             if any(row['controller']==row['unit'] for row in namespaces.values()):raise FreshnessHold('invalidation_unsafe')
+            root=os.stat(f'/proc/{child.pid}/root')
+            if not stat.S_ISDIR(root.st_mode):raise FreshnessHold('invalidation_unsafe')
             cache._write_record(Path(value['directory'])/'view-namespace.json',{'version':1,
                 'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],
-                'pid':child.pid,'namespaces':namespaces})
+                'pid':child.pid,'namespaces':namespaces,
+                'root_identity':{'device':(os.major(root.st_dev)<<20)|os.minor(root.st_dev),
+                    'inode':root.st_ino,'mode':root.st_mode}})
         _control(endpoint,3,child.pid);_release(exec_release,cancel,value['deadline']);observed=True
     try:
         forwarded=tuple([stage_bootstrap,data,cancel,release,control,*value['extras']])
@@ -723,7 +728,8 @@ CARGO_FIXTURE_MANIFEST='[package]\nname="private-cargo-probe"\nversion="0.0.0"\n
 CARGO_FIXTURE_SOURCE='''fn main(){
  assert_eq!(private_cargo_probe::value(),7);
  let out=std::path::PathBuf::from(env!("OUT_DIR"));
- assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),b"pub const GENERATED:u8=7;\\n");
+ let expected=format!("#[path={:?}] mod generated_mod;\\npub const GENERATED:u8=generated_mod::VALUE;\\n",out.join("mod.rs"));
+ assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),expected.as_bytes());
  assert!(out.join("empty").is_dir());
  assert_eq!(std::fs::read_dir(out.join("empty")).unwrap().count(),0);
  assert!(std::fs::write(out.join("forbidden"),b"x").is_err());
@@ -740,7 +746,11 @@ pub fn value()->u8{GENERATED}
 CARGO_FIXTURE_BUILD='''fn main(){
  let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
  std::fs::create_dir_all(out.join("empty")).unwrap();
- std::fs::write(out.join("generated.rs"),b"pub const GENERATED:u8=7;\\n").unwrap();
+ std::fs::create_dir_all(out.join("chosen")).unwrap();
+ std::fs::write(out.join("chosen/mod.rs"),b"pub const VALUE:u8=7;\\n").unwrap();
+ std::fs::write(out.join("mod.rs"),b"mod chosen;pub const VALUE:u8=chosen::VALUE;\\n").unwrap();
+ let generated=format!("#[path={:?}] mod generated_mod;\\npub const GENERATED:u8=generated_mod::VALUE;\\n",out.join("mod.rs"));
+ std::fs::write(out.join("generated.rs"),generated.as_bytes()).unwrap();
  let metadata=std::path::Path::new("target/debug/.fingerprint");
  std::fs::create_dir_all(metadata).unwrap();
  std::fs::write(metadata.join("build-script-forged"),b"private unit only").unwrap();
@@ -866,6 +876,59 @@ class _CargoProbe:
 
     def running(self,view):pass
 
+    def record_invalidations(self,events,metadata,user_namespace):
+        """Consume the actual library's missing-module query after unit drain.
+
+        This fixed private replay only records invalidation intent. It cannot
+        approve reuse, delete Cargo metadata, or publish a passing-CI proof.
+        """
+        if self.owner!=os.getpid() or self.report is None:raise FreshnessHold('cleanup_uncertain')
+        libraries=[(ordinal,unit) for ordinal,unit in self.units.items()
+            if unit['mapping']['kind']=='compile' and unit['mapping']['role']=='library']
+        binaries=[unit for unit in self.units.values()
+            if unit['mapping']['kind']=='compile' and unit['mapping']['role']=='binary']
+        if len(libraries)!=1 or len(binaries)!=1:raise FreshnessHold('input_census_unknown')
+        ordinal,unit=libraries[0];mapping=unit['mapping'];publication=self.publications['generated']
+        original=publication['root']/mapping['generated_root']
+        if unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']:
+            raise FreshnessHold('input_census_unknown')
+        prefix='/workspace/target/'+mapping['generated_root']
+        def index(root):
+            return lookup_inputs.FrozenLookupIndex({'generated':(prefix,root,
+                unit_views.inventory(root,owner=0,sealed=True))},kernel_roots={'/':unit['root_identity']},owner=0)
+        selected=[e for e in events if e['pid']==e['tid']==unit['pid'] and e['uid']==2000+ordinal
+            and e['path']==(prefix+'/chosen.rs').encode() and e['syscall'] in (262,332) and e['result']==-errno.ENOENT]
+        if not selected:raise FreshnessHold('input_census_unknown')
+        scope=int(unit['namespaces']['mnt']['unit'].split('[',1)[1][:-1])
+        observation=index(original).select(selected,metadata,pid=unit['pid'],uid=2000+ordinal,
+            user_namespace=user_namespace,mount_namespace=scope)
+        variant=self.root/'introduced-generated'
+        unit_views.copy_output_roots(publication['root'],variant,[mapping['generated_root']],owner=0,controller=0)
+        changed=variant/mapping['generated_root'];changed.chmod(0o755)
+        introduced=changed/'chosen.rs';introduced.write_bytes(b'pub const VALUE:u8=9;\n')
+        os.utime(introduced,ns=(946684800000000000,946684800000000000));introduced.chmod(0o444);changed.chmod(0o555)
+        before=observation.observation['sha256'];after=observation.refresh(index(changed))['sha256']
+        if before==after:raise FreshnessHold('input_census_unknown')
+        ledger=self.root/'invalidations';ledger.mkdir(mode=0o700)
+        args={'binding':self.admission.binding,'command':self.admission.command}
+        journal=lookup_inputs.UnitInvalidations(ledger/'units.json',**args)
+        journal.register('library',dependencies=[],content_sha256=before,fingerprints=[mapping['fingerprint']])
+        # The fixed graph's binary consumes this library. Its selected subset
+        # includes that dependency; this is not a complete binary-input census.
+        journal.register('binary',dependencies=['library'],content_sha256=before,
+            fingerprints=[binaries[0]['mapping']['fingerprint']])
+        pending=journal.changed({'library':after})
+        restored=lookup_inputs.UnitInvalidations(ledger/'units.json',**args)
+        if pending!=['binary','library'] or restored.pending()!=pending:raise FreshnessHold('metadata_torn')
+        if (any(self._stat(path)!=prior for path,prior in self.generated_stats.items())
+                or unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']):
+            raise FreshnessHold('input_census_unknown')
+        self.report['invalidation']={'version':1,'unit_pid':unit['pid'],'unit_uid':2000+ordinal,
+            'queries':len(selected),'binding_sha256':observation.binding_sha256,
+            'original_sha256':before,'refreshed_sha256':after,'pending':pending,
+            'durable':True,'original_generated_preserved':True,
+            'input_closure_complete':False,'shipping_authority':False}
+
     def finish(self,view,directory,raw):
         ordinal=view['ordinal'];record=self.units[ordinal];mapping=record['mapping']
         if raw!=0:
@@ -925,7 +988,7 @@ class _CargoProbe:
                 raise FreshnessHold('invalidation_unsafe')
         pid=observed.get('pid')
         if type(pid) is not int or pid<=0:raise FreshnessHold('cleanup_uncertain')
-        record.update(finished=True,namespaces=observed['namespaces'],pid=pid)
+        record.update(finished=True,namespaces=observed['namespaces'],pid=pid,root_identity=observed['root_identity'])
 
     def run(self,value,relay):
         first=len(relay.completed);counts=[];script_counts=[];fingerprint=None
@@ -1303,7 +1366,7 @@ def _probe(arguments):
         if item['mapping']['kind']=='application')
     kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor',
         view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'),results[4]['statx_sha256'],view_probe.source,
-        int(view_probe.receipt['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),view_probe)
+        int(view_probe.receipt['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),view_probe,cargo_probe)
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],
@@ -1354,10 +1417,25 @@ def validate_filesystem_probe(value):
     return value
 
 
+def validate_compiler_invalidation(value):
+    keys={'version','unit_pid','unit_uid','queries','binding_sha256','original_sha256','refreshed_sha256',
+        'pending','durable','original_generated_preserved','input_closure_complete','shipping_authority'}
+    if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
+            or type(value['unit_pid']) is not int or not 0<value['unit_pid']<2**31
+            or type(value['unit_uid']) is not int or not 2005<=value['unit_uid']<6096
+            or type(value['queries']) is not int or not 0<value['queries']<=4096
+            or any(not cache._digest(value[key]) for key in ('binding_sha256','original_sha256','refreshed_sha256'))
+            or value['original_sha256']==value['refreshed_sha256'] or value['pending']!=['binary','library']
+            or value['durable'] is not True or value['original_generated_preserved'] is not True
+            or value['input_closure_complete'] is not False or value['shipping_authority'] is not False):
+        raise FreshnessHold('input_census_unknown')
+    return value
+
+
 def validate_cargo_probe(value):
     keys={'version','compiler_calls','application_runs','actual_metadata_preserved','sealed_artifact_detached',
         'units','allocation_removed','trusted_input_closure','shipping_authority','build_script_calls',
-        'generated_tree_preserved','library_input_mounted'}
+        'generated_tree_preserved','library_input_mounted','invalidation'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['compiler_calls']!=[3,0] or any(type(count) is not int for count in value['compiler_calls'])
             or value['build_script_calls']!=[1,0] or any(type(count) is not int for count in value['build_script_calls'])
@@ -1366,6 +1444,9 @@ def validate_cargo_probe(value):
                 'allocation_removed','generated_tree_preserved','library_input_mounted'))
             or value['trusted_input_closure'] is not False or value['shipping_authority'] is not False
             or type(value['units']) is not list or not 6<=len(value['units'])<=32):
+        raise FreshnessHold('input_census_unknown')
+    validate_compiler_invalidation(value['invalidation'])
+    if value['invalidation']['unit_uid'] not in [unit.get('uid') for unit in value['units'] if type(unit) is dict]:
         raise FreshnessHold('input_census_unknown')
     for ordinal,unit in enumerate(value['units'],start=5):
         if (type(unit) is not dict or set(unit)!={'ordinal','uid','started','cancelled','returncode',

@@ -129,6 +129,30 @@ class LookupInputTests(unittest.TestCase):
             with self.subTest(fault=fault),self.assertRaises(self.inputs.FreshnessHold):
                 index(original).select([e],[m,m] if fault=='duplicate' else [m],pid=101,uid=2004,user_namespace=100,mount_namespace=50)
 
+    def test_absolute_compiler_lookup_requires_original_kernel_root(self):
+        views=load('ci_cargo_views');root=self.root/'generated';root.mkdir()
+        (root/'mod.rs').write_bytes(b'mod chosen;');(root/'mod.rs').chmod(0o444);root.chmod(0o555)
+        prefix='/workspace/target/debug/build/probe/out'
+        namespaces={'generated':(prefix,root,views.inventory(root,owner=os.geteuid(),sealed=True))}
+        original={'device':12,'inode':34,'mode':0o40755}
+        event={'uid':2005,'pid':101,'tid':101,'syscall':262,'sequence':1,'path':(prefix+'/chosen.rs').encode(),'result':-2,
+            'lookup_attempts':[{'dfd':-100,'user_namespace':100,'mount_namespace':50,'init_result':0,
+                'base':dict(original,flags=256,path_seq=2,dentry_seq=2)}]}
+        metadata={key:event[key] for key in ('uid','pid','tid','syscall','sequence','path','result')}
+        metadata.update(fd=-100,flags=256,mask=0,user_namespace=100,stat=None,copy_result=None)
+        def select(index):return index.select([event],[metadata],pid=101,uid=2005,user_namespace=100,mount_namespace=50)
+        with self.assertRaises(self.inputs.FreshnessHold):
+            select(self.inputs.FrozenLookupIndex(namespaces,owner=os.geteuid()))
+        selected=select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()))
+        self.assertFalse(selected.observation['shipping_authority'])
+        # A valid root anchor only routes to declared frozen trees.
+        event['path']=metadata['path']=b'/etc/unknown'
+        with self.assertRaises(self.inputs.FreshnessHold):
+            select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()))
+        for fault in (dict(original,inode=True),dict(original,mode=0o100444),dict(original,extra=1)):
+            with self.subTest(fault=fault),self.assertRaises(self.inputs.FreshnessHold):
+                self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':fault},owner=os.geteuid())
+
     def test_frozen_index_keeps_binary_names_detached_records_and_refuses_aliases(self):
         views=load('ci_cargo_views');root=self.root/'tree';root.mkdir()
         raw=root/os.fsdecode(b'raw-\xff');raw.write_bytes(b'content');raw.chmod(0o444);root.chmod(0o555)

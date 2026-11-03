@@ -33,7 +33,8 @@ async fn live_shared_ci_planner_protocol_v3()->Result<()> {
     std::fs::write(root.join("src/main.rs"),r####"fn main(){
  assert_eq!(private_cargo_probe::value(),7);
  let out=std::path::PathBuf::from(env!("OUT_DIR"));
- assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),b"pub const GENERATED:u8=7;\n");
+ let expected=format!("#[path={:?}] mod generated_mod;\npub const GENERATED:u8=generated_mod::VALUE;\n",out.join("mod.rs"));
+ assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),expected.as_bytes());
  assert!(out.join("empty").is_dir());
  assert_eq!(std::fs::read_dir(out.join("empty")).unwrap().count(),0);
  assert!(std::fs::write(out.join("forbidden"),b"x").is_err());
@@ -50,7 +51,11 @@ pub fn value()->u8{GENERATED}
     std::fs::write(root.join("build.rs"),r####"fn main(){
  let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
  std::fs::create_dir_all(out.join("empty")).unwrap();
- std::fs::write(out.join("generated.rs"),b"pub const GENERATED:u8=7;\n").unwrap();
+ std::fs::create_dir_all(out.join("chosen")).unwrap();
+ std::fs::write(out.join("chosen/mod.rs"),b"pub const VALUE:u8=7;\n").unwrap();
+ std::fs::write(out.join("mod.rs"),b"mod chosen;pub const VALUE:u8=chosen::VALUE;\n").unwrap();
+ let generated=format!("#[path={:?}] mod generated_mod;\npub const GENERATED:u8=generated_mod::VALUE;\n",out.join("mod.rs"));
+ std::fs::write(out.join("generated.rs"),generated.as_bytes()).unwrap();
  let metadata=std::path::Path::new("target/debug/.fingerprint");
  std::fs::create_dir_all(metadata).unwrap();
  std::fs::write(metadata.join("build-script-forged"),b"private unit only").unwrap();
@@ -81,6 +86,12 @@ pub fn value()->u8{GENERATED}
         && probe["cargo"]["generated_tree_preserved"]==true && probe["cargo"]["library_input_mounted"]==true
         && probe["cargo"]["application_runs"]==2 && probe["cargo"]["actual_metadata_preserved"]==true
         && probe["cargo"]["sealed_artifact_detached"]==true && probe["cargo"]["allocation_removed"]==true
+        && probe["cargo"]["invalidation"]["pending"]==serde_json::json!(["binary","library"])
+        && probe["cargo"]["invalidation"]["durable"]==true
+        && probe["cargo"]["invalidation"]["original_generated_preserved"]==true
+        && probe["cargo"]["invalidation"]["original_sha256"]!=probe["cargo"]["invalidation"]["refreshed_sha256"]
+        && probe["cargo"]["invalidation"]["input_closure_complete"]==false
+        && probe["cargo"]["invalidation"]["shipping_authority"]==false
         && probe["kernel_observation"]["witness_observed"]==true
         && probe["kernel_observation"]["positive_query_observed"]==true
         && probe["kernel_observation"]["negative_query_observed"]==true

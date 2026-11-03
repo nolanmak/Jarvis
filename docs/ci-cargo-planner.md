@@ -1087,3 +1087,18 @@ selector and planner retry path still need to consume it. Its regression suite
 passes alongside all 275 Python CI tests with native helpers and no skips;
 focused managed Rust checks also pass. No new native VM result or production
 activation is claimed for this journal addition.
+
+The fixed private Cargo replay now connects the journal to the original library
+compiler's negative lookup for a generated `chosen.rs`. The build script emits
+`mod.rs` and `chosen/mod.rs`; the application still checks the exact generated
+bytes, value 7, empty directory, denied writes and isolated Cargo metadata.
+Root captures the unit's kernel root object at the supervised exec stop, before
+releasing user code. Absolute lookup names can route through that original
+object only into explicitly declared frozen trees. After the original scopes
+drain, a separate sealed view introduces `chosen.rs` at an old timestamp.
+Refreshing the actual compiler selector must change its content digest and
+durably mark both library and binary pending, while preserving the old sealed
+publication and metadata. This extends the diagnostic acceptance, not the final
+input-proof API. Actual fingerprint deletion, compiler retry and the original
+in-command regression remain unfinished. Native validation of this extension
+is pending.

@@ -89,7 +89,8 @@ class PlannerProtocolTests(unittest.TestCase):
             b'-C',b'metadata=0123456789abcdef',b'-C',b'extra-filename=-0123456789abcdef',
             b'--out-dir',b'/workspace/target/debug/deps',b'-L',b'dependency=/workspace/target/debug/deps']
         mapped=planner.fixture_request(request(args))
-        self.assertEqual(mapped,{'kind':'compile','role':'binary','dependencies':[],'generated_root':None,'outputs':[
+        self.assertEqual(mapped,{'kind':'compile','role':'binary','dependencies':[],'generated_root':None,
+            'fingerprint':'debug/.fingerprint/private-cargo-probe-0123456789abcdef','outputs':[
             'debug/deps/private_cargo_probe-0123456789abcdef',
             'debug/deps/private_cargo_probe-0123456789abcdef.d']})
         self.assertEqual(planner.fixture_request(request(args,search=b'/unrelated/path')),mapped)
@@ -111,7 +112,7 @@ class PlannerProtocolTests(unittest.TestCase):
             'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5,14)]
         value={'version':1,'compiler_calls':[3,0],'build_script_calls':[1,0],'generated_tree_preserved':True,'library_input_mounted':True,'application_runs':2,'actual_metadata_preserved':True,
             'sealed_artifact_detached':True,'units':units,'allocation_removed':True,
-            'trusted_input_closure':False,'shipping_authority':False}
+            'trusted_input_closure':False,'shipping_authority':False,'invalidation':self.compiler_invalidation()}
         self.assertEqual(planner.validate_cargo_probe(value),value)
         for field,replacement in (('compiler_calls',[True,0]),('compiler_calls',[3,1]),
                 ('build_script_calls',[True,0]),('build_script_calls',[1,1]),('generated_tree_preserved',False),('library_input_mounted',False),
@@ -123,6 +124,20 @@ class PlannerProtocolTests(unittest.TestCase):
                 ('returncode',125),('original_cleanup',False),('input_closure_complete',True),('shipping_authority',True)):
             bad=copy.deepcopy(value);bad['units'][0][field]=replacement
             with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):planner.validate_cargo_probe(bad)
+
+    def compiler_invalidation(self):
+        return {'version':1,'unit_pid':42,'unit_uid':2008,'queries':1,'binding_sha256':'1'*64,
+            'original_sha256':'2'*64,'refreshed_sha256':'3'*64,'pending':['binary','library'],
+            'durable':True,'original_generated_preserved':True,'input_closure_complete':False,'shipping_authority':False}
+
+    def test_compiler_invalidation_report_requires_changed_content_and_durable_dependents(self):
+        value=self.compiler_invalidation()
+        self.assertEqual(planner.validate_compiler_invalidation(value),value)
+        for field,replacement in (('unit_pid',True),('unit_uid',1001),('queries',0),('queries',True),
+                ('binding_sha256','unknown'),('refreshed_sha256',value['original_sha256']),('pending',['library']),
+                ('durable',False),('original_generated_preserved',False),('input_closure_complete',True),('shipping_authority',True)):
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):
+                planner.validate_compiler_invalidation(value|{field:replacement})
 
     def test_dynamic_output_report_requires_exact_declared_root_inventory(self):
         original=self.probe()[0]['filesystem']
