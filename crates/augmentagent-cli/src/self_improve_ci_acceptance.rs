@@ -86,8 +86,15 @@ pub fn value()->u8{GENERATED}
         && probe["kernel_observation"]["negative_query_observed"]==true
         && probe["kernel_observation"]["max_path_query_observed"]==true
         && probe["kernel_observation"]["missed_probe_census_complete"]==true
-        && probe["kernel_observation"]["probe_census"]["before"]["links"].as_array().is_some_and(|values|values.len()==4)
-        && probe["kernel_observation"]["probe_census"]["after"]["programs"].as_array().is_some_and(|values|values.len()==4)
+        && probe["kernel_observation"]["probe_census"]["before"]["links"].as_array().is_some_and(|values|values.len()==8)
+        && probe["kernel_observation"]["probe_census"]["after"]["programs"].as_array().is_some_and(|values|values.len()==8)
+        && probe["kernel_observation"]["directory_witness_observed"]==true
+        && probe["kernel_observation"]["binary_directory_name_observed"]==true
+        && probe["kernel_observation"]["directory_short_read_observed"]==true
+        && probe["kernel_observation"]["directory_eof_observed"]==true
+        && probe["kernel_observation"]["cargo_directory_queries_observed"]==true
+        && probe["kernel_observation"]["directory_reads"].as_u64().is_some_and(|value|value>=11)
+        && probe["kernel_observation"]["directory_entries"].as_u64().is_some_and(|value|value>=13)
         && probe["kernel_observation"]["after_kernel_copy"]==true
         && probe["kernel_observation"]["compiler_queries_observed"]==true
         && probe["kernel_observation"]["library_generated_query_observed"]==true
