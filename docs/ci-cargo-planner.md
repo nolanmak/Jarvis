@@ -1967,8 +1967,34 @@ The updated independent review of S26/S42/S46 found no remaining quoted seam
 defects at source/test-review level. Routine validation for this carrier revision
 passes **370 Python CI tests without skips and 32 focused managed Rust tests**
 (20 opt-in native cases excluded). The separate VM shape suite passes 14 cases
-with six VM/runtime cases excluded. Native carrier validation remains pending.
-The earlier native capacity result at
-`c88829e3` is not presented as a run of this later executable. Production remains
+with six VM/runtime cases excluded. The subsequent native runs are recorded
+below; the earlier capacity result at `c88829e3` is not presented as a run of this
+later executable. Production remains
 unchanged; final C proof, real-plan sufficiency, M enforcement and rollout gates
 remain open.
+
+At exact executable `1eb2b5e5`, the ordinary five-command generated-input adapter
+replay passed in **169.65 seconds**. Its existing protected audit contains four
+cleanup diagnostics, each matching its original command/cache and a protected
+`shared_ci_vm_quiescent` record for the same command/source binding. The first
+successful command retired five existing sessions and retained 44 with
+`unclosed_links`; compatible cross-VM compiler reuse, generated-change hold,
+metadata refusals and raw-worker exec denial remained intact. Audit extraction:
+`/tmp/autoship-1703-legacy-diagnostic-native-audit-1.json`.
+
+The same executable's production-base comparison then passed in **250.71
+seconds**, under the original admission and individual command deadlines. Both
+views began at **20,635,648 available bytes**. Strict selection inspected 192
+sessions, retired four, retained 188 and ended at **53,284,864 bytes**. Closed-link
+selection inspected 79, retired 32, retained 47 (45 unclosed-link and two unsafe
+sessions), reported `attempt_retirements`, and ended at **2,124,382,208 bytes**.
+The exact same protected inventory—**46,602 files / 4,167,370,136 unique logical
+content bytes**—and entire original raw-image identity/SHA were preserved across
+both views. The report is a bounded observed selection scope; it does not claim
+the remaining sessions were inspected or recoverable.
+
+Receipt: `/tmp/augmentagent-ci-recovery-comparison-20261103222854/receipt.json`,
+SHA-256 `656c3a7c66d687a3a7f727a511bbca5b32024146c2f83fc4c7a7120df79a68ac`.
+The reporting carrier and explicit worker opt-in are now native-validated.
+Production is unchanged, the actual required application-plan sufficiency gate
+remains open, and no input-completeness, full-CI or shipping authority is granted.

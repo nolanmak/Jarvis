@@ -8,10 +8,12 @@ admission/dispatch, normal main/updater rollout, original workflows, Discord
 commands/sessions/updates, and the full unattended/soak/merge acceptance remain open.
 
 Current implementation: opt-in mechanism and same-base native capacity comparison
-passed at `c88829e3`. The normal-worker opt-in and retained-scope reporting carrier
-are implemented locally and awaiting managed Rust/native validation and review.
-The prior 57-seam review is complete; the changed reporting interfaces require
-review against this revision. This component is not ready for production handoff.
+passed at `c88829e3`. The worker opt-in and reporting carrier at `1eb2b5e5` pass
+370 Python tests, 32 managed Rust tests, the ordinary native adapter replay
+(169.65 seconds) and same-base production-image comparison (250.71 seconds).
+Updated S26/S42/S46 review has no remaining source/test-level findings. The real
+application-plan sufficiency and original C/M/rollout gates still block production
+handoff; no production cache change or autonomous merge is claimed.
 
 ## Evidence and premise
 
@@ -304,8 +306,9 @@ not an implicit authorization to prune. Final C API/audit and M/rollout ownershi
 remain as defined by #1807 and are not discharged by this amendment.
 
 R owns validation and review of the D8 retained-scope reporting carrier (S26/S46).
-The local implementation is not yet native-validated or independently reviewed.
-That gate blocks production handoff. Low capacity gain, a reached bound or unsafe
+Its current source/test review and native adapter/comparison runs pass at
+`1eb2b5e5`; the original production activation gates still apply. Low capacity
+gain, a reached bound or unsafe
 unknown namespaces trigger a separately admitted read-only R diagnostic when the
 bounded selection counters cannot explain all retained data. Do not infer total
 retained scope from logical bytes, selection counters or retirement count.
