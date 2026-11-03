@@ -2072,5 +2072,20 @@ unbound, restore the original selection, preserve relevance after an unread
 file's contents change, and detect an added member in the observed empty
 directory. The original tool program, argv, streams, counters and budgets are
 unchanged. **376 Python CI tests pass without skips.** The 32 focused managed Rust tests also pass (20 native opt-ins excluded).
-Actual native validation of this revision is pending; all complete-input/full-CI/
-shipping flags remain false and production remains disabled.
+The actual native protocol gate at `68288eef` then passed in **116.12 seconds**.
+It selected six original directory calls, retained 29 unbound calls (including
+the original three-call rewind), restored the original selection and detected
+added membership while unread file-content changes kept the same identity.
+The collector retained 558 pathname queries and 153 directory calls; the original
+compiler counts stayed `[3, 0]`, and the invalidated library's retry still failed
+with Cargo exit 101. Existing original-unit cleanup, source/metadata isolation,
+signals, jobserver and exact probe-census assertions all passed.
+
+Receipt: `/tmp/augmentagent-ci-directory-selection-20261103233113/receipt.json`,
+SHA-256 `f4b2a19f776e52f1264d0959966e1fcf5de9bf9c7cd70ac754f7ed7080d134b6`.
+This is actual directory-selector evidence, not a complete compiler-input proof.
+All complete-input/full-CI/shipping flags remain false and production remains
+disabled. Runtime/toolchain, direct descriptor and full metadata inputs,
+publication-time invalidation/restart, trusted dependency seed integration,
+the unchanged opaque-wrapper/in-command fixture and final proof/API/audit and
+merge enforcement remain required.
