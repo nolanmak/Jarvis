@@ -177,8 +177,11 @@ def execute(request,run=vm.run,progress=None):
     progress["stage"]="request_schema"
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
               'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations','retained_producers','producer_retirements'}
-    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency'}
+    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency','planner_protocol_probe'}
     if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository','dependency'):raise vm.Unavailable('invalid CI VM request')
+    if (type(request.get('planner_protocol_probe',False)) is not bool
+            or request.get('planner_protocol_probe') and request['operation']!='repository'):
+        raise cache_generation.FreshnessHold('invalidation_unsafe')
     dependency=dependency_action(request)
     if not cache_generation._uuid(request['source_generation']) or not cache_generation._uuid(request['command_id']) or (request['predecessor'] is not None and not cache_generation._uuid(request['predecessor'])):raise cache_generation.FreshnessHold('generation_mismatch')
     retained=request['retained_generations']

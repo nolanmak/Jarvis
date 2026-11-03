@@ -259,6 +259,11 @@ ordinary WorkerScope still refuses UID 0. It tests large raw stdin, actual
 jobserver capabilities, planner-file/socket access denial, closed control FDs,
 and cancellation through the native V3 client. Five host framing/refusal tests
 pass; actual guest credentials and end-to-end transport are not yet verified.
+The first attempted replay at `2e9d1db3` stopped at the host request schema: the
+Rust sender included the new private probe field, but the strict adapter did not
+allow it. Adapter fixtures now include the Rust sender's ordinary false value,
+and malformed or non-repository probe selection fails before runtime loading.
+The corrected guest replay is still required.
 The probe does not run arbitrary protected Cargo, freeze unit namespaces, seal
 reusable outputs, establish a complete input collector or create a CI proof.
 Those activation blockers, including race/cancellation and nested-builder

@@ -14,6 +14,14 @@ def observed_inputs(workers):
   'observed_events':0,'events_sha256':hashlib.sha256(b'').hexdigest(),'before_sha256':'f'*64,'after_sha256':'f'*64,
   'guest_worker_quiescence':workers['scopes'][-1],'shipping_authority':False}
 class AdapterTests(unittest.TestCase):
+ def test_internal_probe_flag_is_typed_and_cannot_select_a_root_probe_from_other_operations(self):
+  with tempfile.TemporaryDirectory() as directory:
+   request=self.fixture(Path(directory))
+   for value in (True,1,0,'true',None,{}):
+    with self.subTest(value=value),patch.object(vm.Runtime,'load') as load:
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|{'planner_protocol_probe':value})
+     load.assert_not_called()
+
  def test_source_projection_requires_current_binding_roles_and_independent_worker_cleanup(self):
   for fault in ('missing','version','binding','command','owner','manifest','flags','missing-role','wrong-role','duplicate-probe','borrowed-worker','foreign-scope'):
    with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
@@ -70,7 +78,7 @@ class AdapterTests(unittest.TestCase):
    return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-C',str(root/'workspace'),*args],text=True).strip()
   git('init','-q');(root/'workspace/source.rs').write_text('literal source');git('add','.');git('commit','-qm','source')
   generation=str(uuid.uuid4())
-  return {'version':2,'source_generation':generation,'retained_generations':[generation],'retained_producers':[],'producer_retirements':[],'command_id':str(uuid.uuid4()),'predecessor':None,
+  return {'version':2,'planner_protocol_probe':False,'source_generation':generation,'retained_generations':[generation],'retained_producers':[],'producer_retirements':[],'command_id':str(uuid.uuid4()),'predecessor':None,
    'tree':git('rev-parse','HEAD^{tree}'),'controller_authority_sha256':'d'*64,
    'operation':'plan','runtime_config':str(root/'runtime.json'),'workspace':str(root/'workspace'),
    'state':str(root/'state'),'scratch':str(root/'scratch'),'git_objects':str(root/'objects'),
