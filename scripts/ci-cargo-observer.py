@@ -77,7 +77,9 @@ def decode(data,*,complete=True):
         if kind in pair:raise ObservationUnavailable('duplicate kernel observation')
         if kind=='N':
             path=match[7].encode()
-            if (len(path)>=PATH_BYTES-1 or any(part in (b'',b'.',b'..') for part in path.split(b'/')[1:])
+            parts=path.split(b'/')
+            if parts[-1]==b'':parts=parts[:-1]
+            if (len(path)>=PATH_BYTES-1 or any(part in (b'',b'.',b'..') for part in parts[1:])
                     or not (uid==1999 and re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path)
                         or 2000<=uid<6096 and (path.startswith(b'/workspace/')
                             or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
@@ -168,6 +170,15 @@ class Observer:
         return self.stdout.read_bytes()
 
     def start(self):
+        # This private guest mounts sysfs during boot. bpftrace also needs
+        # tracefs for probe discovery and successful original-probe detach.
+        tracefs=Path('/sys/kernel/tracing')
+        if not (tracefs/'kprobe_events').is_file():
+            subprocess.run(['/usr/bin/mount','-t','tracefs','tracefs',str(tracefs)],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                check=True,timeout=min(5,max(.001,self.deadline-time.monotonic())))
+        if not (tracefs/'kprobe_events').is_file():
+            raise OSError(errno.ENOENT,'private kernel trace filesystem unavailable')
         binary=Path('/usr/bin/bpftrace');info=binary.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:
             raise ObservationUnavailable('untrusted kernel observer')

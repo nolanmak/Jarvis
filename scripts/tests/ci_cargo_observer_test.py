@@ -49,6 +49,14 @@ class KernelObserverTests(unittest.TestCase):
             with self.subTest(path=path),self.assertRaises(observer.ObservationUnavailable):
                 observer.decode(lookup(2004,101,101,257,1,3,path)+frame('map',{'@emitted':2}))
 
+    def test_directory_trailing_slash_is_preserved_without_accepting_empty_interior_components(self):
+        for path in ('/workspace/directory','/workspace/directory/'):
+            self.assertEqual(observer.decode(lookup(2004,101,101,262,1,0,path)
+                +frame('map',{'@emitted':2}))[0]['path'],path.encode())
+        for path in ('/workspace//directory','/workspace/directory//','/workspace/directory/../'):
+            with self.subTest(path=path),self.assertRaises(observer.ObservationUnavailable):
+                observer.decode(lookup(2004,101,101,262,1,0,path)+frame('map',{'@emitted':2}))
+
     def test_cross_cpu_delivery_keeps_repeated_thread_lookups_distinct(self):
         first=lookup(2004,101,101,257,10,3,'/workspace/first',reverse=True)
         second=lookup(2004,101,101,257,12,-2,'/workspace/second')
