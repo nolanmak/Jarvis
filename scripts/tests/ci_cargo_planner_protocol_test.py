@@ -56,6 +56,48 @@ class PlannerProtocolTests(unittest.TestCase):
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 
+    def test_pinned_probe_parent_streams_stdin_and_waits_for_real_exec_child(self):
+        # Exercise the fixed fixture's real fork/exec/pipe parent path without
+        # claiming the root-only transport or credential isolation on this host.
+        # Only the root-only setup assertions and unit policy result are stubs.
+        peer = """import hashlib,json,os,re,sys
+flags=os.environ.get('CARGO_MAKEFLAGS')
+if flags:
+ numbers=re.search(r'--jobserver-fds=(\\d+),(\\d+)',flags)
+ reader,writer=map(int,numbers.groups())
+ assert os.read(reader,1)==b'+'
+ os.write(writer,b'+')
+assert os.environb[b'RAW']==b'\\xffvalue'
+print(json.dumps({'uid':int(sys.argv[1]),'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
+ 'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}),flush=True)
+"""
+        harness = """import ctypes,errno,importlib.util,os,sys
+spec=importlib.util.spec_from_file_location('fixture',sys.argv[1]);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+os.getresuid=lambda:(1001,1001,1001)
+os.getresgid=lambda:(1001,1001,1001)
+os.getgroups=lambda:[]
+class Syscall:
+ def __call__(self,*args):ctypes.set_errno(errno.EPERM);return -1
+class Libc:syscall=Syscall()
+ctypes.CDLL=lambda *args,**kwargs:Libc()
+original_exec=os.execve
+peer=sys.argv[2];mode=sys.argv[3];metadata=sys.argv[4]
+def unit_exec(file,argv,environment):
+ return original_exec(sys.executable,[sys.executable,'-I','-c',peer,'2000'],environment)
+os.execve=unit_exec
+sys.argv=['fixed-fixture',mode,metadata,'/unused-root-socket','2000']
+exec(compile(module._PLANNER_PROBE,'fixed-planner-probe','exec'))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            for mode in ('stdin','jobserver'):
+                with self.subTest(mode=mode):
+                    result=subprocess.run([sys.executable,'-I','-c',harness,str(ROOT/'ci-cargo-planner.py'),peer,mode,
+                        str(Path(directory)/'metadata')],capture_output=True,timeout=5)
+                    self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+                    observed=__import__('json').loads(result.stdout)
+                    self.assertEqual(observed['stdin_sha256'],hashlib.sha256(b'\xffstdin'*200000).hexdigest())
+                    self.assertEqual(observed['jobserver'],mode=='jobserver')
+
     def test_staging_and_actual_exec_are_distinct_versioned_events(self):
         self.assertNotEqual(planner.event('staging_ready',0),planner.event('tool_started',0))
         self.assertEqual(planner.decode_event(planner.event('staging_ready',0)),('staging_ready',0))

@@ -456,7 +456,7 @@ if child==0:
   if jobs:env[b'CARGO_MAKEFLAGS']=('-j --jobserver-fds=%d,%d --jobserver-auth=%d,%d'%(*jobs,*jobs)).encode()
   os.execve(b'/usr/bin/python3',[b'python3',b'-I',b'-c',body.encode(),os.fsencode(metadata),os.fsencode(socket_path),str(expected_uid).encode()],env)
  except BaseException:os._exit(126)
-os._exit(127)
+ os._exit(127)
 os.close(source_read);os.close(output_write);os.close(start_write)
 assert os.read(start_read,1)==b'';os.close(start_read)
 data=b'\xffstdin'*200000 if mode!='cancel' else b''

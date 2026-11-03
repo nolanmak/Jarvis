@@ -372,7 +372,7 @@ impl Outcome {
                 .expect("bounded freshness protocol serializes");
         }
         if let Some(value)=&self.guest_diagnostic {
-            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command")).unwrap_or("unknown");
+            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_supervisor")).unwrap_or("unknown");
             let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
             diagnostic["guest"]=serde_json::json!({"stage":stage,"category":category,
                 "errno":value["errno"].as_i64().filter(|value|(0..=4096).contains(value))});
@@ -1215,6 +1215,20 @@ mod tests {
             serde_json::json!({"stage":"unknown","category":"unknown","errno":null})
         );
         assert!(receipt.validate(&binding, "step").is_err());
+    }
+
+    #[test]
+    fn planner_guest_failure_keeps_only_fixed_protocol_phase_and_errno() {
+        for stage in ["planner_protocol_probe","planner_startup","planner_unit","planner_capture",
+            "planner_authorize","planner_drop","planner_arm_exec","planner_unit_exec","planner_client_start",
+            "planner_client_exec","planner_probe_stdin","planner_probe_jobserver","planner_probe_cancel",
+            "planner_probe_supervisor"] {
+            let outcome:Outcome=serde_json::from_value(serde_json::json!({"version":1,"boundary":"existing-build-vm",
+                "status":"prerequisite_hold","stage":"vm_launch","category":"Unavailable",
+                "guest_diagnostic":{"stage":stage,"category":"OSError","errno":71,"private":"owner contents"}})).unwrap();
+            assert_eq!(outcome.setup_diagnostic()["guest"],serde_json::json!({"stage":stage,"category":"OSError","errno":71}));
+            assert!(!outcome.setup_diagnostic().to_string().contains("owner"));
+        }
     }
     #[test]
     fn vm_receipt_requires_exact_binding_and_observed_exit() {

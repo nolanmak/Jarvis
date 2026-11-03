@@ -236,7 +236,7 @@ not execute tools, provide a complete input closure or publish CI authority; it
 is not connected to the existing same-UID version-2 experiment.
 
 The separate V3 native client and root transport now have an unactivated
-implementation and a fixed guest probe awaiting its first real replay. The
+implementation and a fixed guest probe that has not yet passed a real replay. The
 V3 client requires UID/GID 1001 for real/effective/saved credentials, no
 supplementary groups, a root-owned sealed startup descriptor and the original
 root listener's peer credentials. Protocol version 3 fixes the planner role to
@@ -257,13 +257,20 @@ cannot be selected by the ordinary CLI or worker environment. Its controller
 scope executes only a measured fixed probe with a minimal root environment;
 ordinary WorkerScope still refuses UID 0. It tests large raw stdin, actual
 jobserver capabilities, planner-file/socket access denial, closed control FDs,
-and cancellation through the native V3 client. Five host framing/refusal tests
-pass; actual guest credentials and end-to-end transport are not yet verified.
+and cancellation through the native V3 client. Six host framing/refusal and
+fixture-control tests pass; actual guest credentials and end-to-end transport
+are not yet verified.
 The first attempted replay at `2e9d1db3` stopped at the host request schema: the
 Rust sender included the new private probe field, but the strict adapter did not
 allow it. Adapter fixtures now include the Rust sender's ordinary false value,
 and malformed or non-repository probe selection fails before runtime loading.
-The corrected guest replay is still required.
+The next replay at `452cb44f` reached the guest but failed. Its bounded phase
+was stripped by the Rust diagnostic whitelist; a failing regression now covers
+that transport. The fixed probe also had an unconditional parent exit before
+stdin streaming. A real fork/exec/pipe fixture test reproduced exit 127 for
+ordinary stdin and jobserver modes and passes after correcting the child-only
+exit. The host test stubs root-only setup and unit policy assertions; it does
+not establish guest isolation. A rebuilt real guest replay is still required.
 The probe does not run arbitrary protected Cargo, freeze unit namespaces, seal
 reusable outputs, establish a complete input collector or create a CI proof.
 Those activation blockers, including race/cancellation and nested-builder
