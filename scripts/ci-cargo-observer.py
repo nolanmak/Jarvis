@@ -223,7 +223,7 @@ class Observer:
         finally:os.close(descriptor)
         self.output=self.stdout.open('xb');self.error=self.stderr.open('xb')
         os.chmod(self.stdout,0o600);os.chmod(self.stderr,0o600)
-        self.child=subprocess.Popen([str(binary),'-kk','-q','-B','none','-f','json','-e',self.program],
+        self.child=subprocess.Popen([str(binary),'-v','-kk','-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
             env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'','HOME':'/tmp'})
         deadline=min(self.deadline,time.monotonic()+10);origin=os.getpid()
