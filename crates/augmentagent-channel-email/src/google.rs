@@ -307,11 +307,19 @@ impl GoogleGmail {
     /// fatal to the fetch: a missing record reads as unauthenticated.
     fn record_sender_auth(&self, msg: &GmailMessage) {
         let Some(store) = &self.sender_auth_store else { return };
-        let Some(auth) = msg.sender_auth() else { return };
         if msg.id.is_empty() {
             return;
         }
         let now = chrono::Utc::now().timestamp_millis();
+        // #1833 D9 — a mailing-list message is never a 1:1 thread. Recorded
+        // in the same fetch as the verdict below, so a message with a
+        // verdict and no record here had no `List-Id`.
+        if !msg.header("List-Id").trim().is_empty() {
+            if let Err(e) = store.record_email_list_header(&msg.id, now) {
+                tracing::warn!(message_id = %msg.id, error = %e, "could not record List-Id");
+            }
+        }
+        let Some(auth) = msg.sender_auth() else { return };
         if let Err(e) = store.record_email_sender_auth(&msg.id, auth, now) {
             tracing::warn!(message_id = %msg.id, error = %e, "could not record sender authentication");
         }

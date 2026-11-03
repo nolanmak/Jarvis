@@ -12,15 +12,27 @@
 //! - [`switch`] — the `AUGMENTAGENT_AUTONOMY` master switch (D1).
 //! - [`records`] — idempotency keys and re-exports of the durable plan/step
 //!   records kept in `augmentagent-store` (D11).
-//!
-//! Nothing here sends, plans or gates: that is C5–C8.
+//! - [`planner`] — the C5 planning call and its strict parser (D8).
+//! - [`gate`] — the C7 `AutonomyGate` checks in D6 order.
+//! - [`broker`] — the `AutonomyBroker` decorator, execution and sweeps.
+//! - [`control`] — Undo / Pause / Pause all / Confirm (C8, D10).
+//! - [`watch`] — config hash check and reload before every decision (D3).
+//! - [`explain`] — the side-effect-free `autonomy explain` dry run.
 
+pub mod broker;
+pub mod calendar;
 pub mod config;
+pub mod control;
+pub mod exempt;
+pub mod explain;
+pub mod gate;
 pub mod handle;
+pub mod planner;
 pub mod records;
 pub mod registry;
 pub mod switch;
 pub mod trust;
+pub mod watch;
 pub mod writer;
 
 pub use config::{

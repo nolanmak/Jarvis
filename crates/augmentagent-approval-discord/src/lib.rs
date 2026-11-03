@@ -9,6 +9,7 @@
 //! still `pending`, across daemon restarts, unlimited timeouts.
 
 pub mod attachments;
+pub mod autonomy;
 pub mod imessage_owner;
 pub mod imessage_owner_control;
 pub mod compute_inputs;
@@ -170,6 +171,9 @@ pub enum ApprovalError {
     Serenity(#[from] serenity::Error),
     #[error("not ready")]
     NotReady,
+    /// #1833 — the broker has no surface for this kind of post.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Post a fresh approval card to Discord. Non-blocking: returns once the
@@ -288,6 +292,50 @@ pub trait ApprovalBroker: Send + Sync {
     ) -> Result<(), ApprovalError> {
         let _ = (channel_id, message_id);
         Ok(())
+    }
+
+    /// #1833 D6 — the card for an active trusted contact whose message the
+    /// autonomy gate held back, with `note` (the reason) shown on it. The
+    /// default ignores the note and posts the plain card; every sender who
+    /// is not an active trusted contact gets plain [`Self::post_approval`]
+    /// from the gate, never this (NG6).
+    async fn post_approval_noted(
+        &self,
+        action_id: &str,
+        email: &Email,
+        draft: &str,
+        note: &str,
+    ) -> Result<(), ApprovalError> {
+        let _ = note;
+        self.post_approval(action_id, email, draft).await
+    }
+
+    /// #1833 D10 — whether [`Self::post_autonomy_notice`] can reach the
+    /// owner. The gate refuses to act while this is false, so a deployment
+    /// without a notice surface never runs autonomously.
+    fn can_post_autonomy_notice(&self) -> bool {
+        false
+    }
+
+    /// #1833 D10 — the notice after a plan ran without a click (Undo /
+    /// Pause this person / Pause all). Returns the posted message id. The
+    /// default cannot deliver it.
+    async fn post_autonomy_notice(
+        &self,
+        notice: &autonomy::AutonomyNotice,
+    ) -> Result<String, ApprovalError> {
+        let _ = notice;
+        Err(ApprovalError::Unsupported("autonomy notices".into()))
+    }
+
+    /// #1833 D3 — "Trusted contacts changed": config alerts plus a Confirm
+    /// per newly pending contact. The default posts the text as a digest
+    /// (no buttons; `augmentagent trust confirm <slug>` still works).
+    async fn post_trust_notice(
+        &self,
+        notice: &autonomy::TrustNotice,
+    ) -> Result<(), ApprovalError> {
+        self.post_digest("Trusted contacts changed", &notice.text()).await
     }
 }
 
