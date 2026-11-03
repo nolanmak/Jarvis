@@ -14,6 +14,7 @@ import json
 import socket
 import array
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,100 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_restart_gate_keeps_original_grant_and_four_pass_limit_across_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binding=self.publication_binding();context={'binding':binding,'command':'original','deadline':time.monotonic()+60}
+            scope=root/'command-0';scope.mkdir(mode=0o700)
+            planner.cache._write_record(scope/'control.json',{'binding':binding,'command':'original','operation':'run'})
+            (scope/'cleanup').write_bytes(b'all-descendants-reaped\n');(scope/'cleanup').chmod(0o600)
+            gate=planner.RestartGate(root/'restart.json',context)
+            for _ in range(4):gate.begin(context);gate.finish(context,scope/'cleanup')
+            self.assertEqual(gate.state()['passes'],4)
+            with self.assertRaises(planner.FreshnessHold):gate.begin(context)
+            reopened=planner.RestartGate(root/'restart.json',context)
+            with self.assertRaises(planner.FreshnessHold):reopened.begin(context)
+            self.assertFalse(reopened.state()['shipping_authority'])
+
+    def test_restart_gate_requires_original_cleanup_and_rejects_deadline_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);context={'binding':self.publication_binding(),'command':'original','deadline':time.monotonic()+60}
+            gate=planner.RestartGate(root/'restart.json',context);gate.begin(context)
+            with self.assertRaises(planner.FreshnessHold):gate.finish(context,root/'missing/cleanup')
+            with self.assertRaises(planner.FreshnessHold):gate.begin(context)
+            with self.assertRaises(planner.FreshnessHold):planner.RestartGate(root/'restart.json',context|{'deadline':context['deadline']+60})
+            self.assertEqual(gate.state()['passes'],1)
+            expired_context=context|{'deadline':time.monotonic()-1}
+            expired=planner.RestartGate(root/'expired.json',expired_context)
+            with self.assertRaises(planner.FreshnessHold):expired.begin(expired_context)
+
+    def publication_binding(self):
+        return {'generation':'12345678-1234-4234-8234-123456789abc','head':'a'*40,'tree':'b'*40,
+            **{key:'c'*64 for key in ('contract_sha256','authority_sha256','cache_identity_sha256','source_inputs_sha256')}}
+
+    def stored_publication(self,store,*,value=b'old',extra=False):
+        identity,root=store.allocate();(root/'debug/build/pkg-aaaaaaaaaaaaaaaa/out').mkdir(parents=True)
+        output=root/'debug/build/pkg-aaaaaaaaaaaaaaaa/out';(output/'value.rs').write_bytes(value)
+        if extra:(output/'chosen.rs').write_bytes(b'new')
+        for path in root.rglob('*'):path.chmod(0o555 if path.is_dir() else 0o444)
+        root.chmod(0o555);rows=planner.unit_views.inventory(root,owner=os.geteuid(),sealed=True)
+        publication={'root':root,'manifest':rows,'files':[os.fsdecode(bytes.fromhex(row[0])) for row in rows if row[1]=='file'],
+            'roots':['debug/build/pkg-aaaaaaaaaaaaaaaa/out'],'action':'generated',
+            'cargo_target':{'package_id':'pkg','target_name':'build-script-build','target_kind':['custom-build'],
+                'manifest_path':'/workspace/Cargo.toml','source_path':'/workspace/build.rs'},
+            'generated_root':'debug/build/pkg-aaaaaaaaaaaaaaaa/out'}
+        return identity,publication
+
+    def test_publication_store_preserves_history_and_invalidates_before_namespace_advance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'units').mkdir(mode=0o700)
+            store=planner.PublicationStore(root/'store',binding=self.publication_binding(),command='original',
+                unit_root=root/'units',allow_diagnostic=True)
+            first,old=self.stored_publication(store);store.publish(first,old)
+            captured=[]
+            def changed(publication):
+                state=store.state();self.assertEqual(state['namespaces'][old['roots'][0]],first)
+                self.assertEqual(state['transition']['producer'],second);captured.append('library');return ['library','binary']
+            store.watch(old['roots'][0],changed)
+            second,new=self.stored_publication(store,extra=True);store.publish(second,new)
+            active,files=store.snapshot();history,_=store.snapshot(historical=True)
+            self.assertEqual(store.state()['namespaces'][old['roots'][0]],second)
+            self.assertEqual(set(history),{first,second});self.assertEqual(set(active),{second})
+            self.assertEqual((old['root']/old['roots'][0]/'value.rs').read_bytes(),b'old')
+            self.assertEqual(captured,['library']);self.assertEqual(store.state()['last_affected'],['binary','library'])
+            self.assertEqual(files[old['roots'][0]+'/chosen.rs'][0],second)
+
+    def test_publication_store_leaves_interrupted_transition_unusable_and_keeps_old_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'units').mkdir(mode=0o700)
+            args={'binding':self.publication_binding(),'command':'original','unit_root':root/'units','allow_diagnostic':True}
+            store=planner.PublicationStore(root/'store',**args);first,old=self.stored_publication(store);store.publish(first,old)
+            def interrupted(_):raise planner.FreshnessHold('metadata_torn')
+            store.watch(old['roots'][0],interrupted);second,new=self.stored_publication(store,extra=True)
+            with self.assertRaises(planner.FreshnessHold):store.publish(second,new)
+            self.assertEqual(store.state()['namespaces'][old['roots'][0]],first)
+            self.assertEqual(store.state()['transition']['producer'],second)
+            with self.assertRaises(planner.FreshnessHold):store.snapshot()
+            with self.assertRaises(planner.FreshnessHold):planner.PublicationStore(root/'store',**args)
+            self.assertTrue((root/'store/records'/first).with_suffix('.json').is_file())
+            self.assertTrue(old['root'].is_dir());self.assertTrue(new['root'].is_dir())
+
+    def test_publication_store_requires_bound_successful_original_unit_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);units=root/'units';units.mkdir(mode=0o700);binding=self.publication_binding()
+            store=planner.PublicationStore(root/'store',binding=binding,command='original',unit_root=units)
+            identity,publication=self.stored_publication(store)
+            with self.assertRaises(planner.FreshnessHold):store.publish(identity,publication)
+            scope=units/str(uuid.uuid4());scope.mkdir(mode=0o700)
+            (scope/'cleanup').write_bytes(b'all-descendants-reaped\n');(scope/'cleanup').chmod(0o600)
+            record={'version':3,'binding':binding,'command':'original','ordinal':7,'returncode':1,'exec_observed':True}
+            planner.cache._write_record(scope/'exit-status.json',record)
+            with self.assertRaises(planner.FreshnessHold):store.publish(identity,publication,scope=scope,ordinal=7)
+            planner.cache._write_record(scope/'exit-status.json',record|{'returncode':0})
+            store.publish(identity,publication,scope=scope,ordinal=7)
+            saved=planner.cache._read_record(root/'store/records'/(identity+'.json'))
+            self.assertEqual(saved['evidence']['kind'],'unit');self.assertTrue(saved['evidence']['original_cleanup'])
+            self.assertEqual(len(store.state()['history']),1)
+
     def test_dispatch_uses_graph_and_owned_executable_instead_of_package_labels(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);source=root/'source';source.mkdir();source,metadata=self.frozen_graph(source)
@@ -332,7 +427,7 @@ class PlannerProtocolTests(unittest.TestCase):
         value={'version':1,'compiler_calls':[3,0],'build_script_calls':[1,0],'generated_tree_preserved':True,'library_input_mounted':True,'application_runs':2,'actual_metadata_preserved':True,
             'sealed_artifact_detached':True,'units':units,'allocation_removed':True,
             'trusted_input_closure':False,'shipping_authority':False,'invalidation':self.compiler_invalidation(),
-            'retry':self.cargo_retry(),'cargo_graph':self.cargo_graph()}
+            'retry':self.cargo_retry(),'cargo_graph':self.cargo_graph(),'publication_store':self.publication_store()}
         self.assertEqual(planner.validate_cargo_probe(value),value)
         for field,replacement in (('compiler_calls',[True,0]),('compiler_calls',[3,1]),
                 ('build_script_calls',[True,0]),('build_script_calls',[1,1]),('generated_tree_preserved',False),('library_input_mounted',False),
@@ -355,9 +450,23 @@ class PlannerProtocolTests(unittest.TestCase):
             'rounds':1,'original_planner_cleanup':True,'original_unit_cleanup':True,
             'unaffected_fingerprints_preserved':True,'original_generated_preserved':True,
             'failed_outputs_unpublished':True,'pending':['binary','library'],
+            'planner_passes':2,'planner_pass_limit':4,'original_grant_unchanged':True,
             'units':[{'ordinal':14,'uid':2014,'started':True,'cancelled':False,'returncode':1,
                 'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False}],
             'input_closure_complete':False,'shipping_authority':False}
+
+    def publication_store(self):
+        return {'version':1,'history_records':5,'active_producers':4,'unit_producers':4,'diagnostic_producers':1,
+            'invalidation_before_activation':True,'last_affected':['binary','library'],'original_unit_cleanup':True,
+            'history_preserved':True,'input_closure_complete':False,'shipping_authority':False}
+
+    def test_publication_store_receipt_distinguishes_diagnostic_snapshots_from_executed_units(self):
+        value=self.publication_store();self.assertEqual(planner.validate_publication_store(value),value)
+        for field,replacement in (('history_records',4),('unit_producers',5),('diagnostic_producers',0),
+                ('invalidation_before_activation',False),('original_unit_cleanup',False),('history_preserved',False),
+                ('last_affected',[]),('shipping_authority',True)):
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):
+                planner.validate_publication_store(value|{field:replacement})
 
     def cargo_graph(self):
         admissions=[]

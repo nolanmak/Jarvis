@@ -1245,3 +1245,26 @@ kernel programs/links stayed verified. All 290 Python CI tests and 31 focused
 managed Rust tests passed (15 opt-in cases excluded). General CI activation,
 multi-package publication lifetimes and the original in-command restart exit
 remain unfinished; no shipping authority is claimed.
+
+Publication storage now uses per-execution producer IDs, protected records and
+separate active file/namespace indexes. Role names remain diagnostic aliases
+only. Each actual producer requires a successful original unit exit and cleanup
+receipt bound to this command; a root-created relevance snapshot is explicitly
+`controller-diagnostic` with no execution claim. Old sealed objects and producer
+records survive namespace replacement. Cross-producer collisions and overlapping
+namespaces hold. A prepared transition is durable before selector callbacks;
+callbacks persist affected units before the active index changes. Failed
+callbacks/materialization leave the store unusable and recovery does not
+silently recreate an empty store. Detached planner copies are replaced atomically
+after ownership/content validation, never by mutating sealed history.
+
+The private replay now publishes its introduced-module snapshot through this
+transition path: the actual compiler selector refresh marks library/binary
+pending before activation, then the same Cargo command exercises the selective
+failed rebuild. A durable restart gate binds the original bootstrap context and
+deadline, requires original Cargo cleanup between passes, and refuses more than
+four passes or a changed grant after reopening. The unchanged warm command and
+its failed retry use two passes in this diagnostic; this does not prove the
+original in-command publication harness. Live selector recovery, opaque tools,
+general CI entry dispatch, full input closure and final passing-CI publication
+remain unfinished. Native validation of this integration is pending.

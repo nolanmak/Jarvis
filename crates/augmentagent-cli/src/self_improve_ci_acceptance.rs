@@ -95,6 +95,8 @@ pub fn value()->u8{GENERATED}
         && probe["cargo"]["retry"]["cargo_exit"]==101 && probe["cargo"]["retry"]["library_exit"]==1
         && probe["cargo"]["retry"]["compiler_calls"]==1 && probe["cargo"]["retry"]["diagnostic"]=="E0761"
         && probe["cargo"]["retry"]["rounds"]==1 && probe["cargo"]["retry"]["original_planner_cleanup"]==true
+        && probe["cargo"]["retry"]["planner_passes"]==2 && probe["cargo"]["retry"]["planner_pass_limit"]==4
+        && probe["cargo"]["retry"]["original_grant_unchanged"]==true
         && probe["cargo"]["retry"]["original_unit_cleanup"]==true
         && probe["cargo"]["retry"]["unaffected_fingerprints_preserved"]==true
         && probe["cargo"]["retry"]["original_generated_preserved"]==true
@@ -107,6 +109,12 @@ pub fn value()->u8{GENERATED}
         && probe["cargo"]["cargo_graph"]["admissions"].as_array().is_some_and(|values|values.len()==4)
         && probe["cargo"]["cargo_graph"]["input_closure_complete"]==false
         && probe["cargo"]["cargo_graph"]["shipping_authority"]==false
+        && probe["cargo"]["publication_store"]["history_records"]==5
+        && probe["cargo"]["publication_store"]["unit_producers"]==4
+        && probe["cargo"]["publication_store"]["diagnostic_producers"]==1
+        && probe["cargo"]["publication_store"]["invalidation_before_activation"]==true
+        && probe["cargo"]["publication_store"]["history_preserved"]==true
+        && probe["cargo"]["publication_store"]["shipping_authority"]==false
         && probe["kernel_observation"]["witness_observed"]==true
         && probe["kernel_observation"]["positive_query_observed"]==true
         && probe["kernel_observation"]["negative_query_observed"]==true

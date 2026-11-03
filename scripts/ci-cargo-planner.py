@@ -8,6 +8,7 @@ still required before this transport can run protected production Cargo.
 """
 import array
 import ctypes
+import copy
 import errno
 import fcntl
 import hashlib
@@ -324,6 +325,202 @@ def rustc_unit(request,*,package,host_triple):
             'request_sha256':hashlib.sha256(json.dumps(context,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
             'input_closure_complete':False,'shipping_authority':False}
     except (ValueError,TypeError,KeyError,AttributeError,IndexError,UnicodeError):hold()
+
+
+class RestartGate:
+    """Durable four-pass counter for one authenticated bootstrap grant.
+
+    The caller supplies original execution authority. This gate cannot renew a
+    deadline, clear invalidations, issue passing CI or authenticate a new grant.
+    """
+    def __init__(self,path,context):
+        self.path=unit_views.literal(path)
+        cache.validate_binding(context['binding'])
+        deadline=context.get('deadline');command=context.get('command')
+        if (type(deadline) not in (int,float) or not math.isfinite(deadline)
+                or type(command) is not str or not 0<len(command)<=256):raise FreshnessHold('metadata_torn')
+        encoded=json.dumps(context,sort_keys=True,separators=(',',':')).encode()
+        if len(encoded)>65536:raise FreshnessHold('metadata_torn')
+        self.grant=hashlib.sha256(encoded).hexdigest();self.deadline=deadline
+        if self.path.exists() or self.path.is_symlink():self._state=cache._read_record(self.path)
+        else:
+            self._state={'version':1,'binding':copy.deepcopy(context['binding']),'command':command,'grant_sha256':self.grant,
+                'deadline':deadline,'passes':0,'active':False,'shipping_authority':False}
+            cache._write_record(self.path,self._state)
+        value=self._state
+        if (set(value)!={'version','binding','command','grant_sha256','deadline','passes','active','shipping_authority'}
+                or type(value['version']) is not int or value['version']!=1 or value['binding']!=context['binding']
+                or value['command']!=command or value['grant_sha256']!=self.grant or value['deadline']!=deadline
+                or type(value['passes']) is not int or not 0<=value['passes']<=4
+                or type(value['active']) is not bool or value['shipping_authority'] is not False):
+            raise FreshnessHold('metadata_torn')
+
+    def _check(self,context):
+        if (hashlib.sha256(json.dumps(context,sort_keys=True,separators=(',',':')).encode()).hexdigest()!=self.grant
+                or cache._read_record(self.path)!=self._state):raise FreshnessHold('metadata_torn')
+
+    def begin(self,context):
+        self._check(context)
+        if self._state['active'] or self._state['passes']>=4 or time.monotonic()>=self.deadline:
+            raise FreshnessHold('input_census_unknown')
+        value=self._state|{'passes':self._state['passes']+1,'active':True}
+        cache._write_record(self.path,value);self._state=value
+
+    def finish(self,context,cleanup):
+        self._check(context);cleanup=unit_views.literal(cleanup)
+        if not self._state['active'] or cleanup.parent.parent!=self.path.parent:raise FreshnessHold('cleanup_uncertain')
+        original_cargo_cleanup(cleanup,owner=os.geteuid());control=cache._read_record(cleanup.parent/'control.json')
+        if (control.get('binding')!=self._state['binding'] or control.get('command')!=self._state['command']
+                or control.get('operation')!='run'):raise FreshnessHold('cleanup_uncertain')
+        value=self._state|{'active':False};cache._write_record(self.path,value);self._state=value
+
+    def state(self):return copy.deepcopy(self._state)
+
+
+class PublicationStore:
+    """Controller-owned producer history and active publication indexes.
+
+    The caller establishes admission and producer identity. Diagnostic snapshots
+    are explicit and never claim execution. Reopening a store cannot restore
+    in-memory selectors or grant reuse; recovery remains a typed hold.
+    """
+    LIMIT=16*1024**2
+
+    def __init__(self,root,*,binding,command,unit_root,allow_diagnostic=False):
+        cache.validate_binding(binding)
+        if not isinstance(command,str) or not command or len(command)>256 or type(allow_diagnostic) is not bool:
+            raise FreshnessHold('metadata_torn')
+        self.root=unit_views.literal(root);self.unit_root=unit_views.literal(unit_root)
+        self.owner=os.geteuid();self.controller=os.getpid();self.binding=copy.deepcopy(binding);self.command=command
+        self.allow_diagnostic=allow_diagnostic;self._lock=threading.RLock();self._records={};self._rows={};self._reserved=set();self._watches={}
+        if self.root.exists() or self.root.is_symlink():raise FreshnessHold('metadata_torn')
+        self.root.mkdir(mode=0o700)
+        for name in ('objects','records','allocations'):(self.root/name).mkdir(mode=0o700)
+        self.objects=self.root/'objects';self._state={'version':1,'binding':self.binding,'command':command,'epoch':0,
+            'history':[],'files':{},'namespaces':{},'transition':None,'last_affected':[],'shipping_authority':False}
+        self._write(self.root/'state.json',self._state)
+
+    def _write(self,path,value):
+        if len(json.dumps(value,separators=(',',':')).encode())>self.LIMIT:raise FreshnessHold('metadata_torn')
+        cache._write_record(path,value)
+
+    def _check(self,*,active=True):
+        if (os.getpid()!=self.controller or os.geteuid()!=self.owner
+                or cache._read_record(self.root/'state.json',max_bytes=self.LIMIT)!=self._state
+                or active and self._state['transition'] is not None):raise FreshnessHold('metadata_torn')
+
+    def state(self):
+        with self._lock:self._check(active=False);return copy.deepcopy(self._state)
+
+    def allocate(self):
+        with self._lock:
+            self._check()
+            if len(self._reserved)+len(self._records)>=4096:raise FreshnessHold('invalidation_unsafe')
+            identity=str(uuid.uuid4());path=self.objects/identity
+            if path.exists() or path.is_symlink():raise FreshnessHold('invalidation_unsafe')
+            self._write(self.root/'allocations'/(identity+'.json'),{'version':1,'binding':self.binding,
+                'command':self.command,'producer':identity,'state':'allocated','shipping_authority':False})
+            self._reserved.add(identity);return identity,path
+
+    def watch(self,namespace,callback):
+        with self._lock:
+            self._check();unit_views.relative(namespace)
+            if namespace not in self._state['namespaces'] or not callable(callback):raise FreshnessHold('input_census_unknown')
+            self._watches.setdefault(namespace,[]).append(callback)
+
+    @staticmethod
+    def _family(publication):
+        target=publication['cargo_target']
+        return (publication['action'],target['package_id'],target['target_name'],tuple(target['target_kind']),
+            target['manifest_path'],target['source_path'],tuple(publication['roots']))
+
+    def _evidence(self,scope,ordinal):
+        if scope is None:
+            if not self.allow_diagnostic or ordinal is not None:raise FreshnessHold('artifact_provenance_unknown')
+            return {'kind':'controller-diagnostic','original_cleanup':False}
+        scope=unit_views.literal(scope)
+        if scope.parent!=self.unit_root or type(ordinal) is not int or not 0<=ordinal<4096:
+            raise FreshnessHold('artifact_provenance_unknown')
+        original_cargo_cleanup(scope/'cleanup',owner=self.owner)
+        status=cache._read_record(scope/'exit-status.json')
+        if (type(status.get('version')) is not int or status['version']!=3 or status.get('binding')!=self.binding
+                or status.get('command')!=self.command or status.get('ordinal')!=ordinal
+                or type(status.get('returncode')) is not int or status['returncode']!=0
+                or status.get('exec_observed') is not True):raise FreshnessHold('artifact_provenance_unknown')
+        return {'kind':'unit','status':status,'original_cleanup':True,
+            'cleanup_sha256':hashlib.sha256(b'all-descendants-reaped\n').hexdigest()}
+
+    def publish(self,identity,publication,*,scope=None,ordinal=None,materialize=None):
+        with self._lock:
+            self._check()
+            if identity not in self._reserved or publication['root']!=self.objects/identity:
+                raise FreshnessHold('artifact_provenance_unknown')
+            publication=copy.deepcopy(publication);family=self._family(publication)
+            rows=unit_views.inventory(publication['root'],owner=self.owner,sealed=True)
+            names={os.fsdecode(bytes.fromhex(row[0])):row for row in rows if row[1]=='file'}
+            if (rows!=publication['manifest'] or set(names)!=set(publication['files'])
+                    or len(set(publication['files']))!=len(publication['files'])
+                    or publication['action'] not in ('library','check','binary','test','build-script','generated')
+                    or bool(publication['roots'])!=(publication['action']=='generated')):
+                raise FreshnessHold('artifact_provenance_unknown')
+            roots=publication['roots']
+            if (type(roots) is not list or len(roots)>64 or len(set(roots))!=len(roots)
+                    or any(a.startswith(b+'/') or b.startswith(a+'/') for i,a in enumerate(roots) for b in roots[i+1:])):
+                raise FreshnessHold('artifact_provenance_unknown')
+            for root in roots:unit_views.relative(root)
+            following=copy.deepcopy(self._state);files=following['files'];namespaces=following['namespaces']
+            for root in publication['roots']:
+                for other,previous in list(namespaces.items()):
+                    if root==other:
+                        if self._family(self._records[previous])!=family:raise FreshnessHold('artifact_provenance_unknown')
+                        files={name:producer for name,producer in files.items() if not name.startswith(root+'/')}
+                    elif root.startswith(other+'/') or other.startswith(root+'/'):raise FreshnessHold('artifact_provenance_unknown')
+                namespaces[root]=identity
+            for name in names:
+                previous=files.get(name)
+                if previous is not None and self._family(self._records[previous])!=family:
+                    raise FreshnessHold('artifact_provenance_unknown')
+                for root,producer in namespaces.items():
+                    if name.startswith(root+'/') and producer!=identity and self._family(self._records[producer])!=family:
+                        raise FreshnessHold('artifact_provenance_unknown')
+                files[name]=identity
+            evidence=self._evidence(scope,ordinal)
+            document={key:value for key,value in publication.items() if key!='root'}
+            record={'version':1,'binding':self.binding,'command':self.command,'producer':identity,
+                'publication':document,'evidence':evidence,'input_closure_complete':False,'shipping_authority':False}
+            self._write(self.root/'records'/(identity+'.json'),record)
+            pending=copy.deepcopy(self._state);pending['transition']={'producer':identity,'phase':'prepared'}
+            self._write(self.root/'state.json',pending);self._state=pending
+            self._records[identity]=publication;self._rows[identity]=names;affected=set()
+            for root in publication['roots']:
+                for callback in self._watches.get(root,[]):
+                    changed=callback(copy.deepcopy(publication))
+                    if (type(changed) is not list or len(changed)>4096
+                            or any(not lookup_inputs.UnitInvalidations._name(name) for name in changed)):
+                        raise FreshnessHold('input_census_unknown')
+                    affected.update(changed)
+            if materialize is not None:materialize(copy.deepcopy(publication))
+            if unit_views.inventory(publication['root'],owner=self.owner,sealed=True)!=rows:
+                raise FreshnessHold('artifact_provenance_unknown')
+            following.update(files=files,epoch=following['epoch']+1,history=[*following['history'],identity],
+                transition=None,last_affected=sorted(affected))
+            self._write(self.root/'state.json',following);self._state=following;self._reserved.remove(identity)
+            return identity
+
+    def record(self,identity):
+        with self._lock:
+            self._check()
+            if identity not in self._state['history']:raise FreshnessHold('artifact_provenance_unknown')
+            return copy.deepcopy(self._records[identity])
+
+    def snapshot(self,*,historical=False):
+        with self._lock:
+            self._check();selected=(set(self._state['history']) if historical
+                else set(self._state['files'].values())|set(self._state['namespaces'].values()))
+            publications={identity:copy.deepcopy(self._records[identity]) for identity in selected};files={}
+            for name,identity in self._state['files'].items():
+                files[name]=(identity,copy.deepcopy(self._rows[identity][name]))
+            return publications,files
 
 
 class CargoGraph:
@@ -1048,10 +1245,11 @@ class _CargoProbe:
                 or admission.owner!=os.getpid() or os.getresuid()!=(0,0,0)):
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
-        self.admission=admission;self.owner=os.getpid();self.units={};self.publications={};self.files={};self.report=None
+        self.admission=admission;self.owner=os.getpid();self.units={};self.fixture_labels={};self.report=None
         self.generated_stats={};self.library_used=False;self.commands=[]
         self.retry_active=False;self.retry_publication=None;self.journal=None;self.fingerprints=None
         self.graph=None;self.preparing_graph=False
+        self.restart_gate=None
         self.source=admission.target.parent/'source-projection'
         for name,body in (('Cargo.toml',CARGO_FIXTURE_MANIFEST),('src/main.rs',CARGO_FIXTURE_SOURCE),
                 ('src/lib.rs',CARGO_FIXTURE_LIB),('build.rs',CARGO_FIXTURE_BUILD)):
@@ -1062,9 +1260,22 @@ class _CargoProbe:
         self.control={'version':1,'kind':'private-cargo-view-probe','binding':admission.binding,
             'command':admission.command,'shipping_authority':False}
         cache._write_record(self.root/'control.json',{**self.control,'state':'active'})
+        self.store=PublicationStore(self.root/'publications',binding=admission.binding,command=admission.command,
+            unit_root=admission.root/'units',allow_diagnostic=True)
         self.target=self.root/'planner-target'
         for name in ('planner-target','home','cargo-home'):
             path=self.root/name;path.mkdir(mode=0o700);os.chown(path,1001,1001)
+
+    @property
+    def publications(self):return self.store.snapshot()[0]
+
+    @property
+    def files(self):return self.store.snapshot()[1]
+
+    @property
+    def history(self):return self.store.snapshot(historical=True)[0]
+
+    def publication(self,label):return self.store.record(self.fixture_labels[label])
 
     @staticmethod
     def _directory(root,name,unit):
@@ -1099,9 +1310,9 @@ class _CargoProbe:
         finally:os.close(descriptor)
         return path
 
-    def _file_input(self,artifacts,unit,name,alias=None):
-        if name not in self.files:raise cargo_hold('planner_cargo_artifact')
-        label,row=self.files[name];publication=self.publications[label]
+    def _file_input(self,artifacts,unit,name,alias=None,*,publications,files):
+        if name not in files:raise cargo_hold('planner_cargo_artifact')
+        label,row=files[name];publication=publications[label]
         if unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']:
             raise cargo_hold('planner_cargo_artifact')
         original=publication['root']/name;actual=self._planner_file(name,row)
@@ -1114,9 +1325,8 @@ class _CargoProbe:
         (artifacts/virtual).touch(mode=0o444);raw=os.fsencode(virtual).hex()
         return [raw,str(original),[raw,*row[1:]]]
 
-    def _generated_input(self,artifacts,unit,name,package_id):
-        publication=(generated_publication({'retry':self.retry_publication},name,package_id) if self.retry_active
-            else generated_publication(self.publications,name,package_id))
+    def _generated_input(self,artifacts,unit,name,package_id,*,publications):
+        publication=generated_publication(publications,name,package_id)
         _declared_publication(self.graph,publication)
         if publication is None or publication['roots']!=[name]:raise cargo_hold('planner_cargo_artifact')
         if unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']:
@@ -1130,8 +1340,9 @@ class _CargoProbe:
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
         try:
             guarded=fixture_request(request)
+            publications,files=self.store.snapshot()
             mapped=dispatch_request(request,graph=self.graph,planner_target=self.target,
-                publications=self.publications,files=self.files)
+                publications=publications,files=files)
             if any(mapped.get(key)!=value for key,value in guarded.items()):raise cargo_hold('planner_cargo_request')
         except FreshnessHold as error:
             if not hasattr(error,'unit_view_stage'):error.unit_view_stage='planner_cargo_request'
@@ -1145,21 +1356,21 @@ class _CargoProbe:
             path=artifacts/name;path.mkdir(mode=0o700);os.chown(path,unit,unit)
         entries=[];mounted=set()
         if mapped['kind'] in ('application','build_script'):
-            entries.append(self._file_input(artifacts,unit,mapped['artifact'],mapped['alias']))
+            entries.append(self._file_input(artifacts,unit,mapped['artifact'],mapped['alias'],publications=publications,files=files))
         if mapped['kind']=='compile':
             for name in mapped['dependencies']:
-                if name not in self.files:raise cargo_hold('planner_cargo_artifact')
-                publication=self.publications[self.files[name][0]]
+                if name not in files:raise cargo_hold('planner_cargo_artifact')
+                publication=publications[files[name][0]]
                 if publication['action'] not in ('library','check'):raise cargo_hold('planner_cargo_artifact')
                 for artifact in publication['files']:
                     if artifact.endswith(('.rlib','.rmeta')) and artifact not in mounted:
-                        entries.append(self._file_input(artifacts,unit,artifact));mounted.add(artifact)
+                        entries.append(self._file_input(artifacts,unit,artifact,publications=publications,files=files));mounted.add(artifact)
                 self.library_used=True
             self._directory(artifacts,str(Path(mapped['outputs'][0]).parent),unit)
         generated=mapped.get('generated_root')
         if generated is not None:
             if mapped['kind']=='build_script':self._directory(artifacts,generated,unit)
-            else:entries.append(self._generated_input(artifacts,unit,generated,admission['package_id']))
+            else:entries.append(self._generated_input(artifacts,unit,generated,admission['package_id'],publications=publications))
         root=slot/'root';root.mkdir(mode=0o700);mounts=slot/'mounts.json'
         cache._write_record(mounts,{'version':1,'binding':self.admission.binding,
             'command':self.admission.command,'ordinal':ordinal,'entries':entries})
@@ -1169,6 +1380,29 @@ class _CargoProbe:
         return view
 
     def running(self,view):pass
+
+    def _materialize(self,publication,previous_files):
+        for row in publication['manifest']:
+            if row[0]!='2e' and row[1]=='directory':self._directory(self.target,os.fsdecode(bytes.fromhex(row[0])),1001)
+        for name in publication['files']:
+            destination=self.target/name;self._directory(self.target,str(Path(name).parent),1001)
+            if destination.exists() or destination.is_symlink():
+                if name not in previous_files:raise cargo_hold('planner_cargo_artifact')
+                self._planner_file(name,previous_files[name][1])
+            temporary=destination.with_name('.ci-publication-'+str(uuid.uuid4()))
+            descriptor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+            try:
+                mode,_size,_digest=unit_views._read(publication['root']/name,0,True,descriptor)
+                os.fchown(descriptor,1001,1001);os.fchmod(descriptor,0o755 if mode&0o111 else 0o644);os.fsync(descriptor)
+            finally:os.close(descriptor)
+            try:
+                os.replace(temporary,destination)
+                directory=os.open(destination.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC|os.O_NOFOLLOW)
+                try:os.fsync(directory)
+                finally:os.close(directory)
+            finally:
+                try:temporary.unlink()
+                except FileNotFoundError:pass
 
     def record_invalidations(self,events,metadata,user_namespace):
         """Consume the actual library's missing-module query after unit drain.
@@ -1182,7 +1416,7 @@ class _CargoProbe:
         binaries=[unit for unit in self.units.values()
             if unit['mapping']['kind']=='compile' and unit['mapping']['role']=='binary']
         if len(libraries)!=1 or len(binaries)!=1:raise FreshnessHold('input_census_unknown')
-        ordinal,unit=libraries[0];mapping=unit['mapping'];publication=self.publications['generated']
+        ordinal,unit=libraries[0];mapping=unit['mapping'];publication=self.publication('generated')
         original=publication['root']/mapping['generated_root']
         if unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']:
             raise FreshnessHold('input_census_unknown')
@@ -1196,7 +1430,7 @@ class _CargoProbe:
         scope=int(unit['namespaces']['mnt']['unit'].split('[',1)[1][:-1])
         observation=index(original).select(selected,metadata,pid=unit['pid'],uid=2000+ordinal,
             user_namespace=user_namespace,mount_namespace=scope,threaded=True)
-        variant=self.root/'introduced-generated'
+        variant_id,variant=self.store.allocate()
         unit_views.copy_output_roots(publication['root'],variant,[mapping['generated_root']],owner=0,controller=0)
         changed=variant/mapping['generated_root'];changed.chmod(0o755)
         introduced=changed/'chosen.rs';introduced.write_bytes(b'pub const VALUE:u8=9;\n')
@@ -1211,12 +1445,22 @@ class _CargoProbe:
         # includes that dependency; this is not a complete binary-input census.
         journal.register('binary',dependencies=['library'],content_sha256=before,
             fingerprints=[binaries[0]['mapping']['fingerprint']])
-        pending=journal.changed({'library':after})
+        def refresh(publication):
+            digest=observation.refresh(index(publication['root']/mapping['generated_root']))['sha256']
+            return journal.changed({'library':digest})
+        self.store.watch(mapping['generated_root'],refresh)
+        variant_manifest=unit_views.inventory(variant,owner=0,sealed=True)
+        self.retry_publication={'root':variant,'manifest':variant_manifest,
+            'files':[os.fsdecode(bytes.fromhex(row[0])) for row in variant_manifest if row[1]=='file'],
+            'roots':[mapping['generated_root']],'action':'generated','cargo_target':publication['cargo_target'],
+            'generated_root':mapping['generated_root']}
+        # This is a root-created relevance snapshot, not another BRS execution.
+        self.store.publish(variant_id,self.retry_publication)
+        pending=journal.pending()
         restored=lookup_inputs.UnitInvalidations(ledger/'units.json',**args)
-        if pending!=['binary','library'] or restored.pending()!=pending:raise FreshnessHold('metadata_torn')
+        if (pending!=['binary','library'] or restored.pending()!=pending
+                or self.store.state()['last_affected']!=pending):raise FreshnessHold('metadata_torn')
         self.journal=restored
-        self.retry_publication={'root':variant,'manifest':unit_views.inventory(variant,owner=0,sealed=True),
-            'roots':[mapping['generated_root']],'action':'generated','cargo_target':publication['cargo_target']}
         if (any(self._stat(path)!=prior for path,prior in self.generated_stats.items())
                 or unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']):
             raise FreshnessHold('input_census_unknown')
@@ -1248,8 +1492,8 @@ class _CargoProbe:
             raise cargo_hold(stage)
         if mapping['kind'] in ('compile','build_script'):
             label=mapping['role'] if mapping['kind']=='compile' else 'generated'
-            if label in self.publications:raise FreshnessHold('input_census_unknown')
-            staged=self.root/('preparing-'+label);roots=[]
+            identity,sealed=self.store.allocate()
+            staged=self.store.objects/('.preparing-'+identity);roots=[]
             if mapping['kind']=='compile':
                 manifest=unit_views.copy_outputs(Path(view['artifacts']),staged,mapping['outputs'],owner=2000+ordinal,controller=0)
             else:
@@ -1258,34 +1502,19 @@ class _CargoProbe:
                 forged=Path(view['artifacts'])/'debug/.fingerprint/build-script-forged'
                 if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
                     raise FreshnessHold('invalidation_unsafe')
-            sealed=self.root/('sealed-'+label);staged.rename(sealed)
-            parent=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            staged.rename(sealed)
+            parent=os.open(self.store.objects,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
             try:os.fsync(parent)
             finally:os.close(parent)
             outputs=[os.fsdecode(bytes.fromhex(row[0])) for row in manifest if row[1]=='file']
             if mapping['kind']=='compile':outputs=mapping['outputs']
             action=mapping['role'] if mapping['kind']=='compile' else 'generated'
-            self.publications[label]={'root':sealed,'manifest':manifest,'files':outputs,'roots':roots,
+            publication={'root':sealed,'manifest':manifest,'files':outputs,'roots':roots,
                 'action':action,'cargo_target':record['cargo_target'],'generated_root':mapping.get('generated_root')}
-            cache._write_record(self.root/('publication-'+label+'.json'),{'version':1,
-                'binding':self.admission.binding,'command':self.admission.command,'ordinal':ordinal,
-                'kind':'private-cargo-output-probe','role':label,'outputs':manifest,
-                'action':action,'cargo_target':record['cargo_target'],'generated_root':mapping.get('generated_root'),
-                'original_cleanup':True,'shipping_authority':False})
-            for row in manifest:
-                if row[0]=='2e':continue
-                name=os.fsdecode(bytes.fromhex(row[0]))
-                if row[1]=='directory':self._directory(self.target,name,1001)
-                else:self.files[name]=(label,row)
-            # Cargo may hardlink and change bookkeeping on these detached copies.
-            # Its metadata must never share an inode with immutable unit inputs.
-            for name in outputs:
-                destination=self.target/name;self._directory(self.target,str(Path(name).parent),1001)
-                descriptor=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
-                try:
-                    mode,_size,_digest=unit_views._read(sealed/name,0,True,descriptor)
-                    os.fchown(descriptor,1001,1001);os.fchmod(descriptor,0o755 if mode&0o111 else 0o644);os.fsync(descriptor)
-                finally:os.close(descriptor)
+            _publications,previous_files=self.store.snapshot()
+            self.store.publish(identity,publication,scope=directory,ordinal=ordinal,
+                materialize=lambda item:self._materialize(item,previous_files))
+            self.fixture_labels.setdefault(label,identity)
             if label=='generated':
                 tree=sealed/roots[0]
                 for row in unit_views.inventory(tree,owner=0,sealed=True):
@@ -1340,7 +1569,10 @@ class _CargoProbe:
         if status!=0:raise cargo_hold('planner_cargo_request')
         self.graph=CargoGraph(self.source,output,owner=0)
         for iteration in range(2):
+            if iteration==1:
+                self.restart_gate=RestartGate(self.root/'restart.json',value);self.restart_gate.begin(value)
             before=len(relay.completed);status,output,error=self._command(value,relay)
+            if iteration==1:self.restart_gate.finish(value,self.commands[-1]['directory']/'cleanup')
             if status!=0 or output!=b'ISOLATED\n':
                 global _CHILD_DIAGNOSTIC
                 _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
@@ -1361,7 +1593,7 @@ class _CargoProbe:
                 raise FreshnessHold('invalidation_unsafe')
             fingerprint=current
         self.fingerprints=fingerprint
-        if (set(self.publications)!={'build-script','generated','library','binary'} or not self.library_used
+        if (set(self.fixture_labels)!={'build-script','generated','library','binary'} or not self.library_used
                 or not self.generated_stats or any(not unit['finished'] for unit in self.units.values())
                 or any(unit_views.inventory(pub['root'],owner=0,sealed=True)!=pub['manifest'] for pub in self.publications.values())
                 or any(self._stat(path)!=before for path,before in self.generated_stats.items())):
@@ -1389,23 +1621,26 @@ class _CargoProbe:
             binding=self.admission.binding,command=self.admission.command)
         if restored.state()!=self.journal.state() or restored.pending()!=['binary','library']:
             raise FreshnessHold('metadata_torn')
+        if self.restart_gate is None or self.restart_gate.state()['passes']!=1:raise FreshnessHold('metadata_torn')
+        self.restart_gate.begin(value)
         state=restored.state();paths=[path for name in restored.pending() for path in state['units'][name]['fingerprints']]
         intent={'version':1,'binding':self.admission.binding,'command':self.admission.command,
             'paths':paths,'fingerprints':self.fingerprints,'pending':restored.pending(),'state':'prepared'}
         cache._write_record(self.root/'invalidations/retirement.json',intent)
         retained=retire_unit_fingerprints(self.target,self.fingerprints,paths)
         cache._write_record(self.root/'invalidations/retirement.json',intent|{'state':'retired'})
-        before=len(relay.completed);old_publications=copy_publications(self.publications)
+        before=len(relay.completed);old_publications=copy_publications(self.history)
         self.retry_active=True;_PHASE='planner_cargo_retry'
         try:status,output,error=self._command(value,relay)
         finally:self.retry_active=False
+        self.restart_gate.finish(value,self.commands[-1]['directory']/'cleanup')
         completed=relay.completed[before:]
         compilers=[unit for unit in completed if self.units[unit['ordinal']]['mapping']['kind']=='compile']
         if (status!=101 or output or b'E0761' not in error or len(compilers)!=1
                 or self.units[compilers[0]['ordinal']]['mapping']['role']!='library'
                 or compilers[0]['returncode']!=1
                 or any(self.units[unit['ordinal']]['mapping']['kind'] in ('application','build_script') for unit in completed)
-                or copy_publications(self.publications)!=old_publications
+                or copy_publications(self.history)!=old_publications
                 or any(self._stat(path)!=prior for path,prior in self.generated_stats.items())):
             raise cargo_hold('planner_cargo_compile')
         current=unit_views.inventory(self.target/'debug/.fingerprint',owner=1001,sealed=False)
@@ -1420,6 +1655,7 @@ class _CargoProbe:
             'rounds':1,'original_planner_cleanup':True,'original_unit_cleanup':True,
             'unaffected_fingerprints_preserved':True,'original_generated_preserved':True,
             'failed_outputs_unpublished':True,'pending':restored.pending(),'units':completed,
+            'planner_passes':self.restart_gate.state()['passes'],'planner_pass_limit':4,'original_grant_unchanged':True,
             'input_closure_complete':False,'shipping_authority':False}
         admissions=[]
         for ordinal,unit in sorted(self.units.items()):
@@ -1430,6 +1666,17 @@ class _CargoProbe:
             'packages':len(self.graph.packages),'targets':self.graph.target_count,
             'original_metadata_cleanup':True,'admissions':admissions,'graph_dispatch':True,
             'input_closure_complete':False,'shipping_authority':False}
+        state=self.store.state();history=self.history;active,_files=self.store.snapshot()
+        evidence=[cache._read_record(self.store.root/'records'/(identity+'.json'),max_bytes=self.store.LIMIT)['evidence']
+            for identity in state['history']]
+        actual=[item for item in evidence if item['kind']=='unit'];diagnostic=[item for item in evidence if item['kind']=='controller-diagnostic']
+        if (len(history)!=5 or len(active)!=4 or len(actual)!=4 or len(diagnostic)!=1
+                or any(item['original_cleanup'] is not True for item in actual)
+                or diagnostic[0]['original_cleanup'] is not False or state['last_affected']!=['binary','library']):
+            raise FreshnessHold('artifact_provenance_unknown')
+        self.report['publication_store']={'version':1,'history_records':5,'active_producers':4,'unit_producers':4,
+            'diagnostic_producers':1,'invalidation_before_activation':True,'last_affected':state['last_affected'],
+            'original_unit_cleanup':True,'history_preserved':True,'input_closure_complete':False,'shipping_authority':False}
 
     def cleanup(self):
         if self.owner!=os.getpid() or self.report is None:raise FreshnessHold('cleanup_uncertain')
@@ -1830,7 +2077,7 @@ def _probe(arguments):
         _PHASE='planner_kernel_observer'
         compilers={item['mapping']['role']:(item['pid'],2000+ordinal)
             for ordinal,item in cargo_probe.units.items() if item['mapping']['kind']=='compile'}
-        generated=cargo_probe.publications['generated']
+        generated=cargo_probe.publication('generated')
         empty=generated['root']/generated['roots'][0]/'empty'
         directories=[(view_probe.original_pid,2004,view_probe.inputs/'deps',view_probe.directory_members),
             (view_probe.original_pid,2004,view_probe.inputs/'deps/empty',{})]
@@ -1907,10 +2154,10 @@ def validate_compiler_invalidation(value):
 
 def validate_cargo_retry(value,*,start):
     flags={'original_planner_cleanup','original_unit_cleanup','unaffected_fingerprints_preserved',
-        'original_generated_preserved','failed_outputs_unpublished'}
+        'original_generated_preserved','failed_outputs_unpublished','original_grant_unchanged'}
     keys=flags|{'version','cargo_exit','library_exit','compiler_calls','diagnostic','rounds','pending','units',
-        'input_closure_complete','shipping_authority'}
-    integers={'version':1,'cargo_exit':101,'library_exit':1,'compiler_calls':1,'rounds':1}
+        'input_closure_complete','shipping_authority','planner_passes','planner_pass_limit'}
+    integers={'version':1,'cargo_exit':101,'library_exit':1,'compiler_calls':1,'rounds':1,'planner_passes':2,'planner_pass_limit':4}
     if (type(value) is not dict or set(value)!=keys or type(start) is not int or not 5<=start<4096
             or any(type(value[key]) is not int or value[key]!=expected for key,expected in integers.items())
             or value['diagnostic']!='E0761' or value['pending']!=['binary','library']
@@ -1965,10 +2212,22 @@ def validate_cargo_graph(value,*,initial_units,retry_units,selected_uid):
     return value
 
 
+def validate_publication_store(value):
+    integers={'version':1,'history_records':5,'active_producers':4,'unit_producers':4,'diagnostic_producers':1}
+    flags={'invalidation_before_activation','original_unit_cleanup','history_preserved'}
+    keys=set(integers)|flags|{'last_affected','input_closure_complete','shipping_authority'}
+    if (type(value) is not dict or set(value)!=keys
+            or any(type(value[key]) is not int or value[key]!=expected for key,expected in integers.items())
+            or any(value[key] is not True for key in flags) or value['last_affected']!=['binary','library']
+            or value['input_closure_complete'] is not False or value['shipping_authority'] is not False):
+        raise FreshnessHold('artifact_provenance_unknown')
+    return value
+
+
 def validate_cargo_probe(value):
     keys={'version','compiler_calls','application_runs','actual_metadata_preserved','sealed_artifact_detached',
         'units','allocation_removed','trusted_input_closure','shipping_authority','build_script_calls',
-        'generated_tree_preserved','library_input_mounted','invalidation','retry','cargo_graph'}
+        'generated_tree_preserved','library_input_mounted','invalidation','retry','cargo_graph','publication_store'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['compiler_calls']!=[3,0] or any(type(count) is not int for count in value['compiler_calls'])
             or value['build_script_calls']!=[1,0] or any(type(count) is not int for count in value['build_script_calls'])
@@ -1993,6 +2252,7 @@ def validate_cargo_probe(value):
     validate_cargo_retry(value['retry'],start=value['units'][-1]['ordinal']+1)
     validate_cargo_graph(value['cargo_graph'],initial_units=value['units'],retry_units=value['retry']['units'],
         selected_uid=value['invalidation']['unit_uid'])
+    validate_publication_store(value['publication_store'])
     return value
 
 
