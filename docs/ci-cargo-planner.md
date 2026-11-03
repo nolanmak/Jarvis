@@ -1338,9 +1338,9 @@ mounts, with a supported ELF interpreter. Static/opaque executables and loader
 redirects hold rather than running without the preload's kernel guard. Requests with an observed namespace mismatch or mismatched
 per-message sender credentials hold. The shared listener parent is traversable
 without being listable or writable; child directories and sockets retain
-separate credential permissions. The private protocol replay now additionally
+separate credential permissions. The private protocol replay additionally
 requires both crossed worker/planner descriptor roles to exit before reaching
-main. Native validation of these changes is pending.
+main. These assertions now pass in the native replay described below.
 
 The new repository VM test exercises Python spawning Cargo three times. It
 requires a real first compilation despite forged worker-owned fingerprints,
@@ -1350,3 +1350,23 @@ These assertions do not replace the unchanged original in-command publication
 regression. Persistent predecessor recovery, frozen generated forests, the opaque
 counter-wrapper graph, broader tools and complete input/CI authority remain
 unfinished; repository reentry with a predecessor is still explicitly held.
+
+
+Native validation at `a5eed6ec` passed in **101.86 seconds** through the actual
+repository adapter. The original Python driver ran under UID/GID 1000 and three
+original Cargo processes ran under UID/GID 1001. Compiler calls were `[1,0,1]`:
+real first build despite worker-forged fingerprints, unchanged build reuse, and
+real test compilation/execution. Direct worker exec syscalls were denied, planner
+metadata traversal was denied, original worker/Cargo cleanup was verified, and
+original stdout/stderr remained intact. No generated forest, opaque compiler
+wrapper or cross-command recovery capability is established by this case.
+
+The publication/restart replay also passed at that source in **111.88 seconds**,
+including both negative credential-role cases before main. Original compiler
+cold/warm `[3,0]`, build-script `[1,0]`, actual E0761/Cargo101 retry, publication
+history, pre-activation invalidation, original cleanup and sixteen zero-miss
+kernel programs/links remained verified. All **307 Python CI tests passed with
+no skips**, and **31 focused Rust tests passed** with 17 opt-in cases excluded.
+The repository and protocol VM cases were then explicitly run. Both adapter
+modes remain disabled in production builds; the unchanged original in-command
+regression, complete input closure and passing-CI/merge authority remain open.
