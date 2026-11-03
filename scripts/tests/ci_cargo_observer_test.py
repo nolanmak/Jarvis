@@ -22,6 +22,15 @@ def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_expected_empty_map_default_does_not_hide_read_or_update_failures(self):
+        normal={'type':'helper_error','msg':'Map lookup failed','helper':'map_lookup_elem','retcode':0,'line':5,'col':2}
+        data=lookup(2004,101,101,257,1,3,'/workspace/input')+frame('map',{'@emitted':2})
+        self.assertEqual(len(observer.decode((json.dumps(normal)+'\n').encode()+data)),1)
+        for change in ({'helper':'probe_read_kernel','retcode':-14},{'helper':'map_update_elem','retcode':-12},
+                {'helper':'map_delete_elem','retcode':-2},{'retcode':True},{'line':0},{'extra':'unknown'}):
+            with self.subTest(change=change),self.assertRaises(observer.ObservationUnavailable):
+                observer.decode((json.dumps({**normal,**change})+'\n').encode()+data)
+
     def test_startup_error_is_not_classified_from_an_unrelated_probe_warning(self):
         data=(b'stdin:6-7: WARNING: getname_flags is not traceable; attaching will likely fail\n'
             b'error: in function rawtracepoint:sys_exit: Looks like the BPF stack limit is exceeded.\n')

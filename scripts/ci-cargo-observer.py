@@ -54,6 +54,15 @@ def decode(data,*,complete=True):
         if not line:continue
         try:record=json.loads(line,object_pairs_hook=cache._unique_object)
         except (ValueError,TypeError):raise ObservationUnavailable('invalid kernel record framing') from None
+        if type(record) is dict and record.get('type')=='helper_error':
+            if (set(record)=={'type','msg','helper','retcode','line','col'}
+                    and record['helper']=='map_lookup_elem' and type(record['retcode']) is int and record['retcode']==0
+                    and type(record['msg']) is str and 1<=len(record['msg'])<=256
+                    and record['msg'].isascii() and all(ord(c)>=32 for c in record['msg'])
+                    and type(record['line']) is int and 1<=record['line']<=512
+                    and type(record['col']) is int and 1<=record['col']<=512):
+                continue  # bpftrace's specified zero default for an absent map key.
+            raise ObservationUnavailable('kernel helper failed')
         if type(record) is not dict or set(record)!={'type','data'}:raise ObservationUnavailable('unknown kernel record')
         if record['type']=='attached_probes':
             if (type(record['data']) is not dict or set(record['data'])!={'probes'}
@@ -118,7 +127,7 @@ struct observer_filename { const char *name; };
 rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  @number[tid] = arg1;
  @sequence[tid] = @sequence[tid] + 1;
- delete(@seen[tid]);
+ @seen[tid]=0; @ready[tid]=0;
 }
 kretprobe:getname_flags
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
@@ -141,6 +150,15 @@ kretprobe:getname_flags
   $tail=(uint64)0;
   while ($tail<8 && $length<4096 && *(uint8 *)($name+$length)!=0) { $length=$length+1; $tail=$tail+1; }
   @length[tid]=$length;
+  @original_name[tid]=(uint64)$name;
+  @ready[tid]=@sequence[tid];
+ }
+}
+kretprobe:getname_flags
+/ ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
+ if (@ready[tid]>0 && @ready[tid]==@sequence[tid]) {
+  $name=((struct observer_filename *)retval)->name;
+  if (@original_name[tid]!=(uint64)$name) { printf("foreign kernel pathname pointer\n"); }
   $length=@length[tid];
   $owner_uid=uid; $owner_pid=pid; $owner_tid=tid;
   $call=@number[tid]; $entry=@sequence[tid];
@@ -156,6 +174,7 @@ kretprobe:getname_flags
    printf("invalid kernel pathname length\n"); $chunks=1;
   }
   @emitted=sum($chunks);
+  @ready[tid]=0;
   @seen[tid] = 1;
  }
 }
@@ -163,10 +182,10 @@ rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  if (@seen[tid]) {
   printf("E %u %u %u %lld %llu %lld\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],(int64)arg1);
   @emitted = sum(1);
+  @seen[tid]=0;
  }
- delete(@seen[tid]); delete(@number[tid]);
 }
-END { clear(@seen); clear(@length); clear(@sequence); clear(@number); }
+END { clear(@seen); clear(@ready); clear(@original_name); clear(@length); clear(@sequence); clear(@number); }
 '''
 _WITNESS=r'''
 import ctypes,errno,os,sys
