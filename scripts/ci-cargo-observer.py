@@ -105,13 +105,17 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
 }
 kretprobe:getname_flags
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
- $value = str(((struct observer_filename *)retval)->name, 128);
+ $name = ((struct observer_filename *)retval)->name;
+ $prefix = *(uint64 *)$name;
  if ((@number[tid]==2 || @number[tid]==4 || @number[tid]==6 || @number[tid]==21 ||
       @number[tid]==89 || @number[tid]==257 || @number[tid]==262 || @number[tid]==267 ||
       @number[tid]==269 || @number[tid]==332 || @number[tid]==439) &&
-     (strncmp($value,"/workspace/",11)==0 || $value=="src/lib.rs" || $value=="src/main.rs" ||
-      $value=="build.rs" || $value == __WITNESS__)) {
-  printf("N %u %u %u %lld %llu %s\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],$value);
+     (($prefix==0x6170736b726f772f && *(uint16 *)($name+8)==0x6563 && *(uint8 *)($name+10)==47) ||
+      $prefix==0x6573626f2d69632f ||
+      ($prefix==0x2e62696c2f637273 && *(uint16 *)($name+8)==0x7372 && *(uint8 *)($name+10)==0) ||
+      ($prefix==0x6e69616d2f637273 && *(uint16 *)($name+8)==0x722e && *(uint16 *)($name+10)==0x73) ||
+      ($prefix==0x73722e646c697562 && *(uint8 *)($name+8)==0))) {
+  printf("N %u %u %u %lld %llu %s\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],str($name,128));
   @emitted = count(); @seen[tid] = 1;
  }
 }
@@ -148,7 +152,7 @@ class Observer:
             'command':admission.command,'shipping_authority':False}
         cache._write_record(self.root/'control.json',self.control)
         self.witness='/ci-observer-witness-'+str(uuid.uuid4());self.witness_pid=None
-        self.program=_PROGRAM.replace('__WITNESS__',json.dumps(self.witness))
+        self.program=_PROGRAM
         self.stdout=self.root/'stdout';self.stderr=self.root/'stderr';self.output=None;self.error=None
         self.report=None
 
