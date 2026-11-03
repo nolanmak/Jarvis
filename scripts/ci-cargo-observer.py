@@ -292,6 +292,30 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
 }
 kretprobe:getname_flags*
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
+ if (@ready[tid]>0 && @ready[tid]==@sequence[tid]) {
+  $name=((struct observer_filename *)retval)->name;
+  if (@original_name[tid]!=(uint64)$name) { printf("foreign kernel pathname pointer\n"); }
+  $length=@length[tid];
+  $owner_uid=uid; $owner_pid=pid; $owner_tid=tid;
+  $call=@number[tid]; $entry=@sequence[tid];
+  $offset=(uint64)0;
+  $chunks=(uint64)0;
+  if ($length>0 && $length<=4096) {
+   while ($offset<$length) {
+    printf("N %u %u %u %lld %llu %llu %llu %s\n",$owner_uid,$owner_pid,$owner_tid,(int64)$call,$entry,
+     $offset,$length,str($name+$offset,64));
+    $chunks=$chunks+1; $offset=$offset+63;
+   }
+  } else {
+   printf("invalid kernel pathname length\n"); $chunks=1;
+  }
+  @emitted=sum($chunks);
+  @ready[tid]=(uint64)0;
+  @seen[tid] = 1;
+ }
+}
+kretprobe:getname_flags*
+/ ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
  $name = ((struct observer_filename *)retval)->name;
  $prefix = *(uint64 *)$name;
  if ((@number[tid]==2 || @number[tid]==4 || @number[tid]==6 || @number[tid]==21 ||
@@ -317,30 +341,6 @@ kretprobe:getname_flags*
   @length[tid]=$length;
   @original_name[tid]=(uint64)$name;
   @ready[tid]=@sequence[tid];
- }
-}
-kretprobe:getname_flags*
-/ ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
- if (@ready[tid]>0 && @ready[tid]==@sequence[tid]) {
-  $name=((struct observer_filename *)retval)->name;
-  if (@original_name[tid]!=(uint64)$name) { printf("foreign kernel pathname pointer\n"); }
-  $length=@length[tid];
-  $owner_uid=uid; $owner_pid=pid; $owner_tid=tid;
-  $call=@number[tid]; $entry=@sequence[tid];
-  $offset=(uint64)0;
-  $chunks=(uint64)0;
-  if ($length>0 && $length<=4096) {
-   while ($offset<$length) {
-    printf("N %u %u %u %lld %llu %llu %llu %s\n",$owner_uid,$owner_pid,$owner_tid,(int64)$call,$entry,
-     $offset,$length,str($name+$offset,64));
-    $chunks=$chunks+1; $offset=$offset+63;
-   }
-  } else {
-   printf("invalid kernel pathname length\n"); $chunks=1;
-  }
-  @emitted=sum($chunks);
-  @ready[tid]=(uint64)0;
-  @seen[tid] = 1;
  }
 }
 rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
