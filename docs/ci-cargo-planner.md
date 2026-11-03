@@ -699,9 +699,14 @@ The measured root helper starts a fixed bpftrace program in the existing VM.
 Before releasing any target unit it requires an actual captured raw-openat
 witness from a fixed credential and fresh controller nonce. The selected
 records are restricted to the original unit UID range, workspace paths and the
-pinned fixture's source spellings. JSON framing prevents embedded newlines
-from creating extra events. A settled emitted-event counter, bounded parser,
-original observer exit and original exec-callback PIDs bind the observations.
+pinned fixture's source spellings. Fixed prefix reads from the kernel-copied
+name avoid large temporary strings during filtering; the decoder checks the
+full name. Name and return records are emitted separately, joined by original
+UID/PID/TID, syscall number and per-thread entry sequence. Delivery across CPU
+buffers may reorder the two records; duplicate or incomplete pairs refuse.
+JSON framing prevents embedded newlines from creating extra events. A settled
+emitted-record counter, bounded parser, original observer exit and original
+exec-callback PIDs bind the observations.
 Native evidence must include both positive/negative raw opens and the actual
 library/build-script/binary source queries plus the library's generated input.
 The program/helper bytes join the measured controller bundle; updater detection
@@ -715,3 +720,13 @@ Long/unknown path spellings and malformed/lost/count-mismatched observations
 have no proof. The existing generic input-closure and shipping flags remain
 false. Native feasibility is pending; reuse, invalidation and passing-proof
 publication remain blocked on the complete collector and original regressions.
+
+Actual VM startup at `33729c22` failed because the BPF exit probe exceeded the
+kernel stack limit. Reducing the capture capacity at `6a49996d` did not resolve
+it. Splitting name/result records at `2eeb8162` removed that exit-probe problem
+but the name-filter probe still exceeded the limit. Fixed prefix reads at
+`a5172687` got past compilation; that replay failed observation validation after
+98.92 seconds. The capture capacity is restored to 128 bytes and names reaching
+the 127-byte truncation boundary refuse. The seven parser/startup tests and 31
+focused Rust tests passed at that revision; these do not establish native
+lookup coverage. The captured records still need inspection and correction.
