@@ -271,6 +271,46 @@ def run_worker(argv,input_roots=None):
     guest_worker_receipts.append(stopped.observation())
     return result
 
+SOURCE_ACCESS_PROBE=r"""
+import errno,json,os,stat,subprocess,sys
+head,role=sys.argv[1],int(sys.argv[2])
+assert os.geteuid()==role and os.getegid()==role
+environment={'PATH':'/usr/bin:/bin','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_OPTIONAL_LOCKS':'0'}
+def git(arguments):
+ result=subprocess.run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+  '-c','safe.directory=/workspace','-C','/workspace',*arguments],env=environment,
+  stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+ assert result.returncode==0 and len(result.stdout)<=16*1024**2
+ return result.stdout
+assert git(['rev-parse','HEAD']).decode().strip()==head
+rows=git(['ls-tree','-rz','--full-tree',head]).split(b'\0')
+row=next(row for row in rows if row);metadata,name=row.split(b'\t',1)
+assert metadata.split()[0] in (b'100644',b'100755')
+path=b'/workspace/'+name
+descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+assert os.fstat(descriptor).st_uid==0;os.read(descriptor,1);os.close(descriptor)
+for destination,flags in [(path,os.O_WRONLY|os.O_NOFOLLOW|os.O_NONBLOCK),
+ (b'/workspace/.ci-source-write-probe',os.O_WRONLY|os.O_CREAT|os.O_EXCL)]:
+ try:descriptor=os.open(destination,flags,0o600)
+ except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM,errno.EROFS)
+ else:os.close(descriptor);raise RuntimeError('immutable source is writable')
+print(json.dumps({'uid':role,'git_head':head,'read_only':True}))
+"""
+
+def verify_source_access(generation):
+    access=[]
+    for role in (1001,2000):
+        scope=ci_workers.WorkerScope(worker_control,role,role,
+            ['/usr/bin/python3','-I','-c',SOURCE_ACCESS_PROBE,generation['binding']['head'],str(role)])
+        result=_run_worker(scope.argv,scope)
+        stopped=scope.verify();observation=stopped.observation();guest_worker_receipts.append(observation)
+        try:value=json.loads(result.get('stdout',''))
+        except (ValueError,TypeError):value=None
+        if result.get('exit_code')!=0 or value!={'uid':role,'git_head':generation['binding']['head'],'read_only':True}:
+            raise ci_cache['FreshnessHold']('invalidation_unsafe')
+        access.append({'uid':role,'scope':observation})
+    return access
+
 def observe_phase(value):
     global guest_stage
     guest_stage=value
@@ -281,6 +321,7 @@ try:
     seed_reclaimed=[]
     dependency_result=None
     cache_preparation=None
+    source_projection=None
     action=job.get('ci_dependency')
     if job.get('ci_context') and job.get('build_cache'):
         guest_stage='reclaim_producers'
@@ -315,6 +356,13 @@ try:
             cache_reclaimed=ci_cache['reclaim']('/build-cache',generation['retained_generations'],uid,gid)
             ci_target=ci_cache['prepare']('/build-cache',generation['binding'],generation['command'],uid,gid,
                 predecessor=generation['predecessor'])
+            source_view=ci_cache['prepare_source_projection'](ci_target,Path('/workspace'),Path('/ci-git-objects'),
+                generation['binding'],generation['command'],generation['outputs'])
+            subprocess.run(['/usr/bin/mount','--bind',str(source_view),'/workspace'],check=True)
+            subprocess.run(['/usr/bin/mount','-o','remount,bind,ro,nosuid,nodev,noatime','/workspace'],check=True)
+            environment.pop('GIT_ALTERNATE_OBJECT_DIRECTORIES',None)
+            access=verify_source_access(generation)
+            source_projection=ci_cache['source_projection_observation'](ci_target,generation['binding'],generation['command'],access)
             subprocess.run(['/usr/bin/mount','--bind',str(ci_target),'/workspace/target'],check=True)
             output_mounts=ci_cache['prepare_outputs'](ci_target,generation['outputs'],uid,gid)
             for relative,source in output_mounts.items():
@@ -341,6 +389,7 @@ try:
             'worker_free':True,'scopes':guest_worker_receipts,'shipping_authority':False}
     if dependency_result is not None:result['dependency_result']=dependency_result
     if cache_preparation is not None:result['cache_preparation']=cache_preparation
+    if source_projection is not None:result['source_projection']=source_projection
 except Exception as error:
     import errno
     # copytree aggregates per-file failures into shutil.Error without an errno.

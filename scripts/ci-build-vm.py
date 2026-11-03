@@ -318,6 +318,8 @@ def execute(request,run=vm.run,progress=None):
         if dependency is not None and prepared['dependency_seed']!=dependency['seed']:
             raise cache_generation.FreshnessHold('artifact_provenance_unknown')
         result['cache_preparation']=prepared
+        result['source_projection']=cache_generation.validate_source_projection_observation(
+            outcome.get('source_projection'),generation['binding'],generation['command'],guest_workers,observed_inputs)
     if dependency is not None:
         observed=outcome.get('dependency_result')
         if (not isinstance(observed,dict) or observed.get('version')!=1 or observed.get('shipping_authority') is not False

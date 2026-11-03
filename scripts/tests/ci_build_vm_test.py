@@ -8,12 +8,35 @@ vm=adapter.vm
 def stopped_workers():
  return {'version':1,'kind':'ci-guest-command-quiescence','worker_free':True,'shipping_authority':False,
   'scopes':[{'version':1,'kind':'ci-guest-workers-quiescent','state':'all_descendants_reaped',
-   'scope_id':str(uuid.uuid4()),'receipt_sha256':hashlib.sha256(b'all-descendants-reaped\n').hexdigest(),'shipping_authority':False}]}
+   'scope_id':str(uuid.uuid4()),'receipt_sha256':hashlib.sha256(b'all-descendants-reaped\n').hexdigest(),'shipping_authority':False} for _ in range(3)]}
 def observed_inputs(workers):
  return {'format_version':1,'kind':'ci-input-write-observation','changed':False,'changed_roots':[],
   'observed_events':0,'events_sha256':hashlib.sha256(b'').hexdigest(),'before_sha256':'f'*64,'after_sha256':'f'*64,
-  'guest_worker_quiescence':workers['scopes'][0],'shipping_authority':False}
+  'guest_worker_quiescence':workers['scopes'][-1],'shipping_authority':False}
 class AdapterTests(unittest.TestCase):
+ def test_source_projection_requires_current_binding_roles_and_independent_worker_cleanup(self):
+  for fault in ('missing','version','binding','command','owner','manifest','flags','missing-role','wrong-role','duplicate-probe','borrowed-worker','foreign-scope'):
+   with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+    root=Path(directory);request=self.fixture(root)
+    request.update(operation='repository',command='true',build_cache=str(root/'cache'))
+    def execute(*args,**options):
+     result=self.prepared_result(options,exit_code=0,stdout='',stderr='');projected=result['source_projection']
+     if fault=='missing':result.pop('source_projection')
+     elif fault=='version':projected['version']=True
+     elif fault=='binding':projected['binding']['generation']=str(uuid.uuid4())
+     elif fault=='command':projected['command']=str(uuid.uuid4())
+     elif fault=='owner':projected['owner_uid']=1000
+     elif fault=='manifest':projected['manifest_sha256']='unknown'
+     elif fault=='flags':projected['input_closure_complete']=True
+     elif fault=='missing-role':projected['access'].pop()
+     elif fault=='wrong-role':projected['access'][0]['uid']=2000
+     elif fault=='duplicate-probe':projected['access'][1]['scope']=projected['access'][0]['scope']
+     elif fault=='borrowed-worker':result['input_write_observation']['guest_worker_quiescence']=projected['access'][0]['scope']
+     elif fault=='foreign-scope':projected['access'][0]['scope']={**projected['access'][0]['scope'],'scope_id':str(uuid.uuid4())}
+     return result
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
  def test_seed_cleanup_receipt_is_required_bounded_unique_and_typed(self):
   for reclaimed in (None,{},[[]],['unknown'],['a'*64,'a'*64],['a'*64,'b'*64,'c'*64]):
    with self.subTest(reclaimed=reclaimed),tempfile.TemporaryDirectory() as directory:
@@ -32,6 +55,10 @@ class AdapterTests(unittest.TestCase):
   result['cache_preparation']={'version':1,'binding':dict(generation['binding']),'command':generation['command'],
    'outputs_sha256':hashlib.sha256(json.dumps(generation['outputs'],sort_keys=True,separators=(',',':')).encode()).hexdigest(),
    'dependency_seed':None}
+  result['source_projection']={'version':1,'kind':'ci-git-source-projection','binding':dict(generation['binding']),
+   'command':generation['command'],'manifest_sha256':'9'*64,'owner_uid':0,
+   'access':[{'uid':uid,'scope':result['guest_worker_quiescence']['scopes'][index]} for index,uid in enumerate((1001,2000))],
+   'input_closure_complete':False,'shipping_authority':False}
   return result
  def fixture(self,root):
   for name in ['workspace','state','scratch','objects']:(root/name).mkdir(mode=0o700)
@@ -214,9 +241,9 @@ class AdapterTests(unittest.TestCase):
       if fault=='physical-cache':value['binding']['cache_identity_sha256']='2'*64
       if fault=='output-policy':value['outputs_sha256']='3'*64
       if fault=='seed':value['dependency_seed']='unknown'
-      result={'exit_code':status,'stdout':'source command output','stderr':'','seed_reclaimed':[],'guest_worker_quiescence':stopped_workers()}
-      result['input_write_observation']=observed_inputs(result['guest_worker_quiescence'])
-      if fault!='missing':result['cache_preparation']=value
+      result=self.prepared_result(options,exit_code=status,stdout='source command output',stderr='')
+      if fault=='missing':result.pop('cache_preparation')
+      else:result['cache_preparation']=value
       return result
      with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'ensure_cache',
       side_effect=lambda path,*args:Path(path).touch(mode=0o600)):

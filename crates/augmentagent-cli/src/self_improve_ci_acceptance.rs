@@ -460,6 +460,11 @@ PY"#} else {"RUSTC_WRAPPER=/workspace/rustc-counter.py cargo build --offline --l
     ensure!(old.status=="passed","initial generator failed: {}",old.stderr);
     let first=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
     ensure!(first.status=="passed" && first.stdout.trim()=="CALLS=1\nOLD","initial generated input did not execute: {} {}",first.stdout,first.stderr);
+    let projected_source=first.command_receipt.as_ref().context("source projection controller receipt missing")?
+        .value()["source_projection"].clone();
+    ensure!(projected_source["owner_uid"]==0 && projected_source["access"][0]["uid"]==1001
+        && projected_source["access"][1]["uid"]==2000 && projected_source["input_closure_complete"]==false
+        && projected_source["shipping_authority"]==false,"source projection role probes missing");
     let unchanged=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(compile),&storage,&target,&audit,timeout).await?;
     ensure!(unchanged.status=="passed" && unchanged.stdout.trim()=="CALLS=0\nOLD","unchanged compatible unit recompiled or did not remain valid: {}",unchanged.stdout);
     let changed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some(&generate_new),&storage,&target,&audit,timeout).await?;
@@ -526,6 +531,7 @@ PY"#} else {"rustc --edition=2021 --crate-name resolution_control src/main.rs -o
         "device_read_queries":lookup_observation.as_ref().map(|value|&value["device_read_queries"]),
         "lookup_content_inputs_changed":lookup_observation.as_ref().map(|value|&value["lookup_content_inputs_changed"]),
         "unrelated_generated_input_keeps_identity":lookup_observation.as_ref().map(|value|&value["unrelated_generated_input_keeps_identity"]),
+        "source_projection_observation":projected_source,
         "trusted_input_closure":false,"cargo_metadata_isolation_established":false,
         "full_ci_pass":false,"shipping_authority":false,"autonomous_merges_claimed":0});
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&report)?)?;

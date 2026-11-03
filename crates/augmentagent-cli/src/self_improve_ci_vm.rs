@@ -105,6 +105,36 @@ pub(super) struct GuestWorkerQuiescence {
 struct GuestWorkerExit {
     version:u32,kind:String,state:String,scope_id:String,receipt_sha256:String,shipping_authority:bool,
 }
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourceProjectionObservation {
+    version:u32,kind:String,binding:CacheBinding,command:String,manifest_sha256:String,
+    owner_uid:u32,access:Vec<SourceAccess>,input_closure_complete:bool,shipping_authority:bool,
+}
+#[derive(Clone,Debug,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+struct SourceAccess {uid:u32,scope:GuestWorkerExit}
+impl SourceProjectionObservation {
+    pub(super) fn validate(&self,prepared:&CachePreparation,workers:&GuestWorkerQuiescence,
+        inputs:&NamespaceObservation)->Result<()> {
+        let sha=|value:&str|value.len()==64 && value.bytes().all(|byte|matches!(byte,b'0'..=b'9'|b'a'..=b'f'));
+        if self.version!=1 || self.kind!="ci-git-source-projection" || self.binding!=prepared.binding
+            || self.command!=prepared.command || !sha(&self.manifest_sha256) || self.owner_uid!=0
+            || self.input_closure_complete || self.shipping_authority || self.access.len()!=2 {
+            return Err(metadata_hold(crate::autoship_freshness::Reason::InputCensusUnknown,
+                "read-only source projection is incomplete or belongs to another invocation"));
+        }
+        let mut seen=BTreeSet::new();
+        for (item,uid) in self.access.iter().zip([1001,2000]) {
+            if item.uid!=uid || !workers.scopes.contains(&item.scope) || !seen.insert(&item.scope.scope_id)
+                || item.scope.scope_id==inputs.guest_worker_quiescence.scope_id {
+                return Err(metadata_hold(crate::autoship_freshness::Reason::CleanupUncertain,
+                    "source access probe reused or borrowed another worker cleanup"));
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NamespaceObservation {
@@ -155,15 +185,24 @@ impl GuestWorkerQuiescence {
 }
 #[cfg(test)]
 pub(super) fn stopped_workers_fixture()->serde_json::Value {
+    let scopes=(0..3).map(|_|serde_json::json!({"version":1,"kind":"ci-guest-workers-quiescent",
+        "state":"all_descendants_reaped","scope_id":uuid::Uuid::new_v4().to_string(),
+        "receipt_sha256":digest(b"all-descendants-reaped\n"),"shipping_authority":false})).collect::<Vec<_>>();
     serde_json::json!({"version":1,"kind":"ci-guest-command-quiescence","worker_free":true,"shipping_authority":false,
-        "scopes":[{"version":1,"kind":"ci-guest-workers-quiescent","state":"all_descendants_reaped",
-            "scope_id":uuid::Uuid::new_v4().to_string(),"receipt_sha256":digest(b"all-descendants-reaped\n"),"shipping_authority":false}]})
+        "scopes":scopes})
 }
 #[cfg(test)]
 pub(super) fn input_observation_fixture(workers:&serde_json::Value)->serde_json::Value {
     serde_json::json!({"format_version":1,"kind":"ci-input-write-observation","changed":false,"changed_roots":[],
         "observed_events":0,"events_sha256":digest(b""),"before_sha256":"f".repeat(64),"after_sha256":"f".repeat(64),
-        "guest_worker_quiescence":workers["scopes"][0],"shipping_authority":false})
+        "guest_worker_quiescence":workers["scopes"].as_array().unwrap().last().unwrap(),"shipping_authority":false})
+}
+#[cfg(test)]
+pub(super) fn source_projection_fixture(prepared:&serde_json::Value,workers:&serde_json::Value)->serde_json::Value {
+    serde_json::json!({"version":1,"kind":"ci-git-source-projection","binding":prepared["binding"],
+        "command":prepared["command"],"manifest_sha256":"9".repeat(64),"owner_uid":0,
+        "access":[{"uid":1001,"scope":workers["scopes"][0]},{"uid":2000,"scope":workers["scopes"][1]}],
+        "input_closure_complete":false,"shipping_authority":false})
 }
 #[derive(Debug, Deserialize)]
 pub(super) struct Outcome {
@@ -204,6 +243,8 @@ pub(super) struct Outcome {
     source_kind:Option<String>,
     #[serde(default)]
     cache_preparation: Option<serde_json::Value>,
+    #[serde(default)]
+    source_projection: Option<serde_json::Value>,
     /// Host-only capability, created after all result and kernel checks. A VM
     /// JSON object cannot supply or deserialize a protected audit receipt.
     #[serde(skip)]
@@ -218,6 +259,15 @@ pub(super) struct Outcome {
     guest_diagnostic:Option<serde_json::Value>,
 }
 impl Outcome {
+    fn validated_source_projection(&self,prepared:&CachePreparation,inputs:&NamespaceObservation,
+        operation:&str)->Result<SourceProjectionObservation> {
+        let value=self.source_projection.as_ref().ok_or_else(||metadata_hold(
+            crate::autoship_freshness::Reason::LegacyFormat,"read-only source projection missing"))?;
+        let projected:SourceProjectionObservation=serde_json::from_value(value.clone()).map_err(|_|metadata_hold(
+            crate::autoship_freshness::Reason::MetadataTorn,"read-only source projection schema incomplete"))?;
+        projected.validate(prepared,&self.validated_guest_workers(operation)?,inputs)?;
+        Ok(projected)
+    }
     fn validated_guest_workers(&self,operation:&str)->Result<GuestWorkerQuiescence> {
         let value=self.guest_worker_quiescence.as_ref().ok_or_else(||metadata_hold(
             crate::autoship_freshness::Reason::CleanupUncertain,"guest worker cleanup evidence missing"))?;
@@ -859,6 +909,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             let invocation_sha256=invocation.digest()?;
             let expected=proof::InputExpectation::current_execution(root,owned_source,binding,&command_id,invocation,self).await?;
             let prepared=outcome.validated_preparation(binding,&generation,&command_id,&self.authority_sha256,expected.physical_cache_sha256())?;
+            let input_observation=outcome.validated_input_observation(operation)?;
+            let source_projection=outcome.validated_source_projection(&prepared,&input_observation,operation)?;
             // Preparation proves the original invocation/cache relationship.
             // Generated-input attestation and full planned coverage must still
             // be established before C can publish its final passing proof.
@@ -869,7 +921,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
                 "controller_authority_sha256":self.authority_sha256,"cache_preparation":prepared,
                 "quiescence_receipt_sha256":quiescence_sha256,"status":outcome.status,
                 "guest_worker_quiescence":outcome.guest_worker_quiescence,
-                "input_write_observation":outcome.validated_input_observation(operation)?,
+                "input_write_observation":input_observation,"source_projection":source_projection,
                 "exit_code":outcome.exit_code,"stdout_sha256":digest(outcome.stdout.as_bytes()),
                 "stderr_sha256":digest(outcome.stderr.as_bytes()),"shipping_authority":false,
             })).context("shared CI prerequisite unavailable: command receipt not committed")?);
@@ -1042,6 +1094,42 @@ mod tests {
             assert!(!crate::build_storage::ci_holds::may_cleanup(root).unwrap());
             drop(hold);
         });
+    }
+
+    #[test]
+    fn source_projection_binds_roles_generation_and_distinct_original_worker_cleanup() {
+        let workers_value=stopped_workers_fixture();
+        let workers:GuestWorkerQuiescence=serde_json::from_value(workers_value.clone()).unwrap();
+        workers.validate(true).unwrap();
+        let inputs:NamespaceObservation=serde_json::from_value(input_observation_fixture(&workers_value)).unwrap();
+        let prepared_value=serde_json::json!({"version":1,"binding":{"generation":uuid::Uuid::new_v4().to_string(),
+            "head":"a".repeat(40),"tree":"b".repeat(40),"contract_sha256":"c".repeat(64),
+            "authority_sha256":"d".repeat(64),"cache_identity_sha256":"e".repeat(64),"source_inputs_sha256":"f".repeat(64)},
+            "command":uuid::Uuid::new_v4().to_string(),"outputs_sha256":"7".repeat(64),"dependency_seed":null});
+        let prepared:CachePreparation=serde_json::from_value(prepared_value.clone()).unwrap();
+        let original=source_projection_fixture(&prepared_value,&workers_value);
+        let good:SourceProjectionObservation=serde_json::from_value(original.clone()).unwrap();
+        good.validate(&prepared,&workers,&inputs).unwrap();
+        for fault in ["version","binding","command","owner","manifest","flags","missing-role","wrong-role","duplicate-probe","borrowed-worker","foreign-scope","unknown-field"] {
+            let mut value=original.clone();
+            match fault {
+                "version"=>value["version"]=true.into(),
+                "binding"=>value["binding"]["generation"]=uuid::Uuid::new_v4().to_string().into(),
+                "command"=>value["command"]=uuid::Uuid::new_v4().to_string().into(),
+                "owner"=>value["owner_uid"]=1000.into(),
+                "manifest"=>value["manifest_sha256"]="unknown".into(),
+                "flags"=>value["input_closure_complete"]=true.into(),
+                "missing-role"=>{value["access"].as_array_mut().unwrap().pop();},
+                "wrong-role"=>value["access"][0]["uid"]=2000.into(),
+                "duplicate-probe"=>value["access"][1]["scope"]=value["access"][0]["scope"].clone(),
+                "borrowed-worker"=>value["access"][0]["scope"]=workers_value["scopes"][2].clone(),
+                "foreign-scope"=>value["access"][0]["scope"]["scope_id"]=uuid::Uuid::new_v4().to_string().into(),
+                "unknown-field"=>value["unexpected"]=true.into(),
+                _=>unreachable!(),
+            }
+            let parsed=serde_json::from_value::<SourceProjectionObservation>(value);
+            assert!(parsed.is_err() || parsed.unwrap().validate(&prepared,&workers,&inputs).is_err(),"{fault}");
+        }
     }
 
     #[test]

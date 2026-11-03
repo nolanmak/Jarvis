@@ -70,6 +70,17 @@ producer/output provenance and original quiescence. A prior snapshot and a later
 trace cannot substitute for these obligations. No artifact-reuse path consumes
 this observation yet.
 
+The source projection now copies literal Git bytes into the original private
+generation, packs the reachable controlled Git history without external
+alternates, and seals files and directories read-only. Host tests cover SHA-1
+and SHA-256 repositories, shallow boundaries, tampering, interrupted allocation,
+and replay of the original retirement inventory. The adapter mounts this view
+read-only and requires separate original supervisor receipts for fixed access
+probes under UID 1001 and UID 2000. Their receipts cannot substitute for command
+worker cleanup. Host tests and focused Rust validation pass; the real guest
+replay for this revision is still pending. This projection does not freeze
+generated inputs or enable protected Cargo execution or passing-CI publication.
+
 ## Decisions and reasons
 
 1. **Separate the planner from application execution.** Cargo runs as non-root

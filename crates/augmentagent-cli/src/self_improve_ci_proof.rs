@@ -705,6 +705,7 @@ struct Command {
     binding: Binding,
     controller_authority_sha256: String,
     cache_preparation: super::vm::CachePreparation,
+    source_projection: super::vm::SourceProjectionObservation,
     quiescence_receipt_sha256: String,
     guest_worker_quiescence: super::vm::GuestWorkerQuiescence,
     input_write_observation: super::vm::NamespaceObservation,
@@ -879,6 +880,8 @@ fn validate_execution(
         command
             .input_write_observation
             .validate(&command.guest_worker_quiescence)?;
+        command.source_projection.validate(&command.cache_preparation,&command.guest_worker_quiescence,
+            &command.input_write_observation)?;
         if command
             .guest_worker_quiescence
             .scope_ids()
@@ -1331,6 +1334,8 @@ mod tests {
             "invocation_sha256":inputs.invocation_sha256,"input_attestation_sha256":input_ref});
         command["input_write_observation"] =
             vm::input_observation_fixture(&command["guest_worker_quiescence"]);
+        command["source_projection"]=vm::source_projection_fixture(&command["cache_preparation"],
+            &command["guest_worker_quiescence"]);
         match fault {
             "guest-reused" => {
                 command["guest_worker_quiescence"] = plan.value()["guest_worker_quiescence"].clone()
