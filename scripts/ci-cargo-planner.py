@@ -45,7 +45,7 @@ _CHILD_DIAGNOSTIC=None
 def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
-        'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor',
+        'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
         'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin'}
     categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','Unavailable'}
     value=value if type(value) is dict else {}
@@ -450,7 +450,7 @@ def _stage(arguments):
 
 
 _TOOL_PROBE=r'''
-import ctypes,errno,hashlib,json,os,socket,sys
+import ctypes,errno,hashlib,json,os,signal,socket,sys
 metadata,socket_path,expected=sys.argv[1:];expected=int(expected)
 _PROBE_PHASE='planner_tool_credentials'
 assert os.getresuid()==(expected,expected,expected) and os.getresgid()==(expected,expected,expected) and os.getgroups()==[]
@@ -481,6 +481,7 @@ assert os.environb[b'RAW']==b'\xffvalue'
 _PROBE_PHASE='planner_tool_stdin'
 print(json.dumps({'uid':expected,'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
  'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}),flush=True)
+if os.environ.get('CI_PLANNER_PROBE_SIGNAL')=='1':signal.pause()
 '''
 
 
@@ -506,6 +507,7 @@ if child==0:
   os.dup2(source_read,0);os.dup2(output_write,1)
   for fd in jobs:os.set_inheritable(fd,True)
   env=dict(os.environb);env[b'RAW']=b'\xffvalue'
+  if mode=='signal':env[b'CI_PLANNER_PROBE_SIGNAL']=b'1'
   if jobs:env[b'CARGO_MAKEFLAGS']=('-j --jobserver-fds=%d,%d --jobserver-auth=%d,%d'%(*jobs,*jobs)).encode()
   os.execve(b'/usr/bin/python3',[b'python3',b'-I',b'-c',body.encode(),os.fsencode(metadata),os.fsencode(socket_path),str(expected_uid).encode()],env)
  except BaseException:os._exit(126)
@@ -521,7 +523,12 @@ else:
  while view:view=view[os.write(source_write,view):]
  os.close(source_write);source_write=None
 _PROBE_PHASE='planner_probe_wait'
-with os.fdopen(output_read,'rb') as output:captured=output.read(8193)
+with os.fdopen(output_read,'rb') as output:
+ if mode=='signal':
+  captured=output.readline(8193);assert 0<len(captured)<=8192
+  os.kill(child,signal.SIGUSR1)
+  assert output.read(1)==b''
+ else:captured=output.read(8193)
 _,status=os.waitpid(child,0);code=os.waitstatus_to_exitcode(status)
 if source_write is not None:os.close(source_write)
 _PROBE_PHASE='planner_probe_status'
@@ -529,8 +536,9 @@ if mode=='cancel':
  assert code==125 and captured==b'',(code,captured)
  result={'cancelled_before_exec':True,'proxy_exit':code}
 else:
- assert code==0,(code,captured)
+ assert code==(-signal.SIGUSR1 if mode=='signal' else 0),(code,captured)
  result=json.loads(captured);assert result['stdin_sha256']==hashlib.sha256(data).hexdigest()
+ if mode=='signal':result.update(signal_forwarded=int(signal.SIGUSR1),proxy_signal=-code)
  if jobs:assert os.read(jobs[0],1)==b'+'
 for fd in jobs:os.close(fd)
 print(json.dumps(result),flush=True)
@@ -543,7 +551,7 @@ def _planner(arguments):
     _PHASE='planner_client_start'
     bootstrap,configuration=map(int,arguments)
     value=_bootstrap(bootstrap,'planner');_parent_guard(value['parent'])
-    if value.get('mode') not in ('stdin','jobserver','cancel'):raise FreshnessHold('metadata_torn')
+    if value.get('mode') not in ('stdin','jobserver','cancel','signal'):raise FreshnessHold('metadata_torn')
     os.close(bootstrap)
     environment={'PATH':'/usr/bin:/bin','HOME':'/tmp','LD_PRELOAD':value['library'],
         'JARVIS_CARGO_RELAY_FD':str(configuration)}
@@ -563,7 +571,7 @@ def _probe(arguments):
     results=[]
     with RootRelay(admission,library=value['library'],timeout=30) as relay:
         metadata=root/'planner-metadata';metadata.write_text('');os.chown(metadata,1001,1001);metadata.chmod(0o600)
-        for ordinal,mode in enumerate(('stdin','jobserver','cancel')):
+        for ordinal,mode in enumerate(('stdin','jobserver','cancel','signal')):
             _PHASE='planner_probe_'+mode
             client=relay.config_fd();child_bootstrap=None;child=None
             try:
@@ -582,7 +590,7 @@ def _probe(arguments):
                 if child is not None and child.poll() is None:child.kill();child.wait(timeout=5)
                 os.close(client)
                 if child_bootstrap is not None:os.close(child_bootstrap)
-        if len(relay.completed)!=3 or relay.errors:raise FreshnessHold('cleanup_uncertain')
+        if len(relay.completed)!=4 or relay.errors:raise FreshnessHold('cleanup_uncertain')
         for ordinal,completed in enumerate(relay.completed):
             if (completed['ordinal']!=ordinal or completed['uid']!=2000+ordinal
                     or completed['started']!=(ordinal!=2) or completed['cancelled']!=(ordinal==2)
@@ -614,8 +622,8 @@ def validate_probe(value,binding,command,workers,writer,source_projection):
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=3
             or value['kind']!='ci-planner-protocol-probe' or value['binding']!=binding or value['command']!=command
             or value['input_closure_complete'] is not False or value['cargo_metadata_isolation_established'] is not False
-            or value['shipping_authority'] is not False or type(value['cases']) is not list or len(value['cases'])!=3
-            or type(value['units']) is not list or len(value['units'])!=3):raise FreshnessHold('input_census_unknown')
+            or value['shipping_authority'] is not False or type(value['cases']) is not list or len(value['cases'])!=4
+            or type(value['units']) is not list or len(value['units'])!=4):raise FreshnessHold('input_census_unknown')
     scope=value['guest_worker_quiescence']
     if (scope not in workers['scopes'] or scope==writer['guest_worker_quiescence']
             or any(scope==item['scope'] for item in source_projection['access'])):raise FreshnessHold('cleanup_uncertain')
@@ -626,17 +634,21 @@ def validate_probe(value,binding,command,workers,writer,source_projection):
                 or type(unit['ordinal']) is not int or unit['ordinal']!=ordinal or type(unit['uid']) is not int
                 or unit['uid']!=2000+ordinal or unit['started'] is not (ordinal!=2)
                 or unit['cancelled'] is not (ordinal==2) or unit['original_cleanup'] is not True
-                or type(unit['returncode']) is not int or (ordinal!=2 and unit['returncode']!=0)
+                or type(unit['returncode']) is not int or (ordinal!=2 and unit['returncode']!=(-10 if ordinal==3 else 0))
                 or unit['input_closure_complete'] is not False or unit['shipping_authority'] is not False):
             raise FreshnessHold('cleanup_uncertain')
         case=value['cases'][ordinal]
         if ordinal==2:
             if case!={'cancelled_before_exec':True,'proxy_exit':125}:raise FreshnessHold('input_census_unknown')
-        elif (type(case) is not dict or set(case)!={'uid','stdin_sha256','metadata_denied','root_socket_denied',
-                'control_fds_closed','jobserver'} or type(case['uid']) is not int or case['uid']!=2000+ordinal
-                or case['stdin_sha256']!=expected or case['metadata_denied'] is not True
-                or case['root_socket_denied'] is not True or case['control_fds_closed'] is not True
-                or case['jobserver'] is not (ordinal==1)):raise FreshnessHold('input_census_unknown')
+        else:
+            case_keys={'uid','stdin_sha256','metadata_denied','root_socket_denied','control_fds_closed','jobserver'}
+            if ordinal==3:case_keys|={'signal_forwarded','proxy_signal'}
+            if (type(case) is not dict or set(case)!=case_keys or type(case['uid']) is not int or case['uid']!=2000+ordinal
+                    or case['stdin_sha256']!=expected or case['metadata_denied'] is not True
+                    or case['root_socket_denied'] is not True or case['control_fds_closed'] is not True
+                    or case['jobserver'] is not (ordinal==1)
+                    or (ordinal==3 and (case['signal_forwarded']!=10 or case['proxy_signal']!=10))):
+                raise FreshnessHold('input_census_unknown')
     return value
 
 

@@ -28,8 +28,11 @@ class PlannerProtocolTests(unittest.TestCase):
         cases=[{'uid':2000+i,'stdin_sha256':hashlib.sha256(b'\xffstdin'*200000).hexdigest(),
             'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':i==1} for i in range(2)]
         cases.append({'cancelled_before_exec':True,'proxy_exit':125})
-        units=[{'ordinal':i,'uid':2000+i,'started':i!=2,'cancelled':i==2,'returncode':0 if i!=2 else -9,
-            'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(3)]
+        cases.append({'uid':2003,'stdin_sha256':hashlib.sha256(b'\xffstdin'*200000).hexdigest(),
+            'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':False,
+            'signal_forwarded':10,'proxy_signal':10})
+        units=[{'ordinal':i,'uid':2000+i,'started':i!=2,'cancelled':i==2,'returncode':(-9 if i==2 else -10 if i==3 else 0),
+            'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(4)]
         value={'version':3,'kind':'ci-planner-protocol-probe','binding':binding,'command':command,
             'cases':cases,'units':units,'guest_worker_quiescence':scopes[2],
             'input_closure_complete':False,'cargo_metadata_isolation_established':False,'shipping_authority':False}
@@ -39,7 +42,8 @@ class PlannerProtocolTests(unittest.TestCase):
         original,binding,command,workers,writer,source=self.probe()
         self.assertEqual(planner.validate_probe(original,binding,command,workers,writer,source),original)
         for fault in ('version','binding','command','scope','writer','source','role','cancelled-start',
-                'cleanup','case-role','control-fds','jobserver','closure','authority','unknown'):
+                'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
+                'signal-status','signal-proxy','signal-number','signal-not-started'):
             value=copy.deepcopy(original)
             if fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
@@ -56,6 +60,10 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='closure':value['input_closure_complete']=True
             elif fault=='authority':value['shipping_authority']=True
             elif fault=='unknown':value['extra']=True
+            elif fault=='signal-status':value['units'][3]['returncode']=0
+            elif fault=='signal-proxy':value['cases'][3]['proxy_signal']=15
+            elif fault=='signal-number':value['cases'][3]['signal_forwarded']=15
+            elif fault=='signal-not-started':value['units'][3]['started']=False
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 
@@ -63,7 +71,7 @@ class PlannerProtocolTests(unittest.TestCase):
         # Exercise the fixed fixture's real fork/exec/pipe parent path without
         # claiming the root-only transport or credential isolation on this host.
         # Only the root-only setup assertions and unit policy result are stubs.
-        peer = """import hashlib,json,os,re,sys
+        peer = """import hashlib,json,os,re,signal,sys
 flags=os.environ.get('CARGO_MAKEFLAGS')
 if flags:
  numbers=re.search(r'--jobserver-fds=(\\d+),(\\d+)',flags)
@@ -73,6 +81,7 @@ if flags:
 assert os.environb[b'RAW']==b'\\xffvalue'
 print(json.dumps({'uid':int(sys.argv[1]),'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
  'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}),flush=True)
+if os.environ.get('CI_PLANNER_PROBE_SIGNAL')=='1':signal.pause()
 """
         harness = """import ctypes,errno,importlib.util,os,sys
 spec=importlib.util.spec_from_file_location('fixture',sys.argv[1]);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
@@ -92,7 +101,7 @@ sys.argv=['fixed-fixture',mode,metadata,'/unused-root-socket','2000']
 exec(compile(module.guarded_probe(module._PLANNER_PROBE),'fixed-planner-probe','exec'))
 """
         with tempfile.TemporaryDirectory() as directory:
-            for mode in ('stdin','jobserver'):
+            for mode in ('stdin','jobserver','signal'):
                 with self.subTest(mode=mode):
                     result=subprocess.run([sys.executable,'-I','-c',harness,str(ROOT/'ci-cargo-planner.py'),peer,mode,
                         str(Path(directory)/'metadata')],capture_output=True,timeout=5)
@@ -100,6 +109,7 @@ exec(compile(module.guarded_probe(module._PLANNER_PROBE),'fixed-planner-probe','
                     observed=__import__('json').loads(result.stdout)
                     self.assertEqual(observed['stdin_sha256'],hashlib.sha256(b'\xffstdin'*200000).hexdigest())
                     self.assertEqual(observed['jobserver'],mode=='jobserver')
+                    if mode=='signal':self.assertEqual(observed['proxy_signal'],10)
 
     def test_fixed_probe_reports_bounded_phase_without_exception_contents(self):
         private='PRIVATE_OWNER_CONTENTS_AND_PATH'
