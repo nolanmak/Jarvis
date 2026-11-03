@@ -236,7 +236,8 @@ not execute tools, provide a complete input closure or publish CI authority; it
 is not connected to the existing same-UID version-2 experiment.
 
 The separate V3 native client and root transport now have an unactivated
-implementation and a fixed guest probe that has not yet passed a real replay. The
+implementation and a fixed guest probe that passed a real replay at `f1b4397f`
+in 88.59 seconds. This is transport evidence, not protected Cargo activation. The
 V3 client requires UID/GID 1001 for real/effective/saved credentials, no
 supplementary groups, a root-owned sealed startup descriptor and the original
 root listener's peer credentials. Protocol version 3 fixes the planner role to
@@ -258,8 +259,11 @@ scope executes only a measured fixed probe with a minimal root environment;
 ordinary WorkerScope still refuses UID 0. It tests large raw stdin, actual
 jobserver capabilities, planner-file/socket access denial, closed control FDs,
 and cancellation through the native V3 client. Eleven host framing/refusal, original-control and
-fixture-control tests pass; actual guest credentials and end-to-end transport
-are not yet verified.
+fixture-control tests pass. The real guest receipt verifies UID 2000/2001 tool
+execution and UID 2002 cancellation, large raw stdin with identical digests,
+jobserver capability preservation, planner-file/socket access denial, closed
+control descriptors and original cleanup. The planner-file fixture is not
+actual Cargo metadata; its isolation claim remains false.
 The first attempted replay at `2e9d1db3` stopped at the host request schema: the
 Rust sender included the new private probe field, but the strict adapter did not
 allow it. Adapter fixtures now include the Rust sender's ordinary false value,
@@ -277,7 +281,10 @@ SOCK_SEQPACKET EOF. The old decoder rejected that EOF as an incomplete frame.
 A real socket/pidfd regression fails on the original behavior and passes after
 ignoring only that flag for empty EOF. Foreign, short, unknown-stage and truncated
 frames still refuse, and their received capabilities are closed. The corrected
-real guest replay is still required.
+real guest replay passed at `f1b4397f`. Its original unit receipts record two
+zero exits and an unstarted SIGKILL cancellation, with outer original-scope
+quiescence. The pinned test binary SHA-256 is
+`cf8610685e7d72fd971d4b72c225a27692897d723c1bddb9f19ded42f4f2d3c1`.
 The probe does not run arbitrary protected Cargo, freeze unit namespaces, seal
 reusable outputs, establish a complete input collector or create a CI proof.
 Those activation blockers, including race/cancellation and nested-builder
@@ -296,7 +303,8 @@ SIGKILL and verifies the original parent before starting the bootstrap. This
 covers the interval before tracing can enable EXITKILL. Protected credential
 dropping must rearm and verify this guard after credential changes, which clear
 it (the Linux [parent-death signal rules](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html));
-that transition still needs its actual guest proof.
+the normal transition is covered by the V3 guest receipt above. Original-parent
+death across the credential transition still needs guest fault injection.
 
 Thirteen real subprocess tests cover short-lived exec, failed exec, stager death,
 forged stops/signals, observer failure, multi-thread refusal, original tracer
@@ -371,8 +379,11 @@ cleanup interfaces. None requests a new product decision from the owner.
   versus always-fresh execution under D8. Blocks implementation acceptance.
 * **Credential, I/O and cancellation feasibility:** prove the loader/peer/drop
   protocol, stable jobserver mapping, bounded stdin staging, unsupported spawn
-  handling, and original supervisor ownership in the real guest. Existing
-  same-UID evidence does not prove these transitions. Blocks protected activation.
+  handling, and original supervisor ownership in the real guest. The fixed V3
+  replay now proves normal credential transitions, stdin/jobserver transport and
+  pre-exec SIGUSR1 cancellation. Complete signal/race, original-parent death and
+  unsupported-spawn fault coverage remain required. Same-UID evidence cannot
+  substitute for those guest cases. Blocks protected activation.
 * **Final unit schema and suite mapping:** turn the fields above into exact
   validated record types and publication/replay rules, including producer-versus-
   reuse records and protected metadata restoration after interrupted Cargo.
