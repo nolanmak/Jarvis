@@ -977,4 +977,17 @@ for selected kernel-copied query names, avoiding an unbounded expansion into
 all runtime metadata. Startup requires both original copy paths before target
 execution. Generic descriptor lifecycle, concurrent cwd/namespace resolution,
 complete filesystem coverage and protected invalidation/reuse authority remain
-unproved. Native replay of this extension is pending.
+unproved.
+
+At `153427a2`, the admitted real VM replay passed in **105.49 seconds** on
+`7.0.0-31-generic`. The protected receipt records **548 path queries,
+153 directory reads, 3,890 entries and 744 metadata observations**. The
+descriptor-relative source lookup, exact 256-byte statx copy digest, missing
+query and failed copy all passed. All fourteen original programs/links and
+their IDs/tags stayed unchanged with zero missed/recursion counts. Compiler
+calls remained `[3, 0]`, build scripts `[1, 0]`, both applications ran, metadata
+was preserved, and original cleanup/allocation removal passed. The 269-test
+CI Python suite passed with native helpers and no skips; 20 observer tests and
+31 focused Rust tests passed (15 opt-in Rust cases excluded). This adds actual
+query-context evidence, not generic descriptor/cwd resolution, complete input
+closure, protected invalidation, passing CI or shipping authority.
