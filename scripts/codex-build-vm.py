@@ -414,6 +414,16 @@ with path.open('w') as receipt:
 BUILD_CACHE_MOUNT = '/build-cache'
 
 
+def validate_result_shape(result,ci_context):
+    expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
+    if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
+    if ci_context is not None:
+        for field in ('cache_preparation','input_write_observation','source_projection'):
+            if field in result:expected.add(field)
+    if set(result)!=expected or type(result['exit_code']) is not int:
+        raise Unavailable('invalid VM result')
+
+
 def qemu_command(config, image, shares, build_cache):
     """The qemu argv for one build VM."""
     command = [config['qemu'], '-no-user-config', '-nodefaults', '-machine', 'pc,accel=kvm',
@@ -683,12 +693,7 @@ poweroff -f
                     raise Unavailable(result['error'])
                 if download_info is not None:
                     download_info.update(requests=broker.requests, bytes=broker.bytes)
-                expected={'exit_code','stdout','stderr'}|({'cache_reclaimed','producer_reclaimed','seed_reclaimed','guest_worker_quiescence'} if ci_context is not None else set())
-                if ci_context is not None and ci_context.get('dependency_action') is not None:expected.add('dependency_result')
-                if ci_context is not None and 'cache_preparation' in result:expected.add('cache_preparation')
-                if ci_context is not None and 'input_write_observation' in result:expected.add('input_write_observation')
-                if set(result) != expected or type(result['exit_code']) is not int:
-                    raise Unavailable('invalid VM result')
+                validate_result_shape(result,ci_context)
                 if ci_context is not None:
                     seeds=result['seed_reclaimed']
                     action=ci_context.get('dependency_action')

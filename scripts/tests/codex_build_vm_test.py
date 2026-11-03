@@ -14,6 +14,18 @@ SPEC.loader.exec_module(vm)
 
 
 class SnapshotValidationTests(unittest.TestCase):
+    def test_source_projection_survives_transport_only_for_ci_and_unknown_fields_still_fail(self):
+        ordinary={'exit_code':0,'stdout':'','stderr':''}
+        projection={'version':1,'kind':'ci-git-source-projection'}
+        result={**ordinary,'cache_reclaimed':[],'producer_reclaimed':[],'seed_reclaimed':[],
+            'guest_worker_quiescence':{},'cache_preparation':{},'input_write_observation':{},
+            'source_projection':projection}
+        vm.validate_result_shape(result,{})
+        self.assertIs(result['source_projection'],projection)
+        with self.assertRaises(vm.Unavailable):vm.validate_result_shape({**ordinary,'source_projection':projection},None)
+        with self.assertRaises(vm.Unavailable):vm.validate_result_shape({**result,'unknown':True},{})
+        with self.assertRaises(vm.Unavailable):vm.validate_result_shape({**result,'exit_code':False},{})
+
     def test_guest_failure_diagnostic_keeps_only_protocol_enums_and_errno(self):
         self.assertEqual(vm.guest_diagnostic({'stage':'hide_producer_cache','category':'CalledProcessError','errno':22,
                                               'message':'private source or credential contents'}),
