@@ -50,7 +50,7 @@ def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
         'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute'}
     categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','CalledProcessError','Unavailable'}
     value=value if type(value) is dict else {}
     return {'stage':value.get('stage') if value.get('stage') in phases else 'planner_startup',
@@ -194,7 +194,9 @@ def fixture_request(request):
     input-closure authority. Preserve the original command and its virtual paths.
     """
     file,argv,_environment,cwd,search,_ignored,_blocked=request
-    if cwd!=b'/workspace' or search is not None or not argv or argv[0]!=file:
+    # POSIX spawnp/execvp preserve their search request even for absolute files.
+    # An absolute executable ignores PATH; keep the original payload untouched.
+    if cwd!=b'/workspace' or not argv or argv[0]!=file:
         raise FreshnessHold('input_census_unknown')
     if file==b'/workspace/target/debug/private-cargo-probe' and len(argv)==1:
         return {'kind':'application'}
@@ -329,7 +331,8 @@ class RootRelay:
             numbers=self._receive(connection,descriptors);phase[0]='planner_unit'
             self._run(connection,ordinal,descriptors,numbers,phase)
         except (OSError,ValueError,RuntimeError,struct.error,subprocess.SubprocessError,FreshnessHold,staging.StagingUnavailable) as error:
-            self.errors.append(diagnostic({'stage':phase[0],'category':type(error).__name__,'errno':getattr(error,'errno',None)}))
+            self.errors.append(diagnostic({'stage':getattr(error,'unit_view_stage',phase[0]),
+                'category':type(error).__name__,'errno':getattr(error,'errno',None)}))
             try:connection.sendall(event('error',errno.EINVAL))
             except OSError:pass
         finally:
@@ -665,25 +668,27 @@ class _CargoProbe:
 
     def prepare(self,ordinal,request):
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
-        mapped=fixture_request(request);slot=self.root/('unit-'+str(ordinal));slot.mkdir(mode=0o700)
+        try:mapped=fixture_request(request)
+        except FreshnessHold as error:error.unit_view_stage='planner_cargo_request';raise
+        slot=self.root/('unit-'+str(ordinal));slot.mkdir(mode=0o700)
         unit=2000+ordinal;artifacts=slot/'artifacts';artifacts.mkdir(mode=0o700);os.chown(artifacts,unit,unit)
         for name in ('debug','debug/deps'):
             path=artifacts/name;path.mkdir(mode=0o700);os.chown(path,unit,unit)
         entries=[]
         if mapped['kind']=='application':
-            if self.published is None:raise FreshnessHold('artifact_provenance_unknown')
+            if self.published is None:raise cargo_hold('planner_cargo_artifact')
             sealed,manifest,outputs=self.published;alias=self.target/'debug/private-cargo-probe'
             artifact=self.target/outputs[0]
             if (not alias.is_file() or alias.is_symlink() or not artifact.samefile(alias)
                     or unit_views.inventory(sealed,owner=0,sealed=True)!=manifest):
-                raise FreshnessHold('artifact_provenance_unknown')
+                raise cargo_hold('planner_cargo_artifact')
             original=sealed/outputs[0];expected=next(row for row in manifest if row[0]==os.fsencode(outputs[0]).hex())
             descriptor=os.open(artifact,os.O_RDONLY|os.O_NOFOLLOW|os.O_NOATIME|os.O_CLOEXEC)
             try:
                 info=os.fstat(descriptor)
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid!=1001 or info.st_size!=expected[3]
                         or hashlib.sha256(os.pread(descriptor,info.st_size+1,0)).hexdigest()!=expected[4]):
-                    raise FreshnessHold('artifact_provenance_unknown')
+                    raise cargo_hold('planner_cargo_artifact')
             finally:os.close(descriptor)
             name='debug/private-cargo-probe';(artifacts/name).touch(mode=0o444)
             raw=os.fsencode(name).hex();entries=[[raw,str(original),[raw,*expected[1:]]]]
@@ -775,6 +780,10 @@ class _CargoProbe:
         shutil.rmtree(self.root);self.report['allocation_removed']=True
 
 
+def cargo_hold(stage):
+    error=FreshnessHold('artifact_provenance_unknown');error.unit_view_stage=stage;return error
+
+
 def _cargo(arguments):
     """Internal fixed Cargo bootstrap; requires the original root-sealed grant."""
     global _PHASE
@@ -785,10 +794,10 @@ def _cargo(arguments):
             or cache._read_record(root/'control.json')!={'version':1,'kind':'private-cargo-view-probe',
                 'binding':value['binding'],'command':value['command'],'shipping_authority':False,'state':'active'}):
         raise FreshnessHold('invalidation_unsafe')
-    libc=ctypes.CDLL(None,use_errno=True)
+    _PHASE='planner_cargo_runtime';libc=ctypes.CDLL(None,use_errno=True)
     if libc.unshare(0x00020000)!=0:raise OSError(ctypes.get_errno(),'planner mount namespace unavailable')
     unit_views._mount('--make-rprivate','/');os.chdir('/')
-    runtime=root/'toolchain-runtime';runtime.mkdir(mode=0o755)
+    runtime=root/('toolchain-runtime-'+str(uuid.uuid4()));runtime.mkdir(mode=0o755)
     unit_views.toolchain_view('/toolchain',runtime)
     unit_views._mount('--rbind',runtime,'/toolchain')
     unit_views._mount('-o','remount,bind,ro,nosuid,nodev,noatime','/toolchain')
@@ -804,7 +813,7 @@ def _cargo(arguments):
         'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)}
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1001);os.setuid(1001);os.umask(0o077);_parent_guard(value['parent'])
-    os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_client_exec'
+    os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_cargo_execute'
     os.execve('/toolchain/bin/cargo',['/toolchain/bin/cargo','run','--offline','--locked','--quiet'],environment)
 
 

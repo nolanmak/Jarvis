@@ -49,13 +49,14 @@ class PlannerProtocolTests(unittest.TestCase):
         self.assertEqual(mapped,{'kind':'compile','outputs':[
             'debug/deps/private_cargo_probe-0123456789abcdef',
             'debug/deps/private_cargo_probe-0123456789abcdef.d']})
+        self.assertEqual(planner.fixture_request(request(args,search=b'/unrelated/path')),mapped)
         for extra in ([b'--extern',b'evil=/tmp/evil.rlib'],[b'-o',b'/tmp/escape'],
                 [b'@/tmp/response'],[b'--cfg',b'unknown'],[b'other.rs'],
                 [b'--out-dir',b'/workspace/target/debug/deps']):
             with self.subTest(extra=extra),self.assertRaises(planner.FreshnessHold):
                 planner.fixture_request(request([*args,*extra]))
         for invalid in (request([b'--print=sysroot',b'/tmp/input.rs']),
-                request(args,cwd=b'/tmp'),request(args,search=b'/toolchain/bin'),
+                request(args,cwd=b'/tmp'),request(args,file=b'rustc',search=b'/toolchain/bin'),
                 request([],file=b'/bin/sh'),request([b'--version'],file=b'/tmp/rustc')):
             with self.subTest(invalid=invalid),self.assertRaises(planner.FreshnessHold):
                 planner.fixture_request(invalid)
