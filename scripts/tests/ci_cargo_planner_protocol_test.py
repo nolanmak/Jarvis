@@ -24,6 +24,34 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_worker_runtime_holds_opaque_static_and_loader_redirects(self):
+        request=(b'/usr/bin/python3',[b'python3',b'-I',b'driver.py'],{},b'/workspace',None,0,0)
+        with patch.object(planner.os,'statvfs',return_value=SimpleNamespace(f_flag=os.ST_RDONLY)):
+            self.assertTrue(planner.worker_runtime_request(request,'/ci-tools/ci-cargo-planner.so'))
+        with patch.object(planner.os,'statvfs',return_value=SimpleNamespace(f_flag=0)),self.assertRaises(planner.FreshnessHold):
+            planner.worker_runtime_request(request,'/ci-tools/ci-cargo-planner.so')
+        for file,environment in ((b'/bin/true',{}),(b'/workspace/opaque',{}),
+                (request[0],{b'LD_LIBRARY_PATH':b'/workspace'}),(request[0],{b'LD_PRELOAD':b'/workspace/evil.so'}),
+                (request[0],{b'LD_AUDIT':b'/workspace/evil.so'})):
+            with self.subTest(file=file,environment=environment),self.assertRaises(planner.FreshnessHold):
+                planner.worker_runtime_request((file,[file],environment,request[3],None,0,0),'/ci-tools/ci-cargo-planner.so')
+
+    def test_worker_capability_cannot_select_planner_credentials_or_an_unpinned_cargo(self):
+        base=(b'cargo',[b'cargo',b'test'],{b'PATH':b'/toolchain/bin:/usr/bin:/bin'},b'/workspace',b'/toolchain/bin:/usr/bin:/bin',0,0)
+        self.assertTrue(planner.worker_cargo_request(base))
+        absolute=(b'/toolchain/bin/cargo',[b'/toolchain/bin/cargo',b'build'],base[2],base[3],None,0,0)
+        self.assertTrue(planner.worker_cargo_request(absolute))
+        self.assertTrue(planner.worker_cargo_request((absolute[0],[b'cargo',b'build'],*absolute[2:])))
+        self.assertFalse(planner.worker_cargo_request((b'/bin/bash',[b'/bin/bash',b'-c',b'cargo test'],{},base[3],None,0,0)))
+        for path in (b'/tmp:/toolchain/bin',b'/usr/bin:/toolchain/bin',b':/toolchain/bin'):
+            request=(base[0],base[1],{b'PATH':path},base[3],path,0,0)
+            with self.subTest(path=path),self.assertRaises(planner.FreshnessHold):planner.worker_cargo_request(request)
+        with self.assertRaises(planner.FreshnessHold):planner.execution_identity({'ordinal':0,'execution_role':'worker','execution_uid':1001})
+        with self.assertRaises(planner.FreshnessHold):planner.execution_identity({'ordinal':0,'execution_role':'cargo','execution_uid':1000})
+        self.assertEqual(planner.execution_identity({'ordinal':7}),2007)
+        self.assertEqual(planner.execution_identity({'ordinal':7,'execution_role':'worker','execution_uid':1000}),1000)
+        self.assertEqual(planner.execution_identity({'ordinal':7,'execution_role':'cargo','execution_uid':1001}),1001)
+
     def test_dispatch_admits_pinned_rustc_path_search_without_rewriting_actual_request(self):
         path=b'/toolchain/bin:/usr/bin:/bin'
         request=(b'rustc',[b'rustc',b'-vV'],{b'PATH':path},b'/workspace',path,0,0)
@@ -598,6 +626,7 @@ class PlannerProtocolTests(unittest.TestCase):
         units=[{'ordinal':i,'uid':2000+i,'started':i!=2,'cancelled':i==2,'returncode':(-9 if i==2 else -10 if i==3 else 0),
             'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5)]
         value={'version':3,'kind':'ci-planner-protocol-probe','binding':binding,'command':command,
+            'credential_roles':{'worker_rejects_planner':True,'planner_rejects_worker':True},
             'cases':cases,'units':units,'filesystem':filesystem,'guest_worker_quiescence':scopes[2],
             'input_closure_complete':False,'cargo_metadata_isolation_established':False,'shipping_authority':False}
         value['kernel_observation']={'version':1,'kind':'kernel-copied-filename-probe','binding':binding,'command':command,
@@ -632,13 +661,16 @@ class PlannerProtocolTests(unittest.TestCase):
     def test_probe_requires_original_distinct_scope_roles_bindings_and_no_authority(self):
         original,binding,command,workers,writer,source=self.probe()
         self.assertEqual(planner.validate_probe(original,binding,command,workers,writer,source),original)
-        for fault in ('version','binding','command','scope','writer','source','role','cancelled-start',
+        for fault in ('role-credential-missing','role-credential-false','role-credential-int','version','binding','command','scope','writer','source','role','cancelled-start',
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
                 'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
                 'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
                 'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census','kernel-binary-path','kernel-cursor','kernel-fstat','kernel-statx','kernel-base','kernel-content'):
             value=copy.deepcopy(original)
-            if fault=='version':value['version']=True
+            if fault=='role-credential-missing':value.pop('credential_roles')
+            elif fault=='role-credential-false':value['credential_roles']['worker_rejects_planner']=False
+            elif fault=='role-credential-int':value['credential_roles']['planner_rejects_worker']=1
+            elif fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
             elif fault=='command':value['command']=str(uuid.uuid4())
             elif fault=='scope':value['guest_worker_quiescence']={'scope_id':str(uuid.uuid4())}

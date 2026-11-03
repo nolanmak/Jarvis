@@ -775,6 +775,77 @@ def fixture_request(request):
 
 
 
+def worker_cargo_request(request):
+    file,argv,environment,cwd,search,*_=request
+    if not argv:raise cargo_hold('planner_cargo_request')
+    if file==b'/toolchain/bin/cargo':return True
+    if file==b'cargo':
+        if (search not in (b'/toolchain/bin',b'/toolchain/bin:/usr/bin:/bin')
+                or environment.get(b'PATH')!=search):raise cargo_hold('planner_cargo_request')
+        return True
+    return False
+
+
+def worker_runtime_request(request,library):
+    """Only pinned dynamic runtimes may install the worker guard at startup.
+
+    Static/opaque programs and loader overrides require a separate guarded
+    execution implementation; they cannot silently run without mediation.
+    """
+    file,argv,environment,cwd,search,*_=request
+    clean=strip_transport(environment,library)
+    if any(key.startswith(b'LD_') for key in clean):raise cargo_hold('planner_cargo_runtime')
+    aliases=('/bin/bash','/usr/bin/python3')
+    allowed={os.path.realpath(path) for path in aliases}
+    if b'/' not in file:
+        if (search not in (b'/toolchain/bin',b'/toolchain/bin:/usr/bin:/bin')
+                or environment.get(b'PATH')!=search):raise cargo_hold('planner_cargo_runtime')
+        candidates=[Path(os.fsdecode(directory))/os.fsdecode(file) for directory in search.split(b':')]
+        executable=next((path for path in candidates if path.exists() or path.is_symlink()),None)
+    else:executable=Path(os.fsdecode(file))
+    if executable is None or not executable.is_absolute():raise cargo_hold('planner_cargo_runtime')
+    path=Path(os.path.realpath(executable))
+    if str(path) not in allowed:raise cargo_hold('planner_cargo_runtime')
+    descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        info=os.fstat(descriptor);header=os.pread(descriptor,64,0)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0,1000) or info.st_mode&0o022 or not info.st_mode&0o111
+                or not os.statvfs(path).f_flag&os.ST_RDONLY or len(header)!=64 or header[:7]!=b'\x7fELF\x02\x01\x01'):raise cargo_hold('planner_cargo_runtime')
+        offset=struct.unpack_from('<Q',header,32)[0];size,count=struct.unpack_from('<HH',header,54)
+        if size!=56 or not 1<=count<=128 or not 64<=offset<=16384:raise cargo_hold('planner_cargo_runtime')
+        entries=os.pread(descriptor,size*count,offset);interpreters=[]
+        if len(entries)!=size*count:raise cargo_hold('planner_cargo_runtime')
+        for index in range(count):
+            entry=entries[index*size:(index+1)*size]
+            if struct.unpack_from('<I',entry)[0]!=3:continue
+            start=struct.unpack_from('<Q',entry,8)[0];length=struct.unpack_from('<Q',entry,32)[0]
+            if not 1<=length<=4096 or start+length>info.st_size:raise cargo_hold('planner_cargo_runtime')
+            interpreters.append(os.pread(descriptor,length,start))
+        if (len(interpreters)!=1 or interpreters[0] not in (b'/lib64/ld-linux-x86-64.so.2\0',b'/lib/ld-linux-aarch64.so.1\0')
+                or unit_views._key(os.fstat(descriptor))!=unit_views._key(info)):raise cargo_hold('planner_cargo_runtime')
+    finally:os.close(descriptor)
+    return True
+
+
+def execution_identity(value):
+    ordinal=value['ordinal'];role=value.get('execution_role','unit')
+    if type(ordinal) is not int or not 0<=ordinal<4096:raise FreshnessHold('invalidation_unsafe')
+    expected={'unit':2000+ordinal,'worker':1000,'cargo':1001}.get(role)
+    if expected is None or value.get('execution_uid',expected)!=expected:raise FreshnessHold('invalidation_unsafe')
+    if role!='unit' and ('view' in value or type(value.get('relay_fd')) not in (int,type(None))):
+        raise FreshnessHold('invalidation_unsafe')
+    return expected
+
+
+def strip_transport(environment,library):
+    result=dict(environment);result.pop(b'JARVIS_CARGO_RELAY_FD',None)
+    if b'LD_PRELOAD' in result:
+        libraries=[part for part in result[b'LD_PRELOAD'].replace(b':',b' ').split() if part!=os.fsencode(library)]
+        if libraries:result[b'LD_PRELOAD']=b' '.join(libraries)
+        else:result.pop(b'LD_PRELOAD')
+    return result
+
+
 class RootRelay:
     def __init__(self,admission,*,library,timeout=30):
         if (os.geteuid()!=0 or type(admission) is not _Admission or admission.token is not _TOKEN
@@ -785,16 +856,17 @@ class RootRelay:
         info=self.library.lstat()
         if (self.library.resolve()!=self.library or not stat.S_ISREG(info.st_mode) or info.st_uid!=0
                 or info.st_mode&0o022 or info.st_nlink!=1 or not 1<=info.st_size<=2*1024**2):raise FreshnessHold('authority_changed')
-        self.timeout=timeout;self.path=self.root/'relay.sock';self.nonce=os.urandom(32)
+        self.timeout=timeout;self.peer_uid=1001;self.config_magic=b'JARVCFG3'
+        self.path=self.root/'relay.sock';self.nonce=os.urandom(32)
         if len(os.fsencode(self.path))>=108:raise FreshnessHold('invalidation_unsafe')
         self.views=None;self.completed=[];self.errors=[];self._stop=threading.Event();self._slots=threading.BoundedSemaphore(4)
         self._threads=[];self._requests=0;self._children=set();self._lock=threading.Lock()
 
     def __enter__(self):
-        os.chown(self.root,0,1001);self.root.chmod(0o710)
+        os.chown(self.root,0,self.peer_uid);self.root.chmod(0o710)
         (self.root/'units').mkdir(mode=0o700)
         self.listener=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
-        self.listener.bind(str(self.path));os.chown(self.path,0,1001);self.path.chmod(0o660)
+        self.listener.bind(str(self.path));os.chown(self.path,0,self.peer_uid);self.path.chmod(0o660)
         self.listener.listen(8);self.listener.settimeout(.05)
         self.thread=threading.Thread(target=self._accept,daemon=True);self.thread.start();return self
 
@@ -818,7 +890,7 @@ class RootRelay:
     def config_fd(self):
         fd=os.memfd_create('ci-planner-client',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
         try:
-            body=legacy.CONFIG.pack(b'JARVCFG3',0,os.getpid(),int(self.timeout*1000),self.nonce,os.fsencode(self.path))
+            body=legacy.CONFIG.pack(self.config_magic,0,os.getpid(),int(self.timeout*1000),self.nonce,os.fsencode(self.path))
             if os.write(fd,body)!=len(body):raise OSError(errno.EIO,'client configuration write failed')
             fcntl.fcntl(fd,fcntl.F_ADD_SEALS,legacy.SEALS);return fd
         except BaseException:os.close(fd);raise
@@ -837,7 +909,7 @@ class RootRelay:
 
     def _receive(self,connection,descriptors):
         pid,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
-        if pid<=0 or uid!=1001 or gid!=1001:raise FreshnessHold('invalidation_unsafe')
+        if pid<=0 or uid!=self.peer_uid or gid!=self.peer_uid:raise FreshnessHold('invalidation_unsafe')
         data,ancillary,flags,_=connection.recvmsg(legacy.REQUEST.size,socket.CMSG_SPACE(65*4),socket.MSG_CMSG_CLOEXEC)
         for level,kind,body in ancillary:
             if level!=socket.SOL_SOCKET or kind!=socket.SCM_RIGHTS:raise FreshnessHold('metadata_torn')
@@ -867,6 +939,9 @@ class RootRelay:
         finally:
             legacy._close(descriptors);connection.close();self._slots.release()
 
+    def request_context(self,ordinal,request):return {},None
+    def unit_finished(self,value,record):pass
+
     def _run(self,connection,ordinal,descriptors,numbers,phase):
         directory=self.root/'units'/str(uuid.uuid4());directory.mkdir(mode=0o700)
         control,child_control=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
@@ -876,17 +951,26 @@ class RootRelay:
             'binding':self.admission.binding,'command':self.admission.command,'directory':str(directory),
             'ordinal':ordinal,'deadline':deadline,'library':str(self.library),'numbers':numbers,
             'extras':descriptors[4:]}
-        view=None;bootstrap=None;child=None;pidfd=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
+        view=None;bootstrap=None;child=None;pidfd=None;relay_fd=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
         signal_count=0;cancelled_at=None;control_eof=False;original_pid=None
         try:
+            request=payload(descriptors[0]);context,relay_fd=self.request_context(ordinal,request)
+            if relay_fd is not None:
+                # Avoid all original descriptor target numbers before their
+                # jobserver mapping is restored in the stage helper.
+                minimum=max(256,max(numbers)+1)
+                private=fcntl.fcntl(relay_fd,fcntl.F_DUPFD_CLOEXEC,minimum);os.close(relay_fd);relay_fd=private
+                if relay_fd>65535:raise FreshnessHold('input_census_unknown')
+                context=dict(context,relay_fd=relay_fd)
+            value.update(context)
             if self.views is not None:
-                phase[0]='planner_view_prepare';view=self.views.prepare(ordinal,payload(descriptors[0]))
+                phase[0]='planner_view_prepare';view=self.views.prepare(ordinal,request)
                 if view is not None:value['view']=view
             bootstrap=_sealed(value)
             argv=[sys.executable,'-I',str(Path(__file__).resolve()),'--unit',
                 *map(str,(bootstrap,descriptors[0],cancel,release,exec_release,child_control.fileno()))]
             child=subprocess.Popen(argv,stdin=descriptors[1],stdout=descriptors[2],stderr=descriptors[3],
-                pass_fds=tuple([bootstrap,*descriptors,cancel,release,exec_release,child_control.fileno()]),
+                pass_fds=tuple([bootstrap,*descriptors,cancel,release,exec_release,child_control.fileno(),*(() if relay_fd is None else (relay_fd,))]),
                 env={'PATH':os.defpath,'JARVIS_SUPERVISOR_PARENT_PID':str(os.getpid())})
             with self._lock:self._children.add(child)
             os.close(bootstrap);bootstrap=None;child_control.close();legacy._close(descriptors);descriptors.clear()
@@ -956,9 +1040,10 @@ class RootRelay:
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
             if view is not None:
                 phase[0]='planner_view_publish';self.views.finish(view,directory,raw)
-            self.completed.append({'ordinal':ordinal,'uid':2000+ordinal,'started':started,
+            self.completed.append({'ordinal':ordinal,'uid':execution_identity(value),'started':started,
                 'cancelled':cancelled,'returncode':raw,'original_cleanup':True,
                 'input_closure_complete':False,'shipping_authority':False})
+            self.unit_finished(value,self.completed[-1])
             if not cancelled:
                 if not started or record.get('exec_observed') is not True:connection.sendall(event('error',errno.EIO))
                 else:connection.sendall(event('signaled' if raw<0 else 'finished',abs(raw)))
@@ -966,9 +1051,86 @@ class RootRelay:
             if child is not None:
                 if child.poll() is None:child.terminate();child.wait(timeout=6)
                 with self._lock:self._children.discard(child)
-            legacy._close([cancel,stop,release,grant,exec_release,exec_grant]+([] if bootstrap is None else [bootstrap]))
+            legacy._close([cancel,stop,release,grant,exec_release,exec_grant]+([] if bootstrap is None else [bootstrap])+([] if relay_fd is None else [relay_fd]))
             control.close();child_control.close()
             if pidfd is not None:os.close(pidfd)
+
+
+class WorkerRelay(RootRelay):
+    """Repository-worker transport, with a distinct sealed UID-1000 role.
+
+    Ordinary worker children keep the worker credential and execution guard.
+    Only a pinned Cargo request enters the isolated UID-1001 planner view.
+    This routing does not establish generated-input closure or CI authority.
+    """
+    def __init__(self,admission,*,planner_relay,value):
+        super().__init__(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())))
+        self.peer_uid=1000;self.config_magic=b'JARVWRK3';self.planner_relay=planner_relay
+        self.value=value;self.executor=None;self.cargo_lock=threading.Lock();self.cargo_owner=None;self.cargo_commands=[]
+
+    def _receive(self,connection,descriptors):
+        numbers=super()._receive(connection,descriptors)
+        pid,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+        if any(os.readlink(f'/proc/{pid}/ns/'+name)!=os.readlink('/proc/self/ns/'+name)
+                for name in ('mnt','ipc','net','user','pid')):raise FreshnessHold('input_census_unknown')
+        return numbers
+
+    def _run(self,connection,ordinal,descriptors,numbers,phase):
+        is_cargo=worker_cargo_request(payload(descriptors[0]));locked=False
+        try:
+            if is_cargo:
+                locked=self.cargo_lock.acquire(blocking=False)
+                if not locked:raise FreshnessHold('input_census_unknown')
+                self.cargo_owner=ordinal
+            super()._run(connection,ordinal,descriptors,numbers,phase)
+        finally:
+            if locked and self.cargo_owner==ordinal:
+                self.cargo_owner=None;self.cargo_lock.release()
+
+    def unit_finished(self,value,record):
+        if value.get('execution_role')!='cargo':return
+        self.planner_relay.drain()
+        if record['uid']!=1001 or self.cargo_owner!=record['ordinal']:raise FreshnessHold('cleanup_uncertain')
+        units=self.planner_relay.completed[value['planner_first_unit']:]
+        self.cargo_commands.append({'ordinal':record['ordinal'],'cargo_exit':record['returncode'],
+            'original_cargo_cleanup':True,'compiler_calls':sum(
+                self.executor.units[unit['ordinal']]['mapping']['kind']=='compile' for unit in units),'units':units})
+        # Finish evidence and release the original Cargo slot before sending
+        # its terminal response, so a sequential caller cannot race the slot.
+        self.cargo_owner=None;self.cargo_lock.release()
+
+    def request_context(self,ordinal,request):
+        try:return self._request_context(ordinal,request)
+        except (FreshnessHold,OSError) as error:
+            file,argv,environment,cwd,search,*_=request
+            cache._write_record(self.admission.target.parent/'repository-held-request.json',{
+                'version':1,'binding':self.admission.binding,'command':self.admission.command,
+                'file_hex':file[:4096].hex(),'argv_hex':[arg[:2048].hex() for arg in argv[:32]],
+                'cwd_hex':cwd[:4096].hex(),'search_hex':None if search is None else search[:4096].hex(),
+                'stage':getattr(error,'unit_view_stage','planner_cargo_request'),'shipping_authority':False})
+            raise
+
+    def _request_context(self,ordinal,request):
+        if not worker_cargo_request(request):
+            worker_runtime_request(request,self.library)
+            return {'execution_role':'worker','execution_uid':1000},self.config_fd()
+        file,argv,environment,cwd,search,*_=request
+        environment=strip_transport(environment,self.library)
+        # The canonical executable is used only for this additional controller
+        # metadata query. _stage executes the sealed original file/argv/search.
+        invocation=validate_invocation(['/toolchain/bin/cargo',*[os.fsdecode(arg) for arg in argv[1:]]],
+            {os.fsdecode(key):os.fsdecode(value) for key,value in environment.items()},os.fsdecode(cwd))
+        if self.executor is None:
+            self.executor=_CargoExecutor(self.planner_relay.admission);self.planner_relay.views=self.executor
+            self.executor.preparing_graph=True
+            try:status,metadata,error=self.executor._command(dict(self.value,original_invocation=invocation),
+                self.planner_relay,operation='metadata')
+            finally:self.executor.preparing_graph=False
+            if status!=0:raise cargo_hold('planner_cargo_request')
+            self.executor.graph=CargoGraph(self.executor.source,metadata,owner=0)
+        self.executor.graph._verify()
+        return {'execution_role':'cargo','execution_uid':1001,'planner_first_unit':len(self.planner_relay.completed),'cargo_root':str(self.executor.root),
+            'source':str(self.executor.source)},self.planner_relay.config_fd()
 
 
 def _unit(arguments):
@@ -976,7 +1138,7 @@ def _unit(arguments):
     _PHASE='planner_unit'
     bootstrap,data,cancel,release,exec_release,control=map(int,arguments)
     value=_bootstrap(bootstrap,'unit');_parent_guard(value['parent'])
-    descriptors=[bootstrap,data,cancel,release,exec_release,control,*value['extras']]
+    descriptors=[bootstrap,data,cancel,release,exec_release,control,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))]
     for fd in descriptors:os.set_inheritable(fd,False)
     stage=dict(value,kind='stage',parent=os.getpid());stage_bootstrap=_sealed(stage)
     stage_identity=os.fstat(stage_bootstrap)
@@ -989,7 +1151,7 @@ def _unit(arguments):
     def executed(child):
         nonlocal observed
         status=Path(f'/proc/{child.pid}/status').read_text()
-        expected=2000+value['ordinal']
+        expected=execution_identity(value)
         for label in ('Uid:','Gid:'):
             row=next(line for line in status.splitlines() if line.startswith(label))
             if [int(number) for number in row.split()[1:]]!=[expected]*4:raise FreshnessHold('invalidation_unsafe')
@@ -1006,7 +1168,7 @@ def _unit(arguments):
                     'inode':root.st_ino,'mode':root.st_mode}})
         _control(endpoint,3,child.pid);_release(exec_release,cancel,value['deadline']);observed=True
     try:
-        forwarded=tuple([stage_bootstrap,data,cancel,release,control,*value['extras']])
+        forwarded=tuple([stage_bootstrap,data,cancel,release,control,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))])
         argv=[sys.executable,'-I',str(Path(__file__).resolve()),'--stage',*map(str,(stage_bootstrap,data,cancel,release,control))]
         raw=supervisor.supervise(Path(value['directory'])/'cleanup',argv,forward_fds=forwarded,
             close_after_spawn=(stage_bootstrap,),return_raw_status=True,on_spawn=spawned,on_exec=executed)
@@ -1029,7 +1191,7 @@ def _stage(arguments):
     bootstrap,data,cancel,release,control=map(int,arguments)
     value=_bootstrap(bootstrap,'stage');_parent_guard(value['parent'])
     if type(value['ordinal']) is not int or not 0<=value['ordinal']<4096:raise FreshnessHold('invalidation_unsafe')
-    for fd in (bootstrap,data,cancel,release,control,*value['extras']):os.set_inheritable(fd,False)
+    for fd in (bootstrap,data,cancel,release,control,*value['extras'],*(() if value.get('relay_fd') is None else (value['relay_fd'],))):os.set_inheritable(fd,False)
     file,argv,environment,cwd,search,ignored,blocked=payload(data)
     environment,mapping,jobserver=staging.normalize_jobserver(environment,dict(zip(value['numbers'][3:],value['extras'])))
     _PHASE='planner_capture';captured=staging.capture(0,cancel,command_deadline=value['deadline'])
@@ -1042,11 +1204,15 @@ def _stage(arguments):
     saved=[(target,fcntl.fcntl(source,fcntl.F_DUPFD_CLOEXEC,128)) for target,source in mapping]
     os.dup2(captured.fileno(),0)
     for target,source in saved:os.dup2(source,target,inheritable=True);os.close(source)
-    environment.pop(b'JARVIS_CARGO_RELAY_FD',None)
-    if b'LD_PRELOAD' in environment:
-        libraries=[part for part in environment[b'LD_PRELOAD'].replace(b':',b' ').split() if part!=os.fsencode(value['library'])]
-        if libraries:environment[b'LD_PRELOAD']=b' '.join(libraries)
-        else:environment.pop(b'LD_PRELOAD')
+    environment=strip_transport(environment,value['library'])
+    role=value.get('execution_role','unit');uid=execution_identity(value)
+    if role in ('worker','cargo'):
+        descriptor=value.get('relay_fd')
+        if type(descriptor) is not int or not 3<=descriptor<=65535:raise FreshnessHold('invalidation_unsafe')
+        os.set_inheritable(descriptor,True)
+        environment[b'JARVIS_CARGO_RELAY_FD']=str(descriptor).encode()
+        environment[b'LD_PRELOAD']=os.fsencode(value['library'])+(b' '+environment[b'LD_PRELOAD'] if b'LD_PRELOAD' in environment else b'')
+        if role=='cargo':cargo_namespace(value['cargo_root'],value['source'])
     if 'view' in value:
         _PHASE='planner_view_enter';view=value['view']
         mounts=cache._read_record(Path(view['mounts']),max_bytes=16*1024**2)
@@ -1056,7 +1222,7 @@ def _stage(arguments):
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     _PHASE='planner_drop'
-    uid=2000+value['ordinal'];os.setgroups([]);os.setgid(uid);os.setuid(uid);os.umask(0o077)
+    os.setgroups([]);os.setgid(uid);os.setuid(uid);os.umask(0o077)
     _parent_guard(value['parent'])  # setuid/setgid clear the previous guard.
     os.chdir(cwd)
     for number in legacy.FORWARDED_SIGNALS:
@@ -1258,7 +1424,7 @@ def validate_invocation(argv,environment,cwd):
             or type(environment) is not dict or len(environment)>4096 or cwd!='/workspace'
             or any(type(key) is not str or not key or '=' in key or '\0' in key
                 or type(value) is not str or '\0' in value for key,value in environment.items())
-            or any(key in environment for key in ('LD_PRELOAD','JARVIS_CARGO_RELAY_FD'))
+            or any(key.startswith('LD_') or key=='JARVIS_CARGO_RELAY_FD' for key in environment)
             or environment.get('CARGO_TARGET_DIR')!='/workspace/target'
             or environment.get('CARGO_HOME')!='/ci-cargo-home'):
         raise cargo_hold('planner_cargo_request')
@@ -1874,17 +2040,9 @@ def _cargo_supervisor(arguments):
         forward_fds=(child_bootstrap,configuration),close_after_spawn=(child_bootstrap,))
 
 
-def _cargo(arguments):
-    """Cargo bootstrap under non-root planner credentials and the sealed grant."""
-    global _PHASE
-    _PHASE='planner_client_start';bootstrap,configuration=map(int,arguments)
-    value=_bootstrap(bootstrap,'cargo');_parent_guard(value['parent']);os.close(bootstrap)
-    root=unit_views.literal(value['cargo_root']);source=unit_views.literal(value['source'])
-    if (root.parent!=Path(value['target']) or not root.name.startswith('.cargo-execution-')
-            or cache._read_record(root/'control.json')!={'version':1,'kind':'cargo-execution',
-                'binding':value['binding'],'command':value['command'],'shipping_authority':False,'state':'active'}):
-        raise FreshnessHold('invalidation_unsafe')
-    _PHASE='planner_cargo_runtime';libc=ctypes.CDLL(None,use_errno=True)
+def cargo_namespace(root,source):
+    root=unit_views.literal(root);source=unit_views.literal(source)
+    libc=ctypes.CDLL(None,use_errno=True)
     if libc.unshare(0x00020000)!=0:raise OSError(ctypes.get_errno(),'planner mount namespace unavailable')
     unit_views._mount('--make-rprivate','/');os.chdir('/')
     runtime=root/('toolchain-runtime-'+str(uuid.uuid4()));runtime.mkdir(mode=0o755)
@@ -1897,6 +2055,19 @@ def _cargo(arguments):
         destination.mkdir(mode=0o755,parents=True,exist_ok=True)
         unit_views._mount('--bind',original,destination)
         unit_views._mount('-o','remount,bind,rw,nosuid,nodev,noatime',destination)
+
+
+def _cargo(arguments):
+    """Cargo bootstrap under non-root planner credentials and the sealed grant."""
+    global _PHASE
+    _PHASE='planner_client_start';bootstrap,configuration=map(int,arguments)
+    value=_bootstrap(bootstrap,'cargo');_parent_guard(value['parent']);os.close(bootstrap)
+    root=unit_views.literal(value['cargo_root']);source=unit_views.literal(value['source'])
+    if (root.parent!=Path(value['target']) or not root.name.startswith('.cargo-execution-')
+            or cache._read_record(root/'control.json')!={'version':1,'kind':'cargo-execution',
+                'binding':value['binding'],'command':value['command'],'shipping_authority':False,'state':'active'}):
+        raise FreshnessHold('invalidation_unsafe')
+    _PHASE='planner_cargo_runtime';cargo_namespace(root,source);libc=ctypes.CDLL(None,use_errno=True)
     invocation=value.get('original_invocation')
     if invocation is None:
         environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','CARGO_HOME':'/ci-cargo-home',
@@ -2157,6 +2328,40 @@ def _planner(arguments):
         value['metadata'],value['socket'],str(value['expected_uid'])],environment)
 
 
+def _credential_client(arguments):
+    bootstrap=int(arguments[0]);value=_bootstrap(bootstrap,'credential-client');_parent_guard(value['parent']);os.close(bootstrap)
+    uid=value['uid'];configuration=int(arguments[1])
+    if type(uid) is not int or uid not in (1000,1001):raise FreshnessHold('invalidation_unsafe')
+    libc=ctypes.CDLL(None,use_errno=True)
+    if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
+    os.setgroups([]);os.setgid(uid);os.setuid(uid);_parent_guard(value['parent'])
+    os.set_inheritable(configuration,True)
+    os.execve('/usr/bin/python3',['python3','-I','-c','print("CREDENTIAL_MAIN_REACHED",flush=True)'],
+        {'PATH':os.defpath,'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)})
+
+
+def credential_role_probe(value,relay):
+    results={}
+    for name,uid,magic in (('worker_rejects_planner',1000,b'JARVCFG3'),('planner_rejects_worker',1001,b'JARVWRK3')):
+        configuration=os.memfd_create('negative-credential-role',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+        bootstrap=None;child=None
+        try:
+            body=legacy.CONFIG.pack(magic,0,os.getpid(),30000,relay.nonce,os.fsencode(relay.path))
+            if os.write(configuration,body)!=len(body):raise FreshnessHold('metadata_torn')
+            fcntl.fcntl(configuration,fcntl.F_ADD_SEALS,legacy.SEALS)
+            bootstrap=_sealed(dict(value,kind='credential-client',parent=os.getpid(),uid=uid))
+            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--credential-client',str(bootstrap),str(configuration)],
+                pass_fds=(bootstrap,configuration),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            output,error=child.communicate(timeout=5)
+            if child.returncode!=125 or output or error:raise FreshnessHold('invalidation_unsafe')
+            results[name]=True
+        finally:
+            if child is not None and child.poll() is None:child.kill();child.wait(timeout=2)
+            os.close(configuration)
+            if bootstrap is not None:os.close(bootstrap)
+    return results
+
+
 def _probe(arguments):
     global _PHASE,_CHILD_DIAGNOSTIC
     value=_bootstrap(int(arguments[0]),'probe');_parent_guard(value['parent'])
@@ -2164,6 +2369,7 @@ def _probe(arguments):
     results=[];view_probe=None;cargo_probe=None
     _PHASE='planner_kernel_observer'
     with kernel_observer.Observer(admission,deadline=value['deadline']) as observer, RootRelay(admission,library=value['library'],timeout=30) as relay:
+        credential_roles=credential_role_probe(value,relay)
         metadata=root/'planner-metadata';metadata.write_text('');os.chown(metadata,1001,1001);metadata.chmod(0o600)
         for ordinal,mode in enumerate(('stdin','jobserver','cancel','signal','view')):
             _PHASE='planner_probe_'+mode
@@ -2209,7 +2415,7 @@ def _probe(arguments):
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],
-        'command':value['command'],'cases':results,'units':original_units,'filesystem':view_probe.receipt,
+        'command':value['command'],'credential_roles':credential_roles,'cases':results,'units':original_units,'filesystem':view_probe.receipt,
         'cargo':cargo_probe.report,'kernel_observation':kernel,
         'input_closure_complete':False,'cargo_metadata_isolation_established':False,'shipping_authority':False}))
     return 0
@@ -2261,12 +2467,112 @@ def _execute(arguments):
     return 0
 
 
+def _repository_worker(arguments):
+    bootstrap=int(arguments[0]);value=_bootstrap(bootstrap,'repository-worker');_parent_guard(value['parent']);os.close(bootstrap)
+    configuration=int(arguments[1]);environment=dict(value['environment'])
+    if (value['cwd']!='/workspace' or type(value['argv']) is not list or not value['argv']
+            or value['argv'][0]!='/bin/bash' or any(key in environment for key in ('LD_PRELOAD','JARVIS_CARGO_RELAY_FD'))):
+        raise FreshnessHold('invalidation_unsafe')
+    worker_runtime_request((os.fsencode(value['argv'][0]),list(map(os.fsencode,value['argv'])),
+        {os.fsencode(key):os.fsencode(item) for key,item in environment.items()},b'/workspace',None,0,0),value['library'])
+    environment.update(LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
+    libc=ctypes.CDLL(None,use_errno=True)
+    if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
+    os.setgroups([]);os.setgid(1000);os.setuid(1000);os.umask(0o022);_parent_guard(value['parent'])
+    os.set_inheritable(configuration,True);os.chdir(value['cwd'])
+    os.execve(value['argv'][0],value['argv'],environment)
+
+
+def _repository_worker_supervisor(arguments):
+    value=_bootstrap(int(arguments[0]),'repository-worker-supervisor');_parent_guard(value['parent'])
+    bootstrap=_sealed(dict(value,kind='repository-worker',parent=os.getpid()))
+    supervisor=_load('original_repository_worker_supervisor','provider-supervisor.py')
+    return supervisor.supervise(value['worker_receipt'],[sys.executable,'-I',str(Path(__file__).resolve()),
+        '--repository-worker',str(bootstrap),arguments[1]],forward_fds=(bootstrap,int(arguments[1])),close_after_spawn=(bootstrap,))
+
+
+def _execute_repository(arguments):
+    value=_bootstrap(int(arguments[0]),'repository-execution');_parent_guard(value['parent'])
+    root=Path(value['root']);worker_admission=admit(value['target'],value['binding'],value['command'],root)
+    planner_root=root/'planner';planner_root.mkdir(mode=0o700)
+    planner_admission=admit(value['target'],value['binding'],value['command'],planner_root)
+    supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None
+    with RootRelay(planner_admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic()))) as planner:
+      with WorkerRelay(worker_admission,planner_relay=planner,value=value) as worker:
+        try:
+            configuration=worker.config_fd()
+            bootstrap=_sealed(dict(value,kind='repository-worker-supervisor',parent=os.getpid(),worker_receipt=str(supervisor_receipt)))
+            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--repository-worker-supervisor',str(bootstrap),str(configuration)],
+                pass_fds=(bootstrap,configuration),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            output,error=capture_command(child,value['deadline']);original_cargo_cleanup(supervisor_receipt)
+            worker.drain();planner.drain()
+            if worker.errors or planner.errors:raise FreshnessHold('input_census_unknown')
+            receipt={'version':1,'kind':'ci-repository-execution','binding':value['binding'],'command':value['command'],
+                'worker_units':worker.completed,'cargo_commands':worker.cargo_commands,'original_worker_cleanup':True,
+                'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+            print(json.dumps({'exit_code':child.returncode,'stdout':output.decode('utf-8','replace'),
+                'stderr':error.decode('utf-8','replace'),'repository_execution':receipt}))
+        finally:
+            try:
+                if child is not None and child.poll() is None:
+                    child.terminate()
+                    try:child.wait(timeout=6)
+                    except subprocess.TimeoutExpired:child.kill();child.wait(timeout=2);raise FreshnessHold('cleanup_uncertain') from None
+            finally:
+                legacy._close([] if bootstrap is None else [bootstrap]);legacy._close([] if configuration is None else [configuration])
+    return 0
+
+
+def _repository_execution_supervisor(arguments):
+    value=_bootstrap(int(arguments[0]),'repository-execution-supervisor');_parent_guard(value['parent'])
+    bootstrap=_sealed(dict(value,kind='repository-execution',parent=os.getpid()))
+    supervisor=_load('original_repository_execution_supervisor','provider-supervisor.py')
+    return supervisor.supervise(value['receipt'],[sys.executable,'-I',str(Path(__file__).resolve()),'--execute-repository',str(bootstrap)],
+        forward_fds=(bootstrap,),close_after_spawn=(bootstrap,))
+
+
 def _execution_supervisor(arguments):
     value=_bootstrap(int(arguments[0]),'execution-supervisor');_parent_guard(value['parent'])
     child=_sealed(dict(value,kind='execution',parent=os.getpid()))
     supervisor=_load('original_ci_cargo_supervisor','provider-supervisor.py')
     return supervisor.supervise(value['receipt'],[sys.executable,'-I',str(Path(__file__).resolve()),'--execute',str(child)],
         forward_fds=(child,),close_after_spawn=(child,))
+
+
+def validate_repository_execution(value,binding,command,workers,scope):
+    try:
+        keys={'version','kind','binding','command','worker_units','cargo_commands','original_worker_cleanup',
+            'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
+        if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
+                or value['kind']!='ci-repository-execution' or value['binding']!=binding or value['command']!=command
+                or value['original_worker_cleanup'] is not True
+                or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))
+                or value['guest_worker_quiescence']!=scope or scope not in workers['scopes']
+                or type(value['worker_units']) is not list or len(value['worker_units'])>4096
+                or type(value['cargo_commands']) is not list or len(value['cargo_commands'])>4096):raise ValueError()
+        units={};cargo=set()
+        for unit in value['worker_units']:
+            ordinal=unit['ordinal']
+            if (type(ordinal) is not int or not 0<=ordinal<4096 or ordinal in units
+                    or type(unit['uid']) is not int or unit['uid'] not in (1000,1001)
+                    or unit['started'] is not True or unit['cancelled'] is not False or unit['original_cleanup'] is not True
+                    or unit['shipping_authority'] is not False or unit['input_closure_complete'] is not False
+                    or type(unit['returncode']) is not int or not -64<=unit['returncode']<=255):raise ValueError()
+            units[ordinal]=unit
+        for command in value['cargo_commands']:
+            ordinal=command['ordinal'];unit=units[ordinal]
+            if (ordinal in cargo or unit['uid']!=1001 or command['cargo_exit']!=unit['returncode']
+                    or command['original_cargo_cleanup'] is not True or type(command['compiler_calls']) is not int
+                    or type(command['units']) is not list or not 0<=command['compiler_calls']<=len(command['units'])):raise ValueError()
+            cargo.add(ordinal)
+            for compiler in command['units']:
+                if (type(compiler['ordinal']) is not int or compiler['uid']!=2000+compiler['ordinal']
+                        or compiler['original_cleanup'] is not True or compiler['shipping_authority'] is not False
+                        or compiler['input_closure_complete'] is not False):raise ValueError()
+        if cargo!={ordinal for ordinal,unit in units.items() if unit['uid']==1001}:raise ValueError()
+        return value
+    except (ValueError,TypeError,KeyError):raise FreshnessHold('input_census_unknown') from None
 
 
 def validate_execution(value,binding,command,commands,workers,scope,exit_code):
@@ -2461,10 +2767,13 @@ def validate_cargo_probe(value):
 
 
 def validate_probe(value,binding,command,workers,writer,source_projection):
-    keys={'version','kind','binding','command','cases','units','guest_worker_quiescence','filesystem',
+    keys={'version','kind','binding','command','credential_roles','cases','units','guest_worker_quiescence','filesystem',
         'input_closure_complete','cargo_metadata_isolation_established','shipping_authority','kernel_observation'}
     if (type(value) is not dict or set(value) not in (keys,keys|{'cargo'}) or type(value['version']) is not int or value['version']!=3
             or value['kind']!='ci-planner-protocol-probe' or value['binding']!=binding or value['command']!=command
+            or type(value['credential_roles']) is not dict
+            or set(value['credential_roles'])!={'worker_rejects_planner','planner_rejects_worker'}
+            or any(result is not True for result in value['credential_roles'].values())
             or value['input_closure_complete'] is not False or value['cargo_metadata_isolation_established'] is not False
             or value['shipping_authority'] is not False or type(value['cases']) is not list or len(value['cases'])!=5
             or type(value['units']) is not list or len(value['units'])!=5):raise FreshnessHold('input_census_unknown')
@@ -2517,6 +2826,11 @@ if __name__=='__main__':
         elif sys.argv[1:2]==['--cargo-supervisor']:result=_cargo_supervisor(sys.argv[2:])
         elif sys.argv[1:2]==['--execute']:result=_execute(sys.argv[2:])
         elif sys.argv[1:2]==['--execution-supervisor']:result=_execution_supervisor(sys.argv[2:])
+        elif sys.argv[1:2]==['--repository-worker']:result=_repository_worker(sys.argv[2:])
+        elif sys.argv[1:2]==['--repository-worker-supervisor']:result=_repository_worker_supervisor(sys.argv[2:])
+        elif sys.argv[1:2]==['--execute-repository']:result=_execute_repository(sys.argv[2:])
+        elif sys.argv[1:2]==['--repository-execution-supervisor']:result=_repository_execution_supervisor(sys.argv[2:])
+        elif sys.argv[1:2]==['--credential-client']:result=_credential_client(sys.argv[2:])
         elif sys.argv[1:2]==['--probe']:result=_probe(sys.argv[2:])
         elif sys.argv[1:2]==['--probe-supervisor']:result=_probe_supervisor(sys.argv[2:])
         else:raise FreshnessHold('invalidation_unsafe')

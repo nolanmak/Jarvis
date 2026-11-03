@@ -1321,3 +1321,30 @@ CI tests passed without skips**, and **31 focused Rust tests passed** with 16
 opt-in cases excluded. The structured adapter and compatibility VM cases were
 then explicitly executed. This does not prove the original in-command harness,
 persistent reuse or complete input/CI authority. No restoration is deployed.
+
+Repository-command routing now has a distinct sealed worker role (`JARVWRK3`,
+UID/GID 1000), separate from the planner role (`JARVCFG3`, UID/GID 1001). Root
+still owns both descriptors and authenticates the listener peer. Worker children
+retain their worker credential and execution guard. Only pinned Cargo requests
+enter the existing protected planner namespace; their exact original request,
+stdin and descriptor mapping remain staged under the original supervisor.
+Terminal Cargo evidence is completed and its slot released before replying, so
+an immediately following unchanged command cannot race the prior slot cleanup.
+
+This path is exposed through the actual repository adapter behind an internal
+test-session switch. It remains disabled in production. The currently admitted
+worker runtimes are pinned shell/Python executables from read-only runtime
+mounts, with a supported ELF interpreter. Static/opaque executables and loader
+redirects hold rather than running without the preload's kernel guard. Worker
+namespace changes also hold. The private protocol replay now additionally
+requires both crossed worker/planner descriptor roles to exit before reaching
+main. Native validation of these changes is pending.
+
+The new repository VM test exercises Python spawning Cargo three times. It
+requires a real first compilation despite forged worker-owned fingerprints,
+zero compiler calls for the unchanged build, and a real test compilation/run.
+It also attempts direct exec syscalls and traversal into planner metadata.
+These assertions do not replace the unchanged original in-command publication
+regression. Persistent predecessor recovery, frozen generated forests, the opaque
+counter-wrapper graph, broader tools and complete input/CI authority remain
+unfinished; repository reentry with a predecessor is still explicitly held.

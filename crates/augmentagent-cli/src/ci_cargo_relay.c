@@ -149,13 +149,6 @@ static const char *environment_value(const char *name) {
 __attribute__((constructor)) static void initialize_relay(void) {
     const char *value = environment_value("JARVIS_CARGO_RELAY_FD");
     if (geteuid() == 0 || getuid() != geteuid() || !value || !*value) _exit(125);
-#ifdef JARVIS_CARGO_PROTOCOL_V3
-    uid_t real_uid,effective_uid,saved_uid;
-    gid_t real_gid,effective_gid,saved_gid;
-    if (getresuid(&real_uid,&effective_uid,&saved_uid) || getresgid(&real_gid,&effective_gid,&saved_gid)
-        || real_uid!=1001 || effective_uid!=1001 || saved_uid!=1001
-        || real_gid!=1001 || effective_gid!=1001 || saved_gid!=1001 || getgroups(0,NULL)!=0) _exit(125);
-#endif
     unsigned long number = 0;
     for (const char *digit = value; *digit; ++digit) {
         if (*digit < '0' || *digit > '9' || number > 6553) _exit(125);
@@ -169,13 +162,22 @@ __attribute__((constructor)) static void initialize_relay(void) {
         || seals < 0 || (seals & SEALS) != SEALS
         || pread(fd, &config, sizeof(config), 0) != sizeof(config)) _exit(125);
     close(fd);
-    if (memcmp(config.magic, CONFIG_MAGIC, 8)
 #ifdef JARVIS_CARGO_PROTOCOL_V3
+    /* Root grants distinct worker/planner roles. A worker descriptor never
+     * admits planner credentials, and vice versa. The server peer stays root. */
+    int worker = memcmp(config.magic, "JARVWRK3", 8) == 0;
+    uid_t expected = worker ? 1000 : 1001;
+    uid_t real_uid,effective_uid,saved_uid;
+    gid_t real_gid,effective_gid,saved_gid;
+    if ((!worker && memcmp(config.magic, CONFIG_MAGIC, 8))
         || config.uid!=0 || info.st_uid!=0
+        || getresuid(&real_uid,&effective_uid,&saved_uid) || getresgid(&real_gid,&effective_gid,&saved_gid)
+        || real_uid!=expected || effective_uid!=expected || saved_uid!=expected
+        || real_gid!=expected || effective_gid!=expected || saved_gid!=expected || getgroups(0,NULL)!=0) _exit(125);
 #else
-        || config.uid != geteuid()
+    if (memcmp(config.magic, CONFIG_MAGIC, 8) || config.uid != geteuid()) _exit(125);
 #endif
-        || config.pid == 0 || config.pid > INT_MAX || config.timeout_ms < 1000
+    if (config.pid == 0 || config.pid > INT_MAX || config.timeout_ms < 1000
         || config.timeout_ms > MAX_TIMEOUT_MS || config.path[0] != '/'
         || !memchr(config.path, 0, sizeof(config.path))) _exit(125);
     if (jarvis_ci_deny_exec() != 0) _exit(125);

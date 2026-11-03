@@ -67,6 +67,38 @@ class AdapterTests(unittest.TestCase):
       self.assertEqual((result['exit_code'],result['stdout'],result['stderr']),(101,'original failure','original Cargo stderr'))
       self.assertFalse(result['cargo_execution']['shipping_authority'])
 
+ def test_repository_entry_refuses_mixed_roles_and_predecessor_without_recovery(self):
+  with tempfile.TemporaryDirectory() as directory:
+   request=self.fixture(Path(directory))
+   for change in ({'protected_repository':True},{'protected_repository':1},
+    {'protected_repository':True,'operation':'repository','command':'true','predecessor':str(uuid.uuid4())},
+    {'protected_repository':True,'operation':'repository','command':'true','planner_protocol_probe':True}):
+    with self.subTest(change=change),patch.object(vm.Runtime,'load') as load:
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|change)
+     load.assert_not_called()
+
+ def test_repository_entry_preserves_original_shell_and_requires_its_own_worker_scope(self):
+  for borrowed in (False,True):
+   with self.subTest(borrowed=borrowed),tempfile.TemporaryDirectory() as directory:
+    root=Path(directory);request=self.fixture(root)
+    request.update(operation='repository',command='python3 -I repository_driver.py',protected_repository=True,build_cache=str(root/'cache'))
+    def execute(runtime,workspace,command,environment,**options):
+     self.assertEqual(command,['/bin/bash','--noprofile','--norc','-o','pipefail','-c',request['command']])
+     self.assertTrue(options['ci_context']['repository_execution'])
+     result=self.prepared_result(options,exit_code=0,stdout='original nested stdout',stderr='')
+     generation=options['ci_context']['generation']
+     result['repository_execution']={'version':1,'kind':'ci-repository-execution','binding':generation['binding'],
+      'command':generation['command'],'worker_units':[],'cargo_commands':[],'original_worker_cleanup':True,
+      'input_closure_complete':False,'full_ci':False,'shipping_authority':False,
+      'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
+     return result
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'private_bytes',side_effect=lambda path:
+      b'measured program' if Path(path).name=='ci-cargo-planner.so' else Path(path).read_bytes()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+     if borrowed:
+      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+     else:self.assertEqual(adapter.execute(request,run=execute)['stdout'],'original nested stdout')
+
  def test_source_projection_requires_current_binding_roles_and_independent_worker_cleanup(self):
   for fault in ('missing','version','binding','command','owner','manifest','flags','missing-role','wrong-role','duplicate-probe','borrowed-worker','foreign-scope'):
    with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:

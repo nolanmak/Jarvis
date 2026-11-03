@@ -181,7 +181,7 @@ def execute(request,run=vm.run,progress=None):
     progress["stage"]="request_schema"
     required={'version','operation','runtime_config','workspace','state','git_objects','runner','contract','head','base','storage','scratch','build_cache',
               'source_generation','command_id','predecessor','tree','controller_authority_sha256','retained_generations','retained_producers','producer_retirements'}
-    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency','planner_protocol_probe','protected_cargo'}
+    optional={'id','changed_files','cache_bytes','packages','filters','command','dependency','planner_protocol_probe','protected_cargo','protected_repository'}
     if set(request)-required-optional or not required<=set(request) or request['version']!=2 or request['operation'] not in ('plan','step','targeted','baseline','repository','dependency'):raise vm.Unavailable('invalid CI VM request')
     if (type(request.get('planner_protocol_probe',False)) is not bool
             or request.get('planner_protocol_probe') and request['operation']!='repository'):
@@ -191,6 +191,10 @@ def execute(request,run=vm.run,progress=None):
             or request.get('planner_protocol_probe') or request['predecessor'] is not None)):
         # Existing executor state must be recovered/revalidated, never silently
         # replaced with another cold target to bypass missing reuse evidence.
+        raise cache_generation.FreshnessHold('input_census_unknown')
+    repository=request.get('protected_repository',False)
+    if (type(repository) is not bool or repository and (request['operation']!='repository'
+            or request.get('planner_protocol_probe') or protected or request['predecessor'] is not None)):
         raise cache_generation.FreshnessHold('input_census_unknown')
     dependency=dependency_action(request)
     if not cache_generation._uuid(request['source_generation']) or not cache_generation._uuid(request['command_id']) or (request['predecessor'] is not None and not cache_generation._uuid(request['predecessor'])):raise cache_generation.FreshnessHold('generation_mismatch')
@@ -302,11 +306,12 @@ def execute(request,run=vm.run,progress=None):
                             'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency}
     probe=request.get('planner_protocol_probe',False)
     if type(probe) is not bool or probe and request['operation']!='repository':raise cache_generation.FreshnessHold('invalidation_unsafe')
-    if probe or protected:
+    if probe or protected or repository:
         context.update(planner_programs={name:private_bytes(BASE/name) for name in (
             'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so')})
     if probe:context['planner_protocol_probe']=True
     if protected:context['cargo_execution']=cargo_commands(cargo)
+    if repository:context['repository_execution']=True
     outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
                 ci_context=context)
     progress['stage']='receipt_validate'
@@ -353,6 +358,12 @@ def execute(request,run=vm.run,progress=None):
         try:result['cargo_execution']=planner.validate_execution(outcome.get('cargo_execution'),
             generation['binding'],generation['command'],cargo_commands(cargo),guest_workers,
             observed_inputs['guest_worker_quiescence'],result['exit_code'])
+        except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
+    if repository:
+        spec=importlib.util.spec_from_file_location('observed_repository_execution',BASE/'ci-cargo-planner.py')
+        planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
+        try:result['repository_execution']=planner.validate_repository_execution(outcome.get('repository_execution'),
+            generation['binding'],generation['command'],guest_workers,observed_inputs['guest_worker_quiescence'])
         except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
     if dependency is not None:
         observed=outcome.get('dependency_result')

@@ -120,7 +120,7 @@ _CONTROLLER_TOKEN=object()
 
 class _ControllerScope(WorkerScope):
     def __init__(self,token,control,configuration,kind):
-        if kind not in ('probe','execution') or token is not _CONTROLLER_TOKEN or os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):
+        if kind not in ('probe','execution','repository-execution') or token is not _CONTROLLER_TOKEN or os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):
             raise FreshnessHold('invalidation_unsafe')
         control=Path(control);info=control.lstat()
         if control.resolve()!=control or not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode&0o077:
@@ -156,3 +156,7 @@ def controller_probe_scope(control,configuration):
 def controller_execution_scope(control,configuration):
     """Pinned Cargo executor only; the root helper never execs candidate argv."""
     return _ControllerScope(_CONTROLLER_TOKEN,control,configuration,'execution')
+
+
+def controller_repository_scope(control,configuration):
+    return _ControllerScope(_CONTROLLER_TOKEN,control,configuration,'repository-execution')
