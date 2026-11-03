@@ -1461,3 +1461,12 @@ tests passed** with 18 opt-in cases excluded; this new VM case was explicitly
 executed. The original in-command counter/publication harness remains unchanged
 and unfinished. Complete input closure, opaque wrapper execution, passing-CI
 proof and merge enforcement still gate production activation.
+
+Compatibility at the same executable source also passed: the publication/retry
+replay completed in **111.84 seconds**, retaining original credential-role,
+stdio, cleanup, compiler `[3,0]`, build-script `[1,0]`, actual E0761/Cargo101,
+immutable-history and sixteen-program/link zero-miss criteria. The structured
+success/failing-test replay completed in **192.13 seconds**. Both cases retained
+compiler counts `[2,1]`, original build/test argv and original test output; their
+actual test Cargo exits were 0 and 101 respectively. These are component
+execution/recovery checks, not completed full CI or an autonomous merge.
