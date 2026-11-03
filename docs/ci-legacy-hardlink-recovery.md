@@ -110,6 +110,14 @@ controller still reconcile all recognized pending formats before workers start;
 the option is not an old-reader emulation or permission to ignore pending state.
 
 D6. Commit root-private intent and fsync its namespace ancestors before any move.
+An abrupt process stop before publishing `receipt.json` cannot authorize source
+mutation. Reconcile only an empty allocation or one regular, controller-owned,
+single-link mode-0600 `.preparing-[a-z0-9_]{8}` atomic-writer temporary file,
+bounded by 1 MiB with no xattrs, inside the original mode-0700 controller-private
+allocation. Validate the whole envelope before unlinking it and fsync its parent.
+Unknown files, links, unsafe metadata, more than one temporary file, or a private
+`data` directory without published intent retain the admission hold. The same
+validated temporary-file cleanup may precede replay of an existing valid intent.
 The original session is moved into the existing controller-private `data` path.
 Before mutation, validate the original root/chain, source-versus-data exclusivity,
 all remaining file identities and all remaining linked files' recorded endpoints.
@@ -168,12 +176,28 @@ C/R own that sufficiency gate; it becomes executable when the required C produce
 and plan are supported. Until then retain the explicit blocking open thread.
 Report exact observations; do not infer that the application builds, that third-party seeds
 are trusted, or that legacy compiled artifacts can certify current CI.
+The protected inventory uses the existing preview helper's exact fields: encoded
+literal path, inode, mode, UID/GID and xattrs for each included object; regular
+files additionally include link count, size, mtime/ctime nanoseconds and content
+SHA-256, while symlinks include their literal target bytes. Access time is excluded
+from this comparison (inventory reads still use `O_NOATIME`). Directory times and
+link counts are excluded because namespace removal changes them legitimately.
+Only `target/debug/incremental`, `target/release/incremental` and
+`ci-legacy-incremental-retirements` are excluded subtrees. This byte/metadata
+preservation diagnostic cannot certify application input closure or reuse.
 
 D10. Production activation remains gated by the original protected maintenance
 rollout, independent review and old-executor census/drain, matched deployed builds,
 source/provenance proof and merge enforcement. The cleanup controller alone does
 not fence every possible old executable. Pending records must be settled before
 any new worker starts; unknown old writers keep admission fenced.
+Replay may settle at most 32 sessions per command. If any additional recognized
+pending intent remains after that budget, raise the existing cleanup hold rather
+than return ordinary success and launch workers. Completed records remain durable
+cleanup history even when this command cannot return a successful ID reply. The
+existing infrastructure-retry path, after verified command teardown, drains the
+remaining work under a new original admission without model repair or accounting
+reset. A reply's bounded IDs never stand for uncompleted sessions.
 
 ## TDD build order and testable exits
 
@@ -209,3 +233,14 @@ foreign aliases and over-bound closures remain retained until a separately
 reviewed extension can handle them; their carrying cost is explicit lost capacity,
 not an implicit authorization to prune. Final C API/audit and M/rollout ownership
 remain as defined by #1807 and are not discharged by this amendment.
+
+R also owns the still-open retained-scope reporting handoff (S26/S46). Before
+production activation, define and carry bounded inspected/retained counts,
+categorized exclusions and reached bounds through the trusted command/audit
+result, with the original command/base binding. Current ID-only acknowledgements
+and available-byte observations do not provide that diagnostic. A capacity
+rehearsal with low gain or a reached bound triggers this work; until its consumer
+is implemented, use a separately admitted read-only R diagnostic and keep the
+reporting/activation gate open. Do not infer retained scope from logical bytes or
+retirement count. This open thread blocks production handoff, not opt-in mechanism
+testing.

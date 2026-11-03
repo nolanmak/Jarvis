@@ -1350,7 +1350,8 @@ impl Session {
             "storage":{"fd":first.as_raw_fd(),"fds":files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
                 "path":lock,"device":info.dev(),"inode":info.ino(),
                 "floor_bytes":(crate::disk::gate_min_free_gb()*1024.0_f64.powi(3)) as u64}});
-        let request=bundle.join("legacy-recovery-preview-request.json");let result=bundle.join("legacy-recovery-preview-result.json");
+        let request=bundle.join(format!("legacy-recovery-preview-{command_id}-request.json"));
+        let result=bundle.join(format!("legacy-recovery-preview-{command_id}-result.json"));
         private_write(&request,&serde_json::to_vec(&specification)?)?;
         let mut command=Command::new("/usr/bin/python3");
         command.arg("-I").arg(bundle.join("ci-legacy-recovery-preview.py")).arg(&request).arg(&result)

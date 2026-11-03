@@ -1268,6 +1268,34 @@ def _reclaim_closed_legacy_unit(cache,unit,sessions,binding,command,worker,root_
     return reclaimed
 
 
+def _legacy_settle_envelope(allocation,*,unpublished=False):
+    """Only the trusted atomic writer can populate these root-private files."""
+    import itertools
+    _directory(allocation,0o700,create=False)
+    info=allocation.lstat()
+    if stat.S_IMODE(info.st_mode)!=0o700 or os.listxattr(allocation,follow_symlinks=False):
+        raise FreshnessHold('cleanup_uncertain')
+    children=list(itertools.islice(allocation.iterdir(),4));temporary=[]
+    if len(children)>3:raise FreshnessHold('cleanup_uncertain')
+    for child in children:
+        if child.name in ('receipt.json','data'):
+            if unpublished:raise FreshnessHold('cleanup_uncertain')
+            continue
+        value=child.lstat()
+        if (re.fullmatch(r'\.preparing-[a-z0-9_]{8}',child.name) is None or temporary
+                or not stat.S_ISREG(value.st_mode) or value.st_uid!=os.geteuid()
+                or value.st_dev!=info.st_dev or value.st_nlink!=1 or stat.S_IMODE(value.st_mode)!=0o600
+                or value.st_size>_LEGACY_MAX_RECORD or os.listxattr(child,follow_symlinks=False)):
+            raise FreshnessHold('cleanup_uncertain')
+        temporary.append(child)
+    for child in temporary:child.unlink()
+    if unpublished:allocation.rmdir()
+    directory=allocation.parent if unpublished else allocation
+    fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+
+
 def reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,limit=32,allow_closed_links=False):
     """Retire recognized derived sessions under original exclusive admission.
 
@@ -1291,23 +1319,28 @@ def reclaim_legacy_incremental(cache,binding,command,worker_uid,worker_gid,*,lim
         if stat.S_IMODE(retired.stat().st_mode)!=0o700:raise FreshnessHold('cleanup_uncertain')
         allocations=list(itertools.islice(retired.iterdir(),_LEGACY_MAX_RETIREMENTS+1))
         if len(allocations)>_LEGACY_MAX_RETIREMENTS:raise FreshnessHold('cleanup_uncertain')
-        for allocation in sorted(allocations):
+        for ordinal,allocation in enumerate(sorted(allocations)):
             if not _uuid(allocation.name):raise FreshnessHold('cleanup_uncertain')
             _directory(allocation,0o700,create=False)
             try:record=_read_record(allocation/'receipt.json',max_bytes=_LEGACY_MAX_RECORD)
             except FreshnessHold as error:
-                if error.reason!='metadata_missing' or any(allocation.iterdir()):raise
-                # An empty controller-private envelope can remain if ENOSPC
-                # interrupted the initial intent write. No source was moved.
-                allocation.rmdir()
-                fd=os.open(retired,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
-                try:os.fsync(fd)
-                finally:os.close(fd)
+                if error.reason!='metadata_missing':raise
+                # No published intent means source mutation was never authorized.
+                # Recognize only the bounded private atomic-writer crash window.
+                _legacy_settle_envelope(allocation,unpublished=True)
                 continue
             record=_validate_legacy_retirement(record,binding)
+            _legacy_settle_envelope(allocation)
             if record['state']=='retiring':
                 _finish_legacy_retirement(cache,allocation,record);reclaimed.append(allocation.name)
-                if len(reclaimed)>=limit:return reclaimed
+                if len(reclaimed)>=limit:
+                    for pending in sorted(allocations)[ordinal+1:]:
+                        if not _uuid(pending.name):raise FreshnessHold('cleanup_uncertain')
+                        _directory(pending,0o700,create=False)
+                        later=_validate_legacy_retirement(_read_record(pending/'receipt.json',max_bytes=_LEGACY_MAX_RECORD),binding)
+                        _legacy_settle_envelope(pending)
+                        if later['state']=='retiring':raise FreshnessHold('cleanup_uncertain')
+                    return reclaimed
     else:allocations=[]
     target=cache/'target'
     if not target.exists() and not target.is_symlink():return reclaimed

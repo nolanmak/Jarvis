@@ -196,6 +196,40 @@ class LegacyIncrementalTests(unittest.TestCase):
         self.assertEqual(self.reclaim(allow_closed_links=True),[])
         self.assertTrue(self.session.exists());self.assertTrue(peer.exists())
 
+    def test_abrupt_stop_before_intent_publication_recovers_only_private_temporary_file(self):
+        pid=os.fork()
+        if pid==0:
+            with patch.object(cache.os,'replace',side_effect=lambda *a,**kw:os._exit(77)):
+                self.reclaim(allow_closed_links=True)
+            os._exit(78)
+        _,status=os.waitpid(pid,0);self.assertEqual(os.waitstatus_to_exitcode(status),77)
+        allocation=next((self.root/'ci-legacy-incremental-retirements').iterdir())
+        self.assertFalse((allocation/'receipt.json').exists())
+        self.assertEqual(len(list(allocation.glob('.preparing-*'))),1)
+        self.assertTrue(self.session.exists())
+        self.assertEqual(len(self.reclaim(allow_closed_links=True)),1)
+
+    def test_more_pending_records_than_ack_budget_keep_worker_admission_fenced(self):
+        with patch.object(cache.os,'rename',side_effect=OSError(errno.EIO,'stop before move')):
+            with self.assertRaises(cache.FreshnessHold):self.reclaim()
+        receipt=next((self.root/'ci-legacy-incremental-retirements').glob('*/receipt.json'))
+        template=json.loads(receipt.read_text())
+        for index in range(32):
+            session=self.unit/('s-abcdef-p'+str(index)+'-0123456789');session.mkdir(mode=0o755)
+            (self.unit/('s-abcdef-p'+str(index)+'.lock')).touch(mode=0o600)
+            (session/'dep-graph.bin').write_bytes(b'pending incremental')
+            (session/'dep-graph.bin').chmod(0o644)
+            value=copy.deepcopy(template);value['relative']=str(session.relative_to(self.root))
+            value['session']=cache._legacy_identity(session.stat())
+            value['files']=cache._legacy_files(session,[os.getuid(),os.getgid()],self.root.stat().st_dev)
+            value['bytes']=sum(row[7] for row in value['files'])
+            allocation=receipt.parent.parent/str(uuid.uuid4());allocation.mkdir(mode=0o700)
+            cache._write_record(allocation/'receipt.json',value)
+        with self.assertRaises(cache.FreshnessHold):self.reclaim()
+        pending=[p for p in receipt.parent.parent.glob('*/receipt.json') if json.loads(p.read_text())['state']=='retiring']
+        self.assertEqual(len(pending),1)
+        self.assertEqual(len(self.reclaim()),1)
+
     def test_retires_only_recognized_unlocked_sessions_and_preserves_compiled_units(self):
         self.assertEqual(len(self.reclaim()),1)
         self.assertFalse(self.session.exists());self.assertTrue(self.lock.exists())

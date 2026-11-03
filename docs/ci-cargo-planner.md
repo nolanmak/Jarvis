@@ -1891,3 +1891,28 @@ capacity, and a larger final capacity with closed-link cleanup. Neither command
 runs application CI or grants reuse/merge authority. The proposed contract is
 [ci-legacy-hardlink-recovery.md](ci-legacy-hardlink-recovery.md); its independent
 review is incomplete and production activation remains gated.
+
+The first same-base comparison completed its strict reference in the real VM
+but the second diagnostic command hit `EEXIST` before launch: a Session reused
+fixed private request/result names. They now include the original command UUID.
+The successful reference again retired four sessions, increasing available
+bytes from 20,713,472 to 53,362,688; its base was unchanged. No closed-link native
+capacity result was produced by that attempt.
+
+Fault validation now covers an abrupt process exit inside the atomic writer,
+before `receipt.json` publication. Only a bounded, correctly owned mode-0600
+single-link writer temporary in the protected mode-0700 envelope is discarded;
+unknown data remains held. An allowed-format synthetic backlog of 33 pending
+intents now fences worker launch after the 32-session replay budget; a later
+admission can finish the remaining intent. This is a format-safety regression,
+not evidence that production naturally accumulated that backlog. These two
+regressions fail against `e30b69a8` and pass after the changes. Routine validation
+now passes **361 Python tests without skips and 31 focused managed Rust tests**
+(20 native cases excluded). The native comparison requires a rerun.
+
+All 57 mapped amendment seams were checked with fresh leaf reviewers. Findings
+at six seams produced exact compact-hash/count definitions, private-writer crash
+recovery, bounded pending-drain fencing and precise inventory field/exclusion
+definitions. The two retained-scope reporting findings remain one explicit
+R-owned blocking handoff; the ID-only normal result does not yet explain skipped
+scopes/bounds. No production activation or completed final C audit is claimed.
