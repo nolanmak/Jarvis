@@ -915,6 +915,7 @@ class ExecutionLease:
         return {'command':command,'store_sha256':PublicationStore.checkpoint(root/'publications',binding=binding,command=command),
             'planner':planner_snapshot(root/'planner-target',owner=1001),'home':planner_snapshot(root/'home',owner=1001),
             'cargo_home':planner_snapshot(root/'cargo-home',owner=1001),
+            'input_observations':planner_snapshot(root/'input-observations',owner=os.geteuid()),
             'commands':[planner_snapshot(path,owner=os.geteuid()) for path in commands],
             'forests':cache._read_record(root/'input-forests.json')['forests'],
             'outputs':cache._read_record(root/'input-forests.json')['outputs']}
@@ -1530,7 +1531,7 @@ class WorkerRelay(RootRelay):
     def __init__(self,admission,*,planner_relay,value):
         super().__init__(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline'])
         self.peer_uid=1000;self.config_magic=b'JARVWRK3';self.require_message_credentials=True;self.planner_relay=planner_relay
-        self.value=value;self.executor=None;self.cargo_lock=threading.Lock();self.cargo_owner=None;self.cargo_commands=[]
+        self.value=value;self.executor=None;self.cargo_lock=threading.Lock();self.cargo_owner=None;self.cargo_commands=[];self.metadata_units=[]
 
     def __enter__(self):
         super().__enter__()
@@ -1594,9 +1595,11 @@ class WorkerRelay(RootRelay):
         if self.executor is None:
             self.executor=_CargoExecutor(self.planner_relay.admission,execution_lease=self.value.get('execution_lease'),generated_outputs=self.value.get('generated_outputs'));self.planner_relay.views=self.executor
             self.executor.preparing_graph=True
+            metadata_start=len(self.planner_relay.completed)
             try:status,metadata,error=self.executor._command(dict(self.value,original_invocation=invocation),
                 self.planner_relay,operation='metadata')
             finally:self.executor.preparing_graph=False
+            self.metadata_units=list(self.planner_relay.completed[metadata_start:])
             if status!=0:raise cargo_hold('planner_cargo_request')
             self.executor.graph=CargoGraph(self.executor.source,metadata,owner=0)
         self.executor.graph._verify()
@@ -1923,6 +1926,104 @@ def capture_command(child,deadline,*,limit=8*1024**2):
     return bytes(output['stdout']),bytes(output['stderr'])
 
 
+class CommandObservation:
+    """Original-unit kernel facts for later selectors, never complete inputs."""
+    def __init__(self,admission,deadline):
+        self.admission=admission;self.observer=kernel_observer.Observer(admission,deadline=deadline,path_scope='all')
+
+    def __enter__(self):
+        try:self.observer.__enter__();return self
+        except (kernel_observer.ObservationUnavailable,OSError) as error:
+            raise FreshnessHold('input_census_unknown',b'original kernel collector startup failed') from error
+
+    def __exit__(self,*arguments):
+        try:self.observer.__exit__(*arguments)
+        except (kernel_observer.ObservationUnavailable,OSError) as error:
+            raise FreshnessHold('cleanup_uncertain',b'original kernel collector cleanup failed') from error
+
+    def finish(self,executor):
+        try:events,directories,metadata,census=self.observer.capture()
+        except (kernel_observer.ObservationUnavailable,OSError) as error:
+            raise FreshnessHold('input_census_unknown',b'original kernel capture incomplete') from error
+        units=[];scopes=[];known=set()
+        for ordinal,item in sorted(({} if executor is None else executor.units).items()):
+            if not item['finished']:raise FreshnessHold('cleanup_uncertain')
+            pid=item['pid'];uid=2000+ordinal;known.add(uid)
+            queries=[event for event in events if event['uid']==uid]
+            reads=[event for event in directories if event['uid']==uid]
+            stats=[event for event in metadata if event['uid']==uid]
+            mapping=item['mapping'];source=mapping.get('source');observed=False
+            if mapping['kind']=='compile':
+                names={os.fsencode(source),os.fsencode(source).removeprefix(b'/workspace/')}
+                observed=any(event['pid']==pid and event['syscall'] in (2,257,439) and event['result']>=0 and event['path'] in names for event in queries)
+                if not observed:raise FreshnessHold('input_census_unknown',b'original compiler source open absent')
+            units.append({'ordinal':ordinal,'pid':pid,'uid':uid,'kind':mapping['kind'],
+                'queries':len(queries),'directory_reads':len(reads),'metadata_queries':len(stats),
+                'source_open_observed':observed})
+            scopes.append({'ordinal':ordinal,'pid':pid,'uid':uid,'mapping':{key:mapping[key] for key in ('kind','role','source','fingerprint','request_sha256','dependencies','generated_root') if key in mapping},
+                'scope_evidence':item['scope_evidence'],'namespaces':item['namespaces'],'root_identity':item['root_identity'],'returncode':item['returncode']})
+        if any(event['uid']!=1999 and event['uid'] not in known
+                for event in [*events,*directories,*metadata]):
+            raise FreshnessHold('input_census_unknown',b'kernel event outside original unit scopes')
+        directory=self.observer.root if executor is None else executor.root/'input-observations'
+        record={'version':1,'kind':'ci-command-kernel-record','binding':self.admission.binding,
+            'command':self.admission.command,'path_scope':'all','scopes':lookup_inputs._wire(scopes),
+            'events':lookup_inputs._wire(events),'directories':lookup_inputs._wire(directories),
+            'metadata':lookup_inputs._wire(metadata),'probe_census':census,
+            'program_sha256':hashlib.sha256(self.observer.program.encode()).hexdigest(),
+            'binary_sha256':self.observer.binary_sha256,'original_observer_cleanup':True,
+            'input_closure_complete':False,'shipping_authority':False}
+        encoded=json.dumps(record,sort_keys=True,separators=(',',':')).encode()
+        if len(encoded)>16*1024**2:raise FreshnessHold('input_census_unknown')
+        path=directory/(self.admission.command+'.json')
+        if path.exists() or path.is_symlink():raise FreshnessHold('artifact_provenance_unknown')
+        cache._write_record(path,record)
+        return {'version':1,'kind':'ci-command-kernel-observation','binding':self.admission.binding,
+            'command':self.admission.command,'record_sha256':hashlib.sha256(encoded).hexdigest(),
+            'program_sha256':record['program_sha256'],'binary_sha256':record['binary_sha256'],
+            'probe_census':census,'units':units,'original_observer_cleanup':True,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+
+
+def original_unit_ordinals(units):
+    if type(units) is not list or len(units)>4096:raise FreshnessHold('input_census_unknown')
+    seen=set()
+    for unit in units:
+        if (type(unit) is not dict or type(unit.get('ordinal')) is not int or not 0<=unit['ordinal']<4096
+                or unit['ordinal'] in seen or unit.get('uid')!=2000+unit['ordinal']
+                or unit.get('started') is not True or unit.get('cancelled') is not False
+                or unit.get('original_cleanup') is not True or unit.get('input_closure_complete') is not False
+                or unit.get('shipping_authority') is not False):raise FreshnessHold('input_census_unknown')
+        seen.add(unit['ordinal'])
+    return seen
+
+
+def validate_command_observation(value,binding,command,ordinals):
+    try:
+        if (type(value) is not dict or set(value)!={'version','kind','binding','command','record_sha256',
+                'program_sha256','binary_sha256','probe_census','units','original_observer_cleanup',
+                'input_closure_complete','full_ci','shipping_authority'}
+                or type(value['version']) is not int or value['version']!=1
+                or value['kind']!='ci-command-kernel-observation' or value['binding']!=binding or value['command']!=command
+                or any(not cache._digest(value[key]) for key in ('record_sha256','program_sha256','binary_sha256'))
+                or value['original_observer_cleanup'] is not True or type(value['units']) is not list or len(value['units'])>4096
+                or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))):raise ValueError()
+        kernel_observer.validate_census(value['probe_census']);seen=set()
+        for unit in value['units']:
+            if (type(unit) is not dict or set(unit)!={'ordinal','pid','uid','kind','queries','directory_reads','metadata_queries','source_open_observed'}
+                    or type(unit['ordinal']) is not int or unit['ordinal'] not in ordinals or unit['ordinal'] in seen
+                    or type(unit['pid']) is not int or not 0<unit['pid']<2**31 or unit['uid']!=2000+unit['ordinal']
+                    or unit['kind'] not in ('compile','build_script','application','information')
+                    or any(type(unit[key]) is not int or not 0<=unit[key]<=40000 for key in ('queries','directory_reads','metadata_queries'))
+                    or type(unit['source_open_observed']) is not bool
+                    or unit['kind']=='compile' and not unit['source_open_observed']):raise ValueError()
+            seen.add(unit['ordinal'])
+        if seen!=ordinals:raise ValueError()
+        return value
+    except (ValueError,TypeError,KeyError,kernel_observer.ObservationUnavailable):
+        raise FreshnessHold('input_census_unknown') from None
+
+
 class _CargoExecutor:
     """Graph-backed execution; incomplete input closure grants no reuse/CI proof."""
     def __init__(self,admission,*,diagnostic=False,execution_lease=None,generated_outputs=None):
@@ -1949,6 +2050,7 @@ class _CargoExecutor:
             for name in ('planner-target','home','cargo-home'):
                 path=self.root/name;path.mkdir(mode=0o700);os.chown(path,1001,1001)
             self.next_command=0
+            (self.root/'input-observations').mkdir(mode=0o700)
             if lease is not None:lease.created(self.root)
         else:
             if diagnostic:raise FreshnessHold('invalidation_unsafe')
@@ -2138,8 +2240,13 @@ class _CargoExecutor:
             raise FreshnessHold('invalidation_unsafe')
         pid=observed.get('pid')
         if type(pid) is not int or pid<=0:raise FreshnessHold('cleanup_uncertain')
+        status=cache._read_record(directory/'exit-status.json')
+        if status!={'version':3,'binding':self.admission.binding,'command':self.admission.command,
+                'ordinal':ordinal,'returncode':raw,'exec_observed':True}:raise FreshnessHold('cleanup_uncertain')
+        original_cargo_cleanup(directory/'cleanup')
         record.update(finished=True,namespaces=observed['namespaces'],pid=pid,
-            root_identity=observed['root_identity'],returncode=raw)
+            root_identity=observed['root_identity'],returncode=raw,
+            scope_evidence={'status':status,'cleanup_sha256':ExecutionLease.cleanup_digest()})
         if raw!=0:
             self._failed(mapping,raw)
             return
@@ -2939,7 +3046,7 @@ def _execute(arguments):
     for argv in commands:validate_invocation(argv,environment,cwd)
     admission=admit(value['target'],value['binding'],value['command'],value['root'])
     outputs=[];errors=[];receipts=[];exit_code=0
-    with RootRelay(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic()))) as relay:
+    with CommandObservation(admission,value['deadline']) as observation, RootRelay(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic()))) as relay:
         executor=_CargoExecutor(admission,execution_lease=value.get('execution_lease'),generated_outputs=value.get('generated_outputs'));relay.views=executor
         first=validate_invocation(commands[0],environment,cwd)
         context=dict(value,original_invocation=first)
@@ -2948,6 +3055,7 @@ def _execute(arguments):
         finally:executor.preparing_graph=False
         if status!=0:raise cargo_hold('planner_cargo_request')
         executor.graph=CargoGraph(executor.source,metadata,owner=0)
+        metadata_units=list(relay.completed)
         for argv in commands:
             invocation=validate_invocation(argv,environment,cwd);before=len(relay.completed)
             exit_code,output,error=executor._command(dict(value,original_invocation=invocation),relay,operation='original')
@@ -2961,8 +3069,9 @@ def _execute(arguments):
                 'units':units})
             if exit_code:break
         relay.drain()
+        captured=observation.finish(executor)
         receipt={'version':1,'kind':'ci-cargo-execution','binding':value['binding'],'command':value['command'],
-            'commands':receipts,'metadata_sha256':executor.graph.metadata_sha256,'original_metadata_cleanup':True,
+            'commands':receipts,'metadata_units':metadata_units,'metadata_sha256':executor.graph.metadata_sha256,'original_metadata_cleanup':True,'kernel_observation':captured,
             'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
         # Leave the protected ownership records intact. A following command must
         # recover/revalidate them; a fresh private target is not a reuse policy.
@@ -3002,7 +3111,7 @@ def _execute_repository(arguments):
     planner_root=root/'planner';planner_root.mkdir(mode=0o700)
     planner_admission=admit(value['target'],value['binding'],value['command'],planner_root)
     supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None
-    with RootRelay(planner_admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline']) as planner:
+    with CommandObservation(planner_admission,value['deadline']) as observation, RootRelay(planner_admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline']) as planner:
       with WorkerRelay(worker_admission,planner_relay=planner,value=value) as worker:
         try:
             configuration=worker.config_fd()
@@ -3013,8 +3122,9 @@ def _execute_repository(arguments):
             output,error=capture_command(child,value['deadline']);original_cargo_cleanup(supervisor_receipt)
             worker.drain();planner.drain()
             if worker.errors or planner.errors:raise FreshnessHold('input_census_unknown')
+            captured=observation.finish(worker.executor)
             receipt={'version':1,'kind':'ci-repository-execution','binding':value['binding'],'command':value['command'],
-                'worker_units':worker.completed,'cargo_commands':worker.cargo_commands,'original_worker_cleanup':True,
+                'worker_units':worker.completed,'metadata_units':worker.metadata_units,'cargo_commands':worker.cargo_commands,'original_worker_cleanup':True,'kernel_observation':captured,
                 'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
             print(json.dumps({'exit_code':child.returncode,'stdout':output.decode('utf-8','replace'),
                 'stderr':error.decode('utf-8','replace'),'repository_execution':receipt}))
@@ -3059,7 +3169,7 @@ def validate_checkpoint(value,binding,command,predecessor,scope):
 def validate_repository_execution(value,binding,command,workers,scope,predecessor=None):
     try:
         keys={'version','kind','binding','command','checkpoint','worker_units','cargo_commands','original_worker_cleanup',
-            'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
+            'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence','kernel_observation','metadata_units'}
         if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
                 or value['kind']!='ci-repository-execution' or value['binding']!=binding or value['command']!=command
                 or value['original_worker_cleanup'] is not True
@@ -3088,6 +3198,8 @@ def validate_repository_execution(value,binding,command,workers,scope,predecesso
                         or compiler['original_cleanup'] is not True or compiler['shipping_authority'] is not False
                         or compiler['input_closure_complete'] is not False):raise ValueError()
         if cargo!={ordinal for ordinal,unit in units.items() if unit['uid']==1001}:raise ValueError()
+        validate_command_observation(value['kernel_observation'],binding,command,
+            original_unit_ordinals([*value['metadata_units'],*[unit for item in value['cargo_commands'] for unit in item['units']]]))
         return value
     except (ValueError,TypeError,KeyError):raise FreshnessHold('input_census_unknown') from None
 
@@ -3095,7 +3207,7 @@ def validate_repository_execution(value,binding,command,workers,scope,predecesso
 def validate_execution(value,binding,command,commands,workers,scope,exit_code,predecessor=None):
     try:
         keys={'version','kind','binding','command','checkpoint','commands','metadata_sha256','original_metadata_cleanup',
-            'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
+            'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence','kernel_observation','metadata_units'}
         if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
                 or value['kind']!='ci-cargo-execution' or value['binding']!=binding or value['command']!=command
                 or not cache._digest(value['metadata_sha256']) or value['original_metadata_cleanup'] is not True
@@ -3104,7 +3216,7 @@ def validate_execution(value,binding,command,commands,workers,scope,exit_code,pr
                 or type(value['commands']) is not list or not 1<=len(value['commands'])<=len(commands)):
             raise ValueError()
         validate_checkpoint(value['checkpoint'],binding,command,predecessor,scope)
-        ordinals=set()
+        ordinals=original_unit_ordinals(value['metadata_units'])
         for index,item in enumerate(value['commands']):
             if (type(item) is not dict or set(item)!={'argv','context_sha256','exit_code','original_cargo_cleanup','compiler_calls','units'}
                     or item['argv']!=commands[index] or not cache._digest(item['context_sha256'])
@@ -3118,6 +3230,7 @@ def validate_execution(value,binding,command,commands,workers,scope,exit_code,pr
                         or unit.get('started') is not True or unit.get('cancelled') is not False
                         or unit.get('original_cleanup') is not True):raise ValueError()
                 ordinals.add(unit['ordinal'])
+        validate_command_observation(value['kernel_observation'],binding,command,ordinals)
         if (len(value['commands'])<len(commands) and value['commands'][-1]['exit_code']==0
                 or type(exit_code) is not int or value['commands'][-1]['exit_code']!=exit_code):raise ValueError()
         return value

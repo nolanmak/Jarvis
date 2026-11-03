@@ -575,7 +575,8 @@ def path_metadata_witness(queries,pid,uid,path,user_namespace,*,lookup,flags,dir
         if not matches:raise ObservationUnavailable('original path metadata witness missing')
 
 
-def decode(data,*,complete=True,with_directories=False,with_metadata=False):
+def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_scope='fixture'):
+    if path_scope not in ('fixture','all'):raise ObservationUnavailable('unknown pathname scope')
     if not isinstance(data,bytes) or len(data)>MAX_BYTES:raise ObservationUnavailable('unbounded observation')
     if complete and (not data or not data.endswith(b'\n')):raise ObservationUnavailable('incomplete observation')
     if not complete and not data.endswith(b'\n'):data=data.rpartition(b'\n')[0]+b'\n'
@@ -664,9 +665,9 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
         path=b''.join(pair['N'][offset] for offset in range(0,pair['length'],CHUNK_BYTES))
         parts=path.split(b'/')
         if parts[-1]==b'':parts=parts[:-1]
-        if (any(part in (b'',b'.',b'..') for part in parts[1:])
+        if ((path_scope=='fixture' and any(part in (b'',b'.',b'..') for part in parts[1:]))
                 or not (uid==1999 and (re.fullmatch(rb'/ci-observer-witness-[a-z0-9-]+',path) or path==b'/proc/sys/kernel/random')
-                    or 2000<=uid<6096 and (path.startswith(b'/workspace/')
+                    or 2000<=uid<6096 and (path_scope=='all' or path.startswith(b'/workspace/')
                         or path in (b'src/lib.rs',b'src/main.rs',b'build.rs')))):
             raise ObservationUnavailable('foreign kernel pathname')
         events.append({'uid':uid,'pid':pid,'tid':tid,'syscall':call,'sequence':sequence,'result':pair['E'],'path':path})
@@ -990,8 +991,18 @@ finally:os.close(descriptor)
 '''
 
 
+def observation_program(path_scope):
+    if path_scope=='fixture':return _PROGRAM
+    if path_scope!='all':raise ObservationUnavailable('unknown pathname scope')
+    # Keep the original syscall/credential gates and witness selection. General
+    # unit paths retain their literal spelling; resolution belongs to the index.
+    marker='     (($prefix=='
+    if _PROGRAM.count(marker)!=1:raise ObservationUnavailable('pathname gate changed')
+    return _PROGRAM.replace(marker,'     ((uid>=2000 && uid<6096) || ($prefix==')
+
+
 class Observer:
-    def __init__(self,admission,*,deadline):
+    def __init__(self,admission,*,deadline,path_scope='fixture'):
         if (os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0) or admission is None
                 or admission.owner!=os.getpid() or not time.monotonic()<deadline<=time.monotonic()+901):
             raise ObservationUnavailable('private root admission required')
@@ -1005,7 +1016,7 @@ class Observer:
             'command':admission.command,'shipping_authority':False}
         cache._write_record(self.root/'control.json',self.control)
         self.witness='/ci-observer-witness-'+str(uuid.uuid4())+'-'+'x'*192;self.witness_pid=None
-        self.program=_PROGRAM
+        self.path_scope=path_scope;self.program=observation_program(path_scope)
         self.stdout=self.root/'stdout';self.stderr=self.root/'stderr';self.output=None;self.error=None
         self.report=None;self.census_before=None;self.census_after=None;self.census_error=False
         self.birth=None;self.kernel_address=None
@@ -1088,7 +1099,7 @@ class Observer:
                 if witness.poll() is None:witness.kill();witness.wait(timeout=2)
             if status!=0:raise ObservationUnavailable('original witness unavailable')
             for _ in range(10):
-                paths,queries,metadata=decode(self._data(),complete=False,with_directories=True,with_metadata=True)
+                paths,queries,metadata=decode(self._data(),complete=False,with_directories=True,with_metadata=True,path_scope=self.path_scope)
                 if any(e['uid']==1999 and e['pid']==witness.pid and e['syscall']==257
                         and e['result']==-errno.ENOENT and e['path']==self.witness.encode()
                         for e in paths):
@@ -1125,15 +1136,23 @@ class Observer:
         for stream in (self.output,self.error):
             if stream is not None and not stream.closed:stream.close()
 
-    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest,source_root,mount_namespace,content_probe,compiler_probe):
+    def capture(self):
+        """Drain the original collector without claiming complete unit inputs."""
         self.stop()
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
         if self.census_error:raise ObservationUnavailable('original kernel census failed')
         census=validate_census({'before':self.census_before,'after':self.census_after})
-        events,queries,metadata=decode(self._data(),with_directories=True,with_metadata=True)
+        events,queries,metadata=decode(self._data(),with_directories=True,with_metadata=True,path_scope=self.path_scope)
         if b'lost' in self.stderr.read_bytes().lower():raise ObservationUnavailable('lost kernel observations')
         directory_witness(queries,self.witness_pid,1999,self.directory_path,self.directory_members)
+        metadata_witness(metadata,self.witness_pid,1999,self.directory_path,self.user_namespace)
+        if cache._read_record(self.root/'control.json')!=self.control:
+            raise ObservationUnavailable('foreign observation allocation')
+        return events,queries,metadata,census
+
+    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest,source_root,mount_namespace,content_probe,compiler_probe):
+        events,queries,metadata,census=self.capture()
         if len(directories)!=4:raise ObservationUnavailable('original directory scopes missing')
         summaries=[directory_witness(queries,*scope) for scope in directories]
         directory_cursor_witness(queries,unit_pid,2004,cursor_directory)

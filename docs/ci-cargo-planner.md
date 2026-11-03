@@ -1470,3 +1470,27 @@ success/failing-test replay completed in **192.13 seconds**. Both cases retained
 compiler counts `[2,1]`, original build/test argv and original test output; their
 actual test Cargo exits were 0 and 101 respectively. These are component
 execution/recovery checks, not completed full CI or an autonomous merge.
+
+Actual structured and repository adapters now start a general-path kernel
+collector before admitting units. The original private fixture mode and its
+path/diagnostic criteria remain separate. General captures preserve literal
+runtime/relative/parent-component names rather than rewriting them; resolution
+and compatible-input selection remain the index's responsibility. The same
+original sixteen attachments and zero-miss census are required.
+
+After original supervisor cleanup and relay drainage, each record binds unit
+credentials, root/namespace identity, terminal supervisor evidence, request
+identity and decoded kernel lookups/directory/metadata facts. Compiler units
+must include an actual successful source open. Child-process observations stay
+with their original unit credential; unknown unit credentials hold. Metadata
+preparation units are retained separately from the original build/test commands.
+Records are controller-owned and included in retained executor checkpoints.
+The host validates the exact command, unit set, census and false authority flags.
+This is actual-path collection groundwork, not full syscall/input/runtime/FD
+coverage, compatible reuse authority, or passing-CI evidence.
+
+The generated-forest replay now uses `arbitrary/source.rs` and requires original
+compiler source opens plus unchanged-unit reuse, covering paths outside the old
+fixture allowlist. Its native validation with the general collector is pending.
+Durable selector revalidation, opaque wrapper execution and the original
+in-command publication regression remain unfinished; production is disabled.

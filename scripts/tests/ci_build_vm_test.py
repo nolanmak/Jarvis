@@ -5,6 +5,8 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('ci_vm',ROOT/'scripts/ci-build-vm.py');adapter=importlib.util.module_from_spec(spec);spec.loader.exec_module(adapter)
 vm=adapter.vm
+observer_spec=importlib.util.spec_from_file_location('test_kernel_observer',ROOT/'scripts/ci-cargo-observer.py')
+observer=importlib.util.module_from_spec(observer_spec);observer_spec.loader.exec_module(observer)
 def stopped_workers():
  return {'version':1,'kind':'ci-guest-command-quiescence','worker_free':True,'shipping_authority':False,
   'scopes':[{'version':1,'kind':'ci-guest-workers-quiescent','state':'all_descendants_reaped',
@@ -13,6 +15,21 @@ def observed_inputs(workers):
  return {'format_version':1,'kind':'ci-input-write-observation','changed':False,'changed_roots':[],
   'observed_events':0,'events_sha256':hashlib.sha256(b'').hexdigest(),'before_sha256':'f'*64,'after_sha256':'f'*64,
   'guest_worker_quiescence':workers['scopes'][-1],'shipping_authority':False}
+def kernel_observation(binding,command):
+ programs=[];links=[]
+ roles=[('raw_tracepoint','sys_enter',0),('raw_tracepoint','sys_exit',0)]
+ roles.extend(('kretprobe_multi' if flags else 'kprobe_multi',name,flags)
+  for (name,flags),count in observer.PROBE_ROLES.items() for _ in range(count))
+ for i,(kind,name,flags) in enumerate(roles,1):
+  programs.append({'id':i,'type':17 if kind=='raw_tracepoint' else 2,'tag':f'{i:016x}','recursion_misses':0})
+  links.append({'id':100+i,'type':kind,'prog_id':i,'tag':f'{i:016x}',
+   **({'tracepoint':name} if kind=='raw_tracepoint' else {'function':name,'count':1,'flags':flags,'missed':0})})
+ census={'pid':42,'birth':1000,'programs':programs,'links':links}
+ return {'version':1,'kind':'ci-command-kernel-observation','binding':binding,'command':command,
+  'record_sha256':'1'*64,'program_sha256':'2'*64,'binary_sha256':'3'*64,
+  'probe_census':{'before':census,'after':census},'units':[],'original_observer_cleanup':True,
+  'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+
 class AdapterTests(unittest.TestCase):
  def test_internal_probe_flag_is_typed_and_cannot_select_a_root_probe_from_other_operations(self):
   with tempfile.TemporaryDirectory() as directory:
@@ -56,7 +73,8 @@ class AdapterTests(unittest.TestCase):
       'command':generation['command'],'commands':[{'argv':argv,'context_sha256':'1'*64,'exit_code':0 if i==0 else 101,
        'compiler_calls':0,'units':[],'original_cargo_cleanup':True} for i,argv in enumerate(commands)],
       'checkpoint':self.execution_checkpoint(generation,result['guest_worker_quiescence']['scopes'][-1]),
-      'metadata_sha256':'2'*64,'original_metadata_cleanup':True,'input_closure_complete':False,'full_ci':False,
+      'metadata_units':[],'metadata_sha256':'2'*64,'original_metadata_cleanup':True,
+      'kernel_observation':kernel_observation(generation['binding'],generation['command']),'input_closure_complete':False,'full_ci':False,
       'shipping_authority':False,'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
      return result
     with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'private_bytes',side_effect=lambda path: b'measured program' if Path(path).name=='ci-cargo-planner.so' else Path(path).read_bytes()),patch.object(adapter,'ensure_cache',
@@ -90,7 +108,8 @@ class AdapterTests(unittest.TestCase):
      generation=options['ci_context']['generation']
      result['repository_execution']={'version':1,'kind':'ci-repository-execution','binding':generation['binding'],
       'command':generation['command'],'checkpoint':self.execution_checkpoint(generation,result['guest_worker_quiescence']['scopes'][-1]),
-      'worker_units':[],'cargo_commands':[],'original_worker_cleanup':True,
+      'worker_units':[],'metadata_units':[],'cargo_commands':[],'original_worker_cleanup':True,
+      'kernel_observation':kernel_observation(generation['binding'],generation['command']),
       'input_closure_complete':False,'full_ci':False,'shipping_authority':False,
       'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
      return result

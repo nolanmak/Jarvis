@@ -37,6 +37,23 @@ def census_sample():
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_general_path_scope_keeps_literal_runtime_relative_and_parent_components(self):
+        for path in (b'/toolchain/lib/../lib/librustc.so',b'arbitrary/module.rs',b'./node_modules/generated.rs',b'../source.rs',b'/workspace//src/lib.rs'):
+            data=lookup(2003,101,102,257,1,3,path)+frame('map',{'@emitted':2})
+            with self.subTest(path=path):
+                self.assertEqual(observer.decode(data,path_scope='all')[0]['path'],path)
+                with self.assertRaises(observer.ObservationUnavailable):observer.decode(data)
+        with self.assertRaises(observer.ObservationUnavailable):observer.decode(data,path_scope=True)
+
+    def test_general_program_retains_original_syscall_credential_and_witness_gates(self):
+        self.assertEqual(observer.observation_program('fixture'),observer._PROGRAM)
+        general=observer.observation_program('all')
+        self.assertEqual(general.count('((uid>=2000 && uid<6096) || ($prefix=='),1)
+        self.assertEqual(general.count('rawtracepoint:sys_enter'),observer._PROGRAM.count('rawtracepoint:sys_enter'))
+        self.assertIn('@number[tid]==439',general)
+        self.assertIn('(uid==1999 && $prefix==0x79732f636f72702f)',general)
+        with self.assertRaises(observer.ObservationUnavailable):observer.observation_program('unknown')
+
     def test_lookup_base_keeps_attempts_objects_failures_and_original_query_binding(self):
         rows=['Q 2004 101 101 262 1 1 3 256 50 100','R 2004 101 101 262 1 1 0',
             'C 2004 101 101 262 1 1 7 900 16749 4096 8192 4 6 6 256 4',
