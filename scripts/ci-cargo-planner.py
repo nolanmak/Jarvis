@@ -615,7 +615,7 @@ class _ViewProbe:
             raise FreshnessHold('input_census_unknown')
         if Path('/tmp/ci-unit-probe-private-marker').exists():raise FreshnessHold('invalidation_unsafe')
         staged=self.root/'publication-preparing'
-        output=unit_views.copy_outputs(Path(view['artifacts']),staged,['unit-output'],owner=2004,controller=0)
+        output=unit_views.copy_output_roots(Path(view['artifacts']),staged,['unit-output'],owner=2004,controller=0)
         staged.rename(self.root/'published')
         descriptor=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
         try:os.fsync(descriptor)
@@ -885,7 +885,8 @@ if is_view:
   assert time.monotonic()<deadline
   time.sleep(.01)
  assert input.read_bytes()==b'OLD' and selected(input.stat())==before
- Path('/workspace/target/unit-output').write_bytes(b'sealed result\n')
+ output=Path('/workspace/target/unit-output');output.mkdir();(output/'empty').mkdir()
+ (output/('generated-'+str(os.getpid())+'.bin')).write_bytes(b'sealed result\n')
  result['filesystem']={'input_stable':True,'input_metadata_stable':True,'source_read_only':True,
   'abstract_socket_isolated':True,'private_temp':True,'metadata_hidden':True,'output_written':True}
 print(json.dumps(result),flush=True)
@@ -1033,8 +1034,16 @@ def _probe_supervisor(arguments):
 def validate_filesystem_probe(value):
     keys={'version','input_bytes_preserved','input_inode_metadata_preserved','next_publication_distinct',
         'namespaces','outputs','original_unit_cleanup','allocation_removed','shipping_authority'}
-    expected_outputs=[['2e','directory',0o555],
-        [b'unit-output'.hex(),'file',0o444,14,hashlib.sha256(b'sealed result\n').hexdigest()]]
+    outputs=value.get('outputs') if type(value) is dict else None
+    if (type(outputs) is not list or len(outputs)!=4 or type(outputs[3]) is not list
+            or len(outputs[3])!=5 or type(outputs[3][0]) is not str):raise FreshnessHold('input_census_unknown')
+    try:name=bytes.fromhex(outputs[3][0])
+    except ValueError:raise FreshnessHold('input_census_unknown') from None
+    if re.fullmatch(rb'unit-output/generated-[1-9][0-9]{0,19}\.bin',name) is None:
+        raise FreshnessHold('input_census_unknown')
+    expected_outputs=[['2e','directory',0o555],[b'unit-output'.hex(),'directory',0o555],
+        [b'unit-output/empty'.hex(),'directory',0o555],
+        [name.hex(),'file',0o444,14,hashlib.sha256(b'sealed result\n').hexdigest()]]
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or any(value[key] is not True for key in ('input_bytes_preserved','input_inode_metadata_preserved',
                 'next_publication_distinct','original_unit_cleanup','allocation_removed'))

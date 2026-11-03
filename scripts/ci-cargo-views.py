@@ -103,20 +103,31 @@ def clone_inputs(source,destination,expected,*,owner,unit):
     return bindings
 
 
-def copy_outputs(source,destination,names,*,owner,controller):
+def _output_directory(path,owner):
+    info=path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner or info.st_mode&0o7000
+            or (hasattr(os,'listxattr') and os.listxattr(path,follow_symlinks=False))):
+        raise FreshnessHold('artifact_provenance_unknown')
+
+
+def copy_outputs(source,destination,names,*,owner,controller,directories=None):
     source=literal(source);destination=literal(destination)
-    if not isinstance(names,list) or not 1<=len(names)<=MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
-    names=[relative(name) for name in names]
-    if len(set(names))!=len(names):raise FreshnessHold('input_census_unknown')
+    directories=[] if directories is None else directories
+    if (not isinstance(names,list) or not isinstance(directories,list)
+            or not 1<=len(names)+len(directories)<=MAX_ENTRIES):raise FreshnessHold('input_census_unknown')
+    names=[relative(name) for name in names];directories=[relative(name) for name in directories]
+    if len(set(names+directories))!=len(names)+len(directories):raise FreshnessHold('input_census_unknown')
     destination.mkdir(mode=0o700);total=0
+    for name in sorted(directories,key=lambda name:(len(name.parts),os.fsencode(name))):
+        if (source/name).resolve()!=source/name:raise FreshnessHold('artifact_provenance_unknown')
+        for parent in [source,*[source/Path(*name.parts[:i]) for i in range(1,len(name.parts)+1)]]:
+            _output_directory(parent,owner)
+        (destination/name).mkdir(parents=True,mode=0o700,exist_ok=True)
     for name in names:
         original=source/name
         if original.resolve()!=original:raise FreshnessHold('artifact_provenance_unknown')
         for parent in [source,*[source/Path(*name.parts[:i]) for i in range(1,len(name.parts))]]:
-            info=parent.lstat()
-            if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner
-                    or (hasattr(os,'listxattr') and os.listxattr(parent,follow_symlinks=False))):
-                raise FreshnessHold('artifact_provenance_unknown')
+            _output_directory(parent,owner)
         output=destination/name;output.parent.mkdir(parents=True,mode=0o700,exist_ok=True)
         descriptor=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
         try:
@@ -130,6 +141,33 @@ def copy_outputs(source,destination,names,*,owner,controller):
         try:os.fsync(descriptor)
         finally:os.close(descriptor)
     return inventory(destination,owner=controller,sealed=True)
+
+
+def copy_output_roots(source,destination,roots,*,owner,controller):
+    """Inventory only declared producer roots after original-scope quiescence.
+
+    The root planner must establish that barrier before calling this primitive.
+    A returned sealed byte inventory is not itself a producer/reuse capability.
+    Preserve empty directories and unknown names, never capture sibling inputs.
+    """
+    source,destination=map(literal,(source,destination))
+    if not isinstance(roots,list) or not 1<=len(roots)<=MAX_ENTRIES:raise FreshnessHold('input_census_unknown')
+    roots=sorted((relative(root) for root in roots),key=lambda root:root.parts)
+    if any(a==b or a in b.parents for a,b in zip(roots,roots[1:])):
+        raise FreshnessHold('input_census_unknown')
+    snapshots={};names=[];directories=[];size=0;count=0
+    for root in roots:
+        snapshot=inventory(source/root,owner=owner,sealed=False);snapshots[root]=snapshot
+        for row in snapshot:
+            count+=1
+            name=os.fsdecode(root/Path(os.fsdecode(bytes.fromhex(row[0]))))
+            if row[1]=='directory':directories.append(name)
+            else:names.append(name);size+=row[3]
+            if count>MAX_ENTRIES or size>MAX_BYTES:raise FreshnessHold('input_census_unknown')
+    result=copy_outputs(source,destination,names,owner=owner,controller=controller,directories=directories)
+    if any(inventory(source/root,owner=owner,sealed=False)!=snapshot for root,snapshot in snapshots.items()):
+        raise FreshnessHold('input_census_unknown')
+    return result
 
 
 def validate_stdio(descriptors):

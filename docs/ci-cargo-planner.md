@@ -625,3 +625,23 @@ OLD output after publication; independent rustc rejected the new input with
 E0761. Protected Cargo mapping alone does not fix that failure. Complete input
 collection, selective invalidation and bounded planner restart remain required.
 All full-CI, trusted-input-closure and shipping-authority claims remain false.
+
+## Declared output-root checkpoint
+
+`copy_output_roots` inventories only the planner's selected producer directories
+after original-scope quiescence. It preserves runtime-chosen names, empty nested
+directories and roots containing no files. Source roots must not overlap or
+escape their allocation; unsupported entries, inode aliases and attributes
+remain refusals. Entry/byte bounds cover the union of all selected roots. The
+helper rechecks the source inventories after detached copying/sealing; changed
+trees cannot return a publication manifest. Sibling artifact inputs and planner
+metadata are excluded from the census. Only the original root planner can
+establish the required stop barrier; a byte inventory alone supplies no producer
+or reuse authority.
+
+The fixed UID2004 VM unit now creates a filename containing its runtime PID and
+an empty directory beneath one declared root. The original root callback must
+discover and copy both after teardown, verify the exact sealed inventory and
+remove the original allocation. Native validation of this addition is pending.
+Actual Cargo build-script mapping, complete input collection and publication
+invalidation remain separate unfinished requirements.

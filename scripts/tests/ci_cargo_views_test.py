@@ -14,6 +14,56 @@ views=importlib.util.module_from_spec(spec);spec.loader.exec_module(views)
 
 
 class UnitViewTests(unittest.TestCase):
+    def test_declared_roots_publish_unknown_names_and_empty_directories_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'unit';source.mkdir()
+            output=source/'build/hash/out';(output/'empty').mkdir(parents=True)
+            (source/'second/out').mkdir(parents=True)
+            data=output/os.fsdecode(b'unknown-\xff.bin');data.write_bytes(b'generated');data.chmod(0o700)
+            (source/'foreign-input').symlink_to('/unrelated/controller/input')
+            destination=root/'sealed'
+            manifest=views.copy_output_roots(source,destination,['build/hash/out','second/out'],
+                owner=os.getuid(),controller=os.getuid())
+            self.assertEqual((destination/data.relative_to(source)).read_bytes(),b'generated')
+            self.assertTrue((destination/'build/hash/out/empty').is_dir())
+            self.assertTrue((destination/'second/out').is_dir())
+            self.assertFalse((destination/'foreign-input').exists())
+            self.assertEqual(stat.S_IMODE((destination/data.relative_to(source)).stat().st_mode),0o555)
+            self.assertEqual(views.inventory(destination,owner=os.getuid(),sealed=True),manifest)
+            empty=root/'empty-only'
+            views.copy_output_roots(source,empty,['second/out'],owner=os.getuid(),controller=os.getuid())
+            self.assertTrue((empty/'second/out').is_dir())
+
+    def test_output_root_selection_refuses_overlap_escape_and_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'unit';(source/'out/child').mkdir(parents=True)
+            (source/'alias').symlink_to(source/'out',target_is_directory=True)
+            for roots in ([],['out','out'],['out','out/child'],['../out'],['/out'],['alias']):
+                destination=root/'sealed'
+                with self.subTest(roots=roots),self.assertRaises(views.FreshnessHold):
+                    views.copy_output_roots(source,destination,roots,owner=os.getuid(),controller=os.getuid())
+                self.assertFalse(destination.exists())
+
+    def test_output_root_limits_cover_all_selected_trees(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'unit'
+            for name in ('one','two'):
+                (source/name).mkdir(parents=True);(source/name/'file').write_bytes(b'xx')
+            for limit in ('MAX_BYTES','MAX_ENTRIES'):
+                with self.subTest(limit=limit),patch.object(views,limit,3),self.assertRaises(views.FreshnessHold):
+                    views.copy_output_roots(source,root/'sealed',['one','two'],owner=os.getuid(),controller=os.getuid())
+                self.assertFalse((root/'sealed').exists())
+
+    def test_output_root_change_during_publication_cannot_return_a_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'unit';(source/'out').mkdir(parents=True)
+            (source/'out/first').write_bytes(b'first')
+            original=views.copy_outputs
+            def changed(*args,**kwargs):
+                result=original(*args,**kwargs);(source/'out/late').write_bytes(b'late');return result
+            with patch.object(views,'copy_outputs',side_effect=changed),self.assertRaises(views.FreshnessHold):
+                views.copy_output_roots(source,root/'sealed',['out'],owner=os.getuid(),controller=os.getuid())
+
     def test_toolchain_view_exposes_children_without_changing_private_source_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);source=root/'source';source.mkdir(mode=0o700)

@@ -90,6 +90,24 @@ class PlannerProtocolTests(unittest.TestCase):
             bad=copy.deepcopy(value);bad['units'][0][field]=replacement
             with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):planner.validate_cargo_probe(bad)
 
+    def test_dynamic_output_report_requires_exact_declared_root_inventory(self):
+        original=self.probe()[0]['filesystem']
+        changed=copy.deepcopy(original)
+        changed['outputs'][3][0]=b'unit-output/generated-1234.bin'.hex()
+        self.assertEqual(planner.validate_filesystem_probe(changed),changed)
+        for fault in ('escape','unknown','malformed','empty-removed','extra','digest','bytes','alias'):
+            value=copy.deepcopy(original)
+            if fault=='escape':value['outputs'][3][0]=b'../unit-output/generated-42.bin'.hex()
+            elif fault=='unknown':value['outputs'][3][0]=b'unit-output/unplanned.bin'.hex()
+            elif fault=='malformed':value['outputs'][3][0]='not hex'
+            elif fault=='empty-removed':del value['outputs'][2]
+            elif fault=='extra':value['outputs'].append(value['outputs'][3])
+            elif fault=='digest':value['outputs'][3][4]='0'*64
+            elif fault=='bytes':value['outputs'][3][3]=13
+            elif fault=='alias':value['outputs'][3][1]='symlink'
+            with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
+                planner.validate_filesystem_probe(value)
+
     def probe(self):
         scopes=[{'scope_id':str(uuid.uuid4())} for _ in range(4)]
         workers={'scopes':scopes};writer={'guest_worker_quiescence':scopes[-1]}
@@ -109,7 +127,8 @@ class PlannerProtocolTests(unittest.TestCase):
         filesystem={'version':1,'input_bytes_preserved':True,'input_inode_metadata_preserved':True,
             'next_publication_distinct':True,'namespaces':{name:{'controller':name+':[1]','unit':name+':[2]'}
                 for name in ('mnt','ipc','net')},'outputs':[['2e','directory',0o555],
-                [b'unit-output'.hex(),'file',0o444,14,hashlib.sha256(b'sealed result\n').hexdigest()]],
+                [b'unit-output'.hex(),'directory',0o555],[b'unit-output/empty'.hex(),'directory',0o555],
+                [b'unit-output/generated-42.bin'.hex(),'file',0o444,14,hashlib.sha256(b'sealed result\n').hexdigest()]],
             'original_unit_cleanup':True,'allocation_removed':True,'shipping_authority':False}
         units=[{'ordinal':i,'uid':2000+i,'started':i!=2,'cancelled':i==2,'returncode':(-9 if i==2 else -10 if i==3 else 0),
             'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5)]
