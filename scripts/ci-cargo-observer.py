@@ -265,7 +265,7 @@ class Observer:
         self.child=subprocess.Popen([str(binary),'-v','-kk','-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
             env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'',
-                '__BPFTRACE_NOTIFY_PROBES_ATTACHED':'1','HOME':'/tmp'})
+                '__BPFTRACE_NOTIFY_PROBES_ATTACHED':'1','BPFTRACE_LOG_SIZE':str(3*1024**2),'HOME':'/tmp'})
         deadline=min(self.deadline,time.monotonic()+10);origin=os.getpid()
         def drop():
             libc=ctypes.CDLL(None,use_errno=True)
