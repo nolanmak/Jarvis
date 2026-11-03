@@ -172,7 +172,7 @@ class PlannerProtocolTests(unittest.TestCase):
         value['kernel_observation']={'version':1,'kind':'kernel-copied-filename-probe','binding':binding,'command':command,
             'shipping_authority':False,'kernel_release':'7.0.0-test','unit_pid':42,'unit_uid':2004,
             'program_sha256':'1'*64,'binary_sha256':'2'*64,'witness_observed':True,'positive_query_observed':True,
-            'negative_query_observed':True,'compiler_queries_observed':True,'library_generated_query_observed':True,'after_kernel_copy':True,'events':3,'original_observer_cleanup':True,
+            'negative_query_observed':True,'max_path_query_observed':True,'compiler_queries_observed':True,'library_generated_query_observed':True,'after_kernel_copy':True,'events':3,'original_observer_cleanup':True,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':False,'input_closure_complete':False,
             'allocation_removed':True}
         return value,binding,command,workers,writer,source

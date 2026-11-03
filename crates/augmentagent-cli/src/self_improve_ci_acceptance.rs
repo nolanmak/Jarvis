@@ -83,6 +83,7 @@ pub fn value()->u8{GENERATED}
         && probe["kernel_observation"]["witness_observed"]==true
         && probe["kernel_observation"]["positive_query_observed"]==true
         && probe["kernel_observation"]["negative_query_observed"]==true
+        && probe["kernel_observation"]["max_path_query_observed"]==true
         && probe["kernel_observation"]["after_kernel_copy"]==true
         && probe["kernel_observation"]["compiler_queries_observed"]==true
         && probe["kernel_observation"]["library_generated_query_observed"]==true

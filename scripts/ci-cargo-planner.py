@@ -1008,6 +1008,11 @@ if is_view:
  missing=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),
   ctypes.c_char_p(b'/workspace/target/deps/missing'),ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
  assert missing==-1 and ctypes.get_errno()==errno.ENOENT
+ long_path=b'/workspace/'+b'x/'*2042
+ assert len(long_path)==4095
+ longest=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),ctypes.c_char_p(long_path),
+  ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
+ assert longest==-1 and ctypes.get_errno()==errno.ENOENT
  _PROBE_PHASE='planner_tool_view'
  from pathlib import Path
  import time

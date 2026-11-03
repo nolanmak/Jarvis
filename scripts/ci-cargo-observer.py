@@ -133,7 +133,13 @@ kretprobe:getname_flags
       ($prefix==0x6e69616d2f637273 && *(uint16 *)($name+8)==0x722e && *(uint16 *)($name+10)==0x73) ||
       ($prefix==0x73722e646c697562 && *(uint8 *)($name+8)==0))) {
   $length=(uint64)0;
-  while ($length<4096 && *(uint8 *)($name+$length)!=0) { $length=$length+1; }
+  $word=*(uint64 *)$name;
+  while ($length<4096 && (($word-(uint64)0x0101010101010101) & ~$word & (uint64)0x8080808080808080)==0) {
+   $length=$length+8;
+   if ($length<4096) { $word=*(uint64 *)($name+$length); }
+  }
+  $tail=(uint64)0;
+  while ($tail<8 && $length<4096 && *(uint8 *)($name+$length)!=0) { $length=$length+1; $tail=$tail+1; }
   $offset=(uint64)0;
   while ($offset<$length) {
    printf("N %u %u %u %lld %llu %llu %llu %s\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],
@@ -217,7 +223,7 @@ class Observer:
         finally:os.close(descriptor)
         self.output=self.stdout.open('xb');self.error=self.stderr.open('xb')
         os.chmod(self.stdout,0o600);os.chmod(self.stderr,0o600)
-        self.child=subprocess.Popen([str(binary),'-v','-kk','-q','-B','none','-f','json','-e',self.program],
+        self.child=subprocess.Popen([str(binary),'-kk','-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
             env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'','HOME':'/tmp'})
         deadline=min(self.deadline,time.monotonic()+10);origin=os.getpid()
@@ -262,6 +268,9 @@ class Observer:
         if (not any(e['syscall']==257 and e['result']>=0 and e['path']==b'/workspace/target/deps/input' for e in selected)
                 or not any(e['syscall']==257 and e['result']==-errno.ENOENT and e['path']==b'/workspace/target/deps/missing' for e in selected)):
             raise ObservationUnavailable('kernel lookup witnesses missing')
+        if not any(e['syscall']==257 and e['result']==-errno.ENOENT
+                and e['path']==b'/workspace/'+b'x/'*2042 for e in selected):
+            raise ObservationUnavailable('full length kernel pathname witness missing')
         sources={'build-script':b'build.rs','library':b'src/lib.rs','binary':b'src/main.rs'}
         if set(compilers)!=set(sources):raise ObservationUnavailable('compiler scope unavailable')
         for role,path in sources.items():
@@ -275,7 +284,7 @@ class Observer:
             raise ObservationUnavailable('original generated input lookup missing')
         self.report={**self.control,'kernel_release':os.uname().release,'unit_pid':unit_pid,'unit_uid':2004,
             'program_sha256':hashlib.sha256(self.program.encode()).hexdigest(),'binary_sha256':self.binary_sha256,
-            'witness_observed':True,'positive_query_observed':True,'negative_query_observed':True,
+            'witness_observed':True,'positive_query_observed':True,'negative_query_observed':True,'max_path_query_observed':True,
             'compiler_queries_observed':True,'library_generated_query_observed':True,
             'after_kernel_copy':True,'events':len(events),'original_observer_cleanup':True,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':False,
@@ -292,7 +301,7 @@ def validate(value,binding,command):
         'program_sha256','binary_sha256','witness_observed','positive_query_observed','negative_query_observed',
         'after_kernel_copy','events','original_observer_cleanup','filesystem_coverage_complete',
         'missed_probe_census_complete','input_closure_complete','allocation_removed',
-        'compiler_queries_observed','library_generated_query_observed'}
+        'compiler_queries_observed','library_generated_query_observed','max_path_query_observed'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['kind']!='kernel-copied-filename-probe' or value['binding']!=binding or value['command']!=command
             or type(value['unit_pid']) is not int or not 0<value['unit_pid']<2**31
@@ -302,7 +311,7 @@ def validate(value,binding,command):
             or not cache._digest(value['program_sha256']) or not cache._digest(value['binary_sha256'])
             or any(value[key] is not True for key in ('witness_observed','positive_query_observed',
                 'negative_query_observed','after_kernel_copy','original_observer_cleanup','allocation_removed',
-                'compiler_queries_observed','library_generated_query_observed'))
+                'compiler_queries_observed','library_generated_query_observed','max_path_query_observed'))
             or any(value[key] is not False for key in ('shipping_authority','filesystem_coverage_complete',
                 'missed_probe_census_complete','input_closure_complete'))):
         raise ObservationUnavailable('kernel observation is incomplete or foreign')
