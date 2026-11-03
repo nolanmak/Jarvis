@@ -14,6 +14,20 @@ views=importlib.util.module_from_spec(spec);spec.loader.exec_module(views)
 
 
 class UnitViewTests(unittest.TestCase):
+    def test_toolchain_view_exposes_children_without_changing_private_source_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'source';source.mkdir(mode=0o700)
+            for name in ('bin','lib','libexec','share','etc'):(source/name).mkdir(mode=0o755)
+            before=source.stat();destination=root/'runtime';destination.mkdir()
+            with patch.object(views,'_readonly') as mount:
+                views.toolchain_view(source,destination)
+            after=source.stat()
+            self.assertEqual((after.st_mode,after.st_ino,after.st_ctime_ns),
+                (before.st_mode,before.st_ino,before.st_ctime_ns))
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode),0o555)
+            self.assertEqual({(str(call.args[0]),str(call.args[1])) for call in mount.call_args_list},
+                {(str(source/name),str(destination/name)) for name in ('bin','lib','libexec','share','etc')})
+
     def tree(self,root):
         root.mkdir(mode=0o700);(root/'deps').mkdir(mode=0o700)
         (root/'deps/input').write_bytes(b'OLD');(root/'deps/input').chmod(0o444)

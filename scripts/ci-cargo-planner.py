@@ -788,6 +788,10 @@ def _cargo(arguments):
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.unshare(0x00020000)!=0:raise OSError(ctypes.get_errno(),'planner mount namespace unavailable')
     unit_views._mount('--make-rprivate','/');os.chdir('/')
+    runtime=root/'toolchain-runtime';runtime.mkdir(mode=0o755)
+    unit_views.toolchain_view('/toolchain',runtime)
+    unit_views._mount('--rbind',runtime,'/toolchain')
+    unit_views._mount('-o','remount,bind,ro,nosuid,nodev,noatime','/toolchain')
     unit_views._readonly(source,'/workspace')
     for original,destination in ((root/'planner-target',Path('/workspace/target')),
             (root/'home',Path('/home/worker')),(root/'cargo-home',Path('/ci-cargo-home'))):

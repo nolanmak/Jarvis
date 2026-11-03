@@ -151,6 +151,24 @@ def _readonly(source,destination):
     _mount('-o','remount,bind,ro,nosuid,nodev,noatime',destination)
 
 
+def toolchain_view(source,destination):
+    """Expose pinned runtime children without chmod on the private source root.
+
+    The installed host toolchain root is commonly 0700/UID1000. Its existing
+    public children retain their original inode metadata in read-only mounts;
+    the controller creates a traversable virtual root for distinct unit UIDs.
+    This prototype does not establish a general runtime-equivalence policy.
+    """
+    source,destination=map(literal,(source,destination))
+    names=('bin','etc','lib','libexec','share')
+    if (set(path.name for path in source.iterdir())!=set(names) or any(destination.iterdir())
+            or any(not (source/name).is_dir() or (source/name).is_symlink() for name in names)):
+        raise FreshnessHold('input_census_unknown')
+    for name in names:
+        (destination/name).mkdir(mode=0o755);_readonly(source/name,destination/name)
+    destination.chmod(0o555)
+
+
 def enter(root,unit,source,artifacts,bindings=()):
     phase=['planner_view_enter']
     try:return _enter(root,unit,source,artifacts,bindings,phase)
@@ -193,7 +211,7 @@ def _enter(root,unit,source,artifacts,bindings,phase):
         os.chown(root/name,unit,unit);(root/name).chmod(0o700)
     phase[0]='planner_view_runtime'
     _readonly('/usr',root/'usr')
-    if Path('/toolchain').is_dir():_readonly('/toolchain',root/'toolchain')
+    if Path('/toolchain').is_dir():toolchain_view('/toolchain',root/'toolchain')
     phase[0]='planner_view_source'
     _readonly(source,root/'workspace')
     _mount('--bind',artifacts,root/'workspace/target')
