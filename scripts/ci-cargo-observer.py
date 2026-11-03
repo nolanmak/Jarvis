@@ -154,17 +154,22 @@ def _return_link(identity,program,address):
     finally:os.close(descriptor)  # Never keep the observer's attachments alive.
 
 
-def kernel_census(child,owner,birth,address):
+def kernel_census(child,owner,birth,address,diagnostic):
     if child.poll() is not None or _birth(child.pid,owner)!=birth:
         raise ObservationUnavailable('original observer is not live')
-    root=Path('/proc',str(child.pid));programs=[];links=[]
+    root=Path('/proc',str(child.pid));programs=[];links=[];rows=[]
     descriptors=list((root/'fd').iterdir())
     if len(descriptors)>512:raise ObservationUnavailable('unbounded original descriptor census')
     for path in descriptors:
         target=os.readlink(path)
         if target not in ('anon_inode:bpf-prog','anon_inode:bpf_link','anon_inode:bpf-link'):
             continue
-        info=_fdinfo((root/'fdinfo'/path.name).read_bytes())
+        data=(root/'fdinfo'/path.name).read_bytes()
+        if len(data)>16384 or len(rows)>=32:raise ObservationUnavailable('unbounded original BPF descriptor census')
+        rows.append({'fd':path.name,'target':target,'fdinfo':data.hex()})
+    cache._write_record(diagnostic,{'descriptors':rows})
+    for row in rows:
+        target=row['target'];info=_fdinfo(bytes.fromhex(row['fdinfo']))
         if target=='anon_inode:bpf-prog':
             programs.append({'id':_number(info.get('prog_id')),'type':_number(info.get('prog_type')),
                 'tag':info.get('prog_tag'),'recursion_misses':_number(info.get('recursion_misses'))})
@@ -421,7 +426,13 @@ class Observer:
             if b'__BPFTRACE_NOTIFY_PROBES_ATTACHED\n' not in self.stderr.read_bytes():
                 time.sleep(.02);continue
             if self.census_before is None:
-                self.census_before=kernel_census(self.child,self.owner,self.birth,self.kernel_address)
+                try:self.census_before=kernel_census(self.child,self.owner,self.birth,self.kernel_address,
+                    self.root/'census-descriptors-before.json')
+                except (OSError,ObservationUnavailable) as error:
+                    cache._write_record(self.root/'census-failure.json',{'phase':'before-witness',
+                        'category':type(error).__name__,'errno':getattr(error,'errno',None),
+                        'reason':str(error) if isinstance(error,ObservationUnavailable) else None})
+                    raise
                 cache._write_record(self.root/'census-before.json',self.census_before)
                 validate_census({'before':self.census_before,'after':self.census_before})
             witness=subprocess.Popen([sys.executable,'-I','-c',_WITNESS,self.witness],
@@ -444,7 +455,8 @@ class Observer:
             try:
                 if self.census_before is not None and self.census_after is None:
                     try:
-                        self.census_after=kernel_census(self.child,self.owner,self.birth,self.kernel_address)
+                        self.census_after=kernel_census(self.child,self.owner,self.birth,self.kernel_address,
+                            self.root/'census-descriptors-after.json')
                         cache._write_record(self.root/'census-after.json',self.census_after)
                         validate_census({'before':self.census_before,'after':self.census_after})
                     except (OSError,ObservationUnavailable) as error:
