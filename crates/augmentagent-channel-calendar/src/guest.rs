@@ -41,6 +41,12 @@ pub enum GuestOutcome {
     Unconfirmed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Add,
+    Remove,
+}
+
 impl GoogleCalendar {
     /// D8 `calendar.add_guest`: invite `email` to the event as `account`.
     pub async fn add_guest(
@@ -50,8 +56,8 @@ impl GoogleCalendar {
         event_id: &str,
         email: &str,
     ) -> Result<GuestOutcome, CalendarError> {
-        let _ = (account, calendar_id, event_id, email);
-        todo!("C4 add_guest")
+        self.edit_guest(account, calendar_id, event_id, email, Edit::Add)
+            .await
     }
 
     /// D8 undo: take `email` off the event as `account`, unless they
@@ -63,14 +69,153 @@ impl GoogleCalendar {
         event_id: &str,
         email: &str,
     ) -> Result<GuestOutcome, CalendarError> {
-        let _ = (account, calendar_id, event_id, email);
-        todo!("C4 remove_guest")
+        self.edit_guest(account, calendar_id, event_id, email, Edit::Remove)
+            .await
+    }
+
+    async fn edit_guest(
+        &self,
+        account: &str,
+        calendar_id: &str,
+        event_id: &str,
+        email: &str,
+        edit: Edit,
+    ) -> Result<GuestOutcome, CalendarError> {
+        let guest = email.trim().to_ascii_lowercase();
+        if guest.is_empty() || !guest.contains('@') || guest.chars().any(char::is_whitespace) {
+            return Err(CalendarError::Invalid(format!(
+                "guest must be one email address, got {email:?}"
+            )));
+        }
+        if calendar_id.trim().is_empty() || event_id.trim().is_empty() {
+            return Err(CalendarError::Invalid(
+                "calendar id and event id are required".into(),
+            ));
+        }
+        let path = format!(
+            "calendars/{}/events/{}",
+            path_segment(calendar_id),
+            path_segment(event_id)
+        );
+        // Attempt 0, then at most one retry after a 412.
+        let mut attempt = 0;
+        loop {
+            let read = self
+                .call_with(account, "GET", &path, &[], None, CallOptions::default())
+                .await?;
+            let event = read.body;
+            if !is_organizer(&event, account) {
+                return Ok(GuestOutcome::NotOrganizer);
+            }
+            if event.get("attendeesOmitted").and_then(Value::as_bool) == Some(true) {
+                // Writing back a partial list would drop the omitted guests.
+                return Err(CalendarError::Invalid(format!(
+                    "{path}: Google returned a partial attendee list (attendeesOmitted)"
+                )));
+            }
+            let etag = read.etag.filter(|e| !e.trim().is_empty()).ok_or_else(|| {
+                CalendarError::Decode(format!("{path}: event read carried no etag"))
+            })?;
+            let mut attendees: Vec<Value> = match event.get("attendees") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(list)) => list.clone(),
+                Some(other) => {
+                    return Err(CalendarError::Decode(format!(
+                        "{path}: attendees is not a list ({other})"
+                    )))
+                }
+            };
+            let existing = attendees
+                .iter()
+                .position(|a| attendee_email(a).as_deref() == Some(guest.as_str()));
+            match (edit, existing) {
+                (Edit::Add, Some(_)) | (Edit::Remove, None) => return Ok(GuestOutcome::Noop),
+                (Edit::Add, None) => attendees.push(serde_json::json!({ "email": guest })),
+                (Edit::Remove, Some(i)) => {
+                    let accepted = attendees[i]
+                        .get("responseStatus")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("accepted"));
+                    if accepted {
+                        return Ok(GuestOutcome::AlreadyAccepted);
+                    }
+                    attendees.remove(i);
+                }
+            }
+            let patch = serde_json::json!({ "attendees": attendees });
+            let opts = CallOptions {
+                if_match: Some(&etag),
+                unconfirmed_writes: true,
+            };
+            let result = self
+                .call_with(
+                    account,
+                    "PATCH",
+                    &path,
+                    &[("sendUpdates", "all")],
+                    Some(patch),
+                    opts,
+                )
+                .await;
+            match result {
+                Ok(resp) => return Ok(confirm(edit, &guest, resp.body, resp.etag)),
+                Err(CalendarError::PreconditionFailed { .. }) if attempt == 0 => {
+                    attempt += 1;
+                    continue;
+                }
+                Err(CalendarError::Unconfirmed(m)) => return Ok(GuestOutcome::Unconfirmed(m)),
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
-#[allow(dead_code)]
-fn unused(_: Value, _: CallOptions<'_>, _: &str) -> String {
-    path_segment("")
+/// The account organizes the event: Google marks the organizer block
+/// `self`, or it names the account.
+fn is_organizer(event: &Value, account: &str) -> bool {
+    let Some(org) = event.get("organizer") else {
+        return false;
+    };
+    org.get("self").and_then(Value::as_bool) == Some(true)
+        || org
+            .get("email")
+            .and_then(Value::as_str)
+            .is_some_and(|e| e.trim().eq_ignore_ascii_case(account.trim()))
+}
+
+fn attendee_email(a: &Value) -> Option<String> {
+    a.get("email")
+        .and_then(Value::as_str)
+        .map(|e| e.trim().to_ascii_lowercase())
+}
+
+/// "Executed" means Google returned 2xx **with** the updated attendee list
+/// showing the change; anything less is an unknown outcome.
+fn confirm(edit: Edit, guest: &str, body: Value, etag: Option<String>) -> GuestOutcome {
+    let Some(list) = body.get("attendees").and_then(Value::as_array) else {
+        if edit == Edit::Remove && body.get("id").is_some() && body.get("attendees").is_none() {
+            // Google omits `attendees` when the list is empty.
+            return GuestOutcome::Removed {
+                etag,
+                attendees: Vec::new(),
+            };
+        }
+        return GuestOutcome::Unconfirmed(
+            "Google accepted the update but returned no attendee list".into(),
+        );
+    };
+    let attendees: Vec<String> = list.iter().filter_map(attendee_email).collect();
+    let present = attendees.iter().any(|e| e == guest);
+    match (edit, present) {
+        (Edit::Add, true) => GuestOutcome::Added { etag, attendees },
+        (Edit::Remove, false) => GuestOutcome::Removed { etag, attendees },
+        (Edit::Add, false) => GuestOutcome::Unconfirmed(format!(
+            "Google accepted the update but {guest} is not on the returned attendee list"
+        )),
+        (Edit::Remove, true) => GuestOutcome::Unconfirmed(format!(
+            "Google accepted the update but {guest} is still on the returned attendee list"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -187,15 +332,26 @@ mod tests {
         let mut server = Server::new_async().await;
         let got = event("\"e1\"", existing_attendees(), false);
         let get = get_mock(&mut server, &got).await;
-        let patch = server.mock("PATCH", PATH).match_query(Matcher::Any).expect(0).create_async().await;
-        let out = client(server.url()).add_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
+        let patch = server
+            .mock("PATCH", PATH)
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let out = client(server.url())
+            .add_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap();
         assert_eq!(out, GuestOutcome::NotOrganizer);
         get.assert_async().await;
         patch.assert_async().await;
 
         // Undo is organizer-only too.
         let get = get_mock(&mut server, &got).await;
-        let out = client(server.url()).remove_guest(OWNER, "primary", "ev1", "sam@example.test").await.unwrap();
+        let out = client(server.url())
+            .remove_guest(OWNER, "primary", "ev1", "sam@example.test")
+            .await
+            .unwrap();
         assert_eq!(out, GuestOutcome::NotOrganizer);
         get.assert_async().await;
         patch.assert_async().await;
@@ -204,11 +360,22 @@ mod tests {
     #[tokio::test]
     async fn add_guest_noop_when_present() {
         let mut server = Server::new_async().await;
-        let list = with_guest(existing_attendees(), json!({"email": "TEAMMATE@example.test", "responseStatus": "needsAction"}));
+        let list = with_guest(
+            existing_attendees(),
+            json!({"email": "TEAMMATE@example.test", "responseStatus": "needsAction"}),
+        );
         let got = event("\"e1\"", list, true);
         let get = get_mock(&mut server, &got).await;
-        let patch = server.mock("PATCH", PATH).match_query(Matcher::Any).expect(0).create_async().await;
-        let out = client(server.url()).add_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
+        let patch = server
+            .mock("PATCH", PATH)
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let out = client(server.url())
+            .add_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap();
         assert_eq!(out, GuestOutcome::Noop);
         get.assert_async().await;
         patch.assert_async().await;
@@ -222,7 +389,10 @@ mod tests {
         let get1 = get_mock(&mut server, &first).await;
         // Second read sees the concurrent edit (a new attendee) and a new
         // etag; the retry must be built from it, not from the stale list.
-        let fresh_list = with_guest(existing_attendees(), json!({"email": "new@example.test", "responseStatus": "needsAction"}));
+        let fresh_list = with_guest(
+            existing_attendees(),
+            json!({"email": "new@example.test", "responseStatus": "needsAction"}),
+        );
         let second = event("\"v2\"", fresh_list.clone(), true);
         let get2 = get_mock(&mut server, &second).await;
         let stale = server
@@ -244,8 +414,14 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let out = client(server.url()).add_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
-        assert!(matches!(&out, GuestOutcome::Added { etag: Some(e), .. } if e == "\"v3\""), "{out:?}");
+        let out = client(server.url())
+            .add_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&out, GuestOutcome::Added { etag: Some(e), .. } if e == "\"v3\""),
+            "{out:?}"
+        );
         get1.assert_async().await;
         get2.assert_async().await;
         stale.assert_async().await;
@@ -266,8 +442,14 @@ mod tests {
             .expect(2)
             .create_async()
             .await;
-        let err = client(server.url()).add_guest(OWNER, "primary", "ev1", GUEST).await.unwrap_err();
-        assert!(matches!(err, CalendarError::PreconditionFailed { .. }), "{err}");
+        let err = client(server.url())
+            .add_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CalendarError::PreconditionFailed { .. }),
+            "{err}"
+        );
         always.assert_async().await;
     }
 
@@ -282,7 +464,9 @@ mod tests {
         let w = Arc::clone(&writes);
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let body = get_body.clone();
                 let w = Arc::clone(&w);
                 tokio::spawn(async move {
@@ -330,12 +514,22 @@ mod tests {
         use std::sync::atomic::Ordering;
         let got = event("\"e1\"", existing_attendees(), true).to_string();
         let (base, writes) = get_then_hang_up(got).await;
-        let out = client(base).add_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
+        let out = client(base)
+            .add_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap();
         assert!(matches!(out, GuestOutcome::Unconfirmed(_)), "{out:?}");
-        assert_eq!(writes.load(Ordering::SeqCst), 1, "an unknown-outcome PATCH is never retried");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "an unknown-outcome PATCH is never retried"
+        );
 
         // 5xx and an unreadable 2xx body are unknown outcomes too.
-        for (status, body) in [(503, r#"{"error":{"message":"backend"}}"#), (200, "{not json")] {
+        for (status, body) in [
+            (503, r#"{"error":{"message":"backend"}}"#),
+            (200, "{not json"),
+        ] {
             let mut server = Server::new_async().await;
             let _get = get_mock(&mut server, &event("\"e1\"", existing_attendees(), true)).await;
             let patch = server
@@ -346,8 +540,14 @@ mod tests {
                 .expect(1)
                 .create_async()
                 .await;
-            let out = client(server.url()).add_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
-            assert!(matches!(out, GuestOutcome::Unconfirmed(_)), "{status}: {out:?}");
+            let out = client(server.url())
+                .add_guest(OWNER, "primary", "ev1", GUEST)
+                .await
+                .unwrap();
+            assert!(
+                matches!(out, GuestOutcome::Unconfirmed(_)),
+                "{status}: {out:?}"
+            );
             patch.assert_async().await;
         }
 
@@ -360,14 +560,20 @@ mod tests {
             .with_body(event("\"e2\"", existing_attendees(), true).to_string())
             .create_async()
             .await;
-        let out = client(server.url()).add_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
+        let out = client(server.url())
+            .add_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap();
         assert!(matches!(out, GuestOutcome::Unconfirmed(_)), "{out:?}");
     }
 
     #[tokio::test]
     async fn undo_removes_only_that_attendee() {
         let mut server = Server::new_async().await;
-        let list = with_guest(existing_attendees(), json!({"email": GUEST, "responseStatus": "needsAction"}));
+        let list = with_guest(
+            existing_attendees(),
+            json!({"email": GUEST, "responseStatus": "needsAction"}),
+        );
         let got = event("\"u1\"", list, true);
         let get = get_mock(&mut server, &got).await;
         let patch = server
@@ -379,7 +585,10 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let out = client(server.url()).remove_guest(OWNER, "primary", "ev1", "TEAMMATE@example.test").await.unwrap();
+        let out = client(server.url())
+            .remove_guest(OWNER, "primary", "ev1", "TEAMMATE@example.test")
+            .await
+            .unwrap();
         get.assert_async().await;
         patch.assert_async().await;
         assert_eq!(
@@ -398,8 +607,16 @@ mod tests {
         // Not on the event: nothing to undo, nothing written.
         let mut server = Server::new_async().await;
         let _get = get_mock(&mut server, &event("\"u1\"", existing_attendees(), true)).await;
-        let none = server.mock("PATCH", PATH).match_query(Matcher::Any).expect(0).create_async().await;
-        let out = client(server.url()).remove_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
+        let none = server
+            .mock("PATCH", PATH)
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let out = client(server.url())
+            .remove_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap();
         assert_eq!(out, GuestOutcome::Noop);
         none.assert_async().await;
     }
@@ -407,10 +624,21 @@ mod tests {
     #[tokio::test]
     async fn undo_refused_after_accept() {
         let mut server = Server::new_async().await;
-        let list = with_guest(existing_attendees(), json!({"email": GUEST, "responseStatus": "accepted"}));
+        let list = with_guest(
+            existing_attendees(),
+            json!({"email": GUEST, "responseStatus": "accepted"}),
+        );
         let get = get_mock(&mut server, &event("\"u1\"", list, true)).await;
-        let patch = server.mock("PATCH", PATH).match_query(Matcher::Any).expect(0).create_async().await;
-        let out = client(server.url()).remove_guest(OWNER, "primary", "ev1", GUEST).await.unwrap();
+        let patch = server
+            .mock("PATCH", PATH)
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let out = client(server.url())
+            .remove_guest(OWNER, "primary", "ev1", GUEST)
+            .await
+            .unwrap();
         assert_eq!(out, GuestOutcome::AlreadyAccepted);
         get.assert_async().await;
         patch.assert_async().await;

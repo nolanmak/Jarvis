@@ -29,8 +29,6 @@ pub use candidates::{
     connected_google_calendar_accounts, Candidate, CandidateSet, CandidateWindow, EventRef,
     WindowSource, MAX_CANDIDATES,
 };
-pub use google_direct::{CallOptions, CallResponse, GoogleCalendar, GoogleTokens};
-pub use guest::GuestOutcome;
 pub use channel::{
     poll_window, synthetic_attendee_email, CalendarChannel, CalendarChannelConfig,
     PollOutcome,
@@ -40,6 +38,8 @@ pub use gcal::{
     ensure_organizer_accepted, CalendarApi, CalendarError, ComposioCalendarClient,
     CreatedEvent, EventDraft, RsvpResponse,
 };
+pub use google_direct::{CallOptions, CallResponse, GoogleCalendar, GoogleTokens};
+pub use guest::GuestOutcome;
 pub use rsvp::{InviteDecision, RsvpRequest};
 pub use trigger::{CalendarTrigger, HOT_LOOKAHEAD_HOURS, HOT_LOOKBACK_HOURS};
 pub use types::{
