@@ -140,23 +140,33 @@ kretprobe:getname_flags
   }
   $tail=(uint64)0;
   while ($tail<8 && $length<4096 && *(uint8 *)($name+$length)!=0) { $length=$length+1; $tail=$tail+1; }
+  @length[tid]=$length;
+  $length=@length[tid];
+  $owner_uid=uid; $owner_pid=pid; $owner_tid=tid;
+  $call=@number[tid]; $entry=@sequence[tid];
   $offset=(uint64)0;
-  while ($offset<$length) {
-   printf("N %u %u %u %lld %llu %llu %llu %s\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],
-    $offset,$length,str($name+$offset,64));
-   @emitted=count(); $offset=$offset+63;
+  $chunks=(uint64)0;
+  if ($length>0 && $length<=4096) {
+   while ($offset<$length) {
+    printf("N %u %u %u %lld %llu %llu %llu %s\n",$owner_uid,$owner_pid,$owner_tid,(int64)$call,$entry,
+     $offset,$length,str($name+$offset,64));
+    $chunks=$chunks+1; $offset=$offset+63;
+   }
+  } else {
+   printf("invalid kernel pathname length\n"); $chunks=1;
   }
+  @emitted=sum($chunks);
   @seen[tid] = 1;
  }
 }
 rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  if (@seen[tid]) {
   printf("E %u %u %u %lld %llu %lld\n",uid,pid,tid,(int64)@number[tid],@sequence[tid],(int64)arg1);
-  @emitted = count();
+  @emitted = sum(1);
  }
  delete(@seen[tid]); delete(@number[tid]);
 }
-END { clear(@seen); clear(@sequence); clear(@number); }
+END { clear(@seen); clear(@length); clear(@sequence); clear(@number); }
 '''
 _WITNESS=r'''
 import ctypes,errno,os,sys
@@ -223,7 +233,7 @@ class Observer:
         finally:os.close(descriptor)
         self.output=self.stdout.open('xb');self.error=self.stderr.open('xb')
         os.chmod(self.stdout,0o600);os.chmod(self.stderr,0o600)
-        self.child=subprocess.Popen([str(binary),'-v','-kk','-q','-B','none','-f','json','-e',self.program],
+        self.child=subprocess.Popen([str(binary),'-kk','-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
             env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'',
                 '__BPFTRACE_NOTIFY_PROBES_ATTACHED':'1','HOME':'/tmp'})
