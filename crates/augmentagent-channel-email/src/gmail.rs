@@ -237,6 +237,12 @@ impl ComposioClient {
         let email = crate::google::email_of(entity_id)?;
         let built = self.google.get_or_init(|| {
             crate::google::GoogleGmail::from_env()
+                .map(|g| match &self.rate_limit_store {
+                    // #1833 D12 — the daemon's store also receives each
+                    // Gmail-direct message's sender authentication.
+                    Some(store) => g.with_sender_auth_store(Arc::clone(store)),
+                    None => g,
+                })
                 .map(Arc::new)
                 .map_err(|e| e.to_string())
         });

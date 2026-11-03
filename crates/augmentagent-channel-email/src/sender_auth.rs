@@ -27,8 +27,104 @@ pub fn sender_auth_from_headers<'a, I>(headers: I, from: &str) -> Option<SenderA
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
-    let _ = (headers.into_iter().count(), from);
-    todo!()
+    let value = headers.into_iter().find_map(|(name, value)| {
+        (name.trim().eq_ignore_ascii_case("Authentication-Results") && is_google_authserv(value)).then_some(value)
+    })?;
+    let from_domain = from_domain(from);
+    let mut auth = SenderAuth { dmarc_pass: false, dkim_aligned: false };
+    // resinfo entries follow the authserv-id, separated by `;`.
+    for resinfo in strip_comments(value).split(';').skip(1) {
+        let mut tokens = resinfo.split_whitespace();
+        let Some(result) = tokens.next() else { continue };
+        let Some((method, verdict)) = result.split_once('=') else { continue };
+        let method = method.to_ascii_lowercase();
+        let pass = verdict.eq_ignore_ascii_case("pass");
+        if method == "dmarc" && pass {
+            auth.dmarc_pass = true;
+        } else if method == "dkim" && pass {
+            let mut signer = None;
+            for prop in tokens {
+                let Some((key, val)) = prop.split_once('=') else { continue };
+                match key.to_ascii_lowercase().as_str() {
+                    "header.d" => signer = Some(val.to_string()),
+                    // Google writes `header.i=@domain` (AUID); its domain is
+                    // the signing domain or a subdomain of it.
+                    "header.i" if signer.is_none() => {
+                        signer = val.rsplit_once('@').map(|(_, d)| d.to_string())
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some(signer), Some(from)) = (signer, from_domain.as_deref()) {
+                if aligned(&signer, from) {
+                    auth.dkim_aligned = true;
+                }
+            }
+        }
+    }
+    Some(auth)
+}
+
+/// Whether the header's authserv-id — the first token before the first
+/// `;` — is Google's. A trailing version (`mx.google.com 1`) is allowed by
+/// RFC 8601.
+fn is_google_authserv(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .and_then(|head| head.split_whitespace().next())
+        .is_some_and(|id| id.eq_ignore_ascii_case(GOOGLE_AUTHSERV_ID))
+}
+
+/// Remove RFC 5322 comments (`(...)`, nestable) so text inside them can't
+/// read as a result.
+fn strip_comments(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for c in value.chars() {
+        if depth > 0 {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+            }
+            continue;
+        }
+        if c == '(' {
+            depth = 1;
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Domain of the `From` address (`Name <a@b>` or bare), lowercased.
+fn from_domain(from: &str) -> Option<String> {
+    let trimmed = from.trim();
+    let addr = match (trimmed.rfind('<'), trimmed.rfind('>')) {
+        (Some(open), Some(close)) if close > open => &trimmed[open + 1..close],
+        _ => trimmed,
+    };
+    let (_, domain) = addr.trim().rsplit_once('@')?;
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!domain.is_empty()).then_some(domain)
+}
+
+/// The signing domain equals the From domain or is a parent of it (relaxed
+/// alignment). A single-label signer (a bare TLD) never aligns.
+fn aligned(signer: &str, from: &str) -> bool {
+    let signer = signer.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !signer.contains('.') {
+        return false;
+    }
+    from == signer || from.ends_with(&format!(".{signer}"))
 }
 
 #[cfg(test)]

@@ -301,6 +301,22 @@ impl GoogleGmail {
         self
     }
 
+    /// #1833 D12 — persist Google's verdict on `msg`'s sender, when a
+    /// store is attached and the message carries Google's own
+    /// `Authentication-Results` header. A store failure is logged, never
+    /// fatal to the fetch: a missing record reads as unauthenticated.
+    fn record_sender_auth(&self, msg: &GmailMessage) {
+        let Some(store) = &self.sender_auth_store else { return };
+        let Some(auth) = msg.sender_auth() else { return };
+        if msg.id.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Err(e) = store.record_email_sender_auth(&msg.id, auth, now) {
+            tracing::warn!(message_id = %msg.id, error = %e, "could not record sender authentication");
+        }
+    }
+
     pub fn app(&self) -> &OAuthApp {
         &self.app
     }
@@ -732,6 +748,7 @@ impl GoogleGmail {
                     Some(v) => {
                         let msg: GmailMessage = serde_json::from_value(v)
                             .map_err(|e| GmailError::Decode(format!("messages.get {id}: {e}")))?;
+                        self.record_sender_auth(&msg);
                         Ok(Some(msg.into_email(&entity_id_for(email))))
                     }
                 }
@@ -766,7 +783,10 @@ impl GoogleGmail {
         let mut msgs: Vec<Email> = thread
             .messages
             .into_iter()
-            .map(|m| m.into_email(&entity))
+            .map(|m| {
+                self.record_sender_auth(&m);
+                m.into_email(&entity)
+            })
             .collect();
         msgs.sort_by_key(|m| crate::outbound::parse_rfc2822_or_ms(&m.date));
         if max > 0 && msgs.len() > max as usize {
@@ -1275,6 +1295,16 @@ impl GmailMessage {
                 })
             })
             .unwrap_or_default()
+    }
+
+    /// #1833 D12 — Google's verdict from the top-most `mx.google.com`
+    /// `Authentication-Results` header (headers are in message order).
+    pub(crate) fn sender_auth(&self) -> Option<crate::sender_auth::SenderAuth> {
+        let part = self.payload.as_ref()?;
+        crate::sender_auth::sender_auth_from_headers(
+            part.headers.iter().map(|h| (h.name.as_str(), h.value.as_str())),
+            &self.header("From"),
+        )
     }
 
     pub(crate) fn into_email(self, account_entity_id: &str) -> Email {
