@@ -177,7 +177,7 @@ class PlannerProtocolTests(unittest.TestCase):
             'allocation_removed':True}
         census={'pid':100,'birth':1000,
             'programs':[{'id':i,'type':17 if i in (1,4) else 2,'tag':str(i)*16,'recursion_misses':0} for i in range(1,5)],
-            'links':[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kprobe_multi',
+            'links':[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
                 'prog_id':i,'tag':str(i)*16,**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
                     else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]}
         value['kernel_observation']['probe_census']={'before':census,'after':json.loads(json.dumps(census))}

@@ -76,7 +76,7 @@ def validate_census(value):
                         or programs[link['prog_id']]['type']!=17):
                     raise ObservationUnavailable('original syscall attachment unavailable')
                 raw.add(link['tracepoint'])
-            elif link['type']=='kprobe_multi':
+            elif link['type']=='kretprobe_multi':
                 if (set(link)!={'id','type','prog_id','tag','function','count','flags','missed'}
                         or link['function']!='getname_flags' or programs[link['prog_id']]['type']!=2
                         or any(type(link[key]) is not int for key in ('count','flags','missed'))
@@ -95,11 +95,19 @@ def _fdinfo(data):
     if len(data)>16384:raise ObservationUnavailable('unbounded kernel descriptor metadata')
     try:text=data.decode('ascii')
     except UnicodeError:raise ObservationUnavailable('unknown kernel descriptor encoding') from None
-    result={}
-    for line in text.splitlines():
+    result={};lines=text.splitlines();table=False
+    for ordinal,line in enumerate(lines):
+        if re.fullmatch(r'cookie[ \t]+func',line):
+            rows=lines[ordinal+1:]
+            if (result.get('link_type')!='kretprobe_multi' or result.get('kprobe_cnt')!='1'
+                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+getname_flags\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
+                raise ObservationUnavailable('unknown kernel function table')
+            table=True;break
         match=re.fullmatch(r'([a-z0-9_]+):[ \t]*(.*)',line)
         if match is None or match[1] in result:raise ObservationUnavailable('ambiguous kernel descriptor metadata')
         result[match[1]]=match[2]
+    if result.get('link_type')=='kretprobe_multi' and not table:
+        raise ObservationUnavailable('kernel function table missing')
     return result
 
 
@@ -177,7 +185,10 @@ def kernel_census(child,owner,birth,address,diagnostic):
             identity=_number(info.get('link_id'));program=_number(info.get('prog_id'));kind=info.get('link_type')
             link={'id':identity,'type':kind,'prog_id':program,'tag':info.get('prog_tag')}
             if kind=='raw_tracepoint':link['tracepoint']=info.get('tp_name')
-            elif kind=='kprobe_multi':link.update(_return_link(identity,program,address))
+            elif kind=='kretprobe_multi':
+                link.update(_return_link(identity,program,address))
+                if link['missed']!=_number(info.get('missed')):
+                    raise ObservationUnavailable('kernel counters changed during census')
             else:raise ObservationUnavailable('unaccounted observer attachment')
             links.append(link)
     if child.poll() is not None or _birth(child.pid,owner)!=birth:

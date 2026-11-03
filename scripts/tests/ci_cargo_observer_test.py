@@ -24,13 +24,22 @@ def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
 
 def census_sample():
     programs=[{'id':i,'type':17 if i in (1,4) else 2,'tag':str(i)*16,'recursion_misses':0} for i in range(1,5)]
-    links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kprobe_multi',
+    links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
         'prog_id':i,'tag':str(i)*16,**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
             else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]
     return {'pid':42,'birth':1000,'programs':programs,'links':links}
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_kernel_return_link_fdinfo_requires_one_exact_function_table_row(self):
+        data=(b'pos:\t0\nlink_type:\tkretprobe_multi\nlink_id:\t3\nprog_id:\t6\n'
+            b'kprobe_cnt:\t1\nmissed:\t0\ncookie\t func\n0\t getname_flags+0x0/0x20\n')
+        self.assertEqual(observer._fdinfo(data)['missed'],'0')
+        for bad in (data.replace(b'getname_flags',b'other_function'),data.replace(b'+0x0/',b'+0x1/'),
+                data.replace(b'0\t getname',b'1\t getname'),data.replace(b'kprobe_cnt:\t1',b'kprobe_cnt:\t2'),
+                data+b'0\t getname_flags+0x0/0x20\n',data.split(b'cookie')[0],data+b'missed:\t0\n'):
+            with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer._fdinfo(bad)
+
     def test_only_the_same_four_original_links_and_programs_with_zero_misses_have_a_census(self):
         sample=census_sample();value={'before':sample,'after':copy.deepcopy(sample)}
         observer.validate_census(value)
