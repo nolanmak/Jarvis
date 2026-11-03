@@ -87,8 +87,12 @@ pub fn value()->u8{GENERATED}
         && probe["kernel_observation"]["max_path_query_observed"]==true
         && probe["kernel_observation"]["binary_path_query_observed"]==true
         && probe["kernel_observation"]["missed_probe_census_complete"]==true
-        && probe["kernel_observation"]["probe_census"]["before"]["links"].as_array().is_some_and(|values|values.len()==14)
-        && probe["kernel_observation"]["probe_census"]["after"]["programs"].as_array().is_some_and(|values|values.len()==14)
+        && probe["kernel_observation"]["probe_census"]["before"]["links"].as_array().is_some_and(|values|values.len()==16)
+        && probe["kernel_observation"]["probe_census"]["after"]["programs"].as_array().is_some_and(|values|values.len()==16)
+        && probe["kernel_observation"]["lookup_base_query_observed"]==true
+        && probe["kernel_observation"]["lookup_changed_cwd_observed"]==true
+        && probe["kernel_observation"]["lookup_invalid_base_observed"]==true
+        && probe["kernel_observation"]["lookup_base_attempts"].as_u64().is_some_and(|value|value>=4)
         && probe["kernel_observation"]["path_metadata_query_observed"]==true
         && probe["kernel_observation"]["statx_copy_verified"]==true
         && probe["kernel_observation"]["path_metadata_failed_copy_observed"]==true

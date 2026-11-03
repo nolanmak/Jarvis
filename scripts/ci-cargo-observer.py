@@ -2,7 +2,7 @@
 """Private kernel-copied pathname feasibility probe, not an input-proof API.
 
 Only selected lookup spellings and getdents64 actor results are observed. The
-fourteen original kernel attachments require a bounded miss census. This does not establish full
+sixteen original kernel attachments require a bounded miss census. This does not establish full
 syscall/metadata/device coverage, compatibility or reuse authority. It does not
 emulate or change the target's system calls.
 """
@@ -32,7 +32,8 @@ CHUNK_BYTES=63
 SYSCALLS={2,4,6,21,89,257,262,267,269,332,439}
 PROBE_ROLES={('getname_flags',1):2,('iterate_dir',0):1,('iterate_dir',1):1,
     ('filldir64',0):1,('filldir64',1):1,('vfs_fstat',0):1,('vfs_fstat',1):1,
-    ('cp_new_stat',0):1,('cp_new_stat',1):1,('cp_statx',0):1,('cp_statx',1):1}
+    ('cp_new_stat',0):1,('cp_new_stat',1):1,('cp_statx',0):1,('cp_statx',1):1,
+    ('path_init',0):1,('path_init',1):1}
 PROBE_COUNT=2+sum(PROBE_ROLES.values())
 
 
@@ -108,7 +109,7 @@ def _fdinfo(data):
         if re.fullmatch(r'cookie[ \t]+func',line):
             rows=lines[ordinal+1:]
             if (result.get('link_type') not in ('kprobe_multi','kretprobe_multi') or result.get('kprobe_cnt')!='1'
-                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat|cp_new_stat|cp_statx)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
+                    or len(rows)!=1 or re.fullmatch(r'0[ \t]+(getname_flags|iterate_dir|filldir64|vfs_fstat|cp_new_stat|cp_statx|path_init)\+0x0/0x[1-9a-f][0-9a-f]{0,15}',rows[0]) is None):
                 raise ObservationUnavailable('unknown kernel function table')
             result['function']=rows[0].split()[1].split('+',1)[0]
             table=True;break
@@ -350,6 +351,78 @@ STAT_TIMES=('atime_sec','atime_nsec','mtime_sec','mtime_nsec','ctime_sec','ctime
 STATX_FIELDS=('attributes','attributes_mask','btime_sec','btime_nsec','mnt_id','change_cookie','subvol',
     'dio_mem_align','dio_offset_align','dio_read_offset_align','atomic_write_unit_min','atomic_write_unit_max',
     'atomic_write_unit_max_opt','atomic_write_segments_max')
+BASE_FIELDS=('device','inode','mode','dentry','mount','inode_generation','path_seq','dentry_seq','flags','state')
+
+
+def lookup_bases(records,*,complete=True):
+    """Original path_init attempts; a chosen base is not a completed path walk."""
+    if type(records) is not list or len(records)>40000:raise ObservationUnavailable('unbounded lookup bases')
+    pairs={};counts={'Q':5,'R':2,'C':11}
+    for line in records:
+        if type(line) is not str or len(line)>1024:raise ObservationUnavailable('unbounded lookup base record')
+        match=re.fullmatch(r'([QRC]) ([0-9]{1,4}) ([1-9][0-9]{0,9}) ([1-9][0-9]{0,9}) ([0-9]{1,4}) ([1-9][0-9]{0,19}) (.*)',line)
+        if match is None:raise ObservationUnavailable('unknown lookup base record')
+        kind=match[1];uid,pid,tid,call,sequence=map(int,match.groups()[1:6])
+        if (not (uid==1999 or 2000<=uid<6096) or pid>=2**31 or tid>=2**31
+                or call not in SYSCALLS or sequence>=2**64
+                or re.fullmatch(r'-?[0-9]{1,20}(?: -?[0-9]{1,20}){'+str(counts[kind]-1)+'}',match[7]) is None):
+            raise ObservationUnavailable('foreign lookup base observation')
+        values=tuple(map(int,match[7].split()));attempt=values[0]
+        if not 1<=attempt<=64 or any(not -2**63<=v<2**64 for v in values):
+            raise ObservationUnavailable('lookup base value overflow')
+        pair=pairs.setdefault((uid,pid,tid,call,sequence,attempt),{})
+        if kind in pair:raise ObservationUnavailable('duplicate lookup base record')
+        pair[kind]=values[1:]
+    result=[];ordinals={}
+    for (uid,pid,tid,call,sequence,attempt),pair in sorted(pairs.items()):
+        if not {'Q','R'}<=set(pair):
+            if complete:raise ObservationUnavailable('incomplete lookup base')
+            continue
+        dfd,flags,mount_namespace,user_namespace=pair['Q'];status,=pair['R']
+        if (not -2**31<=dfd<2**31 or not 0<=flags<2**32 or not -4095<=status<=0
+                or not 0<mount_namespace<2**32 or not 0<user_namespace<2**32):
+            raise ObservationUnavailable('invalid lookup base context')
+        expected={'Q','R','C'} if status==0 else {'Q','R'}
+        if set(pair)!=expected:
+            if complete:raise ObservationUnavailable('lookup base object unavailable')
+            continue
+        base=None
+        if status==0:
+            base=dict(zip(BASE_FIELDS,pair['C']))
+            limits={key:(64 if key in ('inode','dentry','mount') else 16 if key=='mode' else 32) for key in BASE_FIELDS}
+            if (any(not 0<=base[key]<2**bits for key,bits in limits.items())
+                    or not base['dentry'] or not base['mount']):
+                raise ObservationUnavailable('invalid lookup base object')
+        key=(uid,pid,tid,call,sequence);ordinals.setdefault(key,[]).append(attempt)
+        result.append({'uid':uid,'pid':pid,'tid':tid,'syscall':call,'sequence':sequence,'attempt':attempt,
+            'dfd':dfd,'entry_flags':flags,'mount_namespace':mount_namespace,'user_namespace':user_namespace,
+            'init_result':status,'base':base})
+    if complete and any(values!=list(range(1,len(values)+1)) for values in ordinals.values()):
+        raise ObservationUnavailable('lookup base attempt sequence incomplete')
+    return result
+
+
+def lookup_base_witness(events,pid,uid,path,call,result,*,dfd,user_namespace,mount_namespace,expected=None,init_result=0):
+    info=expected.stat() if expected is not None else None
+    for event in events:
+        if (event['pid']!=event['tid'] or event['pid']!=pid or event['uid']!=uid
+                or event['path']!=path or event['syscall']!=call or event['result']!=result):continue
+        attempts=event['lookup_attempts']
+        if not attempts:continue
+        valid=True
+        for attempt in attempts:
+            base=attempt['base']
+            if (attempt['dfd']!=dfd or attempt['user_namespace']!=user_namespace
+                    or attempt['mount_namespace']!=mount_namespace or attempt['init_result']!=init_result):valid=False;break
+            if init_result!=0:
+                if base is not None:valid=False;break
+                continue
+            if (base is None or base['flags']&256 and (base['path_seq']!=base['dentry_seq'] or base['path_seq']&1)):
+                valid=False;break
+            if info is not None and (base['device'],base['inode'],base['mode'])!=((os.major(info.st_dev)<<20)|os.minor(info.st_dev),info.st_ino,info.st_mode):
+                valid=False;break
+        if valid:return
+    raise ObservationUnavailable('original lookup base witness missing')
 
 
 def _metadata_fields(pair,*,statx=False):
@@ -508,7 +581,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
     if not complete and not data.endswith(b'\n'):data=data.rpartition(b'\n')[0]+b'\n'
     try:lines=data.decode('ascii').splitlines()
     except UnicodeError:raise ObservationUnavailable('unknown pathname encoding') from None
-    pairs={};directories=[];metadata=[];count=None;records=0;loader_records=0
+    pairs={};directories=[];metadata=[];bases=[];count=None;records=0;loader_records=0
     for line in lines:
         if not line:continue
         if (re.fullmatch(r'Program ID: [1-9][0-9]{0,9}',line)
@@ -532,7 +605,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
         if type(record) is not dict or set(record)!={'type','data'}:raise ObservationUnavailable('unknown kernel record')
         if record['type']=='attached_probes':
             if (type(record['data']) is not dict or set(record['data'])!={'probes'}
-                    or type(record['data']['probes']) is not int or not 1<=record['data']['probes']<=16):
+                    or type(record['data']['probes']) is not int or not 1<=record['data']['probes']<=PROBE_COUNT+1):
                 raise ObservationUnavailable('unknown attachment record')
             continue
         if record['type']=='map':
@@ -543,6 +616,10 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
         if record['type']!='printf' or type(record['data']) is not str or not record['data'].endswith('\n'):
             raise ObservationUnavailable('unknown kernel event')
         line=record['data'][:-1]  # Preserve embedded newlines; never reinterpret them as events.
+        if line[:2] in ('Q ','R ','C '):
+            bases.append(line);records+=1
+            if records>40000:raise ObservationUnavailable('observation limit exceeded')
+            continue
         if line[:2] in ('F ','H ','J ','K ','L ','Z ','U ','P ','O ','Y '):
             metadata.append(line);records+=1
             if records>40000:raise ObservationUnavailable('observation limit exceeded')
@@ -596,6 +673,12 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False):
     queries=directory_queries(directories,complete=complete)
     stats=metadata_queries(metadata,complete=complete)
     lookup={(e['uid'],e['pid'],e['tid'],e['syscall'],e['sequence']):e for e in events}
+    for event in events:event['lookup_attempts']=[]
+    for base in lookup_bases(bases,complete=complete):
+        event=lookup.get(tuple(base[k] for k in ('uid','pid','tid','syscall','sequence')))
+        if event is None:
+            if complete:raise ObservationUnavailable('lookup base has no original query')
+        else:event['lookup_attempts'].append(base)
     for query in stats:
         if query['syscall'] in (262,332):
             event=lookup.get(tuple(query[k] for k in ('uid','pid','tid','syscall','sequence')))
@@ -622,6 +705,7 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  @directory_attempt[tid]=(uint64)0; @directory_active[tid]=(uint64)0;
  @fstat_active[tid]=(uint64)0;
  @copy_active[tid]=(uint64)0;
+ @base_depth[tid]=(uint64)0; @base_count[tid]=(uint64)0;
  if (arg1==262 || arg1==332) {
   $regs=(struct pt_regs *)arg0;
   @path_fd[tid]=(uint64)$regs->di;
@@ -705,6 +789,53 @@ kretprobe:vfs*_fstat / ((uid >= 2000 && uid < 6096) || uid == 1999) && @number[t
   printf("L %u %u %u %llu %lld\n",uid,pid,tid,@sequence[tid],$status);
   @emitted=sum(1); @fstat_active[tid]=(uint64)0;
  }
+}
+kprobe:path_i*nit / ((uid >= 2000 && uid < 6096) || uid == 1999) && @seen[tid] / {
+ @base_depth[tid]=@base_depth[tid]+1;
+ $depth=@base_depth[tid];
+ if ($depth<=16) {
+  @base_seq[tid,$depth]=(uint64)0;
+  $nd=(struct nameidata *)arg0;
+  if ((uint64)$nd->pathname==@original_name[tid]) {
+   @base_count[tid]=@base_count[tid]+1;
+   @base_nd[tid,$depth]=arg0; @base_seq[tid,$depth]=@sequence[tid];
+   @base_attempt[tid,$depth]=@base_count[tid];
+   $task=(struct task_struct *)curtask;
+   printf("Q %u %u %u %llu %llu %llu %lld %llu %llu %llu\n",uid,pid,tid,@number[tid],@sequence[tid],
+    @base_count[tid],(int64)$nd->dfd,(uint64)(uint32)arg1,
+    (uint64)$task->nsproxy->mnt_ns->ns.inum,(uint64)$task->cred->user_ns->ns.inum);
+   @emitted=sum(1);
+  }
+ } else { printf("lookup base nesting limit exceeded\n"); @emitted=sum(1); }
+}
+kretprobe:path_i*nit / ((uid >= 2000 && uid < 6096) || uid == 1999) && @seen[tid] / {
+ $depth=@base_depth[tid];
+ if ($depth>0 && $depth<=16 && @base_seq[tid,$depth]>0 && @base_seq[tid,$depth]==@sequence[tid]) {
+  $nd=(struct nameidata *)@base_nd[tid,$depth];
+  $attempt=@base_attempt[tid,$depth];
+  $status=(int64)0;
+  if ((uint64)retval>=(uint64)0xfffffffffffff001) { $status=(int64)retval; }
+  printf("R %u %u %u %llu %llu %llu %lld\n",uid,pid,tid,@number[tid],@sequence[tid],$attempt,$status);
+  @emitted=sum(1);
+  if ($status==0) {
+   if ((uint64)retval!=@original_name[tid]) { printf("lookup base pathname changed\n"); @emitted=sum(1); }
+   else {
+    $inode=$nd->inode; $dentry=$nd->path.dentry;
+    if ((uint64)$inode==0 || (uint64)$dentry==0 || (uint64)$nd->path.mnt==0) {
+     printf("lookup base object missing\n"); @emitted=sum(1);
+    } else {
+     printf("C %u %u %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",uid,pid,tid,@number[tid],@sequence[tid],$attempt,
+      (uint64)$inode->i_sb->s_dev,(uint64)$inode->i_ino,(uint64)$inode->i_mode,
+      (uint64)$dentry,(uint64)$nd->path.mnt,(uint64)$inode->i_generation,
+      (uint64)$nd->seq,(uint64)$dentry->d_seq.seqcount.sequence,(uint64)$nd->flags,(uint64)$nd->state);
+     @emitted=sum(1);
+    }
+   }
+  }
+  @base_seq[tid,$depth]=(uint64)0;
+ }
+ if ($depth>0) { @base_depth[tid]=$depth-1; }
+ else { printf("lookup base return without entry\n"); @emitted=sum(1); }
 }
 __COPY_METADATA_PROBES__
 kretprobe:getname_flags*
@@ -797,7 +928,8 @@ rawtracepoint:sys_exit / (uid >= 2000 && uid < 6096) || uid == 1999 / {
 }
 END { clear(@seen); clear(@ready); clear(@original_name); clear(@length); clear(@sequence); clear(@number);
  clear(@directory_attempt); clear(@directory_active); clear(@directory_context);
- clear(@fstat_active); clear(@fstat_stat); clear(@copy_active); clear(@path_fd); clear(@path_flags); clear(@path_mask); }
+ clear(@fstat_active); clear(@fstat_stat); clear(@copy_active); clear(@path_fd); clear(@path_flags); clear(@path_mask);
+ clear(@base_depth); clear(@base_count); clear(@base_seq); clear(@base_nd); clear(@base_attempt); }
 '''
 _COPY_BASIC=r'''
  printf("J %u %u %u %llu %llu %llu %llu %llu %llu %llu %llu %lld %llu %llu %llu\n",uid,pid,tid,@sequence[tid],
@@ -879,6 +1011,7 @@ class Observer:
         self.birth=None;self.kernel_address=None
         self.directory_path=Path('/proc/sys/kernel/random');self.directory_members=None
         self.user_namespace=Path('/proc/self/ns/user').stat().st_ino
+        self.mount_namespace=Path('/proc/self/ns/mnt').stat().st_ino
 
     def __enter__(self):
         try:self.start();return self
@@ -964,6 +1097,8 @@ class Observer:
                         metadata_witness(metadata,witness.pid,1999,self.directory_path,self.user_namespace)
                         path_metadata_witness(metadata,witness.pid,1999,self.directory_path,self.user_namespace,
                             lookup=b'/proc/sys/kernel/random',flags=0)
+                        lookup_base_witness(paths,witness.pid,1999,self.witness.encode(),257,-errno.ENOENT,
+                            dfd=-100,user_namespace=self.user_namespace,mount_namespace=self.mount_namespace)
                     except ObservationUnavailable:pass
                     else:self.witness_pid=witness.pid;return
                 time.sleep(.01)
@@ -990,7 +1125,7 @@ class Observer:
         for stream in (self.output,self.error):
             if stream is not None and not stream.closed:stream.close()
 
-    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest):
+    def finish(self,unit_pid,compilers,directories,cursor_directory,stat_file,statx_digest,source_root,mount_namespace):
         self.stop()
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
@@ -1009,6 +1144,19 @@ class Observer:
             lookup=b'src/lib.rs',flags=256,dirpath=stat_file.parent,digest=statx_digest)
         stats=[q for q in metadata if q['uid']==2004 and q['pid']==q['tid']==unit_pid
             and q['user_namespace']==self.user_namespace]
+        for outcome,base in ((0,source_root),(-errno.ENOENT,stat_file.parent)):
+            lookup_base_witness(events,unit_pid,2004,b'src/main.rs',262,outcome,dfd=-100,
+                user_namespace=self.user_namespace,mount_namespace=mount_namespace,expected=base)
+        descriptor_calls=[e for e in events if e['pid']==e['tid']==unit_pid and e['uid']==2004
+            and e['syscall']==262 and e['path']==b'src/lib.rs' and e['result']==0]
+        if not any(e['lookup_attempts'] and e['lookup_attempts'][0]['dfd']>=0 for e in descriptor_calls):
+            raise ObservationUnavailable('original descriptor lookup base missing')
+        for event in descriptor_calls:
+            if event['lookup_attempts'] and event['lookup_attempts'][0]['dfd']>=0:
+                lookup_base_witness([event],unit_pid,2004,b'src/lib.rs',262,0,dfd=event['lookup_attempts'][0]['dfd'],
+                    user_namespace=self.user_namespace,mount_namespace=mount_namespace,expected=stat_file.parent)
+        lookup_base_witness(events,unit_pid,2004,b'src/main.rs',262,-errno.EBADF,dfd=-1,
+            user_namespace=self.user_namespace,mount_namespace=mount_namespace,init_result=-errno.EBADF)
         if not any(q['fd']==-1 and q['vfs_result']==q['result']==-errno.EBADF and q['stat'] is None for q in stats):
             raise ObservationUnavailable('original invalid-fd fstat witness missing')
         if not any(q['fd']>=0 and q['vfs_result']==0 and q['result']==-errno.EFAULT
@@ -1059,6 +1207,8 @@ class Observer:
             'fstat_invalid_fd_observed':True,'fstat_failed_copy_observed':True,
             'path_metadata_query_observed':True,'statx_copy_verified':True,
             'path_metadata_failed_copy_observed':True,'path_metadata_lookup_failure_observed':True,
+            'lookup_base_attempts':sum(len(e['lookup_attempts']) for e in events),
+            'lookup_base_query_observed':True,'lookup_changed_cwd_observed':True,'lookup_invalid_base_observed':True,
             'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'probe_census':census,
             'input_closure_complete':False,'allocation_removed':False}
         if cache._read_record(self.root/'control.json')!=self.control:
@@ -1079,12 +1229,13 @@ def validate(value,binding,command):
         'directory_short_read_observed','directory_eof_observed','cargo_directory_queries_observed','directory_cursor_query_observed'}
     keys|={'metadata_queries','fstat_query_observed','fstat_invalid_fd_observed','fstat_failed_copy_observed'}
     keys|={'path_metadata_query_observed','statx_copy_verified','path_metadata_failed_copy_observed','path_metadata_lookup_failure_observed'}
+    keys|={'lookup_base_attempts','lookup_base_query_observed','lookup_changed_cwd_observed','lookup_invalid_base_observed'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['kind']!='kernel-copied-filename-probe' or value['binding']!=binding or value['command']!=command
             or type(value['unit_pid']) is not int or not 0<value['unit_pid']<2**31
             or type(value['unit_uid']) is not int or value['unit_uid']!=2004
             or type(value['events']) is not int or not 3<=value['events']<=20000
-            or any(type(value[key]) is not int or not 1<=value[key]<=40000 for key in ('directory_reads','directory_entries','metadata_queries'))
+            or any(type(value[key]) is not int or not 1<=value[key]<=40000 for key in ('directory_reads','directory_entries','metadata_queries','lookup_base_attempts'))
             or type(value['kernel_release']) is not str or re.fullmatch(r'[A-Za-z0-9+_.-]{1,128}',value['kernel_release']) is None
             or not cache._digest(value['program_sha256']) or not cache._digest(value['binary_sha256'])
             or any(value[key] is not True for key in ('witness_observed','positive_query_observed',
@@ -1096,6 +1247,7 @@ def validate(value,binding,command):
             or any(value[key] is not True for key in ('fstat_query_observed','fstat_invalid_fd_observed','fstat_failed_copy_observed'))
             or any(value[key] is not True for key in ('path_metadata_query_observed','statx_copy_verified',
                 'path_metadata_failed_copy_observed','path_metadata_lookup_failure_observed'))
+            or any(value[key] is not True for key in ('lookup_base_query_observed','lookup_changed_cwd_observed','lookup_invalid_base_observed'))
             or value['directory_cursor_query_observed'] is not True
             or any(value[key] is not False for key in ('shipping_authority','filesystem_coverage_complete','input_closure_complete'))):
         raise ObservationUnavailable('kernel observation is incomplete or foreign')

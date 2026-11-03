@@ -29,7 +29,7 @@ def census_sample():
     links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kretprobe_multi',
         'prog_id':i,'tag':f'{i:016x}',**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
             else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]
-    for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1),('vfs_fstat',0),('vfs_fstat',1),('cp_new_stat',0),('cp_new_stat',1),('cp_statx',0),('cp_statx',1)),5):
+    for i,(function,flags) in enumerate((('iterate_dir',0),('iterate_dir',1),('filldir64',0),('filldir64',1),('vfs_fstat',0),('vfs_fstat',1),('cp_new_stat',0),('cp_new_stat',1),('cp_statx',0),('cp_statx',1),('path_init',0),('path_init',1)),5):
         programs.append({'id':i,'type':2,'tag':f'{i:016x}','recursion_misses':0})
         links.append({'id':10+i,'type':'kretprobe_multi' if flags else 'kprobe_multi',
             'prog_id':i,'tag':f'{i:016x}','function':function,'count':1,'flags':flags,'missed':0})
@@ -37,6 +37,40 @@ def census_sample():
 
 
 class KernelObserverTests(unittest.TestCase):
+    def test_lookup_base_keeps_attempts_objects_failures_and_original_query_binding(self):
+        rows=['Q 2004 101 101 262 1 1 3 256 50 100','R 2004 101 101 262 1 1 0',
+            'C 2004 101 101 262 1 1 7 900 16749 4096 8192 4 6 6 256 4',
+            'Q 2004 101 101 262 1 2 3 0 50 100','R 2004 101 101 262 1 2 -9']
+        attempts=observer.lookup_bases(rows)
+        self.assertEqual([a['attempt'] for a in attempts],[1,2])
+        self.assertEqual(attempts[0]['base']['inode'],900)
+        self.assertEqual(attempts[0]['base']['inode_generation'],4)
+        self.assertEqual(attempts[0]['base']['path_seq'],6)
+        self.assertEqual(attempts[0]['mount_namespace'],50)
+        self.assertIsNone(attempts[1]['base'])
+        data=(lookup(2004,101,101,262,1,-2,'src/main.rs')
+            +b''.join(frame('printf',r+'\n') for r in rows)+frame('map',{'@emitted':len(rows)+2}))
+        self.assertEqual(observer.decode(data)[0]['lookup_attempts'],attempts)
+        event=observer.decode(data)[0];event['lookup_attempts']=attempts[:1]
+        expected=SimpleNamespace(stat=lambda:SimpleNamespace(st_dev=os.makedev(0,7),st_ino=900,st_mode=16749))
+        observer.lookup_base_witness([event],101,2004,b'src/main.rs',262,-2,dfd=3,
+            user_namespace=100,mount_namespace=50,expected=expected)
+        for fault in ('namespace','sequence','inode','descriptor'):
+            bad=copy.deepcopy(event)
+            if fault=='namespace':bad['lookup_attempts'][0]['mount_namespace']=51
+            elif fault=='sequence':bad['lookup_attempts'][0]['base']['dentry_seq']=8
+            elif fault=='inode':bad['lookup_attempts'][0]['base']['inode']=901
+            else:bad['lookup_attempts'][0]['dfd']=-100
+            with self.subTest(fault=fault),self.assertRaises(observer.ObservationUnavailable):
+                observer.lookup_base_witness([bad],101,2004,b'src/main.rs',262,-2,dfd=3,
+                    user_namespace=100,mount_namespace=50,expected=expected)
+        for bad in (rows[:-1],rows+rows[:1],rows[:2]+rows[3:],
+                [r.replace('1 1 3','1 3 3') for r in rows],
+                [r.replace('1 1 7 900','1 1 -1 900') for r in rows],
+                [r.replace('1 2 -9','1 2 0') for r in rows]):
+            with self.subTest(rows=bad),self.assertRaises(observer.ObservationUnavailable):observer.lookup_bases(bad)
+        self.assertEqual(observer.lookup_bases(rows[:1],complete=False),[])
+
     def test_path_metadata_keeps_original_arguments_final_statx_fields_and_copy_result(self):
         rows=['U 2004 101 101 1 332 3 3 256 256 8191 8191 100','P 2004 101 101 1 1 100',
             'J 2004 101 101 1 7 900 33060 1 0 0 0 6 4096 8 8191',
@@ -209,7 +243,7 @@ class KernelObserverTests(unittest.TestCase):
                 data+b'0\t getname_flags+0x0/0x20\n',data.split(b'cookie')[0],data+b'missed:\t0\n'):
             with self.subTest(data=bad),self.assertRaises(observer.ObservationUnavailable):observer._fdinfo(bad)
 
-    def test_only_the_same_fourteen_original_links_and_programs_with_zero_misses_have_a_census(self):
+    def test_only_the_same_sixteen_original_links_and_programs_with_zero_misses_have_a_census(self):
         sample=census_sample();value={'before':sample,'after':copy.deepcopy(sample)}
         observer.validate_census(value)
         for fault in ('missed-before','missed-after','recursion','missing-link','duplicate-program',
@@ -241,7 +275,7 @@ class KernelObserverTests(unittest.TestCase):
             b'processed 298 insns (limit 1000000) max_states_per_insn 1 total_states 24 peak_states 24 mark_read 0\n')
         data=lookup(2004,101,101,257,1,3,'/workspace/input')+frame('map',{'@emitted':2})
         self.assertEqual(len(observer.decode(logs+data)),1)
-        for value in (logs,logs*17+data,b'unknown loader output\n'+data,
+        for value in (logs,logs*(observer.PROBE_COUNT+3)+data,b'unknown loader output\n'+data,
                 b'Program ID: 4 forged\n'+data,b'The verifier log: unverified\n'+data,b'Attaching to 2 functions\n'+data):
             with self.subTest(value=value),self.assertRaises(observer.ObservationUnavailable):observer.decode(value)
 

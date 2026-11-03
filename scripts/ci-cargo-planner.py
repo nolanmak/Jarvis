@@ -1058,6 +1058,16 @@ if is_view:
   assert libc.syscall(ctypes.c_long(332),ctypes.c_long(directory),ctypes.c_char_p(b'/workspace/target/deps/missing'),ctypes.c_uint(256),ctypes.c_uint(8191),extended)==-1
   assert ctypes.get_errno()==errno.ENOENT
  finally:os.close(directory)
+ metadata=ctypes.create_string_buffer(144)
+ assert libc.syscall(ctypes.c_long(262),ctypes.c_long(-100),ctypes.c_char_p(b'src/main.rs'),metadata,ctypes.c_int(256))==0
+ os.chdir('/workspace/target/deps')
+ try:
+  assert libc.syscall(ctypes.c_long(262),ctypes.c_long(-100),ctypes.c_char_p(b'src/lib.rs'),metadata,ctypes.c_int(256))==0
+  assert libc.syscall(ctypes.c_long(262),ctypes.c_long(-100),ctypes.c_char_p(b'src/main.rs'),metadata,ctypes.c_int(256))==-1
+  assert ctypes.get_errno()==errno.ENOENT
+  assert libc.syscall(ctypes.c_long(262),ctypes.c_long(-1),ctypes.c_char_p(b'src/main.rs'),metadata,ctypes.c_int(256))==-1
+  assert ctypes.get_errno()==errno.EBADF
+ finally:os.chdir('/workspace')
  _PROBE_PHASE='planner_tool_view'
  from pathlib import Path
  import time
@@ -1261,7 +1271,8 @@ def _probe(arguments):
     directories.extend((item['pid'],2000+ordinal,empty,{}) for ordinal,item in cargo_probe.units.items()
         if item['mapping']['kind']=='application')
     kernel=observer.finish(view_probe.original_pid,compilers,directories,view_probe.inputs/'deps/cursor',
-        view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'),results[4]['statx_sha256'])
+        view_probe.inputs/'deps'/os.fsdecode(b'raw-\xff'),results[4]['statx_sha256'],view_probe.source,
+        int(view_probe.receipt['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
     view_probe.cleanup()
     cargo_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],

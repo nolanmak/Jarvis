@@ -991,3 +991,32 @@ CI Python suite passed with native helpers and no skips; 20 observer tests and
 31 focused Rust tests passed (15 opt-in Rust cases excluded). This adds actual
 query-context evidence, not generic descriptor/cwd resolution, complete input
 closure, protected invalidation, passing CI or shipping authority.
+
+
+The lookup-base extension records the original `path_init` entry/return for
+selected kernel-copied query names. The kernel has already selected its root,
+working directory or descriptor-backed starting object at this return point.
+Records retain attempt order, actual dfd/lookup flags, mount/user namespaces,
+initialization status, chosen inode/device/mode/generation, dentry/mount object
+identities and the lookup/dentry sequence values. Failed initialization never
+invents a chosen object. Nested callbacks are bounded and matched by their
+original depth/sequence and kernel pathname pointer; retries remain separate.
+A chosen base is not proof that the subsequent path walk completed.
+
+The original isolated unit now queries `src/main.rs` successfully from its
+tracked source working directory, changes cwd to the sealed dependency tree,
+and repeats that same query where it must return ENOENT. A descriptor-relative
+query must use the dependency tree as its base; an invalid descriptor must
+report EBADF without a base object. Root validation checks the actual source
+or dependency inode and the original unit namespaces, including a consistent
+RCU sequence for the controlled immutable objects. The prior cwd is restored
+before the remaining fixture runs. Startup requires a base observation for the
+original nonce before target execution. Sixteen original attachments/programs
+are required, fitting the existing 32-object descriptor census. Diagnostic
+attachment counts follow that exact fixed set; stream/event, kernel verifier,
+VM, storage, memory and deadline limits remain unchanged.
+
+This establishes selected original starting-object context only. Generic FD
+lifecycle, arbitrary symlink/mount traversal and complete input closure remain
+unproved; selectors still cannot grant invalidation/reuse, CI or shipping
+authority. Native replay of the lookup-base extension is pending.
