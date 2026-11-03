@@ -218,7 +218,8 @@ original stager and planner scope and preserve an unverified attempt. No tool
 may start after staging cancellation. Pre-start signals cannot be dropped or
 reported as an executed tool's exit; the complete queue/termination behavior is
 part of the credential/I/O feasibility gate below. This is the selected state
-model, not an implemented protocol or authority to activate a privileged mode.
+model; the private implementation below is not authority to activate a
+privileged production mode.
 
 `ci-cargo-staging.py` implements the bounded capture and descriptor-normalization
 components for that protocol. It reads actual EOF under the lesser of 60 seconds
@@ -230,11 +231,38 @@ descriptors or conflicting flags, and rewrites only the defined descriptor
 numbers to worker FDs 3 and 4. Other environment bytes remain literal. The pipe's
 kernel identity is separate transport evidence, not a semantic compiler input.
 
-Twenty-one real pipe/filesystem tests cover these components. The version-3
-staging-ready/tool-started handshake, pre-start signal handling, root listener,
-credential transition and frozen unit views remain unimplemented. This helper
-does not execute tools, provide a complete input closure or publish CI authority;
-it is not connected to the existing same-UID version-2 experiment.
+Twenty-one real pipe/filesystem tests cover these components. The helper does
+not execute tools, provide a complete input closure or publish CI authority; it
+is not connected to the existing same-UID version-2 experiment.
+
+The separate V3 native client and root transport now have an unactivated
+implementation and a fixed guest probe awaiting its first real replay. The
+V3 client requires UID/GID 1001 for real/effective/saved credentials, no
+supplementary groups, a root-owned sealed startup descriptor and the original
+root listener's peer credentials. Protocol version 3 fixes the planner role to
+1001; the startup UID field identifies the root listener. V2 continues to
+require its same non-root UID and cannot interpret V3 frames.
+
+The root listener uses a root-owned 0710 directory and 0660 socket in group
+1001. Each request gets a fresh single-threaded root helper and a distinct unit
+UID starting at 2000. Stdin capture and jobserver normalization precede an exec
+release gate; the helper drops credentials, rearms parent-death protection and
+uses the original supervisor's kernel exec callback. A second release gate
+keeps the new executable stopped until the controller publishes tool-started.
+Pre-start client signals cancel the request; post-start signals use its original
+pidfd. Original per-unit cleanup is required before completion is returned.
+
+The private fixed probe is compile-test-only at the Rust session entry and
+cannot be selected by the ordinary CLI or worker environment. Its controller
+scope executes only a measured fixed probe with a minimal root environment;
+ordinary WorkerScope still refuses UID 0. It tests large raw stdin, actual
+jobserver capabilities, planner-file/socket access denial, closed control FDs,
+and cancellation through the native V3 client. Five host framing/refusal tests
+pass; actual guest credentials and end-to-end transport are not yet verified.
+The probe does not run arbitrary protected Cargo, freeze unit namespaces, seal
+reusable outputs, establish a complete input collector or create a CI proof.
+Those activation blockers, including race/cancellation and nested-builder
+coverage, remain open until their current-build guest evidence exists.
 
 The original descendant supervisor now has a private `on_exec` hook for a
 single-threaded trusted bootstrap. That bootstrap arms tracing with TRACEME and

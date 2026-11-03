@@ -284,10 +284,16 @@ def execute(request,run=vm.run,progress=None):
         else:
             command=['/usr/bin/python3','-I','-c',CARGO_OPERATIONS,json.dumps(cargo,separators=(',',':'))]
     progress['stage']='vm_launch'
-    outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
-                ci_context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract,
+    context={'state':state,'git_objects':Path(request['git_objects']),'runner':runner,'contract':contract,
                             'cache_program':CACHE_PROGRAM,'generation':generation,'worker_programs':WORKER_PROGRAMS,
-                            'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency})
+                            'dependency_programs':DEPENDENCY_PROGRAMS,'dependency_action':dependency}
+    probe=request.get('planner_protocol_probe',False)
+    if type(probe) is not bool or probe and request['operation']!='repository':raise cache_generation.FreshnessHold('invalidation_unsafe')
+    if probe:
+        context.update(planner_protocol_probe=True,planner_programs={name:private_bytes(BASE/name) for name in (
+            'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py','ci-cargo-planner.so')})
+    outcome=run(runtime,workspace,command,{},timeout=None,scratch_dir=str(scratch),build_cache=request['build_cache'],storage_lease=lease,
+                ci_context=context)
     progress['stage']='receipt_validate'
     reclaimed_seeds=outcome.get('seed_reclaimed')
     protected_seed=dependency.get('seed') if dependency and dependency.get('kind')=='install' else None
@@ -320,6 +326,12 @@ def execute(request,run=vm.run,progress=None):
         result['cache_preparation']=prepared
         result['source_projection']=cache_generation.validate_source_projection_observation(
             outcome.get('source_projection'),generation['binding'],generation['command'],guest_workers,observed_inputs)
+        if probe:
+            probe_spec=importlib.util.spec_from_file_location('observed_planner_probe',BASE/'ci-cargo-planner.py')
+            planner=importlib.util.module_from_spec(probe_spec);probe_spec.loader.exec_module(planner)
+            try:result['planner_protocol_probe']=planner.validate_probe(outcome.get('planner_protocol_probe'),
+                generation['binding'],generation['command'],guest_workers,observed_inputs,result['source_projection'])
+            except planner.FreshnessHold as error:raise cache_generation.FreshnessHold(error.reason) from None
     if dependency is not None:
         observed=outcome.get('dependency_result')
         if (not isinstance(observed,dict) or observed.get('version')!=1 or observed.get('shipping_authority') is not False

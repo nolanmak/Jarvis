@@ -12,6 +12,12 @@ const WORKER_SCOPE: &[u8] = include_bytes!("../../../scripts/ci-worker-scope.py"
 const INPUT_MANIFEST: &[u8] = include_bytes!("../../../scripts/ci-input-manifest.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
+const PLANNER_PROGRAMS:[(&str,&[u8]);4]=[
+    ("ci-cargo-planner.py",include_bytes!("../../../scripts/ci-cargo-planner.py")),
+    ("ci-cargo-relay.py",include_bytes!("../../../scripts/ci-cargo-relay.py")),
+    ("ci-cargo-staging.py",include_bytes!("../../../scripts/ci-cargo-staging.py")),
+    ("ci-cargo-planner.so",include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_planner.so"))),
+];
 const DEPENDENCY_PROGRAMS:[(&str,&[u8]);7]=[
     ("ci-cargo-boundary.py",include_bytes!("../../../scripts/ci-cargo-boundary.py")),
     ("ci-dependency-seed.py",include_bytes!("../../../scripts/ci-dependency-seed.py")),
@@ -245,6 +251,8 @@ pub(super) struct Outcome {
     cache_preparation: Option<serde_json::Value>,
     #[serde(default)]
     source_projection: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(super) planner_protocol_probe:Option<serde_json::Value>,
     /// Host-only capability, created after all result and kernel checks. A VM
     /// JSON object cannot supply or deserialize a protected audit receipt.
     #[serde(skip)]
@@ -676,6 +684,7 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             private_write(&directory.path().join(name), bytes)?;
         }
         for (name,bytes) in DEPENDENCY_PROGRAMS {private_write(&directory.path().join(name),bytes)?;}
+        for (name,bytes) in PLANNER_PROGRAMS {private_write(&directory.path().join(name),bytes)?;}
         for name in ["state", "scratch"] {
             private_directory(&directory.path().join(name))?;
         }
@@ -686,11 +695,12 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         loop {let read=executable.read(&mut buffer)?;if read==0 {break;}executable_digest.update(&buffer[..read]);}
         let executable_sha256=format!("{:x}",executable_digest.finalize());
         let dependency_programs:std::collections::BTreeMap<_,_>=DEPENDENCY_PROGRAMS.iter().map(|(name,bytes)|(*name,digest(bytes))).collect();
+        let planner_programs:std::collections::BTreeMap<_,_>=PLANNER_PROGRAMS.iter().map(|(name,bytes)|(*name,digest(bytes))).collect();
         let runtime_identity=runtime_identity(directory.path(),true)?;
         let authority_sha256 = digest(&serde_json::to_vec(&serde_json::json!({
             "runtime":digest(&runtime),"adapter":digest(ADAPTER),"build_vm":digest(BUILD_VM),"proxy":digest(PROXY),
             "supervisor":digest(SUPERVISOR),"worker_scope":digest(WORKER_SCOPE),"input_manifest":digest(INPUT_MANIFEST),"cache_generation":digest(CACHE_GENERATION),"cache_bytes":limits.cache_bytes,
-            "controller_executable_sha256":executable_sha256,"dependency_programs":dependency_programs,
+            "controller_executable_sha256":executable_sha256,"dependency_programs":dependency_programs,"planner_programs":planner_programs,
             "runtime_identity_program":digest(RUNTIME_IDENTITY),"runtime_content_sha256":runtime_identity.content_sha256,
             "runtime_metadata_sha256":runtime_identity.metadata_sha256}))?);
         Ok(Self {
@@ -703,6 +713,11 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             completed_generations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             execution: tokio::sync::Mutex::new(()),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn enable_planner_protocol_probe(&self)->Result<()> {
+        private_write(&self.directory.as_ref().context("owned probe session missing")?.path().join("planner-probe-enabled"),b"V3\n")
     }
 
     pub(super) async fn run(
@@ -762,7 +777,8 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
             root.join(objects)
         }
         .canonicalize()?;
-        let request = serde_json::json!({"version":2,"operation":operation,
+        let planner_protocol_probe=cfg!(test) && self.directory.as_ref().expect("owned CI session").path().join("planner-probe-enabled").is_file();
+        let request = serde_json::json!({"version":2,"operation":operation,"planner_protocol_probe":planner_protocol_probe,
             "source_generation":generation,"command_id":command_id,"predecessor":predecessor,
             "retained_generations":retained_generations,
             "retained_producers":retained_producers,

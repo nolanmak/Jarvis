@@ -15,6 +15,8 @@ fn main() {
         fs::write(output, []).expect("write unsupported native helper marker");
         fs::write(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("libci_cargo_relay.so"), [])
             .expect("write unsupported relay marker");
+        fs::write(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("libci_cargo_planner.so"), [])
+            .expect("write unsupported planner marker");
         return;
     }
     let source = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
@@ -34,4 +36,11 @@ fn main() {
         .arg("-o").arg(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("libci_cargo_relay.so"))
         .status().expect("start relay compiler");
     assert!(status.success(),"native relay compilation failed");
+    let status=Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()))
+        .args(["-shared", "-fPIC", "-std=c11", "-O2", "-g0", "-Wall", "-Wextra", "-Werror", "-Wl,-z,now", "-DJARVIS_CARGO_PROTOCOL_V3=1"])
+        .arg(PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src/ci_cargo_relay.c"))
+        .arg(PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src/ci_cargo_exec.c"))
+        .arg("-o").arg(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("libci_cargo_planner.so"))
+        .status().expect("start protected planner relay compiler");
+    assert!(status.success(),"native protected planner relay compilation failed");
 }

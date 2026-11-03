@@ -41,7 +41,10 @@ def guest_diagnostic(value):
     value=value if isinstance(value,dict) else {}
     stages={'load_dependency_controller','reclaim_producers','reclaim_seeds','prepare_producer','bind_producer_cache','hide_producer_cache',
             'resolve_dependencies','freeze_resolution','compile_dependencies','record_producer',
-            'publish_dependencies','prepare_generation','execute_command'}
+            'publish_dependencies','prepare_generation','execute_command','planner_protocol_probe',
+            'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
+            'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
+            'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor'}
     categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
                 'IsADirectoryError','CalledProcessError','ValueError','KeyError','ModuleNotFoundError','ImportError'}
     return {'stage':value.get('stage') if value.get('stage') in stages else 'unknown',
@@ -227,9 +230,11 @@ def hide_ci_cache():
     os.chmod('/dev/vda',0o600)
     return private
 def _run_worker(argv,scope=None):
-    process=subprocess.Popen(argv,cwd='/workspace',env=environment,
+    controller_environment=scope.controller_environment() if scope is not None else None
+    process=subprocess.Popen(argv,cwd='/workspace',env=environment if controller_environment is None else controller_environment,
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-        start_new_session=True,preexec_fn=worker if scope is None else None)
+        start_new_session=True,preexec_fn=worker if scope is None else None,
+        pass_fds=() if scope is None else scope.inherited_fds())
     if scope is not None:scope.attach(process)
     outputs={'stdout':bytearray(),'stderr':bytearray()}
     size=0; exceeded=False
@@ -322,6 +327,7 @@ try:
     dependency_result=None
     cache_preparation=None
     source_projection=None
+    planner_protocol_probe=None
     action=job.get('ci_dependency')
     if job.get('ci_context') and job.get('build_cache'):
         guest_stage='reclaim_producers'
@@ -373,7 +379,29 @@ try:
                 dependency_result=ci_dependency.install(action,seed_binding,ci_target,ci_target.parent/'cargo-home')
                 ci_cache['finish_seed_install'](ci_target,generation['binding'],action['seed'])
             cache_preparation=ci_cache['preparation_receipt'](ci_target,generation['binding'],generation['command'],generation['outputs'])
-            hide_ci_cache()
+            private_cache=hide_ci_cache()
+            if job.get('planner_protocol_probe'):
+                guest_stage='planner_protocol_probe'
+                if uid!=1000 or gid!=1000:raise ci_cache['FreshnessHold']('invalidation_unsafe')
+                import tempfile,time,shutil
+                probe_root=Path(tempfile.mkdtemp(prefix='ci-plan-',dir='/tmp'))
+                scope=ci_workers.controller_probe_scope(worker_control,{
+                    'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
+                    'binding':generation['binding'],'command':generation['command'],'root':str(probe_root),
+                    'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+120})
+                observed=_run_worker(scope.argv,scope);stopped=scope.verify()
+                guest_worker_receipts.append(stopped.observation())
+                if observed.get('exit_code')!=0:
+                    for line in observed.get('stderr','').splitlines():
+                        try:failure=json.loads(line)
+                        except ValueError:continue
+                        if type(failure) is dict and type(failure.get('planner_diagnostic')) is dict:
+                            guest_stage=failure['planner_diagnostic'].get('stage','planner_protocol_probe')
+                    raise OSError(71,'private planner probe unavailable')
+                try:planner_protocol_probe=json.loads(observed['stdout'])
+                except (ValueError,KeyError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
+                planner_protocol_probe['guest_worker_quiescence']=stopped.observation()
+                shutil.rmtree(probe_root)
         else:
             seed_build_cache()
       guest_stage='execute_command'
@@ -390,6 +418,7 @@ try:
     if dependency_result is not None:result['dependency_result']=dependency_result
     if cache_preparation is not None:result['cache_preparation']=cache_preparation
     if source_projection is not None:result['source_projection']=source_projection
+    if planner_protocol_probe is not None:result['planner_protocol_probe']=planner_protocol_probe
 except Exception as error:
     import errno
     # copytree aggregates per-file failures into shutil.Error without an errno.
@@ -420,6 +449,7 @@ def validate_result_shape(result,ci_context):
     if ci_context is not None:
         for field in ('cache_preparation','input_write_observation','source_projection'):
             if field in result:expected.add(field)
+        if ci_context.get('planner_protocol_probe') is True and 'planner_protocol_probe' in result:expected.add('planner_protocol_probe')
     if set(result)!=expected or type(result['exit_code']) is not int:
         raise Unavailable('invalid VM result')
 
@@ -526,8 +556,17 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
     auxiliary_dependency=False
     if ci_context is not None:
         base_keys={'state','git_objects','runner','contract','cache_program','generation','worker_programs'}
-        if set(ci_context) not in (base_keys,base_keys|{'dependency_programs','dependency_action'}):
+        probe=ci_context.get('planner_protocol_probe',False)
+        if type(probe) is not bool:raise Unavailable('invalid internal planner probe')
+        probe_keys={'planner_programs','planner_protocol_probe'} if probe else set()
+        if set(ci_context) not in (base_keys|probe_keys,base_keys|probe_keys|{'dependency_programs','dependency_action'}):
             raise Unavailable('invalid controller CI context')
+        if probe:
+            programs=ci_context['planner_programs']
+            if (not isinstance(programs,dict) or set(programs)!={'ci-cargo-planner.py','ci-cargo-relay.py',
+                    'ci-cargo-staging.py','ci-cargo-planner.so'}
+                    or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values())):
+                raise Unavailable('invalid measured planner probe bundle')
         dependency=ci_context.get('dependency_action')
         programs=ci_context['worker_programs']
         if (not isinstance(programs,dict) or set(programs)!={'provider-supervisor.py','ci-worker-scope.py','ci-input-manifest.py'}
@@ -601,6 +640,8 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
                             ('ci-tools/ci-cache-generation.py',stat.S_IFREG|0o444,ci_context['cache_program'],0,0)])
             for name,data in ci_context['worker_programs'].items():
                 entries.append(('ci-tools/'+name,stat.S_IFREG|0o444,data,0,0))
+            for name,data in ci_context.get('planner_programs',{}).items():
+                entries.append(('ci-tools/'+name,stat.S_IFREG|0o444,data,0,0))
             for name,data in ci_context.get('dependency_programs',{}).items():
                 if name=='ci-cache-generation.py':
                     if data!=ci_context['cache_program']:raise Unavailable('contradictory cache controller bundle')
@@ -648,6 +689,7 @@ poweroff -f
                 'uid': os.getuid(), 'gid': os.getgid(), 'build_cache': build_cache is not None,'ci_context':ci_context is not None,
                 'ci_generation':ci_context['generation'] if ci_context is not None else None,
                 'ci_dependency':ci_context.get('dependency_action') if ci_context is not None else None,
+                'planner_protocol_probe':ci_context.get('planner_protocol_probe',False) if ci_context is not None else False,
                 'ort_cache':'ort_cache' in config}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
         command = qemu_command(config, image, shares, build_cache)

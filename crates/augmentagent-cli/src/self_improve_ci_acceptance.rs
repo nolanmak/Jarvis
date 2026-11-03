@@ -9,6 +9,47 @@ const CARGO_EXEC_DENIAL_CASES:&[u8]=include_bytes!("ci_cargo_exec_cases.py");
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 const CARGO_RELAY_LIBRARY:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_relay.so"));
 
+/// Credential and V3 transport feasibility only. Generated input closure,
+/// protected unit outputs and passing-CI publication are still unavailable.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[tokio::test]
+#[ignore = "requires declared build VM, delegated resource policy and exclusive managed storage slot"]
+async fn live_shared_ci_planner_protocol_v3()->Result<()> {
+    let owner=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_REPO")?).canonicalize()?;
+    let evidence=PathBuf::from(std::env::var("AUTOSHIP_CI_ACCEPTANCE_EVIDENCE")?);
+    ensure!(evidence.is_absolute() && !evidence.starts_with(&owner),"private probe evidence required");
+    std::fs::create_dir(&evidence)?;std::fs::set_permissions(&evidence,std::fs::Permissions::from_mode(0o700))?;
+    let audit=workflow::workflow_audit(&evidence.join("workflow.db"),"shared-ci-planner-protocol-v3",None)?;
+    audit.require_run_resources()?;
+    let target=crate::build_storage::effective_target(&owner);
+    let storage=crate::build_storage::admit_ci(&owner,&target).await?;
+    let fixture=tempfile::Builder::new().prefix("planner-protocol-source-").tempdir_in(&target)?;
+    let root=fixture.path();
+    git(root,&["-c","init.templateDir=","init","-q"]).await?;
+    std::fs::write(root.join("source.txt"),"literal immutable protocol fixture\n")?;
+    git(root,&["add","."]).await?;
+    git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
+        "-c","core.hooksPath=/dev/null","commit","-qm","protocol fixture"]).await?;
+    let head=git(root,&["rev-parse","HEAD"]).await?.trim().to_owned();
+    git(root,&["update-ref","refs/remotes/origin/main",&head]).await?;
+    let bound=binding(root).await?;let source=snapshot(root,&bound,&target).await?;
+    let session=vm::Session::prepare(&owner,&target)?;session.enable_planner_protocol_probe()?;
+    let observed=session.run("repository",&source,root,&bound,None,&[],&[],&[],Some("true"),
+        &storage,&target,&audit,std::time::Duration::from_secs(180)).await?;
+    ensure!(observed.status=="passed","V3 probe command failed: {}",observed.stderr);
+    let probe=observed.planner_protocol_probe.context("original V3 probe receipt missing")?;
+    ensure!(probe["version"]==3 && probe["cases"][0]["uid"]==2000 && probe["cases"][1]["uid"]==2001
+        && probe["cases"][2]["cancelled_before_exec"]==true && probe["shipping_authority"]==false,
+        "V3 probe did not establish original credential/cancellation observations");
+    audit.protected_health()?;
+    std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
+        "version":1,"kind":"real_shared_ci_planner_protocol_v3","head":head,
+        "adapter_authority":session.authority_sha256,"probe":probe,"full_ci_pass":false,
+        "cargo_metadata_isolation_established":false,"trusted_input_closure":false,
+        "shipping_authority":false,"autonomous_merges_claimed":0}))?)?;
+    Ok(())
+}
+
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 #[test]
 fn cargo_relay_spawn_interface_fixture() {

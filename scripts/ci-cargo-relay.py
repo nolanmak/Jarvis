@@ -70,7 +70,7 @@ def _response(connection, stage, value):
     connection.sendall(RESPONSE.pack(b'JARVRSP2', STAGES[stage], value))
 
 
-def _payload(fd):
+def _payload(fd,*,expected_magic=b'JARVARG2'):
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or not 36 <= info.st_size <= LIMIT:
         raise ValueError('invalid relay payload')
@@ -81,7 +81,8 @@ def _payload(fd):
         raise ValueError('incomplete relay payload')
     magic, lookup, argc, envc, ignored, blocked = struct.unpack_from('<8sIIIQQ', body)
     unsupported = sum(1 << (number-1) for number in (9, 19, 32, 33))
-    if (magic != b'JARVARG2' or lookup not in (0, 1) or not 1 <= argc <= 4096 or envc > 4096
+    if (expected_magic not in (b'JARVARG2',b'JARVARG3') or magic != expected_magic
+            or lookup not in (0, 1) or not 1 <= argc <= 4096 or envc > 4096
             or (ignored | blocked) & unsupported):
         raise ValueError('invalid relay payload header')
     offset = 36

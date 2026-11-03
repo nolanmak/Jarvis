@@ -91,6 +91,10 @@ class WorkerScope:
             raise FreshnessHold('cleanup_uncertain')
         self._process=process
 
+    def inherited_fds(self):return ()
+
+    def controller_environment(self):return None
+
     def begin_observation(self):
         if self.owner!=os.getpid() or self.closed or self._process is not None or self._observation_started:
             raise FreshnessHold('cleanup_uncertain')
@@ -109,3 +113,41 @@ class WorkerScope:
             self.receipt_sha256=hashlib.sha256(value).hexdigest();self.closed=True
             return StoppedWorkers(_TOKEN,self)
         except (OSError,ValueError):raise FreshnessHold('cleanup_uncertain') from None
+
+
+_CONTROLLER_TOKEN=object()
+
+
+class _ControllerProbeScope(WorkerScope):
+    def __init__(self,token,control,configuration):
+        if token is not _CONTROLLER_TOKEN or os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):
+            raise FreshnessHold('invalidation_unsafe')
+        control=Path(control);info=control.lstat()
+        if control.resolve()!=control or not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode&0o077:
+            raise FreshnessHold('invalidation_unsafe')
+        self.owner=os.getpid();self.closed=False;self.receipt_sha256=None;self._process=None;self._observation_started=False
+        self.directory=control/('worker-'+str(uuid.uuid4()));self.directory.mkdir(mode=0o700)
+        self.receipt=self.directory/'quiescent'
+        spec=importlib.util.spec_from_file_location('admitted_planner_probe',Path(__file__).with_name('ci-cargo-planner.py'))
+        planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
+        planner._source(configuration['target'],configuration['binding'],configuration['command'])
+        value=dict(configuration,version=3,kind='probe-supervisor',parent=os.getpid(),receipt=str(self.receipt))
+        self._bootstrap=planner._sealed(value)
+        self.argv=[sys.executable,'-I',str(Path(__file__).with_name('ci-cargo-planner.py')),'--probe-supervisor',str(self._bootstrap)]
+
+    def inherited_fds(self):
+        if self.owner!=os.getpid() or self._bootstrap is None:raise FreshnessHold('cleanup_uncertain')
+        return (self._bootstrap,)
+
+    def controller_environment(self):
+        if self.owner!=os.getpid():raise FreshnessHold('cleanup_uncertain')
+        return {'PATH':os.defpath}
+
+    def attach(self,process):
+        super().attach(process)
+        os.close(self._bootstrap);self._bootstrap=None
+
+
+def controller_probe_scope(control,configuration):
+    """Fixed measured probe only; ordinary WorkerScope still refuses root."""
+    return _ControllerProbeScope(_CONTROLLER_TOKEN,control,configuration)

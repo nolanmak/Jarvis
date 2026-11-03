@@ -28,6 +28,25 @@ extern char **environ;
 #define MAX_BODY (8U * 1024U * 1024U)
 #define MAX_STRING (1024U * 1024U)
 #define SEALS (F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)
+#ifdef JARVIS_CARGO_PROTOCOL_V3
+#define PROTOCOL_DIGIT '3'
+#define CONFIG_MAGIC "JARVCFG3"
+#define ARGUMENT_MAGIC "JARVARG3"
+#define RESPONSE_MAGIC "JARVRSP3"
+#define ERROR_STAGE 4
+#define FINISHED_STAGE 3
+#define SIGNALED_STAGE 5
+#define MAX_TIMEOUT_MS 900000U
+#else
+#define PROTOCOL_DIGIT '2'
+#define CONFIG_MAGIC "JARVCFG2"
+#define ARGUMENT_MAGIC "JARVARG2"
+#define RESPONSE_MAGIC "JARVRSP2"
+#define ERROR_STAGE 3
+#define FINISHED_STAGE 2
+#define SIGNALED_STAGE 4
+#define MAX_TIMEOUT_MS 60000U
+#endif
 struct configuration {
     char magic[8];
     uint32_t uid, pid, timeout_ms;
@@ -81,7 +100,7 @@ static void forward_signal(int number, siginfo_t *information, void *context) {
     if (information && information->si_code>0
         && (number==SIGSEGV || number==SIGILL || number==SIGFPE || number==SIGBUS
             || number==SIGTRAP || number==SIGSYS)) _exit(125);
-    struct response frame={.magic={'J','A','R','V','S','I','G','2'},.stage=(uint32_t)number,.value=0};
+    struct response frame={.magic={'J','A','R','V','S','I','G',PROTOCOL_DIGIT},.stage=(uint32_t)number,.value=0};
     if (proxy_connection<0 || send(proxy_connection,&frame,sizeof(frame),MSG_DONTWAIT|MSG_NOSIGNAL)!=(ssize_t)sizeof(frame))
         proxy_signal_failure=1;
     errno=saved_errno;
@@ -130,6 +149,13 @@ static const char *environment_value(const char *name) {
 __attribute__((constructor)) static void initialize_relay(void) {
     const char *value = environment_value("JARVIS_CARGO_RELAY_FD");
     if (geteuid() == 0 || getuid() != geteuid() || !value || !*value) _exit(125);
+#ifdef JARVIS_CARGO_PROTOCOL_V3
+    uid_t real_uid,effective_uid,saved_uid;
+    gid_t real_gid,effective_gid,saved_gid;
+    if (getresuid(&real_uid,&effective_uid,&saved_uid) || getresgid(&real_gid,&effective_gid,&saved_gid)
+        || real_uid!=1001 || effective_uid!=1001 || saved_uid!=1001
+        || real_gid!=1001 || effective_gid!=1001 || saved_gid!=1001 || getgroups(0,NULL)!=0) _exit(125);
+#endif
     unsigned long number = 0;
     for (const char *digit = value; *digit; ++digit) {
         if (*digit < '0' || *digit > '9' || number > 6553) _exit(125);
@@ -143,9 +169,14 @@ __attribute__((constructor)) static void initialize_relay(void) {
         || seals < 0 || (seals & SEALS) != SEALS
         || pread(fd, &config, sizeof(config), 0) != sizeof(config)) _exit(125);
     close(fd);
-    if (memcmp(config.magic, "JARVCFG2", 8) || config.uid != geteuid()
+    if (memcmp(config.magic, CONFIG_MAGIC, 8)
+#ifdef JARVIS_CARGO_PROTOCOL_V3
+        || config.uid!=0 || info.st_uid!=0
+#else
+        || config.uid != geteuid()
+#endif
         || config.pid == 0 || config.pid > INT_MAX || config.timeout_ms < 1000
-        || config.timeout_ms > 60000 || config.path[0] != '/'
+        || config.timeout_ms > MAX_TIMEOUT_MS || config.path[0] != '/'
         || !memchr(config.path, 0, sizeof(config.path))) _exit(125);
     if (jarvis_ci_deny_exec() != 0) _exit(125);
     initialized = 1;
@@ -195,7 +226,7 @@ static int payload_fd(const char *file, char *const argv[], char *const envp[], 
     const char *path = lookup ? environment_value("PATH") : "";
     if (!path) path = "/bin:/usr/bin";
     uint64_t dispositions[2]={signals->ignored,signals->blocked};
-    if (write_bytes(fd, "JARVARG2", 8, &total) < 0
+    if (write_bytes(fd, ARGUMENT_MAGIC, 8, &total) < 0
         || write_bytes(fd, header, sizeof(header), &total) < 0
         || write_bytes(fd, dispositions, sizeof(dispositions), &total) < 0
         || write_string(fd, file, &total) < 0 || write_string(fd, cwd, &total) < 0
@@ -288,7 +319,7 @@ static int receive_response(int connection, int64_t deadline, struct response *r
         ssize_t length = recvmsg(connection, &message, 0);
         if (length < 0 && errno == EINTR) continue;
         if (length != sizeof(*response) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)
-            || memcmp(response->magic, "JARVRSP2", 8)) { errno = EIO; return -1; }
+            || memcmp(response->magic, RESPONSE_MAGIC, 8)) { errno = EIO; return -1; }
         return 0;
     }
 }
@@ -317,7 +348,7 @@ static int delegate_exec(const char *file, char *const argv[], char *const envp[
     if (size != sizeof(peer) || peer.uid != config.uid || peer.pid != (pid_t)config.pid) {
         errno = EPERM; goto failed;
     }
-    struct request request = {.magic = {'J','A','R','V','R','E','Q','2'}, .count = 3, .numbers = {0,1,2}};
+    struct request request = {.magic = {'J','A','R','V','R','E','Q',PROTOCOL_DIGIT}, .count = 3, .numbers = {0,1,2}};
     memcpy(request.token, config.token, sizeof(request.token));
     int passed[65] = {payload,0,1,2};
     if (walk_descriptors(0, connection, payload, &request, passed) < 0) goto failed;
@@ -337,15 +368,21 @@ static int delegate_exec(const char *file, char *const argv[], char *const envp[
     int64_t deadline = now + config.timeout_ms;
     struct response response;
     if (receive_response(connection, deadline, &response) < 0) goto failed;
-    if (response.stage == 3 && response.value >= 1 && response.value <= 4095) {
+    if (response.stage == ERROR_STAGE && response.value >= 1 && response.value <= 4095) {
         errno = (int)response.value; goto failed;
     }
     if (response.stage != 1 || response.value != 0) { errno = EIO; goto failed; }
     if (install_signal_proxy(connection)<0) _exit(125);
     if (walk_descriptors(1, connection, -1, NULL, NULL) < 0) _exit(125);
     if (receive_response(connection, deadline, &response) < 0) _exit(125);
-    if (response.stage==4) {close(connection);exit_by_signal(response.value);}
-    if (response.stage != 2 || response.value > 255) _exit(125);
+#ifdef JARVIS_CARGO_PROTOCOL_V3
+    /* Staging readiness closes Cargo's exec-start pipe so it can feed stdin.
+     * Only the controller's later positive exec observation starts the tool. */
+    if (response.stage!=2 || response.value!=0) _exit(125);
+    if (receive_response(connection,deadline,&response)<0) _exit(125);
+#endif
+    if (response.stage==SIGNALED_STAGE) {close(connection);exit_by_signal(response.value);}
+    if (response.stage != FINISHED_STAGE || response.value > 255) _exit(125);
     close(connection);
     _exit((int)response.value);
 failed:;
