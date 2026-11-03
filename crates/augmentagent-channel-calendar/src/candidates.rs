@@ -945,4 +945,54 @@ mod tests {
         );
         assert!(set.get("cand_9").is_none() && set.resolve("cand_9").is_none());
     }
+
+    /// Opt-in live, READ-ONLY check against the owner's real calendars:
+    /// runs the lookup over every listed Google-connected account and prints
+    /// counts only (no titles, no addresses). Never writes. Needs
+    /// GOOGLE_OAUTH_CLIENT_ID/SECRET in the env and the mailboxes' stored
+    /// grants; accounts are comma-separated in
+    /// JARVIS_GCAL_CANDIDATES_QA_ACCOUNTS.
+    #[tokio::test]
+    #[ignore = "live read-only Google Calendar lookup; set JARVIS_GCAL_CANDIDATES_QA_ACCOUNTS"]
+    async fn live_find_candidate_events_read_only() {
+        let accounts: Vec<String> = std::env::var("JARVIS_GCAL_CANDIDATES_QA_ACCOUNTS")
+            .expect("QA accounts")
+            .split(',')
+            .map(|a| a.trim().to_ascii_lowercase())
+            .filter(|a| !a.is_empty())
+            .collect();
+        let google =
+            augmentagent_channel_email::google::GoogleGmail::from_env().expect("OAuth client env");
+        let cal = GoogleCalendar::new(Arc::new(google));
+        for text in ["is the meeting today still on?", "can you send me the link"] {
+            let window = CandidateWindow::for_owner(text);
+            let set = cal
+                .find_candidate_events(&accounts, &window, text)
+                .await
+                .expect("lookup");
+            let per_account = accounts
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let n = set.candidates.iter().filter(|c| &c.account == a).count();
+                    format!("account#{i}={n}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "{:?} tz={} ranges={} candidates={} organizer={} with_link={} all_day={} [{per_account}]",
+                window.source,
+                window.tz,
+                window.ranges.len(),
+                set.candidates.len(),
+                set.candidates.iter().filter(|c| c.is_organizer).count(),
+                set.candidates.iter().filter(|c| c.join_link.is_some()).count(),
+                set.candidates.iter().filter(|c| c.all_day).count(),
+            );
+            assert!(set.candidates.len() <= MAX_CANDIDATES);
+            for c in &set.candidates {
+                assert!(set.resolve(&c.id).is_some());
+            }
+        }
+    }
 }
