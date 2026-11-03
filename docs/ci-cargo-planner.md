@@ -584,3 +584,29 @@ still needs behavioral evidence. Runtime/device/metadata compatibility, nested
 saturation and protected seed restoration remain named C/R gates above. Their
 absence cannot be filled by a passing filesystem fixture. This checkpoint is
 not a final schema/API audit, seam audit or consumer implementation handoff.
+
+## Protected Cargo mapping checkpoint
+
+The fixed V3 VM probe now additionally runs a dependency-free Cargo binary twice.
+Its root-sealed internal bootstrap gives Cargo UID 1001 and a private planner
+target at the original `/workspace/target` path. Each authenticated rustc probe,
+compilation and application request uses a separate unit root and UID. The
+fixture mapper accepts only its known source, flags, output slots and binary;
+unknown mappings hold. This is not the generic Cargo mapper or production mode.
+
+After the original compiler scope stops, output bytes are copied into new
+controller-owned sealed inodes. Separate detached copies reach Cargo's target
+for its alias/fingerprint bookkeeping. The application receives an immutable
+mount of the original sealed executable at Cargo's exact requested alias. Its
+attempt to write fingerprint data must affect only its own private target.
+Root observations require one compiler execution on the first run, zero on the
+unchanged second run, two application executions, unchanged actual fingerprint
+contents, sealed artifact integrity and original cleanup. Native validation of
+this new checkpoint is pending; host mapping tests do not establish it.
+
+The in-command publication regression at `43fd246e` did produce a valid native
+RED: warm two consumer compiles, unchanged zero, then zero consumer compiles and
+OLD output after publication; independent rustc rejected the new input with
+E0761. Protected Cargo mapping alone does not fix that failure. Complete input
+collection, selective invalidation and bounded planner restart remain required.
+All full-CI, trusted-input-closure and shipping-authority claims remain false.

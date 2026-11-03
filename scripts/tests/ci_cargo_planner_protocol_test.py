@@ -13,6 +13,8 @@ import hashlib
 import json
 import socket
 import array
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('planner_protocol',ROOT/'ci-cargo-planner.py')
@@ -20,6 +22,63 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_rejected_mapping_closes_original_request_control_descriptors(self):
+        class Reject:
+            def prepare(self,*args):raise planner.FreshnessHold('input_census_unknown')
+        with tempfile.TemporaryDirectory() as directory:
+            relay=object.__new__(planner.RootRelay);relay.root=Path(directory)
+            (relay.root/'units').mkdir();relay.timeout=1;relay.library=Path('/fixed/library')
+            relay.admission=SimpleNamespace(target='/fixed/target',binding={},command='fixed')
+            relay.views=Reject()
+            before=set(os.listdir('/proc/self/fd'))
+            with patch.object(planner,'payload',return_value=()),self.assertRaises(planner.FreshnessHold):
+                relay._run(None,5,[0],[0,1,2],['planner_unit'])
+            self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+
+    def test_fixed_cargo_mapper_refuses_unknown_inputs_outputs_and_commands(self):
+        def request(args,file=b'/toolchain/bin/rustc',cwd=b'/workspace',search=None):
+            return file,[file,*args],{},cwd,search,0,0
+        self.assertEqual(planner.fixture_request(request([b'-vV']))['kind'],'information')
+        self.assertEqual(planner.fixture_request(request([b'-',b'--crate-name',b'___',
+            b'--print=file-names',b'--crate-type',b'bin']))['kind'],'information')
+        args=[b'--crate-name',b'private_cargo_probe',b'--edition=2021',b'src/main.rs',
+            b'--crate-type',b'bin',b'--emit=dep-info,link',b'-C',b'embed-bitcode=no',
+            b'-C',b'metadata=0123456789abcdef',b'-C',b'extra-filename=-0123456789abcdef',
+            b'--out-dir',b'/workspace/target/debug/deps',b'-L',b'dependency=/workspace/target/debug/deps']
+        mapped=planner.fixture_request(request(args))
+        self.assertEqual(mapped,{'kind':'compile','outputs':[
+            'debug/deps/private_cargo_probe-0123456789abcdef',
+            'debug/deps/private_cargo_probe-0123456789abcdef.d']})
+        for extra in ([b'--extern',b'evil=/tmp/evil.rlib'],[b'-o',b'/tmp/escape'],
+                [b'@/tmp/response'],[b'--cfg',b'unknown'],[b'other.rs'],
+                [b'--out-dir',b'/workspace/target/debug/deps']):
+            with self.subTest(extra=extra),self.assertRaises(planner.FreshnessHold):
+                planner.fixture_request(request([*args,*extra]))
+        for invalid in (request([b'--print=sysroot',b'/tmp/input.rs']),
+                request(args,cwd=b'/tmp'),request(args,search=b'/toolchain/bin'),
+                request([],file=b'/bin/sh'),request([b'--version'],file=b'/tmp/rustc')):
+            with self.subTest(invalid=invalid),self.assertRaises(planner.FreshnessHold):
+                planner.fixture_request(invalid)
+        self.assertEqual(planner.fixture_request(request([],file=b'/workspace/target/debug/private-cargo-probe')),
+            {'kind':'application'})
+
+    def test_cargo_probe_requires_actual_unit_cleanup_and_preserves_no_authority(self):
+        units=[{'ordinal':i,'uid':2000+i,'started':True,'cancelled':False,'returncode':0,
+            'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5,10)]
+        value={'version':1,'compiler_calls':[1,0],'application_runs':2,'actual_metadata_preserved':True,
+            'sealed_artifact_detached':True,'units':units,'allocation_removed':True,
+            'trusted_input_closure':False,'shipping_authority':False}
+        self.assertEqual(planner.validate_cargo_probe(value),value)
+        for field,replacement in (('compiler_calls',[True,0]),('compiler_calls',[1,1]),
+                ('application_runs',True),('actual_metadata_preserved',False),('sealed_artifact_detached',False),
+                ('allocation_removed',False),('trusted_input_closure',True),('shipping_authority',True)):
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):
+                planner.validate_cargo_probe({**value,field:replacement})
+        for field,replacement in (('uid',1001),('ordinal',True),('started',False),('cancelled',True),
+                ('returncode',125),('original_cleanup',False),('input_closure_complete',True),('shipping_authority',True)):
+            bad=copy.deepcopy(value);bad['units'][0][field]=replacement
+            with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):planner.validate_cargo_probe(bad)
+
     def probe(self):
         scopes=[{'scope_id':str(uuid.uuid4())} for _ in range(4)]
         workers={'scopes':scopes};writer={'guest_worker_quiescence':scopes[-1]}

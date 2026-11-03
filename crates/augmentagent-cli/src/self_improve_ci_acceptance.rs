@@ -27,6 +27,10 @@ async fn live_shared_ci_planner_protocol_v3()->Result<()> {
     let root=fixture.path();
     git(root,&["-c","init.templateDir=","init","-q"]).await?;
     std::fs::write(root.join("source.txt"),"literal immutable protocol fixture\n")?;
+    std::fs::create_dir(root.join("src"))?;
+    std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"private-cargo-probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n")?;
+    std::fs::write(root.join("Cargo.lock"),"version=4\n[[package]]\nname=\"private-cargo-probe\"\nversion=\"0.0.0\"\n")?;
+    std::fs::write(root.join("src/main.rs"),"fn main(){\n let root=std::path::Path::new(\"target/debug/.fingerprint\");\n std::fs::create_dir_all(root).unwrap();\n std::fs::write(root.join(\"unit-forged\"),b\"private unit only\").unwrap();\n println!(\"ISOLATED\");\n}\n")?;
     git(root,&["add","."]).await?;
     git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
         "-c","core.hooksPath=/dev/null","commit","-qm","protocol fixture"]).await?;
@@ -45,7 +49,10 @@ async fn live_shared_ci_planner_protocol_v3()->Result<()> {
         && probe["units"][3]["started"]==true && probe["cases"][4]["uid"]==2004
         && probe["cases"][4]["filesystem"]["input_stable"]==true
         && probe["filesystem"]["input_inode_metadata_preserved"]==true
-        && probe["filesystem"]["allocation_removed"]==true && probe["shipping_authority"]==false,
+        && probe["filesystem"]["allocation_removed"]==true && probe["shipping_authority"]==false
+        && probe["cargo"]["compiler_calls"]==serde_json::json!([1,0])
+        && probe["cargo"]["application_runs"]==2 && probe["cargo"]["actual_metadata_preserved"]==true
+        && probe["cargo"]["sealed_artifact_detached"]==true && probe["cargo"]["allocation_removed"]==true,
         "V3 probe did not establish original credential/cancellation observations");
     audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({
