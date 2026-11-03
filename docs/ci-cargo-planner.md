@@ -1216,3 +1216,21 @@ programs/links and sealed-publication/metadata preservation. All 288 Python CI
 tests and 31 focused managed Rust tests passed (15 opt-in Rust cases excluded).
 This evidence exercises the pinned workspace and does not admit registry
 dependencies, general graph dispatch, complete input closure or shipping.
+
+The pinned replay now routes requests through a shared graph-backed dispatcher.
+Compiler requests use admitted targets; dependency artifacts are selected from
+their actual owned publication rather than a global library label. Executables
+must match exactly one owned detached artifact, preserve the requested alias
+and argv, and still match its declared frozen target and producer action.
+Generated input roots must match one publication owned by the requesting
+package; a binary cannot acquire build-script output permissions through a
+contradictory producer record. Publication records now retain action, target
+binding and generated-root context, and historical-state comparisons include
+those fields. Root verifies sealed bytes/inventories again before mounting.
+
+The private fixture guard still applies its original package/source/flag
+restrictions. Publication storage is still the pinned replay's bounded storage;
+multiple-package producer lifetimes, opaque tools, general CI entry dispatch,
+complete input closure and publication-time restart remain unfinished. This
+dispatcher is an execution-routing component, not an artifact compatibility or
+passing-CI capability. Native validation of this extension is pending.

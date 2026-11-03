@@ -23,6 +23,63 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_dispatch_uses_graph_and_owned_executable_instead_of_package_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'source';source.mkdir();source,metadata=self.frozen_graph(source)
+            (source/'member/src').chmod(0o755);(source/'member/src/tool.rs').write_bytes(b'fn main(){}')
+            (source/'member/src/tool.rs').chmod(0o444);(source/'member/src').chmod(0o555)
+            metadata['packages'][0]['targets'].append({'kind':['bin'],'crate_types':['bin'],'name':'tool',
+                'src_path':'/workspace/member/src/tool.rs','edition':'2021'})
+            graph=planner.CargoGraph(source,json.dumps(metadata).encode(),owner=os.geteuid())
+            compiled=self.mapped_request(source=b'src/tool.rs',name=b'tool',kind=b'bin',emit=b'dep-info,link')
+            compiled[2].update({b'CARGO_MANIFEST_DIR':b'/workspace/member',b'CARGO_PKG_NAME':b'consumer-package',b'CARGO_PKG_VERSION':b'0.1.0'})
+            target=root/'target';(target/'debug/deps').mkdir(parents=True)
+            executable=target/'debug/deps/tool-aaaaaaaaaaaaaaaa';executable.write_bytes(b'owned executable');executable.chmod(0o755)
+            alias=target/'debug/tool';os.link(executable,alias)
+            row=[b'debug/deps/tool-aaaaaaaaaaaaaaaa'.hex(),'file',0o555,16,hashlib.sha256(b'owned executable').hexdigest()]
+            admission=graph.admit(compiled,host_triple=b'x86_64-unknown-linux-gnu')['cargo_target']
+            publications={'opaque-producer-key':{'action':'binary','cargo_target':admission,
+                'files':['debug/deps/tool-aaaaaaaaaaaaaaaa'],'generated_root':None}}
+            files={'debug/deps/tool-aaaaaaaaaaaaaaaa':('opaque-producer-key',row)}
+            request=(b'target/debug/tool',[b'target/debug/tool',b'--original-argument'],{},b'/workspace',None,0,0)
+            mapped=planner.dispatch_request(request,graph=graph,planner_target=target,publications=publications,files=files)
+            self.assertEqual(mapped['kind'],'application');self.assertEqual(mapped['artifact'],'debug/deps/tool-aaaaaaaaaaaaaaaa')
+            self.assertEqual(mapped['alias'],'debug/tool');self.assertEqual(mapped['cargo_target'],admission)
+            publications['opaque-producer-key']['action']='build-script'
+            request[2][b'OUT_DIR']=b'/workspace/target/debug/build/consumer-package-bbbbbbbbbbbbbbbb/out'
+            with self.assertRaises(planner.FreshnessHold):
+                planner.dispatch_request(request,graph=graph,planner_target=target,publications=publications,files=files)
+            publications['opaque-producer-key']['action']='binary';request[2].clear()
+            alias.unlink();alias.write_bytes(b'foreign executable')
+            with self.assertRaises(planner.FreshnessHold):
+                planner.dispatch_request(request,graph=graph,planner_target=target,publications=publications,files=files)
+
+    def test_dispatch_requires_declared_compiler_target_and_owned_generated_namespace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root,metadata=self.frozen_graph(directory)
+            (root/'member').chmod(0o755);(root/'member/build.rs').write_bytes(b'fn main(){}')
+            (root/'member/build.rs').chmod(0o444);(root/'member').chmod(0o555)
+            metadata['packages'][0]['targets'].append({'kind':['custom-build'],'crate_types':['bin'],
+                'name':'build-script-build','src_path':'/workspace/member/build.rs','edition':'2021'})
+            graph=planner.CargoGraph(root,json.dumps(metadata).encode(),owner=os.geteuid())
+            build=self.mapped_request(source=b'build.rs',name=b'build_script_build',kind=b'bin',emit=b'dep-info,link',
+                out=b'/workspace/target/debug/build/consumer-package-0123456789abcdef')
+            build[2].update({b'CARGO_MANIFEST_DIR':b'/workspace/member',b'CARGO_PKG_NAME':b'consumer-package',b'CARGO_PKG_VERSION':b'0.1.0'})
+            producer=graph.admit(build,host_triple=b'x86_64-unknown-linux-gnu')['cargo_target']
+            request=self.graph_request()
+            mapped=planner.dispatch_request(request,graph=graph,planner_target=root,publications={},files={})
+            self.assertEqual(mapped['role'],'library');self.assertEqual(mapped['cargo_target']['target_name'],'consumer')
+            request[2][b'OUT_DIR']=b'/workspace/target/debug/build/consumer-package-aaaaaaaaaaaaaaaa/out'
+            with self.assertRaises(planner.FreshnessHold):
+                planner.dispatch_request(request,graph=graph,planner_target=root,publications={},files={})
+            owned={'arbitrary-label':{'action':'generated','roots':['debug/build/consumer-package-aaaaaaaaaaaaaaaa/out'],
+                'cargo_target':producer}}
+            mapped=planner.dispatch_request(request,graph=graph,planner_target=root,publications=owned,files={})
+            self.assertEqual(mapped['generated_root'],'debug/build/consumer-package-aaaaaaaaaaaaaaaa/out')
+            owned['arbitrary-label']['cargo_target']['package_id']='foreign-package'
+            with self.assertRaises(planner.FreshnessHold):
+                planner.dispatch_request(request,graph=graph,planner_target=root,publications=owned,files={})
+
     def frozen_graph(self,directory):
         root=Path(directory);member=root/'member';(member/'src').mkdir(parents=True)
         (root/'Cargo.lock').write_text('version=4\n')
@@ -311,13 +368,13 @@ class PlannerProtocolTests(unittest.TestCase):
                 'version':'0.0.0','manifest_path':'/workspace/Cargo.toml','manifest_sha256':'1'*64,
                 'target_name':name,'target_kind':[kind],'source_path':'/workspace/'+source,
                 'source_sha256':'2'*64,'metadata_sha256':'3'*64}})
-        return {'version':1,'metadata_sha256':'3'*64,'packages':1,'targets':3,'original_metadata_cleanup':True,
+        return {'version':1,'metadata_sha256':'3'*64,'packages':1,'targets':3,'original_metadata_cleanup':True,'graph_dispatch':True,
             'admissions':admissions,'input_closure_complete':False,'shipping_authority':False}
 
     def test_cargo_graph_receipt_requires_every_compiler_binding_and_original_metadata_cleanup(self):
         value=self.cargo_graph();initial=[{'ordinal':i,'uid':2000+i} for i in range(5,14)];retry=[{'ordinal':14,'returncode':1}]
         self.assertEqual(planner.validate_cargo_graph(value,initial_units=initial,retry_units=retry,selected_uid=2008),value)
-        for field,replacement in (('original_metadata_cleanup',False),('packages',True),('targets',0),
+        for field,replacement in (('original_metadata_cleanup',False),('graph_dispatch',False),('packages',True),('targets',0),
                 ('admissions',value['admissions'][:-1]),('input_closure_complete',True),('shipping_authority',True)):
             with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):
                 planner.validate_cargo_graph(value|{field:replacement},initial_units=initial,retry_units=retry,selected_uid=2008)

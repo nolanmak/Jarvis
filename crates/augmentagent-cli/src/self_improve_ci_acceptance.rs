@@ -103,6 +103,7 @@ pub fn value()->u8{GENERATED}
         && probe["cargo"]["retry"]["shipping_authority"]==false
         && probe["cargo"]["cargo_graph"]["packages"]==1 && probe["cargo"]["cargo_graph"]["targets"]==3
         && probe["cargo"]["cargo_graph"]["original_metadata_cleanup"]==true
+        && probe["cargo"]["cargo_graph"]["graph_dispatch"]==true
         && probe["cargo"]["cargo_graph"]["admissions"].as_array().is_some_and(|values|values.len()==4)
         && probe["cargo"]["cargo_graph"]["input_closure_complete"]==false
         && probe["cargo"]["cargo_graph"]["shipping_authority"]==false
