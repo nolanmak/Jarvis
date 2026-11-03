@@ -1273,6 +1273,8 @@ impl Store {
         // #1699 — after retryGuardContext: the backfill reads it.
         crate::recipients::migrate(conn)?;
         crate::team_coverage::migrate(conn)?;
+        // #1833 — trusted-contact autonomy state and D12 sender auth.
+        crate::autonomy::migrate(conn)?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS email_guard_observations (
             id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, action_id TEXT NOT NULL,
             attempt_n INTEGER NOT NULL, guard TEXT NOT NULL, disposition TEXT NOT NULL,

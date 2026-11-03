@@ -12,6 +12,8 @@ pub mod outbound;
 pub mod owner_alerts;
 pub mod prefilter;
 pub mod scheduled;
+// #1833 D12 — Gmail-direct sender authentication.
+pub mod sender_auth;
 pub mod sigextract;
 pub mod tone;
 mod channel;
