@@ -44,6 +44,12 @@ class UnitViewTests(unittest.TestCase):
             with self.assertRaises(views.FreshnessHold):views.clone_inputs(source,root/'view',manifest,owner=os.getuid(),unit=os.getuid())
             self.assertFalse((root/'view').exists())
 
+    def test_sealed_input_with_an_external_inode_alias_has_no_admission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);source=root/'sealed';self.tree(source)
+            os.link(source/'deps/input',root/'external-alias')
+            with self.assertRaises(views.FreshnessHold):views.inventory(source,owner=os.getuid(),sealed=True)
+
     def test_inventory_is_lossless_and_refuses_symlinks_sockets_and_setid(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);source=root/'sealed';self.tree(source);source.chmod(0o700)
@@ -98,6 +104,25 @@ class UnitViewTests(unittest.TestCase):
             with patch.object(views.os,'read',side_effect=changed),self.assertRaises(views.FreshnessHold):
                 views.copy_outputs(output,root/'published',['result'],owner=os.getuid(),controller=os.getuid())
             self.assertFalse((root/'published/manifest.json').exists())
+
+    @unittest.skipUnless(hasattr(os,'setxattr'),'requires filesystem extended attributes')
+    def test_unmodeled_extended_attributes_cannot_be_dropped_from_inputs_or_outputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);source=root/'sealed';self.tree(source)
+            (source/'deps/input').chmod(0o644)
+            try:os.setxattr(source/'deps/input',b'user.unit-probe',b'unmodeled input')
+            except OSError as error:
+                if error.errno in (95,1):self.skipTest('host filesystem disallows user attributes')
+                raise
+            (source/'deps/input').chmod(0o444)
+            with self.assertRaises(views.FreshnessHold):views.inventory(source,owner=os.getuid(),sealed=True)
+            (source/'deps/input').chmod(0o644);os.removexattr(source/'deps/input',b'user.unit-probe');(source/'deps/input').chmod(0o444)
+            source.chmod(0o755);os.setxattr(source,b'user.unit-probe',b'unmodeled directory input');source.chmod(0o555)
+            with self.assertRaises(views.FreshnessHold):views.inventory(source,owner=os.getuid(),sealed=True)
+            output=root/'unit';output.mkdir(mode=0o700);(output/'result').write_bytes(b'output')
+            os.setxattr(output/'result',b'user.unit-probe',b'unmodeled output')
+            with self.assertRaises(views.FreshnessHold):views.copy_outputs(output,root/'published',['result'],
+                owner=os.getuid(),controller=os.getuid())
 
     def test_socket_capabilities_are_never_valid_stdio(self):
         reader,writer=os.pipe2(os.O_CLOEXEC);left,right=socket.socketpair()

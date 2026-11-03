@@ -44,7 +44,8 @@ def _read(path,owner,sealed,writer=None):
     try:
         before=os.fstat(descriptor);mode=stat.S_IMODE(before.st_mode)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid!=owner or mode&0o7000
-                or (sealed and mode not in (0o444,0o555)) or (not sealed and before.st_nlink!=1)
+                or (hasattr(os,'listxattr') and os.listxattr(descriptor))
+                or (sealed and mode not in (0o444,0o555)) or before.st_nlink!=1
                 or before.st_size>MAX_BYTES):raise FreshnessHold('artifact_provenance_unknown')
         count=0;digest=hashlib.sha256()
         while True:
@@ -71,6 +72,7 @@ def inventory(root,*,owner,sealed):
         nonlocal total
         info=directory.lstat();mode=stat.S_IMODE(info.st_mode)
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner or mode&0o7000
+                or (hasattr(os,'listxattr') and os.listxattr(directory,follow_symlinks=False))
                 or (sealed and mode!=0o555)):raise FreshnessHold('artifact_provenance_unknown')
         rows.append([os.fsencode(prefix).hex(),'directory',mode])
         for entry in sorted(directory.iterdir(),key=lambda p:os.fsencode(p.name)):
@@ -112,7 +114,9 @@ def copy_outputs(source,destination,names,*,owner,controller):
         if original.resolve()!=original:raise FreshnessHold('artifact_provenance_unknown')
         for parent in [source,*[source/Path(*name.parts[:i]) for i in range(1,len(name.parts))]]:
             info=parent.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner:raise FreshnessHold('artifact_provenance_unknown')
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid!=owner
+                    or (hasattr(os,'listxattr') and os.listxattr(parent,follow_symlinks=False))):
+                raise FreshnessHold('artifact_provenance_unknown')
         output=destination/name;output.parent.mkdir(parents=True,mode=0o700,exist_ok=True)
         descriptor=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
         try:

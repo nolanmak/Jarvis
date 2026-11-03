@@ -125,6 +125,18 @@ generated inputs or enable protected Cargo execution or passing-CI publication.
    producer and cleanup evidence; it does not manufacture a new execution receipt.
    Cross-reconstruction workspace reuse remains deferred. Independently produced
    third-party seeds remain required across reconstructions.
+   Every generated/artifact publication must also revalidate stored selectors:
+   Cargo may already have cached a fresh decision and never request an affected
+   unit. Mark that command's pending invalidations before accepting its result.
+   Drain its original planner/unit scopes, invalidate affected fingerprints and
+   dependents, then restart the same command with its original binding, stdin,
+   coverage invocation and remaining compute/deadline grant. At most four planner
+   passes, including the first, are allowed; unresolved or oscillating state
+   yields a typed prerequisite. Compatible compilation outcomes may be reused;
+   tests execute on each pass. No passing verdict is published while relevant
+   invalidations remain pending. A verified red remains actionable only while
+   its own observed inputs remain valid. This scheduling protocol is selected
+   but unimplemented and requires a real in-command publication regression.
 
 5. **Distinguish precise and opaque producers.** A pinned rustc invocation with
    no untrusted native extension still needs a proven precise input closure.
@@ -171,14 +183,28 @@ generated inputs or enable protected Cargo execution or passing-CI publication.
 
 9. **Copy stopped outputs into new controller-owned inodes before publication.**
    After the original unit cleanup is verified, copy only the controller's
-   planned output paths into a private preparing publication; reject symlinks,
-   external hard links, changed files and unsupported entries. Preserve exact
+   planned output files or declared output roots into a private preparing
+   publication. Dynamic build-script filenames are inventoried recursively only
+   beneath the originally allocated `OUT_DIR` root, after original cleanup,
+   under the same 100,000-entry/4 GiB unit bounds. Reject symlinks, external hard
+   links, unmodeled extended attributes, changed files and unsupported entries. Preserve exact
    bytes and executable mode, seal the copy, sync files/directories, rename the
    preparing publication and sync its parent before committing its root-owned
    record. A writer's old inode never becomes the published inode. Interrupted
    copies stay uncommitted; resource exhaustion remains a prerequisite under
    the existing image budget. The logical root/output allocations remain in
    the original managed target, including their preparation records.
+
+10. **Start actual producers with empty own output and scratch roots.** Approved
+    source, configuration, dependency artifacts and generated inputs are separate
+    immutable mounts. A real build-script execution gets a fresh empty own
+    `OUT_DIR`; previous contents are supplied only by a verified outcome replay,
+    not restored as mutable initial state. Record initial absence and distinguish
+    reads before writes from reads of that execution's own output. The complete
+    collector must establish that distinction before reuse. Initial namespace
+    identity excludes final outputs, avoiding a circular input/output digest.
+    This selects logical initial contents; metadata/runtime equivalence remains
+    a separate blocking requirement and cannot be inferred from empty bytes.
 
 ### Filesystem feasibility and remaining mapping work
 
@@ -190,15 +216,20 @@ the original bytes and unchanged inode metadata. It also attempts tracked-source
 and generated-input writes, a foreign abstract socket, a supervisor-root lookup,
 and a private temporary write. After original unit teardown, the controller
 copies and seals its one declared output, verifies both inventories and removes
-only the original completed probe allocation. Its first real VM result is still
-pending. Eight host filesystem tests and strict receipt validation are mechanics
-evidence; neither is a trusted input closure or a reusable producer proof.
+only the original completed probe allocation. The first real VM replay at `d84b19dd` passed in 93.15 seconds, including
+actual distinct mount/IPC/network namespaces, generated-file byte and inode
+metadata stability, isolation negatives, stopped output publication and original
+allocation removal. Its binary SHA-256 is
+`e1febea9300eb3664c46e11340db57ca1568d03d280557e7d43780203a034666`.
+The later extended-attribute and external-alias refusal guards require their
+current-build replay. Host filesystem tests and strict receipt validation are
+mechanics evidence; neither is a trusted input closure or a reusable producer proof.
 
 The prototype uses only a pinned literal artifact and output slot. The actual
 Cargo mapper still must resolve each invocation's artifact inputs, output slots,
 fingerprints, generated namespaces and exact configuration. It must reserve
-fresh writable output slots rather than overwrite a mounted input, and define
-self-read build-script outputs from a stable initial view. Unsupported symlinks
+fresh writable output slots rather than overwrite a mounted input, and implement
+Decision 10's empty own-output/scratch roots and write/read provenance. Unsupported symlinks
 and namespace entries currently refuse; repository-required forms need their
 own validated policy and behavioral evidence before activation. The private
 empty `/cargo` in this fixture does not authorize nested Cargo with unprotected
@@ -394,12 +425,16 @@ UUID, input-manifest digest, output-manifest digest, and controller/runtime/cach
 identities from the existing C binding. Paths and argv/environment bytes use a
 lossless byte encoding; JSON booleans cannot stand in for integer fields.
 
-The controller records the original binding before releasing a unit. Only the
-original supervisor's successful stopped/reaped token for that exact scope may
-advance it to input capture and output sealing. A generic cleanup string, another
-scope's receipt, command completion or whole-VM exit cannot substitute for the
-unit token. Outputs become readable to dependent units only after sealing.
-Unknown or incomplete records cannot become reusable after a crash.
+The controller records the original binding before releasing a unit. Before
+exec, freeze the initial filesystem view and actual EOF stdin, and arm the full
+collector before the first untrusted instruction. Observe accesses and writes
+while the original unit runs. Only the original supervisor's stopped/reaped token
+for that exact scope permits finalizing the observed-input manifest and sealing
+outputs; cleanup is not permission to begin first observation afterward. A
+generic cleanup string, another scope's receipt, command completion or whole-VM
+exit cannot substitute for that token. Outputs become readable to dependent
+units only after sealing. Unknown or incomplete records cannot become reusable
+after a crash.
 
 The command's original guest supervisor must own the root launcher, planner,
 relay and all unit supervisors as descendants. The ordinary worker API must not
@@ -429,6 +464,12 @@ cleanup interfaces. None requests a new product decision from the owner.
   active inputs; worker copies of output artifacts must not become authoritative.
   Close how self-read build-script outputs participate in input identity without
   making every unchanged invocation incompatible. Blocks protected activation.
+* **In-command publication scheduling:** implement Decision 4's bounded planner
+  drain/restart under the original command's grant. A producer publishing a new
+  conflicting module after Cargo classified its consumer fresh must not leave
+  that skipped consumer green. The original negative-lookup regression must
+  pass within one Cargo invocation, with compatible compiler counts preserved.
+  C owns this gate; it blocks required-check and passing-proof publication.
 * **Precise lookup closure:** select and prove collection of failed lookups,
   successful opens and relevant directory queries for the pinned pure compiler.
   A new generated module candidate is a required regression even when every
@@ -438,11 +479,24 @@ cleanup interfaces. None requests a new product decision from the owner.
   Kernel syscall tracing is a candidate to test, not an accepted complete
   collector; truncated traces, unsupported operations or incomplete namespace
   resolution must refuse reuse. Blocks precise-mode implementation acceptance.
+* **Runtime/device and metadata equivalence:** C must select and prove treatment
+  of observed randomness/device access, process/runtime inputs and filesystem
+  metadata, including equivalent bytes republished into different inodes. No
+  ordinary file digest, ignored stat field or unstated nondeterminism
+  normalization can establish compatibility. Affected producers have no reuse
+  authority until the rule is proved against D8. The prototype rejects unmodeled
+  extended attributes and external inode aliases; this does not settle the full
+  metadata policy. This load-bearing gate blocks reuse and activation.
 * **Nested builders and rustdoc:** enumerate actual repository use and define how
   a nested Cargo build obtains complete frozen inputs while its parent producer
   is still running. Do not silently allow a nested unprotected cache or assume
-  command-level quiescence freezes an active parent. Define doctest compilation
-  versus always-fresh execution under D8. Blocks implementation acceptance.
+  command-level quiescence freezes an active parent. Define parent suspension,
+  lineage, slot/jobserver release and reacquisition, recursion limits and
+  cancellation before committing the final unit record schema. Four parents
+  waiting for nested work must not occupy every slot needed by their children;
+  prove the saturated case under the original resource grant. Define doctest
+  compilation versus always-fresh execution under D8. C/R own this gate; it
+  blocks implementation acceptance.
 * **Credential, I/O and cancellation feasibility:** prove the loader/peer/drop
   protocol, stable jobserver mapping, bounded stdin staging, unsupported spawn
   handling, and original supervisor ownership in the real guest. The fixed V3
@@ -451,6 +505,22 @@ cleanup interfaces. None requests a new product decision from the owner.
   signal/race, original-parent death and
   unsupported-spawn fault coverage remain required. Same-UID evidence cannot
   substitute for those guest cases. Blocks protected activation.
+* **Protected external-seed import:** use the existing
+  [`ci-dependency-store.py`](../scripts/ci-dependency-store.py) `publish`,
+  `read_seed`, `lookup_seed` and `install` contracts with the existing
+  [`ci-dependency-seed.py`](../scripts/ci-dependency-seed.py) eligibility and
+  [`ci-dependency-artifacts.py`](../scripts/ci-dependency-artifacts.py) selection.
+  The seed binding, isolated producer, original quiescence acknowledgement and
+  per-file/unit integrity remain authoritative. Compatibility revalidates the
+  existing authority/cache/contract/dependency identities; workspace source
+  history is retained without pretending to certify a new source generation.
+  Current `install` uses hard links and sticky root-owned directories; it is not
+  the protected planner's restoration path. C/R must prove import into protected
+  metadata/artifact views while retaining the original seed reference, exact
+  paths/flags, live-consumer metadata stability and the unchanged image budget.
+  No direct adoption of candidate-writable fingerprints or new seed authority is
+  allowed. The already-passing seed replays are credited; protected restoration
+  and required cross-reconstruction reuse remain activation gates.
 * **Final unit schema and suite mapping:** turn the fields above into exact
   validated record types and publication/replay rules, including producer-versus-
   reuse records and protected metadata restoration after interrupted Cargo.
@@ -475,3 +545,14 @@ connect the final proof producer, V/M/baseline consumers and durable reservation
 to-dispatch fence. Normal matching-build rollout, legacy-executor drain/remote
 operation reconciliation, original CLI/Discord merges and the epic's acceptance
 soaks remain required. No fixture or deployment alone closes #1703.
+
+## Filesystem checkpoint audit
+
+Fresh-reader and conversation-to-spec review at the filesystem prototype found
+eight claims. The cleanup/capture ordering contradiction is corrected. Bounded
+in-command planner restart, declared output-root inventory and empty initial
+own-output/scratch contents are now explicit selections whose implementation
+still needs behavioral evidence. Runtime/device/metadata compatibility, nested
+saturation and protected seed restoration remain named C/R gates above. Their
+absence cannot be filled by a passing filesystem fixture. This checkpoint is
+not a final schema/API audit, seam audit or consumer implementation handoff.
