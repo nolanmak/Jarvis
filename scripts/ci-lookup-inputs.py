@@ -44,6 +44,111 @@ def _wire(value):
     return value
 
 
+class UnitInvalidations:
+    """Durable, monotonic invalidation intent for one admitted planner command.
+
+    The root planner supplies the dependency graph and selected-input digests.
+    This journal never deletes fingerprints, clears pending work, or authorizes
+    reuse. Original scope drainage must be proved separately before mutation.
+    A single controller owns the journal; stale writers are refused.
+    """
+    _MAX_BYTES=1024*1024
+
+    def __init__(self,path,*,binding,command):
+        _cache.validate_binding(binding)
+        if not isinstance(command,str) or not command or len(command)>256:_hold()
+        self.path=Path(path);self.binding=copy.deepcopy(binding);self.command=command
+        self._parent()
+        self._record=self._read()
+        if self._record is None:
+            self._record={'version':1,'kind':'ci-unit-invalidations','binding':self.binding,
+                'command':command,'units':{},'pending':[],'shipping_authority':False}
+            self._save(self._record,initial=True)
+        self._validate(self._record)
+
+    def _parent(self):
+        try:
+            info=self.path.parent.lstat()
+            if (self.path.parent.resolve()!=self.path.parent or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)!=0o700):_hold()
+        except OSError:_hold()
+
+    def _read(self):
+        self._parent()
+        try:self.path.lstat()
+        except FileNotFoundError:return None
+        return _cache._read_record(self.path,max_bytes=self._MAX_BYTES)
+
+    @staticmethod
+    def _name(name):
+        return (isinstance(name,str) and 0<len(name)<=128
+            and all(c in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.:' for c in name))
+
+    def _validate(self,value):
+        try:
+            if (type(value) is not dict or set(value)!={'version','kind','binding','command','units','pending','shipping_authority'}
+                    or type(value['version']) is not int or value['version']!=1 or value['kind']!='ci-unit-invalidations'
+                    or value['binding']!=self.binding or value['command']!=self.command
+                    or value['shipping_authority'] is not False or type(value['units']) is not dict
+                    or len(value['units'])>1024 or type(value['pending']) is not list):_hold()
+            units=value['units'];fingerprints=set();finished=set()
+            for name,row in units.items():
+                if (not self._name(name) or type(row) is not dict
+                        or set(row)!={'dependencies','content_sha256','fingerprints'}
+                        or not _cache._digest(row['content_sha256'])):_hold()
+                deps=row['dependencies'];paths=row['fingerprints']
+                if (type(deps) is not list or len(deps)>64 or any(not self._name(d) or d not in units or d==name for d in deps)
+                        or len(set(deps))!=len(deps) or type(paths) is not list or not 0<len(paths)<=32):_hold()
+                for path in paths:
+                    if not isinstance(path,str) or len(path)>512:_hold()
+                    parts=path.split('/')
+                    if (len(parts)!=3 or parts[0] not in ('debug','release') or parts[1]!='.fingerprint'
+                            or not self._name(parts[2]) or parts[2] in ('.','..') or path in fingerprints):_hold()
+                    fingerprints.add(path)
+            # Iterative DAG validation also bounds malformed persisted graphs.
+            while len(finished)<len(units):
+                ready={name for name,row in units.items() if name not in finished and set(row['dependencies'])<=finished}
+                if not ready:_hold()
+                finished.update(ready)
+            pending=value['pending']
+            if any(not self._name(name) or name not in units for name in pending) or pending!=sorted(set(pending)):_hold()
+            if any(name not in pending and any(dep in pending for dep in row['dependencies']) for name,row in units.items()):_hold()
+        except (KeyError,TypeError,ValueError):_hold()
+
+    def _save(self,value,*,initial=False):
+        self._validate(value)
+        if len(_encoded(value))>self._MAX_BYTES:_hold()
+        if self._read()!=(None if initial else self._record):_hold()
+        _cache._write_record(self.path,value)
+        self._record=copy.deepcopy(value)
+
+    def register(self,name,*,dependencies,content_sha256,fingerprints):
+        if not self._name(name) or name in self._record['units']:_hold()
+        value=self.state()
+        value['units'][name]=copy.deepcopy({'dependencies':dependencies,'content_sha256':content_sha256,'fingerprints':fingerprints})
+        if type(dependencies) is list and any(dep in value['pending'] for dep in dependencies):
+            value['pending']=sorted([*value['pending'],name])
+        self._save(value)
+
+    def changed(self,digests):
+        if type(digests) is not dict or len(digests)>1024:_hold()
+        value=self.state();pending=set(value['pending'])
+        for name,digest in digests.items():
+            if name not in value['units'] or not _cache._digest(digest):_hold()
+            if digest!=value['units'][name]['content_sha256']:pending.add(name)
+        while True:
+            more={name for name,row in value['units'].items() if any(dep in pending for dep in row['dependencies'])}-pending
+            if not more:break
+            pending.update(more)
+        value['pending']=sorted(pending)
+        self._save(value)
+        return self.pending()
+
+    def pending(self):return list(self._record['pending'])
+
+    def state(self):return copy.deepcopy(self._record)
+
+
 class LookupCensus:
     """Detached content facts for the exact virtual roots supplied by C.
 

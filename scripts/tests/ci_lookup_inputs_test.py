@@ -1,5 +1,6 @@
 """Selective input identity from captured pathname queries and content censuses."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -16,6 +17,73 @@ def load(name):
 
 
 class LookupInputTests(unittest.TestCase):
+    def journal_binding(self):
+        return {'generation':'12345678-1234-4234-8234-123456789abc','head':'a'*40,'tree':'b'*40,
+            **{key:'c'*64 for key in ('contract_sha256','authority_sha256','cache_identity_sha256','source_inputs_sha256')}}
+
+    def test_changed_unit_marks_dependents_durably_without_claiming_revalidation(self):
+        root=self.root/'journal';root.mkdir(mode=0o700)
+        binding=self.journal_binding()
+        journal=self.inputs.UnitInvalidations(root/'units.json',binding=binding,command='original-command')
+        journal.register('library',dependencies=[],content_sha256='1'*64,fingerprints=['debug/.fingerprint/example-0123456789abcdef'])
+        journal.register('binary',dependencies=['library'],content_sha256='2'*64,fingerprints=['debug/.fingerprint/example-fedcba9876543210'])
+        journal.register('unrelated',dependencies=[],content_sha256='3'*64,fingerprints=['debug/.fingerprint/other-0123456789abcdef'])
+        self.assertEqual(journal.changed({'library':'1'*64}),[])
+        self.assertEqual(journal.changed({'library':'4'*64}),['binary','library'])
+        restored=self.inputs.UnitInvalidations(root/'units.json',binding=binding,command='original-command')
+        self.assertEqual(restored.pending(),['binary','library'])
+        self.assertEqual(restored.changed({'library':'1'*64}),['binary','library'])
+        self.assertFalse(restored.state()['shipping_authority'])
+        with self.assertRaises(self.inputs.FreshnessHold):
+            self.inputs.UnitInvalidations(root/'units.json',binding=binding,command='different-command')
+
+    def test_invalidation_journal_refuses_unknown_graph_paths_and_stale_writers(self):
+        root=self.root/'journal';root.mkdir(mode=0o700);path=root/'units.json'
+        args={'binding':self.journal_binding(),'command':'original-command'}
+        journal=self.inputs.UnitInvalidations(path,**args)
+        stale=self.inputs.UnitInvalidations(path,**args)
+        journal.register('library',dependencies=[],content_sha256='1'*64,fingerprints=['debug/.fingerprint/library-abcd'])
+        committed=path.read_bytes()
+        for name,deps,paths in (
+                ('unknown',['missing'],['debug/.fingerprint/unknown-abcd']),
+                ('self',['self'],['debug/.fingerprint/self-abcd']),
+                ('escape',[],['debug/.fingerprint/../../source']),
+                ('alias',[],['debug/.fingerprint/library-abcd'])):
+            with self.subTest(name=name),self.assertRaises(self.inputs.FreshnessHold):
+                journal.register(name,dependencies=deps,content_sha256='2'*64,fingerprints=paths)
+            self.assertEqual(path.read_bytes(),committed)
+        with self.assertRaises(self.inputs.FreshnessHold):stale.changed({})
+        with self.assertRaises(self.inputs.FreshnessHold):journal.changed({'missing':'2'*64})
+        detached=journal.state();detached['units'].clear()
+        self.assertEqual(journal.changed({'library':'2'*64}),['library'])
+        journal.register('later',dependencies=['library'],content_sha256='3'*64,fingerprints=['debug/.fingerprint/later-abcd'])
+        self.assertEqual(journal.pending(),['later','library'])
+        self.assertEqual(path.stat().st_mode&0o777,0o600)
+
+    def test_invalidation_journal_refuses_corrupt_rebound_and_unprotected_records(self):
+        root=self.root/'journal';root.mkdir(mode=0o700);path=root/'units.json'
+        args={'binding':self.journal_binding(),'command':'original-command'}
+        journal=self.inputs.UnitInvalidations(path,**args)
+        journal.register('library',dependencies=[],content_sha256='1'*64,fingerprints=['debug/.fingerprint/library-abcd'])
+        original=path.read_bytes()
+        with self.assertRaises(self.inputs.FreshnessHold):
+            self.inputs.UnitInvalidations(path,**(args|{'binding':args['binding']|{'head':'d'*40}}))
+        for fault in ('torn','cycle','authority','public','symlink','public-parent'):
+            path.write_bytes(original);path.chmod(0o600);root.chmod(0o700)
+            if fault=='torn':path.write_bytes(b'{')
+            elif fault in ('cycle','authority'):
+                value=json.loads(original)
+                if fault=='cycle':value['units']['library']['dependencies']=['library']
+                else:value['shipping_authority']=True
+                path.write_text(json.dumps(value))
+            elif fault=='public':path.chmod(0o644)
+            elif fault=='public-parent':root.chmod(0o755)
+            else:
+                backing=root/'backing';path.rename(backing);path.symlink_to(backing)
+            with self.subTest(fault=fault),self.assertRaises(self.inputs.FreshnessHold):
+                self.inputs.UnitInvalidations(path,**args)
+            if path.is_symlink():path.unlink()
+
     def setUp(self):
         self.inputs=load('ci_lookup_inputs');self.manifest=load('ci_input_manifest')
         self.directory=self.enterContext(tempfile.TemporaryDirectory())

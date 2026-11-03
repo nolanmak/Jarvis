@@ -1073,3 +1073,17 @@ Python suite passed with native helpers and no skips; 10 lookup-input tests,
 excluded). All 99 updater rebuild checks passed. The input-closure and shipping
 flags remain false; the content comparison does not establish metadata/runtime
 compatibility or schedule a Cargo invalidation/restart yet.
+
+The next invalidation component is a command-bound durable intent journal in
+`ci-lookup-inputs.py`. A changed selected-input digest marks the unit and its
+transitive dependents pending before the caller can act. Restarting the
+controller or observing the original digest again cannot clear pending work.
+Late dependents inherit pending state. Private, atomically replaced records
+retain the original binding, digests and owned fingerprint paths; malformed
+graphs, path escapes, duplicate ownership, stale writers and rebound commands
+are refused. This component does not delete Cargo metadata, prove original
+scope drainage, execute retries or issue passing-CI evidence. The real compiler
+selector and planner retry path still need to consume it. Its regression suite
+passes alongside all 275 Python CI tests with native helpers and no skips;
+focused managed Rust checks also pass. No new native VM result or production
+activation is claimed for this journal addition.
