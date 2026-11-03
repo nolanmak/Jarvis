@@ -173,8 +173,14 @@ class PlannerProtocolTests(unittest.TestCase):
             'shipping_authority':False,'kernel_release':'7.0.0-test','unit_pid':42,'unit_uid':2004,
             'program_sha256':'1'*64,'binary_sha256':'2'*64,'witness_observed':True,'positive_query_observed':True,
             'negative_query_observed':True,'max_path_query_observed':True,'compiler_queries_observed':True,'library_generated_query_observed':True,'after_kernel_copy':True,'events':3,'original_observer_cleanup':True,
-            'filesystem_coverage_complete':False,'missed_probe_census_complete':False,'input_closure_complete':False,
+            'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'input_closure_complete':False,
             'allocation_removed':True}
+        census={'pid':100,'birth':1000,
+            'programs':[{'id':i,'type':17 if i in (1,4) else 2,'tag':str(i)*16,'recursion_misses':0} for i in range(1,5)],
+            'links':[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kprobe_multi',
+                'prog_id':i,'tag':str(i)*16,**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
+                    else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]}
+        value['kernel_observation']['probe_census']={'before':census,'after':json.loads(json.dumps(census))}
         return value,binding,command,workers,writer,source
 
     def test_probe_requires_original_distinct_scope_roles_bindings_and_no_authority(self):
@@ -184,7 +190,7 @@ class PlannerProtocolTests(unittest.TestCase):
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
                 'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
                 'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
-                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup'):
+                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup','kernel-missed','kernel-census'):
             value=copy.deepcopy(original)
             if fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
@@ -217,6 +223,8 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='kernel-coverage':value['kernel_observation']['filesystem_coverage_complete']=True
             elif fault=='kernel-closure':value['kernel_observation']['input_closure_complete']=True
             elif fault=='kernel-cleanup':value['kernel_observation']['original_observer_cleanup']=False
+            elif fault=='kernel-missed':value['kernel_observation']['probe_census']['after']['links'][1]['missed']=1
+            elif fault=='kernel-census':del value['kernel_observation']['probe_census']
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 

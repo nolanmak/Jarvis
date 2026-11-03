@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -43,6 +44,143 @@ def startup_errno(error):
     return errno.EINVAL
 
 
+def validate_census(value):
+    if type(value) is not dict or set(value)!={'before','after'}:
+        raise ObservationUnavailable('kernel census unavailable')
+    for sample in value.values():
+        if (type(sample) is not dict or set(sample)!={'pid','birth','programs','links'}
+                or type(sample['pid']) is not int or not 0<sample['pid']<2**31
+                or type(sample['birth']) is not int or not 0<sample['birth']<2**64
+                or type(sample['programs']) is not list or len(sample['programs'])!=4
+                or type(sample['links']) is not list or len(sample['links'])!=4):
+            raise ObservationUnavailable('original kernel objects unavailable')
+        programs={};links=set();raw=set();linked=set();returns=0
+        for program in sample['programs']:
+            if (type(program) is not dict or set(program)!={'id','type','tag','recursion_misses'}
+                    or type(program['id']) is not int or not 0<program['id']<2**31 or program['id'] in programs
+                    or type(program['type']) is not int or program['type'] not in (2,17)
+                    or type(program['tag']) is not str or re.fullmatch(r'[a-f0-9]{16}',program['tag']) is None
+                    or type(program['recursion_misses']) is not int or program['recursion_misses']!=0):
+                raise ObservationUnavailable('kernel program recursion census failed')
+            programs[program['id']]=program
+        for link in sample['links']:
+            if (type(link) is not dict or not {'id','type','prog_id','tag'}<=set(link)
+                    or type(link['id']) is not int or not 0<link['id']<2**31 or link['id'] in links
+                    or type(link['prog_id']) is not int or link['prog_id'] not in programs or link['prog_id'] in linked
+                    or link['tag']!=programs[link['prog_id']]['tag']):
+                raise ObservationUnavailable('original kernel attachment changed')
+            links.add(link['id']);linked.add(link['prog_id'])
+            if link['type']=='raw_tracepoint':
+                if (set(link)!={'id','type','prog_id','tag','tracepoint'}
+                        or link['tracepoint'] not in ('sys_enter','sys_exit') or link['tracepoint'] in raw
+                        or programs[link['prog_id']]['type']!=17):
+                    raise ObservationUnavailable('original syscall attachment unavailable')
+                raw.add(link['tracepoint'])
+            elif link['type']=='kprobe_multi':
+                if (set(link)!={'id','type','prog_id','tag','function','count','flags','missed'}
+                        or link['function']!='getname_flags' or programs[link['prog_id']]['type']!=2
+                        or any(type(link[key]) is not int for key in ('count','flags','missed'))
+                        or (link['count'],link['flags'],link['missed'])!=(1,1,0)):
+                    raise ObservationUnavailable('kernel return probe census failed')
+                returns+=1
+            else:raise ObservationUnavailable('unknown kernel attachment')
+        if raw!={'sys_enter','sys_exit'} or returns!=2 or linked!=set(programs):
+            raise ObservationUnavailable('kernel attachment census incomplete')
+    if value['before']!=value['after']:
+        raise ObservationUnavailable('kernel census identity or counters changed')
+    return value
+
+
+def _fdinfo(data):
+    if len(data)>16384:raise ObservationUnavailable('unbounded kernel descriptor metadata')
+    try:text=data.decode('ascii')
+    except UnicodeError:raise ObservationUnavailable('unknown kernel descriptor encoding') from None
+    result={}
+    for line in text.splitlines():
+        match=re.fullmatch(r'([a-z0-9_]+):[ \t]*(.*)',line)
+        if match is None or match[1] in result:raise ObservationUnavailable('ambiguous kernel descriptor metadata')
+        result[match[1]]=match[2]
+    return result
+
+
+def _number(value):
+    if not isinstance(value,str) or re.fullmatch(r'[0-9]{1,20}',value) is None or int(value)>=2**64:
+        raise ObservationUnavailable('unknown kernel counter')
+    return int(value)
+
+
+def _birth(pid,owner):
+    fields=Path('/proc',str(pid),'stat').read_text().rsplit(')',1)[1].split()
+    if int(fields[1])!=owner:raise ObservationUnavailable('foreign observer parent')
+    return int(fields[19])
+
+
+def _function_address():
+    found=[];size=0
+    with Path('/proc/kallsyms').open('rb') as stream:
+        for line in stream:
+            size+=len(line)
+            if size>64*1024**2:raise ObservationUnavailable('unbounded kernel symbol census')
+            parts=line.split()
+            if len(parts)==3 and parts[2]==b'getname_flags' and parts[1] in (b't',b'T'):
+                found.append(int(parts[0],16))
+    if len(found)!=1 or not 0<found[0]<2**64:raise ObservationUnavailable('kernel function identity unavailable')
+    return found[0]
+
+
+def _return_link(identity,program,address):
+    # Linux UAPI prefix: bpf_link_info header, alignment, kprobe_multi fields.
+    # The kernel reports the copied prefix length; absent fields never mean zero.
+    if os.uname().machine!='x86_64' or sys.byteorder!='little':
+        raise ObservationUnavailable('unsupported kernel census ABI')
+    libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+    def call(command,argument):
+        result=libc.syscall(ctypes.c_long(321),ctypes.c_int(command),ctypes.byref(argument),ctypes.c_uint(ctypes.sizeof(argument)))
+        if result<0:raise OSError(ctypes.get_errno(),'kernel census query failed')
+        return result
+    argument=ctypes.create_string_buffer(struct.pack('<III',identity,0,0),12)
+    descriptor=call(30,argument)
+    try:
+        addresses=(ctypes.c_uint64*1)();info=ctypes.create_string_buffer(40)
+        struct.pack_into('<QII',info,16,ctypes.addressof(addresses),1,0)
+        query=ctypes.create_string_buffer(struct.pack('<IIQ',descriptor,40,ctypes.addressof(info)),16)
+        call(15,query)
+        if struct.unpack_from('<I',query,4)[0]<40:raise OSError(errno.EPROTONOSUPPORT,'kernel counter ABI unavailable')
+        kind,actual,prog=struct.unpack_from('<III',info)
+        count,flags,missed=struct.unpack_from('<IIQ',info,24)
+        if kind!=8 or actual!=identity or prog!=program or count!=1 or flags!=1 or addresses[0]!=address:
+            raise OSError(errno.ERANGE,'original return attachment unavailable')
+        return {'function':'getname_flags','count':count,'flags':flags,'missed':missed}
+    finally:os.close(descriptor)  # Never keep the observer's attachments alive.
+
+
+def kernel_census(child,owner,birth,address):
+    if child.poll() is not None or _birth(child.pid,owner)!=birth:
+        raise ObservationUnavailable('original observer is not live')
+    root=Path('/proc',str(child.pid));programs=[];links=[]
+    descriptors=list((root/'fd').iterdir())
+    if len(descriptors)>512:raise ObservationUnavailable('unbounded original descriptor census')
+    for path in descriptors:
+        target=os.readlink(path)
+        if target not in ('anon_inode:bpf-prog','anon_inode:bpf_link','anon_inode:bpf-link'):
+            continue
+        info=_fdinfo((root/'fdinfo'/path.name).read_bytes())
+        if target=='anon_inode:bpf-prog':
+            programs.append({'id':_number(info.get('prog_id')),'type':_number(info.get('prog_type')),
+                'tag':info.get('prog_tag'),'recursion_misses':_number(info.get('recursion_misses'))})
+        else:
+            identity=_number(info.get('link_id'));program=_number(info.get('prog_id'));kind=info.get('link_type')
+            link={'id':identity,'type':kind,'prog_id':program,'tag':info.get('prog_tag')}
+            if kind=='raw_tracepoint':link['tracepoint']=info.get('tp_name')
+            elif kind=='kprobe_multi':link.update(_return_link(identity,program,address))
+            else:raise ObservationUnavailable('unaccounted observer attachment')
+            links.append(link)
+    if child.poll() is not None or _birth(child.pid,owner)!=birth:
+        raise ObservationUnavailable('original observer changed during census')
+    return {'pid':child.pid,'birth':birth,'programs':sorted(programs,key=lambda row:row['id']),
+        'links':sorted(links,key=lambda row:row['id'])}
+
+
 def decode(data,*,complete=True):
     if not isinstance(data,bytes) or len(data)>MAX_BYTES:raise ObservationUnavailable('unbounded observation')
     if complete and (not data or not data.endswith(b'\n')):raise ObservationUnavailable('incomplete observation')
@@ -53,6 +191,7 @@ def decode(data,*,complete=True):
     for line in lines:
         if not line:continue
         if (re.fullmatch(r'Program ID: [1-9][0-9]{0,9}',line)
+                or line=='Attaching to 1 functions'
                 or line in ('The verifier log:','The verifier log: ')
                 or re.fullmatch(r'processed [0-9]{1,10} insns \(limit 1000000\) max_states_per_insn [0-9]{1,10} total_states [0-9]{1,10} peak_states [0-9]{1,10} mark_read [0-9]{1,10}',line)):
             loader_records+=1
@@ -135,7 +274,7 @@ rawtracepoint:sys_enter / (uid >= 2000 && uid < 6096) || uid == 1999 / {
  @sequence[tid] = @sequence[tid] + 1;
  @seen[tid]=(uint64)0; @ready[tid]=(uint64)0;
 }
-kretprobe:getname_flags
+kretprobe:getname_flag?
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
  $name = ((struct observer_filename *)retval)->name;
  $prefix = *(uint64 *)$name;
@@ -164,7 +303,7 @@ kretprobe:getname_flags
   @ready[tid]=@sequence[tid];
  }
 }
-kretprobe:getname_flags
+kretprobe:getname_flag?
 / ((uid >= 2000 && uid < 6096) || uid == 1999) && (uint64)retval > 4095 && (uint64)retval < (uint64)0xfffffffffffff001 / {
  if (@ready[tid]>0 && @ready[tid]==@sequence[tid]) {
   $name=((struct observer_filename *)retval)->name;
@@ -223,7 +362,8 @@ class Observer:
         self.witness='/ci-observer-witness-'+str(uuid.uuid4())+'-'+'x'*192;self.witness_pid=None
         self.program=_PROGRAM
         self.stdout=self.root/'stdout';self.stderr=self.root/'stderr';self.output=None;self.error=None
-        self.report=None
+        self.report=None;self.census_before=None;self.census_after=None;self.census_error=False
+        self.birth=None;self.kernel_address=None
 
     def __enter__(self):
         try:self.start();return self
@@ -246,6 +386,7 @@ class Observer:
                 check=True,timeout=min(5,max(.001,self.deadline-time.monotonic())))
         if not (tracefs/'kprobe_events').is_file():
             raise OSError(errno.ENOENT,'private kernel trace filesystem unavailable')
+        self.kernel_address=_function_address()
         binary=Path('/usr/bin/bpftrace');info=binary.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:
             raise ObservationUnavailable('untrusted kernel observer')
@@ -266,6 +407,7 @@ class Observer:
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
             env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'',
                 '__BPFTRACE_NOTIFY_PROBES_ATTACHED':'1','BPFTRACE_LOG_SIZE':str(3*1024**2),'HOME':'/tmp'})
+        self.birth=_birth(self.child.pid,self.owner)
         deadline=min(self.deadline,time.monotonic()+10);origin=os.getpid()
         def drop():
             libc=ctypes.CDLL(None,use_errno=True)
@@ -278,6 +420,10 @@ class Observer:
             if self.stderr.stat().st_size>MAX_BYTES:raise ObservationUnavailable('unbounded startup diagnostics')
             if b'__BPFTRACE_NOTIFY_PROBES_ATTACHED\n' not in self.stderr.read_bytes():
                 time.sleep(.02);continue
+            if self.census_before is None:
+                self.census_before=kernel_census(self.child,self.owner,self.birth,self.kernel_address)
+                cache._write_record(self.root/'census-before.json',self.census_before)
+                validate_census({'before':self.census_before,'after':self.census_before})
             witness=subprocess.Popen([sys.executable,'-I','-c',_WITNESS,self.witness],
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                 env={'PATH':os.defpath},preexec_fn=drop)
@@ -295,9 +441,21 @@ class Observer:
 
     def stop(self):
         if self.child is not None and self.child.poll() is None:
-            self.child.send_signal(signal.SIGINT)
-            try:self.child.wait(timeout=5)
-            except subprocess.TimeoutExpired:self.child.kill();self.child.wait(timeout=2)
+            try:
+                if self.census_before is not None and self.census_after is None:
+                    try:
+                        self.census_after=kernel_census(self.child,self.owner,self.birth,self.kernel_address)
+                        cache._write_record(self.root/'census-after.json',self.census_after)
+                        validate_census({'before':self.census_before,'after':self.census_after})
+                    except (OSError,ObservationUnavailable) as error:
+                        self.census_error=True
+                        try:cache._write_record(self.root/'census-failure.json',
+                            {'phase':'before-observer-detach','category':type(error).__name__,'errno':getattr(error,'errno',None)})
+                        except OSError:pass  # Failure remains fatal even when diagnostics cannot be saved.
+            finally:
+                self.child.send_signal(signal.SIGINT)
+                try:self.child.wait(timeout=5)
+                except subprocess.TimeoutExpired:self.child.kill();self.child.wait(timeout=2)
         for stream in (self.output,self.error):
             if stream is not None and not stream.closed:stream.close()
 
@@ -305,6 +463,8 @@ class Observer:
         self.stop()
         if self.child is None or self.child.returncode!=0 or self.witness_pid is None:
             raise ObservationUnavailable('original kernel observer did not finish')
+        if self.census_error:raise ObservationUnavailable('original kernel census failed')
+        census=validate_census({'before':self.census_before,'after':self.census_after})
         events=decode(self._data())
         if b'lost' in self.stderr.read_bytes().lower():raise ObservationUnavailable('lost kernel observations')
         selected=[e for e in events if e['uid']==2004 and e['pid']==unit_pid and e['tid']==unit_pid]
@@ -330,7 +490,7 @@ class Observer:
             'witness_observed':True,'positive_query_observed':True,'negative_query_observed':True,'max_path_query_observed':True,
             'compiler_queries_observed':True,'library_generated_query_observed':True,
             'after_kernel_copy':True,'events':len(events),'original_observer_cleanup':True,
-            'filesystem_coverage_complete':False,'missed_probe_census_complete':False,
+            'filesystem_coverage_complete':False,'missed_probe_census_complete':True,'probe_census':census,
             'input_closure_complete':False,'allocation_removed':False}
         if cache._read_record(self.root/'control.json')!=self.control:
             raise ObservationUnavailable('foreign observation allocation')
@@ -344,7 +504,7 @@ def validate(value,binding,command):
         'program_sha256','binary_sha256','witness_observed','positive_query_observed','negative_query_observed',
         'after_kernel_copy','events','original_observer_cleanup','filesystem_coverage_complete',
         'missed_probe_census_complete','input_closure_complete','allocation_removed',
-        'compiler_queries_observed','library_generated_query_observed','max_path_query_observed'}
+        'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','probe_census'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
             or value['kind']!='kernel-copied-filename-probe' or value['binding']!=binding or value['command']!=command
             or type(value['unit_pid']) is not int or not 0<value['unit_pid']<2**31
@@ -354,8 +514,8 @@ def validate(value,binding,command):
             or not cache._digest(value['program_sha256']) or not cache._digest(value['binary_sha256'])
             or any(value[key] is not True for key in ('witness_observed','positive_query_observed',
                 'negative_query_observed','after_kernel_copy','original_observer_cleanup','allocation_removed',
-                'compiler_queries_observed','library_generated_query_observed','max_path_query_observed'))
-            or any(value[key] is not False for key in ('shipping_authority','filesystem_coverage_complete',
-                'missed_probe_census_complete','input_closure_complete'))):
+                'compiler_queries_observed','library_generated_query_observed','max_path_query_observed','missed_probe_census_complete'))
+            or any(value[key] is not False for key in ('shipping_authority','filesystem_coverage_complete','input_closure_complete'))):
         raise ObservationUnavailable('kernel observation is incomplete or foreign')
+    validate_census(value['probe_census'])
     return value

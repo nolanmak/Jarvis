@@ -1,5 +1,6 @@
 """Kernel-copied pathname experiment; never a complete input/CI authority."""
 import importlib.util
+import copy
 import errno
 import json
 import os
@@ -21,14 +22,47 @@ def lookup(uid,pid,tid,call,sequence,result,path,*,reverse=False):
     return outcome+name if reverse else name+outcome
 
 
+def census_sample():
+    programs=[{'id':i,'type':17 if i in (1,4) else 2,'tag':str(i)*16,'recursion_misses':0} for i in range(1,5)]
+    links=[{'id':10+i,'type':'raw_tracepoint' if i in (1,4) else 'kprobe_multi',
+        'prog_id':i,'tag':str(i)*16,**({'tracepoint':'sys_enter' if i==1 else 'sys_exit'} if i in (1,4)
+            else {'function':'getname_flags','count':1,'flags':1,'missed':0})} for i in range(1,5)]
+    return {'pid':42,'birth':1000,'programs':programs,'links':links}
+
+
 class KernelObserverTests(unittest.TestCase):
+    def test_only_the_same_four_original_links_and_programs_with_zero_misses_have_a_census(self):
+        sample=census_sample();value={'before':sample,'after':copy.deepcopy(sample)}
+        observer.validate_census(value)
+        for fault in ('missed-before','missed-after','recursion','missing-link','duplicate-program',
+                'changed-owner','changed-birth','changed-link','changed-tag','wrong-symbol','multiple-functions',
+                'entry-probe','foreign-raw-event','bool-misses','unknown-fields','absent-counter'):
+            bad=copy.deepcopy(value);before=bad['before'];after=bad['after']
+            if fault=='missed-before':before['links'][1]['missed']=1
+            elif fault=='missed-after':after['links'][1]['missed']=1
+            elif fault=='recursion':after['programs'][0]['recursion_misses']=1
+            elif fault=='missing-link':after['links'].pop()
+            elif fault=='duplicate-program':after['programs'][1]=after['programs'][0]
+            elif fault=='changed-owner':after['pid']+=1
+            elif fault=='changed-birth':after['birth']+=1
+            elif fault=='changed-link':after['links'][1]['id']+=100
+            elif fault=='changed-tag':after['links'][1]['tag']='a'*16
+            elif fault=='wrong-symbol':after['links'][1]['function']='other'
+            elif fault=='multiple-functions':after['links'][1]['count']=2
+            elif fault=='entry-probe':after['links'][1]['flags']=0
+            elif fault=='foreign-raw-event':after['links'][0]['tracepoint']='sched_switch'
+            elif fault=='bool-misses':after['links'][1]['missed']=False
+            elif fault=='unknown-fields':after['links'][1]['unknown']=True
+            elif fault=='absent-counter':del after['programs'][0]['recursion_misses']
+            with self.subTest(fault=fault),self.assertRaises(observer.ObservationUnavailable):observer.validate_census(bad)
+
     def test_fixed_loader_summaries_never_replace_nonce_events_or_hide_unknown_output(self):
-        logs=(b'\nProgram ID: 4\n\nThe verifier log: \n'
+        logs=(b'\nAttaching to 1 functions\nProgram ID: 4\n\nThe verifier log: \n'
             b'processed 298 insns (limit 1000000) max_states_per_insn 1 total_states 24 peak_states 24 mark_read 0\n')
         data=lookup(2004,101,101,257,1,3,'/workspace/input')+frame('map',{'@emitted':2})
         self.assertEqual(len(observer.decode(logs+data)),1)
         for value in (logs,logs*17+data,b'unknown loader output\n'+data,
-                b'Program ID: 4 forged\n'+data,b'The verifier log: unverified\n'+data):
+                b'Program ID: 4 forged\n'+data,b'The verifier log: unverified\n'+data,b'Attaching to 2 functions\n'+data):
             with self.subTest(value=value),self.assertRaises(observer.ObservationUnavailable):observer.decode(value)
 
     def test_expected_empty_map_default_does_not_hide_read_or_update_failures(self):
