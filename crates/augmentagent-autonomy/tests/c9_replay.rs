@@ -120,6 +120,12 @@ fn inbound(phone: &str) -> augmentagent_store::Email {
 }
 
 const HEDGE: &str = "Let me check on it and get the invite sorted out.";
+/// The incident's receipt: the draft-evidence check hit its time limit.
+/// Calendar plans don't need the receipt (D7 amended 2026-11-03).
+const TIMED_OUT: Option<(bool, &[&str])> = Some((
+    false,
+    &["The context check reached its time limit; relevant sources remain unverified"],
+));
 
 #[tokio::test]
 async fn incident_resolves_without_a_click() {
@@ -152,7 +158,7 @@ async fn incident_resolves_without_a_click() {
         .await;
 
     let email = inbound(PHONE);
-    let action = seed(&r.store, &email, HEDGE, Some((true, &[])));
+    let action = seed(&r.store, &email, HEDGE, TIMED_OUT);
     r.broker
         .post_approval(&action, &email, HEDGE)
         .await
@@ -210,7 +216,7 @@ async fn untrusted_number_gets_byte_identical_card() {
         .create_async()
         .await;
     let email = inbound(OTHER_PHONE);
-    let action = seed(&r.store, &email, HEDGE, Some((true, &[])));
+    let action = seed(&r.store, &email, HEDGE, TIMED_OUT);
     r.broker
         .post_approval(&action, &email, HEDGE)
         .await
@@ -232,7 +238,7 @@ async fn meeting_not_found_is_evidence_incomplete() {
         .create_async()
         .await;
     let email = inbound(PHONE);
-    let action = seed(&r.store, &email, HEDGE, Some((true, &[])));
+    let action = seed(&r.store, &email, HEDGE, TIMED_OUT);
     r.broker
         .post_approval(&action, &email, HEDGE)
         .await
@@ -264,7 +270,7 @@ async fn owner_texted_first_is_owner_took_over() {
         .create_async()
         .await;
     let email = inbound(PHONE);
-    let action = seed(&r.store, &email, HEDGE, Some((true, &[])));
+    let action = seed(&r.store, &email, HEDGE, TIMED_OUT);
     owner_texted(&r.store, PHONE, 13, &minutes_ago(1));
     r.broker
         .post_approval(&action, &email, HEDGE)

@@ -103,6 +103,18 @@ impl Fx {
         }
     }
 
+    /// A `full`-tier contact whose message has no calendar intent: the
+    /// plan is a `reply` step, the only plan D7's receipt rule applies to
+    /// (amended 2026-11-03).
+    fn reply() -> Self {
+        Self {
+            tier: Tier::Full,
+            allowed: vec![],
+            planner: NO_PLAN,
+            ..Self::new()
+        }
+    }
+
     fn gmail(mut self) -> Self {
         self.email = Email {
             message_id: "gm-1".into(),
@@ -275,19 +287,19 @@ async fn gate_check_order_table() {
         ("6 gmail list", Fx { list_header: true, ..Fx::new().gmail() }, Reason::GroupThread),
         ("7 owner texted", Fx { owner_texted_after: true, ..Fx::new() }, Reason::OwnerTookOver),
         ("8 triage skip", Fx { triage: Some(TriageResult::Skip), ..Fx::new() }, Reason::NotAReply),
-        ("9 no receipt", Fx { receipt: None, ..Fx::new() }, Reason::EvidenceIncomplete),
+        ("9 no receipt", Fx { receipt: None, ..Fx::reply() }, Reason::EvidenceIncomplete),
         ("9 receipt gaps", Fx {
             receipt: Some((true, vec!["The context check reached its time limit; relevant sources remain unverified"])),
-            ..Fx::new()
+            ..Fx::reply()
         }, Reason::EvidenceIncomplete),
-        ("9 review unfinished", Fx { receipt: Some((false, vec![])), ..Fx::new() }, Reason::EvidenceIncomplete),
+        ("9 review unfinished", Fx { receipt: Some((false, vec![])), ..Fx::reply() }, Reason::EvidenceIncomplete),
         ("9 assumes", Fx {
             draft: "See you then.\n<!--aa:assumes\n[\"the meeting is today\"]\n-->".into(),
-            ..Fx::new()
+            ..Fx::reply()
         }, Reason::EvidenceIncomplete),
         ("9 needs input", Fx {
             draft: augmentagent_approval_discord::append_needs_input_marker("Sure", &[("time".into(), "When?".into())]),
-            ..Fx::new()
+            ..Fx::reply()
         }, Reason::EvidenceIncomplete),
         ("9 lookup error", Fx { lookup: Err("account owner.work: 401".into()), ..Fx::new() }, Reason::EvidenceIncomplete),
         ("9 nothing found", Fx {
@@ -410,9 +422,9 @@ async fn trusted_card_shows_note() {
     let g = gate(
         &store,
         true,
-        snapshot(contact(Tier::Actions, &[ADD_GUEST])),
+        snapshot(contact(Tier::Full, &[])),
         Some(FakeCalendar::new(Ok(candidate_set(true)))),
-        Some(FakePlanner::new(CAL_PLAN)),
+        Some(FakePlanner::new(NO_PLAN)),
     );
     let b = broker(Arc::clone(&inner), g, FakeExecutor::new(Arc::clone(&store)));
     b.post_approval(&action, &email, "Let me check.")
@@ -441,7 +453,7 @@ async fn evidence_disabled_is_incomplete() {
     for receipt in [None, Some((false, vec![]))] {
         let (got, _, _) = run_named(Fx {
             receipt,
-            ..Fx::new()
+            ..Fx::reply()
         })
         .await;
         assert_eq!(got, Err(Reason::EvidenceIncomplete));
@@ -452,10 +464,64 @@ async fn evidence_disabled_is_incomplete() {
 async fn missing_receipt_is_incomplete() {
     let (got, _, _) = run_named(Fx {
         receipt: None,
+        ..Fx::reply()
+    })
+    .await;
+    assert_eq!(got, Err(Reason::EvidenceIncomplete));
+}
+
+/// D7 amended 2026-11-03: a plan made only of registry calendar actions
+/// sends a template built from the event, so an incomplete (or missing)
+/// draft-context receipt, or a hedging draft, does not hold it.
+#[tokio::test]
+async fn calendar_plan_ignores_incomplete_receipt() {
+    for receipt in [
+        None,
+        Some((
+            false,
+            vec!["The context check reached its time limit; relevant sources remain unverified"],
+        )),
+    ] {
+        let (got, _, _) = run_named(Fx {
+            receipt,
+            draft: augmentagent_approval_discord::append_needs_input_marker(
+                "Let me check on it.",
+                &[("context".into(), "unverified".into())],
+            ),
+            ..Fx::new()
+        })
+        .await;
+        assert_eq!(got, Ok(()));
+    }
+    // Its own evidence still holds it: a failed lookup.
+    let (got, _, _) = run_named(Fx {
+        receipt: None,
+        lookup: Err("account owner.work: 401".into()),
         ..Fx::new()
     })
     .await;
     assert_eq!(got, Err(Reason::EvidenceIncomplete));
+}
+
+/// `reply` steps (full-tier free text) keep strict D7.
+#[tokio::test]
+async fn reply_step_still_requires_complete_receipt() {
+    for receipt in [
+        None,
+        Some((false, vec![])),
+        Some((
+            true,
+            vec!["The context check reached its time limit; relevant sources remain unverified"],
+        )),
+    ] {
+        let (got, _, _) = run_named(Fx {
+            receipt,
+            ..Fx::reply()
+        })
+        .await;
+        assert_eq!(got, Err(Reason::EvidenceIncomplete));
+    }
+    assert_eq!(run_named(Fx::reply()).await.0, Ok(()));
 }
 
 fn ready_broker(

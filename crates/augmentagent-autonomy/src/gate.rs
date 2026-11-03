@@ -11,7 +11,7 @@
 //! | 6 | thread not 1:1 (D9) | `group_thread` |
 //! | 7 | owner wrote in the thread after the inbound (D9) | `owner_took_over` |
 //! | 8 | triage verdict ≠ reply (D9) | `not_a_reply` |
-//! | 9 | evidence incomplete (D7), incl. the calendar lookup | `evidence_incomplete` |
+//! | 9 | evidence incomplete (D7, amended 2026-11-03): the calendar lookup for calendar plans; the draft-context receipt only for `reply` steps | `evidence_incomplete` |
 //! | 10 | plan step not allowed for the tier (D2) | `action_not_allowed` |
 //! | 11 | content floor hit (D9) | `content_floor` |
 //! | 12 | daily cap reached (D9) | `daily_cap` |
@@ -376,10 +376,13 @@ impl AutonomyGate {
             Err(e) => return hold(Reason::NotAReply, c, Some(format!("store: {e}"))),
         }
 
-        // 9. Evidence (D7): the receipt, and a draft without open questions.
-        if let Err(why) = crate::evidence::check(store, input.action_id, input.draft) {
-            return hold(Reason::EvidenceIncomplete, c, Some(why));
-        }
+        // 9. Evidence (D7, amended 2026-11-03): the draft-context receipt is
+        // checked only for a plan with a `reply` step (below). A plan made
+        // only of registry calendar actions sends a template built from
+        // the event fields, so its evidence is the calendar lookup: it
+        // succeeded, the candidate resolves, the owner organizes it (for
+        // add_guest) and it has a join link. The planner therefore runs
+        // even when the receipt is incomplete.
 
         // Planning (D8): the daemon's own candidate lookup, then one
         // closed-schema planning call.
@@ -504,6 +507,11 @@ impl AutonomyGate {
                         c,
                         Some("no registry action fits; replies need the full tier".into()),
                     );
+                }
+                // 9 (reply). Free text keeps strict D7: complete receipt, no
+                // gaps, no assumes block, no needs-input marker.
+                if let Err(why) = crate::evidence::check(store, input.action_id, input.draft) {
+                    return hold(Reason::EvidenceIncomplete, c, Some(why));
                 }
                 let text = augmentagent_approval_discord::strip_assumes_for_send(input.draft)
                     .trim()
