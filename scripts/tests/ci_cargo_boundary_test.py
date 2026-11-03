@@ -41,6 +41,15 @@ class CapabilityTests(unittest.TestCase):
         self.assertFalse(result['enforcement_established'])
         self.assertFalse(result['shipping_authority'])
 
+    @unittest.skipUnless(sys.platform=='linux' and platform.machine()=='x86_64','requires Linux x86-64 kernel ABI')
+    def test_real_kernel_observation_is_stable_across_repeated_variadic_syscalls(self):
+        module=self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            cargo=self.elf(Path(directory))
+            observations=[module.observe(cargo) for _ in range(16)]
+        self.assertTrue(all(value==observations[0] for value in observations))
+        self.assertFalse(observations[0]['shipping_authority'])
+
     def test_unknown_architecture_and_unavailable_kernel_features_refuse(self):
         module=self.load()
         with tempfile.TemporaryDirectory() as directory:

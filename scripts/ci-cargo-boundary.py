@@ -32,8 +32,13 @@ class _Iovec(ctypes.Structure):
 def _kernel_capabilities():
     # Linux x86-64 syscall numbers; observe() rejects all other ABIs first.
     libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+    libc.syscall.argtypes=(ctypes.c_long,)
     def call(number,*arguments):
-        value=libc.syscall(number,*arguments)
+        # syscall() consumes machine-word variadic arguments. ctypes defaults
+        # Python integers to C int; a stack-passed zero can otherwise leave
+        # garbage in the upper half of process_vm_readv's flags argument.
+        values=[ctypes.c_long(value) if type(value) is int else value for value in arguments]
+        value=libc.syscall(number,*values)
         if value<0:raise OSError(ctypes.get_errno(),'kernel capability unavailable')
         return value
     action=ctypes.c_uint(0x7fc00000)  # SECCOMP_RET_USER_NOTIF

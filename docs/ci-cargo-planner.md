@@ -259,6 +259,11 @@ bootstrap exits zero. The hook detaches after observation: it is not the complet
 syscall/input collector. Protected activation still requires the final launch
 and cancellation handshake, credential proof, frozen unit views and collection
 armed before any untrusted instruction; this hook alone cannot supply them.
+The separate kernel-capability probe now passes machine-word scalar arguments
+to the variadic syscall interface. A repeated real-kernel regression reproduced
+intermittent EINVAL before the fix; sixteen observations in the regression and
+100 direct observations pass afterward. Capability observations still confer no
+execution enforcement, complete input closure or CI authority.
 
 ## Private unit records and cleanup
 
