@@ -79,7 +79,16 @@ pub fn value()->u8{GENERATED}
         && probe["cargo"]["build_script_calls"]==serde_json::json!([1,0])
         && probe["cargo"]["generated_tree_preserved"]==true && probe["cargo"]["library_input_mounted"]==true
         && probe["cargo"]["application_runs"]==2 && probe["cargo"]["actual_metadata_preserved"]==true
-        && probe["cargo"]["sealed_artifact_detached"]==true && probe["cargo"]["allocation_removed"]==true,
+        && probe["cargo"]["sealed_artifact_detached"]==true && probe["cargo"]["allocation_removed"]==true
+        && probe["kernel_observation"]["witness_observed"]==true
+        && probe["kernel_observation"]["positive_query_observed"]==true
+        && probe["kernel_observation"]["negative_query_observed"]==true
+        && probe["kernel_observation"]["after_kernel_copy"]==true
+        && probe["kernel_observation"]["compiler_queries_observed"]==true
+        && probe["kernel_observation"]["library_generated_query_observed"]==true
+        && probe["kernel_observation"]["original_observer_cleanup"]==true
+        && probe["kernel_observation"]["allocation_removed"]==true
+        && probe["kernel_observation"]["input_closure_complete"]==false,
         "V3 probe did not establish original credential/cancellation observations");
     audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({

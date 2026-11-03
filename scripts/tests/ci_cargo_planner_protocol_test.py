@@ -169,6 +169,12 @@ class PlannerProtocolTests(unittest.TestCase):
         value={'version':3,'kind':'ci-planner-protocol-probe','binding':binding,'command':command,
             'cases':cases,'units':units,'filesystem':filesystem,'guest_worker_quiescence':scopes[2],
             'input_closure_complete':False,'cargo_metadata_isolation_established':False,'shipping_authority':False}
+        value['kernel_observation']={'version':1,'kind':'kernel-copied-filename-probe','binding':binding,'command':command,
+            'shipping_authority':False,'kernel_release':'7.0.0-test','unit_pid':42,'unit_uid':2004,
+            'program_sha256':'1'*64,'binary_sha256':'2'*64,'witness_observed':True,'positive_query_observed':True,
+            'negative_query_observed':True,'compiler_queries_observed':True,'library_generated_query_observed':True,'after_kernel_copy':True,'events':3,'original_observer_cleanup':True,
+            'filesystem_coverage_complete':False,'missed_probe_census_complete':False,'input_closure_complete':False,
+            'allocation_removed':True}
         return value,binding,command,workers,writer,source
 
     def test_probe_requires_original_distinct_scope_roles_bindings_and_no_authority(self):
@@ -177,7 +183,8 @@ class PlannerProtocolTests(unittest.TestCase):
         for fault in ('version','binding','command','scope','writer','source','role','cancelled-start',
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
                 'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
-                'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case'):
+                'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case',
+                'kernel-binding','kernel-witness','kernel-loss','kernel-coverage','kernel-closure','kernel-cleanup'):
             value=copy.deepcopy(original)
             if fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
@@ -204,6 +211,12 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='filesystem-removed':value['filesystem']['allocation_removed']=False
             elif fault=='filesystem-authority':value['filesystem']['shipping_authority']=True
             elif fault=='filesystem-case':value['cases'][4]['filesystem']['input_stable']=False
+            elif fault=='kernel-binding':value['kernel_observation']['binding']={}
+            elif fault=='kernel-witness':value['kernel_observation']['witness_observed']=False
+            elif fault=='kernel-loss':value['kernel_observation']['events']=True
+            elif fault=='kernel-coverage':value['kernel_observation']['filesystem_coverage_complete']=True
+            elif fault=='kernel-closure':value['kernel_observation']['input_closure_complete']=True
+            elif fault=='kernel-cleanup':value['kernel_observation']['original_observer_cleanup']=False
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 

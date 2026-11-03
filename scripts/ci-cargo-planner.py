@@ -37,6 +37,7 @@ legacy=_load('planner_wire','ci-cargo-relay.py')
 staging=_load('planner_stdin','ci-cargo-staging.py')
 cache=_load('planner_cache','ci-cache-generation.py')
 unit_views=_load('planner_views','ci-cargo-views.py')
+kernel_observer=_load('planner_kernel_observer','ci-cargo-observer.py')
 unit_views.FreshnessHold=cache.FreshnessHold
 import shutil
 FreshnessHold=cache.FreshnessHold
@@ -50,7 +51,7 @@ def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
         'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute','planner_cargo_compile','planner_cargo_build_script','planner_cargo_application'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute','planner_cargo_compile','planner_cargo_build_script','planner_cargo_application','planner_kernel_observer'}
     categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','CalledProcessError','Unavailable'}
     value=value if type(value) is dict else {}
     return {'stage':value.get('stage') if value.get('stage') in phases else 'planner_startup',
@@ -502,7 +503,8 @@ def _unit(arguments):
                 'unit':os.readlink(f'/proc/{child.pid}/ns/'+name)} for name in ('mnt','ipc','net')}
             if any(row['controller']==row['unit'] for row in namespaces.values()):raise FreshnessHold('invalidation_unsafe')
             cache._write_record(Path(value['directory'])/'view-namespace.json',{'version':1,
-                'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],'namespaces':namespaces})
+                'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],
+                'pid':child.pid,'namespaces':namespaces})
         _control(endpoint,3,child.pid);_release(exec_release,cancel,value['deadline']);observed=True
     try:
         forwarded=tuple([stage_bootstrap,data,cancel,release,control,*value['extras']])
@@ -637,6 +639,8 @@ class _ViewProbe:
         if (observed.get('binding')!=self.admission.binding or observed.get('command')!=self.admission.command
                 or observed.get('ordinal')!=4):raise FreshnessHold('generation_mismatch')
         namespaces=observed['namespaces']
+        self.original_pid=observed.get('pid')
+        if type(self.original_pid) is not int or self.original_pid<=0:raise FreshnessHold('cleanup_uncertain')
         if set(namespaces)!={'mnt','ipc','net'} or any(row['controller']==row['unit'] for row in namespaces.values()):
             raise FreshnessHold('invalidation_unsafe')
         now=(self.inputs/'deps/input').stat();before=self.input_stat
@@ -871,7 +875,9 @@ class _CargoProbe:
             forged=Path(view['artifacts'])/'debug/.fingerprint/unit-forged'
             if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
                 raise FreshnessHold('invalidation_unsafe')
-        record.update(finished=True,namespaces=observed['namespaces'])
+        pid=observed.get('pid')
+        if type(pid) is not int or pid<=0:raise FreshnessHold('cleanup_uncertain')
+        record.update(finished=True,namespaces=observed['namespaces'],pid=pid)
 
     def run(self,value,relay):
         first=len(relay.completed);counts=[];script_counts=[];fingerprint=None
@@ -998,6 +1004,10 @@ _PROBE_PHASE='planner_tool_stdin'
 result={'uid':expected,'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
  'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}
 if is_view:
+ libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
+ missing=libc.syscall(ctypes.c_long(257),ctypes.c_long(-100),
+  ctypes.c_char_p(b'/workspace/target/deps/missing'),ctypes.c_long(os.O_RDONLY|os.O_CLOEXEC),ctypes.c_long(0))
+ assert missing==-1 and ctypes.get_errno()==errno.ENOENT
  _PROBE_PHASE='planner_tool_view'
  from pathlib import Path
  import time
@@ -1124,7 +1134,8 @@ def _probe(arguments):
     value=_bootstrap(int(arguments[0]),'probe');_parent_guard(value['parent'])
     root=Path(value['root']);admission=admit(value['target'],value['binding'],value['command'],root)
     results=[];view_probe=None;cargo_probe=None
-    with RootRelay(admission,library=value['library'],timeout=30) as relay:
+    _PHASE='planner_kernel_observer'
+    with kernel_observer.Observer(admission,deadline=value['deadline']) as observer, RootRelay(admission,library=value['library'],timeout=30) as relay:
         metadata=root/'planner-metadata';metadata.write_text('');os.chown(metadata,1001,1001);metadata.chmod(0o600)
         for ordinal,mode in enumerate(('stdin','jobserver','cancel','signal','view')):
             _PHASE='planner_probe_'+mode
@@ -1155,8 +1166,13 @@ def _probe(arguments):
         cargo_probe=_CargoProbe(admission);relay.views=cargo_probe;cargo_probe.run(value,relay)
     view_probe.cleanup()
     cargo_probe.cleanup()
+    _PHASE='planner_kernel_observer'
+    compilers={item['mapping']['role']:(item['pid'],2000+ordinal)
+        for ordinal,item in cargo_probe.units.items() if item['mapping']['kind']=='compile'}
+    kernel=observer.finish(view_probe.original_pid,compilers)
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],
-        'command':value['command'],'cases':results,'units':original_units,'filesystem':view_probe.receipt,'cargo':cargo_probe.report,
+        'command':value['command'],'cases':results,'units':original_units,'filesystem':view_probe.receipt,
+        'cargo':cargo_probe.report,'kernel_observation':kernel,
         'input_closure_complete':False,'cargo_metadata_isolation_established':False,'shipping_authority':False}))
     return 0
 
@@ -1229,13 +1245,15 @@ def validate_cargo_probe(value):
 
 def validate_probe(value,binding,command,workers,writer,source_projection):
     keys={'version','kind','binding','command','cases','units','guest_worker_quiescence','filesystem',
-        'input_closure_complete','cargo_metadata_isolation_established','shipping_authority'}
+        'input_closure_complete','cargo_metadata_isolation_established','shipping_authority','kernel_observation'}
     if (type(value) is not dict or set(value) not in (keys,keys|{'cargo'}) or type(value['version']) is not int or value['version']!=3
             or value['kind']!='ci-planner-protocol-probe' or value['binding']!=binding or value['command']!=command
             or value['input_closure_complete'] is not False or value['cargo_metadata_isolation_established'] is not False
             or value['shipping_authority'] is not False or type(value['cases']) is not list or len(value['cases'])!=5
             or type(value['units']) is not list or len(value['units'])!=5):raise FreshnessHold('input_census_unknown')
     validate_filesystem_probe(value['filesystem'])
+    try:kernel_observer.validate(value['kernel_observation'],binding,command)
+    except kernel_observer.ObservationUnavailable:raise FreshnessHold('input_census_unknown') from None
     if 'cargo' in value:validate_cargo_probe(value['cargo'])
     scope=value['guest_worker_quiescence']
     if (scope not in workers['scopes'] or scope==writer['guest_worker_quiescence']

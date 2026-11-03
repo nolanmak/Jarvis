@@ -683,3 +683,35 @@ passed** (15 opt-in cases excluded). This fixed graph is not the general Cargo
 mapper, complete input collector, runtime-equivalence policy, in-command
 invalidation/restart implementation or final C proof/API. All generic CI,
 trusted-input-closure and shipping-authority flags remain false.
+
+## Kernel-copied pathname observation candidate
+
+The existing supervisor observes the original exec stop and then detaches; it
+does not collect input queries. Sampling a target's pathname memory before
+letting its syscall continue would race with other target threads. Emulating
+all metadata calls also introduces target-memory write races described by the
+[kernel notification API](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html#NOTES).
+The next feasibility probe observes `getname_flags` returns inside the kernel,
+then associates the copied name with the original thread's syscall return.
+It leaves the target's system call and results unchanged.
+
+The measured root helper starts a fixed bpftrace program in the existing VM.
+Before releasing any target unit it requires an actual captured raw-openat
+witness from a fixed credential and fresh controller nonce. The selected
+records are restricted to the original unit UID range, workspace paths and the
+pinned fixture's source spellings. JSON framing prevents embedded newlines
+from creating extra events. A settled emitted-event counter, bounded parser,
+original observer exit and original exec-callback PIDs bind the observations.
+Native evidence must include both positive/negative raw opens and the actual
+library/build-script/binary source queries plus the library's generated input.
+The program/helper bytes join the measured controller bundle; updater detection
+must rebuild when the helper changes. No ordinary caller supplies a BPF program
+or root execution flag. Original image/resource/deadline limits remain in force.
+
+This is a candidate observation experiment, not a selected complete collector
+or final C API. It deliberately does not claim complete syscall/fd/directory/
+metadata/runtime coverage, kernel missed-kretprobe accounting or compatibility.
+Long/unknown path spellings and malformed/lost/count-mismatched observations
+have no proof. The existing generic input-closure and shipping flags remain
+false. Native feasibility is pending; reuse, invalidation and passing-proof
+publication remain blocked on the complete collector and original regressions.

@@ -150,6 +150,7 @@ expect_rebuild scripts/provider-supervisor.py
 expect_rebuild scripts/ci-cargo-planner.py
 expect_rebuild scripts/ci-cargo-staging.py
 expect_rebuild scripts/ci-cargo-views.py
+expect_rebuild scripts/ci-cargo-observer.py
 expect_rebuild scripts/native-provider-vm.py
 expect_rebuild scripts/native-provider-vm-guest.py
 expect_rebuild scripts/native-provider-mcp-relay.py
