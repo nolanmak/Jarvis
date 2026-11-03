@@ -1392,6 +1392,21 @@ Stores with generated namespaces or selector registrations still hold on
 recovery: callback closures are not a persistent selector protocol. The actual
 repository adapter test now includes another VM/command on the same source and
 requires zero compiler calls for unchanged library and test units. Native
-validation of this extension is pending. This ownership/continuation mechanism
-is not a complete-input or passing-CI capability, and production activation
-remains disabled.
+validation at `26cf97b3` passed in **115.32 seconds**: the first command retained
+its original compiler `[1,0,1]`, credential, metadata-denial and cleanup criteria;
+the next VM recovered the predecessor's protected state and completed build/test
+with compiler counts **`[0,0]`**. The test executed again successfully. No cold
+replacement target could meet those criteria. Immutable producer records kept
+their original command/evidence while the store acquired the new command claim.
+
+The publication/restart replay passed at the same source in **114.73 seconds**,
+including crossed-role rejection, original compiler/build-script reuse,
+E0761/Cargo101 retry, immutable history and the sixteen zero-miss programs/links.
+The structured adapter success/failing-test replay also passed in **186.41
+seconds**, retaining original argv and actual Cargo101/diagnostics. All **311
+Python CI tests passed without skips**, and **31 focused Rust tests passed** with
+17 opt-in cases excluded; these three VM cases were then explicitly run. This
+ownership/continuation mechanism is not a complete-input or passing-CI
+capability. Generated namespaces/selectors, frozen generated forests, opaque
+counter-wrapper execution and the original in-command regression remain open.
+Production activation remains disabled.
