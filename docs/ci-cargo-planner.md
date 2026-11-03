@@ -220,6 +220,22 @@ reported as an executed tool's exit; the complete queue/termination behavior is
 part of the credential/I/O feasibility gate below. This is the selected state
 model, not an implemented protocol or authority to activate a privileged mode.
 
+`ci-cargo-staging.py` implements the bounded capture and descriptor-normalization
+components for that protocol. It reads actual EOF under the lesser of 60 seconds
+and the original command deadline, seals at most 8 MiB in a CLOEXEC memfd, and
+checks the original cancellation pipe before publishing. It preserves resource
+errors and never changes the caller's file flags. Jobserver normalization checks
+both directions of the same received kernel pipe, refuses unknown inherited
+descriptors or conflicting flags, and rewrites only the defined descriptor
+numbers to worker FDs 3 and 4. Other environment bytes remain literal. The pipe's
+kernel identity is separate transport evidence, not a semantic compiler input.
+
+Eighteen real pipe/filesystem tests cover these components. The version-3
+staging-ready/tool-started handshake, pre-start signal handling, root listener,
+credential transition and frozen unit views remain unimplemented. This helper
+does not execute tools, provide a complete input closure or publish CI authority;
+it is not connected to the existing same-UID version-2 experiment.
+
 ## Private unit records and cleanup
 
 The proposed internal record has these distinct identities: source generation,
@@ -257,9 +273,9 @@ baseline verdict store or merge allowance here.
 All entries are owned by C; R owns the existing physical admission and original
 cleanup interfaces. None requests a new product decision from the owner.
 
-* **Frozen views and output publication:** specify and test the precise mount,
-  projection, output-slot and publication protocol. Existing 0700 UID-1000 source
-  exports cannot simply be opened to the planner. Other producers must not alter
+* **Frozen views and output publication:** finish and test the precise mount,
+  output-slot and publication protocol. The sealed self-contained projection
+  now supplies read-only Git bytes across credentials. Other producers must not alter
   active inputs; worker copies of output artifacts must not become authoritative.
   Close how self-read build-script outputs participate in input identity without
   making every unchanged invocation incompatible. Blocks protected activation.
