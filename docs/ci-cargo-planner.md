@@ -1155,3 +1155,10 @@ were unchanged in the before/after zero-miss census. The failed retry is a real
 diagnostic compiler result, not a passing-CI capability: complete input closure,
 generic unit mapping, publication-time bounded restart, the original in-command
 regression and all merge/rollout acceptance remain unfinished.
+
+The guest/host diagnostic filters now retain the fixed supervisor, fingerprint
+retirement and retry stages instead of reducing them to `unknown`. Python and
+Rust boundary tests require those stages and errno while discarding private
+payload fields. The 281-test Python CI suite and 31 focused managed Rust tests
+pass after this diagnostic-only follow-up; the separate VM transport suite
+passes 14 cases with its six preexisting provisioned-runtime cases excluded.
