@@ -472,55 +472,82 @@ class FrozenLookupIndex:
                 if (*self.views._key(info),info.st_nlink,info.st_atime_ns)!=identity:_hold()
         except (OSError,ValueError,self.views.FreshnessHold):_hold()
 
-    def select(self,events,metadata,*,pid,uid,user_namespace,mount_namespace,threaded=False):
-        self._verify();queries=[];contexts=[]
+    def _metadata_table(self,metadata):
+        if type(metadata) is not list or len(metadata)>200000:_hold()
+        observed={}
         try:
-            if (type(threaded) is not bool or type(events) is not list or not 0<len(events)<=200000
-                    or type(metadata) is not list or len(metadata)>200000):_hold()
-            keys=('uid','pid','tid','syscall','sequence');observed={}
             for record in metadata:
-                key=tuple(record[k] for k in keys)
+                key=tuple(record[k] for k in ('uid','pid','tid','syscall','sequence'))
                 if key in observed:_hold()
                 observed[key]=record
-            for event in events:
-                # In threaded mode the collector's actual kernel TGID still
-                # binds the original supervised process. Resolve each query
-                # through its own captured base and namespaces; never borrow
-                # the main thread's cwd or a sampled /proc thread directory.
-                if (not threaded and event['pid']!=event['tid']
-                        or type(event['tid']) is not int or not 0<event['tid']<2**31
-                        or event['pid']!=pid or event['uid']!=uid
-                        or event['syscall'] not in (262,332)):_hold()
-                record=observed.get(tuple(event[k] for k in keys))
-                if (record is None or record['user_namespace']!=user_namespace or record['path']!=event['path']
-                        or record['result']!=event['result'] or type(record['flags']) is not int
-                        or record['flags']&~0x900 or event['result'] not in (0,-2,-20,-40)):_hold()
-                bases=[]
-                for attempt in event['lookup_attempts']:
-                    base=attempt['base']
-                    if (attempt['init_result']!=0 or attempt['user_namespace']!=user_namespace
-                            or attempt['mount_namespace']!=mount_namespace or attempt['dfd']!=record['fd']
-                            or base is None or base['flags']&0x18000000
-                            or base['flags']&256 and (base['path_seq']!=base['dentry_seq'] or base['path_seq']&1)):_hold()
-                    virtual=self._bases.get(tuple(base[k] for k in ('device','inode','mode')))
-                    if virtual is None:_hold()
-                    bases.append(virtual)
-                if not bases or len(set(bases))!=1:_hold()
-                path=_path(event['path']);directory=bases[0]
-                if path.startswith(b'/') and directory!=b'/':_hold()
-                if event['result']==0:
-                    resolved,node,error,_facts=self.census._resolve(path,directory,follow=not record['flags']&256)
-                    if error is not None or record['stat'] is None or self._objects.get(resolved)!=tuple(record['stat'][k] for k in ('device','inode','mode')):_hold()
-                elif record['stat'] is not None or record['copy_result'] is not None:_hold()
-                queries.append({'pid':pid,'syscall':'newfstatat' if event['syscall']==262 else 'statx',
-                    'path':path,'directory':directory,'intent':'metadata','outcome':'success' if event['result']==0 else 'failure',
-                    'errno':{0:None,-2:'ENOENT',-20:'ENOTDIR',-40:'ELOOP'}[event['result']],
-                    'arguments':'AT_SYMLINK_NOFOLLOW' if record['flags']&256 else '', 'result':event['result']})
-                contexts.append((event,record))
-            observation=self.census.observe(queries)
-            binding=hashlib.sha256(_encoded(_wire(contexts))).hexdigest()
-            return _ContentSelection(queries,observation,binding,self._layout)
+            return observed
+        except (ValueError,TypeError,KeyError,AttributeError):_hold()
+
+    def _metadata_query(self,event,observed,*,pid,uid,user_namespace,mount_namespace,threaded):
+        try:
+            keys=('uid','pid','tid','syscall','sequence')
+            # In threaded mode the collector's actual kernel TGID still
+            # binds the original supervised process. Resolve each query
+            # through its own captured base and namespaces; never borrow
+            # the main thread's cwd or a sampled /proc thread directory.
+            if (not threaded and event['pid']!=event['tid']
+                    or type(event['tid']) is not int or not 0<event['tid']<2**31
+                    or event['pid']!=pid or event['uid']!=uid
+                    or event['syscall'] not in (262,332)):_hold()
+            record=observed.get(tuple(event[k] for k in keys))
+            if (record is None or record['user_namespace']!=user_namespace or record['path']!=event['path']
+                    or record['result']!=event['result'] or type(record['flags']) is not int
+                    or record['flags']&~0x900 or event['result'] not in (0,-2,-20,-40)):_hold()
+            bases=[]
+            for attempt in event['lookup_attempts']:
+                base=attempt['base']
+                if (attempt['init_result']!=0 or attempt['user_namespace']!=user_namespace
+                        or attempt['mount_namespace']!=mount_namespace or attempt['dfd']!=record['fd']
+                        or base is None or base['flags']&0x18000000
+                        or base['flags']&256 and (base['path_seq']!=base['dentry_seq'] or base['path_seq']&1)):_hold()
+                virtual=self._bases.get(tuple(base[k] for k in ('device','inode','mode')))
+                if virtual is None:_hold()
+                bases.append(virtual)
+            if not bases or len(set(bases))!=1:_hold()
+            path=_path(event['path']);directory=bases[0]
+            if path.startswith(b'/') and directory!=b'/':_hold()
+            if event['result']==0:
+                resolved,node,error,_facts=self.census._resolve(path,directory,follow=not record['flags']&256)
+                if error is not None or record['stat'] is None or self._objects.get(resolved)!=tuple(record['stat'][k] for k in ('device','inode','mode')):_hold()
+            elif record['stat'] is not None or record['copy_result'] is not None:_hold()
+            return {'pid':pid,'syscall':'newfstatat' if event['syscall']==262 else 'statx',
+                'path':path,'directory':directory,'intent':'metadata','outcome':'success' if event['result']==0 else 'failure',
+                'errno':{0:None,-2:'ENOENT',-20:'ENOTDIR',-40:'ELOOP'}[event['result']],
+                'arguments':'AT_SYMLINK_NOFOLLOW' if record['flags']&256 else '', 'result':event['result']}
+
         except (ValueError,TypeError,KeyError,AttributeError,UnicodeError):_hold()
+
+    def select(self,events,metadata,*,pid,uid,user_namespace,mount_namespace,threaded=False):
+        self._verify()
+        if type(threaded) is not bool or type(events) is not list or not 0<len(events)<=200000:_hold()
+        observed=self._metadata_table(metadata);queries=[];contexts=[]
+        for event in events:
+            queries.append(self._metadata_query(event,observed,pid=pid,uid=uid,user_namespace=user_namespace,
+                mount_namespace=mount_namespace,threaded=threaded))
+            contexts.append((event,observed[tuple(event[k] for k in ('uid','pid','tid','syscall','sequence'))]))
+        return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(contexts))).hexdigest(),self._layout)
+
+    def select_metadata_subset(self,events,metadata,*,pid,uid,user_namespace,mount_namespace,threaded=False):
+        """Persist bound lookup outcomes and retain unbound facts explicitly."""
+        self._verify()
+        if type(threaded) is not bool or type(events) is not list or len(events)>200000:_hold()
+        observed=self._metadata_table(metadata);queries=[];contexts=[];unbound=[]
+        for event in events:
+            try:
+                query=self._metadata_query(event,observed,pid=pid,uid=uid,user_namespace=user_namespace,
+                    mount_namespace=mount_namespace,threaded=threaded)
+                self.census.observe([query])
+            except FreshnessHold:unbound.append({key:event[key] for key in ('pid','tid','uid','syscall','sequence')})
+            else:
+                queries.append(query)
+                contexts.append((event,observed[tuple(event[k] for k in ('uid','pid','tid','syscall','sequence'))]))
+        self._verify()
+        return _ContentSelection(queries,self.census.observe(queries),hashlib.sha256(_encoded(_wire(contexts))).hexdigest(),self._layout),unbound
 
     def _open_query(self,event,*,pid,uid,user_namespace,mount_namespace):
         try:

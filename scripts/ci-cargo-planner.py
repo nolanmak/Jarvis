@@ -1954,7 +1954,7 @@ def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,r
     for path in paths:
         if not path.name.endswith('.json') or not cache._uuid(path.stem):raise FreshnessHold('artifact_provenance_unknown')
         record=cache._read_record(path,max_bytes=16*1024**2)
-        if (record.get('version')!=2 or record.get('kind')!='ci-command-kernel-record'
+        if (record.get('version')!=3 or record.get('kind')!='ci-command-kernel-record'
                 or record.get('binding')!=lease.binding or record.get('command')!=path.stem
                 or record.get('input_closure_complete') is not False or record.get('shipping_authority') is not False
                 or record.get('original_observer_cleanup') is not True):raise FreshnessHold('artifact_provenance_unknown')
@@ -1964,15 +1964,24 @@ def record_selected_revalidation(root,source,lease,checkpoint,bindings,outputs,r
             if scope['mapping']['kind']!='compile' or (record['command'],scope['ordinal']) not in active:continue
             before=frozen_input_index(source,previous,scope);following=frozen_input_index(source,bindings,scope)
             selected=lookup_inputs._ContentSelection.restore(scope['selected_reads'],before)
-            refreshed=selected.refresh(following);changed=refreshed['sha256']!=selected.observation['sha256']
+            metadata=lookup_inputs._ContentSelection.restore(scope['selected_metadata'],before)
+            refreshed=selected.refresh(following);refreshed_metadata=metadata.refresh(following)
+            read_changed=refreshed['sha256']!=selected.observation['sha256']
+            metadata_changed=refreshed_metadata['sha256']!=metadata.observation['sha256']
+            changed=read_changed or metadata_changed
             fingerprint=scope['mapping']['fingerprint']
             if changed:affected.add(fingerprint)
             observations.append({'source_command':record['command'],'ordinal':scope['ordinal'],
                 'capture_sha256':record_sha,'binding_sha256':selected.binding_sha256,'fingerprint':fingerprint,
-                'previous_sha256':selected.observation['sha256'],'current_sha256':refreshed['sha256'],
+                'previous_sha256':hashlib.sha256(lookup_inputs._encoded([selected.observation['sha256'],metadata.observation['sha256']])).hexdigest(),
+                'current_sha256':hashlib.sha256(lookup_inputs._encoded([refreshed['sha256'],refreshed_metadata['sha256']])).hexdigest(),
+                'read_relevance_changed':read_changed,'metadata_relevance_changed':metadata_changed,
+                'metadata_binding_sha256':metadata.binding_sha256,
+                'previous_metadata_sha256':metadata.observation['sha256'],'current_metadata_sha256':refreshed_metadata['sha256'],
                 'relevance_changed':changed,'unbound_read_opens':len(scope['unbound_read_opens']),
+                'unbound_metadata_queries':len(scope['unbound_metadata_queries']),
                 'input_closure_complete':False,'shipping_authority':False})
-    report={'version':1,'kind':'ci-selected-input-revalidation','binding':lease.binding,'command':lease.command,
+    report={'version':2,'kind':'ci-selected-input-revalidation','binding':lease.binding,'command':lease.command,
         'checkpoint_command':checkpoint['command'],'previous_forests':checkpoint['forests'],'current_forests':refs,
         'observations':observations,'affected_fingerprints':sorted(affected),
         'action':'hold_for_complete_input_revalidation','input_closure_complete':False,'full_ci':False,'shipping_authority':False}
@@ -2024,21 +2033,27 @@ class CommandObservation:
             units.append({'ordinal':ordinal,'pid':pid,'uid':uid,'kind':mapping['kind'],
                 'queries':len(queries),'directory_reads':len(reads),'metadata_queries':len(stats),
                 'source_open_observed':observed})
-            selected=None;unbound=[]
+            selected=None;unbound=[];selected_metadata=None;unbound_metadata=[]
             if mapping['kind']=='compile':
                 index=frozen_input_index(executor.source,executor.source_bindings,item)
                 selected,unbound=index.select_read_subset([event for event in queries if kernel_observer.readable_open(event)
                     and event['pid']==pid],pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
                     mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]))
                 if not selected.record()['queries']:raise FreshnessHold('input_census_unknown',b'compiler read selection absent')
+                selected_metadata,unbound_metadata=index.select_metadata_subset([event for event in queries
+                    if event['pid']==pid and event['syscall'] in (262,332)],stats,
+                    pid=pid,uid=uid,user_namespace=self.observer.user_namespace,
+                    mount_namespace=int(item['namespaces']['mnt']['unit'].split('[',1)[1][:-1]),threaded=True)
             scopes.append({'ordinal':ordinal,'pid':pid,'uid':uid,'mapping':{key:mapping[key] for key in ('kind','role','source','fingerprint','request_sha256','dependencies','generated_root') if key in mapping},
                 'selected_reads':None if selected is None else selected.record(),'unbound_read_opens':unbound,
+                'selected_metadata':None if selected_metadata is None else selected_metadata.record(),
+                'unbound_metadata_queries':unbound_metadata,
                 'scope_evidence':item['scope_evidence'],'namespaces':item['namespaces'],'root_identity':item['root_identity'],'returncode':item['returncode']})
         if any(event['uid']!=1999 and event['uid'] not in known
                 for event in [*events,*directories,*metadata]):
             raise FreshnessHold('input_census_unknown',b'kernel event outside original unit scopes')
         directory=self.observer.root if executor is None else executor.root/'input-observations'
-        record={'version':2,'kind':'ci-command-kernel-record','binding':self.admission.binding,
+        record={'version':3,'kind':'ci-command-kernel-record','binding':self.admission.binding,
             'command':self.admission.command,'path_scope':'all','scopes':lookup_inputs._wire(scopes),
             'events':lookup_inputs._wire(events),'directories':lookup_inputs._wire(directories),
             'metadata':lookup_inputs._wire(metadata),'probe_census':census,

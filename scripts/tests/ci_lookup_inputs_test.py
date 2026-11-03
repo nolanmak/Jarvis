@@ -17,6 +17,51 @@ def load(name):
 
 
 class LookupInputTests(unittest.TestCase):
+    def test_metadata_subset_persists_missing_module_and_retains_unbound_queries(self):
+        import copy
+        views=load('ci_cargo_views')
+        def tree(name,extra):
+            root=self.root/name;(root/'chosen').mkdir(parents=True)
+            (root/'mod.rs').write_bytes(b'mod chosen;')
+            (root/'chosen/mod.rs').write_bytes(b'OLD')
+            if extra:(root/extra).write_bytes(b'NEW')
+            for path in root.rglob('*'):
+                if path.is_file():os.utime(path,ns=(946684800000000000,946684800000000000))
+                path.chmod(0o555 if path.is_dir() else 0o444)
+            root.chmod(0o555);return root
+        old=tree('original',None);irrelevant=tree('irrelevant','unread');changed=tree('changed','chosen.rs')
+        def index(root):return self.inputs.FrozenLookupIndex({'generated':('/workspace/generated',root,
+            views.inventory(root,owner=os.getuid(),sealed=True))},owner=os.getuid())
+        base=old.stat()
+        event={'uid':2000,'pid':101,'tid':102,'syscall':262,'sequence':1,'path':b'chosen.rs','result':-2,
+            'lookup_attempts':[{'dfd':-100,'user_namespace':100,'mount_namespace':50,'init_result':0,
+                'base':{'device':(os.major(base.st_dev)<<20)|os.minor(base.st_dev),'inode':base.st_ino,
+                    'mode':base.st_mode,'flags':256,'path_seq':2,'dentry_seq':2}}]}
+        metadata={key:event[key] for key in ('uid','pid','tid','syscall','sequence','path','result')}
+        metadata.update(fd=-100,flags=256,mask=0,user_namespace=100,stat=None,copy_result=None)
+        outside=copy.deepcopy(event);outside.update(path=b'/runtime/unknown',sequence=2)
+        outside_metadata=copy.deepcopy(metadata);outside_metadata.update(path=outside['path'],sequence=2)
+        args={'pid':101,'uid':2000,'user_namespace':100,'mount_namespace':50,'threaded':True}
+        selected,unbound=index(old).select_metadata_subset([event,outside],[metadata,outside_metadata],**args)
+        self.assertEqual(unbound[0]['sequence'],2)
+        record=json.loads(json.dumps(selected.record()))
+        restored=self.inputs._ContentSelection.restore(record,index(old))
+        self.assertEqual(restored.observation['sha256'],restored.refresh(index(irrelevant))['sha256'])
+        self.assertNotEqual(restored.observation['sha256'],restored.refresh(index(changed))['sha256'])
+        self.assertEqual((old/'chosen/mod.rs').read_bytes(),(changed/'chosen/mod.rs').read_bytes())
+        self.assertEqual((old/'chosen/mod.rs').stat().st_mtime_ns,(changed/'chosen/mod.rs').stat().st_mtime_ns)
+        for fault in ('descriptor','namespace','result','missing-metadata','duplicate'):
+            e=copy.deepcopy(event);m=copy.deepcopy(metadata)
+            if fault=='descriptor':m['fd']=3
+            elif fault=='namespace':e['lookup_attempts'][0]['mount_namespace']=51
+            elif fault=='result':m['result']=0
+            with self.subTest(fault=fault):
+                if fault=='duplicate':
+                    with self.assertRaises(self.inputs.FreshnessHold):index(old).select_metadata_subset([e],[m,m],**args)
+                else:
+                    rejected,unsupported=index(old).select_metadata_subset([e],[] if fault=='missing-metadata' else [m],**args)
+                    self.assertEqual(len(unsupported),1);self.assertEqual(rejected.record()['queries'],[])
+
     def test_read_open_selection_survives_serialization_and_refreshes_exact_generated_overlay(self):
         import copy
         views=load('ci_cargo_views');source=self.root/'source'

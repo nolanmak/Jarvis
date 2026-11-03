@@ -1610,3 +1610,26 @@ and **31 focused managed Rust tests passed** with 18 opt-in cases excluded; thes
 three VM cases were explicitly run. Complete input revalidation, actual selective
 invalidation/restart, opaque wrapper/producer mediation, the unchanged original
 in-command regression and final proof/merge enforcement remain unfinished.
+
+Actual compiler captures now retain selected metadata lookup outcomes alongside
+read-open selections. Missing-path facts are rechecked against frozen declared
+source/generated overlays; unknown metadata, namespace/descriptor mismatches
+and unsupported paths remain explicit. The original private metadata selector
+uses the same binding checks. The new subset path verifies backing trees once
+per batch and does not turn a selected subset into complete metadata coverage.
+
+Internal kernel records are now version 3 because each compiler's persisted
+metadata selection and unbound-query list are required during refresh. The
+revalidation report (version 2) retains separate read and metadata relevance
+changes and combines their digests for affected active producers. Old records
+cannot substitute for the new metadata evidence. Neither changed nor unchanged
+selected facts approve reuse or retire fingerprints.
+
+A new opt-in `live_shared_ci_generated_negative_lookup_revalidation` replay uses
+actual repository commands and compiler/test execution. Its producer adds a
+conflicting `chosen.rs` at the old timestamp while leaving every previously read
+generated file's bytes and timestamp unchanged. The positive-read replay and
+original in-command wrapper/publication harness remain unchanged. The expected
+native evidence is changed metadata/absence relevance with unchanged read
+relevance, bound to the original active producers, followed by the mandatory
+incomplete-input hold. Native results for this revision are pending.
