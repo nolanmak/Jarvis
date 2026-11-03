@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 augmentagent-phone = { path = "../augmentagent-phone" }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 augmentagent-store = { path = "../augmentagent-store" }
 # #176 — `!loops` Discord command reuses the shared /proc walker + signal
 # primitive that backs `augmentagent loops` (#175).
@@ -35,7 +35,7 @@ serenity = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
-tokio-tungstenite = "0.21"
+tokio-tungstenite = "0.29"
 libc = "0.2"
 uuid = { workspace = true }
 tempfile = "3"
