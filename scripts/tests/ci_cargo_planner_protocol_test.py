@@ -10,6 +10,7 @@ import unittest
 import uuid
 import copy
 import hashlib
+import json
 
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('planner_protocol',ROOT/'ci-cargo-planner.py')
@@ -86,7 +87,7 @@ def unit_exec(file,argv,environment):
  return original_exec(sys.executable,[sys.executable,'-I','-c',peer,'2000'],environment)
 os.execve=unit_exec
 sys.argv=['fixed-fixture',mode,metadata,'/unused-root-socket','2000']
-exec(compile(module._PLANNER_PROBE,'fixed-planner-probe','exec'))
+exec(compile(module.guarded_probe(module._PLANNER_PROBE),'fixed-planner-probe','exec'))
 """
         with tempfile.TemporaryDirectory() as directory:
             for mode in ('stdin','jobserver'):
@@ -97,6 +98,19 @@ exec(compile(module._PLANNER_PROBE,'fixed-planner-probe','exec'))
                     observed=__import__('json').loads(result.stdout)
                     self.assertEqual(observed['stdin_sha256'],hashlib.sha256(b'\xffstdin'*200000).hexdigest())
                     self.assertEqual(observed['jobserver'],mode=='jobserver')
+
+    def test_fixed_probe_reports_bounded_phase_without_exception_contents(self):
+        private='PRIVATE_OWNER_CONTENTS_AND_PATH'
+        body="_PROBE_PHASE='planner_probe_status'\nraise OSError(5,"+repr(private)+")"
+        result=subprocess.run([sys.executable,'-I','-c',planner.guarded_probe(body)],capture_output=True,timeout=3)
+        self.assertEqual(result.returncode,125)
+        self.assertEqual(json.loads(result.stderr),{'planner_diagnostic':{
+            'stage':'planner_probe_status','category':'OSError','errno':5}})
+        self.assertNotIn(private.encode(),result.stdout+result.stderr)
+        for phase in ('planner_probe_credentials','planner_probe_filter','planner_probe_exec_start',
+                'planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive',
+                'planner_request_cleanup'):
+            self.assertEqual(planner.diagnostic({'stage':phase})['stage'],phase)
 
     def test_staging_and_actual_exec_are_distinct_versioned_events(self):
         self.assertNotEqual(planner.event('staging_ready',0),planner.event('tool_started',0))

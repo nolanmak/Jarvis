@@ -45,12 +45,26 @@ _CHILD_DIAGNOSTIC=None
 def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
-        'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor'}
+        'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor',
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup'}
     categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','Unavailable'}
     value=value if type(value) is dict else {}
     return {'stage':value.get('stage') if value.get('stage') in phases else 'planner_startup',
         'category':value.get('category') if value.get('category') in categories else 'Unavailable',
         'errno':value.get('errno') if type(value.get('errno')) is int and 0<=value['errno']<=4095 else None}
+
+
+def guarded_probe(source):
+    # This is only the fixed, measured probe body. No exception text, command
+    # arguments or private payload is included in its bounded failure output.
+    return ("import json,sys\n_PROBE_PHASE='planner_probe_credentials'\ntry:\n"
+        + ' exec(compile('+repr(source)+',\"fixed-planner-probe\",\"exec\"),globals())\n'
+        + "except BaseException as error:\n"
+          " category='OSError' if isinstance(error,OSError) else 'Unavailable'\n"
+          " number=getattr(error,'errno',None)\n"
+          " number=number if type(number) is int and 0<=number<=4095 else None\n"
+          " print(json.dumps({'planner_diagnostic':{'stage':_PROBE_PHASE,'category':category,'errno':number}}),file=sys.stderr)\n"
+          " sys.exit(125)\n")
 
 
 def event(stage,value):
@@ -207,18 +221,19 @@ class RootRelay:
         return numbers[:count]
 
     def _handle(self,connection,ordinal):
-        descriptors=[]
+        descriptors=[];phase=['planner_request_receive']
         try:
             connection.settimeout(self.timeout)
-            numbers=self._receive(connection,descriptors);self._run(connection,ordinal,descriptors,numbers)
-        except (OSError,ValueError,RuntimeError,struct.error,subprocess.SubprocessError,FreshnessHold,staging.StagingUnavailable):
-            self.errors.append('protocol_or_original_cleanup_unverified')
+            numbers=self._receive(connection,descriptors);phase[0]='planner_unit'
+            self._run(connection,ordinal,descriptors,numbers,phase)
+        except (OSError,ValueError,RuntimeError,struct.error,subprocess.SubprocessError,FreshnessHold,staging.StagingUnavailable) as error:
+            self.errors.append(diagnostic({'stage':phase[0],'category':type(error).__name__,'errno':getattr(error,'errno',None)}))
             try:connection.sendall(event('error',errno.EINVAL))
             except OSError:pass
         finally:
             legacy._close(descriptors);connection.close();self._slots.release()
 
-    def _run(self,connection,ordinal,descriptors,numbers):
+    def _run(self,connection,ordinal,descriptors,numbers,phase):
         directory=self.root/'units'/str(uuid.uuid4());directory.mkdir(mode=0o700)
         control,child_control=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
         cancel,stop=os.pipe2(os.O_CLOEXEC);release,grant=os.pipe2(os.O_CLOEXEC);exec_release,exec_grant=os.pipe2(os.O_CLOEXEC)
@@ -295,6 +310,7 @@ class RootRelay:
                 if status is not None:break
                 if cancelled_at is not None and time.monotonic()-cancelled_at>5:
                     raise FreshnessHold('cleanup_uncertain')
+            phase[0]='planner_request_cleanup'
             record=cache._read_record(directory/'exit-status.json')
             cleanup=directory/'cleanup'
             info=cleanup.lstat()
@@ -412,8 +428,10 @@ def _stage(arguments):
 _PLANNER_PROBE=r'''
 import ctypes,errno,hashlib,json,os,signal,sys
 mode,metadata,socket_path,expected_uid=sys.argv[1:];expected_uid=int(expected_uid)
+_PROBE_PHASE='planner_probe_credentials'
 assert os.getresuid()==(1001,1001,1001) and os.getresgid()==(1001,1001,1001) and os.getgroups()==[]
 with open(metadata,'a') as output:output.write('planner\n')
+_PROBE_PHASE='planner_probe_filter'
 libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
 argv=(ctypes.c_char_p*2)(b'true',None);environment=(ctypes.c_char_p*1)(None)
 assert libc.syscall(ctypes.c_long(59),ctypes.c_char_p(b'/usr/bin/true'),argv,environment)==-1
@@ -458,16 +476,20 @@ if child==0:
  except BaseException:os._exit(126)
  os._exit(127)
 os.close(source_read);os.close(output_write);os.close(start_write)
+_PROBE_PHASE='planner_probe_exec_start'
 assert os.read(start_read,1)==b'';os.close(start_read)
 data=b'\xffstdin'*200000 if mode!='cancel' else b''
 if mode=='cancel':os.kill(child,signal.SIGUSR1)
 else:
+ _PROBE_PHASE='planner_probe_stream'
  view=memoryview(data)
  while view:view=view[os.write(source_write,view):]
  os.close(source_write);source_write=None
+_PROBE_PHASE='planner_probe_wait'
 with os.fdopen(output_read,'rb') as output:captured=output.read(8193)
 _,status=os.waitpid(child,0);code=os.waitstatus_to_exitcode(status)
 if source_write is not None:os.close(source_write)
+_PROBE_PHASE='planner_probe_status'
 if mode=='cancel':
  assert code==125 and captured==b'',(code,captured)
  result={'cancelled_before_exec':True,'proxy_exit':code}
@@ -494,7 +516,7 @@ def _planner(arguments):
     os.setgroups([]);os.setgid(1001);os.setuid(1001);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True)
     _PHASE='planner_client_exec'
-    os.execve('/usr/bin/python3',['python3','-I','-c',_PLANNER_PROBE,value['mode'],
+    os.execve('/usr/bin/python3',['python3','-I','-c',guarded_probe(_PLANNER_PROBE),value['mode'],
         value['metadata'],value['socket'],str(value['expected_uid'])],environment)
 
 
@@ -521,7 +543,10 @@ def _probe(arguments):
                         try:decoded=json.loads(line)
                         except ValueError:continue
                         if type(decoded) is dict and 'planner_diagnostic' in decoded:
-                            _CHILD_DIAGNOSTIC=diagnostic(decoded['planner_diagnostic'])
+                            candidate=diagnostic(decoded['planner_diagnostic'])
+                            if _CHILD_DIAGNOSTIC is None or candidate['stage']!='planner_probe_status':
+                                _CHILD_DIAGNOSTIC=candidate
+                    if relay.errors:_CHILD_DIAGNOSTIC=relay.errors[0]
                     raise FreshnessHold('invalidation_unsafe')
                 results.append(json.loads(output))
             finally:

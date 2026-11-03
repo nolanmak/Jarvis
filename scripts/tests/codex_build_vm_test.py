@@ -32,6 +32,14 @@ class SnapshotValidationTests(unittest.TestCase):
                          {'stage':'hide_producer_cache','category':'CalledProcessError','errno':22})
         self.assertEqual(vm.guest_diagnostic({'stage':'private path','category':'private contents','errno':True}),
                          {'stage':'unknown','category':'unknown','errno':None})
+    def test_fixed_planner_failure_phases_survive_guest_transport_without_private_fields(self):
+        for phase in ('planner_probe_credentials','planner_probe_filter','planner_probe_exec_start',
+                'planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive',
+                'planner_request_cleanup'):
+            with self.subTest(phase=phase):
+                self.assertEqual(vm.guest_diagnostic({'stage':phase,'category':'OSError','errno':71,'private':'secret'}),
+                    {'stage':phase,'category':'OSError','errno':71})
+
     def test_internal_build_hard_links_can_reach_the_vm_boundary_unchanged(self):
         class BoundaryReached(Exception): pass
         with tempfile.TemporaryDirectory() as temporary:

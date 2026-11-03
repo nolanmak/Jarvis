@@ -44,7 +44,8 @@ def guest_diagnostic(value):
             'publish_dependencies','prepare_generation','execute_command','planner_protocol_probe',
             'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
             'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
-            'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor'}
+            'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_supervisor',
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup'}
     categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
                 'IsADirectoryError','CalledProcessError','ValueError','KeyError','ModuleNotFoundError','ImportError'}
     return {'stage':value.get('stage') if value.get('stage') in stages else 'unknown',
