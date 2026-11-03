@@ -24,6 +24,33 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_worker_message_credentials_refuse_a_transferred_connected_socket(self):
+        for transferred in (False,True):
+            with self.subTest(transferred=transferred):
+                server,client=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+                server.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1)
+                relay=object.__new__(planner.WorkerRelay);relay.peer_uid=os.getuid();relay.require_message_credentials=True
+                relay.nonce=b'n'*32;descriptors=[];child=None
+                body=bytearray(planner.legacy.encode_request(b'/usr/bin/python3',[b'python3'],{},b'/workspace'))
+                body[:8]=b'JARVARG3';payload=os.memfd_create('worker-request',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+                os.write(payload,body);fcntl.fcntl(payload,fcntl.F_ADD_SEALS,planner.legacy.SEALS)
+                stdin=os.open('/dev/null',os.O_RDONLY);out_r,out_w=os.pipe();err_r,err_w=os.pipe()
+                frame=planner.legacy.REQUEST.pack(b'JARVREQ3',relay.nonce,3,0,1,2,*([0]*61))
+                rights=array.array('i',[payload,stdin,out_w,err_w])
+                try:
+                    if transferred:
+                        child=os.fork()
+                        if child==0:
+                            try:client.sendmsg([frame],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])
+                            finally:os._exit(0)
+                    else:client.sendmsg([frame],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])
+                    if transferred:
+                        with self.assertRaises(planner.FreshnessHold):relay._receive(server,descriptors)
+                    else:self.assertEqual(relay._receive(server,descriptors),[0,1,2])
+                finally:
+                    if child is not None:os.waitpid(child,0)
+                    planner.legacy._close([payload,stdin,out_r,out_w,err_r,err_w,*descriptors]);server.close();client.close()
+
     def test_worker_runtime_holds_opaque_static_and_loader_redirects(self):
         request=(b'/usr/bin/python3',[b'python3',b'-I',b'driver.py'],{},b'/workspace',None,0,0)
         with patch.object(planner.os,'statvfs',return_value=SimpleNamespace(f_flag=os.ST_RDONLY)):
@@ -452,7 +479,7 @@ class PlannerProtocolTests(unittest.TestCase):
             def prepare(self,*args):raise planner.FreshnessHold('input_census_unknown')
         with tempfile.TemporaryDirectory() as directory:
             relay=object.__new__(planner.RootRelay);relay.root=Path(directory)
-            (relay.root/'units').mkdir();relay.timeout=1;relay.library=Path('/fixed/library')
+            (relay.root/'units').mkdir();relay.timeout=1;relay.deadline=None;relay.library=Path('/fixed/library')
             relay.admission=SimpleNamespace(target='/fixed/target',binding={},command='fixed')
             relay.views=Reject()
             before=set(os.listdir('/proc/self/fd'))

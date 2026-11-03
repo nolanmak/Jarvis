@@ -1335,8 +1335,10 @@ This path is exposed through the actual repository adapter behind an internal
 test-session switch. It remains disabled in production. The currently admitted
 worker runtimes are pinned shell/Python executables from read-only runtime
 mounts, with a supported ELF interpreter. Static/opaque executables and loader
-redirects hold rather than running without the preload's kernel guard. Worker
-namespace changes also hold. The private protocol replay now additionally
+redirects hold rather than running without the preload's kernel guard. Requests with an observed namespace mismatch or mismatched
+per-message sender credentials hold. The shared listener parent is traversable
+without being listable or writable; child directories and sockets retain
+separate credential permissions. The private protocol replay now additionally
 requires both crossed worker/planner descriptor roles to exit before reaching
 main. Native validation of these changes is pending.
 

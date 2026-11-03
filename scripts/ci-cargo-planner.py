@@ -847,16 +847,19 @@ def strip_transport(environment,library):
 
 
 class RootRelay:
-    def __init__(self,admission,*,library,timeout=30):
+    def __init__(self,admission,*,library,timeout=30,deadline=None):
         if (os.geteuid()!=0 or type(admission) is not _Admission or admission.token is not _TOKEN
                 or admission.owner!=os.getpid() or type(timeout) not in (int,float) or not 1<=timeout<=900):
             raise FreshnessHold('invalidation_unsafe')
+        if deadline is not None and (type(deadline) not in (int,float) or not math.isfinite(deadline)
+                or not time.monotonic()<deadline<=time.monotonic()+901):raise FreshnessHold('invalidation_unsafe')
+        self.deadline=deadline
         _source(admission.target,admission.binding,admission.command)
         self.admission=admission;self.root=admission.root;self.library=Path(library)
         info=self.library.lstat()
         if (self.library.resolve()!=self.library or not stat.S_ISREG(info.st_mode) or info.st_uid!=0
                 or info.st_mode&0o022 or info.st_nlink!=1 or not 1<=info.st_size<=2*1024**2):raise FreshnessHold('authority_changed')
-        self.timeout=timeout;self.peer_uid=1001;self.config_magic=b'JARVCFG3'
+        self.timeout=timeout;self.peer_uid=1001;self.config_magic=b'JARVCFG3';self.require_message_credentials=False
         self.path=self.root/'relay.sock';self.nonce=os.urandom(32)
         if len(os.fsencode(self.path))>=108:raise FreshnessHold('invalidation_unsafe')
         self.views=None;self.completed=[];self.errors=[];self._stop=threading.Event();self._slots=threading.BoundedSemaphore(4)
@@ -866,6 +869,7 @@ class RootRelay:
         os.chown(self.root,0,self.peer_uid);self.root.chmod(0o710)
         (self.root/'units').mkdir(mode=0o700)
         self.listener=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
+        if self.require_message_credentials:self.listener.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1)
         self.listener.bind(str(self.path));os.chown(self.path,0,self.peer_uid);self.path.chmod(0o660)
         self.listener.listen(8);self.listener.settimeout(.05)
         self.thread=threading.Thread(target=self._accept,daemon=True);self.thread.start();return self
@@ -910,10 +914,16 @@ class RootRelay:
     def _receive(self,connection,descriptors):
         pid,uid,gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
         if pid<=0 or uid!=self.peer_uid or gid!=self.peer_uid:raise FreshnessHold('invalidation_unsafe')
-        data,ancillary,flags,_=connection.recvmsg(legacy.REQUEST.size,socket.CMSG_SPACE(65*4),socket.MSG_CMSG_CLOEXEC)
+        extra=socket.CMSG_SPACE(12) if self.require_message_credentials else 0
+        data,ancillary,flags,_=connection.recvmsg(legacy.REQUEST.size,socket.CMSG_SPACE(65*4)+extra,socket.MSG_CMSG_CLOEXEC)
+        credentials=[]
         for level,kind,body in ancillary:
+            if level==socket.SOL_SOCKET and kind==socket.SCM_CREDENTIALS and self.require_message_credentials:
+                if len(body)!=12:raise FreshnessHold('metadata_torn')
+                credentials.append(struct.unpack('3i',body));continue
             if level!=socket.SOL_SOCKET or kind!=socket.SCM_RIGHTS:raise FreshnessHold('metadata_torn')
             values=array.array('i');values.frombytes(body[:len(body)-len(body)%4]);descriptors.extend(values)
+        if self.require_message_credentials and credentials!=[(pid,uid,gid)]:raise FreshnessHold('invalidation_unsafe')
         if len(data)!=legacy.REQUEST.size or flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC):raise FreshnessHold('metadata_torn')
         magic,nonce,count,*numbers=legacy.REQUEST.unpack(data)
         if (magic!=b'JARVREQ3' or not hmac.compare_digest(nonce,self.nonce) or not 3<=count<=64
@@ -946,7 +956,7 @@ class RootRelay:
         directory=self.root/'units'/str(uuid.uuid4());directory.mkdir(mode=0o700)
         control,child_control=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
         cancel,stop=os.pipe2(os.O_CLOEXEC);release,grant=os.pipe2(os.O_CLOEXEC);exec_release,exec_grant=os.pipe2(os.O_CLOEXEC)
-        deadline=time.monotonic()+self.timeout
+        deadline=min(time.monotonic()+self.timeout,self.deadline) if self.deadline is not None else time.monotonic()+self.timeout
         value={'version':3,'kind':'unit','parent':os.getpid(),'target':str(self.admission.target),
             'binding':self.admission.binding,'command':self.admission.command,'directory':str(directory),
             'ordinal':ordinal,'deadline':deadline,'library':str(self.library),'numbers':numbers,
@@ -1064,9 +1074,16 @@ class WorkerRelay(RootRelay):
     This routing does not establish generated-input closure or CI authority.
     """
     def __init__(self,admission,*,planner_relay,value):
-        super().__init__(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())))
-        self.peer_uid=1000;self.config_magic=b'JARVWRK3';self.planner_relay=planner_relay
+        super().__init__(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline'])
+        self.peer_uid=1000;self.config_magic=b'JARVWRK3';self.require_message_credentials=True;self.planner_relay=planner_relay
         self.value=value;self.executor=None;self.cargo_lock=threading.Lock();self.cargo_owner=None;self.cargo_commands=[]
+
+    def __enter__(self):
+        super().__enter__()
+        # Both credentials traverse this root, but neither can list or write
+        # it. Their child listener directories/sockets enforce their own GID.
+        self.root.chmod(0o711)
+        return self
 
     def _receive(self,connection,descriptors):
         numbers=super()._receive(connection,descriptors)
@@ -2497,7 +2514,7 @@ def _execute_repository(arguments):
     planner_root=root/'planner';planner_root.mkdir(mode=0o700)
     planner_admission=admit(value['target'],value['binding'],value['command'],planner_root)
     supervisor_receipt=root/'original-worker-cleanup';child=None;bootstrap=None;configuration=None
-    with RootRelay(planner_admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic()))) as planner:
+    with RootRelay(planner_admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic())),deadline=value['deadline']) as planner:
       with WorkerRelay(worker_admission,planner_relay=planner,value=value) as worker:
         try:
             configuration=worker.config_fd()
