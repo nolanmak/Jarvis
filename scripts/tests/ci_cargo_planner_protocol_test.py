@@ -22,11 +22,44 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_actual_library_and_build_script_graph_requests_keep_original_paths(self):
+        generated=b'/workspace/target/debug/build/private-cargo-probe-bbbbbbbbbbbbbbbb/out'
+        def compile(source,name,kind,out,emit,extra=None):
+            args=[b'/toolchain/bin/rustc',b'--crate-name',name,b'--edition=2021',source,
+                b'--crate-type',kind,emit,b'-C',b'embed-bitcode=no',b'-C',b'metadata=0123456789abcdef',
+                b'-C',b'extra-filename=-aaaaaaaaaaaaaaaa',b'--out-dir',out,
+                b'-L',b'dependency=/workspace/target/debug/deps',*(extra or [])]
+            return args[0],args,{b'OUT_DIR':generated},b'/workspace',b'/toolchain/bin:/usr/bin:/bin',0,0
+        build=compile(b'build.rs',b'build_script_build',b'bin',
+            b'/workspace/target/debug/build/private-cargo-probe-aaaaaaaaaaaaaaaa',b'--emit=dep-info,link')
+        build[2].clear()
+        self.assertEqual(planner.fixture_request(build)['role'],'build-script')
+        library=compile(b'src/lib.rs',b'private_cargo_probe',b'lib',
+            b'/workspace/target/debug/deps',b'--emit=dep-info,metadata,link')
+        result=planner.fixture_request(library)
+        self.assertEqual(result['role'],'library')
+        self.assertEqual(result['generated_root'],'debug/build/private-cargo-probe-bbbbbbbbbbbbbbbb/out')
+        self.assertIn('debug/deps/libprivate_cargo_probe-aaaaaaaaaaaaaaaa.rlib',result['outputs'])
+        self.assertIn('debug/deps/libprivate_cargo_probe-aaaaaaaaaaaaaaaa.rmeta',result['outputs'])
+        binary=compile(b'src/main.rs',b'private_cargo_probe',b'bin',
+            b'/workspace/target/debug/deps',b'--emit=dep-info,link',
+            [b'--extern',b'private_cargo_probe=/workspace/target/debug/deps/libprivate_cargo_probe-aaaaaaaaaaaaaaaa.rlib'])
+        self.assertEqual(planner.fixture_request(binary)['dependencies'],
+            ['debug/deps/libprivate_cargo_probe-aaaaaaaaaaaaaaaa.rlib'])
+        executable=b'/workspace/target/debug/build/private-cargo-probe-aaaaaaaaaaaaaaaa/build-script-build'
+        request=(executable,[executable],{b'OUT_DIR':generated},b'/workspace',None,0,0)
+        self.assertEqual(planner.fixture_request(request),{'kind':'build_script',
+            'alias':'debug/build/private-cargo-probe-aaaaaaaaaaaaaaaa/build-script-build',
+            'generated_root':'debug/build/private-cargo-probe-bbbbbbbbbbbbbbbb/out'})
+        for request in (library[:2]+({b'OUT_DIR':b'/etc'},)+library[3:],
+                compile(b'build.rs',b'build_script_build',b'lib',b'/workspace/target/debug/deps',b'--emit=dep-info,link')):
+            with self.subTest(request=request),self.assertRaises(planner.FreshnessHold):planner.fixture_request(request)
+
     def test_cargo_run_relative_executable_keeps_its_original_request(self):
         # Cargo 1.94.1 cargo_run.rs strips the caller's cwd from its executable.
         file=b'target/debug/private-cargo-probe'
         request=(file,[file],{},b'/workspace',b'/toolchain/bin:/usr/bin:/bin',0,0)
-        self.assertEqual(planner.fixture_request(request),{'kind':'application'})
+        self.assertEqual(planner.fixture_request(request),{'kind':'application','alias':'debug/private-cargo-probe'})
         self.assertEqual(request[0],file)
         for unknown in (b'../target/debug/private-cargo-probe',b'other/debug/private-cargo-probe',b'private-cargo-probe'):
             with self.subTest(file=unknown),self.assertRaises(planner.FreshnessHold):
@@ -56,7 +89,7 @@ class PlannerProtocolTests(unittest.TestCase):
             b'-C',b'metadata=0123456789abcdef',b'-C',b'extra-filename=-0123456789abcdef',
             b'--out-dir',b'/workspace/target/debug/deps',b'-L',b'dependency=/workspace/target/debug/deps']
         mapped=planner.fixture_request(request(args))
-        self.assertEqual(mapped,{'kind':'compile','outputs':[
+        self.assertEqual(mapped,{'kind':'compile','role':'binary','dependencies':[],'generated_root':None,'outputs':[
             'debug/deps/private_cargo_probe-0123456789abcdef',
             'debug/deps/private_cargo_probe-0123456789abcdef.d']})
         self.assertEqual(planner.fixture_request(request(args,search=b'/unrelated/path')),mapped)
@@ -71,16 +104,17 @@ class PlannerProtocolTests(unittest.TestCase):
             with self.subTest(invalid=invalid),self.assertRaises(planner.FreshnessHold):
                 planner.fixture_request(invalid)
         self.assertEqual(planner.fixture_request(request([],file=b'/workspace/target/debug/private-cargo-probe')),
-            {'kind':'application'})
+            {'kind':'application','alias':'debug/private-cargo-probe'})
 
     def test_cargo_probe_requires_actual_unit_cleanup_and_preserves_no_authority(self):
         units=[{'ordinal':i,'uid':2000+i,'started':True,'cancelled':False,'returncode':0,
-            'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5,10)]
-        value={'version':1,'compiler_calls':[1,0],'application_runs':2,'actual_metadata_preserved':True,
+            'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5,14)]
+        value={'version':1,'compiler_calls':[3,0],'build_script_calls':[1,0],'generated_tree_preserved':True,'library_input_mounted':True,'application_runs':2,'actual_metadata_preserved':True,
             'sealed_artifact_detached':True,'units':units,'allocation_removed':True,
             'trusted_input_closure':False,'shipping_authority':False}
         self.assertEqual(planner.validate_cargo_probe(value),value)
-        for field,replacement in (('compiler_calls',[True,0]),('compiler_calls',[1,1]),
+        for field,replacement in (('compiler_calls',[True,0]),('compiler_calls',[3,1]),
+                ('build_script_calls',[True,0]),('build_script_calls',[1,1]),('generated_tree_preserved',False),('library_input_mounted',False),
                 ('application_runs',True),('actual_metadata_preserved',False),('sealed_artifact_detached',False),
                 ('allocation_removed',False),('trusted_input_closure',True),('shipping_authority',True)):
             with self.subTest(field=field),self.assertRaises(planner.FreshnessHold):

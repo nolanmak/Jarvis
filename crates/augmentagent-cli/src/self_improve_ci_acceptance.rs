@@ -30,7 +30,32 @@ async fn live_shared_ci_planner_protocol_v3()->Result<()> {
     std::fs::create_dir(root.join("src"))?;
     std::fs::write(root.join("Cargo.toml"),"[package]\nname=\"private-cargo-probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n")?;
     std::fs::write(root.join("Cargo.lock"),"version=4\n[[package]]\nname=\"private-cargo-probe\"\nversion=\"0.0.0\"\n")?;
-    std::fs::write(root.join("src/main.rs"),"fn main(){\n let root=std::path::Path::new(\"target/debug/.fingerprint\");\n std::fs::create_dir_all(root).unwrap();\n std::fs::write(root.join(\"unit-forged\"),b\"private unit only\").unwrap();\n println!(\"ISOLATED\");\n}\n")?;
+    std::fs::write(root.join("src/main.rs"),r####"fn main(){
+ assert_eq!(private_cargo_probe::value(),7);
+ let out=std::path::PathBuf::from(env!("OUT_DIR"));
+ assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),b"pub const GENERATED:u8=7;\n");
+ assert!(out.join("empty").is_dir());
+ assert!(std::fs::write(out.join("forbidden"),b"x").is_err());
+ assert!(std::fs::rename(&out,out.with_extension("renamed")).is_err());
+ let root=std::path::Path::new("target/debug/.fingerprint");
+ std::fs::create_dir_all(root).unwrap();
+ std::fs::write(root.join("unit-forged"),b"private unit only").unwrap();
+ println!("ISOLATED");
+}
+"####)?;
+    std::fs::write(root.join("src/lib.rs"),r####"include!(concat!(env!("OUT_DIR"),"/generated.rs"));
+pub fn value()->u8{GENERATED}
+"####)?;
+    std::fs::write(root.join("build.rs"),r####"fn main(){
+ let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+ std::fs::create_dir_all(out.join("empty")).unwrap();
+ std::fs::write(out.join("generated.rs"),b"pub const GENERATED:u8=7;\n").unwrap();
+ let metadata=std::path::Path::new("target/debug/.fingerprint");
+ std::fs::create_dir_all(metadata).unwrap();
+ std::fs::write(metadata.join("build-script-forged"),b"private unit only").unwrap();
+ println!("cargo:rerun-if-changed=build.rs");
+}
+"####)?;
     git(root,&["add","."]).await?;
     git(root,&["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","-c","commit.gpgsign=false",
         "-c","core.hooksPath=/dev/null","commit","-qm","protocol fixture"]).await?;
@@ -50,7 +75,9 @@ async fn live_shared_ci_planner_protocol_v3()->Result<()> {
         && probe["cases"][4]["filesystem"]["input_stable"]==true
         && probe["filesystem"]["input_inode_metadata_preserved"]==true
         && probe["filesystem"]["allocation_removed"]==true && probe["shipping_authority"]==false
-        && probe["cargo"]["compiler_calls"]==serde_json::json!([1,0])
+        && probe["cargo"]["compiler_calls"]==serde_json::json!([3,0])
+        && probe["cargo"]["build_script_calls"]==serde_json::json!([1,0])
+        && probe["cargo"]["generated_tree_preserved"]==true && probe["cargo"]["library_input_mounted"]==true
         && probe["cargo"]["application_runs"]==2 && probe["cargo"]["actual_metadata_preserved"]==true
         && probe["cargo"]["sealed_artifact_detached"]==true && probe["cargo"]["allocation_removed"]==true,
         "V3 probe did not establish original credential/cancellation observations");

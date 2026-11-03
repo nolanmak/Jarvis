@@ -14,6 +14,29 @@ views=importlib.util.module_from_spec(spec);spec.loader.exec_module(views)
 
 
 class UnitViewTests(unittest.TestCase):
+    def test_tree_input_mount_requires_the_exact_sealed_directory_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);source=root/'sealed';self.tree(source)
+            manifest=views.inventory(source,owner=os.getuid(),sealed=True)
+            destination=root/'input';destination.mkdir();raw=b'build/out'.hex()
+            with patch.object(views,'_readonly') as mount:
+                views.input_mount(source,destination,raw,[raw,'tree',manifest],owner=os.getuid())
+                mount.assert_called_once_with(source,destination)
+            (source/'deps/input').chmod(0o644);(source/'deps/input').write_bytes(b'changed');(source/'deps/input').chmod(0o444)
+            with patch.object(views,'_readonly') as mount,self.assertRaises(views.FreshnessHold):
+                views.input_mount(source,destination,raw,[raw,'tree',manifest],owner=os.getuid())
+            mount.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os,'O_NOATIME'),'requires no-atime directory descriptors')
+    def test_inventory_preserves_sealed_directory_access_times(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)/'sealed';self.tree(root)
+            for directory in (root,root/'deps'):
+                info=directory.stat();os.utime(directory,ns=(946684800000000000,info.st_mtime_ns))
+            before=[directory.stat().st_atime_ns for directory in (root,root/'deps')]
+            views.inventory(root,owner=os.getuid(),sealed=True)
+            self.assertEqual([directory.stat().st_atime_ns for directory in (root,root/'deps')],before)
+
     def test_declared_roots_publish_unknown_names_and_empty_directories_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);source=root/'unit';source.mkdir()

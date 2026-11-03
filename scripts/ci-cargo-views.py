@@ -75,7 +75,10 @@ def inventory(root,*,owner,sealed):
                 or (hasattr(os,'listxattr') and os.listxattr(directory,follow_symlinks=False))
                 or (sealed and mode!=0o555)):raise FreshnessHold('artifact_provenance_unknown')
         rows.append([os.fsencode(prefix).hex(),'directory',mode])
-        for entry in sorted(directory.iterdir(),key=lambda p:os.fsencode(p.name)):
+        descriptor=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC|getattr(os,'O_NOATIME',0))
+        try:names=os.listdir(descriptor)
+        finally:os.close(descriptor)
+        for entry in [directory/name for name in sorted(names,key=os.fsencode)]:
             name=prefix/entry.name;info=entry.lstat()
             if stat.S_ISDIR(info.st_mode):walk(entry,name)
             elif stat.S_ISREG(info.st_mode):
@@ -189,6 +192,21 @@ def _readonly(source,destination):
     _mount('-o','remount,bind,ro,nosuid,nodev,noatime',destination)
 
 
+def input_mount(source,destination,raw,expected,*,owner=0):
+    source,destination=map(literal,(source,destination))
+    if type(expected) is not list or len(expected)<2 or expected[0]!=raw:
+        raise FreshnessHold('input_census_unknown')
+    if expected[1]=='tree':
+        if (len(expected)!=3 or not destination.is_dir()
+                or inventory(source,owner=owner,sealed=True)!=expected[2]):
+            raise FreshnessHold('input_census_unknown')
+    elif expected[1]=='file':
+        if not destination.is_file() or expected!=[raw,'file',*_read(source,owner,True)]:
+            raise FreshnessHold('input_census_unknown')
+    else:raise FreshnessHold('input_census_unknown')
+    _readonly(source,destination)
+
+
 def toolchain_view(source,destination):
     """Expose pinned runtime children without chmod on the private source root.
 
@@ -262,10 +280,8 @@ def _enter(root,unit,source,artifacts,bindings,phase):
         try:name=relative(bytes.fromhex(raw))
         except (TypeError,ValueError):raise FreshnessHold('input_census_unknown') from None
         original=literal(original)
-        if expected!=[raw,'file',*_read(original,0,True)]:raise FreshnessHold('input_census_unknown')
         destination=root/'workspace/target'/name
-        if destination.resolve()!=destination or not destination.is_file():raise FreshnessHold('invalidation_unsafe')
-        _readonly(original,destination)
+        input_mount(original,destination,raw,expected)
     phase[0]='planner_view_proc'
     _mount('-t','proc','-o','ro,nosuid,nodev,noexec,hidepid=2','proc',root/'proc')
     phase[0]='planner_view_devices'

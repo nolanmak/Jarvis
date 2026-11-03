@@ -50,7 +50,7 @@ def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
         'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish','planner_cargo_request','planner_cargo_artifact','planner_cargo_runtime','planner_cargo_execute','planner_cargo_compile','planner_cargo_build_script','planner_cargo_application'}
     categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','CalledProcessError','Unavailable'}
     value=value if type(value) is dict else {}
     return {'stage':value.get('stage') if value.get('stage') in phases else 'planner_startup',
@@ -187,13 +187,21 @@ def receive_control(endpoint):
     except BaseException:legacy._close(received);raise
 
 
+def fixture_out_dir(environment):
+    value=environment.get(b'OUT_DIR')
+    if value is None:return None
+    if re.fullmatch(rb'/workspace/target/debug/build/private-cargo-probe-[0-9a-f]{16}/out',value) is None:
+        raise FreshnessHold('input_census_unknown')
+    return os.fsdecode(value.removeprefix(b'/workspace/target/'))
+
+
 def fixture_request(request):
-    """Map only the pinned dependency-free Cargo fixture; unknown work holds.
+    """Map the pinned Cargo build-script/library/binary graph; unknown work holds.
 
     This is an execution mapping experiment, not generic unit discovery or an
     input-closure authority. Preserve the original command and its virtual paths.
     """
-    file,argv,_environment,cwd,search,_ignored,_blocked=request
+    file,argv,environment,cwd,search,_ignored,_blocked=request
     # POSIX spawnp/execvp preserve their search request for files containing '/'.
     # Such files ignore PATH; keep the original executable and payload untouched.
     if cwd!=b'/workspace' or not argv or argv[0]!=file:
@@ -201,7 +209,12 @@ def fixture_request(request):
     # cargo_run.rs at Cargo commit29ea6fb6a strips the caller's cwd prefix.
     # Both literal paths resolve to this one planned mount under /workspace.
     if file in (b'/workspace/target/debug/private-cargo-probe',b'target/debug/private-cargo-probe') and len(argv)==1:
-        return {'kind':'application'}
+        return {'kind':'application','alias':'debug/private-cargo-probe'}
+    if re.fullmatch(rb'/workspace/target/debug/build/private-cargo-probe-[0-9a-f]{16}/build-script-build',file) and len(argv)==1:
+        generated=fixture_out_dir(environment)
+        if generated is None:raise FreshnessHold('input_census_unknown')
+        return {'kind':'build_script','alias':os.fsdecode(file.removeprefix(b'/workspace/target/')),
+            'generated_root':generated}
     if file!=b'/toolchain/bin/rustc':raise FreshnessHold('input_census_unknown')
     args=argv[1:]
     if args in ([b'-vV'],[b'--version']):return {'kind':'information'}
@@ -213,18 +226,18 @@ def fixture_request(request):
         if all(arg in words for arg in args) and any(arg.startswith(b'--print=') for arg in args):
             return {'kind':'information'}
         raise FreshnessHold('input_census_unknown')
-    fields={};codegen={};source=False;index=0
+    fields={};codegen={};source=None;index=0
     while index<len(args):
         arg=args[index];index+=1
         if arg.startswith((b'--error-format=',b'--json=')):
             key,_,value=arg.partition(b'=')
             if key in fields:raise FreshnessHold('input_census_unknown')
             fields[key]=value;continue
-        if arg==b'src/main.rs' and not source:source=True;continue
-        if arg in (b'--edition=2021',b'--emit=dep-info,link'):
+        if arg in (b'src/main.rs',b'src/lib.rs',b'build.rs') and source is None:source=arg;continue
+        if arg in (b'--edition=2021',b'--emit=dep-info,link',b'--emit=dep-info,metadata,link'):
             if arg in fields:raise FreshnessHold('input_census_unknown')
             fields[arg]=True;continue
-        if arg in (b'--crate-name',b'--crate-type',b'--out-dir',b'-L',b'-C',b'--check-cfg',b'--error-format',b'--json'):
+        if arg in (b'--crate-name',b'--crate-type',b'--out-dir',b'-L',b'-C',b'--check-cfg',b'--error-format',b'--json',b'--extern'):
             if index>=len(args):raise FreshnessHold('input_census_unknown')
             value=args[index];index+=1
             if arg==b'-C':
@@ -246,16 +259,34 @@ def fixture_request(request):
                 fields[arg]=value
             continue
         raise FreshnessHold('input_census_unknown')
-    required={b'--crate-name':b'private_cargo_probe',b'--crate-type':b'bin',
-        b'--out-dir':b'/workspace/target/debug/deps',b'-L':b'dependency=/workspace/target/debug/deps',
-        b'--edition=2021':True,b'--emit=dep-info,link':True}
+    if source not in (b'src/main.rs',b'src/lib.rs',b'build.rs'):raise FreshnessHold('input_census_unknown')
+    role={b'src/main.rs':'binary',b'src/lib.rs':'library',b'build.rs':'build-script'}[source]
+    if b'extra-filename' not in codegen or b'metadata' not in codegen:raise FreshnessHold('input_census_unknown')
+    suffix=codegen[b'extra-filename']
+    out=(b'/workspace/target/debug/build/private-cargo-probe'+suffix
+        if role=='build-script' else b'/workspace/target/debug/deps')
+    emit=b'--emit=dep-info,metadata,link' if role=='library' else b'--emit=dep-info,link'
+    required={b'--crate-name':b'build_script_build' if role=='build-script' else b'private_cargo_probe',
+        b'--crate-type':b'lib' if role=='library' else b'bin',
+        b'--out-dir':out,b'-L':b'dependency=/workspace/target/debug/deps',b'--edition=2021':True,emit:True}
     if (not source or any(fields.get(key)!=value for key,value in required.items())
-            or b'extra-filename' not in codegen or b'metadata' not in codegen
+            or (b'--emit=dep-info,link' in fields and b'--emit=dep-info,metadata,link' in fields)
             or fields.get(b'--error-format',b'json')!=b'json'
             or fields.get(b'--json',b'diagnostic-rendered-ansi,artifacts,future-incompat')!=b'diagnostic-rendered-ansi,artifacts,future-incompat'):
         raise FreshnessHold('input_census_unknown')
-    base='debug/deps/private_cargo_probe'+codegen[b'extra-filename'].decode('ascii')
-    return {'kind':'compile','outputs':[base,base+'.d']}
+    prefix=os.fsdecode(out.removeprefix(b'/workspace/target/'))+'/'
+    name=os.fsdecode(required[b'--crate-name']+suffix);base=prefix+name
+    outputs=([prefix+'lib'+name+'.rlib',prefix+'lib'+name+'.rmeta',base+'.d']
+        if role=='library' else [base,base+'.d'])
+    dependencies=[]
+    if b'--extern' in fields:
+        if role!='binary' or re.fullmatch(rb'private_cargo_probe=/workspace/target/debug/deps/libprivate_cargo_probe-[0-9a-f]{16}\.rlib',fields[b'--extern']) is None:
+            raise FreshnessHold('input_census_unknown')
+        dependencies=[os.fsdecode(fields[b'--extern'].split(b'=',1)[1].removeprefix(b'/workspace/target/'))]
+    generated=fixture_out_dir(environment)
+    if role=='library' and generated is None or role=='build-script' and generated is not None:
+        raise FreshnessHold('input_census_unknown')
+    return {'kind':'compile','role':role,'outputs':outputs,'dependencies':dependencies,'generated_root':generated}
 
 
 class RootRelay:
@@ -639,10 +670,29 @@ class _ViewProbe:
 
 CARGO_FIXTURE_MANIFEST='[package]\nname="private-cargo-probe"\nversion="0.0.0"\nedition="2021"\n'
 CARGO_FIXTURE_SOURCE='''fn main(){
+ assert_eq!(private_cargo_probe::value(),7);
+ let out=std::path::PathBuf::from(env!("OUT_DIR"));
+ assert_eq!(std::fs::read(out.join("generated.rs")).unwrap(),b"pub const GENERATED:u8=7;\\n");
+ assert!(out.join("empty").is_dir());
+ assert!(std::fs::write(out.join("forbidden"),b"x").is_err());
+ assert!(std::fs::rename(&out,out.with_extension("renamed")).is_err());
  let root=std::path::Path::new("target/debug/.fingerprint");
  std::fs::create_dir_all(root).unwrap();
  std::fs::write(root.join("unit-forged"),b"private unit only").unwrap();
  println!("ISOLATED");
+}
+'''
+CARGO_FIXTURE_LIB='''include!(concat!(env!("OUT_DIR"),"/generated.rs"));
+pub fn value()->u8{GENERATED}
+'''
+CARGO_FIXTURE_BUILD='''fn main(){
+ let out=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+ std::fs::create_dir_all(out.join("empty")).unwrap();
+ std::fs::write(out.join("generated.rs"),b"pub const GENERATED:u8=7;\\n").unwrap();
+ let metadata=std::path::Path::new("target/debug/.fingerprint");
+ std::fs::create_dir_all(metadata).unwrap();
+ std::fs::write(metadata.join("build-script-forged"),b"private unit only").unwrap();
+ println!("cargo:rerun-if-changed=build.rs");
 }
 '''
 
@@ -654,9 +704,11 @@ class _CargoProbe:
                 or admission.owner!=os.getpid() or os.getresuid()!=(0,0,0)):
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
-        self.admission=admission;self.owner=os.getpid();self.units={};self.published=None;self.report=None
+        self.admission=admission;self.owner=os.getpid();self.units={};self.publications={};self.files={};self.report=None
+        self.generated_stats={};self.library_used=False
         self.source=admission.target.parent/'source-projection'
-        for name,body in (('Cargo.toml',CARGO_FIXTURE_MANIFEST),('src/main.rs',CARGO_FIXTURE_SOURCE)):
+        for name,body in (('Cargo.toml',CARGO_FIXTURE_MANIFEST),('src/main.rs',CARGO_FIXTURE_SOURCE),
+                ('src/lib.rs',CARGO_FIXTURE_LIB),('build.rs',CARGO_FIXTURE_BUILD)):
             if unit_views._read(self.source/name,0,True)[1:]!=(len(body.encode()),hashlib.sha256(body.encode()).hexdigest()):
                 raise FreshnessHold('input_census_unknown')
         self.root=admission.target/('.cargo-view-probe-'+str(uuid.uuid4()));self.root.mkdir(mode=0o710)
@@ -668,6 +720,64 @@ class _CargoProbe:
         for name in ('planner-target','home','cargo-home'):
             path=self.root/name;path.mkdir(mode=0o700);os.chown(path,1001,1001)
 
+    @staticmethod
+    def _directory(root,name,unit):
+        current=root
+        for part in unit_views.relative(name).parts:
+            current=current/part
+            if not current.exists():current.mkdir(mode=0o700);os.chown(current,unit,unit)
+            unit_views._output_directory(current,unit)
+        return current
+
+    @staticmethod
+    def _stat(path):
+        info=path.stat()
+        return (*unit_views._key(info),info.st_nlink,info.st_atime_ns)
+
+    def _planner_file(self,name,expected):
+        path=unit_views.literal(self.target/name)
+        descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NOATIME|os.O_CLOEXEC)
+        try:
+            before=os.fstat(descriptor);digest=hashlib.sha256();count=0
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid!=1001 or before.st_size!=expected[3]
+                    or before.st_size>unit_views.MAX_BYTES):raise cargo_hold('planner_cargo_artifact')
+            while True:
+                block=os.read(descriptor,1024*1024)
+                if not block:break
+                count+=len(block);digest.update(block)
+                if count>before.st_size:raise cargo_hold('planner_cargo_artifact')
+            if (count!=before.st_size or digest.hexdigest()!=expected[4]
+                    or unit_views._key(os.fstat(descriptor))!=unit_views._key(before)
+                    or unit_views._key(path.lstat())!=unit_views._key(before)):
+                raise cargo_hold('planner_cargo_artifact')
+        finally:os.close(descriptor)
+        return path
+
+    def _file_input(self,artifacts,unit,name,alias=None):
+        if name not in self.files:raise cargo_hold('planner_cargo_artifact')
+        label,row=self.files[name];publication=self.publications[label]
+        if unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']:
+            raise cargo_hold('planner_cargo_artifact')
+        original=publication['root']/name;actual=self._planner_file(name,row)
+        if alias is not None:
+            entry=self.target/alias
+            if entry.is_symlink() or not entry.is_file() or not entry.samefile(actual):
+                raise cargo_hold('planner_cargo_artifact')
+        virtual=alias or name
+        self._directory(artifacts,str(Path(virtual).parent),unit)
+        (artifacts/virtual).touch(mode=0o444);raw=os.fsencode(virtual).hex()
+        return [raw,str(original),[raw,*row[1:]]]
+
+    def _generated_input(self,artifacts,unit,name):
+        publication=self.publications.get('generated')
+        if publication is None or publication['roots']!=[name]:raise cargo_hold('planner_cargo_artifact')
+        if unit_views.inventory(publication['root'],owner=0,sealed=True)!=publication['manifest']:
+            raise cargo_hold('planner_cargo_artifact')
+        original=publication['root']/name;manifest=unit_views.inventory(original,owner=0,sealed=True)
+        self._directory(artifacts,str(Path(name).parent),unit)
+        (artifacts/name).mkdir(mode=0o555);raw=os.fsencode(name).hex()
+        return [raw,str(original),[raw,'tree',manifest]]
+
     def prepare(self,ordinal,request):
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
         try:mapped=fixture_request(request)
@@ -677,23 +787,23 @@ class _CargoProbe:
         for name in ('debug','debug/deps'):
             path=artifacts/name;path.mkdir(mode=0o700);os.chown(path,unit,unit)
         entries=[]
+        if mapped['kind'] in ('application','build_script'):
+            label='binary' if mapped['kind']=='application' else 'build-script'
+            if label not in self.publications:raise cargo_hold('planner_cargo_artifact')
+            entries.append(self._file_input(artifacts,unit,self.publications[label]['files'][0],mapped['alias']))
+        if mapped['kind']=='compile':
+            for name in mapped['dependencies']:
+                if name not in self.files or self.files[name][0]!='library':raise cargo_hold('planner_cargo_artifact')
+                for artifact in self.publications['library']['files']:
+                    if artifact.endswith(('.rlib','.rmeta')):entries.append(self._file_input(artifacts,unit,artifact))
+                self.library_used=True
+            self._directory(artifacts,str(Path(mapped['outputs'][0]).parent),unit)
+        generated=mapped.get('generated_root')
         if mapped['kind']=='application':
-            if self.published is None:raise cargo_hold('planner_cargo_artifact')
-            sealed,manifest,outputs=self.published;alias=self.target/'debug/private-cargo-probe'
-            artifact=self.target/outputs[0]
-            if (not alias.is_file() or alias.is_symlink() or not artifact.samefile(alias)
-                    or unit_views.inventory(sealed,owner=0,sealed=True)!=manifest):
-                raise cargo_hold('planner_cargo_artifact')
-            original=sealed/outputs[0];expected=next(row for row in manifest if row[0]==os.fsencode(outputs[0]).hex())
-            descriptor=os.open(artifact,os.O_RDONLY|os.O_NOFOLLOW|os.O_NOATIME|os.O_CLOEXEC)
-            try:
-                info=os.fstat(descriptor)
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid!=1001 or info.st_size!=expected[3]
-                        or hashlib.sha256(os.pread(descriptor,info.st_size+1,0)).hexdigest()!=expected[4]):
-                    raise cargo_hold('planner_cargo_artifact')
-            finally:os.close(descriptor)
-            name='debug/private-cargo-probe';(artifacts/name).touch(mode=0o444)
-            raw=os.fsencode(name).hex();entries=[[raw,str(original),[raw,*expected[1:]]]]
+            generated=self.publications['generated']['roots'][0]
+        if generated is not None:
+            if mapped['kind']=='build_script':self._directory(artifacts,generated,unit)
+            else:entries.append(self._generated_input(artifacts,unit,generated))
         root=slot/'root';root.mkdir(mode=0o700);mounts=slot/'mounts.json'
         cache._write_record(mounts,{'version':1,'binding':self.admission.binding,
             'command':self.admission.command,'ordinal':ordinal,'entries':entries})
@@ -705,30 +815,58 @@ class _CargoProbe:
     def running(self,view):pass
 
     def finish(self,view,directory,raw):
-        if raw!=0:raise FreshnessHold('input_census_unknown')
         ordinal=view['ordinal'];record=self.units[ordinal];mapping=record['mapping']
+        if raw!=0:
+            stage={'compile':'planner_cargo_compile','build_script':'planner_cargo_build_script',
+                'application':'planner_cargo_application'}.get(mapping['kind'],'planner_cargo_compile')
+            raise cargo_hold(stage)
         observed=cache._read_record(directory/'view-namespace.json')
         if (observed.get('binding')!=self.admission.binding or observed.get('command')!=self.admission.command
                 or observed.get('ordinal')!=ordinal
                 or set(observed['namespaces'])!={'mnt','ipc','net'}
                 or any(row['controller']==row['unit'] for row in observed['namespaces'].values())):
             raise FreshnessHold('invalidation_unsafe')
-        if mapping['kind']=='compile':
-            if self.published is not None:raise FreshnessHold('input_census_unknown')
-            staged=self.root/'outputs-preparing';outputs=mapping['outputs']
-            manifest=unit_views.copy_outputs(Path(view['artifacts']),staged,outputs,owner=2000+ordinal,controller=0)
-            sealed=self.root/'outputs-sealed';staged.rename(sealed)
-            self.published=(sealed,manifest,outputs)
+        if mapping['kind'] in ('compile','build_script'):
+            label=mapping['role'] if mapping['kind']=='compile' else 'generated'
+            if label in self.publications:raise FreshnessHold('input_census_unknown')
+            staged=self.root/('preparing-'+label);roots=[]
+            if mapping['kind']=='compile':
+                manifest=unit_views.copy_outputs(Path(view['artifacts']),staged,mapping['outputs'],owner=2000+ordinal,controller=0)
+            else:
+                roots=[mapping['generated_root']]
+                manifest=unit_views.copy_output_roots(Path(view['artifacts']),staged,roots,owner=2000+ordinal,controller=0)
+                forged=Path(view['artifacts'])/'debug/.fingerprint/build-script-forged'
+                if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
+                    raise FreshnessHold('invalidation_unsafe')
+            sealed=self.root/('sealed-'+label);staged.rename(sealed)
+            parent=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            try:os.fsync(parent)
+            finally:os.close(parent)
+            outputs=[os.fsdecode(bytes.fromhex(row[0])) for row in manifest if row[1]=='file']
+            if mapping['kind']=='compile':outputs=mapping['outputs']
+            self.publications[label]={'root':sealed,'manifest':manifest,'files':outputs,'roots':roots}
+            cache._write_record(self.root/('publication-'+label+'.json'),{'version':1,
+                'binding':self.admission.binding,'command':self.admission.command,'ordinal':ordinal,
+                'kind':'private-cargo-output-probe','role':label,'outputs':manifest,
+                'original_cleanup':True,'shipping_authority':False})
+            for row in manifest:
+                if row[0]=='2e':continue
+                name=os.fsdecode(bytes.fromhex(row[0]))
+                if row[1]=='directory':self._directory(self.target,name,1001)
+                else:self.files[name]=(label,row)
             # Cargo may hardlink and change bookkeeping on these detached copies.
             # Its metadata must never share an inode with immutable unit inputs.
             for name in outputs:
-                destination=self.target/name;destination.parent.mkdir(parents=True,exist_ok=True)
-                os.chown(destination.parent,1001,1001);os.chown(destination.parent.parent,1001,1001)
+                destination=self.target/name;self._directory(self.target,str(Path(name).parent),1001)
                 descriptor=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
                 try:
                     mode,_size,_digest=unit_views._read(sealed/name,0,True,descriptor)
                     os.fchown(descriptor,1001,1001);os.fchmod(descriptor,0o755 if mode&0o111 else 0o644);os.fsync(descriptor)
                 finally:os.close(descriptor)
+            if label=='generated':
+                tree=sealed/roots[0]
+                for row in unit_views.inventory(tree,owner=0,sealed=True):
+                    path=tree/Path(os.fsdecode(bytes.fromhex(row[0])));self.generated_stats[path]=self._stat(path)
         elif mapping['kind']=='application':
             forged=Path(view['artifacts'])/'debug/.fingerprint/unit-forged'
             if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
@@ -736,17 +874,17 @@ class _CargoProbe:
         record.update(finished=True,namespaces=observed['namespaces'])
 
     def run(self,value,relay):
-        first=len(relay.completed);counts=[];fingerprint=None
+        first=len(relay.completed);counts=[];script_counts=[];fingerprint=None
         for iteration in range(2):
             client=relay.config_fd();bootstrap=None;child=None;before=len(relay.completed)
             try:
-                config=dict(value,kind='cargo',parent=os.getpid(),deadline=time.monotonic()+40,
+                config=dict(value,kind='cargo',parent=os.getpid(),
                     cargo_root=str(self.root),source=str(self.source))
                 bootstrap=_sealed(config)
                 child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--cargo',str(bootstrap),str(client)],
                     pass_fds=(bootstrap,client),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-                output,error=child.communicate(timeout=45)
+                output,error=child.communicate(timeout=max(.001,value['deadline']-time.monotonic()))
                 if child.returncode!=0 or output!=b'ISOLATED\n' or len(error)>8192 or relay.errors:
                     global _CHILD_DIAGNOSTIC
                     _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
@@ -757,19 +895,26 @@ class _CargoProbe:
                 if bootstrap is not None:os.close(bootstrap)
             completed=relay.completed[before:]
             count=sum(self.units[unit['ordinal']]['mapping']['kind']=='compile' for unit in completed)
-            if count!=(1 if iteration==0 else 0):raise FreshnessHold('input_census_unknown')
+            if count!=(3 if iteration==0 else 0):raise FreshnessHold('input_census_unknown')
+            scripts=sum(self.units[unit['ordinal']]['mapping']['kind']=='build_script' for unit in completed)
+            if scripts!=(1 if iteration==0 else 0):raise FreshnessHold('input_census_unknown')
+            script_counts.append(scripts)
             if sum(self.units[unit['ordinal']]['mapping']['kind']=='application' for unit in completed)!=1:
                 raise FreshnessHold('invalidation_unsafe')
             counts.append(count)
             metadata=self.target/'debug/.fingerprint'
             current=unit_views.inventory(metadata,owner=1001,sealed=False)
-            if (metadata/'unit-forged').exists() or fingerprint is not None and current!=fingerprint:
+            if ((metadata/'unit-forged').exists() or (metadata/'build-script-forged').exists()
+                    or fingerprint is not None and current!=fingerprint):
                 raise FreshnessHold('invalidation_unsafe')
             fingerprint=current
-        if (self.published is None or any(not unit['finished'] for unit in self.units.values())
-                or unit_views.inventory(self.published[0],owner=0,sealed=True)!=self.published[1]):
+        if (set(self.publications)!={'build-script','generated','library','binary'} or not self.library_used
+                or not self.generated_stats or any(not unit['finished'] for unit in self.units.values())
+                or any(unit_views.inventory(pub['root'],owner=0,sealed=True)!=pub['manifest'] for pub in self.publications.values())
+                or any(self._stat(path)!=before for path,before in self.generated_stats.items())):
             raise FreshnessHold('cleanup_uncertain')
-        self.report={'version':1,'compiler_calls':counts,'application_runs':2,
+        self.report={'version':1,'compiler_calls':counts,'build_script_calls':script_counts,'application_runs':2,
+            'generated_tree_preserved':True,'library_input_mounted':True,
             'actual_metadata_preserved':True,'sealed_artifact_detached':True,
             'units':relay.completed[first:],'allocation_removed':False,
             'trusted_input_closure':False,'shipping_authority':False}
@@ -1059,13 +1204,16 @@ def validate_filesystem_probe(value):
 
 def validate_cargo_probe(value):
     keys={'version','compiler_calls','application_runs','actual_metadata_preserved','sealed_artifact_detached',
-        'units','allocation_removed','trusted_input_closure','shipping_authority'}
+        'units','allocation_removed','trusted_input_closure','shipping_authority','build_script_calls',
+        'generated_tree_preserved','library_input_mounted'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
-            or value['compiler_calls']!=[1,0] or any(type(count) is not int for count in value['compiler_calls'])
+            or value['compiler_calls']!=[3,0] or any(type(count) is not int for count in value['compiler_calls'])
+            or value['build_script_calls']!=[1,0] or any(type(count) is not int for count in value['build_script_calls'])
             or type(value['application_runs']) is not int or value['application_runs']!=2
-            or any(value[key] is not True for key in ('actual_metadata_preserved','sealed_artifact_detached','allocation_removed'))
+            or any(value[key] is not True for key in ('actual_metadata_preserved','sealed_artifact_detached',
+                'allocation_removed','generated_tree_preserved','library_input_mounted'))
             or value['trusted_input_closure'] is not False or value['shipping_authority'] is not False
-            or type(value['units']) is not list or not 3<=len(value['units'])<=32):
+            or type(value['units']) is not list or not 6<=len(value['units'])<=32):
         raise FreshnessHold('input_census_unknown')
     for ordinal,unit in enumerate(value['units'],start=5):
         if (type(unit) is not dict or set(unit)!={'ordinal','uid','started','cancelled','returncode',
