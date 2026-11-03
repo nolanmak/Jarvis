@@ -11,6 +11,8 @@ import uuid
 import copy
 import hashlib
 import json
+import socket
+import array
 
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('planner_protocol',ROOT/'ci-cargo-planner.py')
@@ -133,6 +135,39 @@ exec(compile(module.guarded_probe(module._PLANNER_PROBE),'fixed-planner-probe','
             'stage':'planner_tool_credentials','category':'Unavailable','errno':None}})
         self.assertNotIn(private.encode(),result.stdout+result.stderr)
         self.assertEqual(planner.diagnostic({'stage':'planner_unit_exec','category':'TimeoutExpired'})['category'],'TimeoutExpired')
+
+    def test_original_control_socket_eof_with_cloexec_flag_is_normal_completion(self):
+        receiver,sender=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
+        try:
+            original=os.pidfd_open(os.getpid())
+            try:planner._control(sender,1,os.getpid(),original)
+            finally:os.close(original)
+            stage,pid,received=planner.receive_control(receiver)
+            try:
+                self.assertEqual((stage,pid),(1,os.getpid()))
+                self.assertEqual(len(received),1)
+                self.assertTrue(fcntl.fcntl(received[0],fcntl.F_GETFD)&fcntl.FD_CLOEXEC)
+            finally:planner.legacy._close(received)
+            planner._control(sender,2);planner._control(sender,3,os.getpid());sender.close()
+            self.assertEqual(planner.receive_control(receiver),(2,0,[]))
+            self.assertEqual(planner.receive_control(receiver),(3,os.getpid(),[]))
+            self.assertIsNone(planner.receive_control(receiver))
+        finally:receiver.close();sender.close()
+
+    def test_malformed_control_frames_release_received_capabilities(self):
+        original=os.pidfd_open(os.getpid())
+        try:
+            for frame in (b'',b'short',planner.legacy.RESPONSE.pack(b'JARVCTL3',99,0),
+                    planner.legacy.RESPONSE.pack(b'JARVCTL2',1,0),planner.legacy.RESPONSE.pack(b'JARVCTL3',1,0)+b'extra'):
+                with self.subTest(frame=frame):
+                    receiver,sender=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET|socket.SOCK_CLOEXEC)
+                    try:
+                        sender.sendmsg([frame],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[original]))])
+                        before=set(os.listdir('/proc/self/fd'))
+                        with self.assertRaises(ValueError):planner.receive_control(receiver)
+                        self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+                    finally:receiver.close();sender.close()
+        finally:os.close(original)
 
     def test_staging_and_actual_exec_are_distinct_versioned_events(self):
         self.assertNotEqual(planner.event('staging_ready',0),planner.event('tool_started',0))

@@ -257,7 +257,7 @@ cannot be selected by the ordinary CLI or worker environment. Its controller
 scope executes only a measured fixed probe with a minimal root environment;
 ordinary WorkerScope still refuses UID 0. It tests large raw stdin, actual
 jobserver capabilities, planner-file/socket access denial, closed control FDs,
-and cancellation through the native V3 client. Six host framing/refusal and
+and cancellation through the native V3 client. Eleven host framing/refusal, original-control and
 fixture-control tests pass; actual guest credentials and end-to-end transport
 are not yet verified.
 The first attempted replay at `2e9d1db3` stopped at the host request schema: the
@@ -270,7 +270,14 @@ that transport. The fixed probe also had an unconditional parent exit before
 stdin streaming. A real fork/exec/pipe fixture test reproduced exit 127 for
 ordinary stdin and jobserver modes and passes after correcting the child-only
 exit. The host test stubs root-only setup and unit policy assertions; it does
-not establish guest isolation. A rebuilt real guest replay is still required.
+not establish guest isolation. Further guest replays reached the original
+kernel exec event, then failed during completion. Bounded diagnostics reproduced
+a concrete root control decoder defect: Linux returns MSG_CMSG_CLOEXEC on clean
+SOCK_SEQPACKET EOF. The old decoder rejected that EOF as an incomplete frame.
+A real socket/pidfd regression fails on the original behavior and passes after
+ignoring only that flag for empty EOF. Foreign, short, unknown-stage and truncated
+frames still refuse, and their received capabilities are closed. The corrected
+real guest replay is still required.
 The probe does not run arbitrary protected Cargo, freeze unit namespaces, seal
 reusable outputs, establish a complete input collector or create a CI proof.
 Those activation blockers, including race/cancellation and nested-builder

@@ -166,6 +166,23 @@ def _control(endpoint,stage,value=0,descriptor=None):
     endpoint.sendmsg([data],rights)
 
 
+def receive_control(endpoint):
+    frame,extra,flags,_=endpoint.recvmsg(16,socket.CMSG_SPACE(4),socket.MSG_CMSG_CLOEXEC)
+    received=[]
+    try:
+        for level,kind,body in extra:
+            if level!=socket.SOL_SOCKET or kind!=socket.SCM_RIGHTS or len(body)%4:
+                raise ValueError('invalid original control frame')
+            values=array.array('i');values.frombytes(body);received.extend(values)
+        if not frame and not extra and not flags&~socket.MSG_CMSG_CLOEXEC:return None
+        if len(frame)!=16 or flags&~socket.MSG_CMSG_CLOEXEC or len(received)>1:
+            raise ValueError('incomplete original control frame')
+        magic,stage,child_pid=legacy.RESPONSE.unpack(frame)
+        if magic!=b'JARVCTL3' or stage not in (1,2,3):raise ValueError('foreign original control frame')
+        return stage,child_pid,received
+    except BaseException:legacy._close(received);raise
+
+
 class RootRelay:
     def __init__(self,admission,*,library,timeout=30):
         if (os.geteuid()!=0 or type(admission) is not _Admission or admission.token is not _TOKEN
@@ -281,18 +298,11 @@ class RootRelay:
                             try:signal.pidfd_send_signal(pidfd,number)
                             except ProcessLookupError:pass
                 if control in readers:
-                    frame,extra,flags,_=control.recvmsg(16,socket.CMSG_SPACE(4),socket.MSG_CMSG_CLOEXEC)
-                    received=[]
-                    for level,kind,body in extra:
-                        if level!=socket.SOL_SOCKET or kind!=socket.SCM_RIGHTS:raise ValueError('invalid original control frame')
-                        values=array.array('i');values.frombytes(body[:len(body)-len(body)%4]);received.extend(values)
-                    if not frame and not extra and not flags:
+                    message=receive_control(control)
+                    if message is None:
                         control_eof=True
                         continue
-                    if len(frame)!=16 or flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC):
-                        legacy._close(received);raise ValueError('incomplete original control frame')
-                    magic,stage,child_pid=legacy.RESPONSE.unpack(frame)
-                    if magic!=b'JARVCTL3':legacy._close(received);raise ValueError('foreign original control frame')
+                    stage,child_pid,received=message
                     if stage==1 and not ready and len(received)==1 and child_pid>0:
                         pidfd=received.pop();signal.pidfd_send_signal(pidfd,0)
                         info=Path(f'/proc/self/fdinfo/{pidfd}').read_text().splitlines()
