@@ -42,7 +42,10 @@ async fn live_shared_ci_planner_protocol_v3()->Result<()> {
         && probe["cases"][2]["cancelled_before_exec"]==true
         && probe["cases"][3]["uid"]==2003 && probe["cases"][3]["signal_forwarded"]==10
         && probe["cases"][3]["proxy_signal"]==10 && probe["units"][3]["returncode"]==-10
-        && probe["units"][3]["started"]==true && probe["shipping_authority"]==false,
+        && probe["units"][3]["started"]==true && probe["cases"][4]["uid"]==2004
+        && probe["cases"][4]["filesystem"]["input_stable"]==true
+        && probe["filesystem"]["input_inode_metadata_preserved"]==true
+        && probe["filesystem"]["allocation_removed"]==true && probe["shipping_authority"]==false,
         "V3 probe did not establish original credential/cancellation observations");
     audit.protected_health()?;
     std::fs::write(evidence.join("receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({

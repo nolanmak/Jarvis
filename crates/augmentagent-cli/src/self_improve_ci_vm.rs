@@ -12,10 +12,11 @@ const WORKER_SCOPE: &[u8] = include_bytes!("../../../scripts/ci-worker-scope.py"
 const INPUT_MANIFEST: &[u8] = include_bytes!("../../../scripts/ci-input-manifest.py");
 const CACHE_GENERATION: &[u8] = include_bytes!("../../../scripts/ci-cache-generation.py");
 const RUNTIME_IDENTITY:&[u8]=include_bytes!("../../../scripts/ci-runtime-identity.py");
-const PLANNER_PROGRAMS:[(&str,&[u8]);4]=[
+const PLANNER_PROGRAMS:[(&str,&[u8]);5]=[
     ("ci-cargo-planner.py",include_bytes!("../../../scripts/ci-cargo-planner.py")),
     ("ci-cargo-relay.py",include_bytes!("../../../scripts/ci-cargo-relay.py")),
     ("ci-cargo-staging.py",include_bytes!("../../../scripts/ci-cargo-staging.py")),
+    ("ci-cargo-views.py",include_bytes!("../../../scripts/ci-cargo-views.py")),
     ("ci-cargo-planner.so",include_bytes!(concat!(env!("OUT_DIR"),"/libci_cargo_planner.so"))),
 ];
 const DEPENDENCY_PROGRAMS:[(&str,&[u8]);7]=[
@@ -372,7 +373,7 @@ impl Outcome {
                 .expect("bounded freshness protocol serializes");
         }
         if let Some(value)=&self.guest_diagnostic {
-            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_signal"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup"|"planner_tool_credentials"|"planner_tool_metadata"|"planner_tool_socket"|"planner_tool_jobserver"|"planner_tool_fds"|"planner_tool_environment"|"planner_tool_stdin")).unwrap_or("unknown");
+            let stage=value["stage"].as_str().filter(|value|matches!(*value,"load_dependency_controller"|"reclaim_producers"|"prepare_producer"|"bind_producer_cache"|"hide_producer_cache"|"resolve_dependencies"|"freeze_resolution"|"compile_dependencies"|"record_producer"|"publish_dependencies"|"prepare_generation"|"execute_command"|"reclaim_seeds"|"planner_protocol_probe"|"planner_startup"|"planner_unit"|"planner_capture"|"planner_authorize"|"planner_drop"|"planner_arm_exec"|"planner_unit_exec"|"planner_client_start"|"planner_client_exec"|"planner_probe_stdin"|"planner_probe_jobserver"|"planner_probe_cancel"|"planner_probe_signal"|"planner_probe_supervisor"|"planner_probe_credentials"|"planner_probe_filter"|"planner_probe_exec_start"|"planner_probe_stream"|"planner_probe_wait"|"planner_probe_status"|"planner_request_receive"|"planner_request_cleanup"|"planner_tool_credentials"|"planner_tool_metadata"|"planner_tool_socket"|"planner_tool_jobserver"|"planner_tool_fds"|"planner_tool_environment"|"planner_tool_stdin"|"planner_probe_view"|"planner_tool_view"|"planner_view_prepare"|"planner_view_enter"|"planner_view_namespace"|"planner_view_runtime"|"planner_view_source"|"planner_view_inputs"|"planner_view_proc"|"planner_view_devices"|"planner_view_root"|"planner_view_publish")).unwrap_or("unknown");
             let category=value["category"].as_str().filter(|value|matches!(*value,"OSError"|"PermissionError"|"FileNotFoundError"|"FileExistsError"|"NotADirectoryError"|"IsADirectoryError"|"CalledProcessError"|"RuntimeError"|"TimeoutExpired"|"FreshnessHold"|"Unavailable"|"ValueError"|"KeyError"|"ModuleNotFoundError"|"ImportError")).unwrap_or("unknown");
             diagnostic["guest"]=serde_json::json!({"stage":stage,"category":category,
                 "errno":value["errno"].as_i64().filter(|value|(0..=4096).contains(value))});
@@ -1225,7 +1226,8 @@ mod tests {
             "planner_probe_supervisor","planner_probe_signal","planner_probe_credentials","planner_probe_filter","planner_probe_exec_start",
             "planner_probe_stream","planner_probe_wait","planner_probe_status","planner_request_receive",
             "planner_request_cleanup","planner_tool_credentials","planner_tool_metadata","planner_tool_socket",
-            "planner_tool_jobserver","planner_tool_fds","planner_tool_environment","planner_tool_stdin"] {
+            "planner_tool_jobserver","planner_tool_fds","planner_tool_environment","planner_tool_stdin",
+            "planner_probe_view","planner_tool_view","planner_view_prepare","planner_view_enter","planner_view_namespace","planner_view_runtime","planner_view_source","planner_view_inputs","planner_view_proc","planner_view_devices","planner_view_root","planner_view_publish"] {
             let outcome:Outcome=serde_json::from_value(serde_json::json!({"version":1,"boundary":"existing-build-vm",
                 "status":"prerequisite_hold","stage":"vm_launch","category":"Unavailable",
                 "guest_diagnostic":{"stage":stage,"category":"OSError","errno":71,"private":"owner contents"}})).unwrap();

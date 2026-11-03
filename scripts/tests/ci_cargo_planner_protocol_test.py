@@ -31,10 +31,20 @@ class PlannerProtocolTests(unittest.TestCase):
         cases.append({'uid':2003,'stdin_sha256':hashlib.sha256(b'\xffstdin'*200000).hexdigest(),
             'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':False,
             'signal_forwarded':10,'proxy_signal':10})
+        filesystem_case={'input_stable':True,'input_metadata_stable':True,'source_read_only':True,
+            'abstract_socket_isolated':True,'private_temp':True,'metadata_hidden':True,'output_written':True}
+        cases.append({'uid':2004,'stdin_sha256':hashlib.sha256(b'\xffstdin'*200000).hexdigest(),
+            'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':False,
+            'filesystem':filesystem_case})
+        filesystem={'version':1,'input_bytes_preserved':True,'input_inode_metadata_preserved':True,
+            'next_publication_distinct':True,'namespaces':{name:{'controller':name+':[1]','unit':name+':[2]'}
+                for name in ('mnt','ipc','net')},'outputs':[['2e','directory',0o555],
+                [b'unit-output'.hex(),'file',0o444,14,hashlib.sha256(b'sealed result\n').hexdigest()]],
+            'original_unit_cleanup':True,'allocation_removed':True,'shipping_authority':False}
         units=[{'ordinal':i,'uid':2000+i,'started':i!=2,'cancelled':i==2,'returncode':(-9 if i==2 else -10 if i==3 else 0),
-            'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(4)]
+            'original_cleanup':True,'input_closure_complete':False,'shipping_authority':False} for i in range(5)]
         value={'version':3,'kind':'ci-planner-protocol-probe','binding':binding,'command':command,
-            'cases':cases,'units':units,'guest_worker_quiescence':scopes[2],
+            'cases':cases,'units':units,'filesystem':filesystem,'guest_worker_quiescence':scopes[2],
             'input_closure_complete':False,'cargo_metadata_isolation_established':False,'shipping_authority':False}
         return value,binding,command,workers,writer,source
 
@@ -43,7 +53,8 @@ class PlannerProtocolTests(unittest.TestCase):
         self.assertEqual(planner.validate_probe(original,binding,command,workers,writer,source),original)
         for fault in ('version','binding','command','scope','writer','source','role','cancelled-start',
                 'cleanup','case-role','control-fds','jobserver','closure','authority','unknown',
-                'signal-status','signal-proxy','signal-number','signal-not-started'):
+                'signal-status','signal-proxy','signal-number','signal-not-started','filesystem-namespace',
+                'filesystem-output','filesystem-cleanup','filesystem-removed','filesystem-authority','filesystem-case'):
             value=copy.deepcopy(original)
             if fault=='version':value['version']=True
             elif fault=='binding':value['binding']={}
@@ -64,6 +75,12 @@ class PlannerProtocolTests(unittest.TestCase):
             elif fault=='signal-proxy':value['cases'][3]['proxy_signal']=15
             elif fault=='signal-number':value['cases'][3]['signal_forwarded']=15
             elif fault=='signal-not-started':value['units'][3]['started']=False
+            elif fault=='filesystem-namespace':value['filesystem']['namespaces']['mnt']['unit']='mnt:[1]'
+            elif fault=='filesystem-output':value['filesystem']['outputs'][1][-1]='0'*64
+            elif fault=='filesystem-cleanup':value['filesystem']['original_unit_cleanup']=False
+            elif fault=='filesystem-removed':value['filesystem']['allocation_removed']=False
+            elif fault=='filesystem-authority':value['filesystem']['shipping_authority']=True
+            elif fault=='filesystem-case':value['cases'][4]['filesystem']['input_stable']=False
             with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
                 planner.validate_probe(value,binding,command,workers,writer,source)
 

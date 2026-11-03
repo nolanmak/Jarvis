@@ -147,6 +147,66 @@ generated inputs or enable protected Cargo execution or passing-CI publication.
    This is a proposal for the new authority, not a change to current daemon
    settings or permission to delete the existing image's incremental directories.
 
+7. **Use a separate root and mount/IPC/network namespaces for every unit.**
+   Keep stable `/workspace` and target paths, but bind the sealed self-contained
+   source view and only the unit's selected artifacts into that root. Runtime
+   and toolchain mounts are read-only. Temporary files, Cargo scratch, home,
+   shared memory and `/var/tmp` are private to that unit. Unique credentials,
+   restricted process visibility and private IPC/network namespaces prevent
+   another producer retaining writable output capabilities through shared
+   sockets or shared memory. Socket stdio is refused; verified jobserver pipes
+   remain explicit transport. Original supervision stays outside the new root.
+
+8. **Mount immutable artifact files without making hard links.** Materialize a
+   private directory namespace with read-only per-file mounts from controller
+   publications. Hard links change link count and ctime, and reads can change
+   atime: those are observable inputs even when bytes stay identical. The host
+   regression reproduces those changes; input inventory reads and unit mounts
+   now use no-atime semantics. New publications get new immutable inodes and
+   index entries. Keep an old publication unchanged and linked until every
+   original consumer scope is stopped, not merely until its producer stops.
+   Unknown consumer ownership blocks retirement. Directory namespaces are
+   private, so a later publication cannot introduce a missing candidate into
+   an already running unit's view.
+
+9. **Copy stopped outputs into new controller-owned inodes before publication.**
+   After the original unit cleanup is verified, copy only the controller's
+   planned output paths into a private preparing publication; reject symlinks,
+   external hard links, changed files and unsupported entries. Preserve exact
+   bytes and executable mode, seal the copy, sync files/directories, rename the
+   preparing publication and sync its parent before committing its root-owned
+   record. A writer's old inode never becomes the published inode. Interrupted
+   copies stay uncommitted; resource exhaustion remains a prerequisite under
+   the existing image budget. The logical root/output allocations remain in
+   the original managed target, including their preparation records.
+
+### Filesystem feasibility and remaining mapping work
+
+The private fixed guest probe now has an unactivated fifth unit for this
+filesystem candidate. It observes the actual original child's distinct mount,
+IPC and network namespaces at the kernel exec stop. The tool reads a generated
+input while the root controller publishes a different version, then must read
+the original bytes and unchanged inode metadata. It also attempts tracked-source
+and generated-input writes, a foreign abstract socket, a supervisor-root lookup,
+and a private temporary write. After original unit teardown, the controller
+copies and seals its one declared output, verifies both inventories and removes
+only the original completed probe allocation. Its first real VM result is still
+pending. Eight host filesystem tests and strict receipt validation are mechanics
+evidence; neither is a trusted input closure or a reusable producer proof.
+
+The prototype uses only a pinned literal artifact and output slot. The actual
+Cargo mapper still must resolve each invocation's artifact inputs, output slots,
+fingerprints, generated namespaces and exact configuration. It must reserve
+fresh writable output slots rather than overwrite a mounted input, and define
+self-read build-script outputs from a stable initial view. Unsupported symlinks
+and namespace entries currently refuse; repository-required forms need their
+own validated policy and behavioral evidence before activation. The private
+empty `/cargo` in this fixture does not authorize nested Cargo with unprotected
+metadata. Nested builders still require the protected planner and a proven
+snapshot/barrier for inputs from an active parent; the existing open thread
+remains blocking. Complete collector, sealed stdout/stderr, final unit retention,
+original-consumer release recovery and final C proof/API mapping remain absent.
+
 ## Complete replay outcomes and identity bytes
 
 A reusable success contains the entire sealed outcome consumed by Cargo:

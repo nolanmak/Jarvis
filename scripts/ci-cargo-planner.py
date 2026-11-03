@@ -15,6 +15,7 @@ import hmac
 import importlib.util
 import json
 import math
+import re
 import os
 from pathlib import Path
 import select
@@ -35,6 +36,9 @@ def _load(name,file):
 legacy=_load('planner_wire','ci-cargo-relay.py')
 staging=_load('planner_stdin','ci-cargo-staging.py')
 cache=_load('planner_cache','ci-cache-generation.py')
+unit_views=_load('planner_views','ci-cargo-views.py')
+unit_views.FreshnessHold=cache.FreshnessHold
+import shutil
 FreshnessHold=cache.FreshnessHold
 STAGES={'staging_ready':1,'tool_started':2,'finished':3,'error':4,'signaled':5}
 _TOKEN=object()
@@ -46,8 +50,8 @@ def diagnostic(value):
     phases={'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
         'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
         'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin'}
-    categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','Unavailable'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish'}
+    categories={'OSError','ValueError','KeyError','FreshnessHold','StagingUnavailable','RuntimeError','TimeoutExpired','CalledProcessError','Unavailable'}
     value=value if type(value) is dict else {}
     return {'stage':value.get('stage') if value.get('stage') in phases else 'planner_startup',
         'category':value.get('category') if value.get('category') in categories else 'Unavailable',
@@ -195,7 +199,7 @@ class RootRelay:
                 or info.st_mode&0o022 or info.st_nlink!=1 or not 1<=info.st_size<=2*1024**2):raise FreshnessHold('authority_changed')
         self.timeout=timeout;self.path=self.root/'relay.sock';self.nonce=os.urandom(32)
         if len(os.fsencode(self.path))>=108:raise FreshnessHold('invalidation_unsafe')
-        self.completed=[];self.errors=[];self._stop=threading.Event();self._slots=threading.BoundedSemaphore(4)
+        self.views=None;self.completed=[];self.errors=[];self._stop=threading.Event();self._slots=threading.BoundedSemaphore(4)
         self._threads=[];self._requests=0;self._children=set();self._lock=threading.Lock()
 
     def __enter__(self):
@@ -246,6 +250,7 @@ class RootRelay:
                 or len(descriptors)!=count+1 or numbers[:3]!=[0,1,2] or any(numbers[count:])
                 or len(set(numbers[:count]))!=count or any(not 3<=number<=65535 for number in numbers[3:count])):
             raise FreshnessHold('metadata_torn')
+        unit_views.validate_stdio(descriptors[1:4])
         _,_,environment,*_=payload(descriptors[0])
         staging.normalize_jobserver(environment,dict(zip(numbers[3:count],descriptors[4:])))
         return numbers[:count]
@@ -272,6 +277,9 @@ class RootRelay:
             'binding':self.admission.binding,'command':self.admission.command,'directory':str(directory),
             'ordinal':ordinal,'deadline':deadline,'library':str(self.library),'numbers':numbers,
             'extras':descriptors[4:]}
+        if self.views is not None:phase[0]='planner_view_prepare'
+        view=self.views.prepare(ordinal) if self.views is not None else None
+        if view is not None:value['view']=view
         bootstrap=_sealed(value);child=None;pidfd=None;cancelled=False;ready=False;sealed=False;authorized=False;started=False
         signal_count=0;cancelled_at=None;control_eof=False;original_pid=None
         try:
@@ -330,6 +338,7 @@ class RootRelay:
                     if not select.select([connection],[],[],0)[0]:os.write(grant,b'go\n');authorized=True
                 if cancelled and child.poll() is None and cancelled_at is None:
                     os.write(stop,b'cancel');child.terminate();cancelled_at=time.monotonic()
+                if view is not None and started:self.views.running(view)
                 status=child.poll()
                 if status is not None:break
                 if cancelled_at is not None and time.monotonic()-cancelled_at>5:
@@ -345,6 +354,8 @@ class RootRelay:
                     or not -64<=record['returncode']<=255):raise FreshnessHold('cleanup_uncertain')
             raw=record['returncode']
             if status!=(raw if raw>=0 else 128-raw):raise FreshnessHold('cleanup_uncertain')
+            if view is not None:
+                phase[0]='planner_view_publish';self.views.finish(view,directory,raw)
             self.completed.append({'ordinal':ordinal,'uid':2000+ordinal,'started':started,
                 'cancelled':cancelled,'returncode':raw,'original_cleanup':True,
                 'input_closure_complete':False,'shipping_authority':False})
@@ -382,6 +393,12 @@ def _unit(arguments):
         for label in ('Uid:','Gid:'):
             row=next(line for line in status.splitlines() if line.startswith(label))
             if [int(number) for number in row.split()[1:]]!=[expected]*4:raise FreshnessHold('invalidation_unsafe')
+        if 'view' in value:
+            namespaces={name:{'controller':os.readlink('/proc/self/ns/'+name),
+                'unit':os.readlink(f'/proc/{child.pid}/ns/'+name)} for name in ('mnt','ipc','net')}
+            if any(row['controller']==row['unit'] for row in namespaces.values()):raise FreshnessHold('invalidation_unsafe')
+            cache._write_record(Path(value['directory'])/'view-namespace.json',{'version':1,
+                'binding':value['binding'],'command':value['command'],'ordinal':value['ordinal'],'namespaces':namespaces})
         _control(endpoint,3,child.pid);_release(exec_release,cancel,value['deadline']);observed=True
     try:
         forwarded=tuple([stage_bootstrap,data,cancel,release,control,*value['extras']])
@@ -425,6 +442,12 @@ def _stage(arguments):
         libraries=[part for part in environment[b'LD_PRELOAD'].replace(b':',b' ').split() if part!=os.fsencode(value['library'])]
         if libraries:environment[b'LD_PRELOAD']=b' '.join(libraries)
         else:environment.pop(b'LD_PRELOAD')
+    if 'view' in value:
+        _PHASE='planner_view_enter';view=value['view']
+        mounts=cache._read_record(Path(view['mounts']),max_bytes=16*1024**2)
+        if (mounts.get('binding')!=value['binding'] or mounts.get('command')!=value['command']
+                or mounts.get('ordinal')!=value['ordinal']):raise FreshnessHold('generation_mismatch')
+        unit_views.enter(view['root'],2000+value['ordinal'],view['source'],view['artifacts'],mounts['entries'])
     libc=ctypes.CDLL(None,use_errno=True)
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     _PHASE='planner_drop'
@@ -449,20 +472,113 @@ def _stage(arguments):
     raise OSError(errno.EACCES if denied else errno.ENOENT,'unit exec unavailable')
 
 
+class _ViewProbe:
+    """Fixed native filesystem experiment, never a reusable producer record."""
+    def __init__(self,admission):
+        if (type(admission) is not _Admission or admission.token is not _TOKEN or admission.owner!=os.getpid()
+                or os.getresuid()!=(0,0,0)):raise FreshnessHold('invalidation_unsafe')
+        _source(admission.target,admission.binding,admission.command)
+        self.admission=admission;self.owner=os.getpid();self.advanced=False;self.receipt=None
+        self.root=admission.target/('.unit-view-probe-'+str(uuid.uuid4()));self.root.mkdir(mode=0o700)
+        self.control={'version':1,'kind':'private-unit-view-probe','binding':admission.binding,
+            'command':admission.command,'shipping_authority':False}
+        cache._write_record(self.root/'control.json',{**self.control,'state':'preparing'})
+        self.source=admission.target.parent/'source-projection'
+        projected=cache._projection_manifest(cache._read_record(admission.target.parent/'source-projection.json',
+            max_bytes=16*1024**2),admission.binding)
+        if projected['state']!='sealed' or cache._projection_inventory(self.source,sealed=True)!=projected['entries']:
+            raise FreshnessHold('input_census_unknown')
+        self.inputs=self.root/'inputs-v1';self._inputs(self.inputs,b'OLD')
+        self.before=unit_views.inventory(self.inputs,owner=0,sealed=True)
+        self.input_stat=(self.inputs/'deps/input').stat()
+        self.abstract=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM|socket.SOCK_CLOEXEC)
+        self.abstract.bind(b'\0jarvis-unit-view-probe');self.abstract.listen(1)
+        if Path('/tmp/ci-unit-probe-private-marker').exists():raise FreshnessHold('invalidation_unsafe')
+
+    @staticmethod
+    def _inputs(root,data):
+        root.mkdir(mode=0o700);(root/'deps').mkdir(mode=0o700)
+        (root/'deps/input').write_bytes(data);(root/'deps/input').chmod(0o444)
+        (root/'deps').chmod(0o555);root.chmod(0o555)
+
+    def prepare(self,ordinal):
+        if self.owner!=os.getpid() or ordinal!=4:raise FreshnessHold('invalidation_unsafe')
+        self.slot=self.root/'unit';self.slot.mkdir(mode=0o700)
+        artifacts=self.slot/'artifacts'
+        entries=unit_views.clone_inputs(self.inputs,artifacts,self.before,owner=0,unit=2004)
+        root=self.slot/'root';root.mkdir(mode=0o700)
+        manifest=self.slot/'mounts.json'
+        cache._write_record(manifest,{'version':1,'binding':self.admission.binding,
+            'command':self.admission.command,'ordinal':ordinal,'entries':entries})
+        return {'root':str(root),'artifacts':str(artifacts),'source':str(self.source),'mounts':str(manifest),'ordinal':ordinal}
+
+    def running(self,view):
+        if self.advanced:return
+        ready=Path(view['artifacts'])/'ready'
+        if not ready.exists() and not ready.is_symlink():return
+        if unit_views._read(ready,2004,False)[1:]!=(6,hashlib.sha256(b'ready\n').hexdigest()):
+            raise FreshnessHold('input_census_unknown')
+        self.next=self.root/'inputs-v2';self._inputs(self.next,b'NEW')
+        self.after=unit_views.inventory(self.next,owner=0,sealed=True)
+        descriptor=os.open(Path(view['artifacts'])/'ack',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o444)
+        try:
+            if os.write(descriptor,b'published\n')!=10:raise OSError(errno.EIO,'probe acknowledgement failed')
+            os.fsync(descriptor)
+        finally:os.close(descriptor)
+        self.advanced=True
+
+    def finish(self,view,directory,raw):
+        if not self.advanced or raw!=0:raise FreshnessHold('cleanup_uncertain')
+        observed=cache._read_record(directory/'view-namespace.json')
+        if (observed.get('binding')!=self.admission.binding or observed.get('command')!=self.admission.command
+                or observed.get('ordinal')!=4):raise FreshnessHold('generation_mismatch')
+        namespaces=observed['namespaces']
+        if set(namespaces)!={'mnt','ipc','net'} or any(row['controller']==row['unit'] for row in namespaces.values()):
+            raise FreshnessHold('invalidation_unsafe')
+        now=(self.inputs/'deps/input').stat();before=self.input_stat
+        if (unit_views.inventory(self.inputs,owner=0,sealed=True)!=self.before
+                or (now.st_ino,now.st_nlink,now.st_mtime_ns,now.st_ctime_ns,now.st_atime_ns)!=
+                    (before.st_ino,before.st_nlink,before.st_mtime_ns,before.st_ctime_ns,before.st_atime_ns)):
+            raise FreshnessHold('input_census_unknown')
+        if Path('/tmp/ci-unit-probe-private-marker').exists():raise FreshnessHold('invalidation_unsafe')
+        staged=self.root/'publication-preparing'
+        output=unit_views.copy_outputs(Path(view['artifacts']),staged,['unit-output'],owner=2004,controller=0)
+        staged.rename(self.root/'published')
+        descriptor=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+        cache._write_record(self.root/'control.json',{**self.control,'state':'sealed','outputs':output})
+        self.receipt={'version':1,'input_bytes_preserved':True,'input_inode_metadata_preserved':True,
+            'next_publication_distinct':self.before!=self.after,'namespaces':namespaces,'outputs':output,
+            'original_unit_cleanup':True,'allocation_removed':False,'shipping_authority':False}
+
+    def cleanup(self):
+        if self.owner!=os.getpid() or self.receipt is None:raise FreshnessHold('cleanup_uncertain')
+        _source(self.admission.target,self.admission.binding,self.admission.command)
+        if cache._read_record(self.root/'control.json')!={**self.control,'state':'sealed','outputs':self.receipt['outputs']}:
+            raise FreshnessHold('cleanup_uncertain')
+        self.abstract.close();shutil.rmtree(self.root)
+        descriptor=os.open(self.admission.target,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try:os.fsync(descriptor)
+        finally:os.close(descriptor)
+        self.receipt['allocation_removed']=True
+
+
 _TOOL_PROBE=r'''
 import ctypes,errno,hashlib,json,os,signal,socket,sys
 metadata,socket_path,expected=sys.argv[1:];expected=int(expected)
+is_view=os.environ.get('CI_PLANNER_PROBE_VIEW')=='1'
 _PROBE_PHASE='planner_tool_credentials'
 assert os.getresuid()==(expected,expected,expected) and os.getresgid()==(expected,expected,expected) and os.getgroups()==[]
 assert ctypes.CDLL(None).prctl(39,0,0,0,0)==1
 _PROBE_PHASE='planner_tool_metadata'
 try:open(metadata,'a').write('bad')
-except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM)
+except OSError as error:assert error.errno in ((errno.ENOENT,) if is_view else (errno.EACCES,errno.EPERM))
 else:raise AssertionError('unit wrote planner metadata')
 _PROBE_PHASE='planner_tool_socket'
 with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as endpoint:
  try:endpoint.connect(socket_path)
- except OSError as error:assert error.errno in (errno.EACCES,errno.EPERM)
+ except OSError as error:assert error.errno in ((errno.ENOENT,) if is_view else (errno.EACCES,errno.EPERM))
  else:raise AssertionError('unit reached root planner socket')
 _PROBE_PHASE='planner_tool_jobserver'
 flags=os.environ.get('CARGO_MAKEFLAGS')
@@ -479,8 +595,45 @@ assert sorted(fds)==([0,1,2,3,4] if flags else [0,1,2]),fds
 _PROBE_PHASE='planner_tool_environment'
 assert os.environb[b'RAW']==b'\xffvalue'
 _PROBE_PHASE='planner_tool_stdin'
-print(json.dumps({'uid':expected,'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
- 'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}),flush=True)
+result={'uid':expected,'stdin_sha256':hashlib.sha256(sys.stdin.buffer.read()).hexdigest(),
+ 'metadata_denied':True,'root_socket_denied':True,'control_fds_closed':True,'jobserver':bool(flags)}
+if is_view:
+ _PROBE_PHASE='planner_tool_view'
+ from pathlib import Path
+ import time
+ input=Path('/workspace/target/deps/input')
+ selected=lambda info:(info.st_ino,info.st_nlink,info.st_mode,info.st_size,info.st_mtime_ns,info.st_ctime_ns,info.st_atime_ns)
+ before=selected(input.stat());assert input.read_bytes()==b'OLD'
+ for operation in (lambda:input.open('wb'),lambda:input.unlink()):
+  try:operation()
+  except OSError as error:assert error.errno in (errno.EROFS,errno.EACCES,errno.EPERM,errno.EBUSY)
+  else:raise AssertionError('frozen input changed')
+ source=Path('/workspace/source.txt');assert source.read_bytes()==b'literal immutable protocol fixture\n'
+ try:source.write_bytes(b'wrong source')
+ except OSError as error:assert error.errno in (errno.EROFS,errno.EACCES,errno.EPERM)
+ else:raise AssertionError('tracked source changed')
+ with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as endpoint:
+  try:endpoint.connect(b'\0jarvis-unit-view-probe')
+  except OSError as error:assert error.errno in (errno.ENOENT,errno.ECONNREFUSED)
+  else:raise AssertionError('unit reached foreign abstract socket')
+ try:os.readlink('/proc/'+str(os.getppid())+'/root')
+ except OSError as error:assert error.errno in (errno.ENOENT,errno.EACCES,errno.EPERM)
+ else:raise AssertionError('unit reached root supervisor filesystem')
+ Path('/tmp/ci-unit-probe-private-marker').write_bytes(b'private')
+ Path('/workspace/target/ready-preparing').write_bytes(b'ready\n')
+ Path('/workspace/target/ready-preparing').rename('/workspace/target/ready')
+ deadline=time.monotonic()+10
+ while True:
+  try:ack=Path('/workspace/target/ack').read_bytes()
+  except FileNotFoundError:ack=b''
+  if ack==b'published\n':break
+  assert time.monotonic()<deadline
+  time.sleep(.01)
+ assert input.read_bytes()==b'OLD' and selected(input.stat())==before
+ Path('/workspace/target/unit-output').write_bytes(b'sealed result\n')
+ result['filesystem']={'input_stable':True,'input_metadata_stable':True,'source_read_only':True,
+  'abstract_socket_isolated':True,'private_temp':True,'metadata_hidden':True,'output_written':True}
+print(json.dumps(result),flush=True)
 if os.environ.get('CI_PLANNER_PROBE_SIGNAL')=='1':signal.pause()
 '''
 
@@ -508,6 +661,7 @@ if child==0:
   for fd in jobs:os.set_inheritable(fd,True)
   env=dict(os.environb);env[b'RAW']=b'\xffvalue'
   if mode=='signal':env[b'CI_PLANNER_PROBE_SIGNAL']=b'1'
+  if mode=='view':env[b'CI_PLANNER_PROBE_VIEW']=b'1'
   if jobs:env[b'CARGO_MAKEFLAGS']=('-j --jobserver-fds=%d,%d --jobserver-auth=%d,%d'%(*jobs,*jobs)).encode()
   os.execve(b'/usr/bin/python3',[b'python3',b'-I',b'-c',body.encode(),os.fsencode(metadata),os.fsencode(socket_path),str(expected_uid).encode()],env)
  except BaseException:os._exit(126)
@@ -551,7 +705,7 @@ def _planner(arguments):
     _PHASE='planner_client_start'
     bootstrap,configuration=map(int,arguments)
     value=_bootstrap(bootstrap,'planner');_parent_guard(value['parent'])
-    if value.get('mode') not in ('stdin','jobserver','cancel','signal'):raise FreshnessHold('metadata_torn')
+    if value.get('mode') not in ('stdin','jobserver','cancel','signal','view'):raise FreshnessHold('metadata_torn')
     os.close(bootstrap)
     environment={'PATH':'/usr/bin:/bin','HOME':'/tmp','LD_PRELOAD':value['library'],
         'JARVIS_CARGO_RELAY_FD':str(configuration)}
@@ -568,11 +722,12 @@ def _probe(arguments):
     global _PHASE,_CHILD_DIAGNOSTIC
     value=_bootstrap(int(arguments[0]),'probe');_parent_guard(value['parent'])
     root=Path(value['root']);admission=admit(value['target'],value['binding'],value['command'],root)
-    results=[]
+    results=[];view_probe=None
     with RootRelay(admission,library=value['library'],timeout=30) as relay:
         metadata=root/'planner-metadata';metadata.write_text('');os.chown(metadata,1001,1001);metadata.chmod(0o600)
-        for ordinal,mode in enumerate(('stdin','jobserver','cancel','signal')):
+        for ordinal,mode in enumerate(('stdin','jobserver','cancel','signal','view')):
             _PHASE='planner_probe_'+mode
+            if mode=='view':view_probe=_ViewProbe(admission);relay.views=view_probe
             client=relay.config_fd();child_bootstrap=None;child=None
             try:
                 config=dict(value,kind='planner',parent=os.getpid(),deadline=time.monotonic()+30,
@@ -590,13 +745,14 @@ def _probe(arguments):
                 if child is not None and child.poll() is None:child.kill();child.wait(timeout=5)
                 os.close(client)
                 if child_bootstrap is not None:os.close(child_bootstrap)
-        if len(relay.completed)!=4 or relay.errors:raise FreshnessHold('cleanup_uncertain')
+        if len(relay.completed)!=5 or relay.errors:raise FreshnessHold('cleanup_uncertain')
         for ordinal,completed in enumerate(relay.completed):
             if (completed['ordinal']!=ordinal or completed['uid']!=2000+ordinal
                     or completed['started']!=(ordinal!=2) or completed['cancelled']!=(ordinal==2)
                     or completed['original_cleanup'] is not True):raise FreshnessHold('cleanup_uncertain')
+    view_probe.cleanup()
     print(json.dumps({'version':3,'kind':'ci-planner-protocol-probe','binding':value['binding'],
-        'command':value['command'],'cases':results,'units':relay.completed,
+        'command':value['command'],'cases':results,'units':relay.completed,'filesystem':view_probe.receipt,
         'input_closure_complete':False,'cargo_metadata_isolation_established':False,'shipping_authority':False}))
     return 0
 
@@ -616,14 +772,33 @@ def _probe_supervisor(arguments):
         pass
 
 
+def validate_filesystem_probe(value):
+    keys={'version','input_bytes_preserved','input_inode_metadata_preserved','next_publication_distinct',
+        'namespaces','outputs','original_unit_cleanup','allocation_removed','shipping_authority'}
+    expected_outputs=[['2e','directory',0o555],
+        [b'unit-output'.hex(),'file',0o444,14,hashlib.sha256(b'sealed result\n').hexdigest()]]
+    if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
+            or any(value[key] is not True for key in ('input_bytes_preserved','input_inode_metadata_preserved',
+                'next_publication_distinct','original_unit_cleanup','allocation_removed'))
+            or value['shipping_authority'] is not False or value['outputs']!=expected_outputs
+            or type(value['namespaces']) is not dict or set(value['namespaces'])!={'mnt','ipc','net'}):
+        raise FreshnessHold('input_census_unknown')
+    for name,row in value['namespaces'].items():
+        if (type(row) is not dict or set(row)!={'controller','unit'} or row['controller']==row['unit']
+                or any(type(item) is not str or re.fullmatch(name+r':\[[0-9]{1,20}\]',item) is None for item in row.values())):
+            raise FreshnessHold('input_census_unknown')
+    return value
+
+
 def validate_probe(value,binding,command,workers,writer,source_projection):
-    keys={'version','kind','binding','command','cases','units','guest_worker_quiescence',
+    keys={'version','kind','binding','command','cases','units','guest_worker_quiescence','filesystem',
         'input_closure_complete','cargo_metadata_isolation_established','shipping_authority'}
     if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=3
             or value['kind']!='ci-planner-protocol-probe' or value['binding']!=binding or value['command']!=command
             or value['input_closure_complete'] is not False or value['cargo_metadata_isolation_established'] is not False
-            or value['shipping_authority'] is not False or type(value['cases']) is not list or len(value['cases'])!=4
-            or type(value['units']) is not list or len(value['units'])!=4):raise FreshnessHold('input_census_unknown')
+            or value['shipping_authority'] is not False or type(value['cases']) is not list or len(value['cases'])!=5
+            or type(value['units']) is not list or len(value['units'])!=5):raise FreshnessHold('input_census_unknown')
+    validate_filesystem_probe(value['filesystem'])
     scope=value['guest_worker_quiescence']
     if (scope not in workers['scopes'] or scope==writer['guest_worker_quiescence']
             or any(scope==item['scope'] for item in source_projection['access'])):raise FreshnessHold('cleanup_uncertain')
@@ -643,12 +818,18 @@ def validate_probe(value,binding,command,workers,writer,source_projection):
         else:
             case_keys={'uid','stdin_sha256','metadata_denied','root_socket_denied','control_fds_closed','jobserver'}
             if ordinal==3:case_keys|={'signal_forwarded','proxy_signal'}
+            if ordinal==4:case_keys|={'filesystem'}
             if (type(case) is not dict or set(case)!=case_keys or type(case['uid']) is not int or case['uid']!=2000+ordinal
                     or case['stdin_sha256']!=expected or case['metadata_denied'] is not True
                     or case['root_socket_denied'] is not True or case['control_fds_closed'] is not True
                     or case['jobserver'] is not (ordinal==1)
                     or (ordinal==3 and (case['signal_forwarded']!=10 or case['proxy_signal']!=10))):
                 raise FreshnessHold('input_census_unknown')
+            if ordinal==4:
+                flags=case['filesystem'];expected_flags={'input_stable','input_metadata_stable','source_read_only',
+                    'abstract_socket_isolated','private_temp','metadata_hidden','output_written'}
+                if type(flags) is not dict or set(flags)!=expected_flags or any(item is not True for item in flags.values()):
+                    raise FreshnessHold('input_census_unknown')
     return value
 
 
@@ -663,6 +844,6 @@ if __name__=='__main__':
         else:raise FreshnessHold('invalidation_unsafe')
     except BaseException as error:
         print(json.dumps({'planner_diagnostic':_CHILD_DIAGNOSTIC or diagnostic({
-            'stage':_PHASE,'category':type(error).__name__,'errno':getattr(error,'errno',None)})}),file=sys.stderr)
+            'stage':getattr(error,'unit_view_stage',_PHASE),'category':type(error).__name__,'errno':getattr(error,'errno',None)})}),file=sys.stderr)
         result=125
     raise SystemExit(result)

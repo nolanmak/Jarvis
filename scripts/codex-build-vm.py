@@ -45,7 +45,7 @@ def guest_diagnostic(value):
             'planner_startup','planner_unit','planner_capture','planner_authorize','planner_drop',
             'planner_arm_exec','planner_unit_exec','planner_client_start','planner_client_exec',
             'planner_probe_stdin','planner_probe_jobserver','planner_probe_cancel','planner_probe_signal','planner_probe_supervisor',
-        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin'}
+        'planner_probe_credentials','planner_probe_filter','planner_probe_exec_start','planner_probe_stream','planner_probe_wait','planner_probe_status','planner_request_receive','planner_request_cleanup','planner_tool_credentials','planner_tool_metadata','planner_tool_socket','planner_tool_jobserver','planner_tool_fds','planner_tool_environment','planner_tool_stdin','planner_probe_view','planner_tool_view','planner_view_prepare','planner_view_enter','planner_view_namespace','planner_view_runtime','planner_view_source','planner_view_inputs','planner_view_proc','planner_view_devices','planner_view_root','planner_view_publish'}
     categories={'OSError','PermissionError','FileNotFoundError','FileExistsError','NotADirectoryError',
                 'IsADirectoryError','CalledProcessError','RuntimeError','TimeoutExpired','FreshnessHold','Unavailable','ValueError','KeyError','ModuleNotFoundError','ImportError'}
     return {'stage':value.get('stage') if value.get('stage') in stages else 'unknown',
@@ -570,7 +570,7 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
         if probe:
             programs=ci_context['planner_programs']
             if (not isinstance(programs,dict) or set(programs)!={'ci-cargo-planner.py','ci-cargo-relay.py',
-                    'ci-cargo-staging.py','ci-cargo-planner.so'}
+                    'ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-planner.so'}
                     or any(not isinstance(data,bytes) or not 0<len(data)<=2*1024*1024 for data in programs.values())):
                 raise Unavailable('invalid measured planner probe bundle')
         dependency=ci_context.get('dependency_action')
