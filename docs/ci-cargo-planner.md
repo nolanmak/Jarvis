@@ -1302,5 +1302,22 @@ in-command generated-publication regression remain required. The added native
 adapter test uses an independent two-package graph, preserves normal build/test
 argv, checks unchanged dependency/library reuse between those commands, and
 requires an original failing Rust test to propagate Cargo101 and its diagnostic.
-Native verification of this connection is pending; no rollout or shipping
-improvement is claimed from these edits.
+Native validation at `bdcb1a88` passed in **182.94 seconds** through the actual
+adapter. Both source cases compiled two library units for the original build,
+then only the new test unit for the original test command. The successful test
+returned zero; the intentionally failing test returned actual Cargo101 and its
+original diagnostic. Original argv, output and independent worker cleanup were
+preserved. Normal Cargo's bare `rustc` requests are admitted only with the pinned
+toolchain first on the captured PATH, while actual execution requests remain
+unchanged. Writable/reordered search paths hold. The fixture lockfile uses
+canonical bytes generated through the managed Cargo wrapper, so the immutable
+source view does not need permission to rewrite it.
+
+The original publication/restart replay also passed after extraction in
+**109.21 seconds**, preserving cold/warm compiler `[3,0]`, build-script `[1,0]`,
+the actual E0761/Cargo101 retry, pre-activation invalidation, sealed history,
+original cleanup and the sixteen-program/link zero-miss census. All **302 Python
+CI tests passed without skips**, and **31 focused Rust tests passed** with 16
+opt-in cases excluded. The structured adapter and compatibility VM cases were
+then explicitly executed. This does not prove the original in-command harness,
+persistent reuse or complete input/CI authority. No restoration is deployed.
