@@ -20,6 +20,7 @@ import re
 import os
 from pathlib import Path
 import select
+import selectors
 import signal
 import socket
 import stat
@@ -1238,44 +1239,73 @@ CARGO_FIXTURE_BUILD='''fn main(){
 '''
 
 
-class _CargoProbe:
-    """Real Cargo mapping under the private probe capability; no reuse proof."""
-    def __init__(self,admission):
+def validate_invocation(argv,environment,cwd):
+    """Root-captured worker context; mediation only adds its private transport."""
+    if (type(argv) is not list or not 2<=len(argv)<=4096 or argv[0]!='/toolchain/bin/cargo'
+            or any(type(arg) is not str or not arg or '\0' in arg or len(arg)>65536 for arg in argv)
+            or type(environment) is not dict or len(environment)>4096 or cwd!='/workspace'
+            or any(type(key) is not str or not key or '=' in key or '\0' in key
+                or type(value) is not str or '\0' in value for key,value in environment.items())
+            or any(key in environment for key in ('LD_PRELOAD','JARVIS_CARGO_RELAY_FD'))
+            or environment.get('CARGO_TARGET_DIR')!='/workspace/target'
+            or environment.get('CARGO_HOME')!='/ci-cargo-home'):
+        raise cargo_hold('planner_cargo_request')
+    return {'argv':list(argv),'environment':dict(environment),'cwd':cwd}
+
+
+def capture_command(child,deadline,*,limit=8*1024**2):
+    """Bound original Cargo streams while they are produced, not after EOF."""
+    output={'stdout':bytearray(),'stderr':bytearray()};size=0
+    with selectors.DefaultSelector() as streams:
+        streams.register(child.stdout,selectors.EVENT_READ,'stdout')
+        streams.register(child.stderr,selectors.EVENT_READ,'stderr')
+        while streams.get_map():
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise subprocess.TimeoutExpired(child.args,0)
+            for key,_ in streams.select(min(remaining,.1)):
+                block=os.read(key.fileobj.fileno(),65536)
+                if not block:
+                    streams.unregister(key.fileobj);key.fileobj.close();continue
+                size+=len(block)
+                if size>limit:raise FreshnessHold('input_census_unknown')
+                output[key.data].extend(block)
+    child.wait(timeout=max(.001,deadline-time.monotonic()))
+    return bytes(output['stdout']),bytes(output['stderr'])
+
+
+class _CargoExecutor:
+    """Graph-backed execution; incomplete input closure grants no reuse/CI proof."""
+    def __init__(self,admission,*,diagnostic=False):
         if (type(admission) is not _Admission or admission.token is not _TOKEN
                 or admission.owner!=os.getpid() or os.getresuid()!=(0,0,0)):
             raise FreshnessHold('invalidation_unsafe')
         _source(admission.target,admission.binding,admission.command)
-        self.admission=admission;self.owner=os.getpid();self.units={};self.fixture_labels={};self.report=None
-        self.generated_stats={};self.library_used=False;self.commands=[]
-        self.retry_active=False;self.retry_publication=None;self.journal=None;self.fingerprints=None
+        self.admission=admission;self.owner=os.getpid();self.units={};self.commands=[]
         self.graph=None;self.preparing_graph=False
-        self.restart_gate=None
         self.source=admission.target.parent/'source-projection'
-        for name,body in (('Cargo.toml',CARGO_FIXTURE_MANIFEST),('src/main.rs',CARGO_FIXTURE_SOURCE),
-                ('src/lib.rs',CARGO_FIXTURE_LIB),('build.rs',CARGO_FIXTURE_BUILD)):
-            if unit_views._read(self.source/name,0,True)[1:]!=(len(body.encode()),hashlib.sha256(body.encode()).hexdigest()):
-                raise FreshnessHold('input_census_unknown')
-        self.root=admission.target/('.cargo-view-probe-'+str(uuid.uuid4()));self.root.mkdir(mode=0o710)
+        self.root=admission.target/('.cargo-execution-'+str(uuid.uuid4()));self.root.mkdir(mode=0o710)
         os.chown(self.root,0,1001)
-        self.control={'version':1,'kind':'private-cargo-view-probe','binding':admission.binding,
+        self.control={'version':1,'kind':'cargo-execution','binding':admission.binding,
             'command':admission.command,'shipping_authority':False}
         cache._write_record(self.root/'control.json',{**self.control,'state':'active'})
         self.store=PublicationStore(self.root/'publications',binding=admission.binding,command=admission.command,
-            unit_root=admission.root/'units',allow_diagnostic=True)
+            unit_root=admission.root/'units',allow_diagnostic=diagnostic)
         self.target=self.root/'planner-target'
         for name in ('planner-target','home','cargo-home'):
             path=self.root/name;path.mkdir(mode=0o700);os.chown(path,1001,1001)
 
+
     @property
     def publications(self):return self.store.snapshot()[0]
+
 
     @property
     def files(self):return self.store.snapshot()[1]
 
+
     @property
     def history(self):return self.store.snapshot(historical=True)[0]
 
-    def publication(self,label):return self.store.record(self.fixture_labels[label])
 
     @staticmethod
     def _directory(root,name,unit):
@@ -1286,10 +1316,6 @@ class _CargoProbe:
             unit_views._output_directory(current,unit)
         return current
 
-    @staticmethod
-    def _stat(path):
-        info=path.stat()
-        return (*unit_views._key(info),info.st_nlink,info.st_atime_ns)
 
     def _planner_file(self,name,expected):
         path=unit_views.literal(self.target/name)
@@ -1310,6 +1336,7 @@ class _CargoProbe:
         finally:os.close(descriptor)
         return path
 
+
     def _file_input(self,artifacts,unit,name,alias=None,*,publications,files):
         if name not in files:raise cargo_hold('planner_cargo_artifact')
         label,row=files[name];publication=publications[label]
@@ -1325,6 +1352,7 @@ class _CargoProbe:
         (artifacts/virtual).touch(mode=0o444);raw=os.fsencode(virtual).hex()
         return [raw,str(original),[raw,*row[1:]]]
 
+
     def _generated_input(self,artifacts,unit,name,package_id,*,publications):
         publication=generated_publication(publications,name,package_id)
         _declared_publication(self.graph,publication)
@@ -1336,14 +1364,22 @@ class _CargoProbe:
         (artifacts/name).mkdir(mode=0o555);raw=os.fsencode(name).hex()
         return [raw,str(original),[raw,'tree',manifest]]
 
+
+    def _mapping(self,request,publications,files):
+        return dispatch_request(request,graph=self.graph,planner_target=self.target,
+            publications=publications,files=files)
+
+    def _library_input(self):pass
+    def _failed(self,mapping,raw):pass
+    def _generated_outputs(self,view,ordinal):pass
+    def _published(self,label,identity,sealed,roots):pass
+    def _application_outputs(self,view,ordinal):pass
+
     def prepare(self,ordinal,request):
         if self.owner!=os.getpid():raise FreshnessHold('invalidation_unsafe')
         try:
-            guarded=fixture_request(request)
             publications,files=self.store.snapshot()
-            mapped=dispatch_request(request,graph=self.graph,planner_target=self.target,
-                publications=publications,files=files)
-            if any(mapped.get(key)!=value for key,value in guarded.items()):raise cargo_hold('planner_cargo_request')
+            mapped=self._mapping(request,publications,files)
         except FreshnessHold as error:
             if not hasattr(error,'unit_view_stage'):error.unit_view_stage='planner_cargo_request'
             raise
@@ -1365,7 +1401,7 @@ class _CargoProbe:
                 for artifact in publication['files']:
                     if artifact.endswith(('.rlib','.rmeta')) and artifact not in mounted:
                         entries.append(self._file_input(artifacts,unit,artifact,publications=publications,files=files));mounted.add(artifact)
-                self.library_used=True
+                self._library_input()
             self._directory(artifacts,str(Path(mapped['outputs'][0]).parent),unit)
         generated=mapped.get('generated_root')
         if generated is not None:
@@ -1379,7 +1415,9 @@ class _CargoProbe:
         self.units[ordinal]={'view':view,'mapping':mapped,'finished':False,'cargo_target':admission,'graph_dispatch':True}
         return view
 
+
     def running(self,view):pass
+
 
     def _materialize(self,publication,previous_files):
         for row in publication['manifest']:
@@ -1403,6 +1441,139 @@ class _CargoProbe:
             finally:
                 try:temporary.unlink()
                 except FileNotFoundError:pass
+
+
+    def finish(self,view,directory,raw):
+        ordinal=view['ordinal'];record=self.units[ordinal];mapping=record['mapping']
+        observed=cache._read_record(directory/'view-namespace.json')
+        if (observed.get('binding')!=self.admission.binding or observed.get('command')!=self.admission.command
+                or observed.get('ordinal')!=ordinal
+                or set(observed['namespaces'])!={'mnt','ipc','net'}
+                or any(row['controller']==row['unit'] for row in observed['namespaces'].values())):
+            raise FreshnessHold('invalidation_unsafe')
+        pid=observed.get('pid')
+        if type(pid) is not int or pid<=0:raise FreshnessHold('cleanup_uncertain')
+        record.update(finished=True,namespaces=observed['namespaces'],pid=pid,
+            root_identity=observed['root_identity'],returncode=raw)
+        if raw!=0:
+            self._failed(mapping,raw)
+            return
+        if mapping['kind'] in ('compile','build_script'):
+            label=mapping['role'] if mapping['kind']=='compile' else 'generated'
+            identity,sealed=self.store.allocate()
+            staged=self.store.objects/('.preparing-'+identity);roots=[]
+            if mapping['kind']=='compile':
+                manifest=unit_views.copy_outputs(Path(view['artifacts']),staged,mapping['outputs'],owner=2000+ordinal,controller=0)
+            else:
+                roots=[mapping['generated_root']]
+                manifest=unit_views.copy_output_roots(Path(view['artifacts']),staged,roots,owner=2000+ordinal,controller=0)
+                self._generated_outputs(view,ordinal)
+            staged.rename(sealed)
+            parent=os.open(self.store.objects,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+            try:os.fsync(parent)
+            finally:os.close(parent)
+            outputs=[os.fsdecode(bytes.fromhex(row[0])) for row in manifest if row[1]=='file']
+            if mapping['kind']=='compile':outputs=mapping['outputs']
+            action=mapping['role'] if mapping['kind']=='compile' else 'generated'
+            publication={'root':sealed,'manifest':manifest,'files':outputs,'roots':roots,
+                'action':action,'cargo_target':record['cargo_target'],'generated_root':mapping.get('generated_root')}
+            _publications,previous_files=self.store.snapshot()
+            self.store.publish(identity,publication,scope=directory,ordinal=ordinal,
+                materialize=lambda item:self._materialize(item,previous_files))
+            self._published(label,identity,sealed,roots)
+        elif mapping['kind']=='application':self._application_outputs(view,ordinal)
+
+    def _command(self,value,relay,*,operation='run'):
+        global _PHASE,_CHILD_DIAGNOSTIC
+        _PHASE='planner_cargo_supervisor'
+        if self.owner!=os.getpid() or len(self.commands)>=4 or operation not in ('run','metadata','original'):raise FreshnessHold('invalidation_unsafe')
+        invocation=len(self.commands);directory=self.root/('command-'+str(invocation));directory.mkdir(mode=0o700)
+        control={'version':1,'binding':self.admission.binding,'command':self.admission.command,
+            'invocation':invocation,'operation':operation}
+        cache._write_record(directory/'control.json',control)
+        client=relay.config_fd();bootstrap=None;child=None
+        try:
+            config=dict(value,kind='cargo-supervisor',parent=os.getpid(),invocation=invocation,
+                command_directory=str(directory),cargo_operation=operation,cargo_root=str(self.root),source=str(self.source))
+            bootstrap=_sealed(config)
+            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--cargo-supervisor',str(bootstrap),str(client)],
+                pass_fds=(bootstrap,client),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            output,error=capture_command(child,value['deadline'])
+            cleanup=original_cargo_cleanup(directory/'cleanup')
+            if relay.errors:
+                _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
+                raise FreshnessHold('cleanup_uncertain')
+            relay.drain()
+            if len(output)+len(error)>8*1024**2:raise FreshnessHold('input_census_unknown')
+            self.commands.append({'directory':directory,'control':control,'cleanup':cleanup,'returncode':child.returncode})
+            return child.returncode,output,error
+        finally:
+            try:
+                if child is not None and child.poll() is None:
+                    child.terminate()
+                    try:child.wait(timeout=6)
+                    except subprocess.TimeoutExpired:
+                        child.kill();child.wait(timeout=2)
+                        raise FreshnessHold('cleanup_uncertain') from None
+            finally:
+                os.close(client)
+                if bootstrap is not None:os.close(bootstrap)
+
+
+class _CargoProbe(_CargoExecutor):
+    """Keep the exact private fixture guard separate from general CI execution."""
+    def __init__(self,admission):
+        source=admission.target.parent/'source-projection'
+        for name,body in (('Cargo.toml',CARGO_FIXTURE_MANIFEST),('src/main.rs',CARGO_FIXTURE_SOURCE),
+                ('src/lib.rs',CARGO_FIXTURE_LIB),('build.rs',CARGO_FIXTURE_BUILD)):
+            if unit_views._read(source/name,0,True)[1:]!=(len(body.encode()),hashlib.sha256(body.encode()).hexdigest()):
+                raise FreshnessHold('input_census_unknown')
+        super().__init__(admission,diagnostic=True)
+        self.fixture_labels={};self.report=None;self.generated_stats={};self.library_used=False
+        self.retry_active=False;self.retry_publication=None;self.journal=None;self.fingerprints=None;self.restart_gate=None
+
+    def _mapping(self,request,publications,files):
+        guarded=fixture_request(request)
+        mapped=super()._mapping(request,publications,files)
+        if any(mapped.get(key)!=value for key,value in guarded.items()):raise cargo_hold('planner_cargo_request')
+        return mapped
+
+    def _library_input(self):self.library_used=True
+
+    def _failed(self,mapping,raw):
+        if self.retry_active and mapping['kind']=='compile' and mapping['role']=='library' and raw==1:return
+        stage={'compile':'planner_cargo_compile','build_script':'planner_cargo_build_script',
+            'application':'planner_cargo_application'}.get(mapping['kind'],'planner_cargo_compile')
+        raise cargo_hold(stage)
+
+    def _generated_outputs(self,view,ordinal):
+        forged=Path(view['artifacts'])/'debug/.fingerprint/build-script-forged'
+        if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
+            raise FreshnessHold('invalidation_unsafe')
+
+    def _published(self,label,identity,sealed,roots):
+        self.fixture_labels.setdefault(label,identity)
+        if label=='generated':
+            tree=sealed/roots[0]
+            for row in unit_views.inventory(tree,owner=0,sealed=True):
+                path=tree/Path(os.fsdecode(bytes.fromhex(row[0])));self.generated_stats[path]=self._stat(path)
+
+    def _application_outputs(self,view,ordinal):
+        forged=Path(view['artifacts'])/'debug/.fingerprint/unit-forged'
+        if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
+            raise FreshnessHold('invalidation_unsafe')
+
+
+
+    def publication(self,label):return self.store.record(self.fixture_labels[label])
+
+
+    @staticmethod
+    def _stat(path):
+        info=path.stat()
+        return (*unit_views._key(info),info.st_nlink,info.st_atime_ns)
+
 
     def record_invalidations(self,events,metadata,user_namespace):
         """Consume the actual library's missing-module query after unit drain.
@@ -1470,96 +1641,6 @@ class _CargoProbe:
             'durable':True,'original_generated_preserved':True,
             'input_closure_complete':False,'shipping_authority':False}
 
-    def finish(self,view,directory,raw):
-        ordinal=view['ordinal'];record=self.units[ordinal];mapping=record['mapping']
-        observed=cache._read_record(directory/'view-namespace.json')
-        if (observed.get('binding')!=self.admission.binding or observed.get('command')!=self.admission.command
-                or observed.get('ordinal')!=ordinal
-                or set(observed['namespaces'])!={'mnt','ipc','net'}
-                or any(row['controller']==row['unit'] for row in observed['namespaces'].values())):
-            raise FreshnessHold('invalidation_unsafe')
-        pid=observed.get('pid')
-        if type(pid) is not int or pid<=0:raise FreshnessHold('cleanup_uncertain')
-        record.update(finished=True,namespaces=observed['namespaces'],pid=pid,
-            root_identity=observed['root_identity'],returncode=raw)
-        if raw!=0:
-            if self.retry_active and mapping['kind']=='compile' and mapping['role']=='library' and raw==1:
-                # RootRelay has already checked the original cleanup receipt.
-                # Preserve the historical publication; expose no failed output.
-                return
-            stage={'compile':'planner_cargo_compile','build_script':'planner_cargo_build_script',
-                'application':'planner_cargo_application'}.get(mapping['kind'],'planner_cargo_compile')
-            raise cargo_hold(stage)
-        if mapping['kind'] in ('compile','build_script'):
-            label=mapping['role'] if mapping['kind']=='compile' else 'generated'
-            identity,sealed=self.store.allocate()
-            staged=self.store.objects/('.preparing-'+identity);roots=[]
-            if mapping['kind']=='compile':
-                manifest=unit_views.copy_outputs(Path(view['artifacts']),staged,mapping['outputs'],owner=2000+ordinal,controller=0)
-            else:
-                roots=[mapping['generated_root']]
-                manifest=unit_views.copy_output_roots(Path(view['artifacts']),staged,roots,owner=2000+ordinal,controller=0)
-                forged=Path(view['artifacts'])/'debug/.fingerprint/build-script-forged'
-                if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
-                    raise FreshnessHold('invalidation_unsafe')
-            staged.rename(sealed)
-            parent=os.open(self.store.objects,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
-            try:os.fsync(parent)
-            finally:os.close(parent)
-            outputs=[os.fsdecode(bytes.fromhex(row[0])) for row in manifest if row[1]=='file']
-            if mapping['kind']=='compile':outputs=mapping['outputs']
-            action=mapping['role'] if mapping['kind']=='compile' else 'generated'
-            publication={'root':sealed,'manifest':manifest,'files':outputs,'roots':roots,
-                'action':action,'cargo_target':record['cargo_target'],'generated_root':mapping.get('generated_root')}
-            _publications,previous_files=self.store.snapshot()
-            self.store.publish(identity,publication,scope=directory,ordinal=ordinal,
-                materialize=lambda item:self._materialize(item,previous_files))
-            self.fixture_labels.setdefault(label,identity)
-            if label=='generated':
-                tree=sealed/roots[0]
-                for row in unit_views.inventory(tree,owner=0,sealed=True):
-                    path=tree/Path(os.fsdecode(bytes.fromhex(row[0])));self.generated_stats[path]=self._stat(path)
-        elif mapping['kind']=='application':
-            forged=Path(view['artifacts'])/'debug/.fingerprint/unit-forged'
-            if unit_views._read(forged,2000+ordinal,False)[1:]!=(17,hashlib.sha256(b'private unit only').hexdigest()):
-                raise FreshnessHold('invalidation_unsafe')
-
-    def _command(self,value,relay,*,operation='run'):
-        global _PHASE,_CHILD_DIAGNOSTIC
-        _PHASE='planner_cargo_supervisor'
-        if self.owner!=os.getpid() or len(self.commands)>=4 or operation not in ('run','metadata'):raise FreshnessHold('invalidation_unsafe')
-        invocation=len(self.commands);directory=self.root/('command-'+str(invocation));directory.mkdir(mode=0o700)
-        control={'version':1,'binding':self.admission.binding,'command':self.admission.command,
-            'invocation':invocation,'operation':operation}
-        cache._write_record(directory/'control.json',control)
-        client=relay.config_fd();bootstrap=None;child=None
-        try:
-            config=dict(value,kind='cargo-supervisor',parent=os.getpid(),invocation=invocation,
-                command_directory=str(directory),cargo_operation=operation,cargo_root=str(self.root),source=str(self.source))
-            bootstrap=_sealed(config)
-            child=subprocess.Popen([sys.executable,'-I',str(Path(__file__).resolve()),'--cargo-supervisor',str(bootstrap),str(client)],
-                pass_fds=(bootstrap,client),env={'PATH':os.defpath},stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-            output,error=child.communicate(timeout=max(.001,value['deadline']-time.monotonic()))
-            cleanup=original_cargo_cleanup(directory/'cleanup')
-            if relay.errors:
-                _CHILD_DIAGNOSTIC=failed_probe_diagnostic(error,relay.errors)
-                raise FreshnessHold('cleanup_uncertain')
-            relay.drain()
-            if len(error)>8192:raise FreshnessHold('metadata_torn')
-            self.commands.append({'directory':directory,'control':control,'cleanup':cleanup,'returncode':child.returncode})
-            return child.returncode,output,error
-        finally:
-            try:
-                if child is not None and child.poll() is None:
-                    child.terminate()
-                    try:child.wait(timeout=6)
-                    except subprocess.TimeoutExpired:
-                        child.kill();child.wait(timeout=2)
-                        raise FreshnessHold('cleanup_uncertain') from None
-            finally:
-                os.close(client)
-                if bootstrap is not None:os.close(bootstrap)
 
     def run(self,value,relay):
         first=len(relay.completed);counts=[];script_counts=[];fingerprint=None
@@ -1603,6 +1684,7 @@ class _CargoProbe:
             'actual_metadata_preserved':True,'sealed_artifact_detached':True,
             'units':relay.completed[first:],'allocation_removed':False,
             'trusted_input_closure':False,'shipping_authority':False}
+
 
     def retry_invalidated(self,value,relay):
         global _PHASE
@@ -1678,12 +1760,15 @@ class _CargoProbe:
             'diagnostic_producers':1,'invalidation_before_activation':True,'last_affected':state['last_affected'],
             'original_unit_cleanup':True,'history_preserved':True,'input_closure_complete':False,'shipping_authority':False}
 
+
     def cleanup(self):
         if self.owner!=os.getpid() or self.report is None:raise FreshnessHold('cleanup_uncertain')
         _source(self.admission.target,self.admission.binding,self.admission.command)
         if cache._read_record(self.root/'control.json')!={**self.control,'state':'active'}:
             raise FreshnessHold('cleanup_uncertain')
         shutil.rmtree(self.root);self.report['allocation_removed']=True
+
+
 
 
 def cargo_hold(stage):
@@ -1763,13 +1848,13 @@ def _cargo_supervisor(arguments):
 
 
 def _cargo(arguments):
-    """Internal fixed Cargo bootstrap; requires the original root-sealed grant."""
+    """Cargo bootstrap under non-root planner credentials and the sealed grant."""
     global _PHASE
     _PHASE='planner_client_start';bootstrap,configuration=map(int,arguments)
     value=_bootstrap(bootstrap,'cargo');_parent_guard(value['parent']);os.close(bootstrap)
     root=unit_views.literal(value['cargo_root']);source=unit_views.literal(value['source'])
-    if (root.parent!=Path(value['target']) or not root.name.startswith('.cargo-view-probe-')
-            or cache._read_record(root/'control.json')!={'version':1,'kind':'private-cargo-view-probe',
+    if (root.parent!=Path(value['target']) or not root.name.startswith('.cargo-execution-')
+            or cache._read_record(root/'control.json')!={'version':1,'kind':'cargo-execution',
                 'binding':value['binding'],'command':value['command'],'shipping_authority':False,'state':'active'}):
         raise FreshnessHold('invalidation_unsafe')
     _PHASE='planner_cargo_runtime';libc=ctypes.CDLL(None,use_errno=True)
@@ -1785,18 +1870,25 @@ def _cargo(arguments):
         destination.mkdir(mode=0o755,parents=True,exist_ok=True)
         unit_views._mount('--bind',original,destination)
         unit_views._mount('-o','remount,bind,rw,nosuid,nodev,noatime',destination)
-    environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','CARGO_HOME':'/ci-cargo-home',
-        'CARGO_TARGET_DIR':'/workspace/target','CARGO_INCREMENTAL':'0','CARGO_BUILD_JOBS':'1',
-        'CARGO_PROFILE_DEV_DEBUG':'0','RUSTC':'/toolchain/bin/rustc',
-        'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)}
+    invocation=value.get('original_invocation')
+    if invocation is None:
+        environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','CARGO_HOME':'/ci-cargo-home',
+            'CARGO_TARGET_DIR':'/workspace/target','CARGO_INCREMENTAL':'0','CARGO_BUILD_JOBS':'1',
+            'CARGO_PROFILE_DEV_DEBUG':'0','RUSTC':'/toolchain/bin/rustc',
+            'LD_PRELOAD':value['library'],'JARVIS_CARGO_RELAY_FD':str(configuration)}
+    else:
+        validate_invocation(**invocation)
+        environment=dict(invocation['environment'],LD_PRELOAD=value['library'],JARVIS_CARGO_RELAY_FD=str(configuration))
     if libc.prctl(38,1,0,0,0)!=0:raise FreshnessHold('invalidation_unsafe')
     os.setgroups([]);os.setgid(1001);os.setuid(1001);os.umask(0o077);_parent_guard(value['parent'])
     os.set_inheritable(configuration,True);os.chdir('/workspace');_PHASE='planner_cargo_execute'
     operation=value.get('cargo_operation')
     if operation=='metadata':argv=['/toolchain/bin/cargo','metadata','--offline','--locked','--no-deps','--format-version','1']
-    elif operation=='run':argv=['/toolchain/bin/cargo','run','--offline','--locked','--quiet']
+    elif operation=='run' and invocation is None:argv=['/toolchain/bin/cargo','run','--offline','--locked','--quiet']
+    elif operation=='original' and invocation is not None:argv=invocation['argv']
     else:raise FreshnessHold('invalidation_unsafe')
     os.execve('/toolchain/bin/cargo',argv,environment)
+
 
 
 _TOOL_PROBE=r'''
@@ -2096,6 +2188,91 @@ def _probe(arguments):
     return 0
 
 
+def _execute(arguments):
+    """Real structured CI commands through graph dispatch, without CI authority.
+
+    The normal outer host supervisor/deadline/resource lease remains in force.
+    This inner 900s ceiling cannot extend that grant. Persistent recovery and
+    complete input closure are still activation prerequisites.
+    """
+    value=_bootstrap(int(arguments[0]),'execution');_parent_guard(value['parent'])
+    commands=value['commands'];environment=value['environment'];cwd=value['cwd']
+    if type(commands) is not list or not 1<=len(commands)<=2:raise cargo_hold('planner_cargo_request')
+    for argv in commands:validate_invocation(argv,environment,cwd)
+    admission=admit(value['target'],value['binding'],value['command'],value['root'])
+    outputs=[];errors=[];receipts=[];exit_code=0
+    with RootRelay(admission,library=value['library'],timeout=min(900,max(1,value['deadline']-time.monotonic()))) as relay:
+        executor=_CargoExecutor(admission);relay.views=executor
+        first=validate_invocation(commands[0],environment,cwd)
+        context=dict(value,original_invocation=first)
+        executor.preparing_graph=True
+        try:status,metadata,error=executor._command(context,relay,operation='metadata')
+        finally:executor.preparing_graph=False
+        if status!=0:raise cargo_hold('planner_cargo_request')
+        executor.graph=CargoGraph(executor.source,metadata,owner=0)
+        for argv in commands:
+            invocation=validate_invocation(argv,environment,cwd);before=len(relay.completed)
+            exit_code,output,error=executor._command(dict(value,original_invocation=invocation),relay,operation='original')
+            outputs.append(output);errors.append(error)
+            if sum(map(len,outputs))+sum(map(len,errors))>8*1024**2:raise FreshnessHold('input_census_unknown')
+            units=relay.completed[before:]
+            if any(not executor.units[unit['ordinal']]['finished'] for unit in units):raise FreshnessHold('cleanup_uncertain')
+            receipts.append({'argv':argv,'context_sha256':hashlib.sha256(json.dumps(invocation,sort_keys=True,
+                separators=(',',':')).encode()).hexdigest(),'exit_code':exit_code,'original_cargo_cleanup':True,
+                'compiler_calls':sum(executor.units[unit['ordinal']]['mapping']['kind']=='compile' for unit in units),
+                'units':units})
+            if exit_code:break
+        relay.drain()
+        receipt={'version':1,'kind':'ci-cargo-execution','binding':value['binding'],'command':value['command'],
+            'commands':receipts,'metadata_sha256':executor.graph.metadata_sha256,'original_metadata_cleanup':True,
+            'input_closure_complete':False,'full_ci':False,'shipping_authority':False}
+        # Leave the protected ownership records intact. A following command must
+        # recover/revalidate them; a fresh private target is not a reuse policy.
+        cache._write_record(executor.root/'execution.json',receipt)
+    print(json.dumps({'exit_code':exit_code,'stdout':b''.join(outputs).decode('utf-8','replace'),
+        'stderr':b''.join(errors).decode('utf-8','replace'),'cargo_execution':receipt}))
+    return 0
+
+
+def _execution_supervisor(arguments):
+    value=_bootstrap(int(arguments[0]),'execution-supervisor');_parent_guard(value['parent'])
+    child=_sealed(dict(value,kind='execution',parent=os.getpid()))
+    supervisor=_load('original_ci_cargo_supervisor','provider-supervisor.py')
+    return supervisor.supervise(value['receipt'],[sys.executable,'-I',str(Path(__file__).resolve()),'--execute',str(child)],
+        forward_fds=(child,),close_after_spawn=(child,))
+
+
+def validate_execution(value,binding,command,commands,workers,scope,exit_code):
+    try:
+        keys={'version','kind','binding','command','commands','metadata_sha256','original_metadata_cleanup',
+            'input_closure_complete','full_ci','shipping_authority','guest_worker_quiescence'}
+        if (type(value) is not dict or set(value)!=keys or type(value['version']) is not int or value['version']!=1
+                or value['kind']!='ci-cargo-execution' or value['binding']!=binding or value['command']!=command
+                or not cache._digest(value['metadata_sha256']) or value['original_metadata_cleanup'] is not True
+                or any(value[key] is not False for key in ('input_closure_complete','full_ci','shipping_authority'))
+                or value['guest_worker_quiescence']!=scope or scope not in workers['scopes']
+                or type(value['commands']) is not list or not 1<=len(value['commands'])<=len(commands)):
+            raise ValueError()
+        ordinals=set()
+        for index,item in enumerate(value['commands']):
+            if (type(item) is not dict or set(item)!={'argv','context_sha256','exit_code','original_cargo_cleanup','compiler_calls','units'}
+                    or item['argv']!=commands[index] or not cache._digest(item['context_sha256'])
+                    or type(item['exit_code']) is not int or not 0<=item['exit_code']<=255
+                    or item['original_cargo_cleanup'] is not True or type(item['compiler_calls']) is not int
+                    or type(item['units']) is not list or not 0<=item['compiler_calls']<=len(item['units'])
+                    or index<len(value['commands'])-1 and item['exit_code']!=0):raise ValueError()
+            for unit in item['units']:
+                if (type(unit) is not dict or type(unit.get('ordinal')) is not int or not 0<=unit['ordinal']<4096
+                        or unit['ordinal'] in ordinals or unit.get('uid')!=2000+unit['ordinal']
+                        or unit.get('started') is not True or unit.get('cancelled') is not False
+                        or unit.get('original_cleanup') is not True):raise ValueError()
+                ordinals.add(unit['ordinal'])
+        if (len(value['commands'])<len(commands) and value['commands'][-1]['exit_code']==0
+                or type(exit_code) is not int or value['commands'][-1]['exit_code']!=exit_code):raise ValueError()
+        return value
+    except (ValueError,TypeError,KeyError):raise FreshnessHold('input_census_unknown') from None
+
+
 def _probe_supervisor(arguments):
     global _PHASE
     _PHASE='planner_probe_supervisor'
@@ -2311,6 +2488,8 @@ if __name__=='__main__':
         elif sys.argv[1:2]==['--planner']:result=_planner(sys.argv[2:])
         elif sys.argv[1:2]==['--cargo']:result=_cargo(sys.argv[2:])
         elif sys.argv[1:2]==['--cargo-supervisor']:result=_cargo_supervisor(sys.argv[2:])
+        elif sys.argv[1:2]==['--execute']:result=_execute(sys.argv[2:])
+        elif sys.argv[1:2]==['--execution-supervisor']:result=_execution_supervisor(sys.argv[2:])
         elif sys.argv[1:2]==['--probe']:result=_probe(sys.argv[2:])
         elif sys.argv[1:2]==['--probe-supervisor']:result=_probe_supervisor(sys.argv[2:])
         else:raise FreshnessHold('invalidation_unsafe')

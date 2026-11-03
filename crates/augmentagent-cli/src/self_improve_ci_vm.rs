@@ -256,6 +256,8 @@ pub(super) struct Outcome {
     source_projection: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) planner_protocol_probe:Option<serde_json::Value>,
+    #[serde(default)]
+    pub(super) cargo_execution:Option<serde_json::Value>,
     /// Host-only capability, created after all result and kernel checks. A VM
     /// JSON object cannot supply or deserialize a protected audit receipt.
     #[serde(skip)]
@@ -723,6 +725,11 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         private_write(&self.directory.as_ref().context("owned probe session missing")?.path().join("planner-probe-enabled"),b"V3\n")
     }
 
+    #[cfg(test)]
+    pub(super) fn enable_protected_cargo(&self)->Result<()> {
+        private_write(&self.directory.as_ref().context("owned CI session missing")?.path().join("protected-cargo-enabled"),b"execution-only\n")
+    }
+
     pub(super) async fn run(
         &self,
         operation: &str,
@@ -781,7 +788,9 @@ print(json.dumps({'source_sha256':identity,'dependency_inputs_sha256':hashlib.sh
         }
         .canonicalize()?;
         let planner_protocol_probe=cfg!(test) && self.directory.as_ref().expect("owned CI session").path().join("planner-probe-enabled").is_file();
-        let request = serde_json::json!({"version":2,"operation":operation,"planner_protocol_probe":planner_protocol_probe,
+        let protected_cargo=cfg!(test) && matches!(operation,"targeted"|"baseline")
+            && self.directory.as_ref().expect("owned CI session").path().join("protected-cargo-enabled").is_file();
+        let request = serde_json::json!({"version":2,"operation":operation,"planner_protocol_probe":planner_protocol_probe,"protected_cargo":protected_cargo,
             "source_generation":generation,"command_id":command_id,"predecessor":predecessor,
             "retained_generations":retained_generations,
             "retained_producers":retained_producers,

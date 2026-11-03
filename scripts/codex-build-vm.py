@@ -277,6 +277,34 @@ def run_worker(argv,input_roots=None):
     guest_worker_receipts.append(stopped.observation())
     return result
 
+def run_cargo_commands(commands,input_roots):
+    # This replaces the normal structured Cargo driver, not an extra replay.
+    # All candidate code still starts after planner/unit credential drops.
+    import tempfile,time
+    root=Path(tempfile.mkdtemp(prefix='ci-run-',dir='/tmp'))
+    scope=ci_workers.controller_execution_scope(worker_control,{
+        'target':str(private_cache/'ci-source-generations'/generation['binding']['generation']/'target'),
+        'binding':generation['binding'],'command':generation['command'],'root':str(root),
+        'library':'/ci-tools/ci-cargo-planner.so','deadline':time.monotonic()+900,
+        'commands':commands,'environment':dict(environment),'cwd':'/workspace'})
+    journal=ci_inputs.ChangeJournal(input_roots,scope=scope)
+    try:
+        observed=_run_worker(scope.argv,scope);stopped=scope.verify()
+        writes=journal.finish(stopped)
+    finally:journal.close()
+    guest_worker_receipts.append(stopped.observation())
+    if observed.get('exit_code')!=0:raise ci_cache['FreshnessHold']('input_census_unknown')
+    try:
+        result=json.loads(observed['stdout'])
+        if (type(result) is not dict or set(result)!={'exit_code','stdout','stderr','cargo_execution'}
+                or type(result['exit_code']) is not int or not 0<=result['exit_code']<=255
+                or any(type(result[key]) is not str for key in ('stdout','stderr'))):raise ValueError()
+        result['cargo_execution']['guest_worker_quiescence']=stopped.observation()
+    except (ValueError,KeyError,TypeError):raise ci_cache['FreshnessHold']('input_census_unknown') from None
+    result['input_write_observation']=writes
+    return result
+
+
 SOURCE_ACCESS_PROBE=r"""
 import errno,json,os,stat,subprocess,sys
 head,role=sys.argv[1],int(sys.argv[2])
@@ -414,7 +442,7 @@ try:
       roots=None
       if job.get('ci_context') and job.get('ci_generation'):
           roots={'output_'+str(index):Path('/workspace')/name for index,name in enumerate(sorted(job['ci_generation']['outputs']))}
-      result=run_worker(job['argv'],roots)
+      result=run_cargo_commands(job['cargo_execution'],roots) if job.get('cargo_execution') else run_worker(job['argv'],roots)
     if job.get('ci_context'):
         result['cache_reclaimed']=cache_reclaimed
         result['producer_reclaimed']=producer_reclaimed
@@ -456,6 +484,7 @@ def validate_result_shape(result,ci_context):
         for field in ('cache_preparation','input_write_observation','source_projection'):
             if field in result:expected.add(field)
         if ci_context.get('planner_protocol_probe') is True and 'planner_protocol_probe' in result:expected.add('planner_protocol_probe')
+        if ci_context.get('cargo_execution') is not None:expected.add('cargo_execution')
     if set(result)!=expected or type(result['exit_code']) is not int:
         raise Unavailable('invalid VM result')
 
@@ -563,11 +592,19 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
     if ci_context is not None:
         base_keys={'state','git_objects','runner','contract','cache_program','generation','worker_programs'}
         probe=ci_context.get('planner_protocol_probe',False)
-        if type(probe) is not bool:raise Unavailable('invalid internal planner probe')
-        probe_keys={'planner_programs','planner_protocol_probe'} if probe else set()
-        if set(ci_context) not in (base_keys|probe_keys,base_keys|probe_keys|{'dependency_programs','dependency_action'}):
+        execution=ci_context.get('cargo_execution')
+        if type(probe) is not bool or probe and execution is not None:raise Unavailable('invalid internal planner mode')
+        planner_keys={'planner_programs'} if probe or execution is not None else set()
+        if probe:planner_keys.add('planner_protocol_probe')
+        if execution is not None:
+            planner_keys.add('cargo_execution')
+            if (type(execution) is not list or not 1<=len(execution)<=2
+                    or any(type(argv) is not list or not 2<=len(argv)<=4096 or argv[0]!='/toolchain/bin/cargo'
+                        or any(type(arg) is not str or not arg or '\0' in arg or len(arg)>65536 for arg in argv) for argv in execution)
+                    or ci_context['generation']['predecessor'] is not None):raise Unavailable('invalid structured Cargo execution')
+        if set(ci_context) not in (base_keys|planner_keys,base_keys|planner_keys|{'dependency_programs','dependency_action'}):
             raise Unavailable('invalid controller CI context')
-        if probe:
+        if probe or execution is not None:
             programs=ci_context['planner_programs']
             if (not isinstance(programs,dict) or set(programs)!={'ci-cargo-planner.py','ci-cargo-relay.py',
                     'ci-cargo-staging.py','ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so'}
@@ -696,6 +733,7 @@ poweroff -f
                 'ci_generation':ci_context['generation'] if ci_context is not None else None,
                 'ci_dependency':ci_context.get('dependency_action') if ci_context is not None else None,
                 'planner_protocol_probe':ci_context.get('planner_protocol_probe',False) if ci_context is not None else False,
+                'cargo_execution':ci_context.get('cargo_execution') if ci_context is not None else None,
                 'ort_cache':'ort_cache' in config}).encode(), 0, 0)])
         image = private / 'initrd.gz'; image.write_bytes(initrd(entries))
         command = qemu_command(config, image, shares, build_cache)

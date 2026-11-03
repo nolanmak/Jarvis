@@ -1280,3 +1280,27 @@ original cleanup, sealed history/metadata and sixteen zero-miss kernel
 programs/links remained verified. All 296 Python CI tests and 31 focused managed
 Rust tests passed (15 opt-in cases excluded). This is the integrated controlled
 replay, not the original in-command publication exit or production activation.
+
+The workspace executor is now separated from the private fixture guard. An
+internal test-session switch connects it to the actual `targeted`/`baseline`
+adapter, replacing that operation's ordinary Cargo driver. A single controller
+function constructs both drivers' original argv, including package selection,
+filters and test flags. The protected path captures the worker environment and
+cwd, adds only its private transport, supervises original Cargo and unit trees,
+and preserves ordinary command failures and streams. Stream capture is bounded
+while the command runs. Its execution receipt is tied to the same command and
+worker scope as output observation; it is not a complete-input or passing-CI
+proof. The exact private source/body guard and probe-only output assertions stay
+in the probe subclass.
+
+This connection remains disabled in production builds. A predecessor command
+currently holds because persistent selector/publication recovery is unfinished;
+it cannot acquire another cold target as a substitute for D8. The structured
+path still holds unsupported compiler, registry, proc-macro, rustdoc and opaque
+wrapper forms. Repository-shell/nested Cargo entry and the original unchanged
+in-command generated-publication regression remain required. The added native
+adapter test uses an independent two-package graph, preserves normal build/test
+argv, checks unchanged dependency/library reuse between those commands, and
+requires an original failing Rust test to propagate Cargo101 and its diagnostic.
+Native verification of this connection is pending; no rollout or shipping
+improvement is claimed from these edits.

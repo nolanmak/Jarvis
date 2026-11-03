@@ -22,6 +22,51 @@ class AdapterTests(unittest.TestCase):
      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|{'planner_protocol_probe':value})
      load.assert_not_called()
 
+ def test_structured_cargo_commands_preserve_original_selection_flags_and_filters(self):
+  self.assertEqual(adapter.cargo_commands({'operation':'targeted','packages':['alpha','beta'],'filters':[]}),[
+   ['/toolchain/bin/cargo','build','-p','alpha','-p','beta'],
+   ['/toolchain/bin/cargo','test','-p','alpha','-p','beta','--no-fail-fast','--','--test-threads=1']])
+  self.assertEqual(adapter.cargo_commands({'operation':'baseline','packages':[],'filters':['module::case']}),[
+   ['/toolchain/bin/cargo','test','--workspace','--no-fail-fast','--','--test-threads=1','module::case']])
+
+ def test_protected_cargo_entry_rejects_irrelevant_operations_torn_flags_and_predecessors(self):
+  with tempfile.TemporaryDirectory() as directory:
+   request=self.fixture(Path(directory))
+   for change in ({'protected_cargo':True},{'protected_cargo':1},{'protected_cargo':'true'},
+    {'protected_cargo':True,'operation':'baseline','predecessor':str(uuid.uuid4())},
+    {'protected_cargo':True,'planner_protocol_probe':True,'operation':'repository','command':'true'}):
+    with self.subTest(change=change),patch.object(vm.Runtime,'load') as load:
+     with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request|change)
+     load.assert_not_called()
+
+ def test_protected_execution_replaces_driver_and_binds_receipt_to_original_command_scope(self):
+  for borrowed in (False,True):
+   with self.subTest(borrowed=borrowed),tempfile.TemporaryDirectory() as directory:
+    root=Path(directory);request=self.fixture(root)
+    request.update(operation='targeted',packages=['consumer'],filters=[],protected_cargo=True,build_cache=str(root/'cache'))
+    def execute(runtime,workspace,command,environment,**options):
+     context=options['ci_context'];commands=adapter.cargo_commands(request)
+     self.assertEqual(context['cargo_execution'],commands)
+     self.assertEqual(json.loads(command[-1]),commands)
+     self.assertEqual(set(context['planner_programs']),{'ci-cargo-planner.py','ci-cargo-relay.py','ci-cargo-staging.py',
+      'ci-cargo-views.py','ci-cargo-observer.py','ci-lookup-inputs.py','ci-cargo-planner.so'})
+     result=self.prepared_result(options,exit_code=101,stdout='original failure',stderr='original Cargo stderr')
+     generation=context['generation']
+     result['cargo_execution']={'version':1,'kind':'ci-cargo-execution','binding':generation['binding'],
+      'command':generation['command'],'commands':[{'argv':argv,'context_sha256':'1'*64,'exit_code':0 if i==0 else 101,
+       'compiler_calls':0,'units':[],'original_cargo_cleanup':True} for i,argv in enumerate(commands)],
+      'metadata_sha256':'2'*64,'original_metadata_cleanup':True,'input_closure_complete':False,'full_ci':False,
+      'shipping_authority':False,'guest_worker_quiescence':result['guest_worker_quiescence']['scopes'][0 if borrowed else -1]}
+     return result
+    with patch.object(vm.Runtime,'load',return_value=object()),patch.object(adapter,'private_bytes',side_effect=lambda path: b'measured program' if Path(path).name=='ci-cargo-planner.so' else Path(path).read_bytes()),patch.object(adapter,'ensure_cache',
+      side_effect=lambda path,*args:Path(path).touch(mode=0o600)):
+     if borrowed:
+      with self.assertRaises(adapter.cache_generation.FreshnessHold):adapter.execute(request,run=execute)
+     else:
+      result=adapter.execute(request,run=execute)
+      self.assertEqual((result['exit_code'],result['stdout'],result['stderr']),(101,'original failure','original Cargo stderr'))
+      self.assertFalse(result['cargo_execution']['shipping_authority'])
+
  def test_source_projection_requires_current_binding_roles_and_independent_worker_cleanup(self):
   for fault in ('missing','version','binding','command','owner','manifest','flags','missing-role','wrong-role','duplicate-probe','borrowed-worker','foreign-scope'):
    with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:

@@ -118,9 +118,9 @@ class WorkerScope:
 _CONTROLLER_TOKEN=object()
 
 
-class _ControllerProbeScope(WorkerScope):
-    def __init__(self,token,control,configuration):
-        if token is not _CONTROLLER_TOKEN or os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):
+class _ControllerScope(WorkerScope):
+    def __init__(self,token,control,configuration,kind):
+        if kind not in ('probe','execution') or token is not _CONTROLLER_TOKEN or os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0):
             raise FreshnessHold('invalidation_unsafe')
         control=Path(control);info=control.lstat()
         if control.resolve()!=control or not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode&0o077:
@@ -131,9 +131,9 @@ class _ControllerProbeScope(WorkerScope):
         spec=importlib.util.spec_from_file_location('admitted_planner_probe',Path(__file__).with_name('ci-cargo-planner.py'))
         planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
         planner._source(configuration['target'],configuration['binding'],configuration['command'])
-        value=dict(configuration,version=3,kind='probe-supervisor',parent=os.getpid(),receipt=str(self.receipt))
+        value=dict(configuration,version=3,kind=kind+'-supervisor',parent=os.getpid(),receipt=str(self.receipt))
         self._bootstrap=planner._sealed(value)
-        self.argv=[sys.executable,'-I',str(Path(__file__).with_name('ci-cargo-planner.py')),'--probe-supervisor',str(self._bootstrap)]
+        self.argv=[sys.executable,'-I',str(Path(__file__).with_name('ci-cargo-planner.py')),'--'+kind+'-supervisor',str(self._bootstrap)]
 
     def inherited_fds(self):
         if self.owner!=os.getpid() or self._bootstrap is None:raise FreshnessHold('cleanup_uncertain')
@@ -150,4 +150,9 @@ class _ControllerProbeScope(WorkerScope):
 
 def controller_probe_scope(control,configuration):
     """Fixed measured probe only; ordinary WorkerScope still refuses root."""
-    return _ControllerProbeScope(_CONTROLLER_TOKEN,control,configuration)
+    return _ControllerScope(_CONTROLLER_TOKEN,control,configuration,'probe')
+
+
+def controller_execution_scope(control,configuration):
+    """Pinned Cargo executor only; the root helper never execs candidate argv."""
+    return _ControllerScope(_CONTROLLER_TOKEN,control,configuration,'execution')

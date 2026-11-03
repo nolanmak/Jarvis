@@ -24,6 +24,32 @@ planner=importlib.util.module_from_spec(spec);spec.loader.exec_module(planner)
 
 
 class PlannerProtocolTests(unittest.TestCase):
+    def test_original_invocation_preserves_flags_environment_and_rejects_transport_injection(self):
+        environment={'CARGO_TARGET_DIR':'/workspace/target','CARGO_HOME':'/ci-cargo-home',
+            'RUSTFLAGS':'--cfg original_flag','CUSTOM':'value with spaces\nand newline'}
+        argv=['/toolchain/bin/cargo','test','-p','consumer','--no-fail-fast','--','--test-threads=1','module::test']
+        captured=planner.validate_invocation(argv,environment,'/workspace')
+        self.assertEqual(captured,{'argv':argv,'environment':environment,'cwd':'/workspace'})
+        environment['CUSTOM']='changed';argv.append('changed')
+        self.assertNotEqual(captured['environment'],environment);self.assertNotEqual(captured['argv'],argv)
+        for fault in ({'LD_PRELOAD':'candidate.so'},{'JARVIS_CARGO_RELAY_FD':'3'},
+            {'CARGO_TARGET_DIR':'/tmp/target'},{'CARGO_HOME':'/cargo'},{'BAD=KEY':'value'}):
+            with self.subTest(fault=fault),self.assertRaises(planner.FreshnessHold):
+                planner.validate_invocation(argv,environment|fault,'/workspace')
+        with self.assertRaises(planner.FreshnessHold):planner.validate_invocation(['/bin/sh','-c','true'],environment,'/workspace')
+
+    def test_original_stream_capture_is_bounded_before_eof_and_preserves_failure_output(self):
+        child=subprocess.Popen([sys.executable,'-c',"import sys;print('original-out');print('original-err',file=sys.stderr);sys.exit(17)"],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        output,error=planner.capture_command(child,time.monotonic()+5)
+        self.assertEqual((child.returncode,output,error),(17,b'original-out\n',b'original-err\n'))
+        child=subprocess.Popen([sys.executable,'-c',"import os,time;os.write(1,b'x'*2048);time.sleep(10)"],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            with self.assertRaises(planner.FreshnessHold):planner.capture_command(child,time.monotonic()+5,limit=1024)
+            self.assertIsNone(child.poll())
+        finally:child.kill();child.wait();child.stdout.close();child.stderr.close()
+
     def test_restart_gate_keeps_original_grant_and_four_pass_limit_across_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);binding=self.publication_binding();context={'binding':binding,'command':'original','deadline':time.monotonic()+60}
