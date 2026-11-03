@@ -54,6 +54,12 @@ class KernelObserverTests(unittest.TestCase):
             data=lookup(2003,101,102,call,1,3,b'/workspace/source.rs')
             packed=lambda values:data+b''.join(frame('printf',row+'\n') for row in values)+frame('map',{'@emitted':2+len(values)})
             event=observer.decode(packed(rows),path_scope='all')[0]
+            # The actual 18-probe loader emits more diagnostic summaries than
+            # the original 16-probe path. Keep its bounded preamble readable.
+            preamble=b'Program ID: 1\n'*80
+            self.assertEqual(observer.decode(preamble+packed(rows),path_scope='all')[0]['path'],event['path'])
+            with self.assertRaises(observer.ObservationUnavailable):
+                observer.decode(preamble+b'Program ID: 1\n'+packed(rows),path_scope='all')
             self.assertTrue(observer.readable_open(event))
             self.assertEqual(event['open']['arguments']['flags'],32768)
             self.assertEqual(event['open']['installed']['inode'],900)

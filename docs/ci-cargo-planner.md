@@ -1578,3 +1578,11 @@ kernel; the pinned VM is Linux 7.0 and requires `do_file_open`. Its original
 symbol census refused the missing symbol before creating collector output. The
 probe and required census now use the pinned kernel's function. No attachment
 requirement or miss check was relaxed.
+
+The second native attempt attached both new probes and retained copied flags and
+installed-descriptor evidence, but startup parsing still used the original
+16-probe loader-summary bound (**84.84 seconds** overall). The parser now derives
+that diagnostic bound from the required probe count. The original mode retains
+its exact prior bound; general mode remains bounded and still requires all 18
+original attachments and zero misses. The retained actual stream now decodes
+successfully under the corrected bound.

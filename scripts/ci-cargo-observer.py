@@ -642,7 +642,7 @@ def decode(data,*,complete=True,with_directories=False,with_metadata=False,path_
                 or line in ('The verifier log:','The verifier log: ')
                 or re.fullmatch(r'processed [0-9]{1,10} insns \(limit 1000000\) max_states_per_insn [0-9]{1,10} total_states [0-9]{1,10} peak_states [0-9]{1,10} mark_read [0-9]{1,10}',line)):
             loader_records+=1
-            if loader_records>4*PROBE_COUNT+8:raise ObservationUnavailable('unbounded loader summaries')
+            if loader_records>4*(2+sum(probe_roles(path_scope).values()))+8:raise ObservationUnavailable('unbounded loader summaries')
             continue
         try:record=json.loads(line,object_pairs_hook=cache._unique_object)
         except (ValueError,TypeError):raise ObservationUnavailable('invalid kernel record framing') from None
