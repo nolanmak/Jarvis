@@ -77,8 +77,11 @@ and SHA-256 repositories, shallow boundaries, tampering, interrupted allocation,
 and replay of the original retirement inventory. The adapter mounts this view
 read-only and requires separate original supervisor receipts for fixed access
 probes under UID 1001 and UID 2000. Their receipts cannot substitute for command
-worker cleanup. Host tests and focused Rust validation pass; the real guest
-replay for this revision is still pending. This projection does not freeze
+worker cleanup. The real guest replay at `f4107c1e` passed in 195.55 seconds:
+both role probes read the self-contained Git view, failed writes, and supplied
+distinct original cleanup scopes. The unchanged compiler unit performed zero
+compiler calls. The original generated-module conflict still ran cached `OLD`
+while the direct compiler reported E0761. This projection does not freeze
 generated inputs or enable protected Cargo execution or passing-CI publication.
 
 ## Decisions and reasons
