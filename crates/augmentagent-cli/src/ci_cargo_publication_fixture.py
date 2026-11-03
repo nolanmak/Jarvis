@@ -13,19 +13,15 @@ import sys
 import time
 
 PACKAGE='generated-input-consumer'
-PUBLISHER=r'''use std::{env,fs::{self,File,FileTimes},path::PathBuf,thread,time::{Duration,SystemTime}};
+PUBLISHER=r'''use std::{env,fs::{self,File,FileTimes},path::PathBuf,time::{Duration,SystemTime}};
 fn main(){
- println!("cargo:rerun-if-env-changed=CI_FIXTURE_PUBLISH");
- if env::var("CI_FIXTURE_PUBLISH").as_deref()!=Ok("1"){return;}
  let root=PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).parent().unwrap().to_path_buf();
  let generated=root.join("node_modules/generated");fs::create_dir_all(generated.join("chosen")).unwrap();
  let conflict=generated.join("chosen.rs");
  if conflict.exists(){assert_eq!(fs::read(&conflict).unwrap(),b"pub const VALUE:&str=\"NEW\";\n");return;}
- // No mutable cross-unit barrier: verify the observed fresh/publication order
- // from this fixture's event timestamps after completion. They are not cache
- // identities or trusted producer evidence.
- thread::sleep(Duration::from_secs(2));
- let published=SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+ // Cargo must resolve this build dependency before this publisher executes.
+ // The direct call also exercises the cached consumer code before publication.
+ let consumed=generated_input_consumer::value();assert_eq!(consumed,"OLD");
  let old=SystemTime::UNIX_EPOCH+Duration::from_secs(946684800);
  for (name,data) in [("mod.rs",b"mod chosen;pub fn value()->&'static str{chosen::VALUE}\n".as_slice()),
    ("chosen/mod.rs",b"pub const VALUE:&str=\"OLD\";\n".as_slice()),
@@ -33,7 +29,7 @@ fn main(){
   let path=generated.join(name);fs::write(&path,data).unwrap();
   File::open(path).unwrap().set_times(FileTimes::new().set_accessed(old).set_modified(old)).unwrap();
  }
- fs::write(generated.join("publication.json"),format!("{{\"published_at_ns\":{published}}}\n")).unwrap();
+ fs::write(generated.join("publication.json"),"{\"cached_consumer_value\":\"OLD\"}\n").unwrap();
  println!("cargo:warning=fixture published generated conflict");
 }
 '''
@@ -52,10 +48,11 @@ def prepare(root):
     root=Path(root);(root/'src').mkdir();(root/'publisher/src').mkdir(parents=True)
     files={
       'Cargo.toml':'[package]\nname="'+PACKAGE+'"\nversion="0.0.0"\nedition="2021"\n[workspace]\nmembers=["publisher"]\nresolver="2"\n',
-      'Cargo.lock':'version=4\n[[package]]\nname="'+PACKAGE+'"\nversion="0.0.0"\n[[package]]\nname="generated-input-publisher"\nversion="0.0.0"\n',
+      'Cargo.lock':'version=4\n[[package]]\nname="'+PACKAGE+'"\nversion="0.0.0"\n[[package]]\nname="generated-input-publisher"\nversion="0.0.0"\ndependencies=["generated-input-consumer"]\n',
       'package.json':'{"name":"publication-fixture","private":true}\n',
-      'src/main.rs':'#[path="../node_modules/generated/mod.rs"] mod generated;\nfn main(){println!("{}",generated::value());}\n',
-      'publisher/Cargo.toml':'[package]\nname="generated-input-publisher"\nversion="0.0.0"\nedition="2021"\n',
+      'src/lib.rs':'#[path="../node_modules/generated/mod.rs"] mod generated;\npub fn value()->&\'static str{generated::value()}\n',
+      'src/main.rs':'fn main(){println!("{}",generated_input_consumer::value());}\n',
+      'publisher/Cargo.toml':'[package]\nname="generated-input-publisher"\nversion="0.0.0"\nedition="2021"\n[build-dependencies]\ngenerated-input-consumer={path=".."}\n',
       'publisher/src/lib.rs':'pub fn unrelated()->u8{0}\n',
       'publisher/build.rs':PUBLISHER,'rustc-counter.py':COUNTER,
     }
@@ -77,11 +74,11 @@ def run_cargo(root,*,publish,cargo=None,cargo_cwd=None,direct_control=True):
     if conflict.exists():raise RuntimeError('fixture must start without the conflicting module')
     before={name:(root/'node_modules/generated'/name).stat().st_mtime_ns for name in ('mod.rs','chosen/mod.rs')}
     original_bytes={name:(root/'node_modules/generated'/name).read_bytes() for name in before}
-    environment=dict(os.environ,RUSTC_WRAPPER=str(root/'rustc-counter.py'),CARGO_INCREMENTAL='0',CI_FIXTURE_PUBLISH='1' if publish else '0',CI_FIXTURE_COUNTER=str(counter))
+    environment=dict(os.environ,RUSTC_WRAPPER=str(root/'rustc-counter.py'),CARGO_INCREMENTAL='0',CI_FIXTURE_COUNTER=str(counter))
     command=[*(cargo or ['cargo']),'build','--manifest-path',str(root/'Cargo.toml'),'--offline','--locked',
         '--message-format=json',*(['--workspace'] if publish else ['-p',PACKAGE])]
     process=subprocess.Popen(command,cwd=cargo_cwd or root,env=environment,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
-    fresh=False;fresh_at_ns=None;fresh_absent=False;messages=[];stderr=bytearray();pending=bytearray();total=0;deadline=time.monotonic()+120
+    fresh=False;messages=[];stderr=bytearray();pending=bytearray();total=0;deadline=time.monotonic()+120
     try:
         with selectors.DefaultSelector() as streams:
             streams.register(process.stdout,selectors.EVENT_READ,'stdout');streams.register(process.stderr,selectors.EVENT_READ,'stderr')
@@ -99,9 +96,9 @@ def run_cargo(root,*,publish,cargo=None,cargo_cwd=None,direct_control=True):
                         try:message=json.loads(line)
                         except ValueError:continue
                         messages.append(message)
-                        if (message.get('reason')=='compiler-artifact' and message.get('target',{}).get('name')==PACKAGE
-                                and message.get('fresh') is True):
-                            fresh=True;fresh_at_ns=time.time_ns();fresh_absent=not conflict.exists()
+                        if (message.get('reason')=='compiler-artifact' and message.get('target',{}).get('name')==PACKAGE.replace('-','_')
+                                and 'lib' in message.get('target',{}).get('kind',[]) and message.get('fresh') is True):
+                            fresh=True
         code=process.wait(timeout=5)
     finally:
         if process.poll() is None:
@@ -116,19 +113,18 @@ def run_cargo(root,*,publish,cargo=None,cargo_cwd=None,direct_control=True):
     control=None
     if publish and not conflict.is_file():raise RuntimeError('publisher did not produce the conflicting module')
     if publish and direct_control:
-        direct=subprocess.run(['rustc','--edition=2021','--crate-name','publication_control',str(root/'src/main.rs'),
+        direct=subprocess.run(['rustc','--edition=2021','--crate-type','lib','--crate-name','publication_control',str(root/'src/lib.rs'),
             '-o',str(target/'publication-control')],capture_output=True,timeout=30)
         control={'exit':direct.returncode,'e0761':b'E0761' in direct.stderr}
     publication=json.loads((root/'node_modules/generated/publication.json').read_text()) if publish else None
-    ordered=bool(publish and fresh and fresh_absent and type(publication.get('published_at_ns')) is int
-        and publication['published_at_ns']>fresh_at_ns)
+    ordered=bool(publish and fresh and publication.get('cached_consumer_value')=='OLD')
     if publish and not ordered:raise RuntimeError('fixture did not observe publication after the fresh decision')
     after={name:(root/'node_modules/generated'/name).stat().st_mtime_ns for name in before}
     diagnostics=[message.get('message',{}).get('code',{}).get('code') for message in messages
         if message.get('reason')=='compiler-message' and isinstance(message.get('message',{}).get('code'),dict)]
     return {'cargo_exit':code,'consumer_actual_rustc_calls':counts.count('generated_input_consumer'),
         'all_actual_rustc_crates':counts,'consumer_reported_fresh':fresh,'binary_output':binary,
-        'publication_after_fresh_decision':ordered,'event_ordering_observation_only':True,
+        'publication_after_fresh_decision':ordered,'dependency_ordering_observation_only':True,
         'original_read_file_mtimes_unchanged':before==after,
         'original_read_file_bytes_unchanged':all((root/'node_modules/generated'/name).read_bytes()==data for name,data in original_bytes.items()),'conflict_mtime_ns':conflict.stat().st_mtime_ns if conflict.exists() else None,
         'diagnostics':diagnostics,'direct_compiler_control':control,'full_ci_pass':False,'shipping_authority':False}

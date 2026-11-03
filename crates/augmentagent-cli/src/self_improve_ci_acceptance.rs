@@ -419,8 +419,8 @@ async fn live_shared_ci_in_command_generated_publication()->Result<()> {
     std::fs::write(evidence.join("warm.json"),serde_json::to_vec_pretty(&serde_json::json!({
         "status":&warm.status,"stdout":&warm.stdout,"stderr":&warm.stderr,"shipping_authority":false}))?)?;
     let first:serde_json::Value=serde_json::from_str(warm.stdout.trim()).context("warm fixture result missing; inspect private warm.json")?;
-    ensure!(warm.status=="passed" && first["cargo_exit"]==0 && first["consumer_actual_rustc_calls"]==1
-        && first["binary_output"]=="OLD","initial consumer did not compile and execute");
+    ensure!(warm.status=="passed" && first["cargo_exit"]==0 && first["consumer_actual_rustc_calls"]==2
+        && first["binary_output"]=="OLD","initial consumer library/binary did not compile and execute");
     let unchanged=session.run("repository",&source,root,&bound,None,&[],&[],&[],
         Some("python3 -I publication_fixture.py warm"),&storage,&target,&audit,timeout).await?;
     std::fs::write(evidence.join("unchanged.json"),serde_json::to_vec_pretty(&serde_json::json!({

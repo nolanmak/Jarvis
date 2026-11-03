@@ -425,7 +425,9 @@ execution enforcement, complete input closure or CI authority.
 `live_shared_ci_in_command_generated_publication` adds the scheduling case that
 pre-Cargo validation alone cannot cover. Its fixed workspace warms one consumer,
 verifies an unchanged repeat performs zero consumer compiler calls, then builds
-an independent publisher in the same Cargo invocation as that cached consumer.
+a publisher whose build dependency is the cached consumer library. Cargo must
+resolve that library before the publisher can execute; the publisher also calls
+the cached library before introducing the conflict.
 The publisher introduces a conflicting generated module with the same old
 mtime. The fixture checks that Cargo reported the consumer fresh before the
 publication, that all previously read generated files retained bytes and mtimes,
@@ -435,11 +437,12 @@ binary. The original between-command regressions remain independent gates.
 
 Two managed host preflights reproduced the false green: one initial consumer
 compile, zero on an unchanged repeat, and then zero consumer calls / `OLD` after
-the in-command publication. The second fixture revision verifies event order
-without a mutable cross-unit handshake, so it does not require breaking the new
-unit filesystem isolation. Event timestamps and worker-owned counters are only
-fixture observations; they do not authorize reuse or establish trusted input
-closure. The first real isolated-adapter run is pending. A successful ordinary
+the in-command publication. The current fixture uses that explicit dependency order and keeps the consumer
+compiler environment identical, selecting the publisher only with the workspace
+build command. It requires neither a mutable cross-unit handshake nor a timing
+assumption. Worker-owned counters and library-call reports are only fixture
+observations; they do not authorize reuse or establish trusted input
+closure. The corrected dependency-ordered isolated-adapter run is pending. A successful ordinary
 host harness run means the bug was reproduced, not fixed.
 
 ## Private unit records and cleanup
