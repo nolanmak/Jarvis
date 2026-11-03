@@ -225,7 +225,8 @@ class Observer:
         os.chmod(self.stdout,0o600);os.chmod(self.stderr,0o600)
         self.child=subprocess.Popen([str(binary),'-v','-kk','-q','-B','none','-f','json','-e',self.program],
             stdin=subprocess.DEVNULL,stdout=self.output,stderr=self.error,start_new_session=True,
-            env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'','HOME':'/tmp'})
+            env={'PATH':os.defpath,'BPFTRACE_MAX_STRLEN':'64','BPFTRACE_STR_TRUNC_TRAILER':'',
+                '__BPFTRACE_NOTIFY_PROBES_ATTACHED':'1','HOME':'/tmp'})
         deadline=min(self.deadline,time.monotonic()+10);origin=os.getpid()
         def drop():
             libc=ctypes.CDLL(None,use_errno=True)
@@ -235,6 +236,9 @@ class Observer:
         while time.monotonic()<deadline:
             if self.child.poll() is not None:
                 raise OSError(startup_errno(self.stderr.read_bytes()),'private kernel observer startup failed')
+            if self.stderr.stat().st_size>MAX_BYTES:raise ObservationUnavailable('unbounded startup diagnostics')
+            if b'__BPFTRACE_NOTIFY_PROBES_ATTACHED\n' not in self.stderr.read_bytes():
+                time.sleep(.02);continue
             witness=subprocess.Popen([sys.executable,'-I','-c',_WITNESS,self.witness],
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                 env={'PATH':os.defpath},preexec_fn=drop)
