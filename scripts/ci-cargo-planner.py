@@ -765,9 +765,14 @@ class GeneratedForests:
                     path=Path(name)/os.fsdecode(bytes.fromhex(row[0]));key=os.fsdecode(path)
                     (directories if row[1]=='directory' else files).append(key);times[key]=(self.WORKSPACE/path).stat()
             else:files.append(name);times[name]=original.stat()
-        manifest=unit_views.copy_outputs(self.WORKSPACE,data,files,owner=1000,controller=os.geteuid(),directories=directories)
+        prefixes=sorted({str(parent) for name in self.outputs for parent in Path(name).parents})
+        manifest=unit_views.copy_outputs(self.WORKSPACE,data,files,owner=1000,controller=os.geteuid(),
+            directories=directories,controller_prefixes=prefixes)
         for name,info in sorted(times.items(),key=lambda item:len(Path(item[0]).parts),reverse=True):
             os.utime(data/name,ns=(info.st_atime_ns,info.st_mtime_ns),follow_symlinks=False)
+            descriptor=os.open(data/name,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+            try:os.fsync(descriptor)
+            finally:os.close(descriptor)
         if self.public()!=before:raise FreshnessHold('input_census_unknown')
         record={'version':1,'binding':self.lease.binding,'producer':identity,'command':self.lease.command,
             'claim':self.lease.claim,'scope_id':scope.directory.name.removeprefix('worker-'),'outputs':self.outputs,

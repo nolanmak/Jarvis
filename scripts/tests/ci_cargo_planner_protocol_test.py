@@ -32,6 +32,7 @@ class PlannerProtocolTests(unittest.TestCase):
             workspace=root/'workspace';workspace.mkdir();(workspace/'dist').mkdir()
             (workspace/'dist/partial').write_bytes(b'failed producer output')
             command=str(uuid.uuid4());binding=self.publication_binding()
+            workspace.chmod(0o555)
             with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
                 lease=planner.ExecutionLease(target,binding,command,None)
                 scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/false']);lease.bind_scope(scope)
@@ -52,6 +53,7 @@ class PlannerProtocolTests(unittest.TestCase):
             os.utime(artifact,ns=(946684800000000000,946684800000000000))
             binding=self.publication_binding();first=str(uuid.uuid4());second=str(uuid.uuid4())
             outputs={'node_modules':'directory'}
+            workspace.chmod(0o555)
             with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
                 lease=planner.ExecutionLease(target,binding,first,None)
                 scope=workers.WorkerScope(control,os.getuid(),os.getgid(),['/usr/bin/true']);lease.bind_scope(scope)
@@ -91,6 +93,7 @@ class PlannerProtocolTests(unittest.TestCase):
             workspace=root/'workspace';workspace.mkdir();(workspace/'dist').mkdir()
             artifact=workspace/'dist/output';artifact.write_bytes(b'first')
             outputs={'dist':'directory'};binding=self.publication_binding();previous=None;checkpoints=[]
+            workspace.chmod(0o555)
             with patch.object(planner,'_source',return_value=target),patch.object(planner.GeneratedForests,'WORKSPACE',workspace):
                 for index in range(3):
                     command=str(uuid.uuid4());lease=planner.ExecutionLease(target,binding,command,previous)

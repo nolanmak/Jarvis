@@ -113,9 +113,19 @@ def _output_directory(path,owner):
         raise FreshnessHold('artifact_provenance_unknown')
 
 
-def copy_outputs(source,destination,names,*,owner,controller,directories=None):
+def copy_outputs(source,destination,names,*,owner,controller,directories=None,controller_prefixes=None):
     source=literal(source);destination=literal(destination)
     directories=[] if directories is None else directories
+    prefixes=set()
+    if controller_prefixes is not None:
+        if type(controller_prefixes) is not list or len(controller_prefixes)>512:
+            raise FreshnessHold('input_census_unknown')
+        prefixes={Path('.') if name=='.' else relative(name) for name in controller_prefixes}
+    def check_parent(parent):
+        controlled=parent.relative_to(source) in prefixes
+        _output_directory(parent,controller if controlled else owner)
+        if controlled and stat.S_IMODE(parent.lstat().st_mode)!=0o555:
+            raise FreshnessHold('artifact_provenance_unknown')
     if (not isinstance(names,list) or not isinstance(directories,list)
             or not 1<=len(names)+len(directories)<=MAX_ENTRIES):raise FreshnessHold('input_census_unknown')
     names=[relative(name) for name in names];directories=[relative(name) for name in directories]
@@ -124,13 +134,13 @@ def copy_outputs(source,destination,names,*,owner,controller,directories=None):
     for name in sorted(directories,key=lambda name:(len(name.parts),os.fsencode(name))):
         if (source/name).resolve()!=source/name:raise FreshnessHold('artifact_provenance_unknown')
         for parent in [source,*[source/Path(*name.parts[:i]) for i in range(1,len(name.parts)+1)]]:
-            _output_directory(parent,owner)
+            check_parent(parent)
         (destination/name).mkdir(parents=True,mode=0o700,exist_ok=True)
     for name in names:
         original=source/name
         if original.resolve()!=original:raise FreshnessHold('artifact_provenance_unknown')
         for parent in [source,*[source/Path(*name.parts[:i]) for i in range(1,len(name.parts))]]:
-            _output_directory(parent,owner)
+            check_parent(parent)
         output=destination/name;output.parent.mkdir(parents=True,mode=0o700,exist_ok=True)
         descriptor=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
         try:

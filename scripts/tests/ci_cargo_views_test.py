@@ -72,6 +72,20 @@ class UnitViewTests(unittest.TestCase):
             views.copy_output_roots(source,empty,['second/out'],owner=os.getuid(),controller=os.getuid())
             self.assertTrue((empty/'second/out').is_dir())
 
+    def test_declared_generated_copy_keeps_frozen_parent_and_worker_output_checks_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'workspace';(source/'public').mkdir(parents=True)
+            (source/'public/generated.css').write_bytes(b'generated')
+            source.chmod(0o555);(source/'public').chmod(0o555)
+            copied=views.copy_outputs(source,root/'sealed',['public/generated.css'],
+                owner=os.getuid(),controller=os.getuid(),controller_prefixes=['.','public'])
+            self.assertEqual((root/'sealed/public/generated.css').read_bytes(),b'generated')
+            self.assertEqual(copied,views.inventory(root/'sealed',owner=os.getuid(),sealed=True))
+            (source/'public').chmod(0o755)
+            with self.assertRaises(views.FreshnessHold):
+                views.copy_outputs(source,root/'refused',['public/generated.css'],
+                    owner=os.getuid(),controller=os.getuid(),controller_prefixes=['.','public'])
+
     def test_output_root_selection_refuses_overlap_escape_and_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);source=root/'unit';(source/'out/child').mkdir(parents=True)

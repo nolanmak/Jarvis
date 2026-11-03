@@ -1436,3 +1436,11 @@ repository recovery and original in-command generated-publication tests retain
 their criteria. Native results for the new case are pending; production modes
 remain disabled, and opaque wrapper execution, selector recovery, full input
 closure and the final passing-CI/merge enforcement remain unfinished.
+
+The first generated-forest native run held before publication: the actual source
+projection has controller-owned 0555 parent directories, whereas the old output
+copier required worker ownership on every ancestor. The retained stopped VM had
+an allocated empty object and no published record. Copying now distinguishes
+explicit frozen controller prefixes from worker-owned generated outputs; both
+retain their own ownership/mode checks. Snapshot timestamp updates are fsynced
+before publication. This failure did not grant input or shipping authority.
