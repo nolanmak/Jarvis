@@ -425,17 +425,24 @@ class FrozenLookupIndex:
                 if (*self.views._key(info),info.st_nlink,info.st_atime_ns)!=identity:_hold()
         except (OSError,ValueError,self.views.FreshnessHold):_hold()
 
-    def select(self,events,metadata,*,pid,uid,user_namespace,mount_namespace):
+    def select(self,events,metadata,*,pid,uid,user_namespace,mount_namespace,threaded=False):
         self._verify();queries=[];contexts=[]
         try:
-            if type(events) is not list or not 0<len(events)<=200000 or type(metadata) is not list or len(metadata)>200000:_hold()
+            if (type(threaded) is not bool or type(events) is not list or not 0<len(events)<=200000
+                    or type(metadata) is not list or len(metadata)>200000):_hold()
             keys=('uid','pid','tid','syscall','sequence');observed={}
             for record in metadata:
                 key=tuple(record[k] for k in keys)
                 if key in observed:_hold()
                 observed[key]=record
             for event in events:
-                if (event['pid']!=event['tid'] or event['pid']!=pid or event['uid']!=uid
+                # In threaded mode the collector's actual kernel TGID still
+                # binds the original supervised process. Resolve each query
+                # through its own captured base and namespaces; never borrow
+                # the main thread's cwd or a sampled /proc thread directory.
+                if (not threaded and event['pid']!=event['tid']
+                        or type(event['tid']) is not int or not 0<event['tid']<2**31
+                        or event['pid']!=pid or event['uid']!=uid
                         or event['syscall'] not in (262,332)):_hold()
                 record=observed.get(tuple(event[k] for k in keys))
                 if (record is None or record['user_namespace']!=user_namespace or record['path']!=event['path']

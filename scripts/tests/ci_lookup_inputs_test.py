@@ -140,15 +140,30 @@ class LookupInputTests(unittest.TestCase):
                 'base':dict(original,flags=256,path_seq=2,dentry_seq=2)}]}
         metadata={key:event[key] for key in ('uid','pid','tid','syscall','sequence','path','result')}
         metadata.update(fd=-100,flags=256,mask=0,user_namespace=100,stat=None,copy_result=None)
-        def select(index):return index.select([event],[metadata],pid=101,uid=2005,user_namespace=100,mount_namespace=50)
+        def select(index,*,threaded=False):return index.select([event],[metadata],pid=101,uid=2005,
+            user_namespace=100,mount_namespace=50,threaded=threaded)
         with self.assertRaises(self.inputs.FreshnessHold):
             select(self.inputs.FrozenLookupIndex(namespaces,owner=os.geteuid()))
         selected=select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()))
         self.assertFalse(selected.observation['shipping_authority'])
+        # rustc resolves modules in a worker thread. Its kernel TGID remains the
+        # original supervised PID; namespace and selected base still must match.
+        event['tid']=metadata['tid']=103
+        with self.assertRaises(self.inputs.FreshnessHold):
+            select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()))
+        selected=select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()),threaded=True)
+        self.assertFalse(selected.observation['shipping_authority'])
+        for field in ('pid','user_namespace','mount_namespace'):
+            if field=='pid':event['pid']=metadata['pid']=102
+            else:event['lookup_attempts'][0][field]+=1
+            with self.subTest(field=field),self.assertRaises(self.inputs.FreshnessHold):
+                select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()),threaded=True)
+            if field=='pid':event['pid']=metadata['pid']=101
+            else:event['lookup_attempts'][0][field]-=1
         # A valid root anchor only routes to declared frozen trees.
         event['path']=metadata['path']=b'/etc/unknown'
         with self.assertRaises(self.inputs.FreshnessHold):
-            select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()))
+            select(self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':original},owner=os.geteuid()),threaded=True)
         for fault in (dict(original,inode=True),dict(original,mode=0o100444),dict(original,extra=1)):
             with self.subTest(fault=fault),self.assertRaises(self.inputs.FreshnessHold):
                 self.inputs.FrozenLookupIndex(namespaces,kernel_roots={'/':fault},owner=os.geteuid())

@@ -1102,3 +1102,12 @@ publication and metadata. This extends the diagnostic acceptance, not the final
 input-proof API. Actual fingerprint deletion, compiler retry and the original
 in-command regression remain unfinished. Native validation of this extension
 is pending.
+
+The first real compiler replay exposed a main-thread-only selector assumption:
+rustc's actual negative `statx` query came from a worker TID within the original
+supervised process. The retained kernel records preserve its TGID, TID, base
+object and namespaces. Explicit threaded selection now accepts that shape while
+still requiring the original TGID/UID, exact per-query metadata join, original
+root object and both namespaces. Foreign processes/namespaces remain refused;
+the default controlled-probe selector remains main-thread-only. The failed
+native run is retained as diagnostic evidence and is not a passing receipt.

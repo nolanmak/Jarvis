@@ -896,12 +896,12 @@ class _CargoProbe:
         def index(root):
             return lookup_inputs.FrozenLookupIndex({'generated':(prefix,root,
                 unit_views.inventory(root,owner=0,sealed=True))},kernel_roots={'/':unit['root_identity']},owner=0)
-        selected=[e for e in events if e['pid']==e['tid']==unit['pid'] and e['uid']==2000+ordinal
+        selected=[e for e in events if e['pid']==unit['pid'] and e['uid']==2000+ordinal
             and e['path']==(prefix+'/chosen.rs').encode() and e['syscall'] in (262,332) and e['result']==-errno.ENOENT]
         if not selected:raise FreshnessHold('input_census_unknown')
         scope=int(unit['namespaces']['mnt']['unit'].split('[',1)[1][:-1])
         observation=index(original).select(selected,metadata,pid=unit['pid'],uid=2000+ordinal,
-            user_namespace=user_namespace,mount_namespace=scope)
+            user_namespace=user_namespace,mount_namespace=scope,threaded=True)
         variant=self.root/'introduced-generated'
         unit_views.copy_output_roots(publication['root'],variant,[mapping['generated_root']],owner=0,controller=0)
         changed=variant/mapping['generated_root'];changed.chmod(0o755)
