@@ -1100,8 +1100,7 @@ Refreshing the actual compiler selector must change its content digest and
 durably mark both library and binary pending, while preserving the old sealed
 publication and metadata. This extends the diagnostic acceptance, not the final
 input-proof API. Actual fingerprint deletion, compiler retry and the original
-in-command regression remain unfinished. Native validation of this extension
-is pending.
+in-command regression remain unfinished.
 
 The first real compiler replay exposed a main-thread-only selector assumption:
 rustc's actual negative `statx` query came from a worker TID within the original
@@ -1111,3 +1110,16 @@ still requiring the original TGID/UID, exact per-query metadata join, original
 root object and both namespaces. Foreign processes/namespaces remain refused;
 the default controlled-probe selector remains main-thread-only. The failed
 native run is retained as diagnostic evidence and is not a passing receipt.
+
+The corrected native replay at `79c8572d` passed in **109.37 seconds**. Its
+protected receipt contains one actual UID2010 library query, different original
+and refreshed selector digests, and durable `binary`/`library` pending records.
+The original generated publication and metadata remain unchanged. Cold/warm
+compiler counts remain `[3,0]`, build-script counts `[1,0]`, applications 2;
+all nine Cargo unit scopes have original cleanup receipts. The original sixteen
+kernel programs/attachments and zero-miss census remain required. The replay
+observed 558 copied-name/base queries, 750 metadata queries and 153 directory
+reads. All 277 Python CI tests and 31 focused managed Rust tests passed (15
+opt-in Rust cases excluded); the updater checks remain 99/99. Full input closure,
+passing-CI and shipping authority remain false, and this result does not prove
+fingerprint invalidation, command restart, or the in-command regression.
